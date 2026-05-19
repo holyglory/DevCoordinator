@@ -1,0 +1,17 @@
+.DS_Store
+
+# Local editor and runtime state
+.idea/
+.vscode/
+*.log
+
+# Python caches used by skill harness scripts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local audit outputs and scratch runs
+audit-output/
+audit-outputs/
+full-repo-audit-run/
+tmp/
