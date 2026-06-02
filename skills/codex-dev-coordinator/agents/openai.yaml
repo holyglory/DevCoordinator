@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex Dev Coordinator"
+  short_description: "Coordinate ports, dev servers, and Docker."
+  default_prompt: "Use $codex-dev-coordinator to lease a port and start this repo's dev server safely."
+
+policy:
+  allow_implicit_invocation: true

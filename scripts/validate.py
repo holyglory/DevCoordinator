@@ -15,8 +15,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "full_repo_harness"
 SKILLS = [
+    ROOT / "skills" / "codex-dev-coordinator",
     ROOT / "skills" / "full-repo-audit",
     ROOT / "skills" / "full-repo-test-coverage-audit",
+    ROOT / "skills" / "trace-fix-root-causes",
     ROOT / "skills" / "ui-implementation-audit",
     ROOT / "skills" / "user-journey-docs-audit",
 ]
@@ -141,8 +143,10 @@ def main() -> int:
             "-m",
             "compileall",
             "full_repo_harness",
+            "skills/codex-dev-coordinator/scripts",
             "skills/full-repo-audit/scripts",
             "skills/full-repo-test-coverage-audit/scripts",
+            "skills/trace-fix-root-causes/scripts",
             "skills/ui-implementation-audit/scripts",
             "skills/user-journey-docs-audit/scripts",
         ]

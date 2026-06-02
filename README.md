@@ -7,11 +7,17 @@ reviewed, and prepared for installation into a Codex skills directory.
 ## Layout
 
 - `skills/`: source-controlled skill directories.
+- `skills/codex-dev-coordinator/`: a shared coordinator skill for leasing
+  ports, starting/stopping/restarting dev servers, checking health, and routing
+  Docker/Docker Compose commands through one local CLI or HTTP endpoint.
 - `skills/full-repo-audit/`: a repository-wide audit skill for source,
   architecture, user journeys, UI elements, intended features, and tests.
 - `skills/full-repo-test-coverage-audit/`: a repository-wide test coverage
   audit skill that reports missing unit, integration, UI journey, visual,
   feature, edge-case, and failure-path coverage.
+- `skills/trace-fix-root-causes/`: a prevention skill for tracing recently
+  fixed bugs, UI flaws, regressions, and audit misses back to their creation
+  path, then recommending workflow guardrails.
 - `skills/ui-implementation-audit/`: a UI implementation audit skill that
   batches only interface source files while comparing rendered desktop/mobile
   UI against mockups, visual assets, complete UI element requirements, and user
