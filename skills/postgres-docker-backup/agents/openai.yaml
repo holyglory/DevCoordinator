@@ -1,0 +1,7 @@
+interface:
+  display_name: "Postgres Docker Backup"
+  short_description: "Backup and restore Docker Postgres safely."
+  default_prompt: "Use $postgres-docker-backup to back up the running Docker Postgres database before risky database work."
+
+policy:
+  allow_implicit_invocation: true

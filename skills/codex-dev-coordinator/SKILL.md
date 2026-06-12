@@ -5,15 +5,19 @@ description: Use when Codex agents in one or multiple Codex apps need coordinate
 
 # Codex Dev Coordinator
 
-Use this skill before starting local dev servers, allocating ports, or managing
-Docker when multiple Codex agents or Codex app instances may be working on the
-same machine.
+Use this skill before starting local dev servers, allocating ports, inspecting
+running services, or managing Docker when multiple Codex agents or Codex app
+instances may be working on the same machine.
 
 ## Core Rule
 
-Do not guess a replacement port after a collision. Ask the coordinator for a
-lease, then start the server through the coordinator or use the leased port in
-the command you run.
+Do not start dev/test servers, Docker Compose services, Docker containers, or
+local database stacks directly with default ports. First run `inventory` to see
+what is already running. Then start/restart/stop through the coordinator, or
+lease a port through the coordinator and pass that port to the command.
+
+Never do the pattern "try the default port, then try another one if busy." The
+coordinator is the source of truth.
 
 ## Shared State
 
@@ -36,6 +40,10 @@ the same port.
 ## Quick Start
 
 Resolve the script path relative to this skill directory:
+
+```bash
+python3 scripts/dev_coordinator.py inventory --project "$PWD"
+```
 
 ```bash
 python3 scripts/dev_coordinator.py port lease --agent "$USER" --project "$PWD" --range 3000-3999
@@ -73,6 +81,7 @@ python3 scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876
 
 Useful endpoints:
 
+- `GET /v1/inventory`
 - `GET /v1/state`
 - `GET /v1/ports`
 - `GET /v1/servers`
@@ -86,6 +95,9 @@ Useful endpoints:
 - `POST /v1/docker/compose-up`
 - `POST /v1/docker/compose-down`
 - `POST /v1/docker/logs`
+- `POST /v1/docker/start`
+- `POST /v1/docker/stop`
+- `POST /v1/docker/restart`
 
 POST bodies are JSON and use the same option names as the CLI without leading
 dashes, for example:
@@ -104,6 +116,7 @@ python3 scripts/dev_coordinator.py docker ps
 python3 scripts/dev_coordinator.py docker compose-up --cwd "$PWD" --file docker-compose.yml --detach
 python3 scripts/dev_coordinator.py docker compose-down --cwd "$PWD" --file docker-compose.yml
 python3 scripts/dev_coordinator.py docker logs --container my-container --tail 80
+python3 scripts/dev_coordinator.py docker restart --container my-container
 ```
 
 Use `--dry-run` when Docker may not be installed or when validating the command
@@ -111,15 +124,17 @@ shape without changing containers.
 
 ## Agent Workflow
 
-1. Identify the project path and a stable server name such as `web`, `api`, or
+1. Run `inventory --project "$PWD"` before starting, stopping, or replacing any
+   local service. Reuse healthy existing URLs when they match the task.
+2. Identify the project path and a stable server name such as `web`, `api`, or
    `worker`.
-2. Run `server status` first. If the existing healthy server matches the task,
+3. Run `server status` first. If the existing healthy server matches the task,
    reuse its URL.
-3. If no server exists, run `server start` with a command that accepts `{port}`.
-4. If the server exists but is stale or unhealthy, run `server restart`.
-5. When stopping work, run `server stop` only for servers you own or that the
+4. If no server exists, run `server start` with a command that accepts `{port}`.
+5. If the server exists but is stale or unhealthy, run `server restart`.
+6. When stopping work, run `server stop` only for servers you own or that the
    user asked you to stop.
-6. For Docker, prefer `docker compose-*` commands through the coordinator and
+7. For Docker, prefer `docker compose-*` commands through the coordinator and
    inspect status before stopping shared containers.
 
 ## Safety Notes

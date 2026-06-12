@@ -18,6 +18,7 @@ SKILLS = [
     ROOT / "skills" / "codex-dev-coordinator",
     ROOT / "skills" / "full-repo-audit",
     ROOT / "skills" / "full-repo-test-coverage-audit",
+    ROOT / "skills" / "postgres-docker-backup",
     ROOT / "skills" / "trace-fix-root-causes",
     ROOT / "skills" / "ui-implementation-audit",
     ROOT / "skills" / "user-journey-docs-audit",
@@ -146,6 +147,7 @@ def main() -> int:
             "skills/codex-dev-coordinator/scripts",
             "skills/full-repo-audit/scripts",
             "skills/full-repo-test-coverage-audit/scripts",
+            "skills/postgres-docker-backup/scripts",
             "skills/trace-fix-root-causes/scripts",
             "skills/ui-implementation-audit/scripts",
             "skills/user-journey-docs-audit/scripts",
@@ -153,6 +155,9 @@ def main() -> int:
     )
     for skill in SKILLS:
         check_standalone_skill(skill)
+    ops_console = ROOT / "apps" / "CodexOpsConsole"
+    if ops_console.is_dir():
+        run(["swift", "build"], cwd=ops_console)
     print("validation ok")
     return 0
 

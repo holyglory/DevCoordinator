@@ -15,6 +15,9 @@ reviewed, and prepared for installation into a Codex skills directory.
 - `skills/full-repo-test-coverage-audit/`: a repository-wide test coverage
   audit skill that reports missing unit, integration, UI journey, visual,
   feature, edge-case, and failure-path coverage.
+- `skills/postgres-docker-backup/`: a Docker Postgres safety skill for
+  discovering running Postgres containers, creating verified backups, writing
+  manifests, and restoring with confirmation plus a default pre-restore backup.
 - `skills/trace-fix-root-causes/`: a prevention skill for tracing recently
   fixed bugs, UI flaws, regressions, and audit misses back to their creation
   path, then recommending workflow guardrails.
@@ -30,12 +33,48 @@ reviewed, and prepared for installation into a Codex skills directory.
 - `full_repo_harness/`: shared Python harness code for repository discovery,
   batching, manifests, queue markers, and verifier helpers used by audit
   skills.
+- `apps/CodexOpsConsole/`: a native macOS SwiftUI utility for viewing and
+  managing coordinator inventory, dev-server URLs, Docker containers, database
+  backups, leases, and recent service events.
 - `scripts/validate.py`: repo-level validation for all skills, the shared
-  harness, vendored fallback copies, and standalone skill-copy execution.
+  harness, vendored fallback copies, standalone skill-copy execution, and the
+  Codex Ops Console Swift build.
 
 Each skill directory should keep its own `SKILL.md`, README, scripts, agents,
 fixtures, and tests together so the skill can be reviewed or installed as a
 self-contained unit.
+
+## Deployment Notes
+
+Deploy skills into the Codex home used by the specific app/account that needs
+them:
+
+```bash
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+rsync -a --delete skills/codex-dev-coordinator/ "$CODEX_HOME/skills/codex-dev-coordinator/"
+```
+
+Codex sessions load skill metadata at startup. After installing or updating a
+skill, fully restart the Codex app/session that should see it. For Parallels,
+Parall, VMs, or multiple OS users, verify the target app's `$HOME` and
+`$CODEX_HOME`; installing into `/Users/holyglory/.codex/skills` on the host does
+not make the skill available inside a separate guest, sandbox, or account unless
+that environment points to the same Codex home.
+
+## Local Service Policy
+
+Agents must use `codex-dev-coordinator` before starting, stopping, restarting,
+or replacing local dev/test servers, Docker services, Docker containers, or
+database stacks. The first command should be:
+
+```bash
+python3 scripts/dev_coordinator.py inventory --project "$PWD"
+```
+
+Do not start on default ports and then hunt for another port after a collision.
+Lease ports or manage servers through the coordinator. Before destructive
+PostgreSQL-in-Docker work, use `postgres-docker-backup` to create and verify a
+backup.
 
 ## Development Notes
 

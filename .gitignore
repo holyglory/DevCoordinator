@@ -9,9 +9,11 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.build/
 
 # Local audit outputs and scratch runs
 audit-output/
 audit-outputs/
 full-repo-audit-run/
 tmp/
+.codex-db-backups/

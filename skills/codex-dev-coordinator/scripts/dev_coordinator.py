@@ -310,6 +310,133 @@ def server_health(server: dict[str, Any]) -> dict[str, Any]:
     return {"ok": alive and bool(check.get("ok")), "pid_alive": alive, "check": check}
 
 
+def docker_available_command(args: list[str]) -> dict[str, Any]:
+    command = ["docker", *args]
+    try:
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+    except FileNotFoundError:
+        return {"ok": False, "command": command, "error": "Docker CLI was not found on PATH"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "command": command, "error": "Docker command timed out"}
+    return {
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "command": command,
+    }
+
+
+def docker_ps_inventory() -> dict[str, Any]:
+    result = docker_available_command(["ps", "--format", "{{json .}}"])
+    if not result.get("ok"):
+        return {"available": False, "error": result.get("error") or result.get("stderr"), "containers": [], "postgres": []}
+    containers = []
+    postgres = []
+    for line in str(result.get("stdout") or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        container = {
+            "id": item.get("ID"),
+            "name": item.get("Names"),
+            "image": item.get("Image"),
+            "status": item.get("Status"),
+            "ports": item.get("Ports"),
+        }
+        containers.append(container)
+        haystack = " ".join(str(container.get(key) or "").lower() for key in ("name", "image", "ports"))
+        if "postgres" in haystack or "5432" in haystack:
+            postgres.append(container)
+    return {"available": True, "containers": containers, "postgres": postgres}
+
+
+def backup_inventory(project: str | None, backup_dirs: list[str] | None = None) -> list[dict[str, Any]]:
+    roots = []
+    if backup_dirs:
+        roots.extend(Path(item).expanduser() for item in backup_dirs)
+    if project:
+        roots.append(Path(project).expanduser().resolve() / ".codex-db-backups")
+    backups = []
+    seen: set[Path] = set()
+    for root in roots:
+        root = root.resolve()
+        if root in seen or not root.exists():
+            continue
+        seen.add(root)
+        for item in sorted(root.rglob("*")):
+            if not item.is_file() or item.name.endswith(".manifest.json"):
+                continue
+            manifest_path = Path(f"{item}.manifest.json")
+            manifest = None
+            if manifest_path.exists():
+                with contextlib.suppress(json.JSONDecodeError):
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            backups.append(
+                {
+                    "path": str(item),
+                    "size": item.stat().st_size,
+                    "modified_at": iso_timestamp(item.stat().st_mtime),
+                    "manifest": str(manifest_path) if manifest_path.exists() else None,
+                    "database": (manifest or {}).get("database"),
+                    "container": (manifest or {}).get("container"),
+                    "format": (manifest or {}).get("format"),
+                    "sha256": (manifest or {}).get("sha256"),
+                }
+            )
+    return backups
+
+
+def build_inventory(state: dict[str, Any], *, project: str | None = None, include_docker: bool = True, backup_dirs: list[str] | None = None) -> dict[str, Any]:
+    resolved_project = str(Path(project).expanduser().resolve()) if project else None
+    servers = []
+    for server in state["servers"].values():
+        if resolved_project and server.get("project") != resolved_project:
+            continue
+        updated = dict(server)
+        updated["health"] = server_health(server)
+        updated["status"] = "running" if updated["health"].get("ok") else "unhealthy"
+        servers.append(updated)
+    leases = [
+        lease
+        for lease in state["leases"].values()
+        if not resolved_project or lease.get("project") == resolved_project
+    ]
+    urls = [
+        {
+            "name": server.get("name"),
+            "project": server.get("project"),
+            "url": server.get("url"),
+            "health_url": server.get("health_url"),
+            "status": server.get("status"),
+        }
+        for server in servers
+        if server.get("url")
+    ]
+    recent_events = []
+    for event in state.get("history", []):
+        payload = event.get("payload") or {}
+        if resolved_project and payload.get("project") != resolved_project:
+            continue
+        recent_events.append(event)
+    docker = docker_ps_inventory() if include_docker else {"available": None, "containers": [], "postgres": []}
+    return {
+        "coordinator_home": str(coordinator_home()),
+        "state_path": str(state_path()),
+        "project": resolved_project,
+        "urls": urls,
+        "servers": servers,
+        "leases": leases,
+        "recent_events": recent_events[-40:],
+        "docker": docker,
+        "postgres": docker.get("postgres", []),
+        "backups": backup_inventory(resolved_project, backup_dirs),
+    }
+
+
 def wait_for_health(server: dict[str, Any], timeout: float) -> dict[str, Any]:
     deadline = now() + timeout
     last = server_health(server)
@@ -493,6 +620,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Coordinate Codex dev ports, servers, and Docker.")
     sub = parser.add_subparsers(dest="group", required=True)
 
+    inventory = sub.add_parser("inventory")
+    inventory.add_argument("--project")
+    inventory.add_argument("--backup-dir", action="append")
+    inventory.add_argument("--no-docker", action="store_true")
+
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="action", required=True)
     state_sub.add_parser("show")
@@ -553,6 +685,10 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--container", required=True)
     logs.add_argument("--tail", default="80")
     logs.add_argument("--dry-run", action="store_true")
+    for action_name in ("start", "stop", "restart"):
+        container_action = docker_sub.add_parser(action_name)
+        container_action.add_argument("--container", required=True)
+        container_action.add_argument("--dry-run", action="store_true")
 
     api = sub.add_parser("api")
     api_sub = api.add_subparsers(dest="action", required=True)
@@ -575,6 +711,13 @@ def handle_cli(args: argparse.Namespace) -> Any:
             state.update(default_state())
             return state
     with locked_state() as state:
+        if args.group == "inventory":
+            return build_inventory(
+                state,
+                project=args.project,
+                include_docker=not args.no_docker,
+                backup_dirs=args.backup_dir,
+            )
         if args.group == "state" and args.action == "show":
             return state
         if args.group == "port" and args.action == "lease":
@@ -618,6 +761,8 @@ def handle_cli(args: argparse.Namespace) -> Any:
                     ["docker", "logs", "--tail", str(args.tail), args.container],
                     dry_run=args.dry_run,
                 )
+            if args.action in {"start", "stop", "restart"}:
+                return run_docker(state, ["docker", args.action, args.container], dry_run=args.dry_run)
     raise SystemExit("unsupported command")
 
 
@@ -646,6 +791,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             with locked_state() as state:
                 if self.path == "/v1/state":
                     self._send(200, state)
+                elif self.path == "/v1/inventory":
+                    self._send(200, build_inventory(state))
                 elif self.path == "/v1/ports":
                     self._send(200, list(state["leases"].values()))
                 elif self.path == "/v1/servers":
@@ -693,6 +840,13 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     result = run_docker(
                         state,
                         ["docker", "logs", "--tail", str(payload.get("tail") or "80"), payload["container"]],
+                        dry_run=bool(payload.get("dry_run")),
+                    )
+                elif self.path in {"/v1/docker/start", "/v1/docker/stop", "/v1/docker/restart"}:
+                    docker_action = self.path.rsplit("/", 1)[-1]
+                    result = run_docker(
+                        state,
+                        ["docker", docker_action, payload["container"]],
                         dry_run=bool(payload.get("dry_run")),
                     )
                 else:

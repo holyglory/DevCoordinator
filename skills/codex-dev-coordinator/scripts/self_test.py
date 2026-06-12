@@ -17,6 +17,7 @@ from shutil import rmtree
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "dev_coordinator.py"
+SKILL = ROOT / "SKILL.md"
 
 
 def free_port() -> int:
@@ -88,6 +89,10 @@ def main() -> int:
     env["CODEX_AGENT_COORDINATOR_HOME"] = str(tmp / "state")
     api_process: subprocess.Popen[str] | None = None
     try:
+        skill_text = SKILL.read_text(encoding="utf-8")
+        for needle in ("inventory --project", "Do not start dev/test servers", "try the default port"):
+            check(needle in skill_text, f"SKILL.md should retain policy text: {needle}")
+
         port_a = free_port()
         port_b = free_port()
         low, high = sorted((port_a, port_b))
@@ -151,6 +156,9 @@ def main() -> int:
             env=env,
         )
         check(server["health"]["ok"], "managed server should become healthy")
+        inventory = run(["inventory", "--project", str(tmp), "--no-docker"], env=env)
+        check(inventory["urls"][0]["url"] == server["url"], "inventory should expose managed server URL")
+        check(inventory["servers"][0]["status"] == "running", "inventory should health-check managed server")
         status = run(["server", "status", "--project", str(tmp), "--name", "fixture-web"], env=env)
         check(status["status"] == "running", "server status should be running")
         stopped = run(["server", "stop", "--project", str(tmp), "--name", "fixture-web"], env=env)
@@ -159,6 +167,8 @@ def main() -> int:
         docker = run(["docker", "compose-up", "--cwd", str(tmp), "--file", "compose.yml", "--detach", "--dry-run"], env=env)
         check(docker["dry_run"], "docker dry-run should not execute docker")
         check(docker["command"] == ["docker", "compose", "-f", "compose.yml", "up", "-d"], "docker command shape drifted")
+        docker_restart = run(["docker", "restart", "--container", "fixture-postgres", "--dry-run"], env=env)
+        check(docker_restart["command"] == ["docker", "restart", "fixture-postgres"], "docker restart command shape drifted")
 
         api_port = free_port()
         api_process = subprocess.Popen(
@@ -177,6 +187,8 @@ def main() -> int:
         check("port" in api_lease, "API lease should return a port")
         ports = get_json(api_port, "/v1/ports")
         check(any(item["id"] == api_lease["id"] for item in ports), "API lease should appear in port list")
+        api_inventory = get_json(api_port, "/v1/inventory")
+        check("urls" in api_inventory and "docker" in api_inventory, "API inventory should expose URLs and Docker summary")
         state = get_json(api_port, "/v1/state")
         history_types = {item["type"] for item in state["history"]}
         check("port.leased" in history_types and "server.stopped" in history_types, "state should retain action history")
