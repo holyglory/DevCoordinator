@@ -52,10 +52,18 @@ toward durable prevention when the same class of mistake could recur.
 
 - Before starting, stopping, restarting, or replacing any dev/test server,
   Docker Compose service, Docker container, or local database stack, use
-  `$codex-dev-coordinator` and run its `inventory --project "$PWD"` command.
+  `$codex-dev-coordinator`, set
+  `PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`, and run
+  its `inventory --project "$PROJECT_ROOT"` command.
+- Every mutating coordinator call must include both `--agent "$USER"` and
+  `--project "$PROJECT_ROOT"` so the coordinator can attribute servers,
+  Docker containers, databases, and leases to the repo that requested them.
 - Do not start services on default ports directly. Do not follow the pattern
   "try the default port, then try another one if busy." Lease ports or manage
   servers through the coordinator.
+- If a dev server or Docker container is already running outside coordinator
+  state, register it through `$codex-dev-coordinator` (`server register` or
+  `docker register`) instead of launching a duplicate.
 - Reuse a healthy coordinator-managed URL when it matches the task instead of
   launching a duplicate server.
 - Before destructive PostgreSQL-in-Docker operations such as migrations, resets,

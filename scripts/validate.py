@@ -133,9 +133,194 @@ def check_include_glob_exclusions() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_ops_console_interaction_guardrails() -> None:
+    ops_console = ROOT / "apps" / "CodexOpsConsole"
+    if not ops_console.is_dir():
+        return
+
+    source_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((ops_console / "Sources" / "CodexOpsConsole").glob("*.swift"))
+    )
+    views = (ops_console / "Sources" / "CodexOpsConsole" / "Views.swift").read_text(encoding="utf-8")
+    store = (ops_console / "Sources" / "CodexOpsConsole" / "OpsStore.swift").read_text(encoding="utf-8")
+    models = (ops_console / "Sources" / "CodexOpsConsole" / "Models.swift").read_text(encoding="utf-8")
+    menu_snapshot = (ops_console / "Tools" / "MenuBarSnapshotMain.swift").read_text(encoding="utf-8")
+    coordinator = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "dev_coordinator.py").read_text(encoding="utf-8")
+    coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
+    coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
+
+    required = {
+        "left pane splitter": "SplitHandle(width: $sidebarWidth",
+        "right pane splitter": "SplitHandle(width: $inspectorWidth",
+        "thin splitter width": "let splitHandleWidth: CGFloat = 8",
+        "absolute pane layout": "ZStack(alignment: .topLeading)",
+        "exact main pane frame": ".frame(width: layout.mainWidth, height:",
+        "positioned main pane": ".position(x: mainX +",
+        "global splitter drag": "DragGesture(minimumDistance: 0, coordinateSpace: .global)",
+        "stable splitter math": "resizedPaneWidth(",
+        "responsive console layout": "func consoleLayout(",
+        "minimum readable sidebar": "minimumReadableSidebarWidth",
+        "responsive toolbar": "private var compactToolbar",
+        "compact toolbar search": "SearchField(text: $store.searchText, compact: true)",
+        "readable inspector minimum": "let minimumInspectorWidth: CGFloat = 320",
+        "vertical-only service map scroll": "ScrollView(.vertical)",
+        "expandable sidebar tree": "expandedProjects",
+        "sidebar selection": "sidebarSelection",
+        "canonical project grouping": "func projectKey(fromResourceName",
+        "resource leaf prefix removal": "resourceDisplayName(",
+        "typed sidebar leaves": "enum MapLeafKind",
+        "sidebar leaf actions": "SidebarActionButton",
+        "safe sidebar footer": "SidebarFooterView",
+        "explicit sidebar footer width": "sidebarFooterContentWidth(totalWidth:",
+        "sidebar footer geometry": "GeometryReader { proxy in",
+        "sidebar stop all constrained frame": ".frame(maxWidth: .infinity, minHeight: 30)",
+        "sidebar footer icon fixed frame": ".frame(width: 24, height: 24)",
+        "server sidebar toggle": "func toggle(_ server",
+        "docker sidebar toggle": "func toggleDocker",
+        "stop all action": "func stopAll()",
+        "stop all button": "Stop all",
+        "resource tabs": "ResourceTabBar",
+        "resizable table columns": "ResizableHeaderCell",
+        "column resize helper": "func resizedColumnWidth(",
+        "global column drag": "resizedColumnWidth(start: start, startX: value.startLocation.x, currentX: value.location.x)",
+        "wide column drag target": ".frame(width: 14)",
+        "column resize cursor": "NSCursor.resizeLeftRight.push()",
+        "full-height resource table": "GeometryReader { proxy in",
+        "full-size tab body": ".frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)",
+        "details-only right rail": "DetailsRailView",
+        "server logs sheet": "ServerLogsSheet",
+        "server logs action": "func showServerLogs",
+        "server stop reason": "stoppedReason",
+        "coordinator server logs": "def server_logs(",
+        "docker start action": "func startDocker",
+        "exact preferred port model": "preferredPort",
+        "server preferred port flag": "\"--preferred\"",
+        "docker all inventory": "docker_ps_inventory(*, all_containers: bool = True, state:",
+        "docker ps all command": "args.append(\"--all\")",
+        "docker stats command": "\"docker\", \"stats\", \"--no-stream\"",
+        "docker stats history": "stats_history",
+        "docker stats model": "struct DockerStats",
+        "docker telemetry sparkline": "MetricSparkCell",
+        "docker telemetry panel": "DockerTelemetryPanel",
+        "docker auto refresh": "Task.sleep(nanoseconds: 2_500_000_000)",
+        "project runtime command parser": "project_sub = project.add_subparsers",
+        "project runtime status": "def project_runtime_status(",
+        "project runtime start": "def project_runtime_start(",
+        "project runtime declaration": "PROJECT_RUNTIME_FILES",
+        "project dependency classification": "stopped_container",
+        "project runtime skill workflow": "project start --agent \"$USER\" --project \"$PROJECT_ROOT\"",
+        "canonical project root workflow": "PROJECT_ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"",
+        "server register command": "server register",
+        "server register parser": "server_sub.add_parser(\"register\")",
+        "server adoption marker": "\"adopted\": True",
+        "missing command marker": "\"missing_command\"",
+        "docker register command": "docker register",
+        "docker register parser": "docker_sub.add_parser(\"register\")",
+        "docker sidecar metadata": "coordinator_sidecar",
+        "docker metadata store": "docker_metadata_store",
+        "runtime docker metadata adoption": "ensure_runtime_docker_metadata",
+        "stale fixed-port lease reclaim": "reclaim_stale_leases_for_port",
+        "undeclared compose autostart guard": "\"autostart\": compose_declared",
+        "undeclared compose skill policy": "`project start` must not run `docker\ncompose up` from that discovery",
+        "docker identity enforcement": "requires --agent so the coordinator can attribute the action",
+        "project runtime model": "struct ProjectRuntimeReport",
+        "project path grouping": "projectPathForGroup(",
+        "project start UI action": "func startProject(_ group",
+        "project restart UI action": "func restartProject(_ group",
+        "project stop UI action": "func stopProject(_ group",
+        "project runtime inspector": "ProjectRuntimeSummary",
+        "wrapped inspector details": "fixedSize(horizontal: false, vertical: true)",
+        "stacked inspector actions": "InspectorActionStack",
+        "shared app store": "@StateObject private var store = OpsStore()",
+        "console accepts shared store": "@ObservedObject var store: OpsStore",
+        "menu bar status item": "NSStatusBar.system.statusItem",
+        "menu bar popover": "NSPopover",
+        "menu bar runtime view": "MenuBarRuntimeView",
+        "menu bar project rows": "MenuProjectRow",
+        "menu bar task rows": "MenuTaskRow",
+        "menu bar vertical scroll": "ScrollView(.vertical, showsIndicators: true)",
+        "menu bar shared project grouping": "projectGroups(from: store.inventory)",
+        "menu bar hoverable actions": "@State private var isHovering = false",
+        "menu bar action hit shape": ".contentShape(RoundedRectangle(cornerRadius: 7))",
+        "menu bar action hit priority": ".zIndex(20)",
+        "menu bar row action cluster": ".fixedSize()",
+        "menu bar error details panel": "MenuBarErrorPanel",
+        "menu bar copied failure details": "copyLastErrorDetails",
+        "persistent action error details": "lastErrorDetails",
+        "command failure detail builder": "commandFailureDetails",
+        "shell quoted command details": "func shellCommand(",
+        "menu bar error qa mode": "mode == \"error\"",
+        "status item app bridge": "StatusBarController.shared.install(store: store)",
+        "window accessor bridge": "WindowAccessor",
+        "minimize to menu bar": "minimizeToMenuBar",
+        "hide window activation policy": "NSApp.setActivationPolicy(.accessory)",
+        "restore window activation policy": "NSApp.setActivationPolicy(.regular)",
+        "adopted server pid fallback": "os.kill(pid, signal.SIGTERM)",
+        "server restart keeps agent": "\"agent\": agent, \"project\": project, \"name\": name, \"release_port\": True",
+        "adopted restart self-test": "adopted fixed-port server restart should recover cleanly",
+    }
+    haystacks = "\n".join([source_text, views, store, models, menu_snapshot, coordinator, coordinator_self_test, coordinator_skill])
+    missing = [label for label, needle in required.items() if needle not in haystacks]
+    if missing:
+        raise SystemExit("CodexOpsConsole interaction guardrail failed: " + ", ".join(missing))
+
+    prohibited = {
+        "sidebar category rows": "MapCategory",
+        "action queue panel": "ACTION QUEUE",
+        "recent events panel": "RECENT EVENTS",
+        "synthetic recommendation queue": "visibleQueueItems",
+        "inspect recommendations": "Inspect ",
+        "action item model": "ActionItem",
+        "old action rail": "ActionRailView",
+        "fake docker restarts column": "\"Restarts\"",
+        "fake usage bar": "UsageBar",
+        "fake usage seed": "usageSeed",
+        "unused group by control": "\"Group by\"",
+        "unused group state": "groupBy",
+    }
+    present = [label for label, needle in prohibited.items() if needle in haystacks]
+    if present:
+        raise SystemExit("CodexOpsConsole interaction guardrail found prohibited pattern: " + ", ".join(present))
+
+    qa_dir = ops_console / ".build" / "qa"
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    split_test = qa_dir / "SplitSizingTest"
+    menu_snapshot = qa_dir / "MenuBarSnapshot"
+    run(
+        [
+            "swiftc",
+            "-parse-as-library",
+            "-o",
+            str(split_test),
+            "Sources/CodexOpsConsole/Models.swift",
+            "Sources/CodexOpsConsole/OpsStore.swift",
+            "Sources/CodexOpsConsole/Views.swift",
+            "Tools/SplitSizingTest.swift",
+        ],
+        cwd=ops_console,
+    )
+    run([str(split_test)], cwd=ops_console)
+    run(
+        [
+            "swiftc",
+            "-parse-as-library",
+            "-o",
+            str(menu_snapshot),
+            "Sources/CodexOpsConsole/Models.swift",
+            "Sources/CodexOpsConsole/OpsStore.swift",
+            "Sources/CodexOpsConsole/Views.swift",
+            "Sources/CodexOpsConsole/MenuBarViews.swift",
+            "Tools/MenuBarSnapshotMain.swift",
+        ],
+        cwd=ops_console,
+    )
+
+
 def main() -> int:
     check_vendor_sync()
     check_include_glob_exclusions()
+    check_ops_console_interaction_guardrails()
     for skill in SKILLS:
         run([sys.executable, str(skill.relative_to(ROOT) / "scripts" / "self_test.py")])
     run(

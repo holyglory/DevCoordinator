@@ -33,7 +33,7 @@ struct Inventory: Decodable {
         servers: [],
         leases: [],
         recentEvents: [],
-        docker: DockerSummary(available: nil, error: nil, containers: [], postgres: []),
+        docker: DockerSummary(available: nil, error: nil, statsError: nil, containers: [], postgres: []),
         postgres: [],
         backups: []
     )
@@ -70,14 +70,24 @@ struct ManagedServer: Decodable, Identifiable, Hashable {
     var logPath: String?
     var status: String?
     var health: Health?
+    var stoppedAt: String?
+    var stoppedReason: String?
+    var adopted: Bool?
+    var missingCommand: Bool?
+    var metadataSource: String?
 
     enum CodingKeys: String, CodingKey {
         case id, name, agent, project, cwd, port, host, url, pid, status, health
+        case adopted
         case command = "cmd"
         case commandTemplate = "cmd_template"
         case healthURL = "health_url"
         case leaseID = "lease_id"
         case logPath = "log_path"
+        case stoppedAt = "stopped_at"
+        case stoppedReason = "stopped_reason"
+        case missingCommand = "missing_command"
+        case metadataSource = "metadata_source"
     }
 }
 
@@ -109,8 +119,14 @@ struct PortLease: Decodable, Identifiable, Hashable {
 struct DockerSummary: Decodable, Hashable {
     var available: Bool?
     var error: String?
+    var statsError: String?
     var containers: [DockerContainer]
     var postgres: [DockerContainer]
+
+    enum CodingKeys: String, CodingKey {
+        case available, error, containers, postgres
+        case statsError = "stats_error"
+    }
 }
 
 struct DockerContainer: Decodable, Identifiable, Hashable {
@@ -119,6 +135,61 @@ struct DockerContainer: Decodable, Identifiable, Hashable {
     var image: String?
     var status: String?
     var ports: String?
+    var project: String?
+    var agent: String?
+    var role: String?
+    var metadataSource: String?
+    var adopted: Bool?
+    var stats: DockerStats?
+    var statsHistory: [DockerStats]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, image, status, ports, project, agent, role, adopted, stats
+        case metadataSource = "metadata_source"
+        case statsHistory = "stats_history"
+    }
+}
+
+struct DockerStats: Decodable, Identifiable, Hashable {
+    var id: String { "\(containerID ?? name ?? "container"):\(timestampTs ?? 0)" }
+    var containerShortID: String?
+    var containerID: String?
+    var name: String?
+    var timestamp: String?
+    var timestampTs: Double?
+    var live: Bool?
+    var cpuPercent: Double?
+    var memoryPercent: Double?
+    var memoryUsageBytes: Double?
+    var memoryLimitBytes: Double?
+    var networkRxBytes: Double?
+    var networkTxBytes: Double?
+    var blockReadBytes: Double?
+    var blockWriteBytes: Double?
+    var networkRxRateBytesPerSecond: Double?
+    var networkTxRateBytesPerSecond: Double?
+    var blockReadRateBytesPerSecond: Double?
+    var blockWriteRateBytesPerSecond: Double?
+    var pids: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case name, timestamp, live, pids
+        case containerShortID = "id"
+        case containerID = "container_id"
+        case timestampTs = "timestamp_ts"
+        case cpuPercent = "cpu_percent"
+        case memoryPercent = "memory_percent"
+        case memoryUsageBytes = "memory_usage_bytes"
+        case memoryLimitBytes = "memory_limit_bytes"
+        case networkRxBytes = "network_rx_bytes"
+        case networkTxBytes = "network_tx_bytes"
+        case blockReadBytes = "block_read_bytes"
+        case blockWriteBytes = "block_write_bytes"
+        case networkRxRateBytesPerSecond = "network_rx_rate_bytes_per_second"
+        case networkTxRateBytesPerSecond = "network_tx_rate_bytes_per_second"
+        case blockReadRateBytesPerSecond = "block_read_rate_bytes_per_second"
+        case blockWriteRateBytesPerSecond = "block_write_rate_bytes_per_second"
+    }
 }
 
 struct DatabaseBackup: Decodable, Identifiable, Hashable {
@@ -144,26 +215,155 @@ struct RecentEvent: Decodable, Identifiable, Hashable {
     var type: String
 }
 
-struct ActionItem: Identifiable, Hashable {
-    enum State: String {
-        case running = "Running"
-        case queued = "Queued"
-        case completed = "Done"
-        case failed = "Failed"
-    }
-
-    let id = UUID()
-    var title: String
-    var subtitle: String
-    var state: State
-    var detail: String?
-    var createdAt = Date()
-}
-
 struct CommandResult {
     var output: String
     var error: String
     var status: Int32
+}
+
+struct ServerLogPayload: Decodable {
+    var server: ServerLogServer
+    var text: String
+    var tail: Int?
+}
+
+struct ServerLogServer: Decodable {
+    var id: String?
+    var name: String?
+    var project: String?
+    var status: String?
+    var url: String?
+    var port: Int?
+    var stoppedAt: String?
+    var stoppedReason: String?
+    var logPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, project, status, url, port
+        case stoppedAt = "stopped_at"
+        case stoppedReason = "stopped_reason"
+        case logPath = "log_path"
+    }
+}
+
+struct ProjectRuntimeReport: Decodable, Hashable {
+    var action: String?
+    var ok: Bool?
+    var classification: String?
+    var classifications: [String]?
+    var project: String?
+    var runtimeID: String?
+    var name: String?
+    var configPath: String?
+    var declared: Bool?
+    var urls: [ProjectRuntimeURL]
+    var ports: [ProjectRuntimePort]
+    var services: [ProjectRuntimeService]
+    var healthChecks: [ProjectRuntimeHealthCheck]
+    var previousExitReasons: [ProjectRuntimeExitReason]
+    var logs: [ProjectRuntimeLog]
+    var actionErrors: [ProjectRuntimeActionError]?
+
+    enum CodingKeys: String, CodingKey {
+        case action, ok, classification, classifications, project, name, declared, urls, ports, services, logs
+        case runtimeID = "runtime_id"
+        case configPath = "config_path"
+        case healthChecks = "health_checks"
+        case previousExitReasons = "previous_exit_reasons"
+        case actionErrors = "action_errors"
+    }
+}
+
+struct ProjectRuntimeURL: Decodable, Hashable {
+    var name: String?
+    var url: String?
+    var healthURL: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, url
+        case healthURL = "health_url"
+    }
+}
+
+struct ProjectRuntimePort: Decodable, Hashable {
+    var name: String?
+    var port: Int?
+    var fixedPort: Int?
+    var ports: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, port, ports
+        case fixedPort = "fixed_port"
+    }
+}
+
+struct ProjectRuntimeService: Decodable, Identifiable, Hashable {
+    var id: String { "\(type ?? "service"):\(name ?? container ?? url ?? status ?? "unknown")" }
+    var type: String?
+    var name: String?
+    var role: String?
+    var container: String?
+    var required: Bool?
+    var status: String?
+    var ok: Bool?
+    var classification: String?
+    var message: String?
+    var url: String?
+    var healthURL: String?
+    var port: Int?
+    var fixedPort: Int?
+    var ports: String?
+    var image: String?
+    var pid: Int?
+    var logPath: String?
+    var stoppedAt: String?
+    var previousExitReason: String?
+    var recentLogs: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, name, role, container, required, status, ok, classification, message, url, port, ports, image, pid
+        case healthURL = "health_url"
+        case fixedPort = "fixed_port"
+        case logPath = "log_path"
+        case stoppedAt = "stopped_at"
+        case previousExitReason = "previous_exit_reason"
+        case recentLogs = "recent_logs"
+    }
+}
+
+struct ProjectRuntimeHealthCheck: Decodable, Hashable {
+    var name: String?
+    var type: String?
+    var url: String?
+    var host: String?
+    var port: Int?
+    var required: Bool?
+    var ok: Bool?
+    var status: Int?
+    var classification: String?
+    var error: String?
+}
+
+struct ProjectRuntimeExitReason: Decodable, Hashable {
+    var name: String?
+    var reason: String?
+    var stoppedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, reason
+        case stoppedAt = "stopped_at"
+    }
+}
+
+struct ProjectRuntimeLog: Decodable, Hashable {
+    var name: String?
+    var text: String?
+}
+
+struct ProjectRuntimeActionError: Decodable, Hashable {
+    var name: String?
+    var classification: String?
+    var error: String?
 }
 
 enum ServiceFilter: String, CaseIterable, Identifiable {
@@ -173,4 +373,61 @@ enum ServiceFilter: String, CaseIterable, Identifiable {
     case stopped = "Stopped"
 
     var id: String { rawValue }
+}
+
+enum ResourceTab: String, CaseIterable, Identifiable {
+    case servers = "Dev Servers"
+    case docker = "Docker"
+    case databases = "Databases"
+
+    var id: String { rawValue }
+
+    var systemImage: String {
+        switch self {
+        case .servers: return "terminal"
+        case .docker: return "shippingbox"
+        case .databases: return "cylinder.split.1x2"
+        }
+    }
+}
+
+enum SidebarSelection: Hashable {
+    case project(String)
+    case server(String)
+    case docker(String)
+    case database(String)
+}
+
+extension DockerContainer {
+    var stableID: String {
+        id ?? name ?? "\(image ?? "container"):\(ports ?? ""):\(status ?? "")"
+    }
+
+    var isRunning: Bool {
+        isRunningStatus(status)
+    }
+
+    var isPostgresLike: Bool {
+        let haystack = [name, image, ports].compactMap { $0?.lowercased() }.joined(separator: " ")
+        return haystack.contains("postgres") || haystack.contains("postgis") || haystack.contains("5432")
+    }
+}
+
+func isRunningStatus(_ status: String?) -> Bool {
+    let value = (status ?? "").lowercased()
+    return value.hasPrefix("up") || value == "running"
+}
+
+func isStoppedStatus(_ status: String?) -> Bool {
+    let value = (status ?? "").lowercased()
+    return value.contains("exited") || value.contains("created") || value.contains("dead") || value.contains("stopped")
+}
+
+func canStopStatus(_ status: String?) -> Bool {
+    let value = (status ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return !value.isEmpty && !isStoppedStatus(value)
+}
+
+func canStopServer(_ server: ManagedServer) -> Bool {
+    canStopStatus(server.status) || server.health?.pidAlive == true
 }
