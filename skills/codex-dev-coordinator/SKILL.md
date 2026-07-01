@@ -91,7 +91,10 @@ python3 scripts/dev_coordinator.py server start \
 ```
 
 If a server is already running on the declared fixed port but is not registered,
-adopt it instead of starting a duplicate:
+adopt it instead of starting a duplicate. Adoption is allowed only when the
+listener PID can be attributed to the canonical project root. If the occupied
+port belongs to another repo, fix the stale coordinator metadata or register
+the real owner instead of attaching that listener to the current project:
 
 ```bash
 python3 scripts/dev_coordinator.py server register \
@@ -115,6 +118,17 @@ The coordinator keeps managed server log paths and stopped server records. When
 a managed server stops or its PID exits, inventory exposes `stopped_at`,
 `stopped_reason`, and `log_path`, and `server logs` returns the requested log
 tail plus the stop metadata.
+
+Inventory must show one current row per logical server identity
+(`canonical project path + server name`). Repeated starts, stops, restarts, or
+adoptions of the same fixed-port service must not appear as multiple runnable
+rows with the same URL or port. If stale state records exist from older runs,
+inventory collapses them into the preferred current record and may expose
+`duplicate_count` / `duplicate_server_ids` as diagnostic metadata.
+Stopped or stale records whose ports are now reused by another project must not
+be exposed as current URLs. Inventory marks those rows with
+`url_is_current=false`, `port_reused=true`, and `port_reused_by` evidence so
+agents and UI surfaces do not open the wrong app.
 
 ## HTTP Endpoint Mode
 
@@ -207,6 +221,9 @@ them when a repo needs a database, worker, Docker Compose service, fixed port,
 or meaningful readiness check. A project-level `start` must not report success
 only because the web process answers `/`; required dependencies and declared
 readiness checks must also pass.
+Default HTTP health accepts 2xx and 3xx responses. A 4xx response, including a
+foreign app's 404 on the requested health path, is unhealthy unless the repo
+declares a more specific readiness check that proves the app is actually ready.
 
 Docker Compose mutation requires an explicit runtime declaration. If a repo has
 `docker-compose.yml` but no `.codex/dev-runtime.json`, the coordinator may show
@@ -286,6 +303,10 @@ reporting success.
    repo, register it. `project start` adopts healthy fixed-port servers
    automatically; use `server register` or `docker register` for explicit
    repairs.
+8. Before trusting or stopping an adopted process, verify listener ownership
+   through the process cwd/git root. If a registered server PID or port belongs
+   to another project, treat it as `stale_coordinator_metadata`; do not report
+   it as working and do not kill the foreign PID.
 
 ## Safety Notes
 

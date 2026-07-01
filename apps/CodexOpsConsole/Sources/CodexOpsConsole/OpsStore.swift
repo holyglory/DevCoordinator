@@ -118,7 +118,8 @@ final class OpsStore: ObservableObject {
             let result = try await runPython(script: coordinatorScript, arguments: arguments)
             try ensureSuccess(result)
             let data = Data(result.output.utf8)
-            let decoded = try JSONDecoder().decode(Inventory.self, from: data)
+            var decoded = try JSONDecoder().decode(Inventory.self, from: data)
+            decoded.servers = deduplicatedManagedServers(decoded.servers)
             inventory = decoded
             keepSelectionValid()
             if lastErrorSource == "inventory" {

@@ -75,6 +75,12 @@ struct ManagedServer: Decodable, Identifiable, Hashable {
     var adopted: Bool?
     var missingCommand: Bool?
     var metadataSource: String?
+    var updatedAt: String?
+    var duplicateCount: Int?
+    var duplicateServerIDs: [String]?
+    var urlIsCurrent: Bool?
+    var portReused: Bool?
+    var portReusedBy: PortReuseOwner?
 
     enum CodingKeys: String, CodingKey {
         case id, name, agent, project, cwd, port, host, url, pid, status, health
@@ -88,7 +94,23 @@ struct ManagedServer: Decodable, Identifiable, Hashable {
         case stoppedReason = "stopped_reason"
         case missingCommand = "missing_command"
         case metadataSource = "metadata_source"
+        case updatedAt = "updated_at"
+        case duplicateCount = "duplicate_count"
+        case duplicateServerIDs = "duplicate_server_ids"
+        case urlIsCurrent = "url_is_current"
+        case portReused = "port_reused"
+        case portReusedBy = "port_reused_by"
     }
+}
+
+struct PortReuseOwner: Decodable, Hashable {
+    var type: String?
+    var id: String?
+    var name: String?
+    var project: String?
+    var pid: Int?
+    var cwd: String?
+    var url: String?
 }
 
 struct Health: Decodable, Hashable {
@@ -429,5 +451,60 @@ func canStopStatus(_ status: String?) -> Bool {
 }
 
 func canStopServer(_ server: ManagedServer) -> Bool {
-    canStopStatus(server.status) || server.health?.pidAlive == true
+    if isStoppedStatus(server.status) {
+        return false
+    }
+    return canStopStatus(server.status) || server.health?.pidAlive == true
+}
+
+extension ManagedServer {
+    var logicalKey: String {
+        let projectPart = (project ?? cwd ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let namePart = name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return "\(projectPart)::\(namePart)"
+    }
+
+    var currentURL: String? {
+        urlIsCurrent == false ? nil : url
+    }
+}
+
+func deduplicatedManagedServers(_ servers: [ManagedServer]) -> [ManagedServer] {
+    let grouped = Dictionary(grouping: servers, by: \.logicalKey)
+    var winnersByKey: [String: ManagedServer] = [:]
+
+    for (key, bucket) in grouped {
+        guard var winner = bucket.max(by: { managedServerRank($0) < managedServerRank($1) }) else { continue }
+        if bucket.count > 1 {
+            winner.duplicateCount = max(winner.duplicateCount ?? 1, bucket.count)
+            winner.duplicateServerIDs = bucket.map(\.id).filter { $0 != winner.id }
+        }
+        winnersByKey[key] = winner
+    }
+
+    return servers.compactMap { server in
+        guard let winner = winnersByKey[server.logicalKey], winner.id == server.id else { return nil }
+        return winner
+    }
+}
+
+private func managedServerRank(_ server: ManagedServer) -> (Int, String, String) {
+    let status = (server.status ?? "").lowercased()
+    let stateRank: Int
+    if status == "running" || server.health?.ok == true {
+        stateRank = 4
+    } else if status == "starting" || status == "unhealthy" || status == "degraded" {
+        stateRank = 3
+    } else if server.health?.pidAlive == true {
+        stateRank = 2
+    } else if status == "stopped" {
+        stateRank = 1
+    } else {
+        stateRank = 0
+    }
+    return (stateRank, server.updatedAt ?? server.stoppedAt ?? "", server.id)
 }

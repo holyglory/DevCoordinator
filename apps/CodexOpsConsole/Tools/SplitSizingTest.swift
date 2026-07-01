@@ -39,6 +39,8 @@ struct SplitSizingTest {
         assertNarrowLayoutDoesNotOverflow()
         assertSidebarFooterWidth()
         assertProjectGrouping()
+        assertServerDeduplication()
+        assertCurrentURLHandling()
         assertSidebarActionState()
         print("split sizing ok")
     }
@@ -94,6 +96,53 @@ struct SplitSizingTest {
             0,
             "sidebar footer content width should never become negative"
         )
+    }
+
+    private static func assertServerDeduplication() {
+        let staleApi = server(
+            id: "old-api",
+            name: "api",
+            project: "/Users/holyglory/src/XFoilFOAM",
+            port: 4000,
+            status: "stopped",
+            updatedAt: "2026-06-27T21:28:11Z"
+        )
+        let newerApi = server(
+            id: "new-api",
+            name: "api",
+            project: "/Users/holyglory/src/XFoilFOAM",
+            port: 4000,
+            status: "stopped",
+            updatedAt: "2026-06-28T14:09:19Z"
+        )
+        let web = server(
+            id: "web",
+            name: "web",
+            project: "/Users/holyglory/src/XFoilFOAM",
+            port: 3004,
+            status: "stopped",
+            updatedAt: "2026-06-28T14:09:18Z"
+        )
+        let deduped = deduplicatedManagedServers([staleApi, newerApi, web])
+        assert(deduped.count == 2, "deduplication should keep one api row and one web row")
+        let api = deduped.first { $0.name == "api" }
+        assert(api?.id == "new-api", "deduplication should keep the newest duplicate logical server")
+        assert(api?.duplicateCount == 2, "deduplicated server should expose collapsed duplicate count")
+
+        let inventory = Inventory(
+            coordinatorHome: nil,
+            statePath: nil,
+            project: "/Users/holyglory/src/XFoilFOAM",
+            urls: [],
+            servers: [staleApi, newerApi, web],
+            leases: [],
+            recentEvents: [],
+            docker: DockerSummary(available: nil, error: nil, statsError: nil, containers: [], postgres: []),
+            postgres: [],
+            backups: []
+        )
+        let group = projectGroups(from: inventory).first { $0.id == "xfoilfoam" }
+        assert(group?.servers.count == 2, "project tree should not show duplicate api server rows")
     }
 
     private static func assertProjectGrouping() {
@@ -164,6 +213,29 @@ struct SplitSizingTest {
         assert(!canStopStatus("stopped"), "stopped server should show run action")
         assert(!canStopStatus("Exited (0) 2 hours ago"), "exited Docker status should show run action")
         assert(!canStopStatus(nil), "unknown empty status should not show stop action")
+        let stoppedForeignPID = server(
+            id: "stale-pid",
+            name: "web",
+            project: "/Users/holyglory/src/benzovozka",
+            port: 3000,
+            status: "stopped",
+            updatedAt: "2026-07-01T08:39:42Z",
+            health: Health(ok: false, pidAlive: true)
+        )
+        assert(!canStopServer(stoppedForeignPID), "stopped stale metadata rows should not show stop actions for a foreign live PID")
+    }
+
+    private static func assertCurrentURLHandling() {
+        let staleServer = server(
+            id: "skydivelive-web-old",
+            name: "skydivelive-web",
+            project: "/Users/holyglory/src/skydivelive",
+            port: 3001,
+            status: "stopped",
+            updatedAt: "2026-06-21T19:47:48Z",
+            urlIsCurrent: false
+        )
+        assert(staleServer.currentURL == nil, "stale stopped server rows should not expose openable URLs")
     }
 
     private static func assertEqual(_ actual: CGFloat, _ expected: CGFloat, _ message: String) {
@@ -182,6 +254,47 @@ struct SplitSizingTest {
         if !condition {
             fail(message)
         }
+    }
+
+    private static func server(
+        id: String,
+        name: String,
+        project: String,
+        port: Int,
+        status: String,
+        updatedAt: String,
+        health: Health = Health(ok: false, pidAlive: false),
+        urlIsCurrent: Bool? = nil
+    ) -> ManagedServer {
+        ManagedServer(
+            id: id,
+            name: name,
+            agent: "codex",
+            project: project,
+            cwd: project,
+            command: nil,
+            commandTemplate: nil,
+            port: port,
+            host: "127.0.0.1",
+            url: "http://127.0.0.1:\(port)",
+            healthURL: nil,
+            leaseID: nil,
+            pid: nil,
+            logPath: nil,
+            status: status,
+            health: health,
+            stoppedAt: updatedAt,
+            stoppedReason: "Stopped by coordinator",
+            adopted: false,
+            missingCommand: false,
+            metadataSource: "server_start",
+            updatedAt: updatedAt,
+            duplicateCount: nil,
+            duplicateServerIDs: nil,
+            urlIsCurrent: urlIsCurrent,
+            portReused: nil,
+            portReusedBy: nil
+        )
     }
 
     private static func fail(_ message: String) -> Never {

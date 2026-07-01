@@ -146,6 +146,7 @@ def check_ops_console_interaction_guardrails() -> None:
     store = (ops_console / "Sources" / "CodexOpsConsole" / "OpsStore.swift").read_text(encoding="utf-8")
     models = (ops_console / "Sources" / "CodexOpsConsole" / "Models.swift").read_text(encoding="utf-8")
     menu_snapshot = (ops_console / "Tools" / "MenuBarSnapshotMain.swift").read_text(encoding="utf-8")
+    split_sizing = (ops_console / "Tools" / "SplitSizingTest.swift").read_text(encoding="utf-8")
     coordinator = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "dev_coordinator.py").read_text(encoding="utf-8")
     coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
     coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
@@ -257,10 +258,31 @@ def check_ops_console_interaction_guardrails() -> None:
         "hide window activation policy": "NSApp.setActivationPolicy(.accessory)",
         "restore window activation policy": "NSApp.setActivationPolicy(.regular)",
         "adopted server pid fallback": "os.kill(pid, signal.SIGTERM)",
+        "server listener identity": "def server_listener_identity(",
+        "listener ownership guard": "listener_belongs_to_project(",
+        "stale foreign pid stop guard": "linked server process belongs to a different project",
+        "current url marker": "url_is_current",
+        "port reuse owner marker": "port_reused_by",
+        "strict default http health": "200 <= response.status < 400",
+        "404 health self-test": "HTTP 404 health checks should not be treated as healthy",
+        "strict health skill policy": "Default HTTP health accepts 2xx and 3xx responses",
+        "foreign adoption self-test": "wrong-project adoption should report stale coordinator metadata",
+        "foreign register self-test": "server register should reject a listener owned by another project",
+        "stale url reuse self-test": "stopped historical URL should be marked non-current when another project reuses its port",
+        "skill listener ownership policy": "listener PID can be attributed to the canonical project root",
+        "menu current url action": "openAction: server.currentURL == nil",
+        "stopped server cannot stop": "if isStoppedStatus(server.status)",
         "server restart keeps agent": "\"agent\": agent, \"project\": project, \"name\": name, \"release_port\": True",
         "adopted restart self-test": "adopted fixed-port server restart should recover cleanly",
+        "coordinator server record dedupe": "def deduplicate_server_records(",
+        "server start reuses logical record": "server_id = existing_id or str(uuid.uuid4())",
+        "inventory logical server row self-test": "inventory should expose one row per logical server",
+        "inventory duplicate URL self-test": "inventory URLs should not duplicate stale logical servers",
+        "skill logical server inventory contract": "Inventory must show one current row per logical server identity",
+        "swift managed server dedupe": "func deduplicatedManagedServers(",
+        "swift xfoilfoam duplicate regression": "project tree should not show duplicate api server rows",
     }
-    haystacks = "\n".join([source_text, views, store, models, menu_snapshot, coordinator, coordinator_self_test, coordinator_skill])
+    haystacks = "\n".join([source_text, views, store, models, menu_snapshot, split_sizing, coordinator, coordinator_self_test, coordinator_skill])
     missing = [label for label, needle in required.items() if needle not in haystacks]
     if missing:
         raise SystemExit("CodexOpsConsole interaction guardrail failed: " + ", ".join(missing))

@@ -294,7 +294,8 @@ struct ProjectGroup {
 }
 
 func projectGroups(from inventory: Inventory) -> [ProjectGroup] {
-    let servers = Dictionary(grouping: inventory.servers) { projectKey(fromPath: $0.project) }
+    let dedupedServers = deduplicatedManagedServers(inventory.servers)
+    let servers = Dictionary(grouping: dedupedServers) { projectKey(fromPath: $0.project) }
     let docker = Dictionary(grouping: inventory.docker.containers.filter { !$0.isPostgresLike }) { projectKey(fromDockerContainer: $0) }
     let databases = Dictionary(grouping: inventory.postgres) { projectKey(fromDockerContainer: $0) }
     let keys = Set(servers.keys).union(docker.keys).union(databases.keys).sorted()
@@ -600,7 +601,7 @@ struct DevServersSection: View {
                                 Text(shortProject(server.project)).foregroundStyle(Theme.secondary).lineLimit(1)
                             }
                             TableCell(width: widths[2]) {
-                                URLCell(url: server.url, open: { store.openURL(server.url) }, copy: { store.copyURL(server.url) })
+                                URLCell(url: server.currentURL, staleURL: server.url, open: { store.openURL(server.currentURL) }, copy: { store.copyURL(server.currentURL) })
                             }
                             TableCell(width: widths[3]) { StatusText(status: server.status) }
                             TableCell(width: widths[4]) {
@@ -613,7 +614,8 @@ struct DevServersSection: View {
                                 HStack(spacing: 7) {
                                     IconButton("Restart", "arrow.clockwise") { store.restart(server) }
                                     IconButton("Stop", "stop") { store.stop(server) }
-                                    IconButton("Open", "arrow.up.forward.square") { store.openURL(server.url) }
+                                    IconButton("Open", "arrow.up.forward.square") { store.openURL(server.currentURL) }
+                                        .disabled(server.currentURL == nil)
                                     IconButton("Logs", "doc.text.magnifyingglass") { store.showServerLogs(server) }
                                 }
                             }
@@ -970,6 +972,12 @@ struct SelectedServerPanel: View {
                 .fixedSize(horizontal: false, vertical: true)
             DetailLine(label: "Port", value: server.port.map(String.init) ?? "—")
             DetailLine(label: "Health", value: server.status ?? "unknown")
+            if let duplicateCount = server.duplicateCount, duplicateCount > 1 {
+                DetailLine(label: "State Records", value: "\(duplicateCount) collapsed")
+            }
+            if server.portReused == true {
+                DetailLine(label: "Port Reused By", value: portReuseText(server.portReusedBy))
+            }
             DetailLine(label: "Stopped", value: server.stoppedAt ?? "—")
             DetailLine(label: "Reason", value: server.stoppedReason ?? "—")
             DetailLine(label: "Log", value: server.logPath ?? "—")
@@ -982,17 +990,19 @@ struct SelectedServerPanel: View {
             .buttonStyle(.borderedProminent)
             InspectorActionStack {
                 Button {
-                    store.openURL(server.url)
+                    store.openURL(server.currentURL)
                 } label: {
                     Label("Open", systemImage: "arrow.up.forward.square")
                         .frame(maxWidth: .infinity)
                 }
+                .disabled(server.currentURL == nil)
                 Button {
-                    store.copyURL(server.url)
+                    store.copyURL(server.currentURL)
                 } label: {
                     Label("Copy", systemImage: "link")
                         .frame(maxWidth: .infinity)
                 }
+                .disabled(server.currentURL == nil)
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -1071,7 +1081,7 @@ struct SelectedProjectPanel: View {
     @ObservedObject var store: OpsStore
 
     var body: some View {
-        let servers = store.inventory.servers.filter { projectKey(fromPath: $0.project) == name }
+        let servers = deduplicatedManagedServers(store.inventory.servers).filter { projectKey(fromPath: $0.project) == name }
         let docker = store.inventory.docker.containers.filter { projectKey(fromDockerContainer: $0) == name }
         let databases = store.inventory.postgres.filter { projectKey(fromDockerContainer: $0) == name }
         let group = ProjectGroup(
@@ -1527,23 +1537,35 @@ func HeaderRow(_ headers: [String]) -> some View {
 
 struct URLCell: View {
     let url: String?
+    var staleURL: String? = nil
     let open: () -> Void
     let copy: () -> Void
 
     var body: some View {
         HStack(spacing: 6) {
             Button(action: open) {
-                Text(url ?? "—")
+                Text(label)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
             }
             .buttonStyle(URLButtonStyle())
+            .disabled(url == nil)
             Button(action: copy) {
                 Image(systemName: "doc.on.doc")
             }
             .buttonStyle(IconButtonStyle())
             .disabled(url == nil)
         }
+    }
+
+    private var label: String {
+        if let url {
+            return url
+        }
+        if staleURL != nil {
+            return "previous"
+        }
+        return "—"
     }
 }
 
@@ -2207,6 +2229,24 @@ func projectLabel(for container: DockerContainer) -> String {
         return shortProject(project)
     }
     return projectName(from: container.name)
+}
+
+func portReuseText(_ owner: PortReuseOwner?) -> String {
+    guard let owner else { return "unknown" }
+    if let name = owner.name, !name.isEmpty {
+        let project = owner.project.map(shortProject) ?? "unknown"
+        return "\(project) / \(name)"
+    }
+    if let cwd = owner.cwd, !cwd.isEmpty {
+        return shortProject(cwd)
+    }
+    if let project = owner.project, !project.isEmpty {
+        return shortProject(project)
+    }
+    if let pid = owner.pid {
+        return "PID \(pid)"
+    }
+    return "unknown"
 }
 
 func projectKey(fromResourceName name: String?) -> String {

@@ -20,16 +20,21 @@ mind or the requested behavior changed after implementation.
 4. Identify the nearest durable guardrail that allowed the mistake: local
    `AGENTS.md`, project documentation, acceptance criteria, tests, verifier,
    skill instructions, checklist, policy, or context source.
-5. Fix that system guardrail first when practical. If a skill or audit missed
+5. Before editing `AGENTS.md` or another policy file, check guardrail scope and
+   proportionality. A repo `AGENTS.md` is repo policy, not global policy.
+   Policy text must be a generalized reusable rule, not an explanation of a
+   specific incident. Put incident narratives, timelines, and one-off root
+   causes in the root-cause report, `DecisionHistory.md`, or a targeted test.
+6. Fix that system guardrail first when practical. If a skill or audit missed
    the issue, update the skill or deterministic check and rerun it against the
    same evidence so it now catches the gap.
-6. Audit the testing procedure that failed to catch the mistake. Look for other
+7. Audit the testing procedure that failed to catch the mistake. Look for other
    likely missed failures in adjacent journeys, edge cases, failure paths,
    integrations, generated artifacts, and user-visible acceptance criteria.
    Add or update tests for those risks, not only the one reported symptom.
-7. Close the implementation gap only after the prevention layer is patched, or
+8. Close the implementation gap only after the prevention layer is patched, or
    explicitly explain why the product fix had to be done first.
-8. After the detected gap is closed, run comprehensive tests that prove the
+9. After the detected gap is closed, run comprehensive tests that prove the
    user gets the expected result. Include the original reproduction path, the
    new or updated guardrail/check, and the broader tests from the testing
    procedure audit before reporting done.

@@ -206,6 +206,35 @@ def main() -> int:
         check(logs["server"]["log_path"], "server logs should expose log path")
         logs_by_id = run(["server", "logs", "--server-id", stopped["id"], "--tail", "20"], env=env)
         check(logs_by_id["server"]["id"] == stopped["id"], "server logs should support exact server id")
+        restarted_same_service = run(
+            [
+                "server",
+                "start",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(tmp),
+                "--name",
+                "fixture-web",
+                "--cwd",
+                str(tmp),
+                "--cmd",
+                f"{shlex_join([sys.executable, '-m', 'http.server', '{port}', '--bind', '127.0.0.1'])}",
+                "--range",
+                f"{server_port}-{server_port}",
+                "--health-url",
+                "http://127.0.0.1:{port}/",
+            ],
+            env=env,
+        )
+        check(restarted_same_service["id"] == stopped["id"], "restarting a logical server should reuse its state record")
+        deduped_inventory = run(["inventory", "--project", str(tmp), "--no-docker"], env=env)
+        logical_fixture_rows = [item for item in deduped_inventory["servers"] if item["name"] == "fixture-web"]
+        check(len(logical_fixture_rows) == 1, "inventory should expose one row per logical server")
+        logical_fixture_urls = [item for item in deduped_inventory["urls"] if item["name"] == "fixture-web"]
+        check(len(logical_fixture_urls) == 1, "inventory URLs should not duplicate stale logical servers")
+        stopped_again = run(["server", "stop", "--agent", "agent-a", "--project", str(tmp), "--name", "fixture-web", "--reason", "test stop again"], env=env)
+        check(stopped_again["status"] == "stopped", "deduped restarted server should stop cleanly")
 
         adopted_port = free_port()
         adopted_process = subprocess.Popen(
@@ -236,8 +265,151 @@ def main() -> int:
         )
         check(adopted["adopted"], "server register should mark adopted servers")
         check(adopted["missing_command"], "server register without --cmd should expose missing_command")
+        check(adopted.get("lease_id"), "server register should lease an already-running adopted server port")
         adopted_inventory = run(["inventory", "--project", str(tmp), "--no-docker"], env=env)
         check(any(item["name"] == "adopted-web" for item in adopted_inventory["servers"]), "inventory should include adopted server")
+        bad_health_project = tmp / "bad-health-project"
+        bad_health_project.mkdir()
+        bad_health_port = free_port()
+        bad_health_process = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(bad_health_port), "--bind", "127.0.0.1"],
+            cwd=bad_health_project,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        external_processes.append(bad_health_process)
+        wait_for_http(bad_health_port)
+        bad_health = run(
+            [
+                "server",
+                "register",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(bad_health_project),
+                "--name",
+                "bad-health-web",
+                "--port",
+                str(bad_health_port),
+                "--url",
+                f"http://127.0.0.1:{bad_health_port}",
+                "--health-url",
+                f"http://127.0.0.1:{bad_health_port}/missing-health",
+            ],
+            env=env,
+        )
+        check(bad_health["status"] == "unhealthy", "HTTP 404 health checks should not be treated as healthy")
+        wrong_owner_project = tmp / "wrong-owner-project"
+        wrong_owner_project.mkdir()
+        wrong_runtime_dir = wrong_owner_project / ".codex"
+        wrong_runtime_dir.mkdir()
+        (wrong_runtime_dir / "dev-runtime.json").write_text(
+            json.dumps(
+                {
+                    "name": "wrong-owner-runtime",
+                    "servers": [
+                        {
+                            "name": "web",
+                            "role": "web",
+                            "port": adopted_port,
+                            "cwd": ".",
+                            "cmd": shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                            "health_url": "http://127.0.0.1:{port}/",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_fail(
+            [
+                "server",
+                "register",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(wrong_owner_project),
+                "--name",
+                "wrong-web",
+                "--port",
+                str(adopted_port),
+                "--url",
+                f"http://127.0.0.1:{adopted_port}",
+            ],
+            env=env,
+            expected="outside registered project",
+        )
+        check(True, "server register should reject a listener owned by another project")
+        wrong_owner_start = run(["project", "start", "--agent", "agent-a", "--project", str(wrong_owner_project)], env=env)
+        check(not wrong_owner_start["ok"], "wrong-project adoption should not report success")
+        wrong_owner_report = json.dumps(wrong_owner_start)
+        check(
+            "refusing to adopt" in wrong_owner_report and "outside project" in wrong_owner_report,
+            "wrong-project adoption should report stale coordinator metadata",
+        )
+
+        reuse_port = free_port()
+        reuse_old_project = tmp / "reuse-old-project"
+        reuse_new_project = tmp / "reuse-new-project"
+        reuse_old_project.mkdir()
+        reuse_new_project.mkdir()
+        old_reused = run(
+            [
+                "server",
+                "start",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(reuse_old_project),
+                "--name",
+                "web",
+                "--cwd",
+                str(reuse_old_project),
+                "--cmd",
+                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "--range",
+                f"{reuse_port}-{reuse_port}",
+                "--health-url",
+                "http://127.0.0.1:{port}/",
+            ],
+            env=env,
+        )
+        run(["server", "stop", "--agent", "agent-a", "--project", str(reuse_old_project), "--name", "web", "--reason", "historical row"], env=env)
+        new_reused = run(
+            [
+                "server",
+                "start",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(reuse_new_project),
+                "--name",
+                "web",
+                "--cwd",
+                str(reuse_new_project),
+                "--cmd",
+                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "--range",
+                f"{reuse_port}-{reuse_port}",
+                "--health-url",
+                "http://127.0.0.1:{port}/",
+            ],
+            env=env,
+        )
+        reuse_inventory = run(["inventory", "--no-docker"], env=env)
+        old_reused_row = next(item for item in reuse_inventory["servers"] if item["id"] == old_reused["id"])
+        check(old_reused_row.get("url_is_current") is False, "stopped historical URL should be marked non-current when another project reuses its port")
+        check(old_reused_row.get("port_reused") is True, "stopped historical row should expose port_reused")
+        check(
+            old_reused_row.get("port_reused_by", {}).get("project") == str(reuse_new_project.resolve()),
+            "stopped historical row should identify the current port owner",
+        )
+        check(
+            not any(item.get("project") == str(reuse_old_project.resolve()) and item.get("url") == old_reused["url"] for item in reuse_inventory["urls"]),
+            "inventory URL list should not expose stale historical URLs",
+        )
+        run(["server", "stop", "--agent", "agent-a", "--project", str(reuse_new_project), "--name", "web", "--reason", "reuse cleanup"], env=env)
 
         adopt_project = tmp / "adopt-project"
         adopt_project.mkdir()
@@ -528,7 +700,7 @@ else:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=env,
+            env=fake_env,
         )
         wait_for_api(api_process, api_port)
         api_lease = post_json(

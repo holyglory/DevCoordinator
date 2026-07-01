@@ -212,7 +212,7 @@ struct MenuProjectRow: View {
                         selectAction: { store.selectServer(server) },
                         toggleAction: { store.toggle(server) },
                         restartAction: { store.restart(server) },
-                        openAction: server.url == nil ? nil : { store.openURL(server.url) }
+                        openAction: server.currentURL == nil ? nil : { store.openURL(server.currentURL) }
                     )
                 }
 
@@ -368,8 +368,11 @@ struct MenuBarTextButtonStyle: ButtonStyle {
 }
 
 func menuServerSubtitle(_ server: ManagedServer) -> String {
-    if let url = server.url, !url.isEmpty {
+    if let url = server.currentURL, !url.isEmpty {
         return url
+    }
+    if server.urlIsCurrent == false, server.url != nil {
+        return "previous URL"
     }
     if let port = server.port {
         return "Port \(port)"

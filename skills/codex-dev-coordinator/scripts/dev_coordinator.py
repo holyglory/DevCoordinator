@@ -196,6 +196,104 @@ def listening_pid_for_port(port: int) -> int | None:
     return None
 
 
+def process_cwd(pid: int | None) -> str | None:
+    if not pid:
+        return None
+    proc_cwd = Path("/proc") / str(pid) / "cwd"
+    with contextlib.suppress(Exception):
+        if not proc_cwd.exists():
+            raise FileNotFoundError(str(proc_cwd))
+        return str(proc_cwd.resolve())
+    with contextlib.suppress(Exception):
+        completed = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+        )
+        if completed.returncode == 0:
+            for line in completed.stdout.splitlines():
+                if line.startswith("n"):
+                    return str(Path(line[1:]).expanduser().resolve())
+    return None
+
+
+def path_inside(child: str | None, parent: str | None) -> bool:
+    if not child or not parent:
+        return False
+    child_path = Path(child).expanduser().resolve()
+    parent_path = Path(parent).expanduser().resolve()
+    return child_path == parent_path or parent_path in child_path.parents
+
+
+def listener_owner_for_port(port: int) -> dict[str, Any]:
+    pid = listening_pid_for_port(port)
+    cwd = process_cwd(pid)
+    owner_project = canonical_project(cwd) if cwd else None
+    return {"pid": pid, "cwd": cwd, "project": owner_project}
+
+
+def listener_belongs_to_project(port: int, project: str) -> tuple[bool, dict[str, Any]]:
+    owner = listener_owner_for_port(port)
+    resolved_project = canonical_project(project)
+    owner_project = owner.get("project")
+    if not owner.get("pid"):
+        owner["reason"] = f"port {port} is open but no listener PID could be identified"
+        return False, owner
+    if not owner.get("cwd") or not owner_project:
+        owner["reason"] = f"port {port} is owned by PID {owner['pid']}, but its working directory could not be identified"
+        return False, owner
+    if owner_project != resolved_project and not path_inside(str(owner.get("cwd")), resolved_project):
+        owner["reason"] = (
+            f"port {port} is owned by PID {owner['pid']} in {owner.get('cwd')}, "
+            f"outside project {resolved_project}"
+        )
+        return False, owner
+    return True, owner
+
+
+def server_process_identity(server: dict[str, Any]) -> dict[str, Any]:
+    pid = int(server.get("pid") or 0)
+    if not pid or not pid_alive(pid):
+        return {"ok": True, "pid": pid, "cwd": None, "project": None}
+    cwd = process_cwd(pid)
+    server_project = server.get("project")
+    owner_project = canonical_project(cwd) if cwd else None
+    if cwd and server_project:
+        resolved_project = canonical_project(str(server_project))
+        if owner_project != resolved_project and not path_inside(cwd, resolved_project):
+            return {
+                "ok": False,
+                "pid": pid,
+                "cwd": cwd,
+                "project": owner_project,
+                "reason": (
+                    f"PID {pid} cwd {cwd} is outside registered project {resolved_project}; "
+                    f"stale coordinator metadata"
+                ),
+            }
+    return {"ok": True, "pid": pid, "cwd": cwd, "project": owner_project}
+
+
+def server_listener_identity(server: dict[str, Any]) -> dict[str, Any]:
+    identity = server_process_identity(server)
+    if identity.get("ok") is False:
+        return identity
+    pid = int(server.get("pid") or 0)
+    if pid and pid_alive(pid):
+        return identity
+    project = server.get("project")
+    port = server.get("port")
+    if not project or not port:
+        return identity
+    host = str(server.get("host") or "127.0.0.1")
+    if not port_open(host, int(port)):
+        return identity
+    belongs, owner = listener_belongs_to_project(int(port), str(project))
+    return {"ok": belongs, **owner}
+
+
 def port_available(port: int, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -233,6 +331,9 @@ def lease_has_stale_server(state: dict[str, Any], lease: dict[str, Any]) -> bool
     if server.get("status") == "stopped":
         return True
     pid = server.get("pid")
+    identity = server_listener_identity(server)
+    if identity.get("ok") is False:
+        return True
     return bool(pid) and not pid_alive(int(pid))
 
 
@@ -330,6 +431,77 @@ def lease_port(
         return lease
 
     raise RuntimeError(f"no free port available in {port_range}")
+
+
+def release_mismatched_leases_for_existing_listener(
+    state: dict[str, Any],
+    *,
+    port: int,
+    owner_pid: int | None,
+    owner_project: str,
+    reason: str,
+) -> None:
+    resolved_owner_project = canonical_project(owner_project)
+    for lease_id, lease in list(state["leases"].items()):
+        if lease.get("status") != "active" or int(lease.get("port") or 0) != int(port):
+            continue
+        server = state["servers"].get(lease.get("server_id")) if lease.get("server_id") else None
+        lease_project = canonical_project(str(lease.get("project") or "")) if lease.get("project") else None
+        if lease_has_stale_server(state, lease):
+            mark_lease_stale_released(state, lease_id, lease, reason)
+            continue
+        if server and owner_pid and int(server.get("pid") or 0) == int(owner_pid) and lease_project != resolved_owner_project:
+            mark_lease_stale_released(state, lease_id, lease, reason)
+
+
+def lease_existing_server_port(
+    state: dict[str, Any],
+    *,
+    agent: str,
+    project: str,
+    port: int,
+    purpose: str,
+    server_id: str,
+    owner_pid: int | None,
+    ttl: int = DEFAULT_TTL_SECONDS,
+) -> dict[str, Any]:
+    project = canonical_project(project)
+    release_mismatched_leases_for_existing_listener(
+        state,
+        port=port,
+        owner_pid=owner_pid,
+        owner_project=project,
+        reason=f"port {port} lease pointed at stale or foreign server metadata",
+    )
+    for lease in state["leases"].values():
+        if lease.get("status") != "active" or int(lease.get("port") or 0) != int(port):
+            continue
+        if lease.get("server_id") == server_id and canonical_project(str(lease.get("project") or "")) == project:
+            return lease
+        raise RuntimeError(
+            f"port {port} already has an active lease for {lease.get('project') or 'unknown project'}"
+        )
+    lease_id = str(uuid.uuid4())
+    lease = {
+        "id": lease_id,
+        "port": port,
+        "agent": agent,
+        "project": project,
+        "agent_metadata": agent_metadata(agent=agent, project=project, source="port_lease_existing"),
+        "purpose": purpose,
+        "server_id": server_id,
+        "status": "active",
+        "created_at": iso_timestamp(),
+        "created_ts": now(),
+        "expires_at": now() + ttl if ttl > 0 else None,
+        "expires_at_iso": iso_timestamp(now() + ttl) if ttl > 0 else None,
+        "range": f"{port}-{port}",
+        "occupied_existing": True,
+        "owner_pid": owner_pid,
+    }
+    state["leases"][lease_id] = lease
+    record_event(state, "port.leased", lease)
+    return lease
 
 
 def release_port(state: dict[str, Any], *, lease_id: str | None = None, port: int | None = None) -> dict[str, Any]:
@@ -459,9 +631,115 @@ def find_server(state: dict[str, Any], *, project: str, name: str) -> tuple[str,
     return None, None
 
 
+def server_record_key(server: dict[str, Any]) -> str:
+    key = server.get("key")
+    if key:
+        return str(key)
+    project = server.get("project")
+    name = server.get("name")
+    if project and name:
+        return server_key(str(project), str(name))
+    return f"id::{server.get('id') or id(server)}"
+
+
+def server_record_rank(server: dict[str, Any]) -> tuple[int, str, str, str]:
+    status = str(server.get("status") or "").lower()
+    health = server.get("health") or {}
+    if status == "running" or health.get("ok"):
+        state_rank = 4
+    elif status in {"starting", "unhealthy", "degraded"}:
+        state_rank = 3
+    elif health.get("pid_alive"):
+        state_rank = 2
+    elif status == "stopped":
+        state_rank = 1
+    else:
+        state_rank = 0
+    timestamp = str(server.get("updated_at") or server.get("stopped_at") or server.get("created_at") or "")
+    created_at = str(server.get("created_at") or "")
+    server_id = str(server.get("id") or "")
+    return (state_rank, timestamp, created_at, server_id)
+
+
+def preferred_server_record(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    return right if server_record_rank(right) >= server_record_rank(left) else left
+
+
+def deduplicate_server_records(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    preferred: dict[str, dict[str, Any]] = {}
+    duplicate_ids: dict[str, list[str]] = {}
+    for server in servers:
+        key = server_record_key(server)
+        duplicate_ids.setdefault(key, []).append(str(server.get("id") or ""))
+        current = preferred.get(key)
+        preferred[key] = server if current is None else preferred_server_record(current, server)
+
+    result: list[dict[str, Any]] = []
+    emitted: set[str] = set()
+    for server in servers:
+        key = server_record_key(server)
+        winner = preferred[key]
+        winner_id = str(winner.get("id") or "")
+        if str(server.get("id") or "") != winner_id or winner_id in emitted:
+            continue
+        emitted.add(winner_id)
+        duplicate_count = len(duplicate_ids.get(key, []))
+        if duplicate_count > 1:
+            server["duplicate_count"] = duplicate_count
+            server["duplicate_server_ids"] = [item for item in duplicate_ids[key] if item and item != winner_id]
+        result.append(server)
+    return result
+
+
+def annotate_server_url_currency(servers: list[dict[str, Any]]) -> None:
+    active_by_endpoint: dict[tuple[str, int], dict[str, Any]] = {}
+    for server in servers:
+        port = server.get("port")
+        if not port:
+            continue
+        endpoint = (str(server.get("host") or "127.0.0.1"), int(port))
+        health = server.get("health") or {}
+        is_current = server.get("status") != "stopped" and health.get("ok") is True
+        server["url_is_current"] = bool(is_current)
+        if is_current:
+            active_by_endpoint[endpoint] = {
+                "type": "server",
+                "id": server.get("id"),
+                "name": server.get("name"),
+                "project": server.get("project"),
+                "pid": server.get("pid"),
+                "url": server.get("url"),
+            }
+
+    for server in servers:
+        port = server.get("port")
+        if not port or server.get("url_is_current"):
+            continue
+        endpoint = (str(server.get("host") or "127.0.0.1"), int(port))
+        active_owner = active_by_endpoint.get(endpoint)
+        if active_owner and active_owner.get("id") != server.get("id"):
+            server["port_reused"] = True
+            server["url_is_current"] = False
+            server["port_reused_by"] = active_owner
+            continue
+        if port_open(endpoint[0], endpoint[1]):
+            owner = listener_owner_for_port(endpoint[1])
+            server["port_reused"] = True
+            server["url_is_current"] = False
+            server["port_reused_by"] = {
+                "type": "process",
+                "pid": owner.get("pid"),
+                "cwd": owner.get("cwd"),
+                "project": owner.get("project"),
+            }
+
+
 def stop_reason_from_health(server: dict[str, Any], health: dict[str, Any]) -> str:
     pid = server.get("pid")
     check = health.get("check") or {}
+    identity = health.get("identity") or {}
+    if identity.get("ok") is False:
+        return str(identity.get("reason") or "Process belongs to a different project")
     if not health.get("pid_alive"):
         detail = check.get("error") or check.get("reason")
         if detail:
@@ -541,7 +819,7 @@ def http_health(url: str, timeout: float = 2.0) -> dict[str, Any]:
         conn.request("GET", path)
         response = conn.getresponse()
         response.read(200)
-        return {"ok": 200 <= response.status < 500, "status": response.status, "reason": response.reason}
+        return {"ok": 200 <= response.status < 400, "status": response.status, "reason": response.reason}
     except OSError as exc:
         return {"ok": False, "error": str(exc)}
     finally:
@@ -552,12 +830,18 @@ def http_health(url: str, timeout: float = 2.0) -> dict[str, Any]:
 def server_health(server: dict[str, Any]) -> dict[str, Any]:
     pid = int(server.get("pid") or 0)
     alive: bool | None = pid_alive(pid) if pid else None
+    identity = server_listener_identity(server)
     health_url = server.get("health_url")
     if health_url:
         check = http_health(health_url)
     else:
         check = {"ok": port_open("127.0.0.1", int(server["port"]))}
-    return {"ok": alive is not False and bool(check.get("ok")), "pid_alive": alive, "check": check}
+    return {
+        "ok": alive is not False and bool(check.get("ok")) and identity.get("ok") is not False,
+        "pid_alive": alive,
+        "check": check,
+        "identity": identity,
+    }
 
 
 def docker_available_command(args: list[str]) -> dict[str, Any]:
@@ -1663,6 +1947,17 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
         elif health.get("ok"):
             server["health"] = health
             server["status"] = "running"
+        elif (health.get("identity") or {}).get("ok") is False:
+            server["health"] = health
+            mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
+            lease_id = server.get("lease_id")
+            if lease_id and lease_id in state["leases"]:
+                mark_lease_stale_released(
+                    state,
+                    str(lease_id),
+                    state["leases"][lease_id],
+                    "linked server process belongs to a different project",
+                )
         elif not health.get("pid_alive"):
             server["health"] = health
             mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
@@ -1677,6 +1972,8 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
         for lease in state["leases"].values()
         if not resolved_project or (lease.get("project") and canonical_project(str(lease.get("project"))) == resolved_project)
     ]
+    servers = deduplicate_server_records(servers)
+    annotate_server_url_currency(servers)
     urls = [
         {
             "name": server.get("name"),
@@ -1686,7 +1983,7 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
             "status": server.get("status"),
         }
         for server in servers
-        if server.get("url")
+        if server.get("url") and server.get("url_is_current")
     ]
     recent_events = []
     for event in state.get("history", []):
@@ -1746,6 +2043,9 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
     pid = options.get("pid")
     if pid is None:
         pid = listening_pid_for_port(port)
+    identity = server_listener_identity({"pid": int(pid) if pid else None, "project": project, "port": port, "host": host})
+    if identity.get("ok") is False:
+        raise RuntimeError(str(identity.get("reason") or f"PID {pid or 'unknown'} is outside project {project}"))
     server_id, existing = find_server(state, project=project, name=name)
     server_id = server_id or str(uuid.uuid4())
     previous = existing or {}
@@ -1783,6 +2083,18 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
     health = wait_for_health(server, float(options.get("health_timeout") or 3))
     server["health"] = health
     server["status"] = "running" if health.get("ok") else "unhealthy"
+    if server["status"] == "running" and server.get("pid"):
+        lease = lease_existing_server_port(
+            state,
+            agent=agent,
+            project=project,
+            port=port,
+            purpose=f"server:{name}",
+            server_id=server_id,
+            owner_pid=int(server["pid"]),
+            ttl=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+        )
+        server["lease_id"] = lease["id"]
     state["servers"][server_id] = server
     record_event(state, "server.registered", server)
     return server
@@ -1796,6 +2108,12 @@ def adopt_runtime_server_if_running(state: dict[str, Any], server_def: dict[str,
     host = server_def.get("host") or "127.0.0.1"
     if not port_open(host, port):
         return None
+    belongs, owner = listener_belongs_to_project(port, server_def["project"])
+    if not belongs:
+        raise RuntimeError(
+            f"refusing to adopt {server_def['name']} on port {port}: "
+            f"{owner.get('reason') or 'listener does not belong to project'}"
+        )
     health_url_template = server_def.get("health_url")
     health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
     if health_url and not http_health(health_url, timeout=float(server_def.get("health_timeout") or 3)).get("ok"):
@@ -1858,7 +2176,7 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
     if existing:
         stop_server(state, {"agent": agent, "project": project, "name": name, "release_port": True})
 
-    server_id = str(uuid.uuid4())
+    server_id = existing_id or str(uuid.uuid4())
     lease = lease_port(
         state,
         agent=agent,
@@ -1928,6 +2246,18 @@ def stop_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any
     project = canonical_project(str(options.get("project") or server.get("project") or ""))
     if canonical_project(str(server.get("project") or "")) != project:
         raise ValueError("server stop project does not match the registered server project")
+    health = server_health(server)
+    server["health"] = health
+    if (health.get("identity") or {}).get("ok") is False:
+        mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
+        if server.get("lease_id") and server["lease_id"] in state["leases"]:
+            mark_lease_stale_released(
+                state,
+                str(server["lease_id"]),
+                state["leases"][server["lease_id"]],
+                "linked server process belongs to a different project",
+            )
+        return server
     stop_pid(int(server.get("pid") or 0))
     server["health"] = server_health(server)
     server["agent"] = agent
@@ -1979,6 +2309,15 @@ def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, A
     elif health.get("ok"):
         server["status"] = "running"
         server["updated_at"] = iso_timestamp()
+    elif (health.get("identity") or {}).get("ok") is False:
+        mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
+        if server.get("lease_id") and server["lease_id"] in state["leases"]:
+            mark_lease_stale_released(
+                state,
+                str(server["lease_id"]),
+                state["leases"][server["lease_id"]],
+                "linked server process belongs to a different project",
+            )
     elif not health.get("pid_alive"):
         mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
     else:
