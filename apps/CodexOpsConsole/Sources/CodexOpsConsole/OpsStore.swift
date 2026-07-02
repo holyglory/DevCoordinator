@@ -111,14 +111,8 @@ final class OpsStore: ObservableObject {
         isLoading = true
         defer { isLoading = false }
         do {
-            var arguments = ["inventory"]
-            if let scopedProjectPath {
-                arguments.append(contentsOf: ["--project", scopedProjectPath])
-            }
-            let result = try await runPython(script: coordinatorScript, arguments: arguments)
-            try ensureSuccess(result)
-            let data = Data(result.output.utf8)
-            var decoded = try JSONDecoder().decode(Inventory.self, from: data)
+            let inventories = try await loadInventoriesFromCoordinatorHomes()
+            var decoded = mergeInventories(inventories)
             decoded.servers = deduplicatedManagedServers(decoded.servers)
             inventory = decoded
             keepSelectionValid()
@@ -133,6 +127,162 @@ final class OpsStore: ObservableObject {
                 source: "inventory"
             )
         }
+    }
+
+    private func loadInventoriesFromCoordinatorHomes() async throws -> [Inventory] {
+        let homes = discoveredCoordinatorHomes()
+        var inventories: [Inventory] = []
+        var failures: [String] = []
+        for home in homes {
+            var arguments = ["inventory"]
+            if let scopedProjectPath {
+                arguments.append(contentsOf: ["--project", scopedProjectPath])
+            }
+            if home != homes.first {
+                arguments.append("--no-docker")
+            }
+            do {
+                let result = try await runPython(
+                    script: coordinatorScript,
+                    arguments: arguments,
+                    environment: ["CODEX_AGENT_COORDINATOR_HOME": home]
+                )
+                try ensureSuccess(result)
+                inventories.append(try JSONDecoder().decode(Inventory.self, from: Data(result.output.utf8)))
+            } catch {
+                failures.append("\(home): \(error.localizedDescription)")
+            }
+        }
+        if inventories.isEmpty {
+            throw RuntimeError(failures.joined(separator: "\n").isEmpty ? "No coordinator inventory could be loaded" : failures.joined(separator: "\n"))
+        }
+        return inventories
+    }
+
+    private func discoveredCoordinatorHomes() -> [String] {
+        let fileManager = FileManager.default
+        let home = fileManager.homeDirectoryForCurrentUser.path
+        var candidates: [String] = []
+        if let envHome = ProcessInfo.processInfo.environment["CODEX_AGENT_COORDINATOR_HOME"], !envHome.isEmpty {
+            candidates.append(envHome)
+        }
+        candidates.append("\(home)/.codex/agent-coordinator")
+        let parallRoot = "\(home)/Library/Application Support/Parall"
+        if let entries = try? fileManager.contentsOfDirectory(atPath: parallRoot) {
+            for entry in entries.sorted() {
+                candidates.append("\(parallRoot)/\(entry)/.codex/agent-coordinator")
+            }
+        }
+        var seen = Set<String>()
+        return candidates.compactMap { path in
+            let resolved = URL(fileURLWithPath: path).standardizedFileURL.path
+            guard !seen.contains(resolved) else { return nil }
+            seen.insert(resolved)
+            var isDirectory: ObjCBool = false
+            let exists = fileManager.fileExists(atPath: resolved, isDirectory: &isDirectory)
+                || fileManager.fileExists(atPath: "\(resolved)/state.json")
+            return exists ? resolved : nil
+        }
+    }
+
+    private func mergeInventories(_ inventories: [Inventory]) -> Inventory {
+        guard var first = inventories.first else { return .empty }
+        first.coordinatorHome = inventories.compactMap(\.coordinatorHome).joined(separator: ", ")
+        first.statePath = inventories.compactMap(\.statePath).joined(separator: ", ")
+        first.urls = inventories.flatMap(\.urls)
+        first.servers = inventories.flatMap(\.servers)
+        first.leases = inventories.flatMap(\.leases)
+        first.recentEvents = inventories.flatMap(\.recentEvents)
+        first.docker = mergeDockerSummaries(inventories.map(\.docker))
+        first.postgres = mergeDockerContainers(inventories.flatMap(\.postgres))
+        first.backups = inventories.flatMap(\.backups)
+        first.projectUsage = mergeProjectUsage(inventories.flatMap(\.projectUsage))
+        return first
+    }
+
+    private func mergeDockerSummaries(_ summaries: [DockerSummary]) -> DockerSummary {
+        let available = summaries.contains { $0.available == true } ? true : summaries.first?.available
+        let error = summaries.compactMap(\.error).first
+        let statsError = summaries.compactMap(\.statsError).first
+        let containers = mergeDockerContainers(summaries.flatMap(\.containers))
+        let postgres = mergeDockerContainers(summaries.flatMap(\.postgres))
+        return DockerSummary(available: available, error: error, statsError: statsError, containers: containers, postgres: postgres)
+    }
+
+    private func mergeDockerContainers(_ containers: [DockerContainer]) -> [DockerContainer] {
+        let grouped = Dictionary(grouping: containers, by: \.stableID)
+        return grouped.values.compactMap { bucket in
+            bucket.max(by: { dockerContainerRank($0) < dockerContainerRank($1) })
+        }
+        .sorted { ($0.name ?? $0.stableID) < ($1.name ?? $1.stableID) }
+    }
+
+    private func dockerContainerRank(_ container: DockerContainer) -> (Int, Int, Int) {
+        let metadataRank = (container.project?.isEmpty == false ? 2 : 0) + ((container.metadataSource ?? "none") == "none" ? 0 : 1)
+        let statsRank = container.stats == nil ? 0 : 1
+        let runningRank = container.isRunning ? 1 : 0
+        return (metadataRank, statsRank, runningRank)
+    }
+
+    private func mergeProjectUsage(_ rows: [ProjectUsage]) -> [ProjectUsage] {
+        let grouped = Dictionary(grouping: rows) { row in
+            row.project ?? row.projectKey ?? row.name ?? "local"
+        }
+        return grouped.values.map { bucket in
+            var seenPIDs = Set<Int>()
+            var processes: [ProcessUsage] = []
+            var processCPU = 0.0
+            var processMemory = 0.0
+            var fallbackProcessCPU = 0.0
+            var fallbackProcessMemory = 0.0
+            var dockerCPU = 0.0
+            var dockerMemory = 0.0
+            var serverCount = 0
+            var containerCount = 0
+
+            for row in bucket {
+                serverCount += row.serverCount ?? 0
+                containerCount = max(containerCount, row.containerCount ?? 0)
+                dockerCPU = max(dockerCPU, row.dockerCPUPercent ?? 0)
+                dockerMemory = max(dockerMemory, row.dockerMemoryBytes ?? 0)
+                let rowProcesses = row.processes ?? []
+                if rowProcesses.isEmpty {
+                    fallbackProcessCPU += row.processCPUPercent ?? 0
+                    fallbackProcessMemory += row.processMemoryBytes ?? 0
+                }
+                for process in rowProcesses {
+                    guard let pid = process.pid, !seenPIDs.contains(pid) else { continue }
+                    seenPIDs.insert(pid)
+                    processes.append(process)
+                    processCPU += process.cpuPercent ?? 0
+                    processMemory += process.rssBytes ?? process.memoryBytes ?? 0
+                }
+            }
+
+            if processes.isEmpty {
+                processCPU = fallbackProcessCPU
+                processMemory = fallbackProcessMemory
+            }
+            let first = bucket.max(by: { usageRank($0) < usageRank($1) }) ?? bucket[0]
+            let hotProcesses = processes.sorted { ($0.cpuPercent ?? 0, $0.rssBytes ?? 0) > ($1.cpuPercent ?? 0, $1.rssBytes ?? 0) }.prefix(5).map { $0 }
+            return ProjectUsage(
+                project: first.project,
+                projectKey: first.projectKey,
+                name: first.name,
+                serverCount: serverCount,
+                containerCount: containerCount,
+                processCount: processes.isEmpty ? first.processCount : processes.count,
+                cpuPercent: processCPU + dockerCPU,
+                memoryBytes: processMemory + dockerMemory,
+                processCPUPercent: processCPU,
+                processMemoryBytes: processMemory,
+                dockerCPUPercent: dockerCPU,
+                dockerMemoryBytes: dockerMemory,
+                processes: processes,
+                hotProcesses: hotProcesses.isEmpty ? first.hotProcesses : hotProcesses
+            )
+        }
+        .sorted { usageRank($0) > usageRank($1) }
     }
 
     func openURL(_ url: String?) {
@@ -591,11 +741,14 @@ struct RuntimeError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-func runPython(script: String, arguments: [String]) async throws -> CommandResult {
+func runPython(script: String, arguments: [String], environment: [String: String] = [:]) async throws -> CommandResult {
     try await Task.detached(priority: .userInitiated) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["python3", script] + arguments
+        if !environment.isEmpty {
+            process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+        }
 
         let temporaryDirectory = FileManager.default.temporaryDirectory
         let outputURL = temporaryDirectory.appendingPathComponent("codex-ops-\(UUID().uuidString).out")

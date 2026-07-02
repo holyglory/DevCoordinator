@@ -291,6 +291,7 @@ struct ProjectGroup {
     var servers: [ManagedServer]
     var containers: [DockerContainer]
     var databases: [DockerContainer]
+    var usage: ProjectUsage?
 }
 
 func projectGroups(from inventory: Inventory) -> [ProjectGroup] {
@@ -298,7 +299,9 @@ func projectGroups(from inventory: Inventory) -> [ProjectGroup] {
     let servers = Dictionary(grouping: dedupedServers) { projectKey(fromPath: $0.project) }
     let docker = Dictionary(grouping: inventory.docker.containers.filter { !$0.isPostgresLike }) { projectKey(fromDockerContainer: $0) }
     let databases = Dictionary(grouping: inventory.postgres) { projectKey(fromDockerContainer: $0) }
-    let keys = Set(servers.keys).union(docker.keys).union(databases.keys).sorted()
+    let usage = Dictionary(grouping: inventory.projectUsage) { $0.projectKey ?? projectKey(fromPath: $0.project) }
+        .compactMapValues { rows in rows.max(by: { usageRank($0) < usageRank($1) }) }
+    let keys = Set(servers.keys).union(docker.keys).union(databases.keys).union(usage.keys).sorted()
 
     return keys.map { key in
         ProjectGroup(
@@ -317,9 +320,14 @@ func projectGroups(from inventory: Inventory) -> [ProjectGroup] {
             ),
             servers: servers[key] ?? [],
             containers: docker[key] ?? [],
-            databases: databases[key] ?? []
+            databases: databases[key] ?? [],
+            usage: usage[key]
         )
     }
+}
+
+func usageRank(_ usage: ProjectUsage) -> (Double, Double, Int) {
+    (usage.cpuPercent ?? 0, usage.memoryBytes ?? 0, usage.processCount ?? 0)
 }
 
 func projectGroupStatus(_ group: ProjectGroup) -> String {
@@ -442,6 +450,7 @@ struct MainBoardView: View {
             Divider().overlay(Color.white.opacity(0.07))
 
             VStack(spacing: 14) {
+                ProjectUsageStrip(store: store)
                 FilterRow(store: store)
                 ResourceTabBar(store: store)
 
@@ -464,6 +473,107 @@ struct MainBoardView: View {
             StatusBar(store: store)
         }
         .background(Theme.background)
+    }
+}
+
+struct ProjectUsageStrip: View {
+    @ObservedObject var store: OpsStore
+
+    private var rows: [ProjectUsage] {
+        store.inventory.projectUsage
+            .filter { ($0.serverCount ?? 0) > 0 || ($0.containerCount ?? 0) > 0 || ($0.cpuPercent ?? 0) > 0 || ($0.memoryBytes ?? 0) > 0 }
+            .sorted { usageRank($0) > usageRank($1) }
+            .prefix(6)
+            .map { $0 }
+    }
+
+    var body: some View {
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 8) {
+                    Image(systemName: "gauge.with.dots.needle.bottom.100percent")
+                        .foregroundStyle(Theme.secondary)
+                    Text("PROJECT LOAD")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(Theme.secondary)
+                    Spacer(minLength: 0)
+                }
+                VStack(spacing: 0) {
+                    ForEach(rows) { row in
+                        ProjectUsageRow(usage: row)
+                    }
+                }
+                .background(Theme.control)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+}
+
+struct ProjectUsageRow: View {
+    let usage: ProjectUsage
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(usage.name ?? usage.project.map(shortProject) ?? usage.projectKey ?? "Project")
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(resourceCountText)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+            }
+            .frame(minWidth: 130, maxWidth: 180, alignment: .leading)
+            MetricPill(title: "CPU", value: formatCPU(usage.cpuPercent), tint: usageSeverityColor(usage))
+            MetricPill(title: "Memory", value: formatBytes(usage.memoryBytes), tint: usageSeverityColor(usage))
+            Text(hotProcessLabel(usage.hotProcesses?.first))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Theme.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.white.opacity(0.055)).frame(height: 1)
+        }
+    }
+
+    private var resourceCountText: String {
+        let processes = usage.processCount ?? 0
+        let containers = usage.containerCount ?? 0
+        if containers > 0 {
+            return "\(processes) processes / \(containers) containers"
+        }
+        return "\(processes) processes"
+    }
+}
+
+struct MetricPill: View {
+    let title: String
+    let value: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(title)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(Theme.secondary)
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(tint)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .frame(minWidth: 92)
+        .frame(height: 24)
+        .background(Color.black.opacity(0.16))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
 
@@ -978,6 +1088,11 @@ struct SelectedServerPanel: View {
             if server.portReused == true {
                 DetailLine(label: "Port Reused By", value: portReuseText(server.portReusedBy))
             }
+            if let usage = server.processUsage {
+                DetailLine(label: "CPU", value: formatCPU(usage.cpuPercent))
+                DetailLine(label: "Memory", value: formatBytes(usage.memoryBytes ?? usage.rssBytes))
+                DetailLine(label: "Hot Process", value: hotProcessLabel(usage.hotProcesses?.first))
+            }
             DetailLine(label: "Stopped", value: server.stoppedAt ?? "—")
             DetailLine(label: "Reason", value: server.stoppedReason ?? "—")
             DetailLine(label: "Log", value: server.logPath ?? "—")
@@ -1084,13 +1199,15 @@ struct SelectedProjectPanel: View {
         let servers = deduplicatedManagedServers(store.inventory.servers).filter { projectKey(fromPath: $0.project) == name }
         let docker = store.inventory.docker.containers.filter { projectKey(fromDockerContainer: $0) == name }
         let databases = store.inventory.postgres.filter { projectKey(fromDockerContainer: $0) == name }
+        let usage = store.inventory.projectUsage.first { ($0.projectKey ?? projectKey(fromPath: $0.project)) == name }
         let group = ProjectGroup(
             id: name,
             name: projectDisplayName(key: name, servers: servers, containers: docker, databases: databases),
             projectPath: projectPathForGroup(key: name, servers: servers, containers: docker, databases: databases),
             servers: servers,
             containers: docker,
-            databases: databases
+            databases: databases,
+            usage: usage
         )
         let report = store.projectRuntimeReports[name]
         VStack(alignment: .leading, spacing: 10) {
@@ -1101,6 +1218,11 @@ struct SelectedProjectPanel: View {
             DetailLine(label: "Servers", value: "\(servers.count)")
             DetailLine(label: "Docker", value: "\(docker.count)")
             DetailLine(label: "Databases", value: "\(databases.count)")
+            if let usage = group.usage {
+                DetailLine(label: "CPU", value: formatCPU(usage.cpuPercent))
+                DetailLine(label: "Memory", value: formatBytes(usage.memoryBytes))
+                DetailLine(label: "Hot Process", value: hotProcessLabel(usage.hotProcesses?.first))
+            }
             InspectorActionStack {
                 Button { store.startProject(group) } label: { Label("Run", systemImage: "play.fill").frame(maxWidth: .infinity) }
                 Button { store.restartProject(group) } label: { Label("Restart", systemImage: "arrow.clockwise").frame(maxWidth: .infinity) }
@@ -1695,10 +1817,10 @@ struct StatusBar: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            StatusDot(status: store.lastError == nil ? "running" : "unhealthy")
-            Text(store.lastError ?? "All systems nominal")
+            StatusDot(status: statusSeverity)
+            Text(statusText)
                 .font(.system(size: 12))
-                .foregroundStyle(store.lastError == nil ? Theme.secondary : Theme.red)
+                .foregroundStyle(statusSeverity == "running" ? Theme.secondary : Theme.orange)
             Spacer()
             Text("Lease: \(store.inventory.leases.first?.id.prefix(8) ?? "none")")
                 .font(.system(size: 12))
@@ -1709,6 +1831,23 @@ struct StatusBar: View {
         }
         .padding(.horizontal, 18)
         .frame(height: 38)
+    }
+
+    private var overloadedProject: ProjectUsage? {
+        store.inventory.projectUsage.first(where: isHighProjectUsage)
+    }
+
+    private var statusText: String {
+        if let error = store.lastError { return error }
+        if let overloadedProject {
+            return "High load: \(overloadedProject.name ?? overloadedProject.project.map(shortProject) ?? overloadedProject.projectKey ?? "project") \(formatCPU(overloadedProject.cpuPercent)) / \(formatBytes(overloadedProject.memoryBytes))"
+        }
+        return "All systems nominal"
+    }
+
+    private var statusSeverity: String {
+        if store.lastError != nil || overloadedProject != nil { return "unhealthy" }
+        return "running"
     }
 }
 
@@ -2094,6 +2233,10 @@ func formatPercent(_ value: Double?) -> String {
     return String(format: "%.1f%%", value)
 }
 
+func formatCPU(_ value: Double?) -> String {
+    formatPercent(value)
+}
+
 func formatBytes(_ value: Double?) -> String {
     guard let value else { return "—" }
     if value == 0 { return "0 B" }
@@ -2101,6 +2244,30 @@ func formatBytes(_ value: Double?) -> String {
     formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
     formatter.countStyle = .file
     return formatter.string(fromByteCount: Int64(value.rounded()))
+}
+
+func hotProcessLabel(_ process: ProcessUsage?) -> String {
+    guard let process else { return "No hot process" }
+    let pid = process.pid.map { "PID \($0)" } ?? "PID —"
+    let command = process.command?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let command, !command.isEmpty {
+        return "\(pid) \(command)"
+    }
+    return pid
+}
+
+func isHighProjectUsage(_ usage: ProjectUsage) -> Bool {
+    let cpu = usage.cpuPercent ?? 0
+    let memory = usage.memoryBytes ?? 0
+    return cpu >= 200 || memory >= 8_000_000_000
+}
+
+func usageSeverityColor(_ usage: ProjectUsage) -> Color {
+    let cpu = usage.cpuPercent ?? 0
+    let memory = usage.memoryBytes ?? 0
+    if isHighProjectUsage(usage) { return Theme.red }
+    if cpu >= 80 || memory >= 2_000_000_000 { return Theme.orange }
+    return Theme.primary
 }
 
 func formatRate(_ value: Double?) -> String {

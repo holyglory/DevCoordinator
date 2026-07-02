@@ -11,6 +11,7 @@ struct Inventory: Decodable {
     var docker: DockerSummary
     var postgres: [DockerContainer]
     var backups: [DatabaseBackup]
+    var projectUsage: [ProjectUsage]
 
     enum CodingKeys: String, CodingKey {
         case coordinatorHome = "coordinator_home"
@@ -23,6 +24,7 @@ struct Inventory: Decodable {
         case docker
         case postgres
         case backups
+        case projectUsage = "project_usage"
     }
 
     static let empty = Inventory(
@@ -35,7 +37,8 @@ struct Inventory: Decodable {
         recentEvents: [],
         docker: DockerSummary(available: nil, error: nil, statsError: nil, containers: [], postgres: []),
         postgres: [],
-        backups: []
+        backups: [],
+        projectUsage: []
     )
 }
 
@@ -81,6 +84,7 @@ struct ManagedServer: Decodable, Identifiable, Hashable {
     var urlIsCurrent: Bool?
     var portReused: Bool?
     var portReusedBy: PortReuseOwner?
+    var processUsage: ProcessUsage?
 
     enum CodingKeys: String, CodingKey {
         case id, name, agent, project, cwd, port, host, url, pid, status, health
@@ -100,6 +104,79 @@ struct ManagedServer: Decodable, Identifiable, Hashable {
         case urlIsCurrent = "url_is_current"
         case portReused = "port_reused"
         case portReusedBy = "port_reused_by"
+        case processUsage = "process_usage"
+    }
+}
+
+struct ProcessUsage: Decodable, Hashable, Identifiable {
+    var id: String {
+        if let pid { return "pid-\(pid)" }
+        if let rootPIDs, !rootPIDs.isEmpty {
+            return "roots-\(rootPIDs.map(String.init).joined(separator: "-"))"
+        }
+        return command ?? source ?? "process"
+    }
+    var source: String?
+    var pid: Int?
+    var ppid: Int?
+    var rootPIDs: [Int]?
+    var pids: [Int]?
+    var processCount: Int?
+    var cpuPercent: Double?
+    var rssBytes: Double?
+    var memoryBytes: Double?
+    var command: String?
+    var sampledAt: String?
+    var project: String?
+    var serverID: String?
+    var serverName: String?
+    var processes: [ProcessUsage]?
+    var hotProcesses: [ProcessUsage]?
+
+    enum CodingKeys: String, CodingKey {
+        case source, pid, ppid, pids, command, project, processes
+        case rootPIDs = "root_pids"
+        case processCount = "process_count"
+        case cpuPercent = "cpu_percent"
+        case rssBytes = "rss_bytes"
+        case memoryBytes = "memory_bytes"
+        case sampledAt = "sampled_at"
+        case serverID = "server_id"
+        case serverName = "server_name"
+        case hotProcesses = "hot_processes"
+    }
+}
+
+struct ProjectUsage: Decodable, Hashable, Identifiable {
+    var id: String { project ?? projectKey ?? name ?? "project" }
+    var project: String?
+    var projectKey: String?
+    var name: String?
+    var serverCount: Int?
+    var containerCount: Int?
+    var processCount: Int?
+    var cpuPercent: Double?
+    var memoryBytes: Double?
+    var processCPUPercent: Double?
+    var processMemoryBytes: Double?
+    var dockerCPUPercent: Double?
+    var dockerMemoryBytes: Double?
+    var processes: [ProcessUsage]?
+    var hotProcesses: [ProcessUsage]?
+
+    enum CodingKeys: String, CodingKey {
+        case project, name, processes
+        case projectKey = "project_key"
+        case serverCount = "server_count"
+        case containerCount = "container_count"
+        case processCount = "process_count"
+        case cpuPercent = "cpu_percent"
+        case memoryBytes = "memory_bytes"
+        case processCPUPercent = "process_cpu_percent"
+        case processMemoryBytes = "process_memory_bytes"
+        case dockerCPUPercent = "docker_cpu_percent"
+        case dockerMemoryBytes = "docker_memory_bytes"
+        case hotProcesses = "hot_processes"
     }
 }
 

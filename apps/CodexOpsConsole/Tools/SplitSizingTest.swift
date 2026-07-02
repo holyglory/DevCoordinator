@@ -42,6 +42,7 @@ struct SplitSizingTest {
         assertServerDeduplication()
         assertCurrentURLHandling()
         assertSidebarActionState()
+        assertProjectUsageFormatting()
         print("split sizing ok")
     }
 
@@ -139,10 +140,48 @@ struct SplitSizingTest {
             recentEvents: [],
             docker: DockerSummary(available: nil, error: nil, statsError: nil, containers: [], postgres: []),
             postgres: [],
-            backups: []
+            backups: [],
+            projectUsage: [
+                ProjectUsage(
+                    project: "/Users/holyglory/src/XFoilFOAM",
+                    projectKey: "xfoilfoam",
+                    name: "XFoilFOAM",
+                    serverCount: 2,
+                    containerCount: 3,
+                    processCount: 4,
+                    cpuPercent: 329.8,
+                    memoryBytes: 15_323_463_680,
+                    processCPUPercent: 329.8,
+                    processMemoryBytes: 15_081_799_680,
+                    dockerCPUPercent: 0,
+                    dockerMemoryBytes: 0,
+                    processes: nil,
+                    hotProcesses: [
+                        ProcessUsage(
+                            source: nil,
+                            pid: 18970,
+                            ppid: 18790,
+                            rootPIDs: nil,
+                            pids: nil,
+                            processCount: nil,
+                            cpuPercent: 329.8,
+                            rssBytes: 15_071_772_672,
+                            memoryBytes: nil,
+                            command: "next-server (v15.5.19)",
+                            sampledAt: nil,
+                            project: nil,
+                            serverID: nil,
+                            serverName: nil,
+                            processes: nil,
+                            hotProcesses: nil
+                        )
+                    ]
+                )
+            ]
         )
         let group = projectGroups(from: inventory).first { $0.id == "xfoilfoam" }
         assert(group?.servers.count == 2, "project tree should not show duplicate api server rows")
+        assert(group?.usage?.hotProcesses?.first?.pid == 18970, "project tree should retain project usage for XFoilFOAM")
     }
 
     private static func assertProjectGrouping() {
@@ -238,6 +277,29 @@ struct SplitSizingTest {
         assert(staleServer.currentURL == nil, "stale stopped server rows should not expose openable URLs")
     }
 
+    private static func assertProjectUsageFormatting() {
+        let hot = ProcessUsage(
+            source: nil,
+            pid: 18970,
+            ppid: nil,
+            rootPIDs: nil,
+            pids: nil,
+            processCount: nil,
+            cpuPercent: 329.8,
+            rssBytes: 15_071_772_672,
+            memoryBytes: nil,
+            command: "next-server (v15.5.19)",
+            sampledAt: nil,
+            project: nil,
+            serverID: nil,
+            serverName: nil,
+            processes: nil,
+            hotProcesses: nil
+        )
+        assertString(formatCPU(329.8), "329.8%", "CPU formatter should preserve high multi-core percentages")
+        assertString(hotProcessLabel(hot), "PID 18970 next-server (v15.5.19)", "hot process labels should expose PID and command")
+    }
+
     private static func assertEqual(_ actual: CGFloat, _ expected: CGFloat, _ message: String) {
         if abs(actual - expected) > 0.0001 {
             fail("\(message): expected \(expected), got \(actual)")
@@ -293,7 +355,8 @@ struct SplitSizingTest {
             duplicateServerIDs: nil,
             urlIsCurrent: urlIsCurrent,
             portReused: nil,
-            portReusedBy: nil
+            portReusedBy: nil,
+            processUsage: nil
         )
     }
 

@@ -119,6 +119,15 @@ a managed server stops or its PID exits, inventory exposes `stopped_at`,
 `stopped_reason`, and `log_path`, and `server logs` returns the requested log
 tail plus the stop metadata.
 
+Inventory also exposes real per-server process CPU/RSS and project-level
+resource rollups. For managed dev servers, the coordinator samples the launcher
+PID plus its child process tree so Node/Next/Vite child processes are counted
+under the correct canonical repo. Use `inventory --project "$PROJECT_ROOT"` or
+project `status` evidence before assuming a server is healthy when it is slow,
+GC-bound, or memory-heavy. The `project_usage` rollup lists CPU percent, memory
+bytes, process counts, and hot PIDs by repo; it must be treated as diagnostic
+evidence, not synthetic UI decoration.
+
 Inventory must show one current row per logical server identity
 (`canonical project path + server name`). Repeated starts, stops, restarts, or
 adoptions of the same fixed-port service must not appear as multiple runnable

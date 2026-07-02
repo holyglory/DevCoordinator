@@ -7,13 +7,13 @@ import argparse
 import contextlib
 import errno
 import fcntl
-import http.client
 import http.server
 import json
 import os
 import re
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -251,6 +251,101 @@ def listener_belongs_to_project(port: int, project: str) -> tuple[bool, dict[str
         )
         return False, owner
     return True, owner
+
+
+def read_process_table() -> dict[int, dict[str, Any]]:
+    with contextlib.suppress(Exception):
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,%cpu=,rss=,command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=4,
+        )
+        if completed.returncode != 0:
+            return {}
+        rows: dict[int, dict[str, Any]] = {}
+        for line in completed.stdout.splitlines():
+            parts = line.strip().split(None, 4)
+            if len(parts) < 5:
+                continue
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+                cpu_percent = float(parts[2])
+                rss_kb = int(float(parts[3]))
+            except ValueError:
+                continue
+            rows[pid] = {
+                "pid": pid,
+                "ppid": ppid,
+                "cpu_percent": cpu_percent,
+                "rss_kb": rss_kb,
+                "rss_bytes": rss_kb * 1024,
+                "command": parts[4],
+            }
+        return rows
+    return {}
+
+
+def children_by_parent(process_table: dict[int, dict[str, Any]]) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for pid, row in process_table.items():
+        children.setdefault(int(row.get("ppid") or 0), []).append(pid)
+    return children
+
+
+def process_tree_pids(root_pids: set[int], process_table: dict[int, dict[str, Any]], children: dict[int, list[int]]) -> set[int]:
+    seen: set[int] = set()
+    stack = [pid for pid in root_pids if pid in process_table]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children.get(pid, []))
+    return seen
+
+
+def process_usage_entry(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "pid": row.get("pid"),
+        "ppid": row.get("ppid"),
+        "cpu_percent": round(float(row.get("cpu_percent") or 0), 2),
+        "rss_bytes": int(row.get("rss_bytes") or 0),
+        "command": row.get("command"),
+    }
+
+
+def summarize_process_usage(
+    pids: set[int],
+    process_table: dict[int, dict[str, Any]],
+    *,
+    root_pids: set[int] | None = None,
+    source: str,
+) -> dict[str, Any] | None:
+    live_pids = sorted(pid for pid in pids if pid in process_table)
+    if not live_pids:
+        return None
+    processes = [process_usage_entry(process_table[pid]) for pid in live_pids]
+    hot_processes = sorted(
+        processes,
+        key=lambda item: (float(item.get("cpu_percent") or 0), int(item.get("rss_bytes") or 0)),
+        reverse=True,
+    )
+    cpu_percent = sum(float(item.get("cpu_percent") or 0) for item in processes)
+    rss_bytes = sum(int(item.get("rss_bytes") or 0) for item in processes)
+    return {
+        "source": source,
+        "root_pids": sorted(pid for pid in (root_pids or set()) if pid in process_table),
+        "pids": live_pids,
+        "process_count": len(live_pids),
+        "cpu_percent": round(cpu_percent, 2),
+        "rss_bytes": rss_bytes,
+        "memory_bytes": rss_bytes,
+        "processes": processes,
+        "hot_processes": hot_processes[:5],
+    }
 
 
 def server_process_identity(server: dict[str, Any]) -> dict[str, Any]:
@@ -734,6 +829,165 @@ def annotate_server_url_currency(servers: list[dict[str, Any]]) -> None:
             }
 
 
+def resource_project_identity(project: str | None, fallback_name: str | None = None) -> dict[str, str | None]:
+    if project:
+        resolved = canonical_project(str(project))
+        return {
+            "usage_key": f"path:{resolved}",
+            "project": resolved,
+            "project_key": project_key_from_path(resolved),
+            "name": Path(resolved).name,
+        }
+    project_key = project_key_from_resource_name(fallback_name)
+    return {
+        "usage_key": f"name:{project_key}",
+        "project": None,
+        "project_key": project_key,
+        "name": project_key,
+    }
+
+
+def process_owner_matches_project(pid: int, project: str | None) -> bool:
+    if not project:
+        return True
+    cwd = process_cwd(pid)
+    if not cwd:
+        return False
+    resolved_project = canonical_project(str(project))
+    owner_project = canonical_project(cwd)
+    return owner_project == resolved_project or path_inside(cwd, resolved_project)
+
+
+def annotate_server_process_usage(servers: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    process_table = read_process_table()
+    if not process_table:
+        for server in servers:
+            server.pop("process_usage", None)
+        return {}
+
+    children = children_by_parent(process_table)
+    sampled_at = iso_timestamp()
+    listener_cache: dict[int, dict[str, Any]] = {}
+    cwd_match_cache: dict[tuple[int, str | None], bool] = {}
+
+    for server in servers:
+        roots: set[int] = set()
+        project = server.get("project")
+        pid = int(server.get("pid") or 0)
+        if pid in process_table:
+            identity = (server.get("health") or {}).get("identity") or {}
+            if identity.get("ok") is not False:
+                roots.add(pid)
+
+        port = int(server.get("port") or 0)
+        if port and (server.get("status") != "stopped" or server.get("url_is_current") or roots):
+            owner = listener_cache.get(port)
+            if owner is None:
+                owner = listener_owner_for_port(port)
+                listener_cache[port] = owner
+            owner_pid = int(owner.get("pid") or 0)
+            if owner_pid in process_table:
+                cache_key = (owner_pid, str(project) if project else None)
+                matches = cwd_match_cache.get(cache_key)
+                if matches is None:
+                    matches = process_owner_matches_project(owner_pid, str(project) if project else None)
+                    cwd_match_cache[cache_key] = matches
+                if matches:
+                    roots.add(owner_pid)
+
+        pids = process_tree_pids(roots, process_table, children)
+        usage = summarize_process_usage(pids, process_table, root_pids=roots, source="process_tree")
+        if usage:
+            usage["sampled_at"] = sampled_at
+            usage["project"] = project
+            usage["server_id"] = server.get("id")
+            usage["server_name"] = server.get("name")
+            server["process_usage"] = usage
+        else:
+            server.pop("process_usage", None)
+
+    return process_table
+
+
+def build_project_usage(
+    servers: list[dict[str, Any]],
+    docker: dict[str, Any],
+    process_table: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    projects: dict[str, dict[str, Any]] = {}
+    pids_by_project: dict[str, set[int]] = {}
+
+    def ensure(identity: dict[str, str | None]) -> dict[str, Any]:
+        usage_key = str(identity["usage_key"])
+        row = projects.setdefault(
+            usage_key,
+            {
+                "project": identity.get("project"),
+                "project_key": identity.get("project_key"),
+                "name": identity.get("name"),
+                "server_count": 0,
+                "container_count": 0,
+                "process_count": 0,
+                "cpu_percent": 0.0,
+                "memory_bytes": 0,
+                "process_cpu_percent": 0.0,
+                "process_memory_bytes": 0,
+                "docker_cpu_percent": 0.0,
+                "docker_memory_bytes": 0,
+                "processes": [],
+                "hot_processes": [],
+            },
+        )
+        return row
+
+    for server in servers:
+        identity = resource_project_identity(server.get("project"), server.get("name"))
+        row = ensure(identity)
+        row["server_count"] += 1
+        usage = server.get("process_usage") or {}
+        for pid in usage.get("pids") or []:
+            with contextlib.suppress(TypeError, ValueError):
+                pids_by_project.setdefault(str(identity["usage_key"]), set()).add(int(pid))
+
+    for usage_key, pids in pids_by_project.items():
+        row = projects.get(usage_key)
+        if not row:
+            continue
+        summary = summarize_process_usage(pids, process_table, source="project_processes")
+        if not summary:
+            continue
+        row["process_count"] = summary["process_count"]
+        row["process_cpu_percent"] = summary["cpu_percent"]
+        row["process_memory_bytes"] = summary["memory_bytes"]
+        row["processes"] = summary["processes"]
+        row["hot_processes"] = summary["hot_processes"]
+
+    for container in docker.get("containers") or []:
+        identity = resource_project_identity(container.get("project"), container.get("name"))
+        row = ensure(identity)
+        row["container_count"] += 1
+        stats = container.get("stats") or {}
+        if stats.get("live") is False:
+            continue
+        cpu = stats.get("cpu_percent")
+        memory = stats.get("memory_usage_bytes")
+        if isinstance(cpu, (int, float)):
+            row["docker_cpu_percent"] += float(cpu)
+        if isinstance(memory, (int, float)):
+            row["docker_memory_bytes"] += int(memory)
+
+    for row in projects.values():
+        row["cpu_percent"] = round(float(row.get("process_cpu_percent") or 0) + float(row.get("docker_cpu_percent") or 0), 2)
+        row["memory_bytes"] = int(row.get("process_memory_bytes") or 0) + int(row.get("docker_memory_bytes") or 0)
+        row["docker_cpu_percent"] = round(float(row.get("docker_cpu_percent") or 0), 2)
+
+    return sorted(
+        projects.values(),
+        key=lambda item: (float(item.get("cpu_percent") or 0), int(item.get("memory_bytes") or 0), str(item.get("name") or "")),
+        reverse=True,
+    )
+
+
 def stop_reason_from_health(server: dict[str, Any], health: dict[str, Any]) -> str:
     pid = server.get("pid")
     check = health.get("check") or {}
@@ -810,21 +1064,55 @@ def http_health(url: str, timeout: float = 2.0) -> dict[str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return {"ok": False, "error": f"unsupported health URL scheme: {parsed.scheme}"}
-    connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    if not parsed.hostname:
+        return {"ok": False, "error": "health URL is missing a host"}
     path = parsed.path or "/"
     if parsed.query:
         path += f"?{parsed.query}"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    deadline = time.monotonic() + max(timeout, 0.1)
+    sock: socket.socket | ssl.SSLSocket | None = None
     try:
-        conn = connection_class(parsed.hostname, parsed.port, timeout=timeout)
-        conn.request("GET", path)
-        response = conn.getresponse()
-        response.read(200)
-        return {"ok": 200 <= response.status < 400, "status": response.status, "reason": response.reason}
-    except OSError as exc:
+        raw = socket.create_connection((parsed.hostname, port), timeout=timeout)
+        raw.settimeout(max(deadline - time.monotonic(), 0.1))
+        sock = raw
+        if parsed.scheme == "https":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(raw, server_hostname=parsed.hostname)
+            sock.settimeout(max(deadline - time.monotonic(), 0.1))
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {parsed.hostname}\r\n"
+            "Connection: close\r\n"
+            "User-Agent: CodexDevCoordinator/1\r\n"
+            "\r\n"
+        )
+        sock.sendall(request.encode("utf-8"))
+        response = b""
+        while b"\r\n" not in response and len(response) < 8192:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out after {timeout:.1f}s")
+            sock.settimeout(max(remaining, 0.1))
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            response += chunk
+        status_line = response.splitlines()[0].decode("iso-8859-1", errors="replace") if response else ""
+        parts = status_line.split(None, 2)
+        if len(parts) < 2 or not parts[1].isdigit():
+            return {"ok": False, "error": "invalid HTTP response", "response": status_line}
+        status = int(parts[1])
+        reason = parts[2] if len(parts) > 2 else ""
+        return {"ok": 200 <= status < 400, "status": status, "reason": reason}
+    except (socket.timeout, TimeoutError) as exc:
+        return {"ok": False, "classification": "timeout", "error": str(exc)}
+    except (OSError, ssl.SSLError) as exc:
         return {"ok": False, "error": str(exc)}
     finally:
-        with contextlib.suppress(Exception):
-            conn.close()  # type: ignore[name-defined]
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close()
 
 
 def server_health(server: dict[str, Any]) -> dict[str, Any]:
@@ -1974,6 +2262,7 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
     ]
     servers = deduplicate_server_records(servers)
     annotate_server_url_currency(servers)
+    process_table = annotate_server_process_usage(servers)
     urls = [
         {
             "name": server.get("name"),
@@ -1992,6 +2281,7 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
             continue
         recent_events.append(event)
     docker = docker_ps_inventory(state=state) if include_docker else {"available": None, "containers": [], "postgres": []}
+    project_usage = build_project_usage(servers, docker, process_table)
     return {
         "coordinator_home": str(coordinator_home()),
         "state_path": str(state_path()),
@@ -2003,6 +2293,7 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
         "docker": docker,
         "postgres": docker.get("postgres", []),
         "backups": backup_inventory(resolved_project, backup_dirs),
+        "project_usage": project_usage,
     }
 
 

@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HARNESS = ROOT / "full_repo_harness"
 SKILLS = [
     ROOT / "skills" / "codex-dev-coordinator",
+    ROOT / "skills" / "formal-web-ui-verification",
     ROOT / "skills" / "full-repo-audit",
     ROOT / "skills" / "full-repo-test-coverage-audit",
     ROOT / "skills" / "postgres-docker-backup",
@@ -263,7 +264,7 @@ def check_ops_console_interaction_guardrails() -> None:
         "stale foreign pid stop guard": "linked server process belongs to a different project",
         "current url marker": "url_is_current",
         "port reuse owner marker": "port_reused_by",
-        "strict default http health": "200 <= response.status < 400",
+        "strict default http health": "200 <= status < 400",
         "404 health self-test": "HTTP 404 health checks should not be treated as healthy",
         "strict health skill policy": "Default HTTP health accepts 2xx and 3xx responses",
         "foreign adoption self-test": "wrong-project adoption should report stale coordinator metadata",
@@ -281,6 +282,21 @@ def check_ops_console_interaction_guardrails() -> None:
         "skill logical server inventory contract": "Inventory must show one current row per logical server identity",
         "swift managed server dedupe": "func deduplicatedManagedServers(",
         "swift xfoilfoam duplicate regression": "project tree should not show duplicate api server rows",
+        "coordinator process table": "def read_process_table(",
+        "coordinator process tree usage": "def annotate_server_process_usage(",
+        "coordinator project usage rollup": "def build_project_usage(",
+        "inventory project usage": "\"project_usage\": project_usage",
+        "bounded socket http health": "socket.create_connection((parsed.hostname, port), timeout=timeout)",
+        "http health timeout classification": "\"classification\": \"timeout\"",
+        "project usage model": "struct ProjectUsage",
+        "process usage model": "struct ProcessUsage",
+        "project load strip": "ProjectUsageStrip",
+        "project load hot process": "hotProcessLabel(",
+        "multi coordinator home discovery": "discoveredCoordinatorHomes",
+        "coordinator env per inventory": "CODEX_AGENT_COORDINATOR_HOME",
+        "process usage self-test": "inventory should expose project usage rollups",
+        "hanging health self-test": "hanging HTTP health checks should be bounded",
+        "project resource skill contract": "per-server process CPU/RSS",
     }
     haystacks = "\n".join([source_text, views, store, models, menu_snapshot, split_sizing, coordinator, coordinator_self_test, coordinator_skill])
     missing = [label for label, needle in required.items() if needle not in haystacks]
@@ -352,6 +368,7 @@ def main() -> int:
             "compileall",
             "full_repo_harness",
             "skills/codex-dev-coordinator/scripts",
+            "skills/formal-web-ui-verification/scripts",
             "skills/full-repo-audit/scripts",
             "skills/full-repo-test-coverage-audit/scripts",
             "skills/postgres-docker-backup/scripts",

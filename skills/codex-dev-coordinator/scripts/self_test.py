@@ -108,6 +108,17 @@ def wait_for_http(port: int) -> None:
     raise AssertionError(f"HTTP fixture on {port} did not become ready")
 
 
+def wait_for_tcp(port: int) -> None:
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise AssertionError(f"TCP fixture on {port} did not become ready")
+
+
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -193,6 +204,13 @@ def main() -> int:
         inventory = run(["inventory", "--project", str(tmp), "--no-docker"], env=env)
         check(inventory["urls"][0]["url"] == server["url"], "inventory should expose managed server URL")
         check(inventory["servers"][0]["status"] == "running", "inventory should health-check managed server")
+        usage = inventory["servers"][0].get("process_usage") or {}
+        check(usage.get("process_count", 0) >= 1, "inventory should expose managed server process usage")
+        check(usage.get("memory_bytes", 0) > 0, "managed server process usage should include RSS memory")
+        project_usage = inventory.get("project_usage") or []
+        check(project_usage, "inventory should expose project usage rollups")
+        check(project_usage[0].get("process_count", 0) >= 1, "project usage should count managed processes")
+        check(project_usage[0].get("memory_bytes", 0) > 0, "project usage should include managed process memory")
         status = run(["server", "status", "--project", str(tmp), "--name", "fixture-web"], env=env)
         check(status["status"] == "running", "server status should be running")
         stopped = run(["server", "stop", "--agent", "agent-a", "--project", str(tmp), "--name", "fixture-web", "--reason", "test stop"], env=env)
@@ -300,6 +318,58 @@ def main() -> int:
             env=env,
         )
         check(bad_health["status"] == "unhealthy", "HTTP 404 health checks should not be treated as healthy")
+        hanging_health_project = tmp / "hanging-health-project"
+        hanging_health_project.mkdir()
+        hanging_health_port = free_port()
+        hanging_health_code = (
+            "import socket, time\n"
+            "srv = socket.socket()\n"
+            "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            f"srv.bind(('127.0.0.1', {hanging_health_port}))\n"
+            "srv.listen(5)\n"
+            "while True:\n"
+            "    conn, _ = srv.accept()\n"
+            "    time.sleep(30)\n"
+        )
+        hanging_health_process = subprocess.Popen(
+            [sys.executable, "-c", hanging_health_code],
+            cwd=hanging_health_project,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        external_processes.append(hanging_health_process)
+        wait_for_tcp(hanging_health_port)
+        before = time.time()
+        hanging_health = run(
+            [
+                "server",
+                "register",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(hanging_health_project),
+                "--name",
+                "hanging-health-web",
+                "--port",
+                str(hanging_health_port),
+                "--url",
+                f"http://127.0.0.1:{hanging_health_port}",
+                "--health-url",
+                f"http://127.0.0.1:{hanging_health_port}/",
+                "--health-timeout",
+                "1",
+            ],
+            env=env,
+        )
+        check(time.time() - before < 6, "hanging HTTP health checks should be bounded")
+        check(hanging_health["status"] == "unhealthy", "hanging HTTP health checks should report unhealthy")
+        hanging_inventory = run(["inventory", "--project", str(hanging_health_project), "--no-docker"], env=env)
+        hanging_server = next(item for item in hanging_inventory["servers"] if item["name"] == "hanging-health-web")
+        check(
+            (hanging_server.get("health") or {}).get("check", {}).get("classification") == "timeout",
+            "hanging HTTP inventory health should classify timeout",
+        )
         wrong_owner_project = tmp / "wrong-owner-project"
         wrong_owner_project.mkdir()
         wrong_runtime_dir = wrong_owner_project / ".codex"

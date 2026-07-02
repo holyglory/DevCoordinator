@@ -10,6 +10,11 @@ reviewed, and prepared for installation into a Codex skills directory.
 - `skills/codex-dev-coordinator/`: a shared coordinator skill for leasing
   ports, starting/stopping/restarting dev servers, checking health, and routing
   Docker/Docker Compose commands through one local CLI or HTTP endpoint.
+- `skills/formal-web-ui-verification/`: a browser-side formal UI verification
+  skill that injects deterministic JavaScript through Playwright to catch
+  clipped text, hidden controls, overlap, off-canvas elements, broken media,
+  invisible text, horizontal overflow, and visible scrollbars across desktop
+  and mobile web routes.
 - `skills/full-repo-audit/`: a repository-wide audit skill for source,
   architecture, user journeys, UI elements, intended features, and tests.
 - `skills/full-repo-test-coverage-audit/`: a repository-wide test coverage
@@ -52,6 +57,7 @@ them:
 ```bash
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 rsync -a --delete skills/codex-dev-coordinator/ "$CODEX_HOME/skills/codex-dev-coordinator/"
+rsync -a --delete skills/formal-web-ui-verification/ "$CODEX_HOME/skills/formal-web-ui-verification/"
 ```
 
 Codex sessions load skill metadata at startup. After installing or updating a
