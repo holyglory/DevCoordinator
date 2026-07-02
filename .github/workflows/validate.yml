@@ -1,0 +1,38 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    # macOS is required: scripts/validate.py builds the CodexOpsConsole Swift app
+    # and the formal-web-ui self-test drives a real Chromium via Playwright.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Playwright Chromium
+        run: |
+          mkdir -p "$HOME/pw-deps"
+          cd "$HOME/pw-deps"
+          npm init -y >/dev/null 2>&1
+          npm install playwright >/dev/null 2>&1
+          npx playwright install chromium
+          echo "NODE_PATH=$HOME/pw-deps/node_modules" >> "$GITHUB_ENV"
+
+      - name: Run validation gate
+        run: python3 scripts/validate.py

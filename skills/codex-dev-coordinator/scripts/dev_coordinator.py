@@ -28,6 +28,19 @@ DEFAULT_RANGE = "3000-3999"
 DEFAULT_TTL_SECONDS = 8 * 60 * 60
 DEFAULT_API_PORT = 29876
 GRACE_SECONDS = 5
+# A server that fails its health check but was created within this window is
+# reported as "starting" rather than "unhealthy" so slow-booting servers do not
+# trigger needless restart churn.
+STARTUP_GRACE_SECONDS = 20
+# Live `server status` re-checks health a few times before concluding a server
+# is unhealthy, so a transient blip or a still-warming server is not
+# misclassified after a single miss.
+HEALTH_RETRY_ATTEMPTS = 3
+HEALTH_RETRY_BACKOFF_SECONDS = 0.3
+# Stopped-server records are kept for evidence but pruned so the state file does
+# not grow without bound across months of start/stop cycles.
+STOPPED_SERVER_RETENTION_SECONDS = 7 * 24 * 60 * 60
+STOPPED_SERVER_LIMIT = 100
 DOCKER_STATS_HISTORY_LIMIT = 120
 PROJECT_RUNTIME_FILES = (
     ".codex/dev-runtime.json",
@@ -117,7 +130,18 @@ def read_state() -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"Invalid coordinator state JSON at {path}: {exc}") from exc
+        # A corrupt state file (e.g. a partial write after a crash) must not make
+        # even read-only commands like `inventory` unusable. Preserve the corrupt
+        # file for forensics and recover with a fresh default state.
+        backup = path.with_name(f"{path.name}.corrupt-{int(now())}")
+        with contextlib.suppress(OSError):
+            path.replace(backup)
+        print(
+            f"warning: invalid coordinator state JSON at {path}: {exc}; "
+            f"backed up to {backup} and reinitialized empty state",
+            file=sys.stderr,
+        )
+        return default_state()
     data.setdefault("version", VERSION)
     data.setdefault("created_at", iso_timestamp())
     data.setdefault("updated_at", iso_timestamp())
@@ -148,6 +172,7 @@ def locked_state() -> Any:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = read_state()
         prune_expired_leases(state)
+        prune_stopped_servers(state)
         yield state
         write_state(state)
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -397,6 +422,40 @@ def port_available(port: int, host: str = "127.0.0.1") -> bool:
         except OSError:
             return False
     return True
+
+
+def prune_stopped_servers(state: dict[str, Any]) -> None:
+    """Bound the growth of stopped-server records kept for evidence.
+
+    Drops stopped servers older than the retention window, then caps the total
+    number of stopped records (oldest first). Running/adopted servers and any
+    server without a recorded stop time newer than the cap are preserved.
+    """
+    servers = state.get("servers")
+    if not isinstance(servers, dict):
+        return
+    current = now()
+    for server_id, server in list(servers.items()):
+        if not isinstance(server, dict) or server.get("status") != "stopped":
+            continue
+        stopped_ts = server.get("stopped_ts")
+        if stopped_ts is None:
+            continue
+        try:
+            age = current - float(stopped_ts)
+        except (TypeError, ValueError):
+            continue
+        if age > STOPPED_SERVER_RETENTION_SECONDS:
+            servers.pop(server_id, None)
+    stopped = [
+        (server_id, server)
+        for server_id, server in servers.items()
+        if isinstance(server, dict) and server.get("status") == "stopped"
+    ]
+    if len(stopped) > STOPPED_SERVER_LIMIT:
+        stopped.sort(key=lambda item: float(item[1].get("stopped_ts") or 0.0))
+        for server_id, _ in stopped[: len(stopped) - STOPPED_SERVER_LIMIT]:
+            servers.pop(server_id, None)
 
 
 def prune_expired_leases(state: dict[str, Any]) -> None:
@@ -1016,6 +1075,7 @@ def mark_server_stopped(
     was_stopped = server.get("status") == "stopped"
     server["status"] = "stopped"
     server["stopped_at"] = stopped_at or server.get("stopped_at") or iso_timestamp()
+    server["stopped_ts"] = now()
     server["stopped_reason"] = reason
     server["updated_at"] = iso_timestamp()
     if record and not was_stopped:
@@ -1115,20 +1175,61 @@ def http_health(url: str, timeout: float = 2.0) -> dict[str, Any]:
                 sock.close()
 
 
-def server_health(server: dict[str, Any]) -> dict[str, Any]:
+def within_startup_grace(server: dict[str, Any]) -> bool:
+    created_ts = server.get("created_ts")
+    if created_ts is None:
+        return False
+    try:
+        return (now() - float(created_ts)) <= STARTUP_GRACE_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def server_health(
+    server: dict[str, Any],
+    *,
+    attempts: int = 1,
+    backoff: float = HEALTH_RETRY_BACKOFF_SECONDS,
+) -> dict[str, Any]:
     pid = int(server.get("pid") or 0)
     alive: bool | None = pid_alive(pid) if pid else None
+    if alive is False:
+        return {
+            "ok": False,
+            "pid_alive": False,
+            "check": {"ok": False, "skipped": "recorded process is not alive"},
+            "identity": {"ok": True, "skipped": "not checked because recorded process is not alive"},
+            "classification": "stopped",
+        }
     identity = server_listener_identity(server)
     health_url = server.get("health_url")
-    if health_url:
-        check = http_health(health_url)
+    attempts = max(1, int(attempts))
+    check: dict[str, Any] = {"ok": False}
+    for attempt in range(attempts):
+        if health_url:
+            check = http_health(health_url)
+        else:
+            check = {"ok": port_open("127.0.0.1", int(server["port"]))}
+        if check.get("ok"):
+            break
+        if attempt + 1 < attempts:
+            time.sleep(max(0.0, backoff))
+    ok = alive is not False and bool(check.get("ok")) and identity.get("ok") is not False
+    if ok:
+        classification = "healthy"
+    elif identity.get("ok") is False:
+        classification = "wrong-listener"
+    elif within_startup_grace(server):
+        classification = "starting"
     else:
-        check = {"ok": port_open("127.0.0.1", int(server["port"]))}
+        classification = "unhealthy"
     return {
-        "ok": alive is not False and bool(check.get("ok")) and identity.get("ok") is not False,
+        "ok": ok,
         "pid_alive": alive,
         "check": check,
         "identity": identity,
+        "attempts": attempts,
+        "classification": classification,
     }
 
 
@@ -2511,6 +2612,7 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
         "agent_metadata": agent_metadata(agent=agent, project=project, cwd=cwd, source="server_start"),
         "status": "starting",
         "created_at": iso_timestamp(),
+        "created_ts": now(),
         "updated_at": iso_timestamp(),
     }
     health = wait_for_health(server, float(options.get("health_timeout") or 10))
@@ -2593,7 +2695,7 @@ def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, A
         server_id, server = find_server(state, project=options["project"], name=options["name"])
     if not server:
         raise KeyError("matching server not found")
-    health = server_health(server)
+    health = server_health(server, attempts=HEALTH_RETRY_ATTEMPTS)
     server["health"] = health
     if server.get("status") == "stopped":
         pass
@@ -2612,7 +2714,10 @@ def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, A
     elif not health.get("pid_alive"):
         mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
     else:
-        server["status"] = "unhealthy"
+        # A live, correctly-owned server that fails its health check is only
+        # "unhealthy" once it is past its startup grace window; before that it is
+        # still "starting" so a slow boot does not read as a failure.
+        server["status"] = "starting" if health.get("classification") == "starting" else "unhealthy"
         server["updated_at"] = iso_timestamp()
     return server
 

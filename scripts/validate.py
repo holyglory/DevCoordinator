@@ -355,10 +355,46 @@ def check_ops_console_interaction_guardrails() -> None:
     )
 
 
+def check_interaction_label_parity() -> None:
+    """The interaction checklist labels must live only in the shared harness.
+
+    They are the single source of truth for the UI 'hard reporting gate'. If a
+    verifier hardcodes its own copy of the tuple, the gate can silently drift
+    between skills, so fail if the canonical constant name appears anywhere but
+    the shared harness (root + vendored copies).
+    """
+    canonical = HARNESS / "verify_common.py"
+    text = canonical.read_text(encoding="utf-8")
+    labels = [
+        "badge-detail",
+        "row-hit-target",
+        "navigation-cursor",
+        "transient-disclosure",
+        "disclosure-scrollbar",
+        "icon-meaning",
+        "stable-expansion-width",
+        "hover-copy",
+        "status-summary",
+        "message-metadata",
+    ]
+    for label in labels:
+        if label not in text:
+            raise SystemExit(f"Canonical interaction checklist label missing from verify_common.py: {label}")
+    for skill in SKILLS:
+        for verifier in (skill / "scripts").glob("verify_*.py"):
+            body = verifier.read_text(encoding="utf-8")
+            if "INTERACTION_CHECKLIST_LABELS" in body:
+                raise SystemExit(
+                    f"{verifier} redefines INTERACTION_CHECKLIST_LABELS; import it from full_repo_harness.verify_common instead"
+                )
+
+
 def main() -> int:
     check_vendor_sync()
+    check_interaction_label_parity()
     check_include_glob_exclusions()
     check_ops_console_interaction_guardrails()
+    run([sys.executable, str((ROOT / "scripts" / "merge_findings_self_test.py"))])
     for skill in SKILLS:
         run([sys.executable, str(skill.relative_to(ROOT) / "scripts" / "self_test.py")])
     run(

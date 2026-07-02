@@ -1,19 +1,23 @@
-# Global Agent Instructions
+# Repo Agent Instructions
 
-## Codex Implementation Mistake Protocol
+These instructions apply to every coding agent working in this repository
+(Codex and Claude Code alike). "The agent" below means whichever assistant is
+doing the work.
 
-When the user reports an implementation mistake likely made by Codex, handle it
-as a prevention-first incident unless the evidence shows the user changed their
-mind or the requested behavior changed after implementation.
+## Agent Implementation Mistake Protocol
+
+When the user reports an implementation mistake likely made by the agent,
+handle it as a prevention-first incident unless the evidence shows the user
+changed their mind or the requested behavior changed after implementation.
 
 1. Reproduce the reported error through the same surface the user saw whenever
    it is possible and reasonable. If it cannot be reproduced, record why and
    gather the closest concrete evidence available.
 2. Check whether the failure is actually a changed requirement. Compare the
    original request, later clarifications, accepted plans, project docs, and
-   delivered behavior before treating it as a Codex mistake.
+   delivered behavior before treating it as an agent mistake.
 3. If the request was not changed, trace why the mistake happened before
-   changing product code. Inspect the user intent, how Codex perceived the
+   changing product code. Inspect the user intent, how the agent perceived the
    request, requirements, journey docs, design handoff, implementation, tests,
    verifier rules, audit outputs, tool choices, policies, skills, context, and
    handoff assumptions.
@@ -48,6 +52,13 @@ toward durable prevention when the same class of mistake could recur.
 - Keep each skill's `SKILL.md` contract authoritative and mirror enforceable
   behavior in deterministic self-tests where possible.
 - Test the changed path the same way it was reproduced.
+- For detector-style skills (verifiers, auditors, linters, monitors), the
+  self-test must prove recall as well as precision: include at least one
+  realistic must-catch fixture per detection class the `SKILL.md` advertises,
+  built the way real applications break rather than the way the detector
+  measures, plus false-positive guards for common intentional patterns. A
+  detector change is not validated while an advertised detection class has no
+  realistic failing fixture.
 - When a test or verifier missed a user-visible mistake, audit neighboring
   testing gaps and add comprehensive post-fix coverage before delivery.
 - Never deliver static mocks, fake plumbing, no-op UI, synthetic data flows, or

@@ -1,8 +1,10 @@
 # Holy Skills
 
-Holy Skills is a local curation and development repository for Codex skills.
-It is meant to hold reusable skills while they are being designed, tested,
-reviewed, and prepared for installation into a Codex skills directory.
+Holy Skills is a local curation and development repository for agent skills.
+The skills were originally built for Codex and remain Codex-compatible; they
+are also installable into Claude Code. This repo holds reusable skills while
+they are being designed, tested, reviewed, and prepared for installation into
+a Codex or Claude Code skills directory.
 
 ## Layout
 
@@ -66,6 +68,27 @@ Parall, VMs, or multiple OS users, verify the target app's `$HOME` and
 `$CODEX_HOME`; installing into `/Users/holyglory/.codex/skills` on the host does
 not make the skill available inside a separate guest, sandbox, or account unless
 that environment points to the same Codex home.
+
+For Claude Code, deploy the same skill directories into the personal skills
+home (skills are discovered at session startup, so restart the session after
+installing or updating):
+
+```bash
+CLAUDE_SKILLS="$HOME/.claude/skills"
+mkdir -p "$CLAUDE_SKILLS"
+for skill in skills/*/; do
+  rsync -a --delete --exclude '__pycache__' --exclude '*.pyc' \
+    "$skill" "$CLAUDE_SKILLS/$(basename "$skill")/"
+done
+```
+
+Global (all-project) agent policy is maintained per runtime:
+`~/.codex/AGENTS.md` for Codex (mirrored read-only at
+`reference/codex-app-wide/AGENTS.md`) and `~/.claude/CLAUDE.md` for Claude
+Code. When a generalized rule changes in one file, mirror it into the other so
+both runtimes enforce the same policy. The skills coordinate through the same
+shared state (`~/.codex/agent-coordinator/`) regardless of which runtime runs
+them.
 
 ## Local Service Policy
 

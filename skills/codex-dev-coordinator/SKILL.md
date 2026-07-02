@@ -1,13 +1,13 @@
 ---
 name: codex-dev-coordinator
-description: Use when Codex agents in one or multiple Codex apps need coordinated port leases, shared dev-server start/stop/restart/status/health control, or Docker/Docker Compose management through a single local coordinator CLI or HTTP endpoint.
+description: Use when coding agents (Codex, Claude Code) in one or multiple apps or sessions need coordinated port leases, shared dev-server start/stop/restart/status/health control, or Docker/Docker Compose management through a single local coordinator CLI or HTTP endpoint.
 ---
 
 # Codex Dev Coordinator
 
 Use this skill before starting local dev servers, allocating ports, inspecting
-running services, or managing Docker when multiple Codex agents or Codex app
-instances may be working on the same machine.
+running services, or managing Docker when multiple agent sessions or app
+instances (Codex, Claude Code, or both) may be working on the same machine.
 
 ## Core Rule
 
@@ -41,7 +41,12 @@ The bundled script stores leases and server metadata under:
 ~/.codex/agent-coordinator/
 ```
 
-For multiple OS users, Parallels VMs, or separate Codex accounts that need one
+This default is intentionally shared by every runtime on the machine: Codex and
+Claude Code sessions must use the same state directory so they see each other's
+leases, servers, and containers. Do not point one runtime at a different state
+home unless every agent on the machine moves with it.
+
+For multiple OS users, Parallels VMs, or separate agent accounts that need one
 shared memory, set the same writable path in every agent shell:
 
 ```bash
@@ -316,6 +321,23 @@ reporting success.
    through the process cwd/git root. If a registered server PID or port belongs
    to another project, treat it as `stale_coordinator_metadata`; do not report
    it as working and do not kill the foreign PID.
+
+## Health, Status, And State Robustness
+
+- `server status` re-checks health a few times with a short backoff before
+  concluding a server is down, so a transient blip or a still-warming server is
+  not misclassified after a single miss.
+- A live, correctly-owned server that fails its health check within its startup
+  grace window is reported as `starting`, not `unhealthy`, so a slow boot does
+  not trigger needless restart churn. After the grace window it becomes
+  `unhealthy`. `server_health` also returns a `classification` of `healthy`,
+  `starting`, `unhealthy`, `wrong-listener`, or `stopped`.
+- Stopped-server records are retained for evidence but pruned once they pass the
+  retention window or exceed the per-home cap, so the shared state file does not
+  grow without bound across months of start/stop cycles.
+- A corrupt state file (for example a partial write after a crash) is backed up
+  to `state.json.corrupt-<epoch>` and replaced with a fresh default state, so
+  read-only commands like `inventory` recover instead of failing.
 
 ## Safety Notes
 

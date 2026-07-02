@@ -73,6 +73,27 @@ if args[:2] == ["exec", "pg-fixture"] and "pg_dump" in args:
     sys.stdout.write("PGDMP fixture custom backup\\n")
     raise SystemExit(0)
 
+# Deep verify (--test-restore): create/drop scratch DB + sanity query run via
+# `psql -c` without stdin (exec, not exec -i).
+if args[:2] == ["exec", "pg-fixture"] and "psql" in args and "-c" in args:
+    sql = args[args.index("-c") + 1]
+    fail = os.environ.get("FAKE_DOCKER_FAIL", "")
+    if sql.startswith("CREATE DATABASE"):
+        if fail == "create":
+            print("could not create database", file=sys.stderr)
+            raise SystemExit(1)
+        print("CREATE DATABASE")
+        raise SystemExit(0)
+    if sql.startswith("DROP DATABASE"):
+        print("DROP DATABASE")
+        raise SystemExit(0)
+    # Sanity query against the scratch DB.
+    if fail == "sanity":
+        print("relation does not exist", file=sys.stderr)
+        raise SystemExit(1)
+    print("7")
+    raise SystemExit(0)
+
 if args[:3] == ["exec", "-i", "pg-fixture"] and "pg_restore" in args and "--list" in args:
     _ = sys.stdin.read()
     print("; archive created by pg_dump fixture")
@@ -81,7 +102,19 @@ if args[:3] == ["exec", "-i", "pg-fixture"] and "pg_restore" in args and "--list
 
 if args[:3] == ["exec", "-i", "pg-fixture"] and "pg_restore" in args:
     _ = sys.stdin.read()
+    if os.environ.get("FAKE_DOCKER_FAIL", "") == "restore":
+        print("pg_restore: error: truncated dump", file=sys.stderr)
+        raise SystemExit(1)
     print("restore ok")
+    raise SystemExit(0)
+
+# Plain-SQL restore into scratch DB uses psql over stdin (no -c).
+if args[:3] == ["exec", "-i", "pg-fixture"] and "psql" in args:
+    _ = sys.stdin.read()
+    if os.environ.get("FAKE_DOCKER_FAIL", "") == "restore":
+        print("psql: error: syntax error at end of input", file=sys.stderr)
+        raise SystemExit(1)
+    print("plain restore ok")
     raise SystemExit(0)
 
 print("unsupported fake docker command: " + json.dumps(args), file=sys.stderr)
@@ -125,6 +158,69 @@ def main() -> int:
         verified = parse_json(run(["verify", "--file", str(backup_path)], env=env))
         check(verified["ok"], "verify should pass")
         check("widgets" in verified["pg_restore_list"], "verify should return pg_restore list output")
+        check("test_restore" not in verified, "default verify should stay lightweight (no test restore)")
+
+        # --- Deep verify (--test-restore) happy path ---
+        log_path = Path(env["FAKE_DOCKER_LOG"])
+        log_path.write_text("", encoding="utf-8")
+        deep = parse_json(run(["verify", "--file", str(backup_path), "--test-restore"], env=env))
+        check(deep["ok"], "deep verify should pass")
+        check(deep.get("test_restore") is True, "deep verify should report test_restore=True")
+        scratch = deep["scratch_db"]
+        check(scratch.startswith("codex_verify_"), "scratch DB should be uniquely named codex_verify_*")
+        check(scratch != "appdb", "scratch DB must not be the real database")
+        check(deep["restore_returncode"] == 0, "deep verify should report restore exit status")
+        check(deep["table_count"] == 7, "deep verify should report sanity-query table_count")
+        check(deep["target_database"] == "appdb", "deep verify should report the real target database")
+
+        # Inspect the actual docker command sequence that was emitted.
+        seq = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+        def phase_index(pred) -> int:
+            for i, cmd in enumerate(seq):
+                if pred(cmd):
+                    return i
+            return -1
+
+        create_i = phase_index(lambda c: "psql" in c and "-c" in c and c[c.index("-c") + 1].startswith("CREATE DATABASE"))
+        restore_i = phase_index(lambda c: c[:3] == ["exec", "-i", "pg-fixture"] and "pg_restore" in c and "--list" not in c)
+        sanity_i = phase_index(lambda c: "psql" in c and "-c" in c and "pg_tables" in c[c.index("-c") + 1])
+        drop_i = phase_index(lambda c: "psql" in c and "-c" in c and c[c.index("-c") + 1].startswith("DROP DATABASE"))
+        check(create_i != -1, "deep verify should create a scratch DB")
+        check(restore_i != -1, "deep verify should restore into the scratch DB")
+        check(sanity_i != -1, "deep verify should run a sanity query")
+        check(drop_i != -1, "deep verify should drop the scratch DB")
+        check(create_i < restore_i < sanity_i < drop_i, "deep verify order: create -> restore -> sanity -> drop")
+
+        # Restore must target the scratch DB, never the real --database.
+        restore_cmd = seq[restore_i]
+        check(restore_cmd[restore_cmd.index("-d") + 1] == scratch, "restore must target the scratch DB")
+        for cmd in seq:
+            if "pg_restore" in cmd and "--list" not in cmd:
+                check("appdb" not in cmd, "test-restore must never target the real database")
+
+        # --- Deep verify drops scratch DB even when restore fails ---
+        fail_env = dict(env)
+        fail_env["FAKE_DOCKER_FAIL"] = "restore"
+        log_path.write_text("", encoding="utf-8")
+        run(["verify", "--file", str(backup_path), "--test-restore"], env=fail_env, expect=1)
+        fail_seq = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        check(
+            any("psql" in c and "-c" in c and c[c.index("-c") + 1].startswith("DROP DATABASE") for c in fail_seq),
+            "scratch DB must be dropped even when restore fails",
+        )
+
+        # --- Deep verify drops scratch DB even when the sanity query fails ---
+        sanity_fail_env = dict(env)
+        sanity_fail_env["FAKE_DOCKER_FAIL"] = "sanity"
+        log_path.write_text("", encoding="utf-8")
+        run(["verify", "--file", str(backup_path), "--test-restore"], env=sanity_fail_env, expect=1)
+        sanity_seq = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        check(
+            any("psql" in c and "-c" in c and c[c.index("-c") + 1].startswith("DROP DATABASE") for c in sanity_seq),
+            "scratch DB must be dropped even when the sanity query fails",
+        )
+        log_path.write_text("", encoding="utf-8")
 
         rejected = run(["restore", "--file", str(backup_path), "--no-safety-backup"], env=env, expect=1)
         check("confirm" in rejected.stderr.lower(), "restore should require confirmation")

@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -255,6 +256,136 @@ def restore_command(container: str, user: str, database: str, password: str | No
     raise ValueError(f"unsupported restore format: {backup_format}")
 
 
+SANITY_QUERY = (
+    "SELECT count(*) FROM pg_catalog.pg_tables "
+    "WHERE schemaname NOT IN ('pg_catalog', 'information_schema');"
+)
+
+
+def scratch_db_name() -> str:
+    return f"codex_verify_{uuid.uuid4().hex[:12]}"
+
+
+def psql_exec_command(container: str, user: str, database: str, password: str | None, sql: str) -> list[str]:
+    """Run a single SQL statement via psql in the container, against `database`."""
+    return [
+        "exec",
+        container,
+        *auth_prefix(password),
+        "psql",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        user,
+        "-d",
+        database,
+        "-c",
+        sql,
+    ]
+
+
+def create_scratch_db_command(container: str, user: str, password: str | None, scratch_db: str) -> list[str]:
+    # Connect to the maintenance "postgres" database to create the scratch DB.
+    return psql_exec_command(container, user, "postgres", password, f'CREATE DATABASE "{scratch_db}";')
+
+
+def drop_scratch_db_command(container: str, user: str, password: str | None, scratch_db: str) -> list[str]:
+    # Connect to the maintenance "postgres" database to drop the scratch DB.
+    return psql_exec_command(container, user, "postgres", password, f'DROP DATABASE IF EXISTS "{scratch_db}";')
+
+
+def sanity_query_command(container: str, user: str, password: str | None, scratch_db: str) -> list[str]:
+    return [
+        "exec",
+        container,
+        *auth_prefix(password),
+        "psql",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-tA",
+        "-U",
+        user,
+        "-d",
+        scratch_db,
+        "-c",
+        SANITY_QUERY,
+    ]
+
+
+def restore_into_scratch_command(
+    container: str, user: str, password: str | None, scratch_db: str, backup_format: str
+) -> list[str]:
+    """Restore a dump into the scratch DB. Never targets the real database."""
+    prefix = ["exec", "-i", container, *auth_prefix(password)]
+    if backup_format == "custom":
+        # No --clean/--if-exists: the scratch DB is fresh and empty.
+        return [*prefix, "pg_restore", "--no-owner", "-U", user, "-d", scratch_db]
+    if backup_format in {"plain", "all"}:
+        return [*prefix, "psql", "-v", "ON_ERROR_STOP=1", "-U", user, "-d", scratch_db]
+    raise ValueError(f"unsupported backup format: {backup_format}")
+
+
+def deep_verify(
+    path: Path,
+    container: str,
+    user: str,
+    password: str | None,
+    backup_format: str,
+) -> dict[str, Any]:
+    """Restore a dump into a throwaway scratch DB, prove data landed, then always drop it.
+
+    Never targets the real database. The scratch DB is dropped on every exit path
+    (success, restore failure, sanity-query failure).
+    """
+    scratch_db = scratch_db_name()
+    create_cmd = create_scratch_db_command(container, user, password, scratch_db)
+    restore_cmd = restore_into_scratch_command(container, user, password, scratch_db, backup_format)
+    sanity_cmd = sanity_query_command(container, user, password, scratch_db)
+    drop_cmd = drop_scratch_db_command(container, user, password, scratch_db)
+
+    restore_returncode: int | None = None
+    table_count: int | None = None
+    try:
+        docker(create_cmd)
+        restore_result = docker(restore_cmd, input_path=path, capture=True, check=False)
+        restore_returncode = restore_result.returncode
+        if restore_returncode != 0:
+            stderr = restore_result.stderr or ""
+            raise RuntimeError(
+                f"test-restore into scratch DB {scratch_db} failed (exit {restore_returncode}): {stderr.strip()}"
+            )
+        sanity_result = docker(sanity_cmd, capture=True, check=False)
+        if sanity_result.returncode != 0:
+            stderr = sanity_result.stderr or ""
+            raise RuntimeError(
+                f"sanity query on scratch DB {scratch_db} failed (exit {sanity_result.returncode}): {stderr.strip()}"
+            )
+        raw_count = (sanity_result.stdout or "").strip().splitlines()
+        try:
+            table_count = int(raw_count[0]) if raw_count else 0
+        except ValueError as exc:
+            raise RuntimeError(
+                f"sanity query on scratch DB {scratch_db} returned unparseable output: {sanity_result.stdout!r}"
+            ) from exc
+    finally:
+        # Always drop the scratch DB, even if restore or sanity failed.
+        docker(drop_cmd, check=False)
+
+    return {
+        "test_restore": True,
+        "scratch_db": scratch_db,
+        "restore_returncode": restore_returncode,
+        "table_count": table_count,
+        "sanity_query": SANITY_QUERY,
+        "commands": {
+            "create_scratch_db": command_result(create_cmd),
+            "restore_into_scratch": command_result(restore_cmd),
+            "sanity_query": command_result(sanity_cmd),
+            "drop_scratch_db": command_result(drop_cmd),
+        },
+    }
+
+
 def do_verify(args: argparse.Namespace) -> dict[str, Any]:
     path = Path(args.file).expanduser().resolve()
     if not path.exists():
@@ -263,6 +394,20 @@ def do_verify(args: argparse.Namespace) -> dict[str, Any]:
     if manifest and manifest.get("sha256") != sha256_file(path):
         raise RuntimeError("backup checksum does not match manifest")
     backup_format = args.format or (manifest or {}).get("format") or ("custom" if path.suffix == ".dump" else "plain")
+
+    test_restore = getattr(args, "test_restore", False)
+    if test_restore:
+        container, _inspected, env = select_container(args.container)
+        user, database, password = postgres_identity(args, env)
+        deep = deep_verify(path, container, user, password, backup_format)
+        return {
+            "ok": True,
+            "format": backup_format,
+            "sha256": sha256_file(path),
+            "target_database": database,
+            **deep,
+        }
+
     if backup_format == "custom":
         container, _inspected, env = select_container(args.container)
         _user, _database, password = postgres_identity(args, env)
@@ -337,6 +482,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--password")
     verify.add_argument("--file", required=True)
     verify.add_argument("--format", choices=["custom", "plain", "all"])
+    verify.add_argument(
+        "--test-restore",
+        action="store_true",
+        help="deep verify: restore into a throwaway scratch DB in the same container, run a sanity query, then drop it (never touches --database)",
+    )
 
     restore = sub.add_parser("restore")
     restore.add_argument("--container")

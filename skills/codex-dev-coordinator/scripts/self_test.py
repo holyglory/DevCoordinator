@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from shutil import rmtree
@@ -790,6 +791,109 @@ else:
         state = get_json(api_port, "/v1/state")
         history_types = {item["type"] for item in state["history"]}
         check("port.leased" in history_types and "server.stopped" in history_types, "state should retain action history")
+
+        # --- Concurrency: parallel port leases must never double-assign a port ---
+        # lease_port runs inside locked_state (one flock across read-modify-write),
+        # so concurrent leasers must serialize and receive distinct ports.
+        concurrency_range = "38000-38999"
+        lease_results: list[dict] = []
+        lease_errors: list[str] = []
+        lease_lock = threading.Lock()
+
+        def lease_worker(agent_name: str) -> None:
+            try:
+                leased = run(
+                    ["port", "lease", "--agent", agent_name, "--project", str(tmp), "--range", concurrency_range, "--ttl", "120"],
+                    env=env,
+                )
+            except AssertionError as exc:
+                with lease_lock:
+                    lease_errors.append(str(exc))
+                return
+            with lease_lock:
+                lease_results.append(leased)
+
+        lease_threads = [threading.Thread(target=lease_worker, args=(f"conc-agent-{index}",)) for index in range(6)]
+        for thread in lease_threads:
+            thread.start()
+        for thread in lease_threads:
+            thread.join()
+        check(not lease_errors, f"concurrent port leases should all succeed: {lease_errors}")
+        concurrency_ports = [item["port"] for item in lease_results]
+        check(len(concurrency_ports) == 6, f"all concurrent leases should return a port: {concurrency_ports}")
+        check(
+            len(set(concurrency_ports)) == len(concurrency_ports),
+            f"concurrent leases must not double-assign a port: {sorted(concurrency_ports)}",
+        )
+        concurrency_state = run(["state", "show"], env=env)
+        active_lease_ports = [
+            lease["port"] for lease in concurrency_state["leases"].values() if lease.get("status") == "active"
+        ]
+        check(
+            len(active_lease_ports) == len(set(active_lease_ports)),
+            "coordinator state must never hold two active leases on the same port",
+        )
+
+        # --- Stopped-server records past retention are pruned so state does not grow unbounded ---
+        state_file = Path(env["CODEX_AGENT_COORDINATOR_HOME"]) / "state.json"
+        crafted_state = {
+            "version": 1,
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2020-01-01T00:00:00Z",
+            "leases": {},
+            "servers": {
+                "old-stopped": {
+                    "id": "old-stopped",
+                    "name": "old",
+                    "project": str(tmp),
+                    "status": "stopped",
+                    "stopped_at": "2020-01-01T00:00:00Z",
+                    "stopped_ts": time.time() - (30 * 24 * 60 * 60),
+                },
+                "fresh-stopped": {
+                    "id": "fresh-stopped",
+                    "name": "fresh",
+                    "project": str(tmp),
+                    "status": "stopped",
+                    "stopped_at": "2020-01-01T00:00:00Z",
+                    "stopped_ts": time.time(),
+                },
+            },
+            "history": [],
+            "docker": {"last_commands": [], "stats_history": {}, "metadata": {}},
+        }
+        state_file.write_text(json.dumps(crafted_state), encoding="utf-8")
+        pruned_state = run(["state", "show"], env=env)
+        check("old-stopped" not in pruned_state["servers"], "stopped servers past retention should be pruned from state")
+        check("fresh-stopped" in pruned_state["servers"], "recent stopped servers should be retained in state")
+
+        # --- A corrupt state file must recover instead of crashing read-only commands ---
+        state_file.write_text("{ this is not valid json", encoding="utf-8")
+        recovered = run(["inventory", "--project", str(tmp), "--no-docker"], env=env)
+        check("servers" in recovered, "inventory should recover from a corrupt state file instead of crashing")
+        corrupt_backups = list(state_file.parent.glob("state.json.corrupt-*"))
+        check(bool(corrupt_backups), "corrupt state file should be backed up for forensics")
+
+        # --- server_health classification: fresh+unreachable -> starting, aged -> unhealthy ---
+        if str(ROOT / "scripts") not in sys.path:
+            sys.path.insert(0, str(ROOT / "scripts"))
+        import dev_coordinator as dc
+
+        original_identity = dc.server_listener_identity
+        original_pid_alive = dc.pid_alive
+        try:
+            dc.server_listener_identity = lambda server: {"ok": True}
+            dc.pid_alive = lambda pid: True
+            closed_port = free_port()
+            starting_health = dc.server_health({"pid": 1, "port": closed_port, "created_ts": dc.now()})
+            check(starting_health["classification"] == "starting", f"fresh unreachable server should be 'starting': {starting_health}")
+            aged_health = dc.server_health({"pid": 1, "port": closed_port, "created_ts": dc.now() - 600})
+            check(aged_health["classification"] == "unhealthy", f"aged unreachable server should be 'unhealthy': {aged_health}")
+            retried_health = dc.server_health({"pid": 1, "port": closed_port, "created_ts": dc.now()}, attempts=3)
+            check(retried_health.get("attempts") == 3, "server_health should honor the retry attempts count")
+        finally:
+            dc.server_listener_identity = original_identity
+            dc.pid_alive = original_pid_alive
 
         print("self-test ok")
         return 0
