@@ -8,8 +8,8 @@
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-<link rel="stylesheet" href="/app.css?v=1.3.4">
-<script src="/app.js?v=1.3.4" defer></script>
+<link rel="stylesheet" href="/app.css?v=1.4.0">
+<script src="/app.js?v=1.4.0" defer></script>
 </head>
 <body>
 
@@ -55,7 +55,7 @@
   <section id="sec-servers" class="card" data-page="servers" aria-labelledby="servers-h" hidden>
     <div class="sec-head">
       <h2 id="servers-h">Servers <span class="count" id="servers-count" hidden></span></h2>
-      <p class="sec-sub">Dev servers managed by the coordinator, grouped by repo. Each server's public subdomain is managed right here; click a row for logs and details.</p>
+      <p class="sec-sub">Dev servers managed by the coordinator and web servers running in Docker containers, grouped by repo. Each one's public subdomain is managed right here; click a row for logs and details.</p>
     </div>
     <div id="servers-body" class="sec-body">
       <div class="skel" aria-hidden="true"></div>
@@ -84,6 +84,7 @@
           <div class="seg" role="radiogroup" aria-label="Route target type">
             <label class="segopt"><input type="radio" name="rf-kind" value="port" checked><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Fixed port</span></label>
             <label class="segopt"><input type="radio" name="rf-kind" value="server"><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Managed server</span></label>
+            <label class="segopt"><input type="radio" name="rf-kind" value="docker"><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Container</span></label>
           </div>
           <div id="rf-port-wrap" class="target-input">
             <label class="visually-hidden" for="rf-port">Port on 127.0.0.1</label>
@@ -92,6 +93,10 @@
           <div id="rf-server-wrap" class="target-input" hidden>
             <label class="visually-hidden" for="rf-server">Coordinator server</label>
             <select id="rf-server"><option value="">Loading servers…</option></select>
+          </div>
+          <div id="rf-container-wrap" class="target-input" hidden>
+            <label class="visually-hidden" for="rf-container">Docker container and port</label>
+            <select id="rf-container"><option value="">Loading containers…</option></select>
           </div>
         </fieldset>
 

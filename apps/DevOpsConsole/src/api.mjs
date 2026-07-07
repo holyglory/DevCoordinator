@@ -5,7 +5,7 @@
 
 import { CoordError } from './coordinator.mjs';
 import { PrefsError } from './prefs.mjs';
-import { RouteError } from './routes.mjs';
+import { RouteError, publishedContainerPorts } from './routes.mjs';
 
 const BODY_LIMIT = 64 * 1024;
 const SERVER_ACTIONS = new Set(['stop', 'restart']);
@@ -93,7 +93,8 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
 
   async function resolveSafe(slug) {
     try {
-      // resolve() uses coordinator.serversRaw() — never the full inventory.
+      // resolve() uses coordinator.serversRaw() for server routes and the
+      // cached coordinator.inventory() for docker routes (both coalesced).
       return await routeStore.resolve(slug, coordinator);
     } catch (err) {
       return { port: null, reason: err?.message ?? String(err) };
@@ -108,6 +109,7 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
     };
     if (resolved?.reason) view.resolved.reason = resolved.reason;
     if (resolved?.server?.status) view.resolved.serverStatus = resolved.server.status;
+    if (resolved?.container?.status) view.resolved.containerStatus = resolved.container.status;
     return view;
   }
 
@@ -173,6 +175,8 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
       port: body.port,
       project: body.project,
       serverName: body.serverName,
+      containerName: body.containerName,
+      containerPort: body.containerPort,
       auth: body.auth,
       title: body.title,
     });
@@ -182,7 +186,7 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
   async function handleRoutePatch(req, res, slug) {
     const body = await readJsonBody(req);
     const patch = {};
-    for (const key of ['auth', 'title', 'port', 'project', 'serverName', 'kind']) {
+    for (const key of ['auth', 'title', 'port', 'project', 'serverName', 'containerName', 'containerPort', 'kind']) {
       if (Object.hasOwn(body, key)) patch[key] = body[key];
     }
     if (Object.keys(patch).length === 0) {
@@ -267,6 +271,102 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
     });
     if (existing) await routeStore.remove(existing.slug);
     clog?.info?.('server subdomain assigned', { server: server.name, slug: route.slug, auth: route.auth });
+    return sendJson(res, 201, { route: toRouteView(route, await resolveSafe(route.slug)) });
+  }
+
+  // The existing kind:'docker' route publishing this container, if any.
+  function findDockerRoute(name) {
+    return routeStore.list().find((r) => r.kind === 'docker' && r.containerName === name) || null;
+  }
+
+  // Assign / change / remove the subdomain of a docker container in one call.
+  // Body: { name, slug, auth?, port? }. Empty slug unassigns. `port` is the
+  // container-side port and is only needed when the container publishes more
+  // than one — the published host port is resolved live on every request.
+  async function handleDockerSubdomain(req, res, session) {
+    const body = await readJsonBody(req);
+    const name = requireContainer(body.name);
+    // Fresh read: mapping a container must not miss one that started within
+    // the inventory cache window.
+    const inventoryData = await coordinator.inventory({ maxAgeMs: 0 });
+    const docker = inventoryData?.docker;
+    if (!docker || docker.available === false) {
+      throw new ApiError(400, 'docker is unavailable on this machine');
+    }
+    const container = (Array.isArray(docker.containers) ? docker.containers : [])
+      .find((c) => c?.name === name);
+    if (!container) throw new ApiError(404, 'container not found');
+    const existing = findDockerRoute(name);
+    const rawSlug = typeof body.slug === 'string' ? body.slug.trim() : '';
+
+    // Unassign: remove the mapped route (idempotent when none exists).
+    if (!rawSlug) {
+      if (existing) await routeStore.remove(existing.slug);
+      clog?.info?.('docker subdomain removed', { container: name, slug: existing?.slug ?? null });
+      return sendJson(res, 200, { route: null });
+    }
+
+    const authGiven = Object.hasOwn(body, 'auth') ? body.auth : undefined;
+    const options = publishedContainerPorts(container.ports);
+
+    // An explicit container-side port must be currently published, so a typo
+    // cannot silently create a route that never resolves — EXCEPT when it is
+    // the route's existing port (auth changes and renames must keep working
+    // while the container is stopped or republished elsewhere).
+    let requestedPort;
+    if (body.port !== undefined && body.port !== null && body.port !== '') {
+      const p = Number(body.port);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) {
+        throw new ApiError(400, 'port must be a container port between 1 and 65535');
+      }
+      if (p !== existing?.containerPort && !options.some((o) => o.containerPort === p)) {
+        const published = options.map((o) => o.containerPort).join(', ') || 'none';
+        throw new ApiError(400, `container does not publish port ${p} (published: ${published})`);
+      }
+      requestedPort = p;
+    }
+
+    // Same slug already mapped: only access level / container port can
+    // change, and the port only when explicitly requested — never silently
+    // repointed to whatever happens to be published right now.
+    if (existing && existing.slug === rawSlug) {
+      const patch = {};
+      if (authGiven !== undefined) patch.auth = authGiven;
+      if (requestedPort !== undefined && existing.containerPort !== requestedPort) {
+        patch.containerPort = requestedPort;
+      }
+      const route = Object.keys(patch).length
+        ? await routeStore.update(existing.slug, patch)
+        : existing;
+      return sendJson(res, 200, { route: toRouteView(route, await resolveSafe(route.slug)) });
+    }
+
+    // Renames keep the existing port; a brand-new mapping picks the only
+    // published port or demands an explicit choice.
+    let containerPort = requestedPort ?? existing?.containerPort;
+    if (containerPort === undefined) {
+      if (options.length === 1) {
+        containerPort = options[0].containerPort;
+      } else if (options.length === 0) {
+        throw new ApiError(400, 'container publishes no host ports — publish one (compose "ports:") and start the container, then try again');
+      } else {
+        const published = options.map((o) => o.containerPort).join(', ');
+        throw new ApiError(400, `container publishes several ports (${published}) — pass "port" to choose one`);
+      }
+    }
+
+    // New or renamed mapping: create the new route (validates + enforces
+    // uniqueness), then drop the old one so a container maps to one subdomain.
+    const route = await routeStore.create({
+      slug: rawSlug,
+      kind: 'docker',
+      containerName: name,
+      containerPort,
+      auth: authGiven ?? existing?.auth,
+      title: existing?.title,
+    });
+    if (existing) await routeStore.remove(existing.slug);
+    clog?.info?.('docker subdomain assigned', { container: name, slug: route.slug, auth: route.auth, containerPort });
     return sendJson(res, 201, { route: toRouteView(route, await resolveSafe(route.slug)) });
   }
 
@@ -522,6 +622,9 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
       }
       if (method === 'POST' && pathname === '/api/docker/action') {
         return await handleDockerAction(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/docker/subdomain') {
+        return await handleDockerSubdomain(req, res, session);
       }
       if (method === 'POST' && pathname === '/api/docker/logs') {
         return await handleDockerLogs(req, res);

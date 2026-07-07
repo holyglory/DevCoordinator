@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import { promises as fsp } from 'node:fs';
+import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import os from 'node:os';
@@ -38,12 +39,115 @@ describe('e2e: full console stack', () => {
   /** @type {Awaited<ReturnType<typeof startStack>>} */
   let stack;
   let userJar; // authed after the login test; later tests re-login defensively
+  let dockerWeb; // real listener standing in for the docker-published web app
+  let dockerCallsLog; // fake docker appends start/stop/restart argv here
   const extraTempDirs = [];
   const openSockets = new Set();
 
+  // The stack's coordinator sees a FAKE docker CLI (first on its PATH): one
+  // healthy web container whose published host port is a real local listener
+  // (so docker-kind routes proxy to something live), one multi-port container
+  // for the port-disambiguation contract, and an action log for start/stop/
+  // restart wiring proof. Postgres-looking containers are deliberately absent.
+  async function startDockerWebBackend() {
+    const listenOnce = () => new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end('docker-web ok');
+      });
+      server.listen(0, '127.0.0.1', () => resolve({
+        port: server.address().port,
+        close: () => new Promise((done) => {
+          // Drop kept-alive proxy connections first or close() can stall.
+          server.closeAllConnections?.();
+          server.close(done);
+        }),
+      }));
+      server.on('error', reject);
+    });
+    // The coordinator classifies anything whose ports string CONTAINS
+    // "5432" as postgres — an OS-assigned port like 54321 would silently
+    // demote the fixture to a database. Redraw until clean.
+    for (;;) {
+      const backend = await listenOnce();
+      if (!String(backend.port).includes('5432')) return backend;
+      await backend.close();
+    }
+  }
+
+  async function writeFakeDocker(binDir, webHostPort, callsLog) {
+    const projectDir = path.join(binDir, 'e2eweb-project');
+    await fsp.mkdir(projectDir, { recursive: true });
+    const labels = {
+      'com.docker.compose.project': 'e2eweb',
+      'com.docker.compose.project.working_dir': projectDir,
+      'com.docker.compose.service': 'app',
+    };
+    const psRows = [
+      {
+        ID: 'e2eweb000001', Names: 'e2eweb-app-1', Image: 'e2eweb-app',
+        Status: 'Up 2 minutes (healthy)',
+        // Container port 3000 published on the fixture listener's host port —
+        // different numbers on purpose, so resolution must use the mapping.
+        Ports: `0.0.0.0:${webHostPort}->3000/tcp, :::${webHostPort}->3000/tcp`,
+      },
+      {
+        ID: 'e2emulti0001', Names: 'e2emulti-app-1', Image: 'e2emulti-app',
+        Status: 'Up 2 minutes',
+        Ports: '0.0.0.0:19998->3000/tcp, 0.0.0.0:19999->9000/tcp',
+      },
+      {
+        // Dedicated to the stale-route lifecycle test: a seeded route points
+        // at container port 4000, which this container does NOT publish.
+        ID: 'e2estale0001', Names: 'e2estale-app-1', Image: 'e2estale-app',
+        Status: 'Up 2 minutes',
+        Ports: '0.0.0.0:19997->3000/tcp',
+      },
+    ];
+    const inspectMap = {};
+    for (const row of psRows) {
+      const full = { Id: `${row.ID}deadbeef`, Name: `/${row.Names}`, Config: { Labels: labels } };
+      inspectMap[row.ID] = full;
+      inspectMap[row.Names] = full;
+    }
+    const script = `#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+ps_rows = json.loads(${JSON.stringify(JSON.stringify(psRows))})
+inspect_map = json.loads(${JSON.stringify(JSON.stringify(inspectMap))})
+if args[:1] == ["ps"]:
+    for row in ps_rows:
+        print(json.dumps(row))
+elif args[:3] == ["inspect", "--format", "{{json .State}}"]:
+    for _ in args[3:]:
+        print(json.dumps({"Status": "running", "Running": True}))
+elif args[:3] == ["inspect", "--format", "{{json .}}"]:
+    for key in args[3:]:
+        print(json.dumps(inspect_map[key]))
+elif args[:1] == ["stats"]:
+    pass
+elif args[:1] == ["logs"]:
+    print("e2e fake container log line")
+elif args[:1] in (["start"], ["stop"], ["restart"]):
+    with open(${JSON.stringify(callsLog)}, "a") as fh:
+        fh.write(" ".join(args) + "\\n")
+else:
+    sys.exit(1)
+`;
+    const fakeDocker = path.join(binDir, 'docker');
+    await fsp.writeFile(fakeDocker, script, { encoding: 'utf8', mode: 0o755 });
+  }
+
   before(async () => {
+    dockerWeb = await startDockerWebBackend();
+    const fakeBin = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-dockerbin-'));
+    extraTempDirs.push(fakeBin);
+    dockerCallsLog = path.join(fakeBin, 'docker-calls.log');
+    await writeFakeDocker(fakeBin, dockerWeb.port, dockerCallsLog);
+
     stack = await startStack({
       allowedEmails: [FIXTURE_EMAIL],
+      coordinatorEnv: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` },
       routes: ({ upstream, wsEcho }) => [
         // app -> ws-echo (answers plain GET too) — protected by default.
         { slug: 'app', kind: 'port', port: wsEcho.port },
@@ -51,6 +155,9 @@ describe('e2e: full console stack', () => {
         { slug: 'echo', kind: 'port', port: upstream.port },
         // pub -> HTTP echo upstream — explicitly public.
         { slug: 'pub', kind: 'port', port: upstream.port, auth: 'public' },
+        // A docker route whose container port is NOT currently published —
+        // auth changes and renames must keep working on it (test 17).
+        { slug: 'dockstale', kind: 'docker', containerName: 'e2estale-app-1', containerPort: 4000 },
       ],
     });
   });
@@ -64,6 +171,9 @@ describe('e2e: full console stack', () => {
       }
     }
     if (stack) await stack.close();
+    // The docker-web fixture listener refs the event loop — leaving it open
+    // wedges `node --test` (and therefore validate.py/CI) after a green run.
+    if (dockerWeb) await dockerWeb.close();
     for (const dir of extraTempDirs) {
       await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
     }
@@ -1052,5 +1162,187 @@ describe('e2e: full console stack', () => {
     }, { origin: stack.consoleOrigin }, { timeoutMs: 330_000 });
     assert.equal(stopAgain.status, 200, stopAgain.text);
     assert.equal(stopAgain.json?.result?.ok, true);
+  });
+
+  it('16. docker-hosted web servers: inventory row -> subdomain -> proxied 200 -> actions -> unassign', { timeout: 120_000 }, async () => {
+    const jar = await authedJar();
+
+    async function overviewUntil(predicate, label) {
+      const deadline = Date.now() + 20_000;
+      let last = null;
+      for (;;) {
+        last = await apiCall(stack, jar, 'GET', '/api/overview');
+        if (predicate(last.json)) return last;
+        if (Date.now() > deadline) {
+          assert.fail(`${label} — docker inventory: ${JSON.stringify(last.json?.inventory?.docker)?.slice(0, 600)}`);
+        }
+        await delay(500);
+      }
+    }
+
+    // The fake-docker container reaches the console's inventory with its
+    // published mapping intact.
+    const overview = await overviewUntil(
+      (o) => o?.inventory?.docker?.available === true
+        && (o.inventory.docker.containers || []).some((c) => c?.name === 'e2eweb-app-1'),
+      'coordinator must surface the docker web container in the console overview',
+    );
+    const container = overview.json.inventory.docker.containers.find((c) => c.name === 'e2eweb-app-1');
+    assert.match(String(container.ports), /->3000\/tcp/);
+
+    // Assign a subdomain: single published port, so no port choice needed.
+    const assigned = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name: 'e2eweb-app-1',
+      slug: 'dockweb',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(assigned.status, 201, assigned.text);
+    assert.equal(assigned.json.route.kind, 'docker');
+    assert.equal(assigned.json.route.containerName, 'e2eweb-app-1');
+    assert.equal(assigned.json.route.containerPort, 3000);
+    assert.equal(assigned.json.route.resolved.port, dockerWeb.port,
+      'route must resolve to the published HOST port, not the container port');
+
+    // The route serves the real backend through the TLS edge (with session).
+    const viaEdge = await fetchUrl(stack, `https://dockweb.${stack.domain}/`, { jar });
+    assert.equal(viaEdge.status, 200, viaEdge.text);
+    assert.equal(viaEdge.text, 'docker-web ok');
+
+    // Default-deny stands: no session -> no upstream access.
+    const anon = await fetchUrl(stack, `https://dockweb.${stack.domain}/`, {
+      headers: { accept: 'application/json' },
+    });
+    assert.equal(anon.status, 401);
+
+    // Container actions from the console hit docker (argv proves the wiring).
+    const restarted = await apiCall(stack, jar, 'POST', '/api/docker/action', {
+      name: 'e2eweb-app-1',
+      action: 'restart',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(restarted.status, 200, restarted.text);
+    const calls = await fsp.readFile(dockerCallsLog, 'utf8');
+    assert.match(calls, /restart e2eweb-app-1/);
+
+    // Multi-port containers demand an explicit container-port choice…
+    const ambiguous = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name: 'e2emulti-app-1',
+      slug: 'dockmulti',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(ambiguous.status, 400, ambiguous.text);
+    assert.match(ambiguous.json.error, /several ports/);
+    assert.match(ambiguous.json.error, /3000, 9000/);
+
+    // …and honor it, resolving through the chosen mapping.
+    const chosen = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name: 'e2emulti-app-1',
+      slug: 'dockmulti',
+      port: 9000,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(chosen.status, 201, chosen.text);
+    assert.equal(chosen.json.route.containerPort, 9000);
+    assert.equal(chosen.json.route.resolved.port, 19999);
+
+    // A typo'd port cannot create a dead route.
+    const badPort = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name: 'e2emulti-app-1',
+      slug: 'dockmulti',
+      port: 8081,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(badPort.status, 400, badPort.text);
+    assert.match(badPort.json.error, /does not publish port 8081/);
+
+    // Container logs flow end to end through the console endpoint.
+    const logsRes = await apiCall(stack, jar, 'POST', '/api/docker/logs', {
+      name: 'e2eweb-app-1',
+      tail: 50,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(logsRes.status, 200, logsRes.text);
+    assert.match(logsRes.json.text, /e2e fake container log line/);
+
+    // Unassign both — twice each: repeating must stay a calm { route: null },
+    // not an error (the idempotent-unassign contract).
+    for (const name of ['e2eweb-app-1', 'e2emulti-app-1']) {
+      for (let round = 0; round < 2; round += 1) {
+        const removed = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+          name,
+          slug: '',
+        }, { origin: stack.consoleOrigin });
+        assert.equal(removed.status, 200, removed.text);
+        assert.equal(removed.json.route, null);
+      }
+    }
+    const gone = await fetchUrl(stack, `https://dockweb.${stack.domain}/`, { jar });
+    assert.equal(gone.status, 404);
+  });
+
+  it('17. docker subdomain lifecycle: auth changes and renames survive an unpublished container port', { timeout: 60_000 }, async () => {
+    const jar = await authedJar();
+    const name = 'e2estale-app-1';
+
+    // The seeded route points at container port 4000; the container only
+    // publishes 3000 — so the route must exist but resolve dead, honestly.
+    const ov = await apiCall(stack, jar, 'GET', '/api/overview');
+    const stale = (ov.json.routes || []).find((r) => r.slug === 'dockstale');
+    assert.ok(stale, 'seeded dockstale route must appear in the overview');
+    assert.equal(stale.containerPort, 4000);
+    assert.equal(stale.resolved.port, null);
+    assert.match(String(stale.resolved.reason), /does not publish port 4000/);
+
+    // Auth-only update: no port in the body — must succeed AND must not
+    // silently repoint containerPort to the currently-published 3000.
+    const authOnly = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name,
+      slug: 'dockstale',
+      auth: 'public',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(authOnly.status, 200, authOnly.text);
+    assert.equal(authOnly.json.route.auth, 'public');
+    assert.equal(authOnly.json.route.containerPort, 4000, 'auth change must not repoint the container port');
+
+    // Rename: keeps the (unpublished) port, drops the old slug.
+    const renamed = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name,
+      slug: 'dockstale2',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(renamed.status, 201, renamed.text);
+    assert.equal(renamed.json.route.containerPort, 4000, 'rename must keep the existing container port');
+    assert.equal(renamed.json.route.auth, 'public', 'rename must keep the access level');
+    const afterRename = await apiCall(stack, jar, 'GET', '/api/overview');
+    assert.ok(!(afterRename.json.routes || []).some((r) => r.slug === 'dockstale'), 'old slug removed');
+
+    // Re-sending the route's own (unpublished) port is a no-op, not a 400.
+    const samePort = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name,
+      slug: 'dockstale2',
+      port: 4000,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(samePort.status, 200, samePort.text);
+    assert.equal(samePort.json.route.containerPort, 4000);
+
+    // An explicit CHANGE must still name a published port…
+    const badChange = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name,
+      slug: 'dockstale2',
+      port: 8081,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(badChange.status, 400, badChange.text);
+    assert.match(badChange.json.error, /does not publish port 8081/);
+
+    // …and repointing to the real published port brings the route live.
+    const repointed = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name,
+      slug: 'dockstale2',
+      port: 3000,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(repointed.status, 200, repointed.text);
+    assert.equal(repointed.json.route.containerPort, 3000);
+    assert.equal(repointed.json.route.resolved.port, 19997);
+
+    // Cleanup.
+    const removed = await apiCall(stack, jar, 'POST', '/api/docker/subdomain', {
+      name,
+      slug: '',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(removed.status, 200, removed.text);
+    assert.equal(removed.json.route, null);
   });
 });

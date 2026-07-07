@@ -831,6 +831,13 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   margin-left: 10px;
   font-size: 11.5px;
 }
+/* Subdomain chip on tree rows: second line, allowed to wrap — the name line
+   above is nowrap+ellipsis and would clip an inline chip invisible. */
+.tree-grid .c-primary .tree-sub {
+  display: block;
+  white-space: normal;
+  margin-top: 2px;
+}
 
 /* Right-side columns: numbers right-aligned, actions right-aligned. */
 .tree-grid .usage-cell { justify-self: end; }

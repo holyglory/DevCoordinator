@@ -324,15 +324,19 @@ export function createRouteStore({ file, config, log })   // file: <stateDir>/ro
 // → { load(): Promise<void>, list(): Route[], get(slug): Route|null,
 //     create(def): Promise<Route>, update(slug, patch): Promise<Route>,
 //     remove(slug): Promise<Route>,
-//     resolve(slug, coordinator): Promise<{ port: number|null, reason?: string, server?: {id,name,project,status} }> }
+//     resolve(slug, coordinator): Promise<{ port: number|null, reason?: string, server?: {id,name,project,status}, container?: {name,status} }> }
 export class RouteError extends Error {} // .status 400|404|409
+export function parsePublishedPorts(text)      // docker ps Ports → [{hostAddr,hostPort,containerPort}] (tcp, published only)
+export function publishedHostPort(mappings, containerPort) // loopback-reachable host port or null (v4 preferred)
+export function publishedContainerPorts(text)  // [{containerPort, hostPort}] distinct, reachable, sorted
 ```
 Schema on disk: `{ "version": 1, "routes": { "<slug>": Route } }`, atomic
 write (`.tmp` + `rename`). `Route`:
 ```js
-{ slug, kind: 'port'|'server',
+{ slug, kind: 'port'|'server'|'docker',
   port?,                    // kind=port: 1-65535
   project?, serverName?,    // kind=server: coordinator identity key parts
+  containerName?, containerPort?, // kind=docker: container + its CONTAINER-side port
   auth: 'google'|'public',  // DEFAULT 'google' — public must be explicit
   title?, createdAt, updatedAt }
 ```
@@ -340,7 +344,13 @@ Slug rules: regex above, single label, NOT in reserved set
 `{ console, www, api, auth, static, healthz }` ∪ `{config.consoleHost label}`.
 409 on duplicate. `resolve`: `kind=port` → that port; `kind=server` → find in
 `coordinator.serversRaw()` by `project`+`name`, prefer `status==='running'`,
-else return `{ port: null, reason: 'server stopped'|'server not found' }`.
+else return `{ port: null, reason: 'server stopped'|'server not found' }`;
+`kind=docker` → find the container by name in `coordinator.inventory()`
+(cached), require an `Up …` status, then map `containerPort` to its published
+loopback-reachable HOST port via `parsePublishedPorts` — the durable identity
+is container name + container-side port, so remapped host ports keep working.
+Every resolved port (all kinds) passes `guardCoordinatorPort` — a route can
+never proxy into the coordinator API (invariant #1).
 
 ## Console API (`src/api.mjs`)
 
@@ -356,13 +366,14 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 
 | Method+Path | Behavior |
 |---|---|
-| `GET /api/overview` | `{ console: { version, domain, consoleHost, now, tls: certManager.info(), devInsecureHttp }, coordinator: coordinator.status(), inventory: Inventory\|null, routes: RouteView[] }`. Inventory from `coordinator.inventory()`; on CoordError → `inventory: null` and `coordinator.ok:false` with error (HTTP still 200 — UI shows degraded state). `RouteView = Route + { url: 'https://<slug>.<domain>', resolved: { port, reason?, serverStatus? } }` (resolved via `serversRaw`, never full inventory). |
-| `POST /api/routes` | body `{ slug, kind, port?, project?, serverName?, auth?, title? }` → 201 RouteView |
-| `PATCH /api/routes/:slug` | any of `{ auth, title, port, project, serverName, kind }` → RouteView |
+| `GET /api/overview` | `{ console: { version, domain, consoleHost, now, tls: certManager.info(), devInsecureHttp }, coordinator: coordinator.status(), inventory: Inventory\|null, routes: RouteView[] }`. Inventory from `coordinator.inventory()`; on CoordError → `inventory: null` and `coordinator.ok:false` with error (HTTP still 200 — UI shows degraded state). `RouteView = Route + { url: 'https://<slug>.<domain>', resolved: { port, reason?, serverStatus?, containerStatus? } }` (kind=server resolves via `serversRaw`; kind=docker via the cached `inventory()` — both shared/coalesced). |
+| `POST /api/routes` | body `{ slug, kind, port?, project?, serverName?, containerName?, containerPort?, auth?, title? }` → 201 RouteView |
+| `PATCH /api/routes/:slug` | any of `{ auth, title, port, project, serverName, containerName, containerPort, kind }` → RouteView |
 | `DELETE /api/routes/:slug` | → `{ ok: true }` |
 | `POST /api/servers/action` | `{ id, action: 'stop'\|'restart' }` — looks up server in `serversRaw` by id → coordinator `serverStop/serverRestart` with `{ agent: 'devops-console:'+session.email, project: server.project, name: server.name, reason }` → `{ server }` |
 | `POST /api/servers/logs` | `{ id, tail=200 }` → coordinator `serverLogs` `{ server_id: id, tail }` → passthrough |
 | `POST /api/docker/action` | `{ name, action: 'start'\|'stop'\|'restart' }` + attribution (project = config.projectRoot) → passthrough |
+| `POST /api/docker/subdomain` | `{ name, slug, auth?, port? }` — assign/change/remove a container's subdomain in one call (mirrors `/api/servers/subdomain`). Fresh inventory lookup (404 unknown container); `port` is the CONTAINER-side port, required only when the container publishes several (400 lists them), validated against currently-published ports (400 on typo); empty `slug` unassigns → `{ route: null }`. Creates/updates a `kind:'docker'` route → 200/201 `{ route: RouteView }` |
 | `POST /api/docker/logs` | `{ name, tail=120 }` → passthrough `{ text }` |
 | `GET /api/metrics/history?limit=N` | `metrics.history({ limit })` → `{ now, intervalMs, maxPoints, sampler: { running, lastSampleAt, lastError }, entities: [{ key, kind: 'server'\|'docker'\|'project', id, name, project, points: [[epochMs, cpuPercent, memBytes], …] }] }`. `limit` caps points per entity (400 on non-positive/garbage). |
 | `POST /api/ports/lease` | `{ purpose?, preferred?, ttl?, project? }` → coordinator `leasePort` with `agent: 'devops-console:'+session.email`, `project` defaulting to `config.projectRoot`; a `preferred` port pins `range` to that port → 201 `{ lease }` |
@@ -370,7 +381,7 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 | `POST /api/ports/unassign` | `{ name, project }` (or `{ port, force? }` for orphan cleanup) → coordinator `unassignPort` with console-user attribution → `{ assignment }` (status `unassigned`). The only console path that frees a durable port pin. |
 | `POST /api/projects/action` | `{ project, action: 'start'\|'stop'\|'restart' }` → coordinator `/v1/projects/<action>` with console-user attribution (dependencies before web servers, pinned ports preserved; up to 300s) → `{ result }` |
 | `GET /api/prefs` | UI preferences: `{ version, hidden: { servers: [identity keys], docker: [names], projects: [usage_keys] } }` from `<stateDir>/ui-prefs.json` |
-| `PATCH /api/prefs` | `{ hidden: { servers?, docker?, projects? } }` — provided lists replaced after validation (strings, trimmed, deduped, ≤500 × ≤300 chars) → the full prefs. Origin-guarded like every mutation. |
+| `PATCH /api/prefs` | `{ hide?: { servers?, docker?, projects? }, unhide?: {…} }` — DELTAS only, merged server-side (validated: strings, trimmed, deduped, ≤500 entries × ≤300 chars) → the full prefs. Whole-list replacement is deliberately unsupported so a stale client snapshot can never wipe hides made elsewhere. Origin-guarded like every mutation. |
 | `GET /api/session` | `{ email, name, pic, exp }` |
 | anything else | 404 |
 
@@ -406,11 +417,20 @@ start/stop/restart, whole-project start/stop/restart via
 expandable rows: health classification, pid, project,
 cmd, log tail viewer, stop/restart, per-server subdomain assign/edit/remove —
 the primary way routes are managed — plus live CPU%/memory numbers with a
-sparkline that opens full history charts), **Routes** (create form for
-fixed-port or managed-server targets + table: clickable URL + copy button,
-target with "view server" link for server-backed routes, public/login toggle
-switch, resolved status dot, delete), **Docker** (status, image, ports,
-live CPU/mem + sparkline, start/stop/restart, logs), **Port leases** (lease
+sparkline that opens full history charts; docker-hosted web servers appear
+here too as first-class rows — any non-database container publishing a TCP
+port on a loopback-reachable address (`0.0.0.0`/`127.0.0.1`; v6-only
+publishes are excluded because the proxy dials v4 loopback), or a stopped
+one that still has a route — with a `docker` kind tag,
+container status badge, published host ports, start/stop/restart via
+`/api/docker/action`, container log panel, and the same subdomain control
+saving through `/api/docker/subdomain` with a container-port picker when
+several ports are published), **Routes** (create form for
+fixed-port, managed-server or container targets + table: clickable URL + copy
+button, target with "view server" link for server/container-backed routes,
+public/login toggle switch, resolved status dot, delete), **Docker** (status,
+image, ports, live CPU/mem + sparkline, start/stop/restart, logs, subdomain
+control on web-serving containers), **Port leases** (lease
 form: purpose/preferred port/TTL/project; table with countdowns and
 confirmed release), **Performance** (per-entity CPU and memory history
 charts for every sampled server/container + per-project usage bars with

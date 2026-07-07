@@ -7,10 +7,74 @@ import path from 'node:path';
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const BASE_RESERVED = ['console', 'www', 'api', 'auth', 'static', 'healthz'];
-const KINDS = new Set(['port', 'server']);
+const KINDS = new Set(['port', 'server', 'docker']);
 const AUTHS = new Set(['google', 'public']);
 const TITLE_MAX = 120;
 const TEXT_MAX = 512;
+const CONTAINER_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+
+// Host addresses whose published ports our proxy can actually reach. The
+// proxy always dials the v4 loopback 127.0.0.1, and v4/v6 loopback are
+// SEPARATE socket namespaces — accepting a v6-only publish ('::'/'::1')
+// would either 502 on every request or, worse, cross-wire the route into
+// whatever unrelated process holds the same port number on v4 loopback.
+// Docker's normal dual-stack publish always includes a v4 line, so v4-only
+// costs nothing in practice.
+const V4_REACHABLE_ADDRS = new Set(['0.0.0.0', '127.0.0.1', '']);
+
+/**
+ * Parse a `docker ps` Ports column ("0.0.0.0:5001->5001/tcp, :::5001->5001/tcp,
+ * 0.0.0.0:9000-9001->9000-9001/tcp, 5432/tcp") into published TCP mappings:
+ * [{ hostAddr, hostPort, containerPort }]. Exposed-only entries (no "->"),
+ * non-TCP protocols and malformed ranges are skipped.
+ */
+export function parsePublishedPorts(text) {
+  const out = [];
+  for (const rawEntry of String(text ?? '').split(',')) {
+    const entry = rawEntry.trim();
+    if (!entry || !entry.includes('->')) continue;
+    const arrow = entry.lastIndexOf('->');
+    const right = entry.slice(arrow + 2).trim().match(/^(\d+)(?:-(\d+))?\/([a-z0-9]+)$/i);
+    if (!right || right[3].toLowerCase() !== 'tcp') continue;
+    const left = entry.slice(0, arrow).trim().match(/^(.*):(\d+)(?:-(\d+))?$/);
+    if (!left) continue;
+    const hostAddr = left[1].replace(/^\[/, '').replace(/\]$/, '');
+    const hostStart = Number(left[2]);
+    const hostEnd = left[3] ? Number(left[3]) : hostStart;
+    const contStart = Number(right[1]);
+    const contEnd = right[2] ? Number(right[2]) : contStart;
+    if (hostEnd - hostStart !== contEnd - contStart || hostEnd < hostStart) continue;
+    for (let i = 0; i <= hostEnd - hostStart; i += 1) {
+      out.push({ hostAddr, hostPort: hostStart + i, containerPort: contStart + i });
+    }
+  }
+  return out;
+}
+
+// The loopback-reachable host port publishing `containerPort`, or null.
+export function publishedHostPort(mappings, containerPort) {
+  const candidates = mappings.filter((m) => m.containerPort === containerPort);
+  const v4 = candidates.find((m) => V4_REACHABLE_ADDRS.has(m.hostAddr));
+  return v4 ? v4.hostPort : null;
+}
+
+/**
+ * Distinct container ports a route could target, each with the host port it
+ * is currently reachable on: [{ containerPort, hostPort }], sorted.
+ */
+export function publishedContainerPorts(text) {
+  const mappings = parsePublishedPorts(text);
+  const byContainerPort = new Map();
+  for (const m of mappings) {
+    if (!byContainerPort.has(m.containerPort)) {
+      const hostPort = publishedHostPort(mappings, m.containerPort);
+      if (hostPort !== null) byContainerPort.set(m.containerPort, hostPort);
+    }
+  }
+  return [...byContainerPort.entries()]
+    .map(([containerPort, hostPort]) => ({ containerPort, hostPort }))
+    .sort((a, b) => a.containerPort - b.containerPort);
+}
 
 // Status preference order when several coordinator records share project+name.
 const STATUS_RANK = { running: 0, starting: 1, unhealthy: 2, stopped: 3 };
@@ -104,6 +168,22 @@ export function createRouteStore({ file, config, log }) {
       throw new RouteError(400, "auth must be 'google' or 'public'");
     }
     return value;
+  }
+
+  function validateContainerName(value) {
+    if (typeof value !== 'string' || !CONTAINER_NAME_RE.test(value)) {
+      throw new RouteError(400, 'containerName must be a valid container name');
+    }
+    return value;
+  }
+
+  function validateContainerPort(value) {
+    let n = value;
+    if (typeof n === 'string' && /^\d+$/.test(n.trim())) n = Number(n.trim());
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      throw new RouteError(400, 'containerPort must be an integer between 1 and 65535');
+    }
+    return n;
   }
 
   function validateTitle(value) {
@@ -200,7 +280,7 @@ export function createRouteStore({ file, config, log }) {
       throw new RouteError(409, `route '${slug}' already exists`);
     }
     if (!KINDS.has(def.kind)) {
-      throw new RouteError(400, "kind must be 'port' or 'server'");
+      throw new RouteError(400, "kind must be 'port', 'server' or 'docker'");
     }
     const now = new Date().toISOString();
     const route = {
@@ -215,6 +295,9 @@ export function createRouteStore({ file, config, log }) {
     if (title !== undefined) route.title = title;
     if (def.kind === 'port') {
       route.port = validatePort(def.port);
+    } else if (def.kind === 'docker') {
+      route.containerName = validateContainerName(def.containerName);
+      route.containerPort = validateContainerPort(def.containerPort);
     } else {
       route.project = normalizeProject(requireText(def.project, 'project'));
       route.serverName = requireText(def.serverName, 'serverName');
@@ -235,7 +318,7 @@ export function createRouteStore({ file, config, log }) {
     }
     const next = { ...existing };
     if (Object.hasOwn(patch, 'kind')) {
-      if (!KINDS.has(patch.kind)) throw new RouteError(400, "kind must be 'port' or 'server'");
+      if (!KINDS.has(patch.kind)) throw new RouteError(400, "kind must be 'port', 'server' or 'docker'");
       next.kind = patch.kind;
     }
     if (Object.hasOwn(patch, 'auth')) next.auth = validateAuth(patch.auth);
@@ -251,10 +334,21 @@ export function createRouteStore({ file, config, log }) {
     if (Object.hasOwn(patch, 'serverName')) {
       next.serverName = requireText(patch.serverName, 'serverName');
     }
+    if (Object.hasOwn(patch, 'containerName')) next.containerName = validateContainerName(patch.containerName);
+    if (Object.hasOwn(patch, 'containerPort')) next.containerPort = validateContainerPort(patch.containerPort);
     if (next.kind === 'port') {
       if (!Number.isInteger(next.port)) {
         throw new RouteError(400, "a route with kind 'port' requires a port");
       }
+      delete next.project;
+      delete next.serverName;
+      delete next.containerName;
+      delete next.containerPort;
+    } else if (next.kind === 'docker') {
+      if (!next.containerName || !Number.isInteger(next.containerPort)) {
+        throw new RouteError(400, "a route with kind 'docker' requires containerName and containerPort");
+      }
+      delete next.port;
       delete next.project;
       delete next.serverName;
     } else {
@@ -262,6 +356,8 @@ export function createRouteStore({ file, config, log }) {
         throw new RouteError(400, "a route with kind 'server' requires project and serverName");
       }
       delete next.port;
+      delete next.containerName;
+      delete next.containerPort;
     }
     next.slug = existing.slug;
     next.createdAt = existing.createdAt;
@@ -293,11 +389,53 @@ export function createRouteStore({ file, config, log }) {
     return null;
   }
 
+  // kind:'docker' resolves through the (cached) coordinator inventory: the
+  // durable identity is container name + container-side port; the published
+  // host port is looked up live so a remapped restart keeps working.
+  async function resolveDocker(route, coordinator) {
+    let inventoryData;
+    try {
+      inventoryData = await coordinator.inventory();
+    } catch (err) {
+      return { port: null, reason: `coordinator unavailable: ${err?.message ?? err}` };
+    }
+    const docker = inventoryData?.docker;
+    if (!docker || docker.available === false) {
+      const detail = docker?.error ? `: ${docker.error}` : '';
+      return { port: null, reason: `docker unavailable${detail}` };
+    }
+    const list = Array.isArray(docker.containers) ? docker.containers : [];
+    const found = list.find((c) => c && c.name === route.containerName);
+    if (!found) return { port: null, reason: 'container not found' };
+    const container = { name: found.name, status: found.status ?? null };
+    const status = String(found.status ?? '');
+    // "Up 3 minutes (Paused)" still matches /^up/, but a paused container is
+    // frozen — proxying into it just hangs the visitor.
+    if (/\(paused\)/i.test(status)) {
+      return { port: null, reason: 'container is paused', container };
+    }
+    if (!/^\s*up\b/i.test(status)) {
+      return { port: null, reason: 'container is not running', container };
+    }
+    const hostPort = publishedHostPort(parsePublishedPorts(found.ports), route.containerPort);
+    if (hostPort === null) {
+      return {
+        port: null,
+        reason: `container does not publish port ${route.containerPort} on a loopback-reachable address`,
+        container,
+      };
+    }
+    return guardCoordinatorPort(hostPort, { container }) ?? { port: hostPort, container };
+  }
+
   async function resolve(slugInput, coordinator) {
     const route = routes.get(lookupKey(slugInput));
     if (!route) return { port: null, reason: 'route not found' };
     if (route.kind === 'port') {
       return guardCoordinatorPort(route.port) ?? { port: route.port };
+    }
+    if (route.kind === 'docker') {
+      return resolveDocker(route, coordinator);
     }
 
     let servers;

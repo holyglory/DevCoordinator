@@ -429,6 +429,79 @@
   // and must be neither hideable nor kept hidden.
   const isContainerActive = (c) => !/^\s*(exited|created|dead)\b/i.test(String(c.status || ''));
 
+  // ---- docker-hosted web servers ------------------------------------------
+  // Mirrors src/routes.mjs parsePublishedPorts: `docker ps` Ports column
+  // ("0.0.0.0:5001->5001/tcp, :::9000-9001->9000-9001/tcp, 5432/tcp") into
+  // loopback-reachable published TCP mappings.
+  function parsePublishedPorts(text) {
+    const out = [];
+    for (const rawEntry of String(text ?? '').split(',')) {
+      const entry = rawEntry.trim();
+      if (!entry || !entry.includes('->')) continue;
+      const arrow = entry.lastIndexOf('->');
+      const right = entry.slice(arrow + 2).trim().match(/^(\d+)(?:-(\d+))?\/([a-z0-9]+)$/i);
+      if (!right || right[3].toLowerCase() !== 'tcp') continue;
+      const left = entry.slice(0, arrow).trim().match(/^(.*):(\d+)(?:-(\d+))?$/);
+      if (!left) continue;
+      const hostAddr = left[1].replace(/^\[/, '').replace(/\]$/, '');
+      const hostStart = Number(left[2]);
+      const hostEnd = left[3] ? Number(left[3]) : hostStart;
+      const contStart = Number(right[1]);
+      const contEnd = right[2] ? Number(right[2]) : contStart;
+      if (hostEnd - hostStart !== contEnd - contStart || hostEnd < hostStart) continue;
+      for (let i = 0; i <= hostEnd - hostStart; i += 1) {
+        out.push({ hostAddr, hostPort: hostStart + i, containerPort: contStart + i });
+      }
+    }
+    return out;
+  }
+
+  // Only v4-reachable publishes count — the proxy dials 127.0.0.1, and v4/v6
+  // loopback are separate namespaces (mirrors src/routes.mjs).
+  const V4_ADDRS = new Set(['0.0.0.0', '127.0.0.1', '']);
+
+  // Distinct container ports with the host port each is reachable on.
+  function publishedContainerPorts(text) {
+    const mappings = parsePublishedPorts(text);
+    const byPort = new Map();
+    for (const m of mappings) {
+      if (byPort.has(m.containerPort)) continue;
+      const v4 = mappings.find((x) => x.containerPort === m.containerPort && V4_ADDRS.has(x.hostAddr));
+      if (v4) byPort.set(m.containerPort, v4.hostPort);
+    }
+    return [...byPort.entries()]
+      .map(([containerPort, hostPort]) => ({ containerPort, hostPort }))
+      .sort((a, b) => a.containerPort - b.containerPort);
+  }
+
+  // The route (if any) that publishes this container at a subdomain.
+  function dockerRouteFor(o, c) {
+    return (o.routes || []).find((r) => r.kind === 'docker' && r.containerName === c.name) || null;
+  }
+
+  // A container earns a row on the Servers page when a browser could reach
+  // it: it publishes a non-database TCP port, or it already has a subdomain
+  // route (a stopped container publishes nothing, so the route keeps it
+  // startable from this page).
+  function isWebServerContainer(o, group, c) {
+    if (group.dbNames.has(c.name)) return false;
+    return publishedContainerPorts(c.ports).length > 0 || !!dockerRouteFor(o, c);
+  }
+
+  function containerStatusMeta(c) {
+    const status = String(c.status || '');
+    // Real docker reports paused as "Up 3 minutes (Paused)" — check it
+    // before the generic Up match or it reads as a healthy green badge.
+    if (/\(paused\)/i.test(status)) return { css: 'warn', label: 'paused' };
+    if (/^\s*up\b/i.test(status)) {
+      if (/\(unhealthy\)/i.test(status)) return { css: 'err', label: 'unhealthy' };
+      if (/\(health: starting\)/i.test(status)) return { css: 'warn', label: 'starting' };
+      return { css: 'ok', label: 'running' };
+    }
+    if (/^\s*restarting/i.test(status)) return { css: 'err', label: 'restarting' };
+    return { css: 'dim', label: 'stopped' };
+  }
+
   // Anything the coordinator reports as running must never stay hidden.
   async function autoUnhide(o) {
     if (!state.prefs || !o?.inventory || prefsSaving) return;
@@ -810,6 +883,7 @@
     }
     renderSummary();
     updateServerOptions(o);
+    updateContainerOptions(o);
 
     // Only render-relevant coordinator facts belong in section signatures:
     // lastOkAt changes on every poll and would defeat the memoization,
@@ -817,11 +891,15 @@
     const coordSig = o.coordinator ? [o.coordinator.ok, o.coordinator.lastError] : null;
 
     setSection('projects-body',
-      sig(o.inventory?.servers ?? null, o.inventory?.docker ?? null, o.inventory?.project_usage ?? null, coordSig),
+      sig(o.inventory?.servers ?? null, o.inventory?.docker ?? null, o.inventory?.project_usage ?? null,
+        o.routes ?? null, coordSig),
       () => buildProjects(o), force);
     setSection('routes-body', sig(o.routes), () => buildRoutes(o), force);
-    setSection('servers-body', sig(o.inventory?.servers ?? null, o.inventory?.port_assignments ?? null, coordSig), () => buildServers(o), force);
-    setSection('docker-body', sig(o.inventory?.docker ?? null, coordSig), () => buildDocker(o), force);
+    setSection('servers-body',
+      sig(o.inventory?.servers ?? null, o.inventory?.port_assignments ?? null,
+        o.inventory?.docker ?? null, o.routes ?? null, coordSig),
+      () => buildServers(o), force);
+    setSection('docker-body', sig(o.inventory?.docker ?? null, o.routes ?? null, coordSig), () => buildDocker(o), force);
     setSection('leases-body', sig(o.inventory?.leases ?? null, coordSig), () => buildLeases(o), force);
     setSection('assignments-body', sig(o.inventory?.port_assignments ?? null, coordSig), () => buildAssignments(o), force);
     setSection('usage-body', sig(o.inventory?.project_usage ?? null, coordSig), () => buildUsage(o), force);
@@ -831,9 +909,15 @@
       ? (state.metrics.entities || []).filter((e) => e.kind !== 'project').length
       : null;
     const projectGroups = o.inventory ? projectGroupsOf(o).length : null;
+    // The Servers page lists coordinator servers plus docker-hosted web
+    // servers, so its badges count both.
+    const webContainerCount = o.inventory
+      ? projectGroupsOf(o).reduce(
+          (n, g) => n + g.members.containers.filter((c) => isWebServerContainer(o, g, c)).length, 0)
+      : 0;
     setCount('projects-count', projectGroups);
     setCount('routes-count', (o.routes || []).length);
-    setCount('servers-count', o.inventory ? (o.inventory.servers || []).length : null);
+    setCount('servers-count', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
     setCount('docker-count', o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
     setCount('leases-count', o.inventory ? (o.inventory.leases || []).length : null);
     setCount('assignments-count', o.inventory ? (o.inventory.port_assignments || []).length : null);
@@ -841,7 +925,7 @@
     setCount('perf-count', perfEntities);
 
     setNavCount('projects', projectGroups);
-    setNavCount('servers', o.inventory ? (o.inventory.servers || []).length : null);
+    setNavCount('servers', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
     setNavCount('routes', (o.routes || []).length);
     setNavCount('docker', o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
     setNavCount('ports', o.inventory
@@ -1125,15 +1209,20 @@
           kv('State', live ? 'live' : 'not reachable'),
           live ? kv('Upstream', `127.0.0.1:${res.port}`, { mono: true }) : null,
           res?.serverStatus ? kv('Server status', res.serverStatus) : null,
+          res?.containerStatus ? kv('Container status', res.containerStatus, { mono: true }) : null,
           !live && res?.reason ? kv('Reason', res.reason, { mono: true }) : null,
-          kv('Kind', r.kind === 'port' ? `fixed port ${r.port}` : `server "${r.serverName}"`),
+          kv('Kind', r.kind === 'port' ? `fixed port ${r.port}`
+            : r.kind === 'docker' ? `container "${r.containerName}" port ${r.containerPort}`
+            : `server "${r.serverName}"`),
           r.kind === 'server' ? kv('Project', r.project, { mono: true }) : null,
           kv('Created', fmtWhen(r.createdAt)),
           kv('Updated', fmtWhen(r.updatedAt)),
           !live ? h('p', { class: 'pop-hint' },
             r.kind === 'server'
               ? 'Start or restart the linked server on the Servers page, then this route resolves again.'
-              : 'Nothing answered on the fixed port. Start the process listening on it, or repoint the route.')
+              : r.kind === 'docker'
+                ? 'Start the container on the Servers or Docker page, then this route resolves again.'
+                : 'Nothing answered on the fixed port. Start the process listening on it, or repoint the route.')
             : null)
       )),
     }, h('span', { class: 'dot', 'aria-hidden': 'true' }),
@@ -1164,7 +1253,9 @@
 
     const targetText = r.kind === 'port'
       ? `fixed port ${r.port}`
-      : `${r.serverName} · ${projectTail(r.project)}`;
+      : r.kind === 'docker'
+        ? `${r.containerName} · container :${r.containerPort}`
+        : `${r.serverName} · ${projectTail(r.project)}`;
 
     return h('div', { class: 'row routes-grid' },
       h('span', { class: 'cell url-cell', 'data-label': 'URL' },
@@ -1180,7 +1271,7 @@
         }, icon('copy'))),
       h('span', { class: 'cell', 'data-label': 'Target', title: r.kind === 'server' ? (r.project || '') : '' },
         targetText,
-        r.kind === 'server'
+        r.kind === 'server' || r.kind === 'docker'
           ? h('a', {
               class: 'target-srv-link', href: '#/servers',
               title: 'Manage this server and its subdomain on the Servers page',
@@ -1236,6 +1327,52 @@
     }
   }
 
+  let containerOptsSig = '';
+
+  // One option per (running container, published port): the value carries
+  // both so the submit handler needs no second control.
+  function updateContainerOptions(o) {
+    const rows = [];
+    if (o.inventory?.docker?.available) {
+      const dbNames = new Set((o.inventory.docker.postgres || []).map((c) => c.name));
+      for (const c of o.inventory.docker.containers || []) {
+        if (!c?.name || dbNames.has(c.name) || !isContainerRunning(c)) continue;
+        for (const p of publishedContainerPorts(c.ports)) {
+          rows.push({ name: c.name, port: p.containerPort, hostPort: p.hostPort, project: c.project || c.compose_project || '' });
+        }
+      }
+    }
+    rows.sort((a, b) => a.name.localeCompare(b.name) || a.port - b.port);
+    // The placeholder wording depends on WHY the list is empty, so that
+    // state is part of the rebuild signature too.
+    const emptyReason = !o.inventory
+      ? 'Coordinator unavailable'
+      : (o.inventory.docker?.available !== true
+        ? 'Docker unavailable'
+        : 'No running containers publish a port');
+    const newSig = JSON.stringify([emptyReason, rows]);
+    if (newSig === containerOptsSig) return;
+    containerOptsSig = newSig;
+
+    const sel = $('#rf-container');
+    const prev = sel.value;
+    sel.replaceChildren();
+    if (!rows.length) {
+      sel.append(h('option', { value: '' }, emptyReason));
+      sel.disabled = true;
+      return;
+    }
+    sel.disabled = false;
+    sel.append(h('option', { value: '' }, 'Choose a container…'));
+    for (const row of rows) {
+      const value = JSON.stringify([row.name, row.port]);
+      sel.append(h('option', {
+        value,
+        selected: value === prev || undefined,
+      }, `${row.name}${row.project ? ` · ${projectTail(row.project)}` : ''} · :${row.port} (host :${row.hostPort})`));
+    }
+  }
+
   let serverOptsSig = '';
 
   function updateServerOptions(o) {
@@ -1280,9 +1417,10 @@
 
     for (const radio of form.querySelectorAll('input[name="rf-kind"]')) {
       radio.addEventListener('change', () => {
-        const server = form.querySelector('input[name="rf-kind"]:checked').value === 'server';
-        $('#rf-port-wrap').hidden = server;
-        $('#rf-server-wrap').hidden = !server;
+        const kind = form.querySelector('input[name="rf-kind"]:checked').value;
+        $('#rf-port-wrap').hidden = kind !== 'port';
+        $('#rf-server-wrap').hidden = kind !== 'server';
+        $('#rf-container-wrap').hidden = kind !== 'docker';
       });
     }
 
@@ -1321,6 +1459,20 @@
         return;
       }
       body.port = port;
+    } else if (kind === 'docker') {
+      let picked = null;
+      try {
+        picked = JSON.parse($('#rf-container').value || 'null');
+      } catch {
+        picked = null;
+      }
+      if (!Array.isArray(picked) || picked.length !== 2) {
+        fail('Pick a container (and port) for this route.');
+        $('#rf-container').focus();
+        return;
+      }
+      body.containerName = picked[0];
+      body.containerPort = picked[1];
     } else {
       const id = $('#rf-server').value;
       const srv = (state.overview?.inventory?.servers || []).find((s) => s.id === id);
@@ -1384,6 +1536,7 @@
   function buildServers(o) {
     if (!o.inventory) return [degradedPanel(o)];
     const hidden = hiddenSet('servers');
+    const hiddenDocker = hiddenSet('docker');
     const revealing = ui.reveal.has('servers');
     const rank = (s) => (s.status === 'running' ? 0 : s.status === 'stopped' ? 2 : 1);
     let total = 0;
@@ -1398,8 +1551,14 @@
 
     for (const group of projectGroupsOf(o)) {
       const servers = group.members.servers.slice().sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name)));
-      if (!servers.length) continue;
-      total += servers.length;
+      // Docker-hosted web servers belong in this list too: any container
+      // serving a published (non-database) port, plus routed stopped ones.
+      const webContainers = group.members.containers
+        .filter((c) => isWebServerContainer(o, group, c))
+        .sort((a, b) => (isContainerRunning(b) ? 1 : 0) - (isContainerRunning(a) ? 1 : 0)
+          || String(a.name).localeCompare(String(b.name)));
+      if (!servers.length && !webContainers.length) continue;
+      total += servers.length + webContainers.length;
       const visible = [];
       for (const s of servers) {
         const isHidden = hidden.has(s.key);
@@ -1407,9 +1566,17 @@
         if (isHidden && !revealing) continue;
         visible.push(serverItem(o, s, isHidden));
       }
+      for (const c of webContainers) {
+        const isHidden = hiddenDocker.has(c.name);
+        if (isHidden) hiddenCount += 1;
+        if (isHidden && !revealing) continue;
+        visible.push(dockerServerItem(o, c, isHidden));
+      }
       if (!visible.length) continue;
-      const running = servers.filter(isServerRunning).length;
-      out.push(groupHeader(group, `${running} of ${servers.length} running`));
+      const running = servers.filter(isServerRunning).length
+        + webContainers.filter(isContainerRunning).length;
+      const memberCount = servers.length + webContainers.length;
+      out.push(groupHeader(group, `${running} of ${memberCount} running`));
       out.push(...visible);
     }
 
@@ -1419,6 +1586,101 @@
     const toggle = revealToggle('servers', hiddenCount);
     if (toggle) out.push(toggle);
     return out;
+  }
+
+  // A docker-hosted web server rendered as a first-class Servers row: same
+  // columns, container-appropriate status/actions, and the shared subdomain
+  // control saving through /api/docker/subdomain.
+  function dockerServerItem(o, c, hiddenRow = false) {
+    const name = c.name;
+    const running = isContainerRunning(c);
+    const open = ui.dockerOpen.has(name);
+    const busy = ui.busy.has(`docker:${name}`);
+    const meta = containerStatusMeta(c);
+    const panelId = `srv-dock-panel-${name}`;
+
+    const chev = h('button', {
+      class: `chev${open ? ' open' : ''}`, type: 'button',
+      'data-fk': `srv-dock-x:${name}`,
+      'aria-expanded': String(open),
+      'aria-controls': panelId,
+      'aria-label': `${open ? 'Collapse' : 'Expand'} logs for ${name}`,
+      title: open ? 'Collapse logs' : 'Expand container logs',
+      onclick: () => toggleDocker(name),
+    }, icon('chevron'));
+
+    const badgeKey = `srv-dock-badge:${name}`;
+    const badge = h('button', {
+      class: `badge ${meta.css}`, type: 'button',
+      'data-fk': badgeKey, 'aria-haspopup': 'dialog',
+      'aria-expanded': popover.key === badgeKey ? 'true' : 'false',
+      'aria-label': `Status of ${name}: ${meta.label} — show container details`,
+      title: 'Show container details',
+      onclick: (e) => popover.toggle(badgeKey, e.currentTarget, () => (
+        h('div', null,
+          popHead(name),
+          kv('Status', c.status || '—', { mono: true }),
+          kv('Image', c.image || '—', { mono: true }),
+          kv('Ports', c.ports || '—', { mono: true }),
+          kv('Project', c.project || c.compose_project || '—', { mono: true }),
+          c.stats ? kv('CPU now', fmtCpu(c.stats.cpu_percent)) : null,
+          c.stats ? kv('Memory now', fmtBytes(Number(c.stats.memory_usage_bytes) || 0)) : null,
+          h('p', { class: 'pop-hint' }, 'This server runs as a Docker container — actions start, stop and restart the container itself.'))
+      )),
+    }, h('span', { class: 'dot', 'aria-hidden': 'true' }), meta.label);
+
+    const act = (action, label, iconName, confirmText) => h('button', {
+      class: `btn small${busy ? ' is-busy' : ''}`, type: 'button',
+      'data-fk': `srv-dock-${action}:${name}`,
+      disabled: busy || undefined,
+      title: `${label} container ${name}`,
+      onclick: () => runAction(`docker:${name}`,
+        () => api('/api/docker/action', { method: 'POST', body: { name, action } }),
+        confirmText ? { confirmText } : undefined),
+    }, icon(iconName), busy ? 'Working…' : label);
+
+    const ports = publishedContainerPorts(c.ports);
+    const portCell = ports.length
+      ? ports.map((p) => `:${p.hostPort}`).join(' ')
+      : '—';
+
+    const row = h('div', {
+      class: `row srv-grid expandable${hiddenRow ? ' is-hidden' : ''}`,
+      onclick: (e) => {
+        if (e.target.closest('button, a, input, select')) return;
+        toggleDocker(name);
+      },
+    },
+      chev,
+      h('span', { class: 'cell c-primary', 'data-label': 'Server' },
+        h('span', { class: 'srv-name' },
+          h('strong', null, name),
+          ' ',
+          h('span', { class: 'kind-tag k-dock' }, 'docker'),
+          ' ',
+          h('span', { class: 'dim', title: c.project || '' }, projectTail(c.project || c.compose_project))),
+        dockerSubdomainControl(o, c, 'srv')),
+      h('span', { class: 'cell mono', 'data-label': 'Port' }, portCell),
+      usageCellNode({
+        key: `dock:${name}`,
+        title: name,
+        cpu: c.stats?.cpu_percent ?? null,
+        mem: c.stats?.memory_usage_bytes ?? null,
+        running: running && !!c.stats,
+        scope: 'srv',
+      }),
+      h('span', { class: 'cell', 'data-label': 'Status' }, badge),
+      h('span', { 'aria-hidden': 'true' }),
+      h('span', { class: 'cell actions' },
+        running
+          ? [act('stop', 'Stop', 'stop', `Stop container ${name}?\n\nAnything depending on it (like a database) loses its service.`),
+             act('restart', 'Restart', 'refresh')]
+          : act('start', 'Start', 'play'),
+        hiddenRow
+          ? unhideButton('docker', name, name)
+          : (!isContainerActive(c) ? hideButton('docker', name, name) : ghostIconSlot())));
+
+    return h('div', { class: 'item' }, row, open ? dockerPanel(c, panelId) : null);
   }
 
   function serverItem(o, s, hiddenRow = false) {
@@ -1554,19 +1816,55 @@
     return null;
   }
 
-  async function saveSubdomain(s, slug, auth, { confirmText } = {}) {
-    return runAction(`subdomain:${s.id}`,
-      () => api('/api/servers/subdomain', { method: 'POST', body: { id: s.id, slug, auth } }),
-      { confirmText });
+  // (Saving goes through each spec's save() below — one endpoint per kind.)
+
+  // Both server rows and docker-container rows carry the same subdomain
+  // control; a spec abstracts what differs — where the route lives, which
+  // endpoint saves it, and (docker only) the container-port choice.
+  function subdomainSpecForServer(s) {
+    return {
+      key: `srv-sub:${s.id}`,
+      busyKey: `subdomain:${s.id}`,
+      name: s.name,
+      routeOf: (ov) => serverRouteFor(ov, s),
+      save: (slug, auth, opts) => runAction(`subdomain:${s.id}`,
+        () => api('/api/servers/subdomain', { method: 'POST', body: { id: s.id, slug, auth } }),
+        opts),
+      portOptions: null,
+    };
+  }
+
+  function subdomainSpecForDocker(c, scope) {
+    return {
+      key: `${scope}-dock-sub:${c.name}`,
+      busyKey: `subdomain:dock:${c.name}`,
+      name: c.name,
+      routeOf: (ov) => dockerRouteFor(ov, c),
+      save: (slug, auth, opts, port) => runAction(`subdomain:dock:${c.name}`,
+        () => api('/api/docker/subdomain', {
+          method: 'POST',
+          body: { name: c.name, slug, auth, ...(slug && port ? { port } : {}) },
+        }),
+        opts),
+      portOptions: publishedContainerPorts(c.ports),
+    };
   }
 
   // Compact row control: a linked subdomain (with copy + edit) or an assign button.
   function subdomainControl(o, s) {
+    return subdomainControlFor(o, subdomainSpecForServer(s));
+  }
+
+  function dockerSubdomainControl(o, c, scope) {
+    return subdomainControlFor(o, subdomainSpecForDocker(c, scope));
+  }
+
+  function subdomainControlFor(o, spec) {
     const domain = o.console?.domain || 'vr.ae';
-    const route = serverRouteFor(o, s);
-    const busy = ui.busy.has(`subdomain:${s.id}`);
-    const key = `srv-sub:${s.id}`;
-    const openEditor = (e) => popover.toggle(key, e.currentTarget, () => subdomainEditor(o, s, serverRouteFor(o, s)));
+    const route = spec.routeOf(o);
+    const busy = ui.busy.has(spec.busyKey);
+    const key = spec.key;
+    const openEditor = (e) => popover.toggle(key, e.currentTarget, () => subdomainEditor(o, spec, spec.routeOf(o)));
 
     if (route) {
       const host = `${route.slug}.${domain}`;
@@ -1591,7 +1889,7 @@
           class: 'linklike sub-edit', type: 'button', 'data-fk': key,
           'aria-haspopup': 'dialog', 'aria-expanded': popover.key === key ? 'true' : 'false',
           disabled: busy || undefined,
-          'aria-label': `Change or remove the ${host} subdomain for ${s.name}`,
+          'aria-label': `Change or remove the ${host} subdomain for ${spec.name}`,
           title: 'Change or remove subdomain',
           onclick: openEditor,
         }, icon('edit'), busy ? 'Saving…' : 'Edit'));
@@ -1601,14 +1899,14 @@
       class: 'linklike assign-sub', type: 'button', 'data-fk': key,
       'aria-haspopup': 'dialog', 'aria-expanded': popover.key === key ? 'true' : 'false',
       disabled: busy || undefined,
-      'aria-label': `Assign a subdomain to ${s.name}`,
-      title: `Publish ${s.name} at a <name>.${domain} subdomain`,
+      'aria-label': `Assign a subdomain to ${spec.name}`,
+      title: `Publish ${spec.name} at a <name>.${domain} subdomain`,
       onclick: openEditor,
     }, icon('plus'), busy ? 'Saving…' : 'Assign subdomain');
   }
 
-  // Popover editor for assigning / changing / removing a server's subdomain.
-  function subdomainEditor(o, s, route) {
+  // Popover editor for assigning / changing / removing a subdomain.
+  function subdomainEditor(o, spec, route) {
     const domain = o.console?.domain || 'vr.ae';
     let access = route ? route.auth : 'google';
 
@@ -1664,22 +1962,53 @@
       mkAccess('google', 'Login required', 'Only approved Google accounts can open it'),
       mkAccess('public', 'Public', 'Anyone on the internet can open it'));
 
+    // Container-port choice (docker specs only): needed when the container
+    // publishes several ports; otherwise it is picked automatically.
+    let portSelect = null;
+    let portNote = null;
+    if (spec.portOptions) {
+      const options = spec.portOptions.slice();
+      const current = route?.containerPort;
+      if (Number.isInteger(current) && !options.some((op) => op.containerPort === current)) {
+        options.unshift({ containerPort: current, hostPort: null });
+      }
+      if (options.length > 1) {
+        portSelect = h('select', { class: 'sub-input', 'aria-label': 'Container port to publish' },
+          ...options.map((op) => h('option', {
+            value: String(op.containerPort),
+            selected: op.containerPort === (current ?? options[0].containerPort) || undefined,
+          }, op.hostPort === null
+            ? `container port ${op.containerPort} (not published right now)`
+            : `container port ${op.containerPort} → host :${op.hostPort}`)));
+      } else if (options.length === 1) {
+        portNote = h('p', { class: 'pop-hint' },
+          `Publishes container port ${options[0].containerPort}`
+          + (options[0].hostPort === null ? ' (not published right now).' : ` (host :${options[0].hostPort}).`));
+      }
+    }
+    const chosenPort = () => {
+      if (!spec.portOptions) return undefined;
+      if (portSelect) return Number(portSelect.value);
+      const only = spec.portOptions[0]?.containerPort ?? route?.containerPort;
+      return Number.isInteger(only) ? only : undefined;
+    };
+
     save.onclick = () => {
       const v = input.value.trim();
       if (currentProblem()) return;
       const makingPublic = access === 'public' && (!route || route.auth !== 'public');
-      saveSubdomain(s, v, access, {
+      spec.save(v, access, {
         confirmText: makingPublic
           ? `Make https://${v}.${domain} public?\n\nAnyone on the internet will reach this dev server without signing in.`
           : undefined,
-      });
+      }, chosenPort());
     };
 
     const remove = route
       ? h('button', {
           class: 'btn small danger', type: 'button',
           'aria-label': `Remove the ${route.slug}.${domain} subdomain`, title: 'Remove subdomain (server keeps running)',
-          onclick: () => saveSubdomain(s, '', access, {
+          onclick: () => spec.save('', access, {
             confirmText: `Remove https://${route.slug}.${domain}?\n\nThe dev server keeps running — only this public URL stops working.`,
           }),
         }, icon('trash'), 'Remove')
@@ -1687,10 +2016,13 @@
 
     refresh();
     return h('div', { class: 'sub-editor' },
-      popHead(route ? `Subdomain · ${s.name}` : `Assign subdomain · ${s.name}`),
+      popHead(route ? `Subdomain · ${spec.name}` : `Assign subdomain · ${spec.name}`),
       h('label', { class: 'sub-lab' }, 'Subdomain'),
       input,
       preview,
+      portSelect ? h('div', { class: 'sub-lab' }, 'Container port') : null,
+      portSelect,
+      portNote,
       h('div', { class: 'sub-lab' }, 'Access'),
       seg,
       h('div', { class: 'sub-actions' }, save, remove));
@@ -1845,7 +2177,7 @@
         const isHidden = hidden.has(c.name);
         if (isHidden) hiddenCount += 1;
         if (isHidden && !revealing) continue;
-        visible.push(dockerItem(c, isHidden));
+        visible.push(dockerItem(o, c, isHidden, isWebServerContainer(o, group, c)));
       }
       if (!visible.length) continue;
       const up = containers.filter(isContainerRunning).length;
@@ -1864,7 +2196,7 @@
     return out;
   }
 
-  function dockerItem(c, hiddenRow = false) {
+  function dockerItem(o, c, hiddenRow = false, webish = false) {
     const name = c.name;
     const running = isContainerRunning(c);
     const open = ui.dockerOpen.has(name);
@@ -1913,7 +2245,8 @@
       h('span', { class: 'cell c-primary', 'data-label': 'Container' },
         h('strong', null, name),
         ' ',
-        h('span', { class: 'dim' }, running ? 'up' : 'stopped')),
+        h('span', { class: 'dim' }, running ? 'up' : 'stopped'),
+        webish ? dockerSubdomainControl(o, c, 'dock') : null),
       h('span', { class: 'cell dim mono', 'data-label': 'Image' }, c.image || '—'),
       usageCellNode({
         key: `dock:${name}`,
@@ -2285,7 +2618,7 @@
           : (stopped ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot())));
   }
 
-  function treeContainerRow(o, c, isDb, hiddenRow) {
+  function treeContainerRow(o, c, isDb, hiddenRow, webish = false) {
     const busy = ui.busy.has(`docker:${c.name}`);
     const running = isContainerRunning(c);
     const act = (action, label, iconName, confirmText) => h('button', {
@@ -2302,7 +2635,10 @@
         h('span', { class: `kind-tag ${isDb ? 'k-db' : 'k-dock'}` }, isDb ? 'database' : 'container')),
       h('span', { class: 'cell c-primary' },
         h('strong', null, c.name),
-        h('span', { class: 'tree-detail dim mono', title: c.image || '' }, c.image || '')),
+        h('span', { class: 'tree-detail dim mono', title: c.image || '' }, c.image || ''),
+        // Own wrapping block: the name line is nowrap+ellipsis and would
+        // otherwise clip the chip invisible.
+        webish ? h('span', { class: 'tree-sub' }, dockerSubdomainControl(o, c, 'tree')) : null),
       usageCellNode({
         key: `dock:${c.name}`,
         title: c.name,
@@ -2374,7 +2710,8 @@
       for (const c of containers) {
         const isHidden = hiddenDocker.has(c.name);
         if (isHidden && !revealing) continue;
-        children.push(treeContainerRow(o, c, group.dbNames.has(c.name), isHidden));
+        children.push(treeContainerRow(o, c, group.dbNames.has(c.name), isHidden,
+          isWebServerContainer(o, group, c)));
       }
       if (!children.length && memberCount > 0) {
         children.push(h('p', { class: 'inline-note' }, 'All items in this project are hidden.'));

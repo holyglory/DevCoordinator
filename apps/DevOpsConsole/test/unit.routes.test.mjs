@@ -10,7 +10,13 @@ import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { createRouteStore, RouteError } from '../src/routes.mjs';
+import {
+  createRouteStore,
+  parsePublishedPorts,
+  publishedContainerPorts,
+  publishedHostPort,
+  RouteError,
+} from '../src/routes.mjs';
 
 const CONFIG = {
   consoleHost: 'panel.vr.ae',
@@ -329,4 +335,216 @@ test('load: a disk-seeded route on the coordinator API port is dropped (invarian
   // And it must not be resolvable/proxyable either.
   const noCoord = { serversRaw: async () => [] };
   assert.deepEqual(await store.resolve('evil', noCoord), { port: null, reason: 'route not found' });
+});
+
+// ---------------------------------------------------------------------------
+// kind=docker: published-ports parsing and container route resolution
+// ---------------------------------------------------------------------------
+
+test('parsePublishedPorts: v4/v6 pairs, ranges, remaps, and junk-resistance', () => {
+  // Plain dual-stack publish (the common compose case).
+  assert.deepEqual(parsePublishedPorts('0.0.0.0:5001->5001/tcp, :::5001->5001/tcp'), [
+    { hostAddr: '0.0.0.0', hostPort: 5001, containerPort: 5001 },
+    { hostAddr: '::', hostPort: 5001, containerPort: 5001 },
+  ]);
+  // Host/container remap.
+  assert.deepEqual(parsePublishedPorts('127.0.0.1:9010->9000/tcp'), [
+    { hostAddr: '127.0.0.1', hostPort: 9010, containerPort: 9000 },
+  ]);
+  // Ranges expand positionally.
+  assert.deepEqual(parsePublishedPorts('0.0.0.0:9000-9001->9000-9001/tcp'), [
+    { hostAddr: '0.0.0.0', hostPort: 9000, containerPort: 9000 },
+    { hostAddr: '0.0.0.0', hostPort: 9001, containerPort: 9001 },
+  ]);
+  // Exposed-only (no publish), udp, empty, and malformed entries are skipped.
+  assert.deepEqual(parsePublishedPorts('5432/tcp'), []);
+  assert.deepEqual(parsePublishedPorts('0.0.0.0:5353->5353/udp'), []);
+  assert.deepEqual(parsePublishedPorts(''), []);
+  assert.deepEqual(parsePublishedPorts(null), []);
+  assert.deepEqual(parsePublishedPorts('0.0.0.0:9000-9002->9000-9001/tcp'), [], 'mismatched range must be dropped');
+  // Bracketed IPv6 literal.
+  assert.deepEqual(parsePublishedPorts('[::]:8080->80/tcp'), [
+    { hostAddr: '::', hostPort: 8080, containerPort: 80 },
+  ]);
+});
+
+test('publishedHostPort / publishedContainerPorts: loopback preference and reachability', () => {
+  const dual = parsePublishedPorts('0.0.0.0:5001->5001/tcp, :::5001->5001/tcp');
+  assert.equal(publishedHostPort(dual, 5001), 5001);
+  assert.equal(publishedHostPort(dual, 80), null, 'unpublished container port must not resolve');
+
+  // v4 binding wins when both exist on different host ports.
+  const mixed = parsePublishedPorts(':::9100->9000/tcp, 0.0.0.0:9110->9000/tcp');
+  assert.equal(publishedHostPort(mixed, 9000), 9110);
+
+  // A v6-ONLY publish must NOT resolve: the proxy dials v4 loopback, a
+  // separate socket namespace — accepting it would 502 or, worse, cross-wire
+  // the route into an unrelated v4 process on the same port number.
+  const v6only = parsePublishedPorts(':::5000->3000/tcp');
+  assert.equal(publishedHostPort(v6only, 3000), null);
+  assert.deepEqual(publishedContainerPorts('::1:5000->3000/tcp'), []);
+
+  // A publish bound to a specific external address is NOT loopback-reachable.
+  const external = parsePublishedPorts('192.168.1.50:8080->80/tcp');
+  assert.equal(publishedHostPort(external, 80), null);
+  assert.deepEqual(publishedContainerPorts('192.168.1.50:8080->80/tcp'), []);
+
+  assert.deepEqual(
+    publishedContainerPorts('0.0.0.0:19998->3000/tcp, 0.0.0.0:19999->9000/tcp'),
+    [
+      { containerPort: 3000, hostPort: 19998 },
+      { containerPort: 9000, hostPort: 19999 },
+    ],
+  );
+});
+
+test('kind=docker: create validates containerName/containerPort; update keeps kind fields consistent', async (t) => {
+  const { store } = await makeStore(t);
+
+  await assertRejectsRoute(
+    store.create({ slug: 'dweb', kind: 'docker', containerPort: 3000 }),
+    400, /containerName/);
+  await assertRejectsRoute(
+    store.create({ slug: 'dweb', kind: 'docker', containerName: 'bad name!', containerPort: 3000 }),
+    400, /containerName/);
+  await assertRejectsRoute(
+    store.create({ slug: 'dweb', kind: 'docker', containerName: 'web-1' }),
+    400, /containerPort/);
+  await assertRejectsRoute(
+    store.create({ slug: 'dweb', kind: 'docker', containerName: 'web-1', containerPort: 0 }),
+    400, /containerPort/);
+
+  const route = await store.create({ slug: 'dweb', kind: 'docker', containerName: 'web-1', containerPort: 3000 });
+  assert.equal(route.kind, 'docker');
+  assert.equal(route.containerName, 'web-1');
+  assert.equal(route.containerPort, 3000);
+  assert.equal(route.auth, 'google', 'default-deny applies to docker routes too');
+
+  // Converting to kind=port drops the container fields; converting back
+  // demands them again.
+  const asPort = await store.update('dweb', { kind: 'port', port: 4100 });
+  assert.equal(asPort.containerName, undefined);
+  assert.equal(asPort.containerPort, undefined);
+  await assertRejectsRoute(store.update('dweb', { kind: 'docker' }), 400, /containerName and containerPort/);
+});
+
+function dockerCoordinator(containers, { available = true, error } = {}) {
+  return {
+    inventory: async () => ({ docker: { available, error, containers } }),
+    serversRaw: async () => [],
+  };
+}
+
+test('resolve: kind=docker running / stopped / unpublished / missing / docker down', async (t) => {
+  const { store } = await makeStore(t);
+  await store.create({ slug: 'dweb', kind: 'docker', containerName: 'web-1', containerPort: 3000 });
+
+  // Running with a published mapping resolves to the HOST port.
+  const up = dockerCoordinator([
+    { name: 'web-1', status: 'Up 5 minutes (healthy)', ports: '0.0.0.0:32771->3000/tcp, :::32771->3000/tcp' },
+  ]);
+  assert.deepEqual(await store.resolve('dweb', up), {
+    port: 32771,
+    container: { name: 'web-1', status: 'Up 5 minutes (healthy)' },
+  });
+
+  // Stopped container: no port, actionable reason.
+  const down = dockerCoordinator([{ name: 'web-1', status: 'Exited (0) 2 hours ago', ports: '' }]);
+  const stopped = await store.resolve('dweb', down);
+  assert.equal(stopped.port, null);
+  assert.match(stopped.reason, /not running/);
+
+  // Running but the routed container port is not published.
+  const unpublished = dockerCoordinator([{ name: 'web-1', status: 'Up 1 minute', ports: '0.0.0.0:8081->8080/tcp' }]);
+  const missing = await store.resolve('dweb', unpublished);
+  assert.equal(missing.port, null);
+  assert.match(missing.reason, /does not publish port 3000/);
+
+  // Container gone entirely.
+  const absent = await store.resolve('dweb', dockerCoordinator([]));
+  assert.equal(absent.port, null);
+  assert.match(absent.reason, /container not found/);
+
+  // Docker unavailable on the box.
+  const noDocker = await store.resolve('dweb', dockerCoordinator([], { available: false, error: 'no docker' }));
+  assert.equal(noDocker.port, null);
+  assert.match(noDocker.reason, /docker unavailable/);
+
+  // Coordinator unreachable.
+  const dead = { inventory: async () => { throw new Error('boom'); } };
+  const unreachable = await store.resolve('dweb', dead);
+  assert.equal(unreachable.port, null);
+  assert.match(unreachable.reason, /coordinator unavailable/);
+});
+
+test('resolve: kind=docker never resolves to the coordinator API port (invariant #1)', async (t) => {
+  const { store } = await makeStore(t);
+  await store.create({ slug: 'dtrap', kind: 'docker', containerName: 'trap-1', containerPort: 3000 });
+  // A container publishing its port ON the coordinator API port must be refused.
+  const trap = dockerCoordinator([
+    { name: 'trap-1', status: 'Up 1 minute', ports: '0.0.0.0:29876->3000/tcp' },
+  ]);
+  const resolved = await store.resolve('dtrap', trap);
+  assert.equal(resolved.port, null);
+  assert.match(resolved.reason, /coordinator API port/);
+});
+
+// The UI keeps a hand-mirrored copy of the published-ports parser (browser
+// code cannot import node modules). Extract it from app.js by brace matching
+// and run BOTH implementations over the same corpus so they cannot drift.
+test('ui parser mirror: app.js parsePublishedPorts/publishedContainerPorts match src/routes.mjs', async () => {
+  const appJs = await fsp.readFile(
+    new URL('../src/ui/app.js', import.meta.url), 'utf8');
+
+  function extractFunction(source, header) {
+    const start = source.indexOf(header);
+    assert.notEqual(start, -1, `app.js no longer contains "${header}"`);
+    let depth = 0;
+    for (let i = source.indexOf('{', start); i < source.length; i += 1) {
+      if (source[i] === '{') depth += 1;
+      else if (source[i] === '}') {
+        depth -= 1;
+        if (depth === 0) return source.slice(start, i + 1);
+      }
+    }
+    assert.fail(`unbalanced braces extracting ${header}`);
+    return '';
+  }
+
+  const parserSrc = extractFunction(appJs, 'function parsePublishedPorts(text)');
+  const v4Line = appJs.match(/const V4_ADDRS = new Set\(\[[^\]]*\]\);/)?.[0];
+  assert.ok(v4Line, 'app.js V4_ADDRS definition missing');
+  const portsSrc = extractFunction(appJs, 'function publishedContainerPorts(text)');
+
+  // eslint-disable-next-line no-new-func
+  const uiModule = new Function(`
+    ${parserSrc}
+    ${v4Line}
+    ${portsSrc}
+    return { parsePublishedPorts, publishedContainerPorts };
+  `)();
+
+  const corpus = [
+    '0.0.0.0:5001->5001/tcp, :::5001->5001/tcp',
+    '127.0.0.1:9010->9000/tcp',
+    '0.0.0.0:9000-9001->9000-9001/tcp',
+    ':::5000->3000/tcp',
+    '::1:5000->3000/tcp',
+    '[::]:8080->80/tcp',
+    '192.168.1.50:8080->80/tcp',
+    '5432/tcp',
+    '0.0.0.0:5353->5353/udp',
+    '0.0.0.0:19998->3000/tcp, 0.0.0.0:19999->9000/tcp',
+    '0.0.0.0:9000-9002->9000-9001/tcp',
+    '',
+    'garbage, more->garbage/tcp',
+  ];
+  for (const ports of corpus) {
+    assert.deepEqual(
+      uiModule.parsePublishedPorts(ports), parsePublishedPorts(ports),
+      `parsePublishedPorts drift for ${JSON.stringify(ports)}`);
+    assert.deepEqual(
+      uiModule.publishedContainerPorts(ports), publishedContainerPorts(ports),
+      `publishedContainerPorts drift for ${JSON.stringify(ports)}`);
+  }
 });

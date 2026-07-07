@@ -1,5 +1,45 @@
 # Decision History
 
+## 2026-07-07 - DevOps Console: docker-hosted web servers are first-class servers (v1.4.0)
+
+Decision: Containers that serve web traffic (the user's example:
+`skydivelive-app-1`) now appear in the Servers list, can be
+started/stopped/restarted there, and take subdomains like coordinator
+servers. Membership rule: any non-database container publishing a TCP port
+on a loopback-reachable address, plus stopped containers that still hold a
+route (a stopped container publishes nothing, so the route is what keeps it
+startable from the page). Subdomains use a new route kind `docker` whose
+durable identity is container name + CONTAINER-side port; the published host
+port is resolved live from the (cached) coordinator inventory on every
+request, so restarts and remapped host ports keep working. One shared
+subdomain control (spec-parametrized) serves server rows, docker rows, the
+Docker tab and the Projects tree, growing a container-port picker when
+several ports are published; `/api/docker/subdomain` mirrors the server
+endpoint's assign/rename/auth/unassign semantics. Every resolved port —
+docker included — passes the coordinator-API-port guard.
+
+A five-lens adversarial review (57 agents, 24 confirmed findings, all fixed)
+shaped the final design: v6-only publishes (`::`/`::1`) are now REJECTED as
+unreachable because the proxy dials v4 loopback — a separate socket
+namespace — so accepting them either 502s or cross-wires the route into
+whatever unrelated v4 process holds that port number; same-slug updates
+(auth changes, renames) no longer demand a currently-published port and
+never silently repoint the stored container port (explicit `port` only, and
+re-sending the route's own port is a no-op); paused containers
+(`Up … (Paused)`) read as paused, not running, and their routes refuse to
+proxy; the e2e docker-web fixture listener is closed in after() — leaving it
+open wedged `node --test` after a green run, the exact hang class the macOS
+CI work just fixed; an OS-assigned fixture port containing "5432" would have
+silently reclassified the fixture as postgres (redrawn now). Coverage: e2e
+tests 16–17 run a fake docker CLI under the real coordinator (assign →
+proxied 200 through the TLS edge → actions logged → ambiguity/typo 400s →
+stale-port lifecycle → idempotent unassign), and a drift test extracts the
+UI's mirrored ports parser from app.js and runs it against the backend
+parser over a shared corpus. Known residual, accepted: if several docker
+routes point at one container (possible via the Routes form), the row
+control manages the slug-sorted first — the same semantics server rows have
+always had; extras are managed on the Routes page.
+
 ## 2026-07-07 - CI on macOS: never use bare `python3 -m http.server` as a test fixture
 
 Decision: The repo's first full macOS CI runs exposed two independent

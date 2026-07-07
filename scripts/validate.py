@@ -464,6 +464,17 @@ def check_devops_console() -> None:
         "charts built without innerHTML": "document.createElementNS(SVG_NS",
         "fast close clears drain timers": "clearTimeout(killTimer)",
         "test TLS fixture generated on demand": "execFileSync('openssl', [",
+        # Docker-hosted web servers (v1.4.0): published-port parsing feeds
+        # both the docker route resolver and the Servers-page rows; the
+        # resolver must keep screening against the coordinator API port.
+        "docker published-port parser": "export function parsePublishedPorts(",
+        "docker route resolves published host port": "publishedHostPort(parsePublishedPorts(found.ports), route.containerPort)",
+        "docker route resolution guards coordinator port": "guardCoordinatorPort(hostPort, { container })",
+        "docker subdomain endpoint": "'/api/docker/subdomain'",
+        "docker subdomain demands one published port": "pass \"port\" to choose one",
+        "servers page lists docker web servers": "visible.push(dockerServerItem(o, c, isHidden));",
+        "docker server rows detected by published ports or route": "function isWebServerContainer(",
+        "docker server row actions hit docker endpoint": "'data-fk': `srv-dock-${action}:${name}`",
     }
     haystack = "\n".join([source_text, app_js, app_css, index_html, dev_cert_helper])
     missing = [label for label, needle in required.items() if needle not in haystack]

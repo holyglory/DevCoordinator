@@ -179,11 +179,16 @@ inventory alongside everything it manages.
 ## Exposing a dev server
 
 1. Start the server through the coordinator (or the console UI) so it has a
-   tracked port.
-2. Console → *Routes* → create: pick a slug (`myapp` → `https://myapp.vr.ae`),
-   choose the coordinator server (port follows the server across restarts) or
-   a fixed port, and leave access on **login required** (default) or
-   explicitly flip to public.
+   tracked port. Web servers running as Docker containers (any container
+   publishing a non-database TCP port) need nothing extra — they show up on
+   the Servers page automatically.
+2. Console → *Servers* → "Assign subdomain" on the row (works for both
+   coordinator servers and docker containers; a port picker appears when a
+   container publishes several ports), or Console → *Routes* → create: pick a
+   slug (`myapp` → `https://myapp.vr.ae`), choose the coordinator server
+   (port follows the server across restarts), a container (host port follows
+   the container across restarts), or a fixed port, and leave access on
+   **login required** (default) or explicitly flip to public.
 3. WebSockets/HMR pass through. Vite dev servers block unknown hosts with
    "Blocked request. This host … is not allowed" — allow the whole domain
    family once and any assigned slug keeps working after renames:

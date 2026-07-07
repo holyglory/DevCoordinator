@@ -251,12 +251,12 @@ export async function apiCall(stack, jar, method, apiPath, body, extraHeaders = 
 // Real coordinator (isolated home, OS-assigned port)
 // ---------------------------------------------------------------------------
 
-async function spawnCoordinator(home) {
+async function spawnCoordinator(home, extraEnv = {}) {
   const proc = spawn(
     'python3',
     [COORDINATOR_SCRIPT, 'api', 'serve', '--host', '127.0.0.1', '--port', '0'],
     {
-      env: { ...process.env, CODEX_AGENT_COORDINATOR_HOME: home },
+      env: { ...process.env, CODEX_AGENT_COORDINATOR_HOME: home, ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );
@@ -377,8 +377,10 @@ async function stopProcess(proc) {
  * @param {object[]|Function} [options.routes]  routes seeded into
  *   <stateDir>/routes.json; may be a function of ({ issuer, upstream, wsEcho,
  *   coordinator }) so seeds can reference the fixtures' OS-assigned ports.
+ * @param {object} [options.coordinatorEnv]  extra env for the coordinator
+ *   process only (e.g. a PATH with a fake `docker` first).
  */
-export async function startStack({ allowedEmails = ['ja@vr.ae'], claims, routes = [] } = {}) {
+export async function startStack({ allowedEmails = ['ja@vr.ae'], claims, routes = [], coordinatorEnv = {} } = {}) {
   ensureDevCert(); // fresh clones (CI) generate the throwaway TLS fixture
   const cleanups = []; // LIFO
   const runCleanups = async () => {
@@ -404,7 +406,7 @@ export async function startStack({ allowedEmails = ['ja@vr.ae'], claims, routes 
     const wsEcho = await startWsEcho();
     cleanups.push(() => wsEcho.close());
 
-    const coordinator = await spawnCoordinator(coordHome);
+    const coordinator = await spawnCoordinator(coordHome, coordinatorEnv);
     cleanups.push(async () => {
       // Stop any servers the coordinator still manages (e.g. a test failed
       // between servers/start and servers/stop), then the coordinator itself.

@@ -121,24 +121,31 @@ Prioritized: top rows are the most frequent and most important.
 - Trigger: a dev server just started (via coordinator or manually on a fixed
   port) and needs a shareable URL.
 - Preconditions: session; for the "managed server" target, coordinator
-  reachable with at least one server registered.
+  reachable with at least one server registered; for the "container" target,
+  docker reachable with at least one running container publishing a
+  loopback-reachable TCP port.
 - Entry point: Routes section create form (always visible at the top of the
   section — it is the section's primary data-entry surface).
 - Route/screen sequence: form → new row appears in the routes table →
   (optionally) click the row's URL to verify → copy URL.
 - Primary decisions: slug name; target kind (fixed port vs. coordinator
-  server — server-linked routes follow port changes across restarts, fixed
-  ports do not); access mode (default **login required**; public is an
-  explicit, confirmed choice).
+  server vs. docker container — server-linked routes follow port changes
+  across restarts, container routes follow the published host port across
+  restarts, fixed ports do not); access mode (default **login required**;
+  public is an explicit, confirmed choice).
 - Required information per step: live slug preview (`https://<slug>.vr.ae`)
   with inline validity/reserved/duplicate feedback *before* submit; the
   server dropdown must show name, project, port and status so the right
-  instance is pickable; the access switch must state its current meaning in
-  words ("Google sign-in required" / "Public — no sign-in").
+  instance is pickable; the container dropdown shows one option per
+  (container, published port) pair with project and host port; the access
+  switch must state its current meaning in words ("Google sign-in required" /
+  "Public — no sign-in").
 - Warning/flag conditions: invalid/reserved/duplicate slug (inline, live);
   choosing public (confirm dialog spelling out "anyone on the internet");
-  coordinator down (server dropdown disabled with reason; fixed-port routes
-  still creatable); server-side 400/409 (verbatim message inline + banner).
+  coordinator down (server/container dropdowns disabled with reason;
+  fixed-port routes still creatable); docker down (container dropdown
+  disabled with reason); server-side 400/409 (verbatim message inline +
+  banner).
 - Primary actions: fill form, submit, copy resulting URL.
 - Secondary/rare actions: add an optional human title; pick a stopped server
   (options listed but disabled — routes point at running things).
@@ -551,12 +558,12 @@ header is identical on every page):
 
 | Screen area | Journey | Critical info | Primary actions | Secondary actions | Rare details | Device/context constraints |
 | --- | --- | --- | --- | --- | --- | --- |
-| Projects page (`#/projects`, default) | J8, J7 | Repo tree: per-node running counts, project + item CPU/mem, kind tags | Whole-project start/stop/restart; per-item start/stop/restart; hide idle | Collapse nodes; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap |
+| Projects page (`#/projects`, default) | J8, J7 | Repo tree: per-node running counts, project + item CPU/mem, kind tags; subdomain chip on web-serving containers | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain | Collapse nodes; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap |
 | Sticky summary bar | J1 | Health sentence; coordinator/TLS chips | Open chip popovers | Sign out | Coordinator error text; cert dates | One-line sentence, wraps on phone; sticky top |
 | Section nav | All | Page names, live counts, active page | Switch page | Hamburger open/close (phone) | — | Tabs ≥720px; drawer with ≥40px targets below |
-| Servers page (`#/servers`, default) | J2, J3, J7 | Health badge, name, port, subdomain, CPU/mem numbers | Expand; restart; refresh logs; assign/edit subdomain; open history charts | Stop | pid/cmd/cwd/health detail | Log box height-capped, own scrollbar; sparkline fixed-width |
-| Routes page (`#/routes`) | J2, J4 | URL, resolved dot, access mode | Create; copy; toggle access | Delete; title; "view server" link | Timestamps | Form stacks at 390px; table rows become labelled cards |
-| Docker page (`#/docker`) | J5, J7 | Status, name, image, ports, CPU/mem numbers | Logs; restart; start; open history charts | Stop | stats/labels | Same card pattern |
+| Servers page (`#/servers`, default) | J2, J3, J7 | Health badge, name, port, subdomain, CPU/mem numbers; docker-hosted web servers as first-class rows (kind tag, container status, published host ports) | Expand; restart; refresh logs; assign/edit subdomain (containers too, with a port picker when several are published); open history charts | Stop; start (stopped containers) | pid/cmd/cwd/health detail; container image/ports detail | Log box height-capped, own scrollbar; sparkline fixed-width |
+| Routes page (`#/routes`) | J2, J4 | URL, resolved dot, access mode; targets: fixed port, managed server, docker container | Create; copy; toggle access | Delete; title; "view server" link | Timestamps | Form stacks at 390px; table rows become labelled cards |
+| Docker page (`#/docker`) | J5, J7 | Status, name, image, ports, CPU/mem numbers; subdomain chip on web-serving containers | Logs; restart; start; open history charts; assign/edit subdomain | Stop | stats/labels | Same card pattern |
 | Port leases page (`#/ports`) | J6 | Port, purpose, countdown; lease form; pinned ports (port permanently owned per server, with server status) | Lease; release (confirmed); unassign pin (confirmed) | Preferred port/TTL/project | Lease id, ISO expiry, agent, pin provenance (title) | Form stacks at 390px |
 | Performance page (`#/performance`) | J7 | Per-entity CPU/mem charts; per-project bars | Read; jump to rows to act | — | Sampling cadence note | Chart grid single-column on phone |
 
