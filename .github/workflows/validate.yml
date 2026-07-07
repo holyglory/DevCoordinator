@@ -11,7 +11,10 @@ jobs:
     # macOS is required: scripts/validate.py builds the DevOpsBoard Swift app
     # and the formal-web-ui self-test drives a real Chromium via Playwright.
     runs-on: macos-latest
-    timeout-minutes: 30
+    # The gate runs every skill self-test twice (in-repo + standalone copy),
+    # including two Chromium-driven formal-web-ui suites, plus the Swift build
+    # and the console e2e stack — 30 minutes is too tight on a 3-core runner.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
