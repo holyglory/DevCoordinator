@@ -262,41 +262,55 @@ async function spawnCoordinator(home) {
     stderrTail = (stderrTail + chunk).slice(-16_384);
   });
 
-  const port = await new Promise((resolve, reject) => {
-    let out = '';
-    const timer = setTimeout(
-      () => reject(new Error(`coordinator did not print readiness JSON in 15s; stderr: ${stderrTail}`)),
-      15_000,
-    );
-    timer.unref();
-    proc.stdout.on('data', (chunk) => {
-      out += chunk;
-      const nl = out.indexOf('\n');
-      if (nl === -1) return;
-      clearTimeout(timer);
-      try {
-        const parsed = JSON.parse(out.slice(0, nl));
-        if (!Number.isInteger(parsed.port) || parsed.port <= 0) {
-          reject(new Error(`coordinator readiness line has no usable port: ${out.slice(0, nl)}`));
-        } else {
-          resolve(parsed.port);
+  // Cold CI runners (macOS, 3 cores) start python noticeably slower while
+  // node --test floods the box with parallel test files — allow a full
+  // minute. CRITICAL: every failure path must kill the child. An orphaned
+  // coordinator keeps this worker's stdio pipes open, which wedges the whole
+  // `node --test` run until the CI job timeout (observed: a 29-minute silent
+  // hang after a readiness timeout).
+  let port;
+  try {
+    port = await new Promise((resolve, reject) => {
+      let out = '';
+      const timer = setTimeout(
+        () => reject(new Error(
+          `coordinator did not print readiness JSON in 60s; stdout: ${JSON.stringify(out.slice(0, 400))}; stderr: ${stderrTail}`,
+        )),
+        60_000,
+      );
+      timer.unref();
+      proc.stdout.on('data', (chunk) => {
+        out += chunk;
+        const nl = out.indexOf('\n');
+        if (nl === -1) return;
+        clearTimeout(timer);
+        try {
+          const parsed = JSON.parse(out.slice(0, nl));
+          if (!Number.isInteger(parsed.port) || parsed.port <= 0) {
+            reject(new Error(`coordinator readiness line has no usable port: ${out.slice(0, nl)}`));
+          } else {
+            resolve(parsed.port);
+          }
+        } catch (err) {
+          reject(new Error(`unparseable coordinator readiness line ${JSON.stringify(out.slice(0, nl))}: ${err}`));
         }
-      } catch (err) {
-        reject(new Error(`unparseable coordinator readiness line ${JSON.stringify(out.slice(0, nl))}: ${err}`));
-      }
+      });
+      proc.on('exit', (code, signal) => {
+        clearTimeout(timer);
+        reject(new Error(`coordinator exited early (code=${code} signal=${signal}); stderr: ${stderrTail}`));
+      });
+      proc.on('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
     });
-    proc.on('exit', (code, signal) => {
-      clearTimeout(timer);
-      reject(new Error(`coordinator exited early (code=${code} signal=${signal}); stderr: ${stderrTail}`));
-    });
-    proc.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
+  } catch (err) {
+    await stopProcess(proc);
+    throw err;
+  }
 
   const url = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + 30_000;
   for (;;) {
     try {
       const res = await fetch(`${url}/v1/ports`, { signal: AbortSignal.timeout(1000) });
@@ -305,7 +319,10 @@ async function spawnCoordinator(home) {
     } catch {
       // not up yet
     }
-    if (Date.now() > deadline) throw new Error(`coordinator never answered /v1/ports; stderr: ${stderrTail}`);
+    if (Date.now() > deadline) {
+      await stopProcess(proc);
+      throw new Error(`coordinator never answered /v1/ports; stderr: ${stderrTail}`);
+    }
     await delay(100);
   }
 

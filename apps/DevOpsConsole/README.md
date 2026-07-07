@@ -184,11 +184,13 @@ inventory alongside everything it manages.
    choose the coordinator server (port follows the server across restarts) or
    a fixed port, and leave access on **login required** (default) or
    explicitly flip to public.
-3. WebSockets/HMR pass through. For Vite dev servers add the public host:
+3. WebSockets/HMR pass through. Vite dev servers block unknown hosts with
+   "Blocked request. This host … is not allowed" — allow the whole domain
+   family once and any assigned slug keeps working after renames:
 
    ```js
-   // vite.config.js
-   export default { server: { allowedHosts: ['myapp.vr.ae'] } }
+   // vite.config.js / vite.config.ts
+   export default { server: { allowedHosts: ['.vr.ae'] } }
    ```
 
    (The proxy forwards the original `Host` plus `X-Forwarded-Proto/Host/For`.)
