@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -91,9 +92,15 @@ def check_include_glob_exclusions() -> None:
         (repo / "node_modules" / "pkg").mkdir(parents=True)
         (repo / "src" / "app.py").write_text("print(1)\n", encoding="utf-8")
         (repo / "node_modules" / "pkg" / "index.py").write_text("print(2)\n", encoding="utf-8")
+        # Explicit identity so the test does not depend on a machine-global
+        # git user.name/user.email being configured.
+        git_identity = [
+            "-c", "user.name=holyskills-validate",
+            "-c", "user.email=validate@holyskills.local",
+        ]
         run(["git", "init", "-q"], cwd=repo)
         run(["git", "add", "src/app.py"], cwd=repo)
-        run(["git", "commit", "-q", "-m", "init"], cwd=repo)
+        run(["git", *git_identity, "commit", "-q", "-m", "init"], cwd=repo)
 
         broad_out = tmp / "broad"
         run(
@@ -135,17 +142,17 @@ def check_include_glob_exclusions() -> None:
 
 
 def check_ops_console_interaction_guardrails() -> None:
-    ops_console = ROOT / "apps" / "CodexOpsConsole"
+    ops_console = ROOT / "apps" / "DevOpsBoard"
     if not ops_console.is_dir():
         return
 
     source_text = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted((ops_console / "Sources" / "CodexOpsConsole").glob("*.swift"))
+        for path in sorted((ops_console / "Sources" / "DevOpsBoard").glob("*.swift"))
     )
-    views = (ops_console / "Sources" / "CodexOpsConsole" / "Views.swift").read_text(encoding="utf-8")
-    store = (ops_console / "Sources" / "CodexOpsConsole" / "OpsStore.swift").read_text(encoding="utf-8")
-    models = (ops_console / "Sources" / "CodexOpsConsole" / "Models.swift").read_text(encoding="utf-8")
+    views = (ops_console / "Sources" / "DevOpsBoard" / "Views.swift").read_text(encoding="utf-8")
+    store = (ops_console / "Sources" / "DevOpsBoard" / "OpsStore.swift").read_text(encoding="utf-8")
+    models = (ops_console / "Sources" / "DevOpsBoard" / "Models.swift").read_text(encoding="utf-8")
     menu_snapshot = (ops_console / "Tools" / "MenuBarSnapshotMain.swift").read_text(encoding="utf-8")
     split_sizing = (ops_console / "Tools" / "SplitSizingTest.swift").read_text(encoding="utf-8")
     coordinator = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "dev_coordinator.py").read_text(encoding="utf-8")
@@ -169,7 +176,16 @@ def check_ops_console_interaction_guardrails() -> None:
         "vertical-only service map scroll": "ScrollView(.vertical)",
         "expandable sidebar tree": "expandedProjects",
         "sidebar selection": "sidebarSelection",
-        "canonical project grouping": "func projectKey(fromResourceName",
+        "grouping consumes coordinator membership rows": "func makeProjectGroups(from inventory: Inventory)",
+        "usage key membership decoding": "case usageKey = \"usage_key\"",
+        "server membership decoding": "case serverIDs = \"server_ids\"",
+        "container membership decoding": "case containerNames = \"container_names\"",
+        "group identity prefers usage key": "row.usageKey ?? row.project ?? row.projectKey",
+        "stray items fallback group": "strayProjectGroupID",
+        "membership union across coordinator homes": "seenServerIDs.insert(serverID).inserted",
+        "board name-claim divergence must-catch": "grouprepo-db must display under the path-keyed GroupRepo group",
+        "board ambiguity divergence must-catch": "must stay out of the repo group whose actions do not touch it",
+        "board stray visibility must-catch": "must stay visible in the stray fallback group",
         "resource leaf prefix removal": "resourceDisplayName(",
         "typed sidebar leaves": "enum MapLeafKind",
         "sidebar leaf actions": "SidebarActionButton",
@@ -205,7 +221,19 @@ def check_ops_console_interaction_guardrails() -> None:
         "docker stats model": "struct DockerStats",
         "docker telemetry sparkline": "MetricSparkCell",
         "docker telemetry panel": "DockerTelemetryPanel",
-        "docker auto refresh": "Task.sleep(nanoseconds: 2_500_000_000)",
+        "visibility gated auto refresh": "func setSurfaceVisible(",
+        "auto refresh interval": "static let autoRefreshInterval",
+        "auto refresh pauses when hidden": "autoRefreshTask?.cancel()",
+        "window occlusion tracking": "windowDidChangeOcclusionState",
+        "popover visibility tracking": "popoverDidClose",
+        "coalesced inventory refresh": "followUpRequested",
+        "publish inventory only on change": "guard decoded != inventory else { return }",
+        "cached project groups": "@Published private(set) var projectGroups",
+        "non-blocking process wait": "process.terminationHandler",
+        "bounded subprocess watchdog": "watchdog.cancel()",
+        "inventory subprocess timeout": "timeout: .seconds(60)",
+        "deterministic failure ordering": "failures.sorted { $0.index < $1.index }",
+        "project panel usage-key path fallback": "projectPath(fromUsageKey: name)",
         "project runtime command parser": "project_sub = project.add_subparsers",
         "project runtime status": "def project_runtime_status(",
         "project runtime start": "def project_runtime_start(",
@@ -223,11 +251,17 @@ def check_ops_console_interaction_guardrails() -> None:
         "docker metadata store": "docker_metadata_store",
         "runtime docker metadata adoption": "ensure_runtime_docker_metadata",
         "stale fixed-port lease reclaim": "reclaim_stale_leases_for_port",
+        "durable port assignment writer": "def record_port_assignment(",
+        "durable port assignment removal is explicit": "def unassign_port(",
+        "durable port assignment migration seeding": "def seed_port_assignments(",
+        "foreign assigned ports refused with owner named": "is durably assigned to",
+        "assignment survival self-test": "assignment must survive server stop and stopped-record pruning",
+        "pinned restart self-test": "server start after record pruning must land on the durably assigned port",
         "undeclared compose autostart guard": "\"autostart\": compose_declared",
         "undeclared compose skill policy": "`project start` must not run `docker\ncompose up` from that discovery",
         "docker identity enforcement": "requires --agent so the coordinator can attribute the action",
         "project runtime model": "struct ProjectRuntimeReport",
-        "project path grouping": "projectPathForGroup(",
+        "project action path from membership row": "projectPath: row.project",
         "project start UI action": "func startProject(_ group",
         "project restart UI action": "func restartProject(_ group",
         "project stop UI action": "func stopProject(_ group",
@@ -242,7 +276,7 @@ def check_ops_console_interaction_guardrails() -> None:
         "menu bar project rows": "MenuProjectRow",
         "menu bar task rows": "MenuTaskRow",
         "menu bar vertical scroll": "ScrollView(.vertical, showsIndicators: true)",
-        "menu bar shared project grouping": "projectGroups(from: store.inventory)",
+        "menu bar shared project grouping": "store.projectGroups",
         "menu bar hoverable actions": "@State private var isHovering = false",
         "menu bar action hit shape": ".contentShape(RoundedRectangle(cornerRadius: 7))",
         "menu bar action hit priority": ".zIndex(20)",
@@ -286,6 +320,11 @@ def check_ops_console_interaction_guardrails() -> None:
         "coordinator process tree usage": "def annotate_server_process_usage(",
         "coordinator project usage rollup": "def build_project_usage(",
         "inventory project usage": "\"project_usage\": project_usage",
+        "unified container membership attribution": "def container_project_attribution(",
+        "membership claim set shared by display and actions": "def known_project_paths(",
+        "ambiguous container name match stays unclaimed": "\"ambiguous_name\" if claimants else \"unclaimed\"",
+        "membership divergence must-catch fixture": "must-catch: unattributed grouprepo-db must display under the path-keyed repo",
+        "membership blast radius skill contract": "shows exactly the blast radius",
         "bounded socket http health": "socket.create_connection((parsed.hostname, port), timeout=timeout)",
         "http health timeout classification": "\"classification\": \"timeout\"",
         "project usage model": "struct ProjectUsage",
@@ -301,7 +340,7 @@ def check_ops_console_interaction_guardrails() -> None:
     haystacks = "\n".join([source_text, views, store, models, menu_snapshot, split_sizing, coordinator, coordinator_self_test, coordinator_skill])
     missing = [label for label, needle in required.items() if needle not in haystacks]
     if missing:
-        raise SystemExit("CodexOpsConsole interaction guardrail failed: " + ", ".join(missing))
+        raise SystemExit("DevOpsBoard interaction guardrail failed: " + ", ".join(missing))
 
     prohibited = {
         "sidebar category rows": "MapCategory",
@@ -316,11 +355,19 @@ def check_ops_console_interaction_guardrails() -> None:
         "fake usage seed": "usageSeed",
         "unused group by control": "\"Group by\"",
         "unused group state": "groupBy",
+        # Grouping is consumed from coordinator project_usage membership; any
+        # client-side re-derivation of repo identity from resource names is
+        # the display/action divergence class fixed on 2026-07-07.
+        "client-side name-key grouping heuristic": "projectKey(fromResourceName",
+        "client-side project path guessing": "projectPathForGroup(",
     }
     present = [label for label, needle in prohibited.items() if needle in haystacks]
     if present:
-        raise SystemExit("CodexOpsConsole interaction guardrail found prohibited pattern: " + ", ".join(present))
+        raise SystemExit("DevOpsBoard interaction guardrail found prohibited pattern: " + ", ".join(present))
 
+    if shutil.which("swiftc") is None:
+        print("skipping DevOpsBoard swiftc QA tools (no Swift toolchain on this host)")
+        return
     qa_dir = ops_console / ".build" / "qa"
     qa_dir.mkdir(parents=True, exist_ok=True)
     split_test = qa_dir / "SplitSizingTest"
@@ -331,9 +378,9 @@ def check_ops_console_interaction_guardrails() -> None:
             "-parse-as-library",
             "-o",
             str(split_test),
-            "Sources/CodexOpsConsole/Models.swift",
-            "Sources/CodexOpsConsole/OpsStore.swift",
-            "Sources/CodexOpsConsole/Views.swift",
+            "Sources/DevOpsBoard/Models.swift",
+            "Sources/DevOpsBoard/OpsStore.swift",
+            "Sources/DevOpsBoard/Views.swift",
             "Tools/SplitSizingTest.swift",
         ],
         cwd=ops_console,
@@ -345,14 +392,81 @@ def check_ops_console_interaction_guardrails() -> None:
             "-parse-as-library",
             "-o",
             str(menu_snapshot),
-            "Sources/CodexOpsConsole/Models.swift",
-            "Sources/CodexOpsConsole/OpsStore.swift",
-            "Sources/CodexOpsConsole/Views.swift",
-            "Sources/CodexOpsConsole/MenuBarViews.swift",
+            "Sources/DevOpsBoard/Models.swift",
+            "Sources/DevOpsBoard/OpsStore.swift",
+            "Sources/DevOpsBoard/Views.swift",
+            "Sources/DevOpsBoard/MenuBarViews.swift",
             "Tools/MenuBarSnapshotMain.swift",
         ],
         cwd=ops_console,
     )
+
+
+def check_devops_console() -> None:
+    """Deterministic guardrails for the DevOpsConsole web app (apps/DevOpsConsole).
+
+    Text anchors are tied to the security invariants in the app's
+    docs/architecture.md; removing any of them is a policy regression, not a
+    refactor. Also enforces the zero-third-party-dependency rule and runs the
+    app's full node:test suite.
+    """
+    console = ROOT / "apps" / "DevOpsConsole"
+    if not console.is_dir():
+        return
+
+    src_files = sorted((console / "src").rglob("*.mjs")) + sorted((console / "bin").glob("*.mjs"))
+    source_text = "\n".join(path.read_text(encoding="utf-8") for path in src_files)
+    app_js = (console / "src" / "ui" / "app.js").read_text(encoding="utf-8")
+    index_html = (console / "src" / "ui" / "index.html").read_text(encoding="utf-8")
+    package_json = json.loads((console / "package.json").read_text(encoding="utf-8"))
+
+    required = {
+        "routes default to login-required": "def.auth === undefined || def.auth === null ? 'google'",
+        "timing-safe session compare": "crypto.timingSafeEqual(given, expected)",
+        "proxy pinned to loopback": "const LOOPBACK = '127.0.0.1'",
+        "hop-by-hop header stripping": "HOP_BY_HOP",
+        "oidc nonce enforcement": "id_token nonce mismatch",
+        "oidc verified-email enforcement": "payload.email_verified !== true",
+        "csrf origin check on mutations": "mutating && !guard.checkOrigin(req)",
+        "no slug enumeration for anonymous users": "route names cannot be enumerated",
+        "segmented-control overlap allowance annotated": "data-ui-allow-overlap",
+        "coordinator caches invalidated on mutations": "if (isMutation(method, apiPath)) invalidateCaches();",
+        "metrics ring buffer bounded": "points.splice(0, points.length - maxPoints)",
+        "port release requires explicit lease id": "requireString(body.lease_id, 'lease_id')",
+        "pinned ports card rendered from inventory": "function buildAssignments(",
+        "pin removal confirmed in UI": "Unassign port ${a.port} from server",
+        "whole-project runtime control endpoint": "'/api/projects/action'",
+        "ui prefs persisted server-side": "ui-prefs.json",
+        "hidden items auto-reveal when running": "async function autoUnhide(",
+        "project grouping uses coordinator membership": "function projectGroupsOf(",
+        "hamburger nav aria wiring": 'aria-controls="site-nav"',
+        "charts built without innerHTML": "document.createElementNS(SVG_NS",
+    }
+    haystack = "\n".join([source_text, app_js, index_html])
+    missing = [label for label, needle in required.items() if needle not in haystack]
+    if missing:
+        raise SystemExit("DevOpsConsole guardrail failed: " + ", ".join(missing))
+
+    for banned in ("TODO", "FIXME", "wired later"):
+        if banned in source_text or banned in app_js:
+            raise SystemExit(f"DevOpsConsole guardrail found prohibited marker: {banned}")
+
+    if package_json.get("dependencies") or package_json.get("devDependencies"):
+        raise SystemExit("DevOpsConsole must stay zero-dependency; package.json declares dependencies")
+
+    import_pattern = re.compile(r"""(?:import\s[^'\"]*?from\s*|import\(|require\()\s*['\"]([^'\"]+)['\"]""")
+    for path in src_files:
+        for spec in import_pattern.findall(path.read_text(encoding="utf-8")):
+            if not spec.startswith(("node:", ".", "file:")):
+                raise SystemExit(f"DevOpsConsole {path.relative_to(console)} imports a non-stdlib module: {spec}")
+
+    innerhtml_assignments = re.findall(r"\.innerHTML\s*=", app_js)
+    if len(innerhtml_assignments) != 1 or "span.innerHTML = ICONS[name] || ''" not in app_js:
+        raise SystemExit("DevOpsConsole app.js may assign innerHTML only for the static ICONS map")
+
+    for path in [*src_files, console / "src" / "ui" / "app.js"]:
+        run(["node", "--check", str(path)])
+    run(["node", "--test", "test/"], cwd=console)
 
 
 def check_interaction_label_parity() -> None:
@@ -394,6 +508,7 @@ def main() -> int:
     check_interaction_label_parity()
     check_include_glob_exclusions()
     check_ops_console_interaction_guardrails()
+    check_devops_console()
     run([sys.executable, str((ROOT / "scripts" / "merge_findings_self_test.py"))])
     for skill in SKILLS:
         run([sys.executable, str(skill.relative_to(ROOT) / "scripts" / "self_test.py")])
@@ -415,9 +530,12 @@ def main() -> int:
     )
     for skill in SKILLS:
         check_standalone_skill(skill)
-    ops_console = ROOT / "apps" / "CodexOpsConsole"
+    ops_console = ROOT / "apps" / "DevOpsBoard"
     if ops_console.is_dir():
-        run(["swift", "build"], cwd=ops_console)
+        if shutil.which("swift"):
+            run(["swift", "build"], cwd=ops_console)
+        else:
+            print("skipping DevOpsBoard swift build (no Swift toolchain on this host)")
     print("validation ok")
     return 0
 

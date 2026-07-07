@@ -150,11 +150,9 @@ struct OpsConsoleView: View {
         .background(Theme.background)
         .foregroundStyle(Theme.primary)
         .task {
+            // One-shot initial load; recurring refresh is owned by the store
+            // and runs only while a surface is visible.
             await store.loadInventory()
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
-                await store.loadInventory()
-            }
         }
         .sheet(isPresented: $store.showingStartSheet) {
             StartServerSheet(store: store)
@@ -221,7 +219,7 @@ struct ServiceMapView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 WindowDots()
-                Text("Codex Ops Console")
+                Text("DevOps Board")
                     .font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -280,11 +278,11 @@ struct ServiceMapView: View {
     }
 
     private var groupedProjects: [ProjectGroup] {
-        projectGroups(from: store.inventory)
+        store.projectGroups
     }
 }
 
-struct ProjectGroup {
+struct ProjectGroup: Equatable {
     var id: String
     var name: String
     var projectPath: String?
@@ -294,37 +292,65 @@ struct ProjectGroup {
     var usage: ProjectUsage?
 }
 
-func projectGroups(from inventory: Inventory) -> [ProjectGroup] {
-    let dedupedServers = deduplicatedManagedServers(inventory.servers)
-    let servers = Dictionary(grouping: dedupedServers) { projectKey(fromPath: $0.project) }
-    let docker = Dictionary(grouping: inventory.docker.containers.filter { !$0.isPostgresLike }) { projectKey(fromDockerContainer: $0) }
-    let databases = Dictionary(grouping: inventory.postgres) { projectKey(fromDockerContainer: $0) }
-    let usage = Dictionary(grouping: inventory.projectUsage) { $0.projectKey ?? projectKey(fromPath: $0.project) }
-        .compactMapValues { rows in rows.max(by: { usageRank($0) < usageRank($1) }) }
-    let keys = Set(servers.keys).union(docker.keys).union(databases.keys).union(usage.keys).sorted()
+/// Groups come straight from the coordinator's `project_usage` rows, whose
+/// `server_ids`/`container_names` carry the same membership that
+/// whole-project start/stop/restart acts on. The app never re-derives repo
+/// identity from resource names, so the group a container is displayed under
+/// is exactly the group whose project actions touch it.
+func makeProjectGroups(from inventory: Inventory) -> [ProjectGroup] {
+    let servers = deduplicatedManagedServers(inventory.servers)
+    let containers = inventory.docker.containers
+    var claimedServerIDs = Set<String>()
+    var claimedContainerNames = Set<String>()
 
-    return keys.map { key in
-        ProjectGroup(
-            id: key,
-            name: projectDisplayName(
-                key: key,
-                servers: servers[key] ?? [],
-                containers: docker[key] ?? [],
-                databases: databases[key] ?? []
-            ),
-            projectPath: projectPathForGroup(
-                key: key,
-                servers: servers[key] ?? [],
-                containers: docker[key] ?? [],
-                databases: databases[key] ?? []
-            ),
-            servers: servers[key] ?? [],
-            containers: docker[key] ?? [],
-            databases: databases[key] ?? [],
-            usage: usage[key]
+    var groups: [ProjectGroup] = inventory.projectUsage.map { row in
+        let memberServerIDs = Set(row.serverIDs ?? [])
+        let memberContainerNames = Set(row.containerNames ?? [])
+        let rowServers = servers.filter { memberServerIDs.contains($0.id) }
+        let rowContainers = containers.filter { container in
+            guard let name = container.name else { return false }
+            return memberContainerNames.contains(name)
+        }
+        claimedServerIDs.formUnion(rowServers.map(\.id))
+        claimedContainerNames.formUnion(rowContainers.compactMap(\.name))
+        return ProjectGroup(
+            // usage_key first: project_key is a display name and NOT unique
+            // (two repos named "app", or a repo plus a same-named container).
+            id: row.usageKey ?? row.project ?? row.projectKey ?? row.name ?? "local",
+            name: row.name ?? row.project.map(shortProject) ?? row.projectKey ?? "local",
+            projectPath: row.project,
+            servers: rowServers,
+            containers: rowContainers.filter { !$0.isPostgresLike },
+            databases: rowContainers.filter(\.isPostgresLike),
+            usage: row
         )
     }
+    groups.sort { ($0.name.lowercased(), $0.id) < ($1.name.lowercased(), $1.id) }
+
+    // Safety net: anything the rollup did not claim (an older coordinator
+    // payload without membership fields) still gets displayed.
+    let strayServers = servers.filter { !claimedServerIDs.contains($0.id) }
+    let strayContainers = containers.filter { container in
+        guard let name = container.name else { return true }
+        return !claimedContainerNames.contains(name)
+    }
+    if !strayServers.isEmpty || !strayContainers.isEmpty {
+        groups.append(
+            ProjectGroup(
+                id: strayProjectGroupID,
+                name: "other",
+                projectPath: nil,
+                servers: strayServers,
+                containers: strayContainers.filter { !$0.isPostgresLike },
+                databases: strayContainers.filter(\.isPostgresLike),
+                usage: nil
+            )
+        )
+    }
+    return groups
 }
+
+let strayProjectGroupID = "stray:other"
 
 func usageRank(_ usage: ProjectUsage) -> (Double, Double, Int) {
     (usage.cpuPercent ?? 0, usage.memoryBytes ?? 0, usage.processCount ?? 0)
@@ -394,7 +420,7 @@ struct ProjectNode: View {
             if isExpanded {
                 ForEach(group.servers) { server in
                     MapLeaf(
-                        title: resourceDisplayName(server.name, inProject: group.id),
+                        title: resourceDisplayName(server.name, inProject: group.name),
                         kind: .server,
                         status: server.status,
                         isSelected: store.sidebarSelection == .server(server.id),
@@ -406,7 +432,7 @@ struct ProjectNode: View {
 
                 ForEach(group.containers, id: \.stableID) { container in
                     MapLeaf(
-                        title: resourceDisplayName(container.name, inProject: group.id),
+                        title: resourceDisplayName(container.name, inProject: group.name),
                         kind: .docker,
                         status: container.status,
                         isSelected: store.sidebarSelection == .docker(container.stableID),
@@ -418,7 +444,7 @@ struct ProjectNode: View {
 
                 ForEach(group.databases, id: \.stableID) { database in
                     MapLeaf(
-                        title: resourceDisplayName(database.name, inProject: group.id),
+                        title: resourceDisplayName(database.name, inProject: group.name),
                         kind: .database,
                         status: database.status,
                         isSelected: store.sidebarSelection == .database(database.stableID),
@@ -757,7 +783,7 @@ struct DockerSection: View {
                             }
                         }
                         TableCell(width: widths[1]) {
-                            Text(projectLabel(for: container)).foregroundStyle(Theme.secondary).lineLimit(1)
+                            Text(projectLabel(for: container, in: store.projectGroups)).foregroundStyle(Theme.secondary).lineLimit(1)
                         }
                         TableCell(width: widths[2]) { StatusText(status: container.status) }
                         TableCell(width: widths[3]) {
@@ -842,7 +868,7 @@ struct DatabaseSection: View {
                                     .truncationMode(.middle)
                             }
                         }
-                        TableCell(width: widths[1]) { Text(projectLabel(for: db)).foregroundStyle(Theme.secondary).lineLimit(1) }
+                        TableCell(width: widths[1]) { Text(projectLabel(for: db, in: store.projectGroups)).foregroundStyle(Theme.secondary).lineLimit(1) }
                         TableCell(width: widths[2]) { Text(db.image ?? "postgres").foregroundStyle(Theme.secondary).lineLimit(1) }
                         TableCell(width: widths[3]) { StatusText(status: db.status) }
                         TableCell(width: widths[4]) { Text("—").foregroundStyle(Theme.secondary) }
@@ -1196,18 +1222,16 @@ struct SelectedProjectPanel: View {
     @ObservedObject var store: OpsStore
 
     var body: some View {
-        let servers = deduplicatedManagedServers(store.inventory.servers).filter { projectKey(fromPath: $0.project) == name }
-        let docker = store.inventory.docker.containers.filter { projectKey(fromDockerContainer: $0) == name }
-        let databases = store.inventory.postgres.filter { projectKey(fromDockerContainer: $0) == name }
-        let usage = store.inventory.projectUsage.first { ($0.projectKey ?? projectKey(fromPath: $0.project)) == name }
-        let group = ProjectGroup(
+        // Fallback parses the persisted usage_key contract so runtime actions
+        // still work for a selection that has dropped out of the cached groups.
+        let group = store.projectGroups.first { $0.id == name } ?? ProjectGroup(
             id: name,
-            name: projectDisplayName(key: name, servers: servers, containers: docker, databases: databases),
-            projectPath: projectPathForGroup(key: name, servers: servers, containers: docker, databases: databases),
-            servers: servers,
-            containers: docker,
-            databases: databases,
-            usage: usage
+            name: projectName(fromUsageKey: name),
+            projectPath: projectPath(fromUsageKey: name),
+            servers: [],
+            containers: [],
+            databases: [],
+            usage: nil
         )
         let report = store.projectRuntimeReports[name]
         VStack(alignment: .leading, spacing: 10) {
@@ -1215,9 +1239,9 @@ struct SelectedProjectPanel: View {
                 .font(.system(size: 15, weight: .bold))
                 .lineLimit(2)
             DetailLine(label: "Runtime", value: group.projectPath ?? "No project path")
-            DetailLine(label: "Servers", value: "\(servers.count)")
-            DetailLine(label: "Docker", value: "\(docker.count)")
-            DetailLine(label: "Databases", value: "\(databases.count)")
+            DetailLine(label: "Servers", value: "\(group.servers.count)")
+            DetailLine(label: "Docker", value: "\(group.containers.count)")
+            DetailLine(label: "Databases", value: "\(group.databases.count)")
             if let usage = group.usage {
                 DetailLine(label: "CPU", value: formatCPU(usage.cpuPercent))
                 DetailLine(label: "Memory", value: formatBytes(usage.memoryBytes))
@@ -2305,75 +2329,23 @@ func shortProject(_ path: String?) -> String {
     return URL(fileURLWithPath: path).lastPathComponent
 }
 
-private let serviceRoleTokens: Set<String> = [
-    "api",
-    "app",
-    "backend",
-    "cache",
-    "database",
-    "db",
-    "frontend",
-    "mailhog",
-    "metrics",
-    "minio",
-    "nginx",
-    "pg",
-    "postgis",
-    "postgres",
-    "queue",
-    "redis",
-    "scheduler",
-    "server",
-    "web",
-    "worker"
-]
-
-private let deploymentQualifierTokens: Set<String> = [
-    "copy",
-    "dev",
-    "development",
-    "local",
-    "prod",
-    "production",
-    "stage",
-    "staging",
-    "test"
-]
-
-func projectKey(fromPath path: String?) -> String {
-    projectKey(fromResourceName: shortProject(path))
+/// `usage_key` is a persisted coordinator contract: `path:<canonical repo
+/// path>` for attributed groups, `name:<derived key>` for unclaimed ones.
+func projectPath(fromUsageKey key: String) -> String? {
+    guard key.hasPrefix("path:") else { return nil }
+    let path = String(key.dropFirst("path:".count))
+    return path.isEmpty ? nil : path
 }
 
-func projectKey(fromDockerContainer container: DockerContainer) -> String {
-    if let project = container.project, !project.isEmpty {
-        return projectKey(fromPath: project)
+func projectName(fromUsageKey key: String) -> String {
+    if let path = projectPath(fromUsageKey: key) {
+        return shortProject(path)
     }
-    return projectKey(fromResourceName: container.name)
-}
-
-func projectPathForGroup(
-    key: String,
-    servers: [ManagedServer],
-    containers: [DockerContainer],
-    databases: [DockerContainer]
-) -> String? {
-    if let path = servers.compactMap(\.project).first(where: { !$0.isEmpty }) {
-        return path
+    if key.hasPrefix("name:") {
+        let name = String(key.dropFirst("name:".count))
+        if !name.isEmpty { return name }
     }
-    if let path = (containers + databases).compactMap(\.project).first(where: { !$0.isEmpty }) {
-        return path
-    }
-    let sourceRoot = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("src")
-    if let entries = try? FileManager.default.contentsOfDirectory(at: sourceRoot, includingPropertiesForKeys: nil) {
-        if let exact = entries.first(where: { $0.lastPathComponent == key }) {
-            return exact.path
-        }
-        if let caseInsensitive = entries.first(where: { $0.lastPathComponent.lowercased() == key.lowercased() }) {
-            return caseInsensitive.path
-        }
-    }
-    return nil
+    return key
 }
 
 func environmentTitle(_ path: String) -> String {
@@ -2387,15 +2359,20 @@ func environmentSubtitle(_ path: String) -> String {
     return URL(fileURLWithPath: trimmed).deletingLastPathComponent().lastPathComponent
 }
 
-func projectName(from name: String?) -> String {
-    projectKey(fromResourceName: name)
-}
-
-func projectLabel(for container: DockerContainer) -> String {
+/// Table columns show the same project a container is grouped (and acted on)
+/// under; the fallbacks only cover containers absent from every membership row.
+func projectLabel(for container: DockerContainer, in groups: [ProjectGroup]) -> String {
+    let member = groups.first { group in
+        group.containers.contains { $0.stableID == container.stableID }
+            || group.databases.contains { $0.stableID == container.stableID }
+    }
+    if let member {
+        return member.name
+    }
     if let project = container.project, !project.isEmpty {
         return shortProject(project)
     }
-    return projectName(from: container.name)
+    return "other"
 }
 
 func portReuseText(_ owner: PortReuseOwner?) -> String {
@@ -2416,78 +2393,20 @@ func portReuseText(_ owner: PortReuseOwner?) -> String {
     return "unknown"
 }
 
-func projectKey(fromResourceName name: String?) -> String {
-    let tokens = projectNameTokens(from: name)
-    guard !tokens.isEmpty else { return "local" }
-    if let markerIndex = tokens.firstIndex(where: { serviceRoleTokens.contains($0) }) {
-        let projectTokens = trimTrailingQualifiers(Array(tokens[..<markerIndex]))
-        if !projectTokens.isEmpty {
-            return projectTokens.joined(separator: "-")
-        }
-    }
-    return trimTrailingQualifiers(tokens).joined(separator: "-")
-}
-
-func projectDisplayName(
-    key: String,
-    servers: [ManagedServer],
-    containers: [DockerContainer],
-    databases: [DockerContainer]
-) -> String {
-    if let serverProject = servers.compactMap(\.project).map(shortProject).first(where: { projectKey(fromResourceName: $0) == key }) {
-        return serverProject
-    }
-    if let resourceProject = (containers + databases).compactMap(\.project).map(shortProject).first(where: { projectKey(fromResourceName: $0) == key }) {
-        return resourceProject
-    }
-    let resourceName = (containers + databases)
-        .compactMap(\.name)
-        .first { projectKey(fromResourceName: $0) == key }
-    return resourceName.map { displayProjectName(fromResourceName: $0, key: key) } ?? key
-}
-
-func displayProjectName(fromResourceName name: String, key: String) -> String {
-    let tokens = projectNameTokens(from: name)
-    guard !tokens.isEmpty else { return key }
-    if let markerIndex = tokens.firstIndex(where: { serviceRoleTokens.contains($0) }) {
-        let projectTokens = trimTrailingQualifiers(Array(tokens[..<markerIndex]))
-        if !projectTokens.isEmpty {
-            return projectTokens.joined(separator: "-")
-        }
-    }
-    return key
-}
-
-func resourceDisplayName(_ name: String?, inProject projectKey: String) -> String {
+/// Cosmetic leaf label only — grouping never derives from resource names. The
+/// project argument is the group's display name and is normalized here so a
+/// repo named `XFoilFOAM` still strips the `xfoilfoam-` prefix.
+func resourceDisplayName(_ name: String?, inProject projectName: String) -> String {
     guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "service" }
     let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
     let normalized = trimmed.lowercased().replacingOccurrences(of: "_", with: "-")
-    let prefix = projectKey + "-"
+    let prefix = projectName.lowercased().replacingOccurrences(of: "_", with: "-") + "-"
     if normalized.hasPrefix(prefix) {
         let index = trimmed.index(trimmed.startIndex, offsetBy: min(prefix.count, trimmed.count))
         let suffix = String(trimmed[index...]).trimmingCharacters(in: CharacterSet(charactersIn: "-_ "))
         return suffix.isEmpty ? trimmed : suffix
     }
     return trimmed
-}
-
-func projectNameTokens(from name: String?) -> [String] {
-    guard let name else { return [] }
-    return name
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-        .replacingOccurrences(of: "_", with: "-")
-        .split(separator: "-")
-        .map(String.init)
-        .filter { !$0.isEmpty && Int($0) == nil }
-}
-
-func trimTrailingQualifiers(_ tokens: [String]) -> [String] {
-    var result = tokens
-    while let last = result.last, deploymentQualifierTokens.contains(last) {
-        result.removeLast()
-    }
-    return result.isEmpty ? tokens : result
 }
 
 func filterIcon(_ filter: ServiceFilter) -> String {

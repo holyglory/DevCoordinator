@@ -3,11 +3,11 @@
 source visual truth path: `/Users/holyglory/.codex/generated_images/019e8760-bb84-7061-a3d5-dc3a3a8752f3/ig_0332395ad68d9ced016a2c505facbc8191b07701adb394bd59.png`
 
 implementation screenshot paths:
-- Dev Servers: `/Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-implementation.png`
-- Docker: `/Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-docker.png`
-- Databases: `/Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-databases.png`
-- Narrow reproduction before fix: `/Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-narrow-before.png`
-- Narrow verification after fix: `/Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-narrow-after.png`
+- Dev Servers: `/Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-implementation.png`
+- Docker: `/Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-docker.png`
+- Databases: `/Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-databases.png`
+- Narrow reproduction before fix: `/Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-narrow-before.png`
+- Narrow verification after fix: `/Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-narrow-after.png`
 
 viewport: 1440 x 1024 desktop macOS app
 
@@ -20,16 +20,16 @@ commands:
 - `python3 /Users/holyglory/.codex/skills/codex-dev-coordinator/scripts/dev_coordinator.py server logs --server-id <id> --tail 5` verified the installed coordinator returns real managed-server log text and stop metadata.
 - `swift build`
 - `python3 skills/codex-dev-coordinator/scripts/self_test.py`
-- `swiftc -parse-as-library -o .build/qa/CodexOpsConsoleSnapshot Sources/CodexOpsConsole/Models.swift Sources/CodexOpsConsole/OpsStore.swift Sources/CodexOpsConsole/Views.swift Tools/SnapshotMain.swift`
-- `swiftc -parse-as-library -o .build/qa/SplitSizingTest Sources/CodexOpsConsole/Models.swift Sources/CodexOpsConsole/OpsStore.swift Sources/CodexOpsConsole/Views.swift Tools/SplitSizingTest.swift`
+- `swiftc -parse-as-library -o .build/qa/DevOpsBoardSnapshot Sources/DevOpsBoard/Models.swift Sources/DevOpsBoard/OpsStore.swift Sources/DevOpsBoard/Views.swift Tools/SnapshotMain.swift`
+- `swiftc -parse-as-library -o .build/qa/SplitSizingTest Sources/DevOpsBoard/Models.swift Sources/DevOpsBoard/OpsStore.swift Sources/DevOpsBoard/Views.swift Tools/SplitSizingTest.swift`
 - `.build/qa/SplitSizingTest`
-- `.build/qa/CodexOpsConsoleSnapshot /Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-implementation.png`
-- `.build/qa/CodexOpsConsoleSnapshot /Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-docker.png docker`
-- `.build/qa/CodexOpsConsoleSnapshot /Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-databases.png databases`
-- `.build/qa/CodexOpsConsoleSnapshot /Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-narrow-before.png servers 1180 760` reproduced the narrow-window crop before the responsive layout fix.
-- `.build/qa/CodexOpsConsoleSnapshot /Users/holyglory/src/holyskills/apps/CodexOpsConsole/design-qa-narrow-after.png servers 1180 760` verified the sidebar is left-anchored and uncropped after the fix.
+- `.build/qa/DevOpsBoardSnapshot /Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-implementation.png`
+- `.build/qa/DevOpsBoardSnapshot /Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-docker.png docker`
+- `.build/qa/DevOpsBoardSnapshot /Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-databases.png databases`
+- `.build/qa/DevOpsBoardSnapshot /Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-narrow-before.png servers 1180 760` reproduced the narrow-window crop before the responsive layout fix.
+- `.build/qa/DevOpsBoardSnapshot /Users/holyglory/src/holyskills/apps/DevOpsBoard/design-qa-narrow-after.png servers 1180 760` verified the sidebar is left-anchored and uncropped after the fix.
 - `python3 scripts/validate.py`
-- `swift build && swiftc -parse-as-library -o .build/qa/SplitSizingTest Sources/CodexOpsConsole/Models.swift Sources/CodexOpsConsole/OpsStore.swift Sources/CodexOpsConsole/Views.swift Tools/SplitSizingTest.swift && .build/qa/SplitSizingTest` verified sidebar run/stop status decisions after the inline-control pass.
+- `swift build && swiftc -parse-as-library -o .build/qa/SplitSizingTest Sources/DevOpsBoard/Models.swift Sources/DevOpsBoard/OpsStore.swift Sources/DevOpsBoard/Views.swift Tools/SplitSizingTest.swift && .build/qa/SplitSizingTest` verified sidebar run/stop status decisions after the inline-control pass.
 
 incident cause:
 - Previous QA over-weighted static screenshot similarity and did not verify interaction affordances.
@@ -88,6 +88,7 @@ patches made in this pass:
 - Added `scripts/validate.py` source guardrails for splitter panes, tree selection, tabs, resizable columns, Docker start, exact preferred port, all-container inventory, and real Docker telemetry.
 - Added `Tools/SplitSizingTest.swift`, compiled during validation, to verify left and right splitter width math, monotonic right-pane resizing, stable column-width resizing, 1180 px no-overflow layout, canonical project grouping, and sidebar play/stop state.
 - Updated the snapshot helper to capture the Dev Servers, Docker, and Databases tabs directly.
+- 2026-07-07: Replaced the client-side canonical name-key grouping (`projectKey(...)`) with the coordinator's `project_usage` membership (`usage_key`/`server_ids`/`container_names`), added a stray fallback group, and reworked `SplitSizingTest` to verify membership grouping, attributed-name divergence, unclaimed-container separation, and stray visibility.
 
 **Interaction Checklist**
 - [Passed] Left navigation has a visible splitter and adjustable width.

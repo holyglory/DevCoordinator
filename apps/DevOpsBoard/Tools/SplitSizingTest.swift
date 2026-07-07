@@ -143,9 +143,12 @@ struct SplitSizingTest {
             backups: [],
             projectUsage: [
                 ProjectUsage(
+                    usageKey: "path:/Users/holyglory/src/XFoilFOAM",
                     project: "/Users/holyglory/src/XFoilFOAM",
                     projectKey: "xfoilfoam",
                     name: "XFoilFOAM",
+                    serverIDs: ["old-api", "new-api", "web"],
+                    containerNames: nil,
                     serverCount: 2,
                     containerCount: 3,
                     processCount: 4,
@@ -179,42 +182,18 @@ struct SplitSizingTest {
                 )
             ]
         )
-        let group = projectGroups(from: inventory).first { $0.id == "xfoilfoam" }
+        let group = makeProjectGroups(from: inventory).first { $0.id == "path:/Users/holyglory/src/XFoilFOAM" }
         assert(group?.servers.count == 2, "project tree should not show duplicate api server rows")
         assert(group?.usage?.hotProcesses?.first?.pid == 18970, "project tree should retain project usage for XFoilFOAM")
     }
 
+    // Grouping must consume the coordinator's project_usage membership
+    // (usage_key / server_ids / container_names), never re-derive repo
+    // identity from resource names. Fixtures mirror how real inventories
+    // break: sidecar-attributed containers whose names look like another
+    // repo, coordinator-claimed containers, name-keyed unclaimed groups,
+    // and stray items from older coordinator payloads.
     private static func assertProjectGrouping() {
-        assertString(
-            projectKey(fromResourceName: "globalnewstracker-metrics-worker"),
-            "globalnewstracker",
-            "metrics worker should group under globalnewstracker"
-        )
-        assertString(
-            projectKey(fromResourceName: "globalnewstracker-minio"),
-            "globalnewstracker",
-            "minio should group under globalnewstracker"
-        )
-        assertString(
-            projectKey(fromResourceName: "globalnewstracker-postgres"),
-            "globalnewstracker",
-            "postgres should group under globalnewstracker"
-        )
-        assertString(
-            projectKey(fromResourceName: "xfoilfoam-cfd-api"),
-            "xfoilfoam-cfd",
-            "domain words before api should remain part of the project"
-        )
-        assertString(
-            projectKey(fromResourceName: "kosttracking-prod-copy-pg"),
-            "kosttracking",
-            "environment qualifiers before pg should not split the project"
-        )
-        assertString(
-            resourceDisplayName("globalnewstracker-metrics-worker", inProject: "globalnewstracker"),
-            "metrics-worker",
-            "leaf labels should drop the repeated project prefix"
-        )
         let registeredDatabase = DockerContainer(
             id: "3cbab56ad1b2",
             name: "aerodb-pg",
@@ -229,20 +208,228 @@ struct SplitSizingTest {
             stats: nil,
             statsHistory: nil
         )
+        let claimedDatabase = DockerContainer(
+            id: "9f21c00aa001",
+            name: "grouprepo-db",
+            image: "postgres:16-alpine",
+            status: "Up 2 hours",
+            ports: "0.0.0.0:5433->5432/tcp",
+            project: nil,
+            agent: nil,
+            role: nil,
+            metadataSource: "none",
+            adopted: nil,
+            stats: nil,
+            statsHistory: nil
+        )
+        let unclaimedWorker = DockerContainer(
+            id: "77aa88bb99cc",
+            name: "sharedname-worker",
+            image: "node:20",
+            status: "Up 1 hour",
+            ports: "",
+            project: nil,
+            agent: nil,
+            role: nil,
+            metadataSource: "none",
+            adopted: nil,
+            stats: nil,
+            statsHistory: nil
+        )
+        let strayContainer = DockerContainer(
+            id: "00dd11ee22ff",
+            name: "legacy-widget",
+            image: "nginx:1.27",
+            status: "Exited (0) 3 days ago",
+            ports: "",
+            project: nil,
+            agent: nil,
+            role: nil,
+            metadataSource: "none",
+            adopted: nil,
+            stats: nil,
+            statsHistory: nil
+        )
+        let groupRepoWeb = server(
+            id: "grouprepo-web-1",
+            name: "web",
+            project: "/Users/holyglory/src/GroupRepo",
+            port: 3000,
+            status: "running",
+            updatedAt: "2026-07-07T10:00:00Z"
+        )
+        let sharednameRepoWeb = server(
+            id: "sharedname-web-1",
+            name: "web",
+            project: "/Users/holyglory/src/sharedname",
+            port: 3100,
+            status: "running",
+            updatedAt: "2026-07-07T10:00:00Z"
+        )
+        let inventory = Inventory(
+            coordinatorHome: nil,
+            statePath: nil,
+            project: nil,
+            urls: [],
+            servers: [groupRepoWeb, sharednameRepoWeb],
+            leases: [],
+            recentEvents: [],
+            docker: DockerSummary(
+                available: true,
+                error: nil,
+                statsError: nil,
+                containers: [registeredDatabase, claimedDatabase, unclaimedWorker, strayContainer],
+                postgres: [registeredDatabase, claimedDatabase]
+            ),
+            postgres: [registeredDatabase, claimedDatabase],
+            backups: [],
+            projectUsage: [
+                usageRow(
+                    usageKey: "path:/Users/holyglory/src/XFoilFOAM",
+                    project: "/Users/holyglory/src/XFoilFOAM",
+                    projectKey: "xfoilfoam",
+                    name: "XFoilFOAM",
+                    containerNames: ["aerodb-pg"]
+                ),
+                usageRow(
+                    usageKey: "path:/Users/holyglory/src/GroupRepo",
+                    project: "/Users/holyglory/src/GroupRepo",
+                    projectKey: "grouprepo",
+                    name: "GroupRepo",
+                    serverIDs: ["grouprepo-web-1"],
+                    containerNames: ["grouprepo-db"]
+                ),
+                usageRow(
+                    usageKey: "path:/Users/holyglory/src/sharedname",
+                    project: "/Users/holyglory/src/sharedname",
+                    projectKey: "sharedname",
+                    name: "sharedname",
+                    serverIDs: ["sharedname-web-1"]
+                ),
+                usageRow(
+                    usageKey: "name:sharedname",
+                    project: nil,
+                    projectKey: "sharedname",
+                    name: "sharedname",
+                    containerNames: ["sharedname-worker"]
+                )
+            ]
+        )
+        let groups = makeProjectGroups(from: inventory)
+
+        // Must-catch: a sidecar-attributed container whose NAME suggests a
+        // different repo ("aerodb") must display under the attributed repo —
+        // the exact display-vs-action divergence class fixed coordinator-side.
+        let xfoil = groups.first { $0.id == "path:/Users/holyglory/src/XFoilFOAM" }
+        assert(xfoil != nil, "attributed repo should form a usage_key-identified group")
+        assert(
+            xfoil?.databases.contains { $0.stableID == registeredDatabase.stableID } == true,
+            "sidecar-attributed aerodb-pg must display under XFoilFOAM, not a name-derived aerodb group"
+        )
+        assert(
+            !groups.contains { $0.name == "aerodb" },
+            "no name-derived aerodb group may exist for an attributed container"
+        )
+        assertString(xfoil?.name ?? "", "XFoilFOAM", "group display name should come from the membership row")
+        assertString(xfoil?.projectPath ?? "", "/Users/holyglory/src/XFoilFOAM", "group action path should come from the membership row")
+
+        // Must-catch: an unattributed grouprepo-db the coordinator claims by
+        // unique name match must display under the path-keyed repo group.
+        let groupRepo = groups.first { $0.id == "path:/Users/holyglory/src/GroupRepo" }
+        assert(
+            groupRepo?.databases.contains { $0.stableID == claimedDatabase.stableID } == true,
+            "coordinator-claimed grouprepo-db must display under the path-keyed GroupRepo group"
+        )
+        assert(
+            groupRepo?.servers.contains { $0.id == groupRepoWeb.id } == true,
+            "server membership must come from server_ids, not path key derivation"
+        )
+
+        // Must-catch: a container the coordinator left unclaimed must NOT be
+        // folded into a repo group whose derived name key happens to match —
+        // the old name-key heuristics merged these, so the board showed the
+        // container inside a group whose project stop would not touch it.
+        let sharednameRepo = groups.first { $0.id == "path:/Users/holyglory/src/sharedname" }
+        assert(sharednameRepo != nil, "sharedname repo should form its own path-keyed group")
+        assert(
+            sharednameRepo?.containers.isEmpty == true && sharednameRepo?.databases.isEmpty == true,
+            "an unclaimed same-key container must stay out of the repo group whose actions do not touch it"
+        )
+        let unclaimed = groups.first { $0.id == "name:sharedname" }
+        assert(unclaimed != nil, "unclaimed containers should keep their coordinator name-keyed group")
+        assert(unclaimed?.projectPath == nil, "name-keyed groups must not synthesize an action path")
+        assert(
+            unclaimed?.containers.contains { $0.stableID == unclaimedWorker.stableID } == true,
+            "unclaimed worker should display in its name-keyed group"
+        )
+
+        // Safety net: a container missing from every membership row (older
+        // coordinator payload) must stay visible in the stray fallback group.
+        let stray = groups.first { $0.id == strayProjectGroupID }
+        assert(
+            stray?.containers.contains { $0.stableID == strayContainer.stableID } == true,
+            "membership-less containers must stay visible in the stray fallback group"
+        )
+        let displayed = groups.reduce(0) { $0 + $1.containers.count + $1.databases.count }
+        assert(displayed == inventory.docker.containers.count, "every container must be displayed exactly once across groups")
+
+        // Table labels reuse group membership so a row's project column names
+        // the group its actions run under.
         assertString(
-            projectKey(fromDockerContainer: registeredDatabase),
-            "xfoilfoam",
-            "registered Docker sidecar project should beat aerodb-pg name-derived grouping"
+            projectLabel(for: registeredDatabase, in: groups),
+            "XFoilFOAM",
+            "Docker/database table project labels should follow membership grouping"
         )
         assertString(
-            projectDisplayName(key: "xfoilfoam", servers: [], containers: [], databases: [registeredDatabase]),
-            "XFoilFOAM",
-            "project display name should come from registered Docker project path"
+            projectLabel(for: strayContainer, in: groups),
+            "other",
+            "membership-less containers should be labeled with the stray group"
         )
+
         assertString(
-            projectLabel(for: registeredDatabase),
-            "XFoilFOAM",
-            "Docker/database table project labels should prefer registered project paths"
+            resourceDisplayName("globalnewstracker-metrics-worker", inProject: "GlobalNewsTracker"),
+            "metrics-worker",
+            "leaf labels should drop the repeated project prefix case-insensitively"
+        )
+
+        // usage_key is a persisted coordinator contract; the details panel
+        // fallback parses it when a selection drops out of cached groups.
+        assertString(
+            projectPath(fromUsageKey: "path:/Users/holyglory/src/GroupRepo") ?? "",
+            "/Users/holyglory/src/GroupRepo",
+            "path-keyed selections should recover their runtime action path"
+        )
+        assert(projectPath(fromUsageKey: "name:sharedname") == nil, "name-keyed selections must not invent an action path")
+        assertString(projectName(fromUsageKey: "path:/Users/holyglory/src/GroupRepo"), "GroupRepo", "path-keyed selections should display the repo name")
+        assertString(projectName(fromUsageKey: "name:sharedname"), "sharedname", "name-keyed selections should display the derived key")
+    }
+
+    private static func usageRow(
+        usageKey: String,
+        project: String?,
+        projectKey: String,
+        name: String,
+        serverIDs: [String] = [],
+        containerNames: [String] = []
+    ) -> ProjectUsage {
+        ProjectUsage(
+            usageKey: usageKey,
+            project: project,
+            projectKey: projectKey,
+            name: name,
+            serverIDs: serverIDs.isEmpty ? nil : serverIDs,
+            containerNames: containerNames.isEmpty ? nil : containerNames,
+            serverCount: serverIDs.count,
+            containerCount: containerNames.count,
+            processCount: nil,
+            cpuPercent: nil,
+            memoryBytes: nil,
+            processCPUPercent: nil,
+            processMemoryBytes: nil,
+            dockerCPUPercent: nil,
+            dockerMemoryBytes: nil,
+            processes: nil,
+            hotProcesses: nil
         )
     }
 

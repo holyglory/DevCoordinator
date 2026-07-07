@@ -1,5 +1,489 @@
 # Decision History
 
+## 2026-07-07 - DevOpsBoard: project grouping consumes coordinator membership instead of re-deriving it
+
+Decision: Closed the follow-up from the same-day coordinator membership fix —
+the Swift menu-bar app was the last UI re-deriving container→project grouping
+client-side (`projectKey(fromResourceName:)` name-key heuristics plus a
+`projectPathForGroup` ~/src directory scan), so it could show a container
+under a group that differs from the membership `project start/restart/stop`
+acts on (the exact divergence class just fixed for the web console). Fix:
+`makeProjectGroups(from:)` now iterates inventory `project_usage` rows and
+resolves members strictly through `server_ids`/`container_names`;
+`ProjectGroup.id` is the row's `usage_key` (unique — `project_key` is a
+display name), `projectPath` comes from `row.project` only (name-keyed
+`name:<key>` groups get no synthesized action path, matching the coordinator
+refusing whole-project actions on unclaimed containers), and anything no row
+claims stays visible in a stray "other" fallback group like the web console's.
+`ProjectUsage` decodes `usage_key`/`server_ids`/`container_names`;
+`OpsStore.mergeProjectUsage` buckets multi-home inventories by `usage_key` and
+unions membership. The heuristic family (`projectKey(fromPath:/
+fromDockerContainer:/fromResourceName:)`, token sets, `projectDisplayName`,
+`projectPathForGroup`) is deleted; `resourceDisplayName` survives as a
+cosmetic leaf-prefix strip (now fed by the group display name, normalized
+case-insensitively) and Docker/DB table project labels resolve through group
+membership. The details-panel fallback for a selection that dropped out of
+cached groups parses the persisted `usage_key` contract (`path:<resolved>`)
+instead of scanning ~/src. Coverage: `SplitSizingTest` gained must-catch
+fixtures per divergence class — sidecar-attributed `aerodb-pg` must display
+under XFoilFOAM (not a name-derived `aerodb` group), coordinator-claimed
+`grouprepo-db` must display under the path-keyed repo, an unclaimed
+same-name-key container must stay OUT of the repo group whose actions do not
+touch it, membership-less containers must stay visible in the stray group,
+and every container must render exactly once. validate.py replaced the
+heuristic needles ("canonical project grouping", "project path grouping",
+"project panel path fallback") with membership pins (decoding keys, usage-key
+identity, stray group, multi-home union, the three board must-catch strings)
+and added prohibited needles for `projectKey(fromResourceName` /
+`projectPathForGroup(` so the heuristics cannot quietly return. Verified via
+the local needle gate; Swift compile + QA tools need the macOS CI leg (no
+Swift toolchain on this box).
+
+## 2026-07-07 - Coordinator: one container-membership model for display grouping and whole-project actions
+
+Decision: Closed the follow-up gap from the same-day console review — display
+membership (`build_project_usage`/`resource_project_identity`) and
+whole-project action membership (`build_project_runtime_spec` via
+`matching_project_containers`) could disagree: an unattributed container like
+`myrepo-db` displayed under a name-keyed group `name:myrepo` (project null)
+while `project stop` on the path-keyed repo stopped it, and a container
+explicitly attributed elsewhere (Compose labels) was still name-matched into a
+different repo's blast radius. Reproduced both through the CLI (fake docker +
+durable pins) before changing code. Root cause: two independent attribution
+implementations. Fix: a single `container_project_attribution(container,
+known_projects)` used by both paths, fed by one claim set
+(`known_project_paths`: state server records, durable port pins, container
+label/sidecar projects, plus the action's target repo). Rules: explicit
+attribution (Compose labels, then coordinator sidecar) always wins; a unique
+name-key match claims an unattributed container for the known repo; an
+ambiguous name key (several known repos) stays in its own `name:<key>` group
+and no whole-project action touches it (previously EVERY matching repo's stop
+would stop it). `project stop` now records sidecar attribution for containers
+it acts on (start/restart already did via `ensure_runtime_docker_metadata` /
+`run_docker`), so grouping converges to explicit membership after any
+whole-project action. Console UI unchanged by design — it already groups by
+`project_usage` `usage_key`/`server_ids`/`container_names`, which are now also
+the action contract. Coverage: coordinator self-test gained three must-catch
+membership classes (name-claim divergence, explicit-attribution leak,
+ambiguity refusal) — each proven to fail against the pre-fix coordinator via a
+reconstructed old-behavior copy with an expected-fail harness — plus
+convergence and display guards; five new validate.py needles (attribution
+function, shared claim set, ambiguity refusal, must-catch fixture, SKILL blast
+radius contract); SKILL.md and DevOpsConsole docs/coordinator-http-api.json
+now state the unified membership contract (inventory `project_usage` rows
+document `usage_key`/`server_ids`/`container_names` and the claim rules;
+projects/start|stop purposes name the attribution). Known residuals, accepted:
+a DECLARED dependency whose container name does not match the repo key stays
+name-grouped until the first whole-project action records its sidecar
+attribution (display cannot see runtime files; reading every known repo's
+declaration on each inventory was rejected as new I/O/failure surface), and
+the Swift DevOpsBoard app still re-derives grouping client-side
+(`projectKey(fromResourceName:)`) — filed as a follow-up task since this box
+has no Swift toolchain to verify a rework. Full validate.py ok.
+
+## 2026-07-07 - DevOps Console: Projects tree, repo grouping everywhere, hideable items that self-reveal
+
+Decision: Made the console project-centric (v1.3.0). New default `#/projects`
+page renders a tree of repos with everything that belongs to each: servers,
+databases (docker.postgres), containers — per-item AND per-project live
+CPU/mem numbers + sparklines, per-item start/stop/restart, and whole-project
+Start/Restart/Stop through new `POST /api/projects/action` → coordinator
+`/v1/projects/*` (dependencies before web servers, pinned ports preserved,
+300s budget, stop/restart confirmed with blast radius named). Grouping is
+authoritative, not guessed: `build_project_usage` rows now carry
+`server_ids`/`container_names`/`usage_key` membership, so the console never
+re-implements the coordinator's repo-identity heuristics; the Servers,
+Docker and Ports pages group their rows under the same project headers (with
+aggregate CPU/mem + project sparkline). Hiding: stopped servers/containers
+and idle projects can be hidden; hidden keys (server identity key, container
+name, project usage_key) persist server-side in `<stateDir>/ui-prefs.json`
+via new `GET/PATCH /api/prefs` (validated lists, Origin-guarded, atomic
+writes) so the preference follows the operator across devices; anything the
+coordinator reports as running is auto-unhidden on the next poll
+(`autoUnhide` fire-and-forget PATCH), and every page shows a "Show N hidden
+items" reveal with per-row unhide — nothing active can stay hidden, nothing
+hidden is unrecoverable. Tests: e2e 14 (prefs round-trip, dedupe/trim,
+validation 400s, forged-Origin 403, persistence) and e2e 15 (real
+dev-runtime project started/stopped through the console; membership asserted
+via server_ids) — suite 75/75 twice; coordinator self-test asserts the new
+membership fields; four new validate.py needles (projects endpoint, ui-prefs
+persistence, autoUnhide, coordinator-membership grouping). Full validate.py
+ok.
+
+Adversarial review (5 dimensions, 2-skeptic verification; several findings
+reproduced by running code) confirmed 21 findings; root-cause fixes: (1) the
+prefs PATCH was whole-list replacement, so a user hide racing the auto-unhide
+poll, rapid double-hides, a failed boot fetch, or a second stale device could
+silently wipe hides — redesigned to hide/unhide DELTAS merged server-side
+(atomic in-process), plus prefs re-fetch on poll-retry and visibilitychange;
+(2) prefs persist() swallowed disk errors and returned 200 — now propagates
+PrefsError 500 and rolls back memory, with a new unit.prefs.test.mjs proving
+durability from DISK; (3) project metrics/popovers were keyed by non-unique
+project_key (two repos named "app" merge charts) — keyed by usage_key
+everywhere, and the self-test now pins the 'path:<resolved>' usage_key format
+(it lives in persisted prefs); (4) `project restart` ran docker restart
+unguarded after stopping all servers (a missing declared container aborted
+the restart half-done) — now skips missing containers and collects
+action_errors like start/stop do; (5) /api/projects/action accepted arbitrary
+paths — now requires the project to be coordinator-tracked or carry a real
+declared runtime (synthetic missing-runtime placeholders don't count);
+(6) crash-looping "Restarting" containers counted as not-running — hide
+gates, auto-unhide and runningCount now use an is-active predicate and the
+tree badges them "restarting"; (7) duplicate data-fk/popover keys between
+tabs and the tree — usage cells are scope-prefixed; (8) reveal-toggle count
+missed hidden items inside concealed projects; (9) project stop/restart
+confirms now describe the coordinator's actual blast radius (declared
+runtime); (10) e2e test 15's fixed random port window overlapped
+coordinator-leased ranges — bind-checked ephemeral port, plus stop-idempotent
+and unknown-path 404 coverage; (11) the vacuous --no-docker container-
+membership assertion now asserts against the fake-docker fixture. Known
+remaining gap (filed as follow-up): display membership (project_usage
+identity) and runtime-action membership (build_project_runtime_spec) can
+disagree for name-attributed containers — the confirm wording is honest about
+it, unification needs a coordinator refactor. Post-fix: console 79/79 twice,
+coordinator self-test ok, full validate.py ok.
+
+## 2026-07-06 - Coordinator: durable per-repo port assignments (ports never drift across restarts)
+
+Decision: The user requires ports to be fixed per repo server — agents must
+always find a repo's servers on the same ports, across stops, restarts, and
+time. Implemented durable port assignments in `dev_coordinator.py`: a new
+top-level `state.port_assignments` map keyed `canonical_project::server_name`,
+created automatically on `server start`/`server register` (and by explicit
+`port assign`), surviving server stop, lease release/expiry/stale-reclaim, and
+stopped-record pruning; removed only by `port unassign` (foreign pins need
+`--force`). Allocation (`lease_port` and the register-adoption path) excludes
+every foreign-assigned port; an explicit preferred on a foreign pin fails with
+the owner named ("port N is durably assigned to server 'web' of /repo").
+Owners are steered back: `server start` without `--range` pins hard to the
+assigned port (a squatter is a loud error, never silent drift); with an
+explicit range the pin is preferred inside it and a different landing re-pins.
+`server restart` and project-runtime starts consult the assignment, so restart
+works on the same port even after the stopped record was pruned. Existing
+state files migrate by seeding pins from server records (running first, then
+newest-stopped wins a contested port — resolves the demo-web/web-demo 3000
+overlap in web-demo's favor). New surface: CLI `port assign|unassign|
+assignments`, HTTP `GET /v1/ports/assignments`, `POST /v1/ports/assign|
+unassign`, `port_assignments` in inventory (project-filtered, annotated with
+live `server_status`, "unregistered" when only the pin remains). The
+`server start --range` parser default was removed so the coordinator can tell
+"no range given" (pin hard) from an explicit range. Chose a separate
+assignments map over never-expiring leases because four independent reclaim
+paths (TTL expiry, stale-server release, mismatched-listener release,
+fixed-port reclaim) all delete leases by design. Cross-project port reuse now
+requires an explicit unassign first — the self-test was updated to assert the
+refusal, unassign, then proceed. Domains needed no change: console routes are
+already durable per (project, serverName). Console v1.2.0 shows a "Pinned
+ports" card on the Ports page (unassign with confirm, server status, pin
+marker on Servers rows) via `POST /api/ports/unassign`. Coverage: self-test
+blocks for pin lifecycle, prune survival, foreign refusal, unassign rules,
+re-pin, register pinning, migration seeding, HTTP round-trip; console e2e 13;
+six new validate.py needles. Full `validate.py`: ok.
+
+Adversarial review (6-dimension multi-agent, 2-skeptic verification, one
+finding reproduced by actually running the test) confirmed and led to fixes:
+(1) `project start` resolved the fixed port as record-before-pin, silently
+reverting an explicit `port assign` — precedence now declared-port > pin >
+record, matching `server restart`, with a runtime fixture; (2) squatted-pin
+failures through restart/project-start surfaced the opaque "no free port
+available in N-N" — the loud pinned-port error now fires whenever the attempt
+targeted exactly the pin; (3) owner passing `--preferred <own pin>` outside
+3000-3999 without a range got a misleading range error — the pin now becomes
+the range; (4) the healthy-existing short-circuit could move pins (duplicate
+pins after force-assign, silent revert of an explicit re-pin) — it now only
+heals a missing pin; (5) seeding could brick read_state on a malformed legacy
+stopped_ts — guarded; (6) console e2e test 13 raced the console's 5s inventory
+cache after direct coordinator mutations (reproduced failing) — now polls past
+the window; (7) console section sigs included coordinator.lastOkAt, defeating
+render memoization every 6s poll — sigs now use a stable {ok,lastError} slice;
+(8) the Servers-page pin marker claimed the record port was pinned even after
+a pin moved — it now compares ports and shows ":old → :new (next start)";
+(9) console port-only unassign now demands `force: true` up front; (10)
+self-test `free_port()` never re-issues a port any earlier fixture used,
+eliminating pin-collision flakes structurally. Post-fix: self-test ok,
+console 73/73, full validate.py ok.
+
+## 2026-07-06 - DevOps Console: paged UI with hamburger nav, CPU/mem history charts, lease management
+
+Decision: Restructured the console UI from one long page into five hash-routed
+pages (`#/servers` default, `#/routes`, `#/docker`, `#/ports`,
+`#/performance`) behind one sticky header (status summary + tab nav with live
+counts on desktop, hamburger drawer on ≤719px). Added an in-process metrics
+history store (`src/metrics.mjs`): a background sampler pulls coordinator
+inventory every `METRICS_INTERVAL_MS` (default 10s) into per-entity ring
+buffers (720 points) for servers (`process_usage`), running containers
+(`stats`) and projects (`project_usage`); `/api/overview` fetches piggyback
+into the same store. New `GET /api/metrics/history?limit=N` feeds the UI:
+every running server and container row shows live CPU %/memory numbers plus a
+sparkline whose click opens full CPU + memory charts; the Performance page
+charts every sampled entity. Port leases became manageable from the UI via
+`POST /api/ports/lease` (purpose/preferred/ttl/project, attributed
+`devops-console:<email>`) and `POST /api/ports/release` (lease_id, confirmed
+release). Chose in-memory history (resets on restart, UI says so) over disk
+persistence — no retention policy needed, honest about scope.
+
+Two correctness fixes surfaced by the new e2e tests: (1) the coordinator
+client now invalidates its inventory/servers caches after any mutating call,
+so a post-mutation overview can no longer show pre-mutation state for up to
+the 5s cache window (a released lease used to linger); (2) `CoordError`s with
+4xx statuses (coordinator answered, request bad — "matching lease not found")
+now pass through as HTTP 400 instead of masquerading as 502 gateway failures.
+Assets gained `?v=<version>` cache-busting because they are served with a 1h
+immutable cache; `package.json` bumped to 1.1.0. Charts are SVG built via
+`createElementNS` (the app.js innerHTML rule stays: icons map only).
+validate.py gained needles for cache invalidation on mutations, the bounded
+metrics ring, lease-id-required release, hamburger aria wiring, and
+createElementNS charts. Tests: `unit.metrics.test.mjs` (ingest/dedupe/
+trim/prune/limit/sampler) + e2e 11 (lease→overview→Origin 403→release→400 on
+re-release) + e2e 12 (real coordinator server appears in metrics history with
+positive RSS; limit validation; anonymous 401) — 72/72 green.
+
+## 2026-07-06 - DevOps Console: Google OAuth live, Docker installed, per-server subdomains, HSTS
+
+Decision: Three follow-ups after go-live. (1) Wired the real Google OAuth web
+client into `.env` (gitignored) — the console left degraded mode; verified the
+full authorization-code + PKCE flow reaches Google's account chooser
+("continue to vr.ae", no redirect_uri_mismatch) with state/nonce/PKCE all
+present. (2) Installed Docker Engine (`docker.io` 26.1.5) and enabled the
+service — it was genuinely absent, which is why the console reported "Docker
+unavailable"; the coordinator re-checks `docker` per inventory call so the
+console now shows the Docker section as available (0 containers). (3) Added a
+per-server subdomain control to the Servers block: each server row shows its
+mapped `<slug>.vr.ae` (link + copy + access pill + Edit) or an "Assign
+subdomain" affordance, backed by a new `POST /api/servers/subdomain
+{id, slug, auth?}` endpoint that assigns/changes/removes a `kind:server` route
+in one call (empty slug unassigns; a slug change creates-then-removes so a
+server maps to a single subdomain). Also added an HSTS response header
+(`max-age=31536000; includeSubDomains`) on the TLS listener.
+
+Why: The user reported Chrome showing "not secure" (diagnosed as stale
+browser state from the earlier self-signed period — the live cert is valid
+production Let's Encrypt, confirmed by an off-VM fetch and `ssl_verify=0` on
+every host; HSTS added to harden and prevent http:// confusion), asked whether
+Docker was installed, and asked for subdomain assignment directly from the
+Servers block rather than only the Routes form.
+
+Result: OAuth reaches Google live; Docker available; the subdomain feature is
+verified live (assign default-login → change slug+public in one call → old slug
+unrouted, new public route reachable anonymously → CSRF `Origin` guard 403 →
+unknown-id 404) and by a new e2e test (`9b`). The endpoint reads
+`serversRaw({maxAgeMs:0})` so a just-started server is never missed by the 3s
+cache. Suite 63/63; `scripts/validate.py` passes; formal UI verification of the
+authenticated console (with the new controls) reported no findings at 1440x900
+or 390x844 (evidence: `apps/DevOpsConsole/design-qa-servers-subdomain-*.png`).
+The Google client id/secret and are in the gitignored `.env`, never in the repo.
+
+## 2026-07-05 - DevOps Console: automated wildcard renewal via 101domain API
+
+Decision: Replaced the manual DNS-01 renewal with fully unattended automation
+using the 101domain REST API (the user supplied an API key to avoid recurring
+manual TXT edits). Discovered the API by probing: base
+`https://api.101domain.com/v1`, `Authorization: Bearer <key>`, DNS records at
+`/v1/dns/vr.ae/records` — `GET` lists, `POST {"records":[{name,type,ttl,value}]}`
+creates (TTL must be ≥300; values are stored quoted but published as the bare
+string, which is what ACME needs), `DELETE {"ids":[...]}` removes. Wrote certbot
+`manual_auth_hook`/`manual_cleanup_hook` scripts
+(`apps/DevOpsConsole/deploy/101domain/{auth,cleanup}-hook.sh`, versioned in the
+repo, no secret) that create/delete the `_acme-challenge.vr.ae` TXT via the API
+and poll the authoritative nameservers for propagation before returning. The
+API key is stored root-only at `/etc/letsencrypt/101domain/credentials.env`
+(never in the public repo; the hooks source it) and the hooks are installed to
+`/etc/letsencrypt/101domain/` and wired into
+`/etc/letsencrypt/renewal/vr.ae.conf`.
+
+Why: The wildcard must renew every ≤90 days; a manual TXT step each time is a
+standing outage risk (forgotten renewal → every subdomain breaks). API-driven
+DNS-01 makes the certbot systemd timer renew hands-off.
+
+Result: Verified end-to-end. `certbot renew --dry-run` succeeded unattended
+("TXT propagated after 2 check(s)" for both the apex and wildcard authz), then
+a real `certbot renew --force-renewal` issued a new production cert
+(serial …328AC → …2A77), the cleanup hook removed the challenge records, the
+deploy hook reloaded the service (SIGHUP), and the live server served the new
+serial with every host still `ssl_verify=0`. The certbot timer is enabled and
+will now auto-renew within 30 days of expiry. The guided manual helper
+(`deploy/renew-wildcard.sh`) remains as an API-outage fallback. Security: the
+API key is confined to the root-only credentials file; a repo-wide grep
+confirms it appears nowhere under version control.
+
+## 2026-07-05 - DevOps Console: *.vr.ae wildcard cert via manual DNS-01
+
+Decision: Issued the real `*.vr.ae` + `vr.ae` Let's Encrypt wildcard so proxied
+`<slug>.vr.ae` subdomains (not just the console) present a browser-trusted cert.
+DNS-01 is mandatory for wildcards and `vr.ae` DNS is at 101domain with no API
+credential on the box, so the challenge TXT was published by hand: certbot was
+run with a blocking `--manual-auth-hook` that captures the challenge value and
+holds the order open (before CA submission) until a sentinel is created, so the
+operator adds `_acme-challenge.vr.ae` TXT at 101domain with zero rate-limit
+risk while certbot waits. Only one fresh authorization was needed — the apex
+`vr.ae` authz was still cached valid from the morning's HTTP-01 console cert.
+After the record propagated to the authoritative nameservers the sentinel was
+created, certbot validated and issued, and the console reloaded the cert
+(same `--cert-name vr.ae` path `.env` already targets).
+
+Why: The wildcard is the design the app was built for (arbitrary subdomains
+behind one cert); HTTP-01 only covers named hosts. Manual DNS-01 was the path
+the user chose (no willingness to share registrar API credentials this pass).
+The blocking-hook + sentinel pattern makes a cross-turn manual DNS step
+reliable without burning Let's Encrypt's 5-failed-validations-per-hour budget.
+
+Result: `console.vr.ae`, `vr.ae`, and every `*.vr.ae` subdomain now serve the
+wildcard and validate with `ssl_verify_result=0` (confirmed both on-box and
+via an off-VM fetch to `https://demo.vr.ae/healthz` → trusted cert, 200).
+Cert valid 89 days. Two durability fixes: (1) a **default ACL**
+(`setfacl -R -d -m u:holyglory:rX /etc/letsencrypt/{live,archive}`) so each
+renewal's freshly-written `privkeyN.pem` stays readable by the service user —
+without it the first same-path reload failed `EACCES` on the new key; (2) the
+temporary challenge-hook path certbot recorded in
+`/etc/letsencrypt/renewal/vr.ae.conf` was removed so the unattended certbot
+timer cleanly SKIPS this manual cert instead of invoking a vanished script.
+LIMITATION: renewal is manual (~60 days) — shipped
+`apps/DevOpsConsole/deploy/renew-wildcard.sh`, a guided one-command helper that
+runs certbot, prints the TXT record to add, verifies propagation at the
+authoritative NS, completes issuance, and reloads the service. Fully hands-off
+renewal still needs a DNS API hook or acme-dns CNAME delegation (documented).
+
+## 2026-07-05 - DevOps Console: real Let's Encrypt cert via in-app ACME HTTP-01
+
+Decision: The console served only the self-signed fallback cert ("SSL doesn't
+work" — every browser rejected it). `vr.ae` DNS is at an external registrar
+(101domain) and this VM's service account has no DNS API scope, so the DNS-01
+wildcard the app was designed to consume could not be provisioned here. Added
+native ACME HTTP-01 support instead: the plain-HTTP :80 listener serves
+`/.well-known/acme-challenge/<token>` from `ACME_WEBROOT`
+(`config.acmeWebroot`, default `<stateDir>/acme`) before the https redirect
+(`src/server.mjs` `tryServeAcmeChallenge`, wired ahead of the redirect and the
+`/healthz` handler), with token charset validation and a resolve+prefix
+traversal guard. Issued a real Let's Encrypt cert for `console.vr.ae` + `vr.ae`
+via `certbot --webroot`, granted the `holyglory` service user ACL read on
+`/etc/letsencrypt/{live,archive}/vr.ae`, pointed `.env` at the live PEMs, and
+installed a renewal deploy hook that reloads the service (SIGHUP) on renew.
+
+Why: A wildcard `*.vr.ae` is only issuable via DNS-01, which needs registrar
+DNS access not available on this box. HTTP-01 needs only inbound port 80, which
+the app already owns and which is internet-reachable (confirmed by a
+Let's Encrypt staging dry-run). Serving the challenge in-app (rather than
+stopping the service for `certbot --standalone`) keeps port 80 continuously
+owned and makes unattended renewal work without downtime.
+
+Result: `https://console.vr.ae` and `https://vr.ae` now present a
+browser-trusted Let's Encrypt cert (verified externally via an off-VM fetch
+that previously failed on the self-signed cert; `curl` reports
+`ssl_verify_result=0`), valid 89 days with the certbot timer active and the
+deploy hook reload proven by `certbot renew --dry-run`. The cert-path change
+required a full service restart (a SIGHUP reload only re-reads the
+already-configured path — documented in the README). Coverage: added an e2e
+test (`1b`) asserting the challenge is served as 200 over plain HTTP for any
+vhost with no redirect, plus 404 for missing tokens and traversal attempts;
+suite is 62/62 and `scripts/validate.py` passes. LIMITATION: this cert covers
+only the two named hosts — proxied `<slug>.vr.ae` subdomains still fail cert
+validation (name mismatch) until a `*.vr.ae` wildcard is provisioned via
+DNS-01 (needs 101domain DNS credentials) or on-demand per-slug HTTP-01
+issuance is added. Surfaced to the user as an open decision.
+
+## 2026-07-05 - DevOps Console web app: TLS edge + subdomain reverse proxy on vr.ae
+
+Decision: Added `apps/DevOpsConsole/`, a zero-third-party-dependency Node 20
+web app that is the public edge of the `vr.ae` VPS. It terminates TLS for
+`*.vr.ae` on 443 (wildcard cert read from `.env`, hot-reloaded on file change
+and SIGHUP), redirects 80→443, and Host-routes: `console.vr.ae` serves an
+authenticated control panel (REST API + vanilla-JS UI), `<slug>.vr.ae`
+reverse-proxies to `127.0.0.1:<port>` including WebSocket/HMR upgrades, and the
+apex redirects to the console. Each subdomain route is `google` (default) or
+`public`; anonymous requests to unknown slugs are made indistinguishable from
+protected ones so route names cannot be enumerated. Google sign-in uses an
+in-process OIDC authorization-code + PKCE flow with ID-token signature
+verification against Google's JWKS (no auth library); sessions are
+HMAC-SHA256-signed cookies scoped to `Domain=.vr.ae` so one login covers every
+subdomain. All server/Docker/lease state and mutations go through the existing
+`codex-dev-coordinator` HTTP API on loopback `127.0.0.1:29876`, which the app
+autostarts if absent. Deployed via a systemd unit that grants only
+`CAP_NET_BIND_SERVICE` (no root) and reloads the cert on SIGHUP. The app runs
+in a degraded-but-real mode (public routes still proxy; auth-gated surfaces
+show a setup page) until the operator creates the Google OAuth client, and
+serves a self-signed `*.vr.ae` cert until the Let's Encrypt DNS-01 wildcard is
+provisioned out-of-band.
+
+Two shared coordinator changes were required and made general (the coordinator
+advertises itself as pure-stdlib and Linux-ready): `listening_pid_for_port`
+now resolves the owning PID via `/proc/net/tcp{,6}` + `/proc/<pid>/fd` before
+falling back to `lsof`, so `server register`/adoption works on Linux hosts
+without `lsof` installed (this VPS had none, which had been silently failing
+the coordinator self-test and the console's own port-443 self-registration);
+and `http_health` skips TLS certificate verification for loopback targets
+(`127.0.0.1`/`localhost`/`::1`), because an HTTPS edge on loopback serves a
+public-hostname cert that can never validate against the loopback address.
+
+Why: The user asked for a web control center for the VPS that reuses the
+coordinator as its control engine and adds in-app subdomain reverse-proxying
+with Google auth on `vr.ae`. The zero-dependency Node 20 constraint keeps the
+public edge auditable and free of a supply chain. Routing every control action
+through the coordinator (rather than shelling out or duplicating logic) keeps
+one source of truth for servers, ports, Docker, and leases shared with DevOps
+Board and Codex. The coordinator portability fixes were prerequisites: without
+`/proc` PID resolution the app could not register itself, and without
+loopback-relaxed health checks a TLS edge could never report healthy.
+
+Result: Live on `https://console.vr.ae` under systemd. Verified end-to-end on
+the real domain: 80→443 redirect, apex/`www` redirect, 421 for foreign hosts,
+anonymous console and protected/unknown slugs redirect to Google login
+(indistinguishable), full route lifecycle (create defaults to login-required →
+authed 200 / anon 302 → flip to public → anon 200 with no restart), CSRF
+`Origin` check (mutations without a same-origin `Origin` → 403), a WebSocket
+echo relayed through the 443 edge (anonymous WS upgrade to a protected slug
+refused with 401 before 101), and the console self-registered with the
+coordinator as a healthy server on 443. Tests: 61 node:test cases (unit + real
+end-to-end against a spawned coordinator, a local OIDC issuer with real
+RS256-signed tokens, and HTTP/SSE/WebSocket upstreams), all green across 10+
+consecutive runs. An adversarial multi-lens security review (auth/proxy,
+correctness, policy) surfaced one defense-in-depth gap — the coordinator-port
+guard was enforced only on the create-route API path, not on disk-loaded or
+`kind:server` routes — which was fixed in `routes.mjs`/`router.mjs` and locked
+with two regression tests proven to fail pre-fix. Formal web UI verification
+(mobile 390x844 + desktop 1440x900) passed with no critical or warning
+findings on both the control panel and login page. `scripts/validate.py` gained
+a `check_devops_console` guardrail (security-invariant text anchors,
+zero-dependency enforcement, stdlib-only import scan, single-purpose innerHTML
+check, `node --check` + full `node --test`) and was made resilient to hosts
+without a Swift toolchain or a global git identity; the coordinator and
+formal-web-ui-verification self-tests were extended to cover the new code
+paths. The `formal-web-ui-verification` skill gained `--cookie` and
+`--ignore-https-errors` (with must-catch self-test fixtures) so auth-gated,
+self-signed-TLS pages can be verified.
+
+## 2026-07-05 - Codex Ops Console renamed to DevOps Board; idle CPU eliminated
+
+Decision: The macOS console app is now DevOps Board (`apps/DevOpsBoard/`,
+SwiftPM package/product/executable `DevOpsBoard`), and its inventory refresh is
+visibility-gated instead of free-running. The store polls only while the main
+window is actually visible (tracked through `windowDidChangeOcclusionState`)
+or the menu bar popover is open (tracked through the popover delegate), at a
+5-second cadence; concurrent refreshes coalesce into one in-flight coordinator
+run with at most one queued follow-up pass. Inventory is published only when
+the decoded payload differs from the current one, project groups are computed
+once per inventory change and cached on the store (`store.projectGroups`)
+instead of being re-derived in every view body, per-coordinator-home inventory
+commands run concurrently in a task group, and `runPython` waits via a
+termination handler instead of blocking a cooperative-pool thread in
+`waitUntilExit()`, with a SIGTERM/SIGKILL watchdog (60 s for inventory, 10 min
+for actions, 1 h for backups) so a wedged coordinator child cannot freeze the
+single-flight refresh pipeline.
+
+Why: The app previously ran `python3 dev_coordinator.py inventory` (which
+itself samples `docker stats`) every 2.5 seconds forever — including while the
+window was hidden to the menu bar — so the app consumed CPU and power
+continuously even when nobody was looking at it. The 2.5-second cadence also
+republished identical inventory each cycle, re-rendering the whole window and
+recomputing project grouping several times per pass.
+
+Result: A hidden DevOps Board spawns no subprocesses at all; a visible one
+samples half as often, skips UI work when nothing changed, and never blocks
+Swift concurrency threads. `scripts/validate.py` guardrails were updated to
+enforce the new contract (visibility-gated refresh, publish-on-change, cached
+project groups, non-blocking process wait) and all `CodexOpsConsole` paths and
+strings were renamed across the app, validation gate, CI workflow, README, and
+design QA notes.
+
 ## 2026-07-03 - Functional hardening pass across all skills
 
 Decision: A functional-only audit (security excluded per user) drove concrete
@@ -63,7 +547,7 @@ verifier) that was never backported here, and `~/.codex/skills/`
 
 ## 2026-07-02 - Coordinator project resource telemetry
 
-Decision: The Codex dev coordinator inventory emits real per-server process-tree CPU/RSS telemetry and project-level resource rollups, and CodexOpsConsole displays those rollups by repo.
+Decision: The Codex dev coordinator inventory emits real per-server process-tree CPU/RSS telemetry and project-level resource rollups, and CodexOpsConsole (renamed to DevOps Board on 2026-07-05) displays those rollups by repo.
 
 Why: Managed dev servers often launch child processes that own the actual listener and resource usage. A launcher PID alone can hide runaway Next/Vite/node child processes, especially across multiple Codex/Parall coordinator homes.
 

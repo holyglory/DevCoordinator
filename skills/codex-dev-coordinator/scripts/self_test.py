@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import http.client
+import http.server
 import json
 import os
 import socket
@@ -13,7 +14,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from shutil import rmtree
+from shutil import rmtree, which as _which
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,10 +22,22 @@ SCRIPT = ROOT / "scripts" / "dev_coordinator.py"
 SKILL = ROOT / "SKILL.md"
 
 
+_ISSUED_PORTS: set[int] = set()
+
+
 def free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    # Never hand out a port an earlier fixture already used: durable port
+    # assignments persist in the shared test home for the whole run, so a
+    # kernel-recycled ephemeral port could otherwise collide with an earlier
+    # block's pin and flake a later single-port fixture.
+    for _ in range(100):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+        if port not in _ISSUED_PORTS:
+            _ISSUED_PORTS.add(port)
+            return port
+    raise AssertionError("could not allocate a fresh fixture port after 100 attempts")
 
 
 def run(args: list[str], *, env: dict[str, str]) -> dict:
@@ -125,7 +138,104 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _load_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dev_coordinator_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_listener_and_health_helpers() -> None:
+    """Directly exercise the two host-portability paths that a CLI register
+    depends on: resolving the PID that owns a listening port, and probing an
+    HTTPS liveness endpoint on loopback.
+
+    These guard against regressions to (a) the pure-stdlib /proc PID resolver
+    that lets `server register`/adoption work on Linux hosts without `lsof`,
+    and (b) the loopback-relaxed TLS verification that lets an HTTPS dev server
+    (serving a public-hostname cert that can never match 127.0.0.1) report
+    healthy.
+    """
+    module = _load_module()
+
+    # (a) PID resolution for a known listener, via whatever path the host
+    # supports (pure-stdlib /proc on Linux; lsof elsewhere).
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listen_port = int(listener.getsockname()[1])
+        resolved = module.listening_pid_for_port(listen_port)
+        check(
+            resolved == os.getpid(),
+            f"listening_pid_for_port({listen_port}) should resolve this process "
+            f"pid {os.getpid()} without lsof, got {resolved}",
+        )
+        check(
+            module.listening_pid_for_port(free_port()) is None,
+            "listening_pid_for_port should return None for a port with no listener",
+        )
+    finally:
+        listener.close()
+
+    # (b) HTTPS loopback health check against a self-signed cert.
+    import ssl as _ssl
+
+    if not _which("openssl"):
+        return  # cert generation needs openssl; skip gracefully where absent
+    cert_dir = Path(tempfile.mkdtemp(prefix="coordinator-health-tls-"))
+    try:
+        cert = cert_dir / "cert.pem"
+        key = cert_dir / "key.pem"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key), "-out", str(cert), "-days", "1",
+                "-subj", "/CN=console.example",
+                "-addext", "subjectAltName=DNS:console.example",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=20,
+        )
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HealthzHandler)
+        context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(cert), str(key))
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        tls_port = int(httpd.server_address[1])
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = module.http_health(f"https://127.0.0.1:{tls_port}/healthz")
+            check(
+                result.get("ok") is True and result.get("status") == 200,
+                f"http_health should accept a self-signed HTTPS loopback endpoint, got {result}",
+            )
+        finally:
+            httpd.shutdown()
+            thread.join(timeout=5)
+    finally:
+        rmtree(cert_dir, ignore_errors=True)
+    check(True, "loopback HTTPS health checks should pass against self-signed certs")
+
+
+class _HealthzHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: object) -> None:
+        return
+
+    def do_GET(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+
 def main() -> int:
+    check_listener_and_health_helpers()
     tmp = Path(tempfile.mkdtemp(prefix="codex-dev-coordinator-self-test-"))
     env = os.environ.copy()
     env["CODEX_AGENT_COORDINATOR_HOME"] = str(tmp / "state")
@@ -212,6 +322,17 @@ def main() -> int:
         check(project_usage, "inventory should expose project usage rollups")
         check(project_usage[0].get("process_count", 0) >= 1, "project usage should count managed processes")
         check(project_usage[0].get("memory_bytes", 0) > 0, "project usage should include managed process memory")
+        check(
+            server["id"] in (project_usage[0].get("server_ids") or []),
+            "project usage rows must list member server ids for authoritative grouping",
+        )
+        check(isinstance(project_usage[0].get("container_names"), list), "project usage rows must carry container membership")
+        # The usage_key FORMAT is a persisted contract: the console stores it
+        # in ui-prefs hidden.projects, so a format change silently unhides.
+        check(
+            project_usage[0].get("usage_key") == f"path:{Path(str(tmp)).resolve()}",
+            "project usage usage_key must keep the 'path:<resolved project>' format",
+        )
         status = run(["server", "status", "--project", str(tmp), "--name", "fixture-web"], env=env)
         check(status["status"] == "running", "server status should be running")
         stopped = run(["server", "stop", "--agent", "agent-a", "--project", str(tmp), "--name", "fixture-web", "--reason", "test stop"], env=env)
@@ -287,6 +408,13 @@ def main() -> int:
         check(adopted.get("lease_id"), "server register should lease an already-running adopted server port")
         adopted_inventory = run(["inventory", "--project", str(tmp), "--no-docker"], env=env)
         check(any(item["name"] == "adopted-web" for item in adopted_inventory["servers"]), "inventory should include adopted server")
+        check(
+            any(
+                item["name"] == "adopted-web" and item["port"] == adopted["port"]
+                for item in adopted_inventory.get("port_assignments", [])
+            ),
+            "server register should durably pin the adopted server's port",
+        )
         bad_health_project = tmp / "bad-health-project"
         bad_health_project.mkdir()
         bad_health_port = free_port()
@@ -447,6 +575,35 @@ def main() -> int:
             env=env,
         )
         run(["server", "stop", "--agent", "agent-a", "--project", str(reuse_old_project), "--name", "web", "--reason", "historical row"], env=env)
+        # The stopped server keeps a durable port assignment, so another
+        # project must be refused until the pin is explicitly removed.
+        run_fail(
+            [
+                "server",
+                "start",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(reuse_new_project),
+                "--name",
+                "web",
+                "--cwd",
+                str(reuse_new_project),
+                "--cmd",
+                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "--range",
+                f"{reuse_port}-{reuse_port}",
+                "--health-url",
+                "http://127.0.0.1:{port}/",
+            ],
+            env=env,
+            expected="no free port available",
+        )
+        check(True, "a stopped server's assigned port must be refused to other projects")
+        run(
+            ["port", "unassign", "--agent", "agent-a", "--project", str(reuse_old_project), "--name", "web"],
+            env=env,
+        )
         new_reused = run(
             [
                 "server",
@@ -481,6 +638,428 @@ def main() -> int:
             "inventory URL list should not expose stale historical URLs",
         )
         run(["server", "stop", "--agent", "agent-a", "--project", str(reuse_new_project), "--name", "web", "--reason", "reuse cleanup"], env=env)
+
+        # --- Durable port assignments: a server's port is pinned to (project, name) ---
+        pin_project = tmp / "pin-project"
+        pin_project.mkdir()
+        pinned = run(
+            [
+                "server",
+                "start",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(pin_project),
+                "--name",
+                "web",
+                "--cwd",
+                str(pin_project),
+                "--cmd",
+                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "--health-url",
+                "http://127.0.0.1:{port}/",
+            ],
+            env=env,
+        )
+        pin_port = int(pinned["port"])
+        pin_assignments = run(["port", "assignments", "--project", str(pin_project)], env=env)
+        check(
+            any(item["name"] == "web" and item["port"] == pin_port for item in pin_assignments),
+            "server start should create a durable port assignment",
+        )
+        run(["server", "stop", "--agent", "agent-a", "--project", str(pin_project), "--name", "web", "--reason", "pin test"], env=env)
+        active_after_stop = run(["port", "list"], env=env)
+        check(
+            not any(int(item.get("port") or 0) == pin_port and item.get("status") == "active" for item in active_after_stop),
+            "stopping the server should release its lease",
+        )
+        pin_assignments = run(["port", "assignments", "--project", str(pin_project)], env=env)
+        check(
+            any(item["name"] == "web" and item["port"] == pin_port for item in pin_assignments),
+            "assignment must survive server stop and stopped-record pruning",
+        )
+        run_fail(
+            ["port", "lease", "--agent", "agent-b", "--project", str(tmp), "--preferred", str(pin_port), "--range", f"{pin_port}-{pin_port}"],
+            env=env,
+            expected="is durably assigned to",
+        )
+        check(True, "a foreign lease on an assigned port must be refused with the owner named")
+
+        # Restart after the stopped record is pruned: age the record past the
+        # retention window (the way pruning really happens), prune, and start
+        # again — the durable assignment must bring the same port back.
+        pin_state_file = Path(env["CODEX_AGENT_COORDINATOR_HOME"]) / "state.json"
+        pin_state = json.loads(pin_state_file.read_text(encoding="utf-8"))
+        for record in pin_state["servers"].values():
+            if record.get("project") == str(pin_project.resolve()) and record.get("name") == "web":
+                record["stopped_ts"] = record["created_ts"] - 30 * 24 * 3600
+        pin_state_file.write_text(json.dumps(pin_state), encoding="utf-8")
+        pruned_view = run(["state", "show"], env=env)
+        check(
+            not any(
+                record.get("project") == str(pin_project.resolve()) and record.get("name") == "web"
+                for record in pruned_view["servers"].values()
+            ),
+            "aged stopped record should be pruned before the pinned restart",
+        )
+        repinned = run(
+            [
+                "server",
+                "start",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(pin_project),
+                "--name",
+                "web",
+                "--cwd",
+                str(pin_project),
+                "--cmd",
+                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "--health-url",
+                "http://127.0.0.1:{port}/",
+            ],
+            env=env,
+        )
+        check(
+            int(repinned["port"]) == pin_port,
+            "server start after record pruning must land on the durably assigned port",
+        )
+
+        # Explicit different preferred port re-pins the assignment.
+        run(["server", "stop", "--agent", "agent-a", "--project", str(pin_project), "--name", "web", "--reason", "re-pin test"], env=env)
+        repin_port = free_port()
+        repin = run(
+            [
+                "server",
+                "start",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(pin_project),
+                "--name",
+                "web",
+                "--cwd",
+                str(pin_project),
+                "--cmd",
+                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "--range",
+                f"{repin_port}-{repin_port}",
+                "--preferred",
+                str(repin_port),
+                "--health-url",
+                "http://127.0.0.1:{port}/",
+            ],
+            env=env,
+        )
+        check(int(repin["port"]) == repin_port, "explicit preferred port should win over the assignment")
+        pin_assignments = run(["port", "assignments", "--project", str(pin_project)], env=env)
+        check(
+            [item["port"] for item in pin_assignments if item["name"] == "web"] == [repin_port],
+            "an explicit different port should re-pin the assignment",
+        )
+        run(["server", "stop", "--agent", "agent-a", "--project", str(pin_project), "--name", "web", "--reason", "re-pin cleanup"], env=env)
+
+        # A foreign process squatting the pinned port must fail the owner's
+        # start loudly instead of silently drifting to a different port.
+        squatter = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(repin_port), "--bind", "127.0.0.1"],
+            cwd=str(tmp),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                probe = socket.socket()
+                try:
+                    probe.connect(("127.0.0.1", repin_port))
+                    probe.close()
+                    break
+                except OSError:
+                    probe.close()
+                    time.sleep(0.1)
+            run_fail(
+                [
+                    "server",
+                    "start",
+                    "--agent",
+                    "agent-a",
+                    "--project",
+                    str(pin_project),
+                    "--name",
+                    "web",
+                    "--cwd",
+                    str(pin_project),
+                    "--cmd",
+                    shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                ],
+                env=env,
+                expected="pinned to port",
+            )
+            check(True, "owner start must fail loudly when a squatter occupies the pinned port")
+        finally:
+            squatter.terminate()
+            squatter.wait(timeout=10)
+
+        # register must refuse a port pinned to another project even when the
+        # listener legitimately belongs to the registering project.
+        register_guard_port = free_port()
+        run(
+            ["port", "assign", "--agent", "agent-b", "--project", str(tmp), "--name", "blocker", "--port", str(register_guard_port)],
+            env=env,
+        )
+        register_victim = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(register_guard_port), "--bind", "127.0.0.1"],
+            cwd=str(pin_project),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                probe = socket.socket()
+                try:
+                    probe.connect(("127.0.0.1", register_guard_port))
+                    probe.close()
+                    break
+                except OSError:
+                    probe.close()
+                    time.sleep(0.1)
+            run_fail(
+                [
+                    "server",
+                    "register",
+                    "--agent",
+                    "agent-a",
+                    "--project",
+                    str(pin_project),
+                    "--name",
+                    "web2",
+                    "--port",
+                    str(register_guard_port),
+                    "--url",
+                    f"http://127.0.0.1:{register_guard_port}",
+                ],
+                env=env,
+                expected="is durably assigned to",
+            )
+            check(True, "server register must refuse a port durably assigned to another project")
+        finally:
+            register_victim.terminate()
+            register_victim.wait(timeout=10)
+        run(
+            ["port", "unassign", "--agent", "agent-b", "--project", str(tmp), "--name", "blocker"],
+            env=env,
+        )
+
+        # Unassign contract: attribution required, foreign unassign needs --force,
+        # and an unassigned port returns to the shared pool.
+        run_fail(
+            ["port", "unassign", "--project", str(pin_project), "--name", "web"],
+            env=env,
+            expected="the following arguments are required: --agent",
+        )
+        check(True, "port unassign without --agent must be rejected")
+        run_fail(
+            ["port", "unassign", "--agent", "agent-b", "--project", str(tmp), "--port", str(repin_port)],
+            env=env,
+            expected="pass --force",
+        )
+        check(True, "unassigning another project's port must require --force")
+        removed_assignment = run(
+            ["port", "unassign", "--agent", "agent-b", "--project", str(tmp), "--port", str(repin_port), "--force"],
+            env=env,
+        )
+        check(removed_assignment.get("status") == "unassigned", "force unassign should remove another project's pin")
+        check(removed_assignment.get("name") == "web", "force unassign should return the removed assignment")
+        freed_lease = run(
+            ["port", "lease", "--agent", "agent-b", "--project", str(tmp), "--preferred", str(repin_port), "--range", f"{repin_port}-{repin_port}", "--ttl", "60"],
+            env=env,
+        )
+        check(int(freed_lease["port"]) == repin_port, "an unassigned port must be leasable again")
+        run(["port", "release", "--lease-id", freed_lease["id"]], env=env)
+
+        # Manual leases must NOT create durable assignments.
+        manual_probe = run(["port", "assignments"], env=env)
+        check(
+            not any(int(item.get("port") or 0) == repin_port for item in manual_probe),
+            "manual port leases must not create durable assignments",
+        )
+
+        # Moving a pin while the server is stopped: `server restart` must land
+        # on the NEW pin, not the stale record port.
+        moved_pin_port = free_port()
+        run(
+            ["port", "assign", "--agent", "agent-a", "--project", str(pin_project), "--name", "web", "--port", str(moved_pin_port)],
+            env=env,
+        )
+        moved_restart = run(
+            ["server", "restart", "--agent", "agent-a", "--project", str(pin_project), "--name", "web"],
+            env=env,
+        )
+        check(
+            int(moved_restart["port"]) == moved_pin_port,
+            "server restart must follow a moved pin instead of the stale record port",
+        )
+
+        # Healthy-existing short-circuit heals a MISSING pin (and only that):
+        # unassign while running, idempotent start recreates the pin in place.
+        run(
+            ["port", "unassign", "--agent", "agent-a", "--project", str(pin_project), "--name", "web"],
+            env=env,
+        )
+        healed = run(
+            [
+                "server",
+                "start",
+                "--agent",
+                "agent-a",
+                "--project",
+                str(pin_project),
+                "--name",
+                "web",
+                "--cwd",
+                str(pin_project),
+                "--cmd",
+                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "--health-url",
+                "http://127.0.0.1:{port}/",
+            ],
+            env=env,
+        )
+        check(int(healed["port"]) == moved_pin_port, "idempotent start of a healthy server must not move it")
+        healed_assignments = run(["port", "assignments", "--project", str(pin_project)], env=env)
+        check(
+            any(item["name"] == "web" and item["port"] == moved_pin_port for item in healed_assignments),
+            "idempotent start of a healthy server must heal a missing pin at the current port",
+        )
+        run(["server", "stop", "--agent", "agent-a", "--project", str(pin_project), "--name", "web", "--reason", "pin fixtures done"], env=env)
+
+        # project start must prefer a moved pin over the stale record port
+        # (same precedence as server restart: declared port > pin > record).
+        pin_runtime_project = tmp / "pin-runtime-project"
+        pin_runtime_dir = pin_runtime_project / ".codex"
+        pin_runtime_dir.mkdir(parents=True)
+        pin_runtime_port = free_port()
+
+        def write_pin_runtime(port_value):
+            server_def = {
+                "name": "web",
+                "role": "web",
+                "cwd": ".",
+                "cmd": shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "health_url": "http://127.0.0.1:{port}/",
+            }
+            if port_value is not None:
+                server_def["port"] = port_value
+            (pin_runtime_dir / "dev-runtime.json").write_text(
+                json.dumps({"name": "pin-runtime", "servers": [server_def]}),
+                encoding="utf-8",
+            )
+
+        write_pin_runtime(pin_runtime_port)
+        first_runtime = run(["project", "start", "--agent", "agent-a", "--project", str(pin_runtime_project)], env=env)
+        check(first_runtime["ok"], f"pin-runtime project should start: {first_runtime}")
+        run(["project", "stop", "--agent", "agent-a", "--project", str(pin_runtime_project)], env=env)
+        # Drop the declared port so the pin (not the stale record) must decide.
+        write_pin_runtime(None)
+        pin_runtime_moved = free_port()
+        run(
+            ["port", "assign", "--agent", "agent-a", "--project", str(pin_runtime_project), "--name", "web", "--port", str(pin_runtime_moved)],
+            env=env,
+        )
+        second_runtime = run(["project", "start", "--agent", "agent-a", "--project", str(pin_runtime_project)], env=env)
+        check(second_runtime["ok"], f"pin-runtime project should restart: {second_runtime}")
+        check(
+            any(str(pin_runtime_moved) in str(item.get("url")) for item in second_runtime.get("urls", [])),
+            "project start must follow a moved pin instead of the stale record port",
+        )
+        run(["project", "stop", "--agent", "agent-a", "--project", str(pin_runtime_project)], env=env)
+
+        # Migration seeding: a pre-assignment state file pins existing records;
+        # on a contested port the most recently stopped record wins.
+        seed_home = tmp / "seed-home"
+        seed_home.mkdir()
+        seed_env = dict(env)
+        seed_env["CODEX_AGENT_COORDINATOR_HOME"] = str(seed_home)
+        seed_now = time.time()
+        seed_state = {
+            "version": 1,
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "leases": {},
+            "servers": {
+                "old-loser": {
+                    "id": "old-loser",
+                    "key": "/repo-a::web",
+                    "name": "web",
+                    "project": "/repo-a",
+                    "port": 4000,
+                    "status": "stopped",
+                    "created_ts": seed_now - 7200,
+                    "stopped_ts": seed_now - 3600,
+                },
+                "new-winner": {
+                    "id": "new-winner",
+                    "key": "/repo-b::web",
+                    "name": "web",
+                    "project": "/repo-b",
+                    "port": 4000,
+                    "status": "stopped",
+                    "created_ts": seed_now - 1800,
+                    "stopped_ts": seed_now - 900,
+                },
+                "solo": {
+                    "id": "solo",
+                    "key": "/repo-c::api",
+                    "name": "api",
+                    "project": "/repo-c",
+                    "port": 4100,
+                    "status": "stopped",
+                    "created_ts": seed_now - 600,
+                    "stopped_ts": seed_now - 300,
+                },
+                # Port 4200 contested between a RUNNING record that is much
+                # older and a freshly stopped one: running must win anyway.
+                "old-runner": {
+                    "id": "old-runner",
+                    "key": "/repo-d::web",
+                    "name": "web",
+                    "project": "/repo-d",
+                    "port": 4200,
+                    "status": "running",
+                    "created_ts": seed_now - 90_000,
+                },
+                "fresh-stopped": {
+                    "id": "fresh-stopped",
+                    "key": "/repo-e::web",
+                    "name": "web",
+                    "project": "/repo-e",
+                    "port": 4200,
+                    "status": "stopped",
+                    "created_ts": seed_now - 120,
+                    "stopped_ts": seed_now - 60,
+                },
+            },
+            "history": [],
+            "docker": {"last_commands": [], "stats_history": {}, "metadata": {}},
+        }
+        (seed_home / "state.json").write_text(json.dumps(seed_state), encoding="utf-8")
+        seeded = run(["port", "assignments"], env=seed_env)
+        seeded_by_key = {item["key"]: item for item in seeded}
+        check(
+            seeded_by_key.get("/repo-b::web", {}).get("port") == 4000
+            and seeded_by_key.get("/repo-b::web", {}).get("source") == "seed_existing_servers",
+            "migration seeding should pin the most recently stopped record on a contested port",
+        )
+        check("/repo-a::web" not in seeded_by_key, "the older contested record must stay unpinned after seeding")
+        check(seeded_by_key.get("/repo-c::api", {}).get("port") == 4100, "uncontested records should seed their ports")
+        check(
+            seeded_by_key.get("/repo-d::web", {}).get("port") == 4200,
+            "a running record must win a contested port during seeding even against a newer stopped record",
+        )
+        check("/repo-e::web" not in seeded_by_key, "the stopped loser of a running-contested port must stay unpinned")
 
         adopt_project = tmp / "adopt-project"
         adopt_project.mkdir()
@@ -650,7 +1229,12 @@ def main() -> int:
         fake_bin = tmp / "fake-bin"
         fake_bin.mkdir()
         compose_owner = tmp / "compose-owner"
+        leak_owner = tmp / "leak-owner"
         fake_docker = fake_bin / "docker"
+        leak_labels = {
+            "com.docker.compose.project.working_dir": str(leak_owner),
+            "com.docker.compose.project": "leak-owner",
+        }
         fake_containers = {
             "abc123def456": {"Id": "abc123def4567890", "Name": "/fixture-postgres", "Config": {"Labels": {}}},
             "fixture-postgres": {"Id": "abc123def4567890", "Name": "/fixture-postgres", "Config": {"Labels": {}}},
@@ -676,11 +1260,24 @@ def main() -> int:
                     }
                 },
             },
+            # Membership fixtures (unified display/action attribution):
+            # an unattributed container named after a real repo, a labeled
+            # container whose name also matches a different repo, and an
+            # unattributed container whose name matches two repos.
+            "11aa22bb33cc": {"Id": "11aa22bb33cc4455", "Name": "/grouprepo-db", "Config": {"Labels": {}}},
+            "grouprepo-db": {"Id": "11aa22bb33cc4455", "Name": "/grouprepo-db", "Config": {"Labels": {}}},
+            "22bb33cc44dd": {"Id": "22bb33cc44dd5566", "Name": "/leakrepo-db", "Config": {"Labels": leak_labels}},
+            "leakrepo-db": {"Id": "22bb33cc44dd5566", "Name": "/leakrepo-db", "Config": {"Labels": leak_labels}},
+            "33cc44dd55ee": {"Id": "33cc44dd55ee6677", "Name": "/duporepo-db", "Config": {"Labels": {}}},
+            "duporepo-db": {"Id": "33cc44dd55ee6677", "Name": "/duporepo-db", "Config": {"Labels": {}}},
         }
         fake_ps = [
             {"ID": "abc123def456", "Names": "fixture-postgres", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "0.0.0.0:5544->5432/tcp"},
             {"ID": "fed789abc012", "Names": "runtime-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
             {"ID": "def456abc123", "Names": "fixture-compose-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
+            {"ID": "11aa22bb33cc", "Names": "grouprepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
+            {"ID": "22bb33cc44dd", "Names": "leakrepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
+            {"ID": "33cc44dd55ee", "Names": "duporepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
         ]
         fake_docker.write_text(
             f"""#!/usr/bin/env python3
@@ -695,7 +1292,7 @@ if args[:1] == ["ps"]:
 elif args[:3] == ["inspect", "--format", "{{{{json .}}}}"]:
     for key in args[3:]:
         print(json.dumps(containers[key]))
-elif args[:1] == ["stats"]:
+elif args[:1] in (["stats"], ["stop"], ["start"], ["restart"]):
     pass
 else:
     sys.exit(1)
@@ -734,6 +1331,15 @@ else:
         fixture_pg = next(item for item in docker_inventory["docker"]["containers"] if item["name"] == "fixture-postgres")
         check(fixture_pg["project"] == str(tmp.resolve()), "inventory should merge sidecar project metadata")
         check(fixture_pg["metadata_source"] == "coordinator_sidecar", "inventory should expose sidecar metadata source")
+        docker_usage_row = next(
+            (row for row in docker_inventory.get("project_usage", []) if row.get("usage_key") == f"path:{tmp.resolve()}"),
+            None,
+        )
+        check(docker_usage_row is not None, "project usage should include the docker-attributed project row")
+        check(
+            "fixture-postgres" in (docker_usage_row.get("container_names") or []),
+            "project usage container_names must list the attributed container",
+        )
         compose_register = run(
             ["docker", "register", "--agent", "agent-a", "--project", str(tmp), "--container", "fixture-compose-db", "--role", "postgres"],
             env=fake_env,
@@ -765,6 +1371,98 @@ else:
         check(runtime_db["project"] == str(declared_docker_project.resolve()), "project start should attach sidecar metadata to declared unlabeled containers")
         check(runtime_db["metadata_source"] == "coordinator_sidecar", "declared unlabeled containers should expose coordinator sidecar metadata")
 
+        # --- Unified container membership: the group the Projects tree shows a
+        # container under must be exactly the group whose whole-project actions
+        # act on it (2026-07-07 review: an unattributed container displayed
+        # under 'name:<key>' while project stop on the path-keyed repo stopped
+        # it). Display (build_project_usage) and actions
+        # (build_project_runtime_spec) must resolve through one attribution.
+        grouprepo = tmp / "grouprepo"
+        grouprepo.mkdir()
+        leakrepo = tmp / "leakrepo"
+        leakrepo.mkdir()
+        duporepo = tmp / "duporepo"
+        duporepo.mkdir()
+        duporepo_twin = tmp / "twin" / "duporepo"
+        duporepo_twin.mkdir(parents=True)
+        for repo in (grouprepo, leakrepo, duporepo, duporepo_twin):
+            run(
+                ["port", "assign", "--agent", "agent-a", "--project", str(repo), "--name", "web", "--port", str(free_port())],
+                env=fake_env,
+            )
+
+        def usage_rows() -> tuple[dict[str, dict], dict]:
+            inventory = run(["inventory"], env=fake_env)
+            return {row["usage_key"]: row for row in inventory.get("project_usage", [])}, inventory
+
+        def stop_targets(project: Path) -> list[str]:
+            report = run(
+                ["project", "stop", "--agent", "agent-a", "--project", str(project), "--dry-run"],
+                env=fake_env,
+            )
+            return [
+                action["command"][2]
+                for action in report.get("actions", [])
+                if action.get("command", [])[:2] == ["docker", "stop"]
+            ]
+
+        rows, _ = usage_rows()
+        group_row = rows.get(f"path:{grouprepo.resolve()}")
+        check(group_row is not None, "name-claimed container must create or join the path-keyed repo row")
+        check(
+            "grouprepo-db" in (group_row or {}).get("container_names", []),
+            "must-catch: unattributed grouprepo-db must display under the path-keyed repo that project actions act on",
+        )
+        check(
+            "name:grouprepo" not in rows,
+            "must-catch: a name-claimed container must not keep a separate name-keyed display group",
+        )
+        check(
+            "grouprepo-db" in stop_targets(grouprepo),
+            "project stop must still act on the container its display group shows",
+        )
+
+        leak_row = rows.get(f"path:{leak_owner.resolve()}")
+        check(
+            leak_row is not None and "leakrepo-db" in leak_row.get("container_names", []),
+            "labeled container must display under its label owner",
+        )
+        check(
+            "leakrepo-db" not in (rows.get(f"path:{leakrepo.resolve()}") or {}).get("container_names", []),
+            "labeled container must not display under a name-matched repo",
+        )
+        check(
+            "leakrepo-db" not in stop_targets(leakrepo),
+            "must-catch: project stop on a name-matched repo must not stop a container attributed to another project",
+        )
+
+        dupo_row = rows.get("name:duporepo")
+        check(
+            dupo_row is not None and "duporepo-db" in dupo_row.get("container_names", []),
+            "ambiguous name match (two repos share the key) must stay in its own name-keyed group",
+        )
+        check(
+            "duporepo-db" not in (rows.get(f"path:{duporepo.resolve()}") or {}).get("container_names", []),
+            "ambiguous name match must not be claimed by either repo row",
+        )
+        check(
+            "duporepo-db" not in stop_targets(duporepo),
+            "project stop must not act on a container whose name matches several repos",
+        )
+
+        member_stop = run(["project", "stop", "--agent", "agent-a", "--project", str(grouprepo)], env=fake_env)
+        check(member_stop["ok"], f"project stop on the claimed repo should succeed: {member_stop}")
+        rows, converged_inventory = usage_rows()
+        converged = next(item for item in converged_inventory["docker"]["containers"] if item["name"] == "grouprepo-db")
+        check(
+            converged["metadata_source"] == "coordinator_sidecar" and converged["project"] == str(grouprepo.resolve()),
+            "whole-project stop must record sidecar attribution for the containers it acted on",
+        )
+        check(
+            "grouprepo-db" in (rows.get(f"path:{grouprepo.resolve()}") or {}).get("container_names", []),
+            "attribution recorded by project stop must keep the container in the repo display group",
+        )
+
         api_port = free_port()
         api_process = subprocess.Popen(
             [sys.executable, str(SCRIPT), "api", "serve", "--host", "127.0.0.1", "--port", str(api_port)],
@@ -788,6 +1486,24 @@ else:
         check("services" in api_runtime and "ok" in api_runtime, "API project status should expose runtime report")
         api_stats = post_json(api_port, "/v1/docker/stats", {"dry_run": True})
         check(api_stats["command"] == ["docker", "stats", "--no-stream", "--format", "{{json .}}"], "API docker stats should use real stats command")
+        api_assign_port = free_port()
+        api_assigned = post_json(
+            api_port,
+            "/v1/ports/assign",
+            {"agent": "api-agent", "project": str(tmp), "name": "api-pinned", "port": api_assign_port},
+        )
+        check(api_assigned.get("port") == api_assign_port, "API port assign should pin the requested port")
+        api_assignments = get_json(api_port, "/v1/ports/assignments")
+        check(
+            any(item.get("name") == "api-pinned" and item.get("port") == api_assign_port for item in api_assignments),
+            "API assignments listing should include the new pin",
+        )
+        api_unassigned = post_json(
+            api_port,
+            "/v1/ports/unassign",
+            {"agent": "api-agent", "project": str(tmp), "name": "api-pinned"},
+        )
+        check(api_unassigned.get("status") == "unassigned", "API port unassign should remove the pin")
         state = get_json(api_port, "/v1/state")
         history_types = {item["type"] for item in state["history"]}
         check("port.leased" in history_types and "server.stopped" in history_types, "state should retain action history")

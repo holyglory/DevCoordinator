@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import glob
 import http.server
 import json
 import os
@@ -118,6 +119,7 @@ def default_state() -> dict[str, Any]:
         "updated_at": iso_timestamp(),
         "leases": {},
         "servers": {},
+        "port_assignments": {},
         "history": [],
         "docker": {"last_commands": [], "stats_history": {}, "metadata": {}},
     }
@@ -152,6 +154,11 @@ def read_state() -> dict[str, Any]:
     data["docker"].setdefault("last_commands", [])
     data["docker"].setdefault("stats_history", {})
     data["docker"].setdefault("metadata", {})
+    if "port_assignments" not in data:
+        # One-time migration: pin every pre-existing server record to the port
+        # it already holds so the durable-port contract covers old state files.
+        data["port_assignments"] = {}
+        seed_port_assignments(data)
     return data
 
 
@@ -205,7 +212,48 @@ def port_open(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def _listening_inodes_for_port(port: int) -> set[str]:
+    """Socket inodes of TCP sockets in LISTEN state on `port`, read from /proc.
+
+    Pure-stdlib, Linux-native, and privilege-free — the parsed files are the
+    calling user's view of the network tables. Covers IPv4 and IPv6.
+    """
+    inodes: set[str] = set()
+    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        with contextlib.suppress(Exception):
+            with open(proc_file, encoding="utf-8") as handle:
+                next(handle, None)  # header
+                for line in handle:
+                    fields = line.split()
+                    if len(fields) < 10:
+                        continue
+                    local_port = int(fields[1].rsplit(":", 1)[1], 16)
+                    state = fields[3]
+                    if local_port == port and state == "0A":  # 0A = TCP_LISTEN
+                        inodes.add(fields[9])
+    return inodes
+
+
+def _pid_owning_socket_inodes(inodes: set[str]) -> int | None:
+    if not inodes:
+        return None
+    targets = {f"socket:[{inode}]" for inode in inodes}
+    for fd_dir in glob.glob("/proc/[0-9]*/fd"):
+        with contextlib.suppress(Exception):
+            for fd_path in os.scandir(fd_dir):
+                with contextlib.suppress(OSError):
+                    if os.readlink(fd_path.path) in targets:
+                        return int(fd_dir.rsplit("/", 2)[1])
+    return None
+
+
 def listening_pid_for_port(port: int) -> int | None:
+    # Prefer /proc on Linux (no external dependency); fall back to lsof so
+    # macOS and other platforms without /proc still resolve the owner.
+    with contextlib.suppress(Exception):
+        pid = _pid_owning_socket_inodes(_listening_inodes_for_port(port))
+        if pid is not None:
+            return pid
     with contextlib.suppress(Exception):
         completed = subprocess.run(
             ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
@@ -548,6 +596,7 @@ def lease_port(
     ttl: int = DEFAULT_TTL_SECONDS,
     purpose: str = "manual",
     server_id: str | None = None,
+    assignment_key: str | None = None,
 ) -> dict[str, Any]:
     project = canonical_project(project)
     start, end = parse_range(port_range)
@@ -559,8 +608,16 @@ def lease_port(
     candidates.extend(port for port in range(start, end + 1) if port != preferred)
 
     used = active_lease_ports(state)
+    # Ports durably assigned to another (project, server) are never handed out,
+    # even while that server is stopped — that is the whole durability contract.
+    assigned = foreign_assigned_ports(state, owner_key=assignment_key)
+    if preferred is not None and preferred in assigned:
+        raise RuntimeError(
+            f"port {preferred} is durably assigned to {assignment_owner_text(assigned[preferred])}; "
+            "choose another port or unassign it first"
+        )
     for port in candidates:
-        if port in used:
+        if port in used or port in assigned:
             continue
         if not port_available(port):
             continue
@@ -618,8 +675,15 @@ def lease_existing_server_port(
     server_id: str,
     owner_pid: int | None,
     ttl: int = DEFAULT_TTL_SECONDS,
+    assignment_key: str | None = None,
 ) -> dict[str, Any]:
     project = canonical_project(project)
+    foreign = foreign_assigned_ports(state, owner_key=assignment_key)
+    if int(port) in foreign:
+        raise RuntimeError(
+            f"port {port} is durably assigned to {assignment_owner_text(foreign[int(port)])}; "
+            "register on another port or unassign it first"
+        )
     release_mismatched_leases_for_existing_listener(
         state,
         port=port,
@@ -688,6 +752,200 @@ def canonical_project(project: str) -> str:
             if completed.returncode == 0 and completed.stdout.strip():
                 return str(Path(completed.stdout.strip()).expanduser().resolve())
     return str(raw.resolve())
+
+
+# --- durable port assignments -------------------------------------------------
+# A port assignment permanently maps (canonical project, server name) -> port so
+# a repo's servers always come back on the same ports. Assignments live in
+# state["port_assignments"] (a sibling of leases/servers), survive server stop,
+# lease release/expiry/stale-reclaim, and stopped-record pruning, and are
+# removed only by explicit unassignment (or `state reset`).
+
+
+def find_port_assignment(state: dict[str, Any], *, project: str, name: str) -> tuple[str, dict[str, Any] | None]:
+    key = server_key(project, name)
+    return key, state.setdefault("port_assignments", {}).get(key)
+
+
+def foreign_assigned_ports(state: dict[str, Any], *, owner_key: str | None = None) -> dict[int, dict[str, Any]]:
+    """Map of durably assigned ports -> assignment, excluding owner_key's own."""
+    out: dict[int, dict[str, Any]] = {}
+    for key, assignment in state.setdefault("port_assignments", {}).items():
+        if key == owner_key:
+            continue
+        with contextlib.suppress(TypeError, ValueError):
+            out[int(assignment["port"])] = assignment
+    return out
+
+
+def assignment_owner_text(assignment: dict[str, Any]) -> str:
+    return f"server '{assignment.get('name')}' of {assignment.get('project')}"
+
+
+def record_port_assignment(
+    state: dict[str, Any],
+    *,
+    agent: str,
+    project: str,
+    name: str,
+    port: int,
+    source: str,
+) -> dict[str, Any]:
+    """Create or move the durable assignment for (project, name). Idempotent
+    per key; landing on a different port (an explicit caller choice) re-pins."""
+    project = canonical_project(project)
+    key = server_key(project, name)
+    assignments = state.setdefault("port_assignments", {})
+    existing = assignments.get(key)
+    if existing and int(existing.get("port") or 0) == int(port):
+        existing["updated_at"] = iso_timestamp()
+        return existing
+    assignment = {
+        "key": key,
+        "project": project,
+        "name": name,
+        "port": int(port),
+        "agent": agent,
+        "source": source,
+        "created_at": existing.get("created_at") if existing else iso_timestamp(),
+        "updated_at": iso_timestamp(),
+    }
+    assignments[key] = assignment
+    record_event(state, "port.assigned", assignment)
+    return assignment
+
+
+def assign_port(
+    state: dict[str, Any],
+    *,
+    agent: str,
+    project: str,
+    name: str,
+    port: int,
+    force: bool = False,
+) -> dict[str, Any]:
+    agent = str(agent or "").strip()
+    if not agent:
+        raise ValueError("port assign requires --agent so the coordinator can attribute the action")
+    if not str(project or "").strip():
+        raise ValueError("port assign requires --project with the canonical repo path")
+    if not str(name or "").strip():
+        raise ValueError("port assign requires --name of the server the port belongs to")
+    port = int(port)
+    if port < 1 or port > 65535:
+        raise ValueError(f"port {port} is outside 1-65535")
+    project = canonical_project(project)
+    key = server_key(project, name)
+    foreign = foreign_assigned_ports(state, owner_key=key)
+    if port in foreign:
+        raise RuntimeError(
+            f"port {port} is durably assigned to {assignment_owner_text(foreign[port])}; unassign it first"
+        )
+    if not force:
+        for lease in state["leases"].values():
+            if lease.get("status") != "active" or int(lease.get("port") or 0) != port:
+                continue
+            lease_project = canonical_project(str(lease.get("project"))) if lease.get("project") else None
+            if lease_project != project:
+                raise RuntimeError(
+                    f"port {port} already has an active lease for {lease.get('project') or 'unknown project'}"
+                )
+    return record_port_assignment(state, agent=agent, project=project, name=name, port=port, source="port_assign")
+
+
+def unassign_port(
+    state: dict[str, Any],
+    *,
+    agent: str,
+    project: str | None = None,
+    name: str | None = None,
+    port: int | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    agent = str(agent or "").strip()
+    if not agent:
+        raise ValueError("port unassign requires --agent so the coordinator can attribute the action")
+    if name is not None and not str(project or "").strip():
+        raise ValueError("port unassign by --name requires --project naming the owning repo")
+    if name is None and port is None:
+        raise ValueError("port unassign requires --name or --port")
+    resolved = canonical_project(project) if project else None
+    assignments = state.setdefault("port_assignments", {})
+    for key, assignment in list(assignments.items()):
+        if name is not None:
+            if assignment.get("name") != name or assignment.get("project") != resolved:
+                continue
+        else:
+            if int(assignment.get("port") or 0) != int(port):
+                continue
+            if assignment.get("project") != resolved and not force:
+                # A moved/renamed repo can orphan an assignment whose canonical
+                # project no longer matches any caller; --force is the cleanup.
+                raise RuntimeError(
+                    f"port {port} is durably assigned to {assignment_owner_text(assignment)}; "
+                    "pass --force to remove another project's assignment"
+                )
+        assignments.pop(key, None)
+        removed = {**assignment, "status": "unassigned", "unassigned_at": iso_timestamp(), "unassigned_by": agent}
+        record_event(state, "port.unassigned", removed)
+        return removed
+    raise KeyError("matching port assignment not found")
+
+
+def list_port_assignments(state: dict[str, Any], *, project: str | None = None) -> list[dict[str, Any]]:
+    resolved = canonical_project(project) if project else None
+    out = [
+        dict(assignment)
+        for assignment in state.setdefault("port_assignments", {}).values()
+        if not resolved or assignment.get("project") == resolved
+    ]
+    out.sort(key=lambda item: int(item.get("port") or 0))
+    return out
+
+
+def seed_port_assignments(state: dict[str, Any]) -> None:
+    """Migration for pre-assignment state files: pin each server record to its
+    recorded port. On a contested port, running servers win; among stopped
+    records the most recently stopped wins. Losers stay unpinned and get a
+    fresh pinned port on their next start."""
+    servers = [
+        server
+        for server in state.get("servers", {}).values()
+        if isinstance(server, dict) and server.get("port") and server.get("name") and server.get("key")
+    ]
+
+    def rank(server: dict[str, Any]) -> tuple[int, float]:
+        stopped = 1 if server.get("status") == "stopped" else 0
+        try:
+            ts = float(server.get("stopped_ts") or server.get("created_ts") or 0)
+        except (TypeError, ValueError):
+            # A malformed timestamp in a legacy record must degrade its rank,
+            # never brick read_state (which every command depends on).
+            ts = 0.0
+        return (stopped, -ts)
+
+    servers.sort(key=rank)
+    assignments = state.setdefault("port_assignments", {})
+    claimed = {int(a.get("port") or 0) for a in assignments.values()}
+    for server in servers:
+        key = str(server["key"])
+        try:
+            port = int(server["port"])
+        except (TypeError, ValueError):
+            continue
+        if key in assignments or port in claimed:
+            continue
+        assignments[key] = {
+            "key": key,
+            "project": str(server.get("project") or key.rsplit("::", 1)[0]),
+            "name": str(server["name"]),
+            "port": port,
+            "agent": str(server.get("agent") or "coordinator"),
+            "source": "seed_existing_servers",
+            "created_at": iso_timestamp(),
+            "updated_at": iso_timestamp(),
+        }
+        claimed.add(port)
 
 
 def git_value(project: str, *args: str) -> str | None:
@@ -906,6 +1164,63 @@ def resource_project_identity(project: str | None, fallback_name: str | None = N
     }
 
 
+def known_project_paths(
+    state: dict[str, Any] | None,
+    containers: list[dict[str, Any]] | None = None,
+    extra: list[str] | None = None,
+) -> set[str]:
+    """Repo paths eligible to claim unattributed resources by name.
+
+    State-recorded projects (server records, durable port pins) and `extra`
+    entries are trusted as already canonical; container projects can come from
+    Compose labels pointing inside a repo, so they are canonicalized.
+    """
+    paths: set[str] = set()
+    for value in extra or []:
+        if value:
+            paths.add(str(value))
+    for server in (state or {}).get("servers", {}).values():
+        if server.get("project"):
+            paths.add(str(server["project"]))
+    for assignment in (state or {}).get("port_assignments", {}).values():
+        if assignment.get("project"):
+            paths.add(str(assignment["project"]))
+    for container in containers or []:
+        if container.get("project"):
+            paths.add(canonical_project(str(container["project"])))
+    return paths
+
+
+def container_project_attribution(container: dict[str, Any], known_projects: set[str]) -> dict[str, Any]:
+    """Single authority for which project group a Docker container belongs to.
+
+    Display grouping (`build_project_usage`) and whole-project actions
+    (`build_project_runtime_spec` via `matching_project_containers`) both
+    resolve container membership here, so the group a UI shows a container
+    under is exactly the group whose project start/stop/restart acts on it.
+
+    Explicit attribution (Compose labels or coordinator sidecar metadata)
+    always wins. An unattributed container is claimed by name only when
+    exactly one known project path matches its name key; with zero or several
+    claimants it stays in its own name-keyed group and no project action
+    touches it.
+    """
+    fallback_name = container.get("name") or container.get("image")
+    if container.get("project"):
+        identity = resource_project_identity(str(container["project"]), fallback_name)
+        identity["attribution"] = "explicit"
+        return identity
+    name_key = project_key_from_resource_name(fallback_name)
+    claimants = sorted(path for path in known_projects if project_key_from_path(path) == name_key)
+    if len(claimants) == 1:
+        identity = resource_project_identity(claimants[0], fallback_name)
+        identity["attribution"] = "name_match"
+        return identity
+    identity = resource_project_identity(None, fallback_name)
+    identity["attribution"] = "ambiguous_name" if claimants else "unclaimed"
+    return identity
+
+
 def process_owner_matches_project(pid: int, project: str | None) -> bool:
     if not project:
         return True
@@ -972,15 +1287,23 @@ def build_project_usage(
     servers: list[dict[str, Any]],
     docker: dict[str, Any],
     process_table: dict[int, dict[str, Any]],
+    state: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     projects: dict[str, dict[str, Any]] = {}
     pids_by_project: dict[str, set[int]] = {}
+    containers = docker.get("containers") or []
+    # Same claim set as matching_project_containers: membership shown here is
+    # exactly the membership whole-project actions act on.
+    claimant_paths = known_project_paths(
+        state, containers, extra=[str(s["project"]) for s in servers if s.get("project")]
+    )
 
     def ensure(identity: dict[str, str | None]) -> dict[str, Any]:
         usage_key = str(identity["usage_key"])
         row = projects.setdefault(
             usage_key,
             {
+                "usage_key": usage_key,
                 "project": identity.get("project"),
                 "project_key": identity.get("project_key"),
                 "name": identity.get("name"),
@@ -993,6 +1316,10 @@ def build_project_usage(
                 "process_memory_bytes": 0,
                 "docker_cpu_percent": 0.0,
                 "docker_memory_bytes": 0,
+                # Authoritative membership so UIs can group inventory rows by
+                # repo without re-implementing the identity heuristics above.
+                "server_ids": [],
+                "container_names": [],
                 "processes": [],
                 "hot_processes": [],
             },
@@ -1003,6 +1330,8 @@ def build_project_usage(
         identity = resource_project_identity(server.get("project"), server.get("name"))
         row = ensure(identity)
         row["server_count"] += 1
+        if server.get("id"):
+            row["server_ids"].append(str(server["id"]))
         usage = server.get("process_usage") or {}
         for pid in usage.get("pids") or []:
             with contextlib.suppress(TypeError, ValueError):
@@ -1021,10 +1350,12 @@ def build_project_usage(
         row["processes"] = summary["processes"]
         row["hot_processes"] = summary["hot_processes"]
 
-    for container in docker.get("containers") or []:
-        identity = resource_project_identity(container.get("project"), container.get("name"))
+    for container in containers:
+        identity = container_project_attribution(container, claimant_paths)
         row = ensure(identity)
         row["container_count"] += 1
+        if container.get("name"):
+            row["container_names"].append(str(container["name"]))
         stats = container.get("stats") or {}
         if stats.get("live") is False:
             continue
@@ -1137,7 +1468,15 @@ def http_health(url: str, timeout: float = 2.0) -> dict[str, Any]:
         raw.settimeout(max(deadline - time.monotonic(), 0.1))
         sock = raw
         if parsed.scheme == "https":
-            context = ssl.create_default_context()
+            # Health probes are liveness checks, not security boundaries. For
+            # loopback targets, skip certificate verification: a TLS edge on
+            # 127.0.0.1 typically serves a cert for a public hostname (e.g. a
+            # *.example wildcard) that can never validate against the loopback
+            # address, and the probe never leaves the machine.
+            if parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+                context = ssl._create_unverified_context()
+            else:
+                context = ssl.create_default_context()
             sock = context.wrap_socket(raw, server_hostname=parsed.hostname)
             sock.settimeout(max(deadline - time.monotonic(), 0.1))
         request = (
@@ -1739,17 +2078,25 @@ def normalize_health_check(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def matching_project_containers(project: str, containers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    key = project_key_from_path(project)
-    matches = []
-    for container in containers:
-        container_project = container.get("project")
-        if container_project and canonical_project(str(container_project)) == project:
-            matches.append(container)
-            continue
-        if project_key_from_resource_name(container.get("name") or container.get("image")) == key:
-            matches.append(container)
-    return matches
+def matching_project_containers(
+    project: str,
+    containers: list[dict[str, Any]],
+    *,
+    state: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Containers whose unified attribution resolves to this project.
+
+    The target project joins the claim set so `project start` on a repo the
+    coordinator has never tracked can still adopt its obviously-named
+    containers; every other rule is container_project_attribution's.
+    """
+    resolved = canonical_project(project)
+    claimant_paths = known_project_paths(state, containers, extra=[resolved])
+    return [
+        container
+        for container in containers
+        if container_project_attribution(container, claimant_paths).get("project") == resolved
+    ]
 
 
 def build_project_runtime_spec(
@@ -1849,7 +2196,7 @@ def build_project_runtime_spec(
             docker_dependencies.append(normalize_docker_dependency(item))
 
     known_containers = {item.get("container") or item.get("name") for item in docker_dependencies}
-    for container in matching_project_containers(resolved_project, docker.get("containers", [])):
+    for container in matching_project_containers(resolved_project, docker.get("containers", []), state=state):
         name = container.get("name")
         if name and name not in known_containers:
             docker_dependencies.append(
@@ -2141,7 +2488,11 @@ def start_runtime_server(state: dict[str, Any], server_def: dict[str, Any], opti
     if server_def.get("missing_fixed_port") and not options.get("allow_port_change"):
         raise RuntimeError(f"project server {server_def['name']} has no fixed port declaration")
     server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
-    fixed_port = server_def.get("port") or (existing or {}).get("port")
+    _, runtime_assignment = find_port_assignment(state, project=server_def["project"], name=server_def["name"])
+    # Precedence must match restart_server: an explicit runtime declaration
+    # wins, then the durable pin, and only then the (possibly stale) record —
+    # otherwise `project start` silently reverts an explicit `port assign`.
+    fixed_port = server_def.get("port") or (runtime_assignment or {}).get("port") or (existing or {}).get("port")
     if fixed_port is None and not options.get("allow_port_change"):
         raise RuntimeError(f"project server {server_def['name']} has no fixed port; add .codex/dev-runtime.json")
     if fixed_port is not None:
@@ -2280,10 +2631,21 @@ def project_runtime_restart(state: dict[str, Any], options: dict[str, Any]) -> d
         server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
         if existing:
             actions.append(stop_server(state, {"server_id": server_id, "agent": agent, "project": existing["project"], "name": existing["name"], "release_port": True, "reason": "Restarted by project runtime"}))
+    action_errors: list[str] = []
     for dep in spec.get("docker_dependencies", []):
         container_name = dep.get("container") or dep.get("name")
-        actions.append(run_docker(state, ["docker", "restart", container_name], dry_run=dry_run, project=spec["project"], agent=agent, container=container_name))
+        current = docker_dependency_status(dep, spec.get("docker", {}).get("containers", []))
+        if current.get("status") == "missing":
+            # A declared-but-absent container must not abort the restart after
+            # the servers were already stopped; project start reports it.
+            continue
+        try:
+            actions.append(run_docker(state, ["docker", "restart", container_name], dry_run=dry_run, project=spec["project"], agent=agent, container=container_name))
+        except RuntimeError as exc:
+            action_errors.append(f"docker restart {container_name}: {exc}")
     started = project_runtime_start(state, options)
+    if action_errors:
+        started["action_errors"] = action_errors + list(started.get("action_errors") or [])
     started["action"] = "restart"
     started["before"] = before
     started["actions"] = actions + started.get("actions", [])
@@ -2296,6 +2658,10 @@ def project_runtime_stop(state: dict[str, Any], options: dict[str, Any]) -> dict
     before = project_runtime_report(state, spec, action="pre-stop")
     dry_run = bool(options.get("dry_run"))
     actions: list[dict[str, Any]] = []
+    # Like start/restart, stop records sidecar attribution for the containers
+    # it acts on, so display grouping converges to explicit membership after
+    # any whole-project action.
+    actions.extend(ensure_runtime_docker_metadata(state, spec, options))
     for server_def in reversed(spec.get("servers", [])):
         server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
         if existing and existing.get("status") != "stopped":
@@ -2361,6 +2727,20 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
         for lease in state["leases"].values()
         if not resolved_project or (lease.get("project") and canonical_project(str(lease.get("project"))) == resolved_project)
     ]
+    # Durable port assignments, annotated with the owning server's live status
+    # (via the record's identity key — no per-assignment subprocess calls).
+    servers_by_key = {
+        str(server.get("key")): server for server in state["servers"].values() if server.get("key")
+    }
+    port_assignments = []
+    for assignment in state.setdefault("port_assignments", {}).values():
+        if resolved_project and assignment.get("project") != resolved_project:
+            continue
+        entry = dict(assignment)
+        record = servers_by_key.get(str(assignment.get("key")))
+        entry["server_status"] = record.get("status") if record else "unregistered"
+        port_assignments.append(entry)
+    port_assignments.sort(key=lambda item: int(item.get("port") or 0))
     servers = deduplicate_server_records(servers)
     annotate_server_url_currency(servers)
     process_table = annotate_server_process_usage(servers)
@@ -2382,7 +2762,7 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
             continue
         recent_events.append(event)
     docker = docker_ps_inventory(state=state) if include_docker else {"available": None, "containers": [], "postgres": []}
-    project_usage = build_project_usage(servers, docker, process_table)
+    project_usage = build_project_usage(servers, docker, process_table, state)
     return {
         "coordinator_home": str(coordinator_home()),
         "state_path": str(state_path()),
@@ -2390,6 +2770,7 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
         "urls": urls,
         "servers": servers,
         "leases": leases,
+        "port_assignments": port_assignments,
         "recent_events": recent_events[-40:],
         "docker": docker,
         "postgres": docker.get("postgres", []),
@@ -2441,6 +2822,13 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
     server_id, existing = find_server(state, project=project, name=name)
     server_id = server_id or str(uuid.uuid4())
     previous = existing or {}
+    assignment_key_value, _ = find_port_assignment(state, project=project, name=name)
+    foreign = foreign_assigned_ports(state, owner_key=assignment_key_value)
+    if int(port) in foreign:
+        raise RuntimeError(
+            f"port {port} is durably assigned to {assignment_owner_text(foreign[int(port)])}; "
+            "register on another port or unassign it first"
+        )
     reclaim_stale_leases_for_port(
         state,
         project=project,
@@ -2485,8 +2873,12 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
             server_id=server_id,
             owner_pid=int(server["pid"]),
             ttl=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+            assignment_key=assignment_key_value,
         )
         server["lease_id"] = lease["id"]
+    # Registration pins the port even when the server is unhealthy or pid-less:
+    # the record's port is the operator's declared home for this server.
+    record_port_assignment(state, agent=agent, project=project, name=name, port=int(port), source="server_register")
     state["servers"][server_id] = server
     record_event(state, "server.registered", server)
     return server
@@ -2564,22 +2956,73 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
     if existing and server_health(existing).get("ok"):
         existing["status"] = "running"
         existing["health"] = server_health(existing)
+        if existing.get("port"):
+            # Self-heal a MISSING pin only: an idempotent re-start must never
+            # move an existing pin (an explicit re-pin would silently revert)
+            # nor collide with a port pinned to another server.
+            heal_key, heal_pin = find_port_assignment(state, project=project, name=name)
+            heal_port = int(existing["port"])
+            if heal_pin is None and heal_port not in foreign_assigned_ports(state, owner_key=heal_key):
+                record_port_assignment(
+                    state, agent=agent, project=project, name=name, port=heal_port, source="server_start"
+                )
         return existing
     if existing:
         stop_server(state, {"agent": agent, "project": project, "name": name, "release_port": True})
 
     server_id = existing_id or str(uuid.uuid4())
-    lease = lease_port(
-        state,
-        agent=agent,
-        project=project,
-        port_range=options.get("range") or DEFAULT_RANGE,
-        preferred=options.get("preferred"),
-        ttl=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
-        purpose=f"server:{name}",
-        server_id=server_id,
-    )
+    key, assignment = find_port_assignment(state, project=project, name=name)
+    port_range = options.get("range")
+    preferred = options.get("preferred")
+    if assignment and preferred is None:
+        assigned_port = int(assignment["port"])
+        if port_range:
+            # The caller chose a range explicitly: steer to the pinned port when
+            # it fits, otherwise honor the range (a successful lease re-pins).
+            range_start, range_end = parse_range(port_range)
+            if range_start <= assigned_port <= range_end:
+                preferred = assigned_port
+        else:
+            # Default flow: the pinned port is the only acceptable outcome, so a
+            # squatter produces a loud error instead of a silent port change.
+            port_range = f"{assigned_port}-{assigned_port}"
+            preferred = assigned_port
+    elif assignment and preferred is not None and int(preferred) == int(assignment["port"]) and not port_range:
+        # The owner explicitly asked for its own pin without a range: the pin
+        # is the range (it may lie outside DEFAULT_RANGE, which would otherwise
+        # reject the request with a misleading "outside 3000-3999" error).
+        port_range = f"{int(preferred)}-{int(preferred)}"
+    try:
+        lease = lease_port(
+            state,
+            agent=agent,
+            project=project,
+            port_range=port_range or DEFAULT_RANGE,
+            preferred=preferred,
+            ttl=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+            purpose=f"server:{name}",
+            server_id=server_id,
+            assignment_key=key,
+        )
+    except RuntimeError as exc:
+        # Whenever the attempt was pinned to exactly the assigned port —
+        # default flow, restart, or project start all pass a single-port range
+        # — surface the pin instead of the opaque "no free port available".
+        pin_port = int(assignment["port"]) if assignment else None
+        effective_range = port_range or DEFAULT_RANGE
+        if (
+            pin_port is not None
+            and preferred == pin_port
+            and effective_range in (f"{pin_port}-{pin_port}", str(pin_port))
+            and "no free port available" in str(exc)
+        ):
+            raise RuntimeError(
+                f"server '{name}' is pinned to port {pin_port} but it is unavailable ({exc}); "
+                f"free the port, or unassign it to pin a fresh one"
+            ) from exc
+        raise
     port = int(lease["port"])
+    record_port_assignment(state, agent=agent, project=project, name=name, port=port, source="server_start")
     host = options.get("host") or "127.0.0.1"
     command = format_command(options["cmd"], port=port, host=host)
     cwd = str(Path(options.get("cwd") or project).expanduser().resolve())
@@ -2669,7 +3112,8 @@ def restart_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, 
         raise KeyError("matching server not found")
     if not server.get("cmd_template"):
         raise RuntimeError(f"server {server.get('name')} is registered without a command; missing_command=true")
-    fixed_port = int(server["port"])
+    _, assignment = find_port_assignment(state, project=project, name=str(options["name"]))
+    fixed_port = int(assignment["port"]) if assignment else int(server["port"])
     restart_options = {
         "agent": agent,
         "project": server["project"],
@@ -2878,6 +3322,20 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("--lease-id")
     release.add_argument("--port", type=int)
     port_sub.add_parser("list")
+    assign = port_sub.add_parser("assign")
+    assign.add_argument("--agent", required=True)
+    assign.add_argument("--project", required=True)
+    assign.add_argument("--name", required=True)
+    assign.add_argument("--port", type=int, required=True)
+    assign.add_argument("--force", action="store_true")
+    unassign = port_sub.add_parser("unassign")
+    unassign.add_argument("--agent", required=True)
+    unassign.add_argument("--project", required=True)
+    unassign.add_argument("--name")
+    unassign.add_argument("--port", type=int)
+    unassign.add_argument("--force", action="store_true")
+    assignments = port_sub.add_parser("assignments")
+    assignments.add_argument("--project")
 
     server = sub.add_parser("server")
     server_sub = server.add_subparsers(dest="action", required=True)
@@ -2887,7 +3345,9 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--name", required=True)
     start.add_argument("--cwd")
     start.add_argument("--cmd", required=True)
-    start.add_argument("--range", default=DEFAULT_RANGE)
+    # No parser default: start_server must see whether --range was actually
+    # given, because an omitted range pins hard to the durable port assignment.
+    start.add_argument("--range")
     start.add_argument("--preferred", type=int)
     start.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
     start.add_argument("--host", default="127.0.0.1")
@@ -3014,6 +3474,26 @@ def handle_cli(args: argparse.Namespace) -> Any:
             return release_port(state, lease_id=args.lease_id, port=args.port)
         if args.group == "port" and args.action == "list":
             return list(state["leases"].values())
+        if args.group == "port" and args.action == "assign":
+            return assign_port(
+                state,
+                agent=args.agent,
+                project=args.project,
+                name=args.name,
+                port=args.port,
+                force=bool(args.force),
+            )
+        if args.group == "port" and args.action == "unassign":
+            return unassign_port(
+                state,
+                agent=args.agent,
+                project=args.project,
+                name=args.name,
+                port=args.port,
+                force=bool(args.force),
+            )
+        if args.group == "port" and args.action == "assignments":
+            return list_port_assignments(state, project=args.project)
         if args.group == "server" and args.action == "start":
             return start_server(state, namespace_to_options(args))
         if args.group == "server" and args.action == "register":
@@ -3103,6 +3583,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     self._send(200, build_inventory(state))
                 elif self.path == "/v1/ports":
                     self._send(200, list(state["leases"].values()))
+                elif self.path == "/v1/ports/assignments":
+                    self._send(200, list_port_assignments(state))
                 elif self.path == "/v1/servers":
                     self._send(200, list(state["servers"].values()))
                 else:
@@ -3126,6 +3608,24 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     )
                 elif self.path == "/v1/ports/release":
                     result = release_port(state, lease_id=payload.get("lease_id"), port=payload.get("port"))
+                elif self.path == "/v1/ports/assign":
+                    result = assign_port(
+                        state,
+                        agent=payload["agent"],
+                        project=payload["project"],
+                        name=payload["name"],
+                        port=payload["port"],
+                        force=bool(payload.get("force")),
+                    )
+                elif self.path == "/v1/ports/unassign":
+                    result = unassign_port(
+                        state,
+                        agent=payload["agent"],
+                        project=payload.get("project"),
+                        name=payload.get("name"),
+                        port=payload.get("port"),
+                        force=bool(payload.get("force")),
+                    )
                 elif self.path == "/v1/servers/start":
                     result = start_server(state, payload)
                 elif self.path == "/v1/servers/register":
@@ -3194,6 +3694,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
 
 def serve_api(host: str, port: int) -> None:
     server = http.server.ThreadingHTTPServer((host, port), ApiHandler)
+    # Report the actual bound port so `--port 0` (OS-assigned) is usable:
+    # callers treat this stdout line as the readiness signal.
+    port = server.server_address[1]
     print(json.dumps({"host": host, "port": port, "url": f"http://{host}:{port}"}), flush=True)
     try:
         server.serve_forever()
