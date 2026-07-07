@@ -155,6 +155,9 @@ def check_ops_console_interaction_guardrails() -> None:
     models = (ops_console / "Sources" / "DevOpsBoard" / "Models.swift").read_text(encoding="utf-8")
     menu_snapshot = (ops_console / "Tools" / "MenuBarSnapshotMain.swift").read_text(encoding="utf-8")
     split_sizing = (ops_console / "Tools" / "SplitSizingTest.swift").read_text(encoding="utf-8")
+    # Read (and thereby existence-gate) the window snapshot tool too; it is
+    # referenced by Package.swift but not compiled by the swiftc QA step.
+    window_snapshot = (ops_console / "Tools" / "SnapshotMain.swift").read_text(encoding="utf-8")
     coordinator = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "dev_coordinator.py").read_text(encoding="utf-8")
     coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
     coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
@@ -191,7 +194,7 @@ def check_ops_console_interaction_guardrails() -> None:
         "sidebar leaf actions": "SidebarActionButton",
         "safe sidebar footer": "SidebarFooterView",
         "explicit sidebar footer width": "sidebarFooterContentWidth(totalWidth:",
-        "sidebar footer geometry": "GeometryReader { proxy in",
+        "sidebar footer geometry": "sidebarFooterContentWidth(totalWidth: proxy.size.width)",
         "sidebar stop all constrained frame": ".frame(maxWidth: .infinity, minHeight: 30)",
         "sidebar footer icon fixed frame": ".frame(width: 24, height: 24)",
         "server sidebar toggle": "func toggle(_ server",
@@ -202,9 +205,9 @@ def check_ops_console_interaction_guardrails() -> None:
         "resizable table columns": "ResizableHeaderCell",
         "column resize helper": "func resizedColumnWidth(",
         "global column drag": "resizedColumnWidth(start: start, startX: value.startLocation.x, currentX: value.location.x)",
-        "wide column drag target": ".frame(width: 14)",
+        "wide column drag target": ".frame(width: 14)\n                .contentShape(Rectangle())",
         "column resize cursor": "NSCursor.resizeLeftRight.push()",
-        "full-height resource table": "GeometryReader { proxy in",
+        "full-height resource table": "let tableWidth = max(totalWidth, proxy.size.width)",
         "full-size tab body": ".frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)",
         "details-only right rail": "DetailsRailView",
         "server logs sheet": "ServerLogsSheet",
@@ -222,6 +225,8 @@ def check_ops_console_interaction_guardrails() -> None:
         "docker telemetry sparkline": "MetricSparkCell",
         "docker telemetry panel": "DockerTelemetryPanel",
         "visibility gated auto refresh": "func setSurfaceVisible(",
+        "window visibility drives refresh gating": "store.setSurfaceVisible(.window, visible)",
+        "popover visibility drives refresh gating": "store?.setSurfaceVisible(.popover, true)",
         "auto refresh interval": "static let autoRefreshInterval",
         "auto refresh pauses when hidden": "autoRefreshTask?.cancel()",
         "window occlusion tracking": "windowDidChangeOcclusionState",
@@ -315,6 +320,7 @@ def check_ops_console_interaction_guardrails() -> None:
         "inventory duplicate URL self-test": "inventory URLs should not duplicate stale logical servers",
         "skill logical server inventory contract": "Inventory must show one current row per logical server identity",
         "swift managed server dedupe": "func deduplicatedManagedServers(",
+        "inventory servers deduplicated at load": "decoded.servers = deduplicatedManagedServers(decoded.servers)",
         "swift xfoilfoam duplicate regression": "project tree should not show duplicate api server rows",
         "coordinator process table": "def read_process_table(",
         "coordinator process tree usage": "def annotate_server_process_usage(",
@@ -337,7 +343,7 @@ def check_ops_console_interaction_guardrails() -> None:
         "hanging health self-test": "hanging HTTP health checks should be bounded",
         "project resource skill contract": "per-server process CPU/RSS",
     }
-    haystacks = "\n".join([source_text, views, store, models, menu_snapshot, split_sizing, coordinator, coordinator_self_test, coordinator_skill])
+    haystacks = "\n".join([source_text, views, store, models, menu_snapshot, split_sizing, window_snapshot, coordinator, coordinator_self_test, coordinator_skill])
     missing = [label for label, needle in required.items() if needle not in haystacks]
     if missing:
         raise SystemExit("DevOpsBoard interaction guardrail failed: " + ", ".join(missing))
@@ -417,7 +423,12 @@ def check_devops_console() -> None:
     src_files = sorted((console / "src").rglob("*.mjs")) + sorted((console / "bin").glob("*.mjs"))
     source_text = "\n".join(path.read_text(encoding="utf-8") for path in src_files)
     app_js = (console / "src" / "ui" / "app.js").read_text(encoding="utf-8")
+    app_css = (console / "src" / "ui" / "app.css").read_text(encoding="utf-8")
     index_html = (console / "src" / "ui" / "index.html").read_text(encoding="utf-8")
+    # The CI-critical TLS fixture generator lives under test/, which is
+    # otherwise outside the needle haystack; read it explicitly so both its
+    # deletion and its generation contract are gated.
+    dev_cert_helper = (console / "test" / "helpers" / "dev-cert.mjs").read_text(encoding="utf-8")
     package_json = json.loads((console / "package.json").read_text(encoding="utf-8"))
 
     required = {
@@ -428,27 +439,34 @@ def check_devops_console() -> None:
         "oidc nonce enforcement": "id_token nonce mismatch",
         "oidc verified-email enforcement": "payload.email_verified !== true",
         "csrf origin check on mutations": "mutating && !guard.checkOrigin(req)",
-        "no slug enumeration for anonymous users": "route names cannot be enumerated",
+        # Pin the guarding CODE, not its comment: inverting this line makes
+        # unknown slugs enumerable while the comment would survive.
+        "no slug enumeration for anonymous users": "const needAuth = !route || route.auth !== 'public';",
         "segmented-control overlap allowance annotated": "data-ui-allow-overlap",
         "coordinator caches invalidated on mutations": "if (isMutation(method, apiPath)) invalidateCaches();",
         "metrics ring buffer bounded": "points.splice(0, points.length - maxPoints)",
+        "metrics project series keyed by unique usage_key": "row?.usage_key ?? row?.project_key",
         "port release requires explicit lease id": "requireString(body.lease_id, 'lease_id')",
         "pinned ports card rendered from inventory": "function buildAssignments(",
+        "pinned ports card wired into render loop": "setSection('assignments-body'",
         "pin removal confirmed in UI": "Unassign port ${a.port} from server",
         "whole-project runtime control endpoint": "'/api/projects/action'",
         "ui prefs persisted server-side": "ui-prefs.json",
         "hidden items auto-reveal when running": "async function autoUnhide(",
+        "hidden items auto-reveal wired into overview refresh": "autoUnhide(data);",
         "project grouping uses coordinator membership": "function projectGroupsOf(",
         "hamburger nav aria wiring": 'aria-controls="site-nav"',
         "charts built without innerHTML": "document.createElementNS(SVG_NS",
+        "fast close clears drain timers": "clearTimeout(killTimer)",
+        "test TLS fixture generated on demand": "execFileSync('openssl', [",
     }
-    haystack = "\n".join([source_text, app_js, index_html])
+    haystack = "\n".join([source_text, app_js, app_css, index_html, dev_cert_helper])
     missing = [label for label, needle in required.items() if needle not in haystack]
     if missing:
         raise SystemExit("DevOpsConsole guardrail failed: " + ", ".join(missing))
 
     for banned in ("TODO", "FIXME", "wired later"):
-        if banned in source_text or banned in app_js:
+        if banned in source_text or banned in app_js or banned in app_css or banned in index_html:
             raise SystemExit(f"DevOpsConsole guardrail found prohibited marker: {banned}")
 
     if package_json.get("dependencies") or package_json.get("devDependencies"):

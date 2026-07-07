@@ -124,6 +124,27 @@ describe('metrics store: ingest', () => {
     assert.ok(keys.includes('srv:srv-1'));
   });
 
+  it('keys project series by unique usage_key so same-named repos never merge histories', () => {
+    const store = makeStore();
+    // Two repos both named "app": identical display project_key, distinct
+    // usage_key identities. Keying by project_key merged their charts (the
+    // confirmed 2026-07-07 collision bug); usage_key must keep them apart.
+    store.ingest({
+      servers: [],
+      docker: { available: false, containers: [] },
+      project_usage: [
+        { usage_key: 'path:/home/u/work/app', project_key: 'app', project: '/home/u/work/app', name: 'app', cpu_percent: 10, memory_bytes: 100 },
+        { usage_key: 'path:/home/u/tmp/app', project_key: 'app', project: '/home/u/tmp/app', name: 'app', cpu_percent: 20, memory_bytes: 200 },
+      ],
+    }, { at: 1_000_000 });
+
+    const keys = store.history().entities.map((e) => e.key).sort();
+    assert.deepEqual(keys, ['proj:path:/home/u/tmp/app', 'proj:path:/home/u/work/app'],
+      'each usage_key gets its own history series');
+    const work = store.history().entities.find((e) => e.key === 'proj:path:/home/u/work/app');
+    assert.deepEqual(work.points, [[1_000_000, 10, 100]], 'series must not merge same-named projects');
+  });
+
   it('ignores malformed payloads without throwing', () => {
     const store = makeStore();
     store.ingest(null);
