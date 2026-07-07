@@ -479,6 +479,14 @@ def check_devops_console() -> None:
         # on live metrics, or every poll reshuffles the page under the user.
         "stable project-group comparator": "function projectGroupOrder(",
         "project groups sorted through the stable comparator": "groups.sort(projectGroupOrder)",
+        # Single-row header: no status sentence, one needs-attention badge
+        # whose popover carries facts, instructions and actions per problem.
+        "header problems collector": "function headerProblems(",
+        "header alert badge wired": "'data-fk': 'hdr-alert'",
+        # Projects tree: identical Start/Restart/Stop slots on every row so
+        # action buttons align into columns; colors carry meaning.
+        "uniform tree action slots": "function treeActionSlots(",
+        "action color code map": "const ACTION_CLS = { start: 'act-start', restart: 'act-restart', stop: 'act-stop' };",
     }
     haystack = "\n".join([source_text, app_js, app_css, index_html, dev_cert_helper])
     missing = [label for label, needle in required.items() if needle not in haystack]

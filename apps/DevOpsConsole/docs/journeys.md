@@ -61,36 +61,43 @@ Prioritized: top rows are the most frequent and most important.
   or reboot.
 - Preconditions: valid allowlisted session (the page never renders without
   one; an expired session reloads into Google login).
-- Entry point: `https://console.vr.ae/` — the sticky status summary bar,
+- Entry point: `https://console.vr.ae/` — the single-row sticky header,
   present on every page.
-- Route/screen sequence: hash-routed pages (`#/servers` default, `#/routes`,
-  `#/docker`, `#/ports`, `#/performance`) behind one sticky header (summary
-  bar + section nav with live counts; hamburger drawer on phones); summary
-  bar → whichever page the summary implicates.
+- Route/screen sequence: hash-routed pages (`#/projects` default,
+  `#/servers`, `#/routes`, `#/docker`, `#/ports`, `#/performance`) behind
+  one sticky single-row header (brand + section nav with live counts +
+  needs-attention badge + account; nav collapses into a hamburger drawer on
+  narrow screens while the header stays one row); the badge popover →
+  whichever page a problem implicates.
 - Primary decisions: *act now, drill in, or close the tab*; if acting —
   *which section and which row*.
-- Required information per step: one plain-language summary sentence
-  (coordinator health, servers running/total, route count + public count,
-  containers up, TLS runway); per-section counts; per-row status colors with
-  text labels.
-- Warning/flag conditions: coordinator unreachable (degrades servers /
-  docker / leases / usage sections but must NOT blank the page); any server
-  `unhealthy` / `wrong-listener`; any route not resolving; TLS < 14 days
-  (amber) or expired (red); `url_is_current === false` on a server; overview
-  fetch failing (banner + "data is stale as of HH:MM:SS" note).
-- Primary actions: read; click a chip/badge/dot for its detail popover.
-- Secondary/rare actions: retry from the error banner; sign out.
-- Conditional or rare details: coordinator autostart state, last error and
-  last-OK time — only inside the coordinator chip popover; TLS
-  subject/issuer/exact expiry — only inside the TLS chip popover.
-- Interaction targets and feedback: chips, badges and dots are click targets
-  that open popovers (hover restyle + `aria-haspopup`/`aria-expanded`);
-  nothing important is hover-only.
-- Message metadata relevance: "updated HH:MM:SS" is passive metadata — dim,
-  unselectable, never part of the decision sentence.
-- Unresolved UI assumptions: none — single-operator product; the summary
-  sentence wording is implementation-defined as long as it is plain language,
-  not raw counts.
+- Required information per step: a quiet header MEANS healthy — no badge, no
+  noise; when anything needs attention one warning badge appears with the
+  problem count (amber for warnings, red when something is down/expired);
+  clicking it lists every problem with facts, plain-language instructions
+  and direct actions (retry, open the relevant page, copy the fix command);
+  per-section counts; per-row status colors with text labels.
+- Warning/flag conditions surfaced by the badge: coordinator unreachable
+  (red; sections degrade but must NOT blank the page); TLS expired (red),
+  expiring < 14 days or unknown (amber); insecure dev HTTP mode; any server
+  `unhealthy` / `wrong-listener`; any route not resolving; Docker daemon
+  unavailable; overview fetch failing ("live data is stale" + refresh
+  action, plus the error banner).
+- Primary actions: read the (absent) badge; click it for per-problem detail
+  popover with actions; click a row badge/dot for its detail popover.
+- Secondary/rare actions: retry from the error banner; sign out via the
+  account button's popover.
+- Conditional or rare details: coordinator URL, last error and last-OK time —
+  only inside the badge popover's coordinator block; TLS subject/issuer/
+  exact expiry and the manual renew command — only inside its TLS block.
+- Interaction targets and feedback: the badge, account button, row badges
+  and dots are click targets that open popovers (hover restyle +
+  `aria-haspopup`/`aria-expanded`); nothing important is hover-only.
+- Message metadata relevance: "last update HH:MM:SS" appears only inside the
+  stale-data problem block — dim, passive, never in the header itself.
+- Unresolved UI assumptions: none — single-operator product; problem titles
+  are implementation-defined as long as they are plain language with a
+  stated action.
 - Empty/loading/error/permission states: first paint shows skeleton rows in
   every section; failed first load replaces skeletons with a one-line error
   and the banner's Retry; 401 anywhere reloads into login.
@@ -489,11 +496,11 @@ Prioritized: top rows are the most frequent and most important.
 
 | Journey | Surface | Item | Relevance | Why it matters | Condition/frequency | Expected access |
 | --- | --- | --- | --- | --- | --- | --- |
-| J1 | Summary bar | Plain-language health sentence | critical-always | The whole triage decision | Always | Inline |
-| J1 | Summary bar | Coordinator ok/degraded chip | critical-always | Gates every mutation | Always | Inline; detail in click popover |
-| J1 | Summary bar | TLS days remaining | primary-frequent | Expiry breaks every host at once | Always; amber <14d | Inline chip; exact dates in popover |
-| J1 | Summary bar | User email + sign out | secondary-occasional | Session sanity | Always visible, rarely used | Inline chip |
-| J1 | Summary bar | "updated HH:MM:SS" | debug | Staleness check | Always | Passive metadata (dim, unselectable) |
+| J1 | Header | Needs-attention badge (count + severity) | critical-always | The whole triage decision: absent = healthy | Only when something is wrong | Inline badge; per-problem facts, instructions and actions in its click popover |
+| J1 | Header badge popover | Coordinator state + retry | critical-when-degraded | Gates every mutation | Only while unreachable | Popover block with Try again |
+| J1 | Header badge popover | TLS expiry + renew command | primary-when-due | Expiry breaks every host at once | Only expired/<14d/unknown | Popover block with copyable command |
+| J1 | Header | Account button (initial) + sign out | secondary-occasional | Session sanity | Always visible, rarely used | Click popover with email + sign out |
+| J1 | Header badge popover | "last update HH:MM:SS" | debug | Staleness check | Only while data is stale | Inside the stale-data block + Refresh now |
 | J2 | Routes form | Slug preview + validity | critical-always (during entry) | Prevents bad submits | While typing | Inline, live |
 | J2 | Routes form | Access mode wording | critical-always | Security-relevant default | Always | Inline on the switch |
 | J2/J4 | Route row | https URL | critical-always | The deliverable | Always | Inline link + hover/focus copy |
@@ -530,7 +537,7 @@ labels, made concrete for this app:
 | icon-meaning | Icon-only controls (copy, delete, dismiss, chevron, warning flag) always pair the icon with `aria-label` **and** `title`; status icons additionally carry visible text ("live/down", "running/stopped", badge words). No bare mystery glyphs. |
 | stable-expansion-width | The popover has a fixed width (`min(360px, 100vw − 24px)`) regardless of content; expanded panels span the full card width so expanding/collapsing never shifts horizontal layout; switching the create-form target kind swaps inputs inside one fixed slot. |
 | hover-copy | URL copy buttons occupy a permanent layout slot and fade in on row hover **and** on any focus within the row (`:focus-within`), so the pointer never chases a moving control; on touch (`hover: none`) they are always visible. Feedback: icon swaps to a check + `aria-live` announcement. |
-| status-summary | The summary bar leads with one plain-language sentence ("All quiet: …" / "Attention — …") that interprets the counts; raw numbers appear as section count pills, never as the only summary. Popovers avoid repeating badge text — they add facts. |
+| status-summary | The header interprets status instead of dumping it: a quiet header means healthy; when anything needs attention exactly one badge appears with the problem count and severity color, and its popover explains every problem in plain language with facts, instructions and a direct action. Raw numbers appear as section count pills, never as the only summary. Popovers avoid repeating badge text — they add facts. |
 | message-metadata | Log lines render a leading timestamp/bracket prefix as dimmed secondary metadata with the message as primary content; UI chrome metadata ("updated 12:00:05", "fetched 12:00:05", "never expires", popover field labels) is dim and `user-select: none` so copying content never drags chrome along. Log text itself stays fully selectable. |
 
 ## UI Handoff Constraints
@@ -558,9 +565,9 @@ header is identical on every page):
 
 | Screen area | Journey | Critical info | Primary actions | Secondary actions | Rare details | Device/context constraints |
 | --- | --- | --- | --- | --- | --- | --- |
-| Projects page (`#/projects`, default) | J8, J7 | Repo tree: per-node running counts, project + item CPU/mem, kind tags; subdomain chip on web-serving containers | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain | Collapse nodes; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap |
-| Sticky summary bar | J1 | Health sentence; coordinator/TLS chips | Open chip popovers | Sign out | Coordinator error text; cert dates | One-line sentence, wraps on phone; sticky top |
-| Section nav | All | Page names, live counts, active page | Switch page | Hamburger open/close (phone) | — | Tabs ≥720px; drawer with ≥40px targets below |
+| Projects page (`#/projects`, default) | J8, J7 | Repo tree: per-node running counts, project + item CPU/mem, kind tags; subdomain chip on web-serving containers | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain. Every row (project header, server, container) renders the SAME three color-coded slots — Start (green) / Restart (blue) / Stop (red), inapplicable ones disabled, never hidden — so buttons align into columns | Collapse nodes; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap |
+| Sticky header (single row) | J1 | Brand; needs-attention badge (only when something is wrong); account button | Open badge popover (facts, instructions, actions per problem) | Sign out via account popover | Coordinator error text; cert dates; renew command | ONE row on every viewport; domain label hidden <480px; sticky top |
+| Section nav | All | Page names, live counts, active page | Switch page | Hamburger open/close (≤1023px) | — | Tabs inline in the header row ≥1024px; drawer with ≥40px targets below |
 | Servers page (`#/servers`, default) | J2, J3, J7 | Health badge, name, port, subdomain, CPU/mem numbers; docker-hosted web servers as first-class rows (kind tag, container status, published host ports) | Expand; restart; refresh logs; assign/edit subdomain (containers too, with a port picker when several are published); open history charts | Stop; start (stopped containers) | pid/cmd/cwd/health detail; container image/ports detail | Log box height-capped, own scrollbar; sparkline fixed-width |
 | Routes page (`#/routes`) | J2, J4 | URL, resolved dot, access mode; targets: fixed port, managed server, docker container | Create; copy; toggle access | Delete; title; "view server" link | Timestamps | Form stacks at 390px; table rows become labelled cards |
 | Docker page (`#/docker`) | J5, J7 | Status, name, image, ports, CPU/mem numbers; subdomain chip on web-serving containers | Logs; restart; start; open history charts; assign/edit subdomain | Stop | stats/labels | Same card pattern |

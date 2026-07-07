@@ -401,10 +401,23 @@ check), GET/HEAD only.
 
 Vanilla JS control panel split into hash-routed pages (`#/projects` default,
 `#/servers`, `#/routes`, `#/docker`, `#/ports`, `#/performance`);
-unknown/empty hashes fall back to Projects. One sticky header on every page: status summary bar
-(coordinator health, counts, TLS cert expiry, user chip + logout) + a section
-nav — tabs with live counts on desktop, a hamburger-toggled drawer
-(`aria-controls`/`aria-expanded`, Escape/outside-tap closes) on ≤719px.
+unknown/empty hashes fall back to Projects. One sticky SINGLE-ROW header on
+every page and viewport: brand + section nav (tabs with live counts inline
+≥1024px; a hamburger-toggled drawer dropping below the row on narrower
+screens — `aria-controls`/`aria-expanded`, Escape/outside-tap closes) + a
+needs-attention badge + a compact account button (popover: email, sign out).
+There is NO status sentence and there are no always-on chips: a quiet header
+means healthy. `headerProblems()` collects everything wrong — coordinator
+unreachable (red), TLS expired (red) / expiring <14d / unknown (amber),
+insecure dev HTTP mode, unhealthy servers, routes not resolving, Docker
+daemon down, stale live data — and the badge shows the count in the worst
+severity's color; its popover explains each problem with facts, an
+instruction, and a direct action (Try again / Open page / copyable
+`sudo certbot renew` / Refresh now). Action buttons console-wide are
+color-coded — Start green, Restart blue, Stop red (disabled drops to
+neutral) — and every Projects-tree row renders the same three fixed-width
+slots via `treeActionSlots` (inapplicable actions disabled, never hidden) so
+buttons align into columns across project headers, servers and containers.
 Fetches `/api/overview` every 6s and `/api/metrics/history` every 10s (both
 paused when `document.hidden`; the performance page requests a longer
 window), optimistic updates on mutations then refetch.

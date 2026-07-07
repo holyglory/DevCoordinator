@@ -142,12 +142,14 @@ a { color: var(--accent); }
 .tb-inner {
   max-width: 1440px;
   margin: 0 auto;
-  padding: 10px 20px;
+  padding: 0 20px;
   display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 12px;
+  flex-wrap: nowrap; /* the header is ONE row on every viewport */
+  min-height: 48px;
 }
+.tb-inner > .brand, .tb-inner > .nav-toggle, .tb-inner > .hdr-side { align-self: center; }
 
 .brand {
   display: inline-flex;
@@ -180,10 +182,10 @@ a { color: var(--accent); }
 .nav-toggle[aria-expanded="true"] { background: var(--bg3); color: var(--text); border-color: var(--accent); }
 
 .site-nav {
-  max-width: 1440px;
-  margin: 0 auto;
-  padding: 0 20px;
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
+  align-items: stretch;
   gap: 2px;
   overflow-x: auto;
   scrollbar-width: none;
@@ -192,7 +194,7 @@ a { color: var(--accent); }
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 7px 12px 9px;
+  padding: 0 12px;
   color: var(--muted);
   text-decoration: none;
   font-size: 13px;
@@ -213,37 +215,65 @@ a { color: var(--accent); }
   user-select: none;
 }
 
-.summary-line {
-  margin: 0;
-  flex: 1 1 340px;
-  min-width: 0;
-  color: var(--muted);
-  font-size: 13px;
-}
-.summary-line.attention { color: var(--warn); }
+/* Right header cluster: a warning badge only when something needs
+   attention, plus the compact account button. */
+.hdr-side { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; flex: none; }
 
-.chips { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-
-.chip {
+.hdr-alert {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  border: 1px solid var(--line2);
-  background: var(--bg2);
-  color: var(--muted);
+  gap: 5px;
+  padding: 4px 10px;
   border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 12px;
+  border: 1px solid;
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
   white-space: nowrap;
 }
-button.chip { cursor: pointer; font: inherit; font-size: 12px; }
-button.chip:hover { background: var(--bg3); color: var(--text); }
-.chip .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-.chip.ok { border-color: #2b5c40; }  .chip.ok .dot { background: var(--ok); }
-.chip.warn { border-color: #6d541f; color: var(--warn); } .chip.warn .dot { background: var(--warn); }
-.chip.err { border-color: #6d2b30; color: #ffb3b8; }      .chip.err .dot { background: var(--err); }
-.chip.dim .dot { background: var(--dim); }
-.chip .chip-mail { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+.hdr-alert svg { width: 14px; height: 14px; }
+.hdr-alert.warn { color: var(--warn); border-color: #6d541f; background: rgba(232, 178, 62, .08); }
+.hdr-alert.warn:hover { background: rgba(232, 178, 62, .16); }
+.hdr-alert.err { color: #ffb3b8; border-color: #6d2b30; background: rgba(236, 95, 103, .10); }
+.hdr-alert.err:hover { background: rgba(236, 95, 103, .18); }
+
+.hdr-user {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--line2);
+  background: var(--bg3);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.hdr-user:hover { border-color: var(--accent); }
+
+/* Needs-attention popover: one block per problem, worst first. */
+.alert-pop { min-width: 280px; }
+.prob { border-top: 1px solid var(--line); padding: 8px 0 6px; }
+.prob:first-of-type { border-top: 0; }
+.prob-title { margin: 0 0 4px; font-weight: 700; display: flex; align-items: center; gap: 7px; }
+.prob .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.prob.warn .prob-title { color: var(--warn); } .prob.warn .dot { background: var(--warn); }
+.prob.err .prob-title { color: #ffb3b8; }      .prob.err .dot { background: var(--err); }
+.prob-actions { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.prob-cmd {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--bg3);
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
 
 /* ---------- error banner (inside the sticky header: always visible) ---------- */
 
@@ -510,6 +540,15 @@ select:disabled { color: var(--dim); }
 .pinned-port.pin-moved { border-bottom-color: var(--warn); color: var(--warn); }
 
 .actions { display: inline-flex; gap: 6px; justify-self: end; align-items: center; }
+
+/* Action color codes: green starts, blue restarts, red stops. Disabled
+   buttons drop back to neutral so color always means "available". */
+.btn.act-start:not(:disabled) { color: #66d695; border-color: #2c5b41; }
+.btn.act-start:not(:disabled):hover { background: rgba(63, 201, 124, .13); }
+.btn.act-restart:not(:disabled) { color: #6fb3ff; border-color: #2f4d72; }
+.btn.act-restart:not(:disabled):hover { background: rgba(77, 163, 255, .13); }
+.btn.act-stop:not(:disabled) { color: #ff8d88; border-color: #6b2f2d; }
+.btn.act-stop:not(:disabled):hover { background: rgba(236, 95, 103, .13); }
 
 .route-url {
   font-family: var(--mono);
@@ -809,7 +848,7 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
    fixed widths for everything except the name — so tags, numbers, badges and
    buttons line up in clean columns on every row. */
 .tree-grid {
-  grid-template-columns: 84px minmax(0, 1fr) 190px 118px 248px;
+  grid-template-columns: 84px minmax(0, 1fr) 180px 112px 310px;
   gap: 8px 12px;
   padding: 5px 8px;
 }
@@ -842,6 +881,8 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
 /* Right-side columns: numbers right-aligned, actions right-aligned. */
 .tree-grid .usage-cell { justify-self: end; }
 .tree-grid .actions { justify-self: end; }
+/* Same three slots on every tree row: fixed width -> aligned columns. */
+.tree-grid .actions .tree-act { width: 86px; justify-content: center; padding-left: 0; padding-right: 0; }
 
 .tree-children { padding-left: 22px; min-width: 0; }
 .tree-children .inline-note { padding: 4px 10px 6px; margin: 0; }
@@ -862,6 +903,10 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   .tree-grid > .c-kind { flex: 0 0 auto; }
   .tree-grid > .c-primary { flex: 1 1 130px; min-width: 110px; }
   .tree-detail { display: none; }
+  /* Same dense-list treatment as tree-detail: the narrow cell would wrap
+     the chip mid-word. Subdomains stay manageable on the Servers and
+     Docker pages at every width. */
+  .tree-sub { display: none; }
   /* The dense list is self-explanatory — no stacked-card field labels. */
   .tree-grid .cell[data-label]::before { display: none; }
   .tree-grid > .usage-cell { flex: 0 0 auto; justify-self: auto; margin-left: auto; }
@@ -958,17 +1003,26 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   text-align: center;
 }
 
-/* ---------- mobile (≤719px): rows become stacked cards ---------- */
+/* ---------- narrow header (≤1023px): tabs collapse into a drawer ---------- */
 
-@media (max-width: 719px) {
-  .tb-inner { padding: 10px 14px; gap: 8px; }
-  #banner-slot { padding: 0 14px; }
-  #main { padding: 14px 14px 48px; gap: 14px; }
-  .card { padding: 13px 12px 11px; }
-
-  /* Hamburger menu: the tab bar becomes a collapsible drawer in the header. */
+@media (max-width: 1023px) {
+  /* Hamburger menu: the tab bar becomes a drawer dropping below the header
+     row, so the header itself stays a single row. */
   .nav-toggle { display: inline-flex; }
-  .site-nav { display: none; flex-direction: column; gap: 2px; padding: 6px 10px 10px; border-top: 1px solid var(--line); }
+  .site-nav {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--line);
+    box-shadow: var(--shadow);
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 10px 10px;
+    overflow: visible;
+  }
   .site-nav.open { display: flex; }
   .site-nav a {
     padding: 11px 10px;
@@ -978,6 +1032,20 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
     border-radius: 6px;
   }
   .site-nav a[aria-current="page"] { border-left-color: var(--accent); background: var(--bg3); }
+}
+
+@media (max-width: 479px) {
+  /* Keep the single header row even on the smallest phones. */
+  .brand-domain { display: none; }
+}
+
+/* ---------- mobile (≤719px): rows become stacked cards ---------- */
+
+@media (max-width: 719px) {
+  .tb-inner { padding: 10px 14px; gap: 8px; }
+  #banner-slot { padding: 0 14px; }
+  #main { padding: 14px 14px 48px; gap: 14px; }
+  .card { padding: 13px 12px 11px; }
 
   .grid-head { display: none; }
 

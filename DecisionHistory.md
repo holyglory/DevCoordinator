@@ -1,5 +1,39 @@
 # Decision History
 
+## 2026-07-07 - DevOps Console: single-row header with a needs-attention badge; uniform color-coded actions (v1.5.1)
+
+Decision: Two user requests shipped together. (1) Projects page action
+alignment: project-header rows rendered Start/Restart/Stop while item rows
+rendered Stop/Restart (or a lone Start), so right-aligned buttons landed in
+mismatched columns. Every tree row now renders the SAME three fixed-width
+(86px) slots through one `treeActionSlots` builder — Start | Restart | Stop,
+inapplicable actions disabled with a title, never hidden — so buttons align
+into exact columns (playwright-verified: one left-X per label on desktop and
+phone). Actions are color-coded console-wide via `ACTION_CLS` — Start green,
+Restart blue, Stop red, disabled drops to neutral so color always means
+"available" — and the Servers/Docker pages adopted the same Restart-before-
+Stop order. (2) Header reimagined: the status sentence and always-on
+coordinator/TLS/dev-http chips are gone; the header is brand + inline nav
+tabs (≥1024px; hamburger drawer that DROPS BELOW the row on narrower
+screens) + a needs-attention badge + a compact account button (avatar
+initial → popover with email + sign out) — ONE row on every viewport
+(48px desktop, 54px phone, domain label hidden <480px; playwright-verified
+one-row geometry + zero horizontal scroll). A quiet header means healthy:
+`headerProblems()` collects coordinator-unreachable (red), TLS
+expired/expiring<14d/unknown, insecure dev HTTP, unhealthy servers,
+unresolving routes, docker down, and stale live data; the badge shows the
+count in the worst severity color and its popover gives each problem facts,
+a plain-language instruction and a direct action (Try again / Open page /
+copyable `sudo certbot renew` / Refresh now). The stale-data path was
+exercised end-to-end in a real browser (network cut → amber badge "1" →
+popover names the problem with Refresh action → badge clears on recovery).
+journeys.md J1, the information-relevance rows and the status-summary
+interpretation were rewritten for badge semantics; validate.py pins
+headerProblems/hdr-alert/treeActionSlots/ACTION_CLS. Residual: on the narrow
+(<1100px) tree layout the container subdomain chip is hidden like
+tree-detail (the tight cell wrapped it mid-word); subdomains remain fully
+manageable on the Servers and Docker pages at every width.
+
 ## 2026-07-07 - DevOps Console: stable ordering contract — live metrics are never a sort key (v1.4.1)
 
 Decision: User-reported incident, handled prevention-first. Symptom: project

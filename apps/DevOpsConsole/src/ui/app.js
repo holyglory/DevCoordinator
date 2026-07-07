@@ -836,7 +836,7 @@
       state.stale = true;
       showBanner(err.message, () => refreshOverview({ force: true }), 'overview');
       if (!state.overview) renderFirstLoadError();
-      else renderSummary();
+      else renderHeader();
     } finally {
       fetching = false;
       if (refetchQueued) {
@@ -890,7 +890,7 @@
       popover.pending = false;
       popover.close();
     }
-    renderSummary();
+    renderHeader();
     updateServerOptions(o);
     updateContainerOptions(o);
 
@@ -994,125 +994,173 @@
     return Math.floor((t - Date.now()) / 86_400_000);
   }
 
-  function summarySentence(o) {
-    const routes = o.routes || [];
-    const pub = routes.filter((r) => r.auth === 'public').length;
-    const inv = o.inventory;
-    const coordOk = !!o.coordinator?.ok && !!inv;
-    const days = tlsDaysLeft(o);
-
-    let tlsPart;
-    if (days === null) tlsPart = o.console?.devInsecureHttp ? 'TLS is off (dev mode)' : 'TLS status is unknown';
-    else if (days < 0) tlsPart = 'the TLS certificate has EXPIRED';
-    else if (days < 14) tlsPart = `the TLS certificate expires in ${days} day${sfx(days)}`;
-    else tlsPart = `TLS is valid for ${days} more days`;
-
-    if (!coordOk) {
-      return `Attention: the coordinator is unreachable, so servers, containers and leases cannot be managed right now — `
-        + `${routes.length} route${sfx(routes.length)} stay${routes.length === 1 ? 's' : ''} configured and ${tlsPart}.`;
-    }
-
-    const servers = inv.servers || [];
-    const running = servers.filter((s) => s.status === 'running').length;
-    const bad = servers.filter((s) => s.status === 'unhealthy' || s.health?.classification === 'wrong-listener').length;
-    const containers = inv.docker?.available ? (inv.docker.containers || []) : [];
-    const up = containers.filter((c) => isContainerRunning(c)).length;
-    const broken = routes.filter((r) => r.resolved && r.resolved.port == null).length;
-
-    const counts = `${running} of ${servers.length} dev server${sfx(servers.length)} running, `
-      + `${routes.length} route${sfx(routes.length)} published (${pub} public), `
-      + `${up} container${sfx(containers.length)} up, and ${tlsPart}`;
-
-    const issues = [];
-    if (bad) issues.push(`${bad} server${sfx(bad)} unhealthy`);
-    if (broken) issues.push(`${broken} route${sfx(broken)} not resolving`);
-    if (days !== null && days < 14) issues.push('TLS renewal is due');
-    if (issues.length) return `Attention — ${issues.join(', ')}: ${counts}.`;
-    return `All quiet: ${counts}.`;
-  }
-
-  function chipButton(key, cls, label, buildPop) {
-    return h('button', {
-      class: `chip ${cls}`, type: 'button',
-      'data-fk': `chip:${key}`,
-      'aria-haspopup': 'dialog',
-      'aria-expanded': popover.key === `chip:${key}` ? 'true' : 'false',
-      title: 'Show details',
-      onclick: (e) => popover.toggle(`chip:${key}`, e.currentTarget, buildPop),
-    }, h('span', { class: 'dot', 'aria-hidden': 'true' }), label);
-  }
-
-  function renderSummary() {
-    const o = state.overview;
-    const line = $('#summary-line');
-    const chips = $('#tb-chips');
-    if (popover.key !== null && String(popover.key).startsWith('chip:')) return;
-
-    if (!o) {
-      line.textContent = 'Loading the latest status…';
-      chips.replaceChildren(userChip());
-      return;
-    }
-
-    $('#brand-domain').textContent = o.console?.domain || '';
-    let text = summarySentence(o);
-    if (state.stale && state.lastFetch) text += ` Live data is stale — last update ${fmtClock(state.lastFetch)}.`;
-    line.textContent = text;
-    line.classList.toggle('attention', text.startsWith('Attention'));
+  // Everything the header should warn about, worst first. Each problem is
+  // { severity: 'err'|'warn', title, body() } — the header stays clean when
+  // this list is empty; otherwise one badge carries the count and its
+  // popover explains every problem with facts, instructions and actions.
+  function headerProblems(o) {
+    const problems = [];
+    if (!o) return problems;
 
     const c = o.coordinator || {};
-    const coordChip = chipButton('coord', c.ok ? 'ok' : 'err', c.ok ? 'Coordinator OK' : 'Coordinator down', () => (
-      h('div', null,
-        popHead('Coordinator'),
-        kv('State', c.ok ? 'reachable' : 'unreachable'),
-        kv('URL', c.url || '—', { mono: true }),
-        kv('Autostarted', c.autostarted ? 'yes' : 'no'),
-        kv('Last OK', fmtWhen(c.lastOkAt)),
-        c.lastError ? kv('Last error', String(c.lastError), { mono: true }) : null,
-        h('p', { class: 'pop-hint' }, c.ok
-          ? 'All server, Docker and lease operations go through this local control engine.'
-          : 'The console keeps retrying automatically. Routes to fixed ports keep working while it is down.'))
-    ));
+    const coordOk = !!c.ok && !!o.inventory;
+    if (!coordOk) {
+      problems.push({
+        severity: 'err',
+        title: 'Coordinator unreachable',
+        body: () => [
+          kv('URL', c.url || '—', { mono: true }),
+          kv('Last OK', fmtWhen(c.lastOkAt)),
+          c.lastError ? kv('Error', String(c.lastError), { mono: true }) : null,
+          h('p', { class: 'pop-hint' }, 'Servers, containers and leases cannot be managed until it answers. The console retries and autostarts it automatically; routes to fixed ports keep working meanwhile.'),
+          h('div', { class: 'prob-actions' },
+            h('button', {
+              class: 'btn small', type: 'button', 'data-fk': 'hdr-coord-retry',
+              onclick: () => refreshOverview({ force: true }),
+            }, icon('refresh'), 'Try again')),
+        ],
+      });
+    }
 
     const days = tlsDaysLeft(o);
     const tls = o.console?.tls;
-    let tlsCls = 'ok';
-    let tlsLabel = days === null ? 'TLS off' : `TLS ${days}d`;
-    if (days === null) tlsCls = 'dim';
-    else if (days < 0) { tlsCls = 'err'; tlsLabel = 'TLS expired'; }
-    else if (days < 14) tlsCls = 'warn';
-    const tlsChip = chipButton('tls', tlsCls, tlsLabel, () => (
-      h('div', null,
-        popHead('TLS certificate'),
-        tls ? [
-          kv('Subject', tls.subject || '—', { mono: true }),
-          kv('Issuer', tls.issuer || '—', { mono: true }),
-          kv('Expires', tls.notAfter ? `${tls.notAfter} (${days} day${sfx(days ?? 0)} left)` : '—'),
-          kv('Loaded', tls.loadedAt ? fmtWhen(tls.loadedAt) : '—'),
-          kv('Self-signed', tls.selfSigned ? 'yes' : 'no'),
-        ] : kv('State', o.console?.devInsecureHttp ? 'disabled (insecure dev HTTP mode)' : 'unknown'),
-        days !== null && days < 14
-          ? h('p', { class: 'pop-hint' }, 'Renew soon: certbot renews via DNS-01 and the console hot-reloads the files.')
-          : null)
-    ));
+    const tlsFacts = () => [
+      tls?.subject ? kv('Subject', tls.subject, { mono: true }) : null,
+      tls?.issuer ? kv('Issuer', tls.issuer, { mono: true }) : null,
+      tls?.notAfter ? kv('Expires', `${tls.notAfter}${days !== null ? ` (${days} day${sfx(days)} left)` : ''}`) : null,
+      h('p', { class: 'pop-hint' }, 'certbot renews via DNS-01 on a timer and the console hot-reloads the files. If this warning persists, renew by hand:'),
+      h('div', { class: 'prob-actions' },
+        h('code', { class: 'prob-cmd' }, 'sudo certbot renew'),
+        h('button', {
+          class: 'btn small', type: 'button', 'data-fk': 'hdr-tls-copy',
+          title: 'Copy the renewal command',
+          onclick: (e) => copyText('sudo certbot renew', e.currentTarget),
+        }, icon('copy'), 'Copy')),
+    ];
+    if (days !== null && days < 0) {
+      problems.push({ severity: 'err', title: 'TLS certificate has EXPIRED', body: tlsFacts });
+    } else if (days !== null && days < 14) {
+      problems.push({ severity: 'warn', title: `TLS certificate expires in ${days} day${sfx(days)}`, body: tlsFacts });
+    } else if (days === null && !o.console?.devInsecureHttp) {
+      problems.push({ severity: 'warn', title: 'TLS status unknown', body: tlsFacts });
+    }
 
-    const devChip = o.console?.devInsecureHttp
-      ? h('span', { class: 'chip warn', title: 'DEV_HTTP=1 — plain HTTP, cookies not Secure' },
-          h('span', { class: 'dot', 'aria-hidden': 'true' }), 'dev http')
+    if (o.console?.devInsecureHttp) {
+      problems.push({
+        severity: 'warn',
+        title: 'Insecure dev HTTP mode',
+        body: () => [h('p', { class: 'pop-hint' }, 'DEV_HTTP=1 — plain HTTP, session cookies are not Secure. Never expose this mode to the internet.')],
+      });
+    }
+
+    if (coordOk) {
+      const bad = (o.inventory.servers || []).filter(
+        (s) => s.status === 'unhealthy' || s.health?.classification === 'wrong-listener',
+      );
+      if (bad.length) {
+        problems.push({
+          severity: 'warn',
+          title: `${bad.length} server${sfx(bad.length)} unhealthy`,
+          body: () => [
+            kv('Servers', bad.map((s) => s.name).join(', '), { mono: true }),
+            h('p', { class: 'pop-hint' }, 'The process is alive but its health check fails — the log usually says why.'),
+            h('div', { class: 'prob-actions' },
+              h('a', { class: 'btn small', href: '#/servers' }, 'Open Servers')),
+          ],
+        });
+      }
+      const broken = (o.routes || []).filter((r) => r.resolved && r.resolved.port == null);
+      if (broken.length) {
+        problems.push({
+          severity: 'warn',
+          title: `${broken.length} route${sfx(broken.length)} not resolving`,
+          body: () => [
+            ...broken.slice(0, 5).map((r) => kv(r.slug, r.resolved?.reason || 'no upstream', { mono: true })),
+            h('p', { class: 'pop-hint' }, 'Visitors get an upstream-unavailable page until the target runs again.'),
+            h('div', { class: 'prob-actions' },
+              h('a', { class: 'btn small', href: '#/routes' }, 'Open Routes')),
+          ],
+        });
+      }
+      const docker = o.inventory.docker;
+      if (docker && docker.available === false) {
+        problems.push({
+          severity: 'warn',
+          title: 'Docker unavailable',
+          body: () => [
+            docker.error ? kv('Error', String(docker.error), { mono: true }) : null,
+            h('p', { class: 'pop-hint' }, 'Containers cannot be listed or controlled until the Docker daemon answers.'),
+          ],
+        });
+      }
+    }
+
+    if (state.stale && state.lastFetch) {
+      problems.push({
+        severity: 'warn',
+        title: 'Live data is stale',
+        body: () => [
+          kv('Last update', fmtClock(state.lastFetch)),
+          h('div', { class: 'prob-actions' },
+            h('button', {
+              class: 'btn small', type: 'button', 'data-fk': 'hdr-stale-retry',
+              onclick: () => refreshOverview({ force: true }),
+            }, icon('refresh'), 'Refresh now')),
+        ],
+      });
+    }
+
+    return problems;
+  }
+
+  function alertPop(problems) {
+    return h('div', { class: 'alert-pop' },
+      popHead('Needs attention'),
+      ...problems.map((p) => h('div', { class: `prob ${p.severity}` },
+        h('p', { class: 'prob-title' }, h('span', { class: 'dot', 'aria-hidden': 'true' }), p.title),
+        ...[p.body()].flat().filter(Boolean))));
+  }
+
+  // One-row header: brand + nav + (warning badge only when something is
+  // wrong) + account. No status sentence, no always-on chips.
+  function renderHeader() {
+    const o = state.overview;
+    const side = $('#hdr-side');
+    // Keep the popover's anchor stable while it is open.
+    if (popover.key !== null && String(popover.key).startsWith('hdr-')) return;
+    if (o) $('#brand-domain').textContent = o.console?.domain || '';
+
+    const problems = headerProblems(o);
+    const worst = problems.some((p) => p.severity === 'err') ? 'err' : 'warn';
+    const alert = problems.length
+      ? h('button', {
+          class: `hdr-alert ${worst}`, type: 'button',
+          'data-fk': 'hdr-alert', 'aria-haspopup': 'dialog',
+          'aria-expanded': popover.key === 'hdr-alert' ? 'true' : 'false',
+          'aria-label': `${problems.length} issue${sfx(problems.length)} need${problems.length === 1 ? 's' : ''} attention — show details and actions`,
+          title: problems.map((p) => p.title).join(' · '),
+          onclick: (e) => popover.toggle('hdr-alert', e.currentTarget, () => alertPop(headerProblems(state.overview))),
+        }, icon('warn'), String(problems.length))
       : null;
-
-    chips.replaceChildren(
-      ...[coordChip, tlsChip, devChip, userChip(),
-        h('span', { class: 'meta-passive' }, state.lastFetch ? `updated ${fmtClock(state.lastFetch)}` : '')].filter(Boolean),
-    );
+    side.replaceChildren(...[alert, userChip()].filter(Boolean));
   }
 
   function userChip() {
-    const email = state.session?.email;
-    return h('span', { class: 'chip dim' },
-      h('span', { class: 'dot', 'aria-hidden': 'true' }),
-      h('span', { class: 'chip-mail', title: email || '' }, email || 'signed in'),
-      h('a', { class: 'btn small', href: '/auth/logout', title: 'Sign out of the console' }, 'Sign out'));
+    const email = state.session?.email || '';
+    return h('button', {
+      class: 'hdr-user', type: 'button',
+      'data-fk': 'hdr-user', 'aria-haspopup': 'dialog',
+      'aria-expanded': popover.key === 'hdr-user' ? 'true' : 'false',
+      'aria-label': `Account ${email || 'signed in'} — show account details and sign out`,
+      title: email || 'Signed in',
+      onclick: (e) => popover.toggle('hdr-user', e.currentTarget, () => (
+        h('div', null,
+          popHead('Account'),
+          kv('Signed in as', email || '—', { mono: true }),
+          h('div', { class: 'prob-actions' },
+            h('a', { class: 'btn small', href: '/auth/logout', title: 'Sign out of the console' }, 'Sign out')))
+      )),
+    }, (email[0] || '?').toUpperCase());
   }
 
   // ---------------------------------------------------------------- shared bits
@@ -1639,7 +1687,7 @@
     }, h('span', { class: 'dot', 'aria-hidden': 'true' }), meta.label);
 
     const act = (action, label, iconName, confirmText) => h('button', {
-      class: `btn small${busy ? ' is-busy' : ''}`, type: 'button',
+      class: `btn small ${ACTION_CLS[action]}${busy ? ' is-busy' : ''}`, type: 'button',
       'data-fk': `srv-dock-${action}:${name}`,
       disabled: busy || undefined,
       title: `${label} container ${name}`,
@@ -1682,8 +1730,8 @@
       h('span', { 'aria-hidden': 'true' }),
       h('span', { class: 'cell actions' },
         running
-          ? [act('stop', 'Stop', 'stop', `Stop container ${name}?\n\nAnything depending on it (like a database) loses its service.`),
-             act('restart', 'Restart', 'refresh')]
+          ? [act('restart', 'Restart', 'refresh'),
+             act('stop', 'Stop', 'stop', `Stop container ${name}?\n\nAnything depending on it (like a database) loses its service.`)]
           : act('start', 'Start', 'play'),
         hiddenRow
           ? unhideButton('docker', name, name)
@@ -1730,15 +1778,7 @@
     const stoppable = ['running', 'starting', 'unhealthy'].includes(s.status);
     const actions = h('span', { class: 'cell actions' },
       h('button', {
-        class: `btn small${busy ? ' is-busy' : ''}`, type: 'button',
-        'data-fk': `srv-stop:${id}`,
-        disabled: (busy || !stoppable) || undefined,
-        title: stoppable ? `Stop ${s.name}` : 'Server is not running',
-        onclick: () => runAction(`server:${id}`,
-          () => api('/api/servers/action', { method: 'POST', body: { id, action: 'stop' } })),
-      }, icon('stop'), busy ? 'Working…' : 'Stop'),
-      h('button', {
-        class: `btn small${busy ? ' is-busy' : ''}`, type: 'button',
+        class: `btn small act-restart${busy ? ' is-busy' : ''}`, type: 'button',
         'data-fk': `srv-restart:${id}`,
         disabled: (busy || s.missing_command) || undefined,
         title: s.missing_command
@@ -1747,6 +1787,14 @@
         onclick: () => runAction(`server:${id}`,
           () => api('/api/servers/action', { method: 'POST', body: { id, action: 'restart' } })),
       }, icon('refresh'), busy ? 'Working…' : 'Restart'),
+      h('button', {
+        class: `btn small act-stop${busy ? ' is-busy' : ''}`, type: 'button',
+        'data-fk': `srv-stop:${id}`,
+        disabled: (busy || !stoppable) || undefined,
+        title: stoppable ? `Stop ${s.name}` : 'Server is not running',
+        onclick: () => runAction(`server:${id}`,
+          () => api('/api/servers/action', { method: 'POST', body: { id, action: 'stop' } })),
+      }, icon('stop'), busy ? 'Working…' : 'Stop'),
       hiddenRow
         ? unhideButton('servers', s.key, s.name || 'server')
         : (s.status === 'stopped' ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot()));
@@ -2234,7 +2282,7 @@
       h('span', { class: 'visually-hidden' }, running ? 'running' : 'stopped'));
 
     const act = (action, label, iconName, confirmText) => h('button', {
-      class: `btn small${busy ? ' is-busy' : ''}`, type: 'button',
+      class: `btn small ${ACTION_CLS[action]}${busy ? ' is-busy' : ''}`, type: 'button',
       'data-fk': `dock-${action}:${name}`,
       disabled: busy || undefined,
       title: `${label} ${name}`,
@@ -2267,8 +2315,8 @@
       h('span', { class: 'cell dim mono', 'data-label': 'Ports' }, c.ports || '—'),
       h('span', { class: 'cell actions' },
         running
-          ? [act('stop', 'Stop', 'stop', `Stop container ${name}?\n\nAnything depending on it (like a database) loses its service.`),
-             act('restart', 'Restart', 'refresh')]
+          ? [act('restart', 'Restart', 'refresh'),
+             act('stop', 'Stop', 'stop', `Stop container ${name}?\n\nAnything depending on it (like a database) loses its service.`)]
           : act('start', 'Start', 'play'),
         h('button', {
           class: 'btn small', type: 'button',
@@ -2564,19 +2612,46 @@
       confirms[action] ? { confirmText: confirms[action] } : undefined);
   }
 
+  // Color code shared by every action button in the console: green starts,
+  // blue restarts, red stops — same meaning on every page.
+  const ACTION_CLS = { start: 'act-start', restart: 'act-restart', stop: 'act-stop' };
+
+  // Every tree actions cell renders the SAME three fixed-width slots
+  // (Start | Restart | Stop); inapplicable actions are disabled, never
+  // hidden, so buttons line up into clean columns across project headers,
+  // server rows and container rows alike.
+  function treeActionSlots(slots) {
+    return ['start', 'restart', 'stop'].map((name) => {
+      const def = slots[name];
+      return h('button', {
+        class: `btn small tree-act ${ACTION_CLS[name]}${def.busy ? ' is-busy' : ''}`, type: 'button',
+        'data-fk': def.fk,
+        disabled: (def.busy || def.disabled) || undefined,
+        title: def.title,
+        onclick: def.onclick,
+      }, icon(def.icon), def.busy ? 'Working…' : def.label);
+    });
+  }
+
   function projectActionButtons(group) {
     const busy = ui.busy.has(`project:${group.key}`);
     const noPath = !group.project;
-    const btn = (action, label, iconName) => h('button', {
-      class: `btn small${busy ? ' is-busy' : ''}`, type: 'button',
-      'data-fk': `proj-${action}:${group.key}`,
-      disabled: (busy || noPath) || undefined,
+    const slot = (action, label, iconName) => ({
+      fk: `proj-${action}:${group.key}`,
+      label,
+      icon: iconName,
+      busy,
+      disabled: noPath,
       title: noPath
         ? 'No repo path known for this group — control its items individually'
         : `${label} the whole project (dependencies first, pinned ports preserved)`,
       onclick: () => projectAction(group, action),
-    }, icon(iconName), busy ? 'Working…' : label);
-    return [btn('start', 'Start', 'play'), btn('restart', 'Restart', 'refresh'), btn('stop', 'Stop', 'stop')];
+    });
+    return treeActionSlots({
+      start: slot('start', 'Start', 'play'),
+      restart: slot('restart', 'Restart', 'refresh'),
+      stop: slot('stop', 'Stop', 'stop'),
+    });
   }
 
   function treeStatusBadge(css, label) {
@@ -2592,14 +2667,16 @@
     const busy = ui.busy.has(`server:${s.id}`);
     const meta = serverStatusMeta(s);
     const stopped = s.status === 'stopped';
-    const act = (action, label, iconName, disabled, title) => h('button', {
-      class: `btn small${busy ? ' is-busy' : ''}`, type: 'button',
-      'data-fk': `tree-srv-${action}-${label}:${s.id}`,
-      disabled: (busy || disabled) || undefined,
+    const slot = (action, label, iconName, disabled, title) => ({
+      fk: `tree-srv-${action}-${label}:${s.id}`,
+      label,
+      icon: iconName,
+      busy,
+      disabled,
       title,
       onclick: () => runAction(`server:${s.id}`,
         () => api('/api/servers/action', { method: 'POST', body: { id: s.id, action } })),
-    }, icon(iconName), busy ? 'Working…' : label);
+    });
     return h('div', { class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}` },
       h('span', { class: 'cell c-kind' }, h('span', { class: 'kind-tag k-srv' }, 'server')),
       h('span', { class: 'cell c-primary' },
@@ -2616,12 +2693,17 @@
       }),
       h('span', { class: 'cell c-status' }, treeStatusBadge(meta.css, meta.label)),
       h('span', { class: 'cell actions' },
-        stopped
-          ? act('restart', 'Start', 'play', s.missing_command,
-              s.missing_command ? 'Registered without a start command' : `Start ${s.name} on its pinned port`)
-          : [act('stop', 'Stop', 'stop', false, `Stop ${s.name}`),
-             act('restart', 'Restart', 'refresh', s.missing_command,
-               s.missing_command ? 'Registered without a start command' : `Restart ${s.name} on the same port`)],
+        // A stopped coordinator server starts through the restart action.
+        treeActionSlots({
+          start: slot('restart', 'Start', 'play', !stopped || s.missing_command,
+            !stopped ? 'Already running'
+              : (s.missing_command ? 'Registered without a start command' : `Start ${s.name} on its pinned port`)),
+          restart: slot('restart', 'Restart', 'refresh', stopped || s.missing_command,
+            stopped ? 'Not running — use Start'
+              : (s.missing_command ? 'Registered without a start command' : `Restart ${s.name} on the same port`)),
+          stop: slot('stop', 'Stop', 'stop', stopped,
+            stopped ? 'Already stopped' : `Stop ${s.name}`),
+        }),
         hiddenRow
           ? unhideButton('servers', s.key, s.name || 'server')
           : (stopped ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot())));
@@ -2630,15 +2712,17 @@
   function treeContainerRow(o, c, isDb, hiddenRow, webish = false) {
     const busy = ui.busy.has(`docker:${c.name}`);
     const running = isContainerRunning(c);
-    const act = (action, label, iconName, confirmText) => h('button', {
-      class: `btn small${busy ? ' is-busy' : ''}`, type: 'button',
-      'data-fk': `tree-dock-${action}:${c.name}`,
-      disabled: busy || undefined,
-      title: `${label} ${c.name}`,
+    const slot = (action, label, iconName, disabled, title, confirmText) => ({
+      fk: `tree-dock-${action}:${c.name}`,
+      label,
+      icon: iconName,
+      busy,
+      disabled,
+      title,
       onclick: () => runAction(`docker:${c.name}`,
         () => api('/api/docker/action', { method: 'POST', body: { name: c.name, action } }),
         confirmText ? { confirmText } : undefined),
-    }, icon(iconName), busy ? 'Working…' : label);
+    });
     return h('div', { class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}` },
       h('span', { class: 'cell c-kind' },
         h('span', { class: `kind-tag ${isDb ? 'k-db' : 'k-dock'}` }, isDb ? 'database' : 'container')),
@@ -2661,10 +2745,15 @@
           ? treeStatusBadge('ok', 'up')
           : (isContainerActive(c) ? treeStatusBadge('err', 'restarting') : treeStatusBadge('dim', 'stopped'))),
       h('span', { class: 'cell actions' },
-        running
-          ? [act('stop', 'Stop', 'stop', `Stop container ${c.name}?\n\nAnything depending on it (like a database) loses its service.`),
-             act('restart', 'Restart', 'refresh')]
-          : act('start', 'Start', 'play'),
+        treeActionSlots({
+          start: slot('start', 'Start', 'play', running,
+            running ? 'Already running' : `Start container ${c.name}`),
+          restart: slot('restart', 'Restart', 'refresh', !running,
+            !running ? 'Not running — use Start' : `Restart container ${c.name}`),
+          stop: slot('stop', 'Stop', 'stop', !running,
+            !running ? 'Already stopped' : `Stop container ${c.name}`,
+            `Stop container ${c.name}?\n\nAnything depending on it (like a database) loses its service.`),
+        }),
         hiddenRow
           ? unhideButton('docker', c.name, c.name)
           : (!isContainerActive(c) ? hideButton('docker', c.name, c.name) : ghostIconSlot())));
@@ -2861,12 +2950,12 @@
     loadPrefs();
 
     api('/api/session')
-      .then((s) => { state.session = s; renderSummary(); })
+      .then((s) => { state.session = s; renderHeader(); })
       .catch((err) => {
         if (err.status !== 401) {
           showBanner(err.message, () => api('/api/session').then((s) => {
             state.session = s;
-            renderSummary();
+            renderHeader();
           }).catch(() => {}));
         }
       });

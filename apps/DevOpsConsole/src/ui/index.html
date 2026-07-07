@@ -8,8 +8,8 @@
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-<link rel="stylesheet" href="/app.css?v=1.4.1">
-<script src="/app.js?v=1.4.1" defer></script>
+<link rel="stylesheet" href="/app.css?v=1.5.1">
+<script src="/app.js?v=1.5.1" defer></script>
 </head>
 <body>
 
@@ -24,17 +24,16 @@
       <span class="brand-name">DevOps Console</span>
       <span id="brand-domain" class="brand-domain"></span>
     </div>
-    <p id="summary-line" class="summary-line">Loading the latest status…</p>
-    <div id="tb-chips" class="chips"></div>
+    <nav id="site-nav" class="site-nav" aria-label="Console sections">
+      <a href="#/projects" data-nav="projects">Projects <span class="nav-count" id="nav-count-projects" hidden></span></a>
+      <a href="#/servers" data-nav="servers">Servers <span class="nav-count" id="nav-count-servers" hidden></span></a>
+      <a href="#/routes" data-nav="routes">Routes <span class="nav-count" id="nav-count-routes" hidden></span></a>
+      <a href="#/docker" data-nav="docker">Docker <span class="nav-count" id="nav-count-docker" hidden></span></a>
+      <a href="#/ports" data-nav="ports">Port leases <span class="nav-count" id="nav-count-ports" hidden></span></a>
+      <a href="#/performance" data-nav="performance">Performance <span class="nav-count" id="nav-count-performance" hidden></span></a>
+    </nav>
+    <div id="hdr-side" class="hdr-side"></div>
   </div>
-  <nav id="site-nav" class="site-nav" aria-label="Console sections">
-    <a href="#/projects" data-nav="projects">Projects <span class="nav-count" id="nav-count-projects" hidden></span></a>
-    <a href="#/servers" data-nav="servers">Servers <span class="nav-count" id="nav-count-servers" hidden></span></a>
-    <a href="#/routes" data-nav="routes">Routes <span class="nav-count" id="nav-count-routes" hidden></span></a>
-    <a href="#/docker" data-nav="docker">Docker <span class="nav-count" id="nav-count-docker" hidden></span></a>
-    <a href="#/ports" data-nav="ports">Port leases <span class="nav-count" id="nav-count-ports" hidden></span></a>
-    <a href="#/performance" data-nav="performance">Performance <span class="nav-count" id="nav-count-performance" hidden></span></a>
-  </nav>
   <div id="banner-slot"></div>
 </header>
 
