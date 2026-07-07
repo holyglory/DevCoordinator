@@ -905,8 +905,9 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   .tree-detail { display: none; }
   /* Same dense-list treatment as tree-detail: the narrow cell would wrap
      the chip mid-word. Subdomains stay manageable on the Servers and
-     Docker pages at every width. */
-  .tree-sub { display: none; }
+     Docker pages at every width. (Selector matches the base rule's
+     specificity or it loses the cascade.) */
+  .tree-grid .c-primary .tree-sub { display: none; }
   /* The dense list is self-explanatory — no stacked-card field labels. */
   .tree-grid .cell[data-label]::before { display: none; }
   .tree-grid > .usage-cell { flex: 0 0 auto; justify-self: auto; margin-left: auto; }
