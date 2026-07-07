@@ -77,8 +77,10 @@ from there too.
 ## TLS certificate runbook (Let's Encrypt DNS-01, out-of-band)
 
 The app never speaks ACME; it just reads the PEMs in `.env` and hot-reloads
-them when the files change. The repo ships a self-signed `*.vr.ae` cert under
-`certs/dev/` as a first-boot fallback.
+them when the files change. `certs/dev/` is gitignored — the test suite
+generates a throwaway self-signed `*.vr.ae` cert there on demand
+(`test/helpers/dev-cert.mjs`), and the same generated pair can serve as a
+first-boot fallback until real certificates are issued.
 
 ### Console + apex cert (HTTP-01, automated — currently live)
 

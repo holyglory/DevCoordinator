@@ -195,22 +195,29 @@ export async function startServers({ config, log, certManager, router, listenPor
         ({ name, server }) =>
           new Promise((resolve) => {
             let settled = false;
+            let killTimer = null;
+            let failsafe = null;
             const finish = () => {
-              if (!settled) {
-                settled = true;
-                resolve();
-              }
+              if (settled) return;
+              settled = true;
+              // A fast close must not leave timers behind that would later
+              // log a spurious drain warning or destroy sockets of an
+              // already-closed server (close() also runs inside long-lived
+              // in-process test hosts).
+              clearTimeout(killTimer);
+              clearTimeout(failsafe);
+              resolve();
             };
             server.close(finish);
             server.closeIdleConnections?.();
-            const killTimer = setTimeout(() => {
+            killTimer = setTimeout(() => {
               log.warn('drain timeout; destroying remaining connections', { name });
               server.closeAllConnections?.();
-              for (const socket of server._trackedSockets) socket.destroy();
+              for (const socket of server._trackedSockets ?? []) socket.destroy();
             }, DRAIN_TIMEOUT_MS);
             killTimer.unref();
             // Failsafe so close() can never hang the shutdown path.
-            const failsafe = setTimeout(finish, DRAIN_TIMEOUT_MS + 1_000);
+            failsafe = setTimeout(finish, DRAIN_TIMEOUT_MS + 1_000);
             failsafe.unref();
           }),
       ),
