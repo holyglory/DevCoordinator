@@ -375,7 +375,7 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 | `POST /api/docker/action` | `{ name, action: 'start'\|'stop'\|'restart' }` + attribution (project = config.projectRoot) → passthrough |
 | `POST /api/docker/subdomain` | `{ name, slug, auth?, port? }` — assign/change/remove a container's subdomain in one call (mirrors `/api/servers/subdomain`). Fresh inventory lookup (404 unknown container); `port` is the CONTAINER-side port, required only when the container publishes several (400 lists them), validated against currently-published ports (400 on typo); empty `slug` unassigns → `{ route: null }`. Creates/updates a `kind:'docker'` route → 200/201 `{ route: RouteView }` |
 | `POST /api/docker/logs` | `{ name, tail=120 }` → passthrough `{ text }` |
-| `GET /api/metrics/history?limit=N` | `metrics.history({ limit })` → `{ now, intervalMs, maxPoints, sampler: { running, lastSampleAt, lastError }, entities: [{ key, kind: 'server'\|'docker'\|'project', id, name, project, points: [[epochMs, cpuPercent, memBytes], …] }] }`. `limit` caps points per entity (400 on non-positive/garbage). |
+| `GET /api/metrics/history?limit=N` | `metrics.history({ limit })` → `{ now, intervalMs, maxPoints, sampler: { running, lastSampleAt, lastError }, host, entities: [{ key, kind: 'host'\|'server'\|'docker'\|'project', id, name, project, points: [[epochMs, cpuPercent, memBytes], …] }] }`. `host` is the latest whole-machine snapshot from `src/host.mjs` (`{ at, cpuPercent, cores, load[3], uptimeSec, mem: { totalBytes, usedBytes, availableBytes }, disks: [{ mount, totalBytes, usedBytes, availableBytes }] }`, `cpuPercent` null until the second sample; sampled every tick INDEPENDENTLY of coordinator health) and its cpu/mem history rides in `entities` as `kind:'host'`, key `host`. Memory "used" is total minus MemAvailable on Linux (plain free elsewhere); disks come from `fs.statfs` over `/` + home, deduped by device. `limit` caps points per entity (400 on non-positive/garbage). |
 | `POST /api/ports/lease` | `{ purpose?, preferred?, ttl?, project? }` → coordinator `leasePort` with `agent: 'devops-console:'+session.email`, `project` defaulting to `config.projectRoot`; a `preferred` port pins `range` to that port → 201 `{ lease }` |
 | `POST /api/ports/release` | `{ lease_id }` (required) → coordinator `releasePort` → `{ lease }` (status `released`). Releasing a lease never removes a durable port pin. |
 | `POST /api/ports/unassign` | `{ name, project }` (or `{ port, force? }` for orphan cleanup) → coordinator `unassignPort` with console-user attribution → `{ assignment }` (status `unassigned`). The only console path that frees a durable port pin. |
@@ -445,7 +445,10 @@ public/login toggle switch, resolved status dot, delete), **Docker** (status,
 image, ports, live CPU/mem + sparkline, start/stop/restart, logs, subdomain
 control on web-serving containers), **Port leases** (lease
 form: purpose/preferred port/TTL/project; table with countdowns and
-confirmed release), **Performance** (per-entity CPU and memory history
+confirmed release), **Performance** (a "Machine" panel first — whole-box
+CPU with cores and load averages, memory used/available, per-disk storage
+and uptime as stat tiles with meters, alarm tint above 90%, plus host
+CPU/memory history charts — then per-entity CPU and memory history
 charts for every sampled server/container + per-project usage bars with
 sparklines). Docker/Ports lists are grouped by repo with project subheaders.
 **Hiding:** stopped servers/containers and idle projects can be hidden

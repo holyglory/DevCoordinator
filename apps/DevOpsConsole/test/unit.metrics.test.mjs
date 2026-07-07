@@ -194,3 +194,88 @@ describe('metrics store: sampler', () => {
     assert.ok(store.history().entities.length > 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Whole-machine health (src/host.mjs + the store's host wiring)
+// ---------------------------------------------------------------------------
+
+describe('host health', () => {
+  it('cpu math: aggregate + delta between snapshots, clamped to 0-100', async () => {
+    const { aggregateCpuTimes, cpuPercentBetween } = await import('../src/host.mjs');
+    const cpus = (idle, busy) => [{ times: { idle, user: busy, sys: 0 } }];
+    const a = aggregateCpuTimes(cpus(1000, 1000));
+    const b = aggregateCpuTimes(cpus(1500, 2500)); // +500 idle over +2000 total
+    assert.equal(cpuPercentBetween(a, b), 75);
+    assert.equal(cpuPercentBetween(null, b), null, 'first sample has no delta');
+    assert.equal(cpuPercentBetween(a, a), null, 'zero elapsed must not divide by zero');
+    assert.equal(aggregateCpuTimes([]), null);
+  });
+
+  it('memory: MemAvailable wins over plain free; missing meminfo falls back', async () => {
+    const { memoryFromMeminfo } = await import('../src/host.mjs');
+    const linux = memoryFromMeminfo('MemTotal: 16000 kB\nMemAvailable:    4096 kB\n', 16_000 * 1024, 100 * 1024);
+    assert.equal(linux.availableBytes, 4096 * 1024);
+    assert.equal(linux.usedBytes, (16_000 - 4096) * 1024);
+    const fallback = memoryFromMeminfo(null, 1000, 400);
+    assert.equal(fallback.availableBytes, 400);
+    assert.equal(fallback.usedBytes, 600);
+  });
+
+  it('probe: second sample carries cpu%, disks dedupe by device, meminfo errors degrade', async () => {
+    const { createHostProbe } = await import('../src/host.mjs');
+    let tick = 0;
+    const probe = createHostProbe({
+      cpusFn: () => [{ times: { idle: 1000 + tick * 500, user: 1000 + tick * 1500 } }],
+      loadavgFn: () => [0.5, 0.4, 0.3],
+      uptimeFn: () => 3600,
+      totalmemFn: () => 8 * 1024 ** 3,
+      freememFn: () => 2 * 1024 ** 3,
+      readMeminfo: async () => { throw new Error('not linux'); },
+      statFn: async (mount) => ({ dev: mount === '/home' ? 1 : 1 }), // same device
+      statfsFn: async () => ({ bsize: 4096, blocks: 1000, bfree: 400, bavail: 300 }),
+      mounts: ['/', '/home'],
+    });
+    const first = await probe.sample();
+    assert.equal(first.cpuPercent, null, 'no delta on the very first sample');
+    assert.equal(first.mem.usedBytes, 6 * 1024 ** 3, 'fallback used = total - free');
+    assert.equal(first.disks.length, 1, 'same-device mounts collapse to one disk');
+    assert.equal(first.disks[0].totalBytes, 4096 * 1000);
+    assert.deepEqual(first.load, [0.5, 0.4, 0.3]);
+
+    tick = 1; // +500 idle over +2000 total -> 75%
+    const second = await probe.sample();
+    assert.equal(second.cpuPercent, 75);
+  });
+
+  it('store: host readings are recorded even while the coordinator is down', async () => {
+    const store = makeStore({
+      coordinator: { inventory: async () => { throw new Error('coordinator down'); } },
+    });
+    // Not started (no timer): drive one tick by hand with an injected probe.
+    const hosted = createMetricsStore({
+      config: { metricsIntervalMs: INTERVAL },
+      coordinator: { inventory: async () => { throw new Error('coordinator down'); } },
+      host: {
+        sample: async () => ({
+          at: Date.now(),
+          cpuPercent: 33,
+          cores: 4,
+          load: [1, 1, 1],
+          uptimeSec: 60,
+          mem: { totalBytes: 1000, usedBytes: 250, availableBytes: 750 },
+          disks: [{ mount: '/', totalBytes: 10_000, usedBytes: 9_500, availableBytes: 500 }],
+        }),
+      },
+    });
+    await hosted.sampleOnce();
+    const view = hosted.history();
+    assert.equal(view.host.cpuPercent, 33, 'snapshot survives a coordinator failure');
+    assert.equal(view.host.disks[0].usedBytes, 9_500);
+    const hostEnt = view.entities.find((e) => e.key === 'host');
+    assert.ok(hostEnt, 'host history entity must exist');
+    assert.equal(hostEnt.kind, 'host');
+    assert.deepEqual(hostEnt.points[0].slice(1), [33, 250]);
+    assert.match(String(view.sampler.lastError), /coordinator down/);
+    void store;
+  });
+});

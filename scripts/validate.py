@@ -487,6 +487,13 @@ def check_devops_console() -> None:
         # action buttons align into columns; colors carry meaning.
         "uniform tree action slots": "function treeActionSlots(",
         "action color code map": "const ACTION_CLS = { start: 'act-start', restart: 'act-restart', stop: 'act-stop' };",
+        # Whole-machine health (v1.6.0): host probe sampled independently of
+        # coordinator health, exposed via metrics history, rendered on the
+        # Performance page.
+        "host probe with injectable readers": "export function createHostProbe(",
+        "host sampled before coordinator inventory": "await sampleHost();",
+        "host snapshot in metrics history": "host: hostNow,",
+        "performance page machine panel": "function hostPanel(",
     }
     haystack = "\n".join([source_text, app_js, app_css, index_html, dev_cert_helper])
     missing = [label for label, needle in required.items() if needle not in haystack]

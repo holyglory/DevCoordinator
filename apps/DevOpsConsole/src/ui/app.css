@@ -748,6 +748,52 @@ select:disabled { color: var(--dim); }
 .bar .fill.mem { background: #b48cf2; }
 .bar-val { font-size: 11.5px; color: var(--muted); text-align: right; }
 
+/* ---------- whole-machine health panel (Performance page) ---------- */
+
+.host-panel {
+  border: 1px solid var(--line2);
+  background: rgba(148, 161, 179, .05);
+  border-radius: var(--radius);
+  padding: 12px 14px 14px;
+  margin-bottom: 14px;
+}
+.host-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.host-head strong { font-size: 13.5px; }
+
+.host-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+.host-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px 10px;
+  min-width: 0;
+}
+.host-tile-label { font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+.host-tile-value { font-size: 15px; overflow-wrap: anywhere; }
+.host-tile-sub { font-size: 11.5px; color: var(--muted); }
+.host-tile.alarm { border-color: #6d2b30; }
+.host-tile.alarm .host-tile-value { color: #ffb3b8; }
+
+.host-meter { height: 6px; background: var(--bg4); border-radius: 999px; overflow: hidden; margin-top: 5px; }
+.host-meter .fill { height: 100%; background: var(--accent); border-radius: 999px; transition: width .3s ease; }
+.host-meter .fill.alarm { background: var(--err); }
+
+.host-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px 16px;
+  margin-top: 10px;
+}
+
+.perf-sec-title { margin: 4px 0 8px; font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+
 /* ---------- CPU/memory sparklines and history charts ---------- */
 
 .usage-cell { display: flex; align-items: center; gap: 8px; }

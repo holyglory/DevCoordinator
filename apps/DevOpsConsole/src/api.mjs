@@ -371,7 +371,7 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
   }
 
   function handleMetricsHistory(res, searchParams) {
-    if (!metrics) return sendJson(res, 200, { entities: [], sampler: { running: false } });
+    if (!metrics) return sendJson(res, 200, { entities: [], host: null, sampler: { running: false } });
     const rawLimit = searchParams.get('limit');
     let limit;
     if (rawLimit !== null) {

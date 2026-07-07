@@ -572,7 +572,7 @@ header is identical on every page):
 | Routes page (`#/routes`) | J2, J4 | URL, resolved dot, access mode; targets: fixed port, managed server, docker container | Create; copy; toggle access | Delete; title; "view server" link | Timestamps | Form stacks at 390px; table rows become labelled cards |
 | Docker page (`#/docker`) | J5, J7 | Status, name, image, ports, CPU/mem numbers; subdomain chip on web-serving containers | Logs; restart; start; open history charts; assign/edit subdomain | Stop | stats/labels | Same card pattern |
 | Port leases page (`#/ports`) | J6 | Port, purpose, countdown; lease form; pinned ports (port permanently owned per server, with server status) | Lease; release (confirmed); unassign pin (confirmed) | Preferred port/TTL/project | Lease id, ISO expiry, agent, pin provenance (title) | Form stacks at 390px |
-| Performance page (`#/performance`) | J7 | Per-entity CPU/mem charts; per-project bars | Read; jump to rows to act | — | Sampling cadence note | Chart grid single-column on phone |
+| Performance page (`#/performance`) | J7 | Machine panel first: whole-box CPU (cores + load), memory used/available, per-disk storage, uptime — with meters, >90% alarm tint and CPU/mem history charts; then per-entity CPU/mem charts; per-project bars | Read; jump to rows to act | — | Sampling cadence note | Tiles and chart grid single-column on phone |
 
 ## QA And Acceptance
 

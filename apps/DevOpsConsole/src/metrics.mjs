@@ -5,6 +5,8 @@
 // watching. History lives only in this process: it resets on console restart
 // and an entity's points age out after the retention window.
 
+import { createHostProbe } from './host.mjs';
+
 export const METRICS_MAX_POINTS = 720; // ring capacity per entity
 
 const MIN_INTERVAL_MS = 2000;
@@ -18,13 +20,18 @@ function isContainerRunning(container) {
   return /^\s*up\b/i.test(String(container?.status ?? ''));
 }
 
-export function createMetricsStore({ config, log, coordinator, maxPoints = METRICS_MAX_POINTS } = {}) {
+export function createMetricsStore({ config, log, coordinator, host, maxPoints = METRICS_MAX_POINTS } = {}) {
   const mlog = typeof log?.child === 'function' ? log.child({ mod: 'metrics' }) : log;
   const intervalMs = Math.max(MIN_INTERVAL_MS, Number(config?.metricsIntervalMs) || 10_000);
   const retentionMs = maxPoints * intervalMs;
+  const hostProbe = host ?? createHostProbe();
 
   // key -> { key, kind, id, name, project, points: [{t, cpu, mem}], lastSeen }
   const entities = new Map();
+
+  // Latest full machine reading (cpu/mem/load/disks/uptime); the cpu/mem
+  // pair also lands in the 'host' history ring above.
+  let hostNow = null;
 
   let timer = null;
   let sampling = false;
@@ -122,11 +129,34 @@ export function createMetricsStore({ config, log, coordinator, maxPoints = METRI
     prune(t);
   }
 
-  /** One sampler tick: fetch (possibly cached) inventory and ingest it. */
+  /** Record one whole-machine reading (never throws, never blocks charts). */
+  async function sampleHost() {
+    try {
+      const reading = await hostProbe.sample();
+      hostNow = reading;
+      // First tick has no CPU delta yet — start the ring on the second.
+      if (reading.cpuPercent !== null) {
+        record(
+          'host',
+          { kind: 'host', id: null, name: 'this machine', project: null },
+          reading.at,
+          reading.cpuPercent,
+          reading.mem?.usedBytes ?? 0,
+          true,
+        );
+      }
+    } catch (err) {
+      mlog?.warn?.('host sample failed', { error: err?.message ?? String(err) });
+    }
+  }
+
+  /** One sampler tick: machine health first, then the coordinator inventory. */
   async function sampleOnce() {
     if (sampling) return;
     sampling = true;
     try {
+      // The machine reading must never depend on coordinator health.
+      await sampleHost();
       const inventoryData = await coordinator.inventory({
         maxAgeMs: Math.max(1000, Math.floor(intervalMs / 2)),
       });
@@ -186,6 +216,9 @@ export function createMetricsStore({ config, log, coordinator, maxPoints = METRI
         lastSampleAt,
         lastError,
       },
+      // Latest whole-machine snapshot (cpu %, mem, load, disks, uptime);
+      // its cpu/mem history rides in entities as kind:'host', key 'host'.
+      host: hostNow,
       entities: out,
     };
   }

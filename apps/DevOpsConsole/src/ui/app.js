@@ -915,7 +915,7 @@
     setSection('perf-body', sig(state.metricsAt, o.inventory ? 1 : 0, coordSig), () => buildPerf(o), force);
 
     const perfEntities = state.metrics
-      ? (state.metrics.entities || []).filter((e) => e.kind !== 'project').length
+      ? (state.metrics.entities || []).filter((e) => e.kind === 'server' || e.kind === 'docker').length
       : null;
     const projectGroups = o.inventory ? projectGroupsOf(o).length : null;
     // The Servers page lists coordinator servers plus docker-hosted web
@@ -2857,6 +2857,88 @@
 
   // ---------------------------------------------------------------- performance
 
+  function fmtUptime(sec) {
+    const s = Math.max(0, Math.floor(Number(sec) || 0));
+    const d = Math.floor(s / 86_400);
+    const hs = Math.floor((s % 86_400) / 3600);
+    const min = Math.floor((s % 3600) / 60);
+    if (d > 0) return `${d}d ${hs}h`;
+    if (hs > 0) return `${hs}h ${min}m`;
+    return `${min}m`;
+  }
+
+  // Overall machine health: CPU, memory, storage, load and uptime for the
+  // box everything above runs on, with the same history charts as any row.
+  function hostPanel() {
+    const info = state.metrics?.host;
+    if (!info) return null;
+
+    const meter = (frac, alarm) => {
+      const fill = h('div', { class: `fill${alarm ? ' alarm' : ''}` });
+      fill.style.width = `${Math.min(100, Math.max(2, (frac || 0) * 100)).toFixed(1)}%`;
+      return h('div', { class: 'host-meter', 'aria-hidden': 'true' }, fill);
+    };
+    const tile = ({ label, value, sub, frac, alarm, valueClass }) => h('div', { class: `host-tile${alarm ? ' alarm' : ''}` },
+      h('span', { class: 'host-tile-label' }, label),
+      h('strong', { class: `host-tile-value mono${valueClass ? ` ${valueClass}` : ''}` }, value),
+      sub ? h('span', { class: 'host-tile-sub' }, sub) : null,
+      frac !== undefined ? meter(frac, alarm) : null);
+
+    const tiles = [];
+    const cpu = info.cpuPercent;
+    const load = (info.load || []).map((n) => n.toFixed(2)).join(' · ');
+    tiles.push(tile({
+      label: 'CPU',
+      value: cpu === null || cpu === undefined ? '—' : fmtCpu(cpu),
+      valueClass: 'u-cpu',
+      sub: `${info.cores ?? '—'} cores · load ${load}`,
+      frac: cpu === null || cpu === undefined ? 0 : cpu / 100,
+      alarm: cpu > 90,
+    }));
+
+    const mem = info.mem || {};
+    const memFrac = mem.totalBytes ? (mem.usedBytes || 0) / mem.totalBytes : 0;
+    tiles.push(tile({
+      label: 'Memory',
+      value: `${fmtBytes(mem.usedBytes || 0)} / ${fmtBytes(mem.totalBytes || 0)}`,
+      valueClass: 'u-mem',
+      sub: `${(memFrac * 100).toFixed(0)}% used · ${fmtBytes(mem.availableBytes || 0)} available`,
+      frac: memFrac,
+      alarm: memFrac > 0.9,
+    }));
+
+    for (const disk of info.disks || []) {
+      const frac = disk.totalBytes ? (disk.usedBytes || 0) / disk.totalBytes : 0;
+      tiles.push(tile({
+        label: `Storage ${disk.mount}`,
+        value: `${fmtBytes(disk.usedBytes || 0)} / ${fmtBytes(disk.totalBytes || 0)}`,
+        sub: `${(frac * 100).toFixed(0)}% used · ${fmtBytes(disk.availableBytes || 0)} free`,
+        frac,
+        alarm: frac > 0.9,
+      }));
+    }
+
+    tiles.push(tile({
+      label: 'Uptime',
+      value: fmtUptime(info.uptimeSec),
+      sub: 'since last boot',
+    }));
+
+    const ent = metricsEntity('host');
+    const charts = ent && ent.points.length >= 2
+      ? h('div', { class: 'host-charts' },
+          chartBlock('CPU', ent.points, (p) => p[1], fmtCpu, 'c-cpu'),
+          chartBlock('Memory used', ent.points, (p) => p[2], fmtBytes, 'c-mem'))
+      : h('p', { class: 'pop-hint' }, 'History charts appear after a couple of samples.');
+
+    return h('div', { class: 'host-panel' },
+      h('div', { class: 'host-head' },
+        h('strong', null, 'Machine'),
+        h('span', { class: 'meta-passive' }, 'everything below runs on this box')),
+      h('div', { class: 'host-tiles' }, ...tiles),
+      charts);
+  }
+
   function buildPerf(o) {
     const m = state.metrics;
     if (!m) {
@@ -2867,6 +2949,9 @@
       out.push(h('p', { class: 'inline-note warn-note' },
         `Sampling is failing right now (${m.sampler.lastError}) — charts show the last collected history.`));
     }
+
+    const hp = hostPanel();
+    if (hp) out.push(hp);
 
     // Live inventory tells us which charted entities are still running.
     const running = new Set();
@@ -2880,6 +2965,9 @@
     }
 
     const entities = (m.entities || []).filter((e) => e.kind === 'server' || e.kind === 'docker');
+    if (entities.length) {
+      out.push(h('p', { class: 'perf-sec-title' }, 'Servers & containers'));
+    }
     if (!entities.length) {
       out.push(emptyState('Nothing to chart yet — start a dev server or container and its CPU/memory history appears here.'));
       return out;

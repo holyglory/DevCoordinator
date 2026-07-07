@@ -866,6 +866,21 @@ else:
       assert.ok(Number.isFinite(t) && t > 0);
       assert.ok(Number.isFinite(cpu) && cpu >= 0);
       assert.ok(Number.isFinite(mem) && mem > 0, 'a live python process must report positive RSS');
+
+      // Whole-machine health rides on the same endpoint: a real snapshot of
+      // this box with memory capacity and at least one readable disk.
+      const hist = await apiCall(stack, jar, 'GET', '/api/metrics/history');
+      const host = hist.json.host;
+      assert.ok(host, 'metrics history must carry a host snapshot');
+      assert.ok(host.mem?.totalBytes > 0, 'host memory capacity must be real');
+      assert.ok(host.mem.usedBytes > 0 && host.mem.usedBytes <= host.mem.totalBytes);
+      assert.ok(Array.isArray(host.disks) && host.disks.length >= 1, 'at least one disk must be readable');
+      assert.ok(host.disks[0].totalBytes > 0);
+      assert.ok(Array.isArray(host.load) && host.load.length === 3);
+      assert.ok(host.uptimeSec > 0);
+      if (host.cpuPercent !== null) {
+        assert.ok(host.cpuPercent >= 0 && host.cpuPercent <= 100);
+      }
     } finally {
       if (server?.id) {
         await stack.coordinator.api('POST', '/v1/servers/stop', {
