@@ -224,7 +224,7 @@ export async function login(stack, jar, { rt } = {}) {
 }
 
 /** JSON helper for the console API through the edge. */
-export async function apiCall(stack, jar, method, apiPath, body, extraHeaders = {}) {
+export async function apiCall(stack, jar, method, apiPath, body, extraHeaders = {}, opts = {}) {
   const res = await fetchUrl(stack, `${stack.consoleOrigin}${apiPath}`, {
     method,
     jar,
@@ -234,6 +234,9 @@ export async function apiCall(stack, jar, method, apiPath, body, extraHeaders = 
       ...extraHeaders,
     },
     body: body != null ? JSON.stringify(body) : undefined,
+    // Slow endpoints (whole-project actions run up to 300s in the
+    // coordinator) need more than fetchUrl's 15s default on loaded runners.
+    ...opts,
   });
   let json = null;
   try {

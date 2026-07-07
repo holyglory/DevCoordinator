@@ -29,6 +29,11 @@ import { wsAcceptFor } from './helpers/ws-echo.mjs';
 
 const FIXTURE_EMAIL = 'ja@vr.ae';
 
+// macOS CI runners hang `python3 -m http.server` in getfqdn() before it ever
+// listens; this equivalent fixture uses plain socketserver.TCPServer (same
+// directory listing, no name resolution). {port} is the coordinator template.
+const PY_HTTP_FIXTURE = "python3 -c 'import socketserver, http.server, sys; socketserver.TCPServer.allow_reuse_address = True; socketserver.TCPServer((\"127.0.0.1\", int(sys.argv[1])), http.server.SimpleHTTPRequestHandler).serve_forever()' {port}";
+
 describe('e2e: full console stack', () => {
   /** @type {Awaited<ReturnType<typeof startStack>>} */
   let stack;
@@ -504,7 +509,7 @@ describe('e2e: full console stack', () => {
         agent: 'e2e',
         project: toplevel,
         name: 'e2e-web',
-        cmd: 'python3 -m http.server {port} --bind 127.0.0.1',
+        cmd: PY_HTTP_FIXTURE,
         range: `${rangeBase}-${rangeBase + 99}`,
         health_timeout: 20,
       }, { timeoutMs: 60_000 });
@@ -568,7 +573,7 @@ describe('e2e: full console stack', () => {
     for (let attempt = 0; attempt < 3; attempt++) {
       server = await stack.coordinator.api('POST', '/v1/servers/start', {
         agent: 'e2e', project: toplevel, name: 'sub-web',
-        cmd: 'python3 -m http.server {port} --bind 127.0.0.1',
+        cmd: PY_HTTP_FIXTURE,
         range: `${rangeBase}-${rangeBase + 99}`, health_timeout: 20,
       }, { timeoutMs: 60_000 });
       if (server.status === 'running') break;
@@ -725,7 +730,7 @@ describe('e2e: full console stack', () => {
           agent: 'e2e-metrics',
           project: toplevel,
           name: 'metrics-target',
-          cmd: 'python3 -m http.server {port} --bind 127.0.0.1',
+          cmd: PY_HTTP_FIXTURE,
           range: `${rangeBase}-${rangeBase + 99}`,
           health_timeout: 20,
         }, { timeoutMs: 60_000 });
@@ -791,7 +796,7 @@ describe('e2e: full console stack', () => {
         agent: 'e2e-pins',
         project: toplevel,
         name: 'pin-target',
-        cmd: 'python3 -m http.server {port} --bind 127.0.0.1',
+        cmd: PY_HTTP_FIXTURE,
         range: `${rangeBase}-${rangeBase + 99}`,
         health_timeout: 20,
       }, { timeoutMs: 60_000 });
@@ -978,7 +983,7 @@ describe('e2e: full console stack', () => {
           role: 'web',
           port: runtimePort,
           cwd: '.',
-          cmd: 'python3 -m http.server {port} --bind 127.0.0.1',
+          cmd: PY_HTTP_FIXTURE,
           health_url: 'http://127.0.0.1:{port}/',
         }],
       }),
@@ -995,7 +1000,7 @@ describe('e2e: full console stack', () => {
     const started = await apiCall(stack, jar, 'POST', '/api/projects/action', {
       project: toplevel,
       action: 'start',
-    }, { origin: stack.consoleOrigin });
+    }, { origin: stack.consoleOrigin }, { timeoutMs: 330_000 });
     assert.equal(started.status, 200, started.text);
     assert.equal(started.json?.result?.ok, true, `project start should succeed: ${started.text}`);
 
@@ -1022,21 +1027,21 @@ describe('e2e: full console stack', () => {
       const badAction = await apiCall(stack, jar, 'POST', '/api/projects/action', {
         project: toplevel,
         action: 'destroy',
-      }, { origin: stack.consoleOrigin });
+      }, { origin: stack.consoleOrigin }, { timeoutMs: 330_000 });
       assert.equal(badAction.status, 400);
 
       // Unknown project paths are refused before reaching the coordinator.
       const unknown = await apiCall(stack, jar, 'POST', '/api/projects/action', {
         project: '/tmp/definitely-not-a-tracked-project',
         action: 'start',
-      }, { origin: stack.consoleOrigin });
+      }, { origin: stack.consoleOrigin }, { timeoutMs: 330_000 });
       assert.equal(unknown.status, 404, unknown.text);
       assert.match(String(unknown.json?.error ?? ''), /unknown project/);
     } finally {
       const stopped = await apiCall(stack, jar, 'POST', '/api/projects/action', {
         project: toplevel,
         action: 'stop',
-      }, { origin: stack.consoleOrigin });
+      }, { origin: stack.consoleOrigin }, { timeoutMs: 330_000 });
       assert.equal(stopped.status, 200, stopped.text);
     }
 
@@ -1044,7 +1049,7 @@ describe('e2e: full console stack', () => {
     const stopAgain = await apiCall(stack, jar, 'POST', '/api/projects/action', {
       project: toplevel,
       action: 'stop',
-    }, { origin: stack.consoleOrigin });
+    }, { origin: stack.consoleOrigin }, { timeoutMs: 330_000 });
     assert.equal(stopAgain.status, 200, stopAgain.text);
     assert.equal(stopAgain.json?.result?.ok, true);
   });

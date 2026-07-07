@@ -1,5 +1,33 @@
 # Decision History
 
+## 2026-07-07 - CI on macOS: never use bare `python3 -m http.server` as a test fixture
+
+Decision: The repo's first full macOS CI runs exposed two independent
+failures, both diagnosed by reproducing on the runner itself (a temporary
+`debug-macos` probe workflow) rather than by guessing. (1) A cancelled-
+after-30-minutes run was a HANG, not slowness: the e2e harness's coordinator
+spawn missed its readiness window and the timeout path leaked the python
+child, whose inherited stdio pipes kept the `node --test` worker alive
+silently until the job timeout — every spawn-failure path now kills the
+child, readiness gets 60s, and the workflow budget is 60 minutes. (2) With
+the hang fixed, every coordinator-started fixture reported "unhealthy, pid
+alive, port closed": the probe showed even a bare
+`python3 -m http.server --bind 127.0.0.1 &` control never reaches listen()
+on macos-latest — lsof shows the socket bound but stuck in CLOSED — because
+`HTTPServer.server_bind` calls `socket.getfqdn()` and the runner's resolver
+black-holes reverse DNS (`getfqdn('')`/`getfqdn(hostname)` hang 20s+; an
+`/etc/hosts` entry does NOT cure it since macOS libinfo routes reverse
+lookups through mDNSResponder). Policy: test fixtures must not use bare
+`http.server`; the suites now share a getfqdn-free equivalent
+(`socketserver.TCPServer` + `SimpleHTTPRequestHandler` — same directory
+listing, no name resolution; `HTTP_FIXTURE_CODE` in the coordinator
+self-test, `PY_HTTP_FIXTURE` in the console e2e), verified answering 200 on
+the same runner where `http.server` hangs. Also: `apiCall` in the console
+e2e forwards fetch options and whole-project actions carry a 330s client
+budget (the coordinator legitimately runs them for minutes). The "successful"
+earlier run that suggested macOS had ever been green was only the Copilot
+review job — the full gate had never passed on macOS before this.
+
 ## 2026-07-07 - validate.py de-staled: needles pin code and call sites, not comments and definitions
 
 Decision: A two-auditor adversarial pass over the gate itself (prompted by the

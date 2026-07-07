@@ -21,6 +21,18 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "dev_coordinator.py"
 SKILL = ROOT / "SKILL.md"
 
+# macOS CI runners black-hole reverse DNS lookups, which hangs
+# `python3 -m http.server` inside HTTPServer.server_bind (socket.getfqdn)
+# between bind() and listen() — the process sits alive with a bound,
+# never-listening socket. This fixture serves the same directory listing
+# through plain socketserver.TCPServer, which never resolves names.
+HTTP_FIXTURE_CODE = (
+    "import socketserver, http.server, sys; "
+    "socketserver.TCPServer.allow_reuse_address = True; "
+    'socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), '
+    "http.server.SimpleHTTPRequestHandler).serve_forever()"
+)
+
 
 _ISSUED_PORTS: set[int] = set()
 
@@ -303,7 +315,7 @@ def main() -> int:
                 "--cwd",
                 str(tmp),
                 "--cmd",
-                f"{shlex_join([sys.executable, '-m', 'http.server', '{port}', '--bind', '127.0.0.1'])}",
+                f"{shlex_join([sys.executable, '-c', HTTP_FIXTURE_CODE, '{port}'])}",
                 "--range",
                 f"{server_port}-{server_port}",
                 "--health-url",
@@ -359,7 +371,7 @@ def main() -> int:
                 "--cwd",
                 str(tmp),
                 "--cmd",
-                f"{shlex_join([sys.executable, '-m', 'http.server', '{port}', '--bind', '127.0.0.1'])}",
+                f"{shlex_join([sys.executable, '-c', HTTP_FIXTURE_CODE, '{port}'])}",
                 "--range",
                 f"{server_port}-{server_port}",
                 "--health-url",
@@ -378,7 +390,7 @@ def main() -> int:
 
         adopted_port = free_port()
         adopted_process = subprocess.Popen(
-            [sys.executable, "-m", "http.server", str(adopted_port), "--bind", "127.0.0.1"],
+            [sys.executable, "-c", HTTP_FIXTURE_CODE, str(adopted_port)],
             cwd=tmp,
             text=True,
             stdout=subprocess.PIPE,
@@ -419,7 +431,7 @@ def main() -> int:
         bad_health_project.mkdir()
         bad_health_port = free_port()
         bad_health_process = subprocess.Popen(
-            [sys.executable, "-m", "http.server", str(bad_health_port), "--bind", "127.0.0.1"],
+            [sys.executable, "-c", HTTP_FIXTURE_CODE, str(bad_health_port)],
             cwd=bad_health_project,
             text=True,
             stdout=subprocess.PIPE,
@@ -513,7 +525,7 @@ def main() -> int:
                             "role": "web",
                             "port": adopted_port,
                             "cwd": ".",
-                            "cmd": shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                            "cmd": shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                             "health_url": "http://127.0.0.1:{port}/",
                         }
                     ],
@@ -566,7 +578,7 @@ def main() -> int:
                 "--cwd",
                 str(reuse_old_project),
                 "--cmd",
-                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 "--range",
                 f"{reuse_port}-{reuse_port}",
                 "--health-url",
@@ -590,7 +602,7 @@ def main() -> int:
                 "--cwd",
                 str(reuse_new_project),
                 "--cmd",
-                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 "--range",
                 f"{reuse_port}-{reuse_port}",
                 "--health-url",
@@ -617,7 +629,7 @@ def main() -> int:
                 "--cwd",
                 str(reuse_new_project),
                 "--cmd",
-                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 "--range",
                 f"{reuse_port}-{reuse_port}",
                 "--health-url",
@@ -655,7 +667,7 @@ def main() -> int:
                 "--cwd",
                 str(pin_project),
                 "--cmd",
-                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 "--health-url",
                 "http://127.0.0.1:{port}/",
             ],
@@ -715,7 +727,7 @@ def main() -> int:
                 "--cwd",
                 str(pin_project),
                 "--cmd",
-                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 "--health-url",
                 "http://127.0.0.1:{port}/",
             ],
@@ -742,7 +754,7 @@ def main() -> int:
                 "--cwd",
                 str(pin_project),
                 "--cmd",
-                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 "--range",
                 f"{repin_port}-{repin_port}",
                 "--preferred",
@@ -763,7 +775,7 @@ def main() -> int:
         # A foreign process squatting the pinned port must fail the owner's
         # start loudly instead of silently drifting to a different port.
         squatter = subprocess.Popen(
-            [sys.executable, "-m", "http.server", str(repin_port), "--bind", "127.0.0.1"],
+            [sys.executable, "-c", HTTP_FIXTURE_CODE, str(repin_port)],
             cwd=str(tmp),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -792,7 +804,7 @@ def main() -> int:
                     "--cwd",
                     str(pin_project),
                     "--cmd",
-                    shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                    shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 ],
                 env=env,
                 expected="pinned to port",
@@ -810,7 +822,7 @@ def main() -> int:
             env=env,
         )
         register_victim = subprocess.Popen(
-            [sys.executable, "-m", "http.server", str(register_guard_port), "--bind", "127.0.0.1"],
+            [sys.executable, "-c", HTTP_FIXTURE_CODE, str(register_guard_port)],
             cwd=str(pin_project),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -922,7 +934,7 @@ def main() -> int:
                 "--cwd",
                 str(pin_project),
                 "--cmd",
-                shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 "--health-url",
                 "http://127.0.0.1:{port}/",
             ],
@@ -948,7 +960,7 @@ def main() -> int:
                 "name": "web",
                 "role": "web",
                 "cwd": ".",
-                "cmd": shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                "cmd": shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                 "health_url": "http://127.0.0.1:{port}/",
             }
             if port_value is not None:
@@ -1076,7 +1088,7 @@ def main() -> int:
                             "role": "web",
                             "port": adopt_runtime_port,
                             "cwd": ".",
-                            "cmd": shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                            "cmd": shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                             "health_url": "http://127.0.0.1:{port}/",
                         }
                     ],
@@ -1085,7 +1097,7 @@ def main() -> int:
             encoding="utf-8",
         )
         runtime_adopt_process = subprocess.Popen(
-            [sys.executable, "-m", "http.server", str(adopt_runtime_port), "--bind", "127.0.0.1"],
+            [sys.executable, "-c", HTTP_FIXTURE_CODE, str(adopt_runtime_port)],
             cwd=adopt_project,
             text=True,
             stdout=subprocess.PIPE,
@@ -1116,7 +1128,7 @@ def main() -> int:
                             "role": "web",
                             "port": runtime_port,
                             "cwd": ".",
-                            "cmd": shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                            "cmd": shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                             "health_url": "http://127.0.0.1:{port}/",
                         }
                     ],
@@ -1158,7 +1170,7 @@ def main() -> int:
                             "role": "web",
                             "port": stale_lease_port,
                             "cwd": ".",
-                            "cmd": shlex_join([sys.executable, "-m", "http.server", "{port}", "--bind", "127.0.0.1"]),
+                            "cmd": shlex_join([sys.executable, "-c", HTTP_FIXTURE_CODE, "{port}"]),
                             "health_url": "http://127.0.0.1:{port}/",
                         }
                     ],
