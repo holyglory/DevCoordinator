@@ -332,6 +332,11 @@ def check_ops_console_interaction_guardrails() -> None:
         "membership divergence must-catch fixture": "must-catch: unattributed grouprepo-db must display under the path-keyed repo",
         "membership blast radius skill contract": "shows exactly the blast radius",
         "bounded socket http health": "socket.create_connection((parsed.hostname, port), timeout=timeout)",
+        # macOS runners black-hole reverse DNS: a stock HTTPServer.server_bind
+        # stalls ~30s in socket.getfqdn between bind() and listen(). The API
+        # server must bind without name resolution, and serve_api must use it.
+        "coordinator api server skips getfqdn": "socketserver.TCPServer.server_bind(self)",
+        "coordinator api server fast-bind use": "server = FastBindThreadingHTTPServer((host, port), ApiHandler)",
         "http health timeout classification": "\"classification\": \"timeout\"",
         "project usage model": "struct ProjectUsage",
         "process usage model": "struct ProcessUsage",

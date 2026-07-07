@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.client
 import http.server
+import socketserver
 import json
 import os
 import socket
@@ -32,6 +33,16 @@ HTTP_FIXTURE_CODE = (
     'socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), '
     "http.server.SimpleHTTPRequestHandler).serve_forever()"
 )
+
+
+class _FastBindThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    # Same macOS getfqdn hazard as HTTP_FIXTURE_CODE above, for in-process
+    # fixtures: skip HTTPServer.server_bind's reverse-DNS lookup.
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
 
 _ISSUED_PORTS: set[int] = set()
@@ -108,7 +119,8 @@ def get_json(port: int, path: str) -> dict | list:
 
 
 def wait_for_api(process: subprocess.Popen[str], port: int) -> None:
-    deadline = time.time() + 10
+    # Cold CI runners need real headroom for interpreter start + state load.
+    deadline = time.time() + 30
     while time.time() < deadline:
         if process.poll() is not None:
             raise AssertionError(f"api exited early: {process.returncode}")
@@ -213,7 +225,7 @@ def check_listener_and_health_helpers() -> None:
             capture_output=True,
             timeout=20,
         )
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HealthzHandler)
+        httpd = _FastBindThreadingHTTPServer(("127.0.0.1", 0), _HealthzHandler)
         context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(cert), str(key))
         httpd.socket = context.wrap_socket(httpd.socket, server_side=True)

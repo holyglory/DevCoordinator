@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import socket
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -3692,8 +3693,25 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             self._send(400, {"error": str(exc)})
 
 
+class FastBindThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse-DNS lookup in server_bind.
+
+    HTTPServer.server_bind calls socket.getfqdn(), which macOS CI runners
+    black-hole for ~30s (mDNSResponder drops reverse queries even for
+    loopback), stalling the server between bind() and listen(). The FQDN
+    only feeds CGI-style environment we never use — bind like a plain
+    TCPServer and report the bound address instead.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
+
+
 def serve_api(host: str, port: int) -> None:
-    server = http.server.ThreadingHTTPServer((host, port), ApiHandler)
+    server = FastBindThreadingHTTPServer((host, port), ApiHandler)
     # Report the actual bound port so `--port 0` (OS-assigned) is usable:
     # callers treat this stdout line as the readiness signal.
     port = server.server_address[1]

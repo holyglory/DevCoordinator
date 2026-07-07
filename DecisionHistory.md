@@ -28,6 +28,20 @@ budget (the coordinator legitimately runs them for minutes). The "successful"
 earlier run that suggested macOS had ever been green was only the Copilot
 review job — the full gate had never passed on macOS before this.
 
+Follow-up (same day): the fixture sweep missed that the hazard is any stdlib
+`HTTPServer` construction, not just `-m http.server` fixtures — the next run
+passed all 81 node tests and then failed in the coordinator self-test because
+`serve_api` itself builds a stock `ThreadingHTTPServer`, which pays the same
+~30s getfqdn stall between bind() and listen() (the console e2e only passed
+because its readiness budget is 60s). Cure at the source: the coordinator API
+now binds through `FastBindThreadingHTTPServer` (a `server_bind` override
+that binds like a plain `socketserver.TCPServer` and skips reverse DNS),
+pinned by validate needles; the coordinator and formal-web-ui self-test
+in-process fixtures use the same override, and `wait_for_api` gets 30s of
+cold-runner headroom. Generalized policy: on this repo, never construct a
+stdlib `HTTPServer`/`ThreadingHTTPServer` (or `-m http.server`) directly in
+anything CI runs — always the fast-bind subclass or a plain `TCPServer`.
+
 ## 2026-07-07 - validate.py de-staled: needles pin code and call sites, not comments and definitions
 
 Decision: A two-auditor adversarial pass over the gate itself (prompted by the
