@@ -489,8 +489,14 @@ select:disabled { color: var(--dim); }
 .cell .title-line { display: block; color: var(--dim); font-size: 12px; }
 
 .routes-grid { grid-template-columns: minmax(0, 1.8fr) minmax(0, 1.4fr) 96px 150px 70px; }
-.srv-grid    { grid-template-columns: 26px minmax(0, 1.6fr) 64px minmax(0, 210px) 112px 22px max-content; }
-.dock-grid   { grid-template-columns: 20px minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 210px) minmax(0, .9fr) max-content; }
+/* Fixed widths everywhere except the name column: each row is its own grid,
+   so a max-content column would size per row and drift the header out of
+   alignment with the rows beneath it. Actions are right-aligned in a fixed
+   slot (ghost icon placeholders keep button groups equal width). */
+.srv-grid    { grid-template-columns: 26px minmax(0, 1fr) 70px 210px 118px 22px 206px; }
+.dock-grid   { grid-template-columns: 20px minmax(0, 1fr) minmax(0, 260px) 210px minmax(0, 200px) 250px; }
+.srv-grid > .actions, .dock-grid > .actions,
+.grid-head.srv-grid > span:last-child, .grid-head.dock-grid > span:last-child { justify-self: end; text-align: right; }
 .lease-grid  { grid-template-columns: 74px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, .9fr) max-content; }
 .assign-grid { grid-template-columns: 74px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, .9fr) max-content; }
 
@@ -715,6 +721,10 @@ select:disabled { color: var(--dim); }
 span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; margin-bottom: 4px; }
 .spark-cpu { stroke: var(--accent); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .spark-mem { stroke: #b48cf2; stroke-width: 1.2; opacity: .7; vector-effect: non-scaling-stroke; }
+
+/* Numbers wear the same colors as their plot lines. */
+.u-cpu { color: var(--accent); }
+.u-mem { color: #b48cf2; }
 
 .chart-block { margin-top: 10px; min-width: 0; }
 .chart-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }

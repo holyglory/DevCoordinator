@@ -575,7 +575,9 @@
   function groupHeader(group, extraText) {
     const usage = group.row
       ? h('span', { class: 'proj-usage mono' },
-          `${fmtCpu(group.row.cpu_percent)} · ${fmtBytes(group.row.memory_bytes || 0)}`)
+          h('span', { class: 'u-cpu' }, fmtCpu(group.row.cpu_percent)),
+          ' · ',
+          h('span', { class: 'u-mem' }, fmtBytes(group.row.memory_bytes || 0)))
       : null;
     return h('div', { class: 'proj-head', title: group.project || '' },
       h('strong', { class: 'proj-name' }, group.name),
@@ -602,12 +604,15 @@
   const fmtCpu = (v) => `${(Number(v) || 0).toFixed(1)}%`;
 
   // points: [[epochMs, cpuPercent, memBytes], ...] oldest first.
-  function seriesLine(points, pick, w, hgt, pad) {
+  // `fixedMax` pins the y-scale: CPU series render on 0..max(100%, observed)
+  // so an idle 1% wiggle reads as the flat line it is; memory has no natural
+  // ceiling and keeps the 0..observed-max scale.
+  function seriesLine(points, pick, w, hgt, pad, fixedMax) {
     const t0 = points[0][0];
     const span = Math.max(1, points[points.length - 1][0] - t0);
     let vMax = 0;
     for (const p of points) vMax = Math.max(vMax, Number(pick(p)) || 0);
-    const scale = vMax || 1;
+    const scale = Math.max(fixedMax || 0, vMax) || 1;
     const coords = points.map((p) => {
       const x = pad + ((p[0] - t0) / span) * (w - pad * 2);
       const y = hgt - pad - (Math.max(0, Number(pick(p)) || 0) / scale) * (hgt - pad * 2);
@@ -631,10 +636,12 @@
     });
     svg.append(
       svgEl('polyline', { class: 'spark-mem', fill: 'none', points: seriesLine(points, (p) => p[2], w, hgt, 2).line }),
-      svgEl('polyline', { class: 'spark-cpu', fill: 'none', points: seriesLine(points, (p) => p[1], w, hgt, 2).line }),
+      svgEl('polyline', { class: 'spark-cpu', fill: 'none', points: seriesLine(points, (p) => p[1], w, hgt, 2, CPU_SCALE_MAX).line }),
     );
     return svg;
   }
+
+  const CPU_SCALE_MAX = 100; // CPU charts use a fixed 0-100% scale (multicore peaks extend it)
 
   function timeSpanText(ms) {
     const min = Math.round(ms / 60_000);
@@ -654,7 +661,7 @@
     const w = 600;
     const hgt = 110;
     const pad = 3;
-    const { line, vMax } = seriesLine(points, pick, w, hgt, pad);
+    const { line, vMax } = seriesLine(points, pick, w, hgt, pad, cssClass === 'c-cpu' ? CPU_SCALE_MAX : 0);
     const svg = svgEl('svg', {
       class: `chart ${cssClass}`,
       viewBox: `0 0 ${w} ${hgt}`,
@@ -668,7 +675,8 @@
     const last = Number(pick(points[points.length - 1])) || 0;
     const span = points[points.length - 1][0] - points[0][0];
     head.append(
-      h('span', { class: 'chart-now mono' }, fmtVal(last)),
+      // Current value in the same color as its plot line.
+      h('span', { class: `chart-now mono ${cssClass === 'c-cpu' ? 'u-cpu' : 'u-mem'}` }, fmtVal(last)),
       h('span', { class: 'meta-passive' }, `peak ${fmtVal(vMax)} · ${timeSpanText(span)}`),
     );
     return h('div', { class: 'chart-block' }, head, svg);
@@ -683,7 +691,11 @@
     if (!hasLive && (!ent || ent.points.length < 2)) {
       return h('span', { class: 'cell usage-cell dim', 'data-label': 'CPU / Mem' }, '—');
     }
-    const nums = hasLive ? `${fmtCpu(cpu)} · ${fmtBytes(Number(mem) || 0)}` : '—';
+    // CPU and memory numbers wear their plot-line colors so the two series
+    // are tellable apart at a glance.
+    const nums = hasLive
+      ? [h('span', { class: 'u-cpu' }, fmtCpu(cpu)), ' · ', h('span', { class: 'u-mem' }, fmtBytes(Number(mem) || 0))]
+      : '—';
     const fkey = `usage:${scope}:${key}`;
     return h('span', { class: 'cell usage-cell', 'data-label': 'CPU / Mem' },
       h('button', {
@@ -2192,7 +2204,7 @@
     return h('div', { class: 'bar-row' },
       h('span', { class: 'bar-label' }, label),
       h('div', { class: 'bar', 'aria-hidden': 'true' }, fill),
-      h('span', { class: 'bar-val mono' }, valueText));
+      h('span', { class: `bar-val mono ${isMem ? 'u-mem' : 'u-cpu'}` }, valueText));
   }
 
   // ---------------------------------------------------------------- projects tree

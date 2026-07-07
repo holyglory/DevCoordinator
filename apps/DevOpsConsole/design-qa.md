@@ -264,3 +264,35 @@ phone; zero horizontal scroll; zero page errors), formal verifier 0 findings
 at 1440/900/390, console suite 79/79, validate.py ok.
 
 final result: passed.
+
+---
+
+# Design QA pass 6 — 2026-07-07: tab header alignment, fixed CPU scale, series-colored numbers (v1.3.4)
+
+User-reported: the Servers/Docker tab header row drifted from the data rows
+(the max-content actions column sized per row); CPU sparklines/charts
+auto-scaled to the observed max, making 1% idle noise fill the full height;
+CPU and memory numbers were monochrome and hard to attribute to their plot
+lines; and an assigned domain (gf.vr.ae) was blocked by Vite's allowedHosts.
+
+Changes: srv-grid/dock-grid switched to fully fixed column templates with a
+right-aligned fixed actions column (headers included); CPU series everywhere
+(sparklines, popover charts, performance cards) render on a fixed
+0–max(100%, observed) scale while memory keeps 0–observed; CPU numbers wear
+the accent blue and memory the purple of their plot lines (row cells, chart
+current values, project group headers, usage bars). The Vite fix is in the
+target project (allowedHosts: ['.vr.ae']) with the runbook updated to
+recommend the domain-family form.
+
+evidence: `design-qa-servers-aligned-desktop.png` (header and rows share
+column geometry; a genuine restart CPU spike reaches the top of the fixed
+scale while idle series hug the baseline), `design-qa-chart-scale-popover.png`
+(colored current values, 0-100% CPU chart).
+verification (live, measured): every header column left edge matches every
+row within 2px and all action cells + header share one right edge; idle CPU
+sparklines stay within the bottom quarter of the fixed scale while the
+restart spike legitimately reaches the top; colored number spans present in
+rows and charts; gf.vr.ae serves the Vite app shell through the TLS edge
+(200 with session). Console suite 81/81, validate.py ok.
+
+final result: passed.
