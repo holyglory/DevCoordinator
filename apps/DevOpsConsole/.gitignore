@@ -1,0 +1,4 @@
+.env
+certs/dev/
+state/
+node_modules/

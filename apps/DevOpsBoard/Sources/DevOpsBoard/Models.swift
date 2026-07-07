@@ -1,6 +1,6 @@
 import Foundation
 
-struct Inventory: Decodable {
+struct Inventory: Decodable, Equatable {
     var coordinatorHome: String?
     var statePath: String?
     var project: String?
@@ -42,7 +42,7 @@ struct Inventory: Decodable {
     )
 }
 
-struct ManagedURL: Decodable, Identifiable {
+struct ManagedURL: Decodable, Identifiable, Hashable {
     var id: String { "\(project ?? ""):\(name ?? ""):\(url ?? "")" }
     var name: String?
     var project: String?
@@ -148,10 +148,15 @@ struct ProcessUsage: Decodable, Hashable, Identifiable {
 }
 
 struct ProjectUsage: Decodable, Hashable, Identifiable {
-    var id: String { project ?? projectKey ?? name ?? "project" }
+    var id: String { usageKey ?? project ?? projectKey ?? name ?? "project" }
+    var usageKey: String?
     var project: String?
     var projectKey: String?
     var name: String?
+    // Authoritative membership from the coordinator: the servers/containers a
+    // row claims are exactly the ones whole-project actions act on.
+    var serverIDs: [String]?
+    var containerNames: [String]?
     var serverCount: Int?
     var containerCount: Int?
     var processCount: Int?
@@ -166,7 +171,10 @@ struct ProjectUsage: Decodable, Hashable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case project, name, processes
+        case usageKey = "usage_key"
         case projectKey = "project_key"
+        case serverIDs = "server_ids"
+        case containerNames = "container_names"
         case serverCount = "server_count"
         case containerCount = "container_count"
         case processCount = "process_count"

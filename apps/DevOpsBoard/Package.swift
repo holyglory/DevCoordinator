@@ -3,12 +3,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "CodexOpsConsole",
+    name: "DevOpsBoard",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "CodexOpsConsole", targets: ["CodexOpsConsole"])
+        .executable(name: "DevOpsBoard", targets: ["DevOpsBoard"])
     ],
     targets: [
-        .executableTarget(name: "CodexOpsConsole")
+        .executableTarget(name: "DevOpsBoard")
     ]
 )

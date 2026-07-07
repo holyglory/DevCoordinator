@@ -8,7 +8,7 @@ on:
 
 jobs:
   validate:
-    # macOS is required: scripts/validate.py builds the CodexOpsConsole Swift app
+    # macOS is required: scripts/validate.py builds the DevOpsBoard Swift app
     # and the formal-web-ui self-test drives a real Chromium via Playwright.
     runs-on: macos-latest
     timeout-minutes: 30

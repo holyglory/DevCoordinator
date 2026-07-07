@@ -40,12 +40,17 @@ a Codex or Claude Code skills directory.
 - `full_repo_harness/`: shared Python harness code for repository discovery,
   batching, manifests, queue markers, and verifier helpers used by audit
   skills.
-- `apps/CodexOpsConsole/`: a native macOS SwiftUI utility for viewing and
-  managing coordinator inventory, dev-server URLs, Docker containers, database
-  backups, leases, and recent service events.
+- `apps/DevOpsBoard/`: a native macOS SwiftUI utility (formerly Codex Ops
+  Console) for viewing and managing coordinator inventory, dev-server URLs,
+  Docker containers, database backups, leases, and recent service events.
+- `apps/DevOpsConsole/`: a zero-dependency Node 20 web control center for the
+  `vr.ae` VPS that terminates TLS for `*.vr.ae` (80→443 redirect), reverse-
+  proxies `<slug>.vr.ae` to local dev-server ports (WebSocket/HMR included)
+  behind Google sign-in with a per-route public/login toggle, and drives the
+  coordinator HTTP API on loopback as its control engine.
 - `scripts/validate.py`: repo-level validation for all skills, the shared
   harness, vendored fallback copies, standalone skill-copy execution, and the
-  Codex Ops Console Swift build.
+  DevOps Board Swift build.
 
 Each skill directory should keep its own `SKILL.md`, README, scripts, agents,
 fixtures, and tests together so the skill can be reviewed or installed as a

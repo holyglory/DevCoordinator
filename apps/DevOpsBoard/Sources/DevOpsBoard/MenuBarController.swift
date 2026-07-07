@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-final class CodexOpsAppDelegate: NSObject, NSApplicationDelegate {
+final class DevOpsBoardAppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
     }
@@ -23,14 +23,17 @@ final class AppWindowController: NSObject, NSWindowDelegate {
     static let shared = AppWindowController()
 
     private weak var window: NSWindow?
+    private weak var store: OpsStore?
 
-    func attach(_ window: NSWindow) {
+    func attach(_ window: NSWindow, store: OpsStore) {
+        self.store = store
         guard self.window !== window else { return }
         self.window = window
         window.delegate = self
         window.isReleasedWhenClosed = false
         window.standardWindowButton(.miniaturizeButton)?.target = self
         window.standardWindowButton(.miniaturizeButton)?.action = #selector(minimizeToMenuBar(_:))
+        publishWindowVisibility()
     }
 
     func showWindow() {
@@ -41,6 +44,7 @@ final class AppWindowController: NSObject, NSWindowDelegate {
         }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        publishWindowVisibility()
     }
 
     func hideWindow() {
@@ -50,6 +54,7 @@ final class AppWindowController: NSObject, NSWindowDelegate {
         }
         window.orderOut(nil)
         NSApp.setActivationPolicy(.accessory)
+        publishWindowVisibility()
     }
 
     @objc
@@ -64,6 +69,16 @@ final class AppWindowController: NSObject, NSWindowDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         hideWindow()
         return false
+    }
+
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        publishWindowVisibility()
+    }
+
+    private func publishWindowVisibility() {
+        guard let window, let store else { return }
+        let visible = window.isVisible && window.occlusionState.contains(.visible)
+        store.setSurfaceVisible(.window, visible)
     }
 }
 
@@ -103,9 +118,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "terminal.fill", accessibilityDescription: "Codex Ops")
+            button.image = NSImage(systemSymbolName: "terminal.fill", accessibilityDescription: "DevOps Board")
             button.imagePosition = .imageLeading
-            button.title = " Ops"
+            button.title = " DevOps"
             button.target = self
             button.action = #selector(togglePopover(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -145,10 +160,19 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             )
         )
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        Task { await store.loadInventory() }
+        store.refresh()
     }
 
     private func closePopover() {
         popover?.performClose(nil)
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        store?.setSurfaceVisible(.popover, true)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        store?.setSurfaceVisible(.popover, false)
+        popover?.contentViewController = nil
     }
 }

@@ -6,7 +6,7 @@ struct MenuBarRuntimeView: View {
     let quit: () -> Void
 
     private var groups: [ProjectGroup] {
-        projectGroups(from: store.inventory)
+        store.projectGroups
     }
 
     var body: some View {
@@ -16,7 +16,7 @@ struct MenuBarRuntimeView: View {
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.blue)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Codex Ops")
+                    Text("DevOps Board")
                         .font(.system(size: 14, weight: .semibold))
                     Text(store.connected ? "Coordinator connected" : "Coordinator waiting")
                         .font(.system(size: 11))
@@ -99,9 +99,6 @@ struct MenuBarRuntimeView: View {
         .frame(width: 430, height: 600)
         .background(Theme.sidebar)
         .foregroundStyle(Theme.primary)
-        .task {
-            await store.loadInventory()
-        }
     }
 }
 
@@ -205,7 +202,7 @@ struct MenuProjectRow: View {
                 ForEach(group.servers) { server in
                     MenuTaskRow(
                         kind: .server,
-                        title: resourceDisplayName(server.name, inProject: group.id),
+                        title: resourceDisplayName(server.name, inProject: group.name),
                         subtitle: menuServerSubtitle(server),
                         status: server.status,
                         canStop: canStopServer(server),
@@ -219,7 +216,7 @@ struct MenuProjectRow: View {
                 ForEach(group.containers, id: \.stableID) { container in
                     MenuTaskRow(
                         kind: .docker,
-                        title: resourceDisplayName(container.name, inProject: group.id),
+                        title: resourceDisplayName(container.name, inProject: group.name),
                         subtitle: menuDockerSubtitle(container),
                         status: container.status,
                         canStop: container.isRunning,
@@ -233,7 +230,7 @@ struct MenuProjectRow: View {
                 ForEach(group.databases, id: \.stableID) { database in
                     MenuTaskRow(
                         kind: .database,
-                        title: resourceDisplayName(database.name, inProject: group.id),
+                        title: resourceDisplayName(database.name, inProject: group.name),
                         subtitle: menuDockerSubtitle(database),
                         status: database.status,
                         canStop: database.isRunning,

@@ -2,9 +2,15 @@ import AppKit
 import Foundation
 import SwiftUI
 
+enum RefreshSurface: Hashable {
+    case window
+    case popover
+}
+
 @MainActor
 final class OpsStore: ObservableObject {
     @Published var inventory: Inventory = .empty
+    @Published private(set) var projectGroups: [ProjectGroup] = []
     @Published var selectedServerID: ManagedServer.ID?
     @Published var selectedDockerID: String?
     @Published var selectedDatabaseID: String?
@@ -13,7 +19,6 @@ final class OpsStore: ObservableObject {
     @Published var activeTab: ResourceTab = .servers
     @Published var searchText = ""
     @Published var filter: ServiceFilter = .all
-    @Published var isLoading = false
     @Published var lastError: String?
     @Published var lastErrorDetails: String?
     @Published var lastErrorTitle: String?
@@ -28,9 +33,15 @@ final class OpsStore: ObservableObject {
     @Published var leaseRange = "3000-3999"
     @Published var projectRuntimeReports: [String: ProjectRuntimeReport] = [:]
 
+    static let autoRefreshInterval: Duration = .seconds(5)
+
     private let coordinatorScript: String
     private let backupScript: String
     private var lastErrorSource: String?
+    private var visibleSurfaces: Set<RefreshSurface> = []
+    private var autoRefreshTask: Task<Void, Never>?
+    private var activeLoad: Task<Void, Never>?
+    private var followUpRequested = false
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -103,19 +114,65 @@ final class OpsStore: ObservableObject {
         NSUserName()
     }
 
+    // MARK: - Refresh scheduling
+
+    /// Auto-refresh runs only while a surface (main window, menu bar popover)
+    /// is actually visible; a hidden app spawns no coordinator processes.
+    func setSurfaceVisible(_ surface: RefreshSurface, _ visible: Bool) {
+        if visible {
+            visibleSurfaces.insert(surface)
+        } else {
+            visibleSurfaces.remove(surface)
+        }
+        if visibleSurfaces.isEmpty {
+            autoRefreshTask?.cancel()
+            autoRefreshTask = nil
+        } else if autoRefreshTask == nil {
+            autoRefreshTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    self?.requestRefresh(force: false)
+                    try? await Task.sleep(for: OpsStore.autoRefreshInterval)
+                }
+            }
+        }
+    }
+
     func refresh() {
-        Task { await loadInventory() }
+        requestRefresh(force: true)
+    }
+
+    /// Coalesces concurrent refreshes into one in-flight load. A forced request
+    /// arriving mid-load queues exactly one follow-up pass so callers that just
+    /// mutated state still observe post-mutation inventory.
+    private func requestRefresh(force: Bool) {
+        if activeLoad != nil {
+            if force { followUpRequested = true }
+            return
+        }
+        activeLoad = Task { [weak self] in
+            await self?.runLoadLoop()
+        }
+    }
+
+    private func runLoadLoop() async {
+        repeat {
+            followUpRequested = false
+            await performLoadInventory()
+        } while followUpRequested
+        activeLoad = nil
     }
 
     func loadInventory() async {
-        isLoading = true
-        defer { isLoading = false }
+        requestRefresh(force: true)
+        await activeLoad?.value
+    }
+
+    private func performLoadInventory() async {
         do {
             let inventories = try await loadInventoriesFromCoordinatorHomes()
             var decoded = mergeInventories(inventories)
             decoded.servers = deduplicatedManagedServers(decoded.servers)
-            inventory = decoded
-            keepSelectionValid()
+            applyInventory(decoded)
             if lastErrorSource == "inventory" {
                 clearLastError()
             }
@@ -129,32 +186,68 @@ final class OpsStore: ObservableObject {
         }
     }
 
+    /// Publishes only when the payload actually changed so an idle inventory
+    /// does not re-render the whole window on every poll.
+    private func applyInventory(_ decoded: Inventory) {
+        guard decoded != inventory else { return }
+        inventory = decoded
+        let groups = makeProjectGroups(from: decoded)
+        if groups != projectGroups {
+            projectGroups = groups
+        }
+        keepSelectionValid()
+    }
+
     private func loadInventoriesFromCoordinatorHomes() async throws -> [Inventory] {
         let homes = discoveredCoordinatorHomes()
-        var inventories: [Inventory] = []
-        var failures: [String] = []
-        for home in homes {
+        let script = coordinatorScript
+        let requests: [(home: String, arguments: [String])] = homes.enumerated().map { index, home in
             var arguments = ["inventory"]
             if let scopedProjectPath {
                 arguments.append(contentsOf: ["--project", scopedProjectPath])
             }
-            if home != homes.first {
+            if index != 0 {
                 arguments.append("--no-docker")
             }
-            do {
-                let result = try await runPython(
-                    script: coordinatorScript,
-                    arguments: arguments,
-                    environment: ["CODEX_AGENT_COORDINATOR_HOME": home]
-                )
-                try ensureSuccess(result)
-                inventories.append(try JSONDecoder().decode(Inventory.self, from: Data(result.output.utf8)))
-            } catch {
-                failures.append("\(home): \(error.localizedDescription)")
+            return (home, arguments)
+        }
+
+        var loaded: [Inventory?] = Array(repeating: nil, count: requests.count)
+        var failures: [(index: Int, message: String)] = []
+        await withTaskGroup(of: (Int, Result<Inventory, Error>).self) { group in
+            for (index, request) in requests.enumerated() {
+                group.addTask {
+                    do {
+                        let result = try await runPython(
+                            script: script,
+                            arguments: request.arguments,
+                            environment: ["CODEX_AGENT_COORDINATOR_HOME": request.home],
+                            timeout: .seconds(60)
+                        )
+                        guard result.status == 0 else {
+                            throw RuntimeError(result.error.isEmpty ? result.output : result.error)
+                        }
+                        let decoded = try JSONDecoder().decode(Inventory.self, from: Data(result.output.utf8))
+                        return (index, .success(decoded))
+                    } catch {
+                        return (index, .failure(error))
+                    }
+                }
+            }
+            for await (index, result) in group {
+                switch result {
+                case .success(let inventory):
+                    loaded[index] = inventory
+                case .failure(let error):
+                    failures.append((index, "\(requests[index].home): \(error.localizedDescription)"))
+                }
             }
         }
+
+        let inventories = loaded.compactMap { $0 }
         if inventories.isEmpty {
-            throw RuntimeError(failures.joined(separator: "\n").isEmpty ? "No coordinator inventory could be loaded" : failures.joined(separator: "\n"))
+            let messages = failures.sorted { $0.index < $1.index }.map { $0.message }
+            throw RuntimeError(messages.isEmpty ? "No coordinator inventory could be loaded" : messages.joined(separator: "\n"))
         }
         return inventories
     }
@@ -226,7 +319,7 @@ final class OpsStore: ObservableObject {
 
     private func mergeProjectUsage(_ rows: [ProjectUsage]) -> [ProjectUsage] {
         let grouped = Dictionary(grouping: rows) { row in
-            row.project ?? row.projectKey ?? row.name ?? "local"
+            row.usageKey ?? row.project ?? row.projectKey ?? row.name ?? "local"
         }
         return grouped.values.map { bucket in
             var seenPIDs = Set<Int>()
@@ -239,12 +332,24 @@ final class OpsStore: ObservableObject {
             var dockerMemory = 0.0
             var serverCount = 0
             var containerCount = 0
+            // Membership must merge as a union: each coordinator home only
+            // reports the servers/containers it manages for the shared repo.
+            var seenServerIDs = Set<String>()
+            var serverIDs: [String] = []
+            var seenContainerNames = Set<String>()
+            var containerNames: [String] = []
 
             for row in bucket {
                 serverCount += row.serverCount ?? 0
                 containerCount = max(containerCount, row.containerCount ?? 0)
                 dockerCPU = max(dockerCPU, row.dockerCPUPercent ?? 0)
                 dockerMemory = max(dockerMemory, row.dockerMemoryBytes ?? 0)
+                for serverID in row.serverIDs ?? [] where seenServerIDs.insert(serverID).inserted {
+                    serverIDs.append(serverID)
+                }
+                for containerName in row.containerNames ?? [] where seenContainerNames.insert(containerName).inserted {
+                    containerNames.append(containerName)
+                }
                 let rowProcesses = row.processes ?? []
                 if rowProcesses.isEmpty {
                     fallbackProcessCPU += row.processCPUPercent ?? 0
@@ -266,9 +371,12 @@ final class OpsStore: ObservableObject {
             let first = bucket.max(by: { usageRank($0) < usageRank($1) }) ?? bucket[0]
             let hotProcesses = processes.sorted { ($0.cpuPercent ?? 0, $0.rssBytes ?? 0) > ($1.cpuPercent ?? 0, $1.rssBytes ?? 0) }.prefix(5).map { $0 }
             return ProjectUsage(
+                usageKey: first.usageKey,
                 project: first.project,
                 projectKey: first.projectKey,
                 name: first.name,
+                serverIDs: serverIDs.isEmpty ? nil : serverIDs,
+                containerNames: containerNames.isEmpty ? nil : containerNames,
                 serverCount: serverCount,
                 containerCount: containerCount,
                 processCount: processes.isEmpty ? first.processCount : processes.count,
@@ -363,7 +471,7 @@ final class OpsStore: ObservableObject {
         runTracked(
             title: "Stop \(server.name)",
             subtitle: project,
-            arguments: ["server", "stop", "--agent", agentID, "--project", project, "--name", server.name, "--reason", "Stopped from Codex Ops Console"]
+            arguments: ["server", "stop", "--agent", agentID, "--project", project, "--name", server.name, "--reason", "Stopped from DevOps Board"]
         )
     }
 
@@ -416,7 +524,14 @@ final class OpsStore: ObservableObject {
         if let name = container?.name, !name.isEmpty {
             args.append(contentsOf: ["--container", name])
         }
-        runTracked(title: "Backup database", subtitle: container?.name ?? "auto-detect Postgres", script: backupScript, arguments: args)
+        // Large database dumps can legitimately run long.
+        runTracked(
+            title: "Backup database",
+            subtitle: container?.name ?? "auto-detect Postgres",
+            script: backupScript,
+            arguments: args,
+            timeout: .seconds(3600)
+        )
     }
 
     func prepareStartDraft() {
@@ -544,18 +659,24 @@ final class OpsStore: ObservableObject {
             self.selectedDatabaseID = nil
         }
         if selectedServerID == nil, selectedDockerID == nil, selectedDatabaseID == nil {
-            selectedServerID = inventory.servers.first?.id
-            if let selectedServerID {
-                sidebarSelection = .server(selectedServerID)
+            if let fallback = inventory.servers.first?.id {
+                selectedServerID = fallback
+                sidebarSelection = .server(fallback)
                 activeTab = .servers
             }
         }
     }
 
-    private func runTracked(title: String, subtitle: String, script: String? = nil, arguments: [String]) {
+    private func runTracked(
+        title: String,
+        subtitle: String,
+        script: String? = nil,
+        arguments: [String],
+        timeout: Duration = .seconds(600)
+    ) {
         Task {
             do {
-                let result = try await runPython(script: script ?? coordinatorScript, arguments: arguments)
+                let result = try await runPython(script: script ?? coordinatorScript, arguments: arguments, timeout: timeout)
                 if result.status == 0 {
                     clearLastError()
                     await loadInventory()
@@ -741,36 +862,68 @@ struct RuntimeError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-func runPython(script: String, arguments: [String], environment: [String: String] = [:]) async throws -> CommandResult {
-    try await Task.detached(priority: .userInitiated) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", script] + arguments
-        if !environment.isEmpty {
-            process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+func runPython(
+    script: String,
+    arguments: [String],
+    environment: [String: String] = [:],
+    timeout: Duration = .seconds(600)
+) async throws -> CommandResult {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["python3", script] + arguments
+    if !environment.isEmpty {
+        process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
+    }
+
+    // Temp-file redirection instead of pipes: spawned grandchildren (dev
+    // servers) can inherit stdio, and a pipe would not reach EOF until they
+    // exit too.
+    let temporaryDirectory = FileManager.default.temporaryDirectory
+    let outputURL = temporaryDirectory.appendingPathComponent("devops-board-\(UUID().uuidString).out")
+    let errorURL = temporaryDirectory.appendingPathComponent("devops-board-\(UUID().uuidString).err")
+    FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+    FileManager.default.createFile(atPath: errorURL.path, contents: nil)
+    let outputHandle = try FileHandle(forWritingTo: outputURL)
+    let errorHandle = try FileHandle(forWritingTo: errorURL)
+    defer {
+        try? outputHandle.close()
+        try? errorHandle.close()
+        try? FileManager.default.removeItem(at: outputURL)
+        try? FileManager.default.removeItem(at: errorURL)
+    }
+    process.standardOutput = outputHandle
+    process.standardError = errorHandle
+
+    // The termination handler is installed before launch so an early exit
+    // cannot be missed, and no thread blocks in waitUntilExit().
+    let termination = AsyncStream<Int32> { continuation in
+        process.terminationHandler = { finished in
+            continuation.yield(finished.terminationStatus)
+            continuation.finish()
         }
+    }
+    try process.run()
 
-        let temporaryDirectory = FileManager.default.temporaryDirectory
-        let outputURL = temporaryDirectory.appendingPathComponent("codex-ops-\(UUID().uuidString).out")
-        let errorURL = temporaryDirectory.appendingPathComponent("codex-ops-\(UUID().uuidString).err")
-        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
-        FileManager.default.createFile(atPath: errorURL.path, contents: nil)
-        let outputHandle = try FileHandle(forWritingTo: outputURL)
-        let errorHandle = try FileHandle(forWritingTo: errorURL)
-        defer {
-            try? outputHandle.close()
-            try? errorHandle.close()
-            try? FileManager.default.removeItem(at: outputURL)
-            try? FileManager.default.removeItem(at: errorURL)
-        }
-        process.standardOutput = outputHandle
-        process.standardError = errorHandle
+    // Watchdog: a wedged child (e.g. a coordinator blocked on state.lock) must
+    // not stall the single-flight refresh pipeline forever. Best-effort only:
+    // cancellation is checked before each signal, but NSTask owns reaping, so
+    // a microsecond-scale exit-at-timeout race against pid reuse remains.
+    let pid = process.processIdentifier
+    let watchdog = Task {
+        try await Task.sleep(for: timeout)
+        try Task.checkCancellation()
+        kill(pid, SIGTERM)
+        try await Task.sleep(for: .seconds(5))
+        try Task.checkCancellation()
+        kill(pid, SIGKILL)
+    }
+    var status: Int32 = -1
+    for await value in termination {
+        status = value
+    }
+    watchdog.cancel()
 
-        try process.run()
-        process.waitUntilExit()
-
-        let output = String(data: (try? Data(contentsOf: outputURL)) ?? Data(), encoding: .utf8) ?? ""
-        let error = String(data: (try? Data(contentsOf: errorURL)) ?? Data(), encoding: .utf8) ?? ""
-        return CommandResult(output: output, error: error, status: process.terminationStatus)
-    }.value
+    let output = String(data: (try? Data(contentsOf: outputURL)) ?? Data(), encoding: .utf8) ?? ""
+    let error = String(data: (try? Data(contentsOf: errorURL)) ?? Data(), encoding: .utf8) ?? ""
+    return CommandResult(output: output, error: error, status: status)
 }

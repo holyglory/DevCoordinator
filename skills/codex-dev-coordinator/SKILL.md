@@ -95,6 +95,44 @@ python3 scripts/dev_coordinator.py server start \
   --health-url 'http://127.0.0.1:{port}/'
 ```
 
+### Durable port assignments (ports are fixed per repo server)
+
+The first successful `server start` or `server register` for a
+`(canonical project, server name)` identity durably pins that port to the
+server. The pin lives in `state.json` under `port_assignments`, survives
+server stops, lease expiry, and stopped-record pruning, and is removed only by
+an explicit unassign (or `state reset`). Consequences agents can rely on:
+
+- Restarting a server — even weeks later, after its stopped record was pruned —
+  lands on the same port, so tests and tooling can hard-code where a repo's
+  servers live. Look the port up while the server is stopped:
+
+```bash
+python3 scripts/dev_coordinator.py port assignments --project "$PROJECT_ROOT"
+```
+
+- No other project can lease, start on, or register over a pinned port. Such
+  attempts fail with an error naming the owner
+  (`port N is durably assigned to server 'web' of /repo`); do not work around
+  it — pick another port or ask the owner to unassign.
+- Starting the owner without `--range` treats the pinned port as the only
+  acceptable outcome: if a foreign process squats it, the start fails loudly
+  instead of silently drifting to a new port.
+- Passing an explicit `--preferred`/`--range` that lands the owner on a
+  different port re-pins the assignment to the new port.
+- Pin a port ahead of the first start, or release one:
+
+```bash
+python3 scripts/dev_coordinator.py port assign --agent "$USER" --project "$PROJECT_ROOT" --name web --port 3210
+python3 scripts/dev_coordinator.py port unassign --agent "$USER" --project "$PROJECT_ROOT" --name web
+```
+
+`port unassign --port N --force` removes another project's pin (for example an
+orphan left by a moved or renamed repo); without `--force` foreign pins are
+protected. Pre-assignment state files are migrated automatically: every
+existing server record seeds a pin for its recorded port, and when two records
+contest one port the most recently stopped record wins.
+
 If a server is already running on the declared fixed port but is not registered,
 adopt it instead of starting a duplicate. Adoption is allowed only when the
 listener PID can be attributed to the canonical project root. If the occupied
@@ -131,7 +169,20 @@ under the correct canonical repo. Use `inventory --project "$PROJECT_ROOT"` or
 project `status` evidence before assuming a server is healthy when it is slow,
 GC-bound, or memory-heavy. The `project_usage` rollup lists CPU percent, memory
 bytes, process counts, and hot PIDs by repo; it must be treated as diagnostic
-evidence, not synthetic UI decoration.
+evidence, not synthetic UI decoration. Each row also carries authoritative
+membership (`usage_key`, `server_ids`, `container_names`) so UIs group
+inventory rows without re-implementing repo-identity heuristics.
+
+Display grouping and whole-project actions share one membership model: the
+same attribution that places a container in a `project_usage` row decides
+whether `project start|restart|stop` acts on it. Explicit attribution (Docker
+Compose labels, then coordinator sidecar metadata) always wins; an
+unattributed container is claimed by a known repo only when exactly one known
+project path matches its name key; a container whose name key matches several
+known repos stays in its own name-keyed group (`usage_key` `name:<key>`,
+`project` null) and no whole-project action touches it. A UI grouped by
+`project_usage` therefore shows exactly the blast radius of whole-project
+actions.
 
 Inventory must show one current row per logical server identity
 (`canonical project path + server name`). Repeated starts, stops, restarts, or
@@ -157,9 +208,12 @@ Useful endpoints:
 - `GET /v1/inventory`
 - `GET /v1/state`
 - `GET /v1/ports`
+- `GET /v1/ports/assignments`
 - `GET /v1/servers`
 - `POST /v1/ports/lease`
 - `POST /v1/ports/release`
+- `POST /v1/ports/assign`
+- `POST /v1/ports/unassign`
 - `POST /v1/servers/start`
 - `POST /v1/servers/register`
 - `POST /v1/servers/stop`
@@ -215,8 +269,10 @@ first, then coordinator sidecar metadata for unlabeled containers.
 
 When a project runtime declaration names an existing unlabeled container,
 `project start` adopts that container into coordinator-side metadata before it
-reports final status. This keeps databases such as `aerodb-pg` grouped under
-the repo that declared them instead of under a name-derived pseudo-project.
+reports final status, and `project stop`/`project restart` record the same
+sidecar attribution for the containers they act on. This keeps databases such
+as `aerodb-pg` grouped under the repo that declared them instead of under a
+name-derived pseudo-project.
 
 The shared inventory includes stopped containers (`docker ps --all`) so agents
 can see containers that are available to start instead of accidentally creating
@@ -284,8 +340,12 @@ Minimal example:
 
 If there is no declaration, the coordinator may discover existing managed
 servers, Docker Compose files, Compose working-directory labels, and matching
-containers. If it still cannot identify a complete runtime, it returns
-`ok=false` with `classification=missing_dependency` instead of guessing ports or
+containers. Container discovery uses the same attribution as inventory's
+`project_usage` grouping: a container explicitly attributed to another project
+never joins this project's runtime, and a name match claims a container only
+when this project is the single known claimant for its name key. If the
+coordinator still cannot identify a complete runtime, it returns `ok=false`
+with `classification=missing_dependency` instead of guessing ports or
 reporting success.
 
 ## Agent Workflow
@@ -307,6 +367,11 @@ reporting success.
    `project start` may reclaim same-project fixed-port leases that were left by
    stopped, missing, or dead managed servers; do not manually switch to a new
    port to work around stale coordinator metadata.
+   Durable port assignments back this policy automatically: every managed or
+   registered server keeps its port across stops, restarts, and record pruning,
+   and `port assignments --project "$PROJECT_ROOT"` answers "where does this
+   repo's server live" even while it is stopped. If a start fails because the
+   pinned port is unavailable, surface the error instead of moving the server.
 5. When a dependency is stopped or unhealthy, preserve the evidence in the
    runtime report (`before`, recent logs, previous exit reasons), then recover
    through `project start` or `project restart`, and report both evidence and
@@ -335,9 +400,13 @@ reporting success.
 - Stopped-server records are retained for evidence but pruned once they pass the
   retention window or exceed the per-home cap, so the shared state file does not
   grow without bound across months of start/stop cycles.
+- Pruning never touches durable port assignments: a server whose stopped record
+  aged out still owns its pinned port and restarts on it.
 - A corrupt state file (for example a partial write after a crash) is backed up
   to `state.json.corrupt-<epoch>` and replaced with a fresh default state, so
-  read-only commands like `inventory` recover instead of failing.
+  read-only commands like `inventory` recover instead of failing. This reset
+  also clears durable port assignments; they re-seed from any surviving server
+  records and re-pin on the next start of each server.
 
 ## Safety Notes
 
@@ -347,4 +416,8 @@ reporting success.
   repo has multiple services.
 - Set `--ttl` for short-lived port leases that are not attached to a managed
   server. Expired leases are ignored during new allocation.
+- Leases and assignments are different things: a lease says "this port is in
+  use right now" and expires or is released on stop; a durable assignment says
+  "this port belongs to this repo's server" and never expires. Manual
+  `port lease` calls do not create assignments.
 - Use `--json` on CLI commands when another script or agent will parse output.

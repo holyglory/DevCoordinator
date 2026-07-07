@@ -1,0 +1,545 @@
+// Console REST API (/api/*). The router only dispatches here for the console
+// host after session validation; this module still re-checks the session and
+// enforces the Origin check on every mutation. Only the fixed endpoint set
+// below ever reaches the (unauthenticated, loopback) coordinator.
+
+import { CoordError } from './coordinator.mjs';
+import { PrefsError } from './prefs.mjs';
+import { RouteError } from './routes.mjs';
+
+const BODY_LIMIT = 64 * 1024;
+const SERVER_ACTIONS = new Set(['stop', 'restart']);
+const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
+const PROJECT_ACTIONS = new Set(['start', 'stop', 'restart']);
+const CONTAINER_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+const TAIL_MAX = 5000;
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+export function createConsoleApi({ config, log, coordinator, routeStore, guard, certManager, metrics, prefs }) {
+  const clog = typeof log?.child === 'function' ? log.child({ mod: 'api' }) : log;
+
+  function sendJson(res, status, payload) {
+    const body = JSON.stringify(payload);
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': Buffer.byteLength(body),
+      'cache-control': 'no-store',
+    });
+    res.end(body);
+  }
+
+  async function readJsonBody(req) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > BODY_LIMIT) {
+        // Early exit destroys the request stream via the async iterator.
+        throw new ApiError(400, 'request body exceeds the 64KB limit');
+      }
+      chunks.push(chunk);
+    }
+    if (size === 0) return {};
+    let parsed;
+    try {
+      parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    } catch {
+      throw new ApiError(400, 'request body must be valid JSON');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new ApiError(400, 'request body must be a JSON object');
+    }
+    return parsed;
+  }
+
+  function requireString(value, field) {
+    if (typeof value !== 'string' || !value.trim()) {
+      throw new ApiError(400, `${field} is required`);
+    }
+    return value.trim();
+  }
+
+  function requireContainer(value) {
+    if (typeof value !== 'string' || !CONTAINER_RE.test(value)) {
+      throw new ApiError(400, 'name must be a valid container name or id');
+    }
+    return value;
+  }
+
+  function clampTail(value, fallback) {
+    if (value === undefined || value === null) return fallback;
+    let n = value;
+    if (typeof n === 'string' && /^\d+$/.test(n.trim())) n = Number(n.trim());
+    if (!Number.isInteger(n) || n < 1 || n > TAIL_MAX) {
+      throw new ApiError(400, `tail must be an integer between 1 and ${TAIL_MAX}`);
+    }
+    return n;
+  }
+
+  function publicUrl(slug) {
+    // Scheme/port follow the deployment (http + explicit port in dev mode);
+    // in production this yields exactly https://<slug>.<domain>.
+    const origin = new URL(config.consoleOrigin);
+    const port = origin.port ? `:${origin.port}` : '';
+    return `${origin.protocol}//${slug}.${config.domain}${port}`;
+  }
+
+  async function resolveSafe(slug) {
+    try {
+      // resolve() uses coordinator.serversRaw() — never the full inventory.
+      return await routeStore.resolve(slug, coordinator);
+    } catch (err) {
+      return { port: null, reason: err?.message ?? String(err) };
+    }
+  }
+
+  function toRouteView(route, resolved) {
+    const view = {
+      ...route,
+      url: publicUrl(route.slug),
+      resolved: { port: resolved?.port ?? null },
+    };
+    if (resolved?.reason) view.resolved.reason = resolved.reason;
+    if (resolved?.server?.status) view.resolved.serverStatus = resolved.server.status;
+    return view;
+  }
+
+  async function routeViews() {
+    // serversRaw() is cached+coalesced, so parallel resolves share one call.
+    return Promise.all(
+      routeStore.list().map(async (route) => toRouteView(route, await resolveSafe(route.slug))),
+    );
+  }
+
+  function normProject(value) {
+    let v = String(value ?? '');
+    while (v.length > 1 && v.endsWith('/')) v = v.slice(0, -1);
+    return v;
+  }
+
+  // The existing kind:'server' route mapped to this coordinator server, if any.
+  function findServerRoute(server) {
+    const proj = normProject(server.project);
+    return (
+      routeStore
+        .list()
+        .find((r) => r.kind === 'server' && normProject(r.project) === proj && r.serverName === server.name) || null
+    );
+  }
+
+  async function handleOverview(res) {
+    let inventoryData = null;
+    let coordErr = null;
+    try {
+      inventoryData = await coordinator.inventory();
+      // Piggyback the fresh reading into the history buffers so charts stay
+      // live while somebody is watching, between background sampler ticks.
+      metrics?.ingest(inventoryData);
+    } catch (err) {
+      coordErr = err;
+    }
+    const base = coordinator.status();
+    const coordView = coordErr
+      ? { ...base, ok: false, lastError: coordErr?.message ?? String(coordErr) }
+      : base;
+    const routes = await routeViews();
+    sendJson(res, 200, {
+      console: {
+        version: config.version,
+        domain: config.domain,
+        consoleHost: config.consoleHost,
+        now: new Date().toISOString(),
+        tls: typeof certManager?.info === 'function' ? certManager.info() : null,
+        devInsecureHttp: Boolean(config.devInsecureHttp),
+      },
+      coordinator: coordView,
+      inventory: inventoryData,
+      routes,
+    });
+  }
+
+  async function handleRouteCreate(req, res) {
+    const body = await readJsonBody(req);
+    const route = await routeStore.create({
+      slug: body.slug,
+      kind: body.kind,
+      port: body.port,
+      project: body.project,
+      serverName: body.serverName,
+      auth: body.auth,
+      title: body.title,
+    });
+    sendJson(res, 201, toRouteView(route, await resolveSafe(route.slug)));
+  }
+
+  async function handleRoutePatch(req, res, slug) {
+    const body = await readJsonBody(req);
+    const patch = {};
+    for (const key of ['auth', 'title', 'port', 'project', 'serverName', 'kind']) {
+      if (Object.hasOwn(body, key)) patch[key] = body[key];
+    }
+    if (Object.keys(patch).length === 0) {
+      throw new ApiError(400, 'no updatable fields in request body');
+    }
+    const route = await routeStore.update(slug, patch);
+    sendJson(res, 200, toRouteView(route, await resolveSafe(route.slug)));
+  }
+
+  async function handleRouteDelete(res, slug) {
+    await routeStore.remove(slug);
+    sendJson(res, 200, { ok: true });
+  }
+
+  async function handleServerAction(req, res, session) {
+    const body = await readJsonBody(req);
+    const id = requireString(body.id, 'id');
+    if (!SERVER_ACTIONS.has(body.action)) {
+      throw new ApiError(400, "action must be 'stop' or 'restart'");
+    }
+    const servers = await coordinator.serversRaw();
+    const server = Array.isArray(servers) ? servers.find((s) => s?.id === id) : null;
+    if (!server) throw new ApiError(404, 'server not found');
+    const payload = {
+      agent: `devops-console:${session.email}`,
+      project: server.project,
+      name: server.name,
+      reason:
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason.trim().slice(0, 300)
+          : `${body.action} requested via DevOps Console`,
+    };
+    const result =
+      body.action === 'stop'
+        ? await coordinator.serverStop(payload)
+        : await coordinator.serverRestart(payload);
+    sendJson(res, 200, { server: result });
+  }
+
+  // Assign / change / remove the subdomain of a coordinator server in one call.
+  // Body: { id, slug, auth? }. Empty slug unassigns. Reuses the route store, so
+  // slug validation, reserved names, and the coordinator-port guard all apply.
+  async function handleServerSubdomain(req, res, session) {
+    const body = await readJsonBody(req);
+    const id = requireString(body.id, 'id');
+    // Fresh read: mapping a specific server must not miss one that started
+    // within the raw-servers cache window.
+    const servers = await coordinator.serversRaw({ maxAgeMs: 0 });
+    const server = Array.isArray(servers) ? servers.find((s) => s?.id === id) : null;
+    if (!server) throw new ApiError(404, 'server not found');
+    if (!server.project || !server.name) {
+      throw new ApiError(400, 'server is missing project/name and cannot be mapped to a subdomain');
+    }
+    const existing = findServerRoute(server);
+    const rawSlug = typeof body.slug === 'string' ? body.slug.trim() : '';
+
+    // Unassign: remove the mapped route (idempotent when none exists).
+    if (!rawSlug) {
+      if (existing) await routeStore.remove(existing.slug);
+      clog?.info?.('server subdomain removed', { server: server.name, slug: existing?.slug ?? null });
+      return sendJson(res, 200, { route: null });
+    }
+
+    const authGiven = Object.hasOwn(body, 'auth') ? body.auth : undefined;
+
+    // Same slug already mapped: only the access level (or nothing) can change.
+    if (existing && existing.slug === rawSlug) {
+      const route =
+        authGiven === undefined ? existing : await routeStore.update(existing.slug, { auth: authGiven });
+      return sendJson(res, 200, { route: toRouteView(route, await resolveSafe(route.slug)) });
+    }
+
+    // New or renamed mapping: create the new route (validates + enforces
+    // uniqueness), then drop the old one so a server maps to a single subdomain.
+    const route = await routeStore.create({
+      slug: rawSlug,
+      kind: 'server',
+      project: server.project,
+      serverName: server.name,
+      auth: authGiven ?? existing?.auth,
+      title: existing?.title,
+    });
+    if (existing) await routeStore.remove(existing.slug);
+    clog?.info?.('server subdomain assigned', { server: server.name, slug: route.slug, auth: route.auth });
+    return sendJson(res, 201, { route: toRouteView(route, await resolveSafe(route.slug)) });
+  }
+
+  function handleMetricsHistory(res, searchParams) {
+    if (!metrics) return sendJson(res, 200, { entities: [], sampler: { running: false } });
+    const rawLimit = searchParams.get('limit');
+    let limit;
+    if (rawLimit !== null) {
+      limit = Number(rawLimit);
+      if (!Number.isInteger(limit) || limit < 1) {
+        throw new ApiError(400, 'limit must be a positive integer');
+      }
+    }
+    return sendJson(res, 200, metrics.history(limit ? { limit } : undefined));
+  }
+
+  async function handlePortLease(req, res, session) {
+    const body = await readJsonBody(req);
+    const payload = {
+      agent: `devops-console:${session.email}`,
+      project:
+        typeof body.project === 'string' && body.project.trim() ? body.project.trim() : config.projectRoot,
+      purpose:
+        typeof body.purpose === 'string' && body.purpose.trim()
+          ? body.purpose.trim().slice(0, 120)
+          : 'devops-console',
+    };
+    if (body.preferred !== undefined && body.preferred !== null && body.preferred !== '') {
+      const preferred = Number(body.preferred);
+      if (!Number.isInteger(preferred) || preferred < 1 || preferred > 65535) {
+        throw new ApiError(400, 'preferred must be a port between 1 and 65535');
+      }
+      payload.preferred = preferred;
+      // A preferred port outside the default 3000-3999 range would be rejected
+      // by the coordinator, so pin the range to the requested port.
+      payload.range = String(preferred);
+    }
+    if (body.ttl !== undefined && body.ttl !== null && body.ttl !== '') {
+      const ttl = Number(body.ttl);
+      if (!Number.isInteger(ttl)) throw new ApiError(400, 'ttl must be an integer number of seconds');
+      payload.ttl = ttl; // ttl <= 0 means the lease never expires
+    }
+    const lease = await coordinator.leasePort(payload);
+    sendJson(res, 201, { lease });
+  }
+
+  async function handlePortRelease(req, res) {
+    const body = await readJsonBody(req);
+    const leaseId = requireString(body.lease_id, 'lease_id');
+    const lease = await coordinator.releasePort({ lease_id: leaseId });
+    sendJson(res, 200, { lease });
+  }
+
+  // Remove a durable port assignment (the pin survives everything else, so
+  // this is the only console path that frees a pinned port).
+  async function handlePortUnassign(req, res, session) {
+    const body = await readJsonBody(req);
+    const payload = { agent: `devops-console:${session.email}` };
+    if (typeof body.name === 'string' && body.name.trim()) {
+      payload.name = body.name.trim();
+      payload.project = requireString(body.project, 'project');
+    } else {
+      const port = Number(body.port);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new ApiError(400, 'unassign needs a server name + project, or a port');
+      }
+      payload.port = port;
+      if (typeof body.project === 'string' && body.project.trim()) payload.project = body.project.trim();
+      if (body.force === true) payload.force = true;
+      if (!payload.project && !payload.force) {
+        // A bare port with no project always names another project's pin from
+        // the coordinator's perspective, so demand the explicit confirmation
+        // it will require anyway instead of a guaranteed downstream refusal.
+        throw new ApiError(400, 'unassigning by bare port removes another project\'s pin — pass force: true to confirm');
+      }
+    }
+    const assignment = await coordinator.unassignPort(payload);
+    sendJson(res, 200, { assignment });
+  }
+
+  async function handleServerLogs(req, res) {
+    const body = await readJsonBody(req);
+    const id = requireString(body.id, 'id');
+    const tail = clampTail(body.tail, 200);
+    const result = await coordinator.serverLogs({ server_id: id, tail });
+    sendJson(res, 200, result);
+  }
+
+  // Whole-project runtime control (starts declared dependencies before web
+  // servers, preserves pinned ports). Slow by nature: compose pulls and
+  // health waits can take minutes; the coordinator client allows 300s.
+  async function handleProjectAction(req, res, session) {
+    const body = await readJsonBody(req);
+    const project = requireString(body.project, 'project');
+    if (!PROJECT_ACTIONS.has(body.action)) {
+      throw new ApiError(400, "action must be 'start', 'stop' or 'restart'");
+    }
+    // Only repos the coordinator can vouch for may be acted on: either it
+    // already tracks them (inventory) or they carry a declared runtime the
+    // coordinator recognizes (first start of a new project). An arbitrary
+    // path with neither must not become a command-execution vector.
+    const inventoryData = await coordinator.inventory();
+    let known = (inventoryData?.project_usage || []).some(
+      (row) => row?.project && row.project === project,
+    );
+    if (!known) {
+      try {
+        const status = await coordinator.projectStatus({ project });
+        // 'declared' means a runtime config exists; otherwise accept only
+        // real services (the synthetic type:'runtime' placeholder that says
+        // "nothing found here" does not count).
+        known = status?.declared === true
+          || (Array.isArray(status?.services)
+            && status.services.some((svc) => svc?.type && svc.type !== 'runtime'));
+      } catch {
+        known = false;
+      }
+    }
+    if (!known) throw new ApiError(404, 'unknown project — nothing registered and no declared runtime');
+    const result = await coordinator.projectAction(body.action, {
+      agent: `devops-console:${session.email}`,
+      project,
+    });
+    sendJson(res, 200, { result });
+  }
+
+  function handlePrefsGet(res) {
+    sendJson(res, 200, prefs.get());
+  }
+
+  async function handlePrefsPatch(req, res) {
+    const body = await readJsonBody(req);
+    // Deltas only: {hide:{kind:[keys]}, unhide:{kind:[keys]}}. Whole-list
+    // replacement is deliberately unsupported — a stale client snapshot must
+    // never be able to wipe hides made elsewhere.
+    const updated = await prefs.applyHiddenDelta({ hide: body.hide, unhide: body.unhide });
+    sendJson(res, 200, updated);
+  }
+
+  async function handleDockerAction(req, res, session) {
+    const body = await readJsonBody(req);
+    const name = requireContainer(body.name);
+    if (!DOCKER_ACTIONS.has(body.action)) {
+      throw new ApiError(400, "action must be 'start', 'stop' or 'restart'");
+    }
+    const result = await coordinator.dockerAction(name, body.action, {
+      agent: `devops-console:${session.email}`,
+      project: config.projectRoot,
+    });
+    sendJson(res, 200, result);
+  }
+
+  async function handleDockerLogs(req, res) {
+    const body = await readJsonBody(req);
+    const name = requireContainer(body.name);
+    const tail = clampTail(body.tail, 120);
+    const result = await coordinator.dockerLogs({ container: name, tail });
+    // docker logs writes container output to stdout or stderr depending on
+    // the image — return both, stdout first.
+    const text = `${result?.stdout ?? ''}${result?.stderr ?? ''}`;
+    sendJson(res, 200, { text });
+  }
+
+  function handleError(res, err) {
+    let status = 500;
+    let message = 'internal error';
+    if (err instanceof ApiError || err instanceof RouteError || err instanceof PrefsError) {
+      status = Number.isInteger(err.status) ? err.status : 500;
+      message = err.message;
+    } else if (err instanceof CoordError) {
+      // The coordinator answered with a client error (e.g. "matching lease
+      // not found"): pass it through as 400. Anything else — unreachable,
+      // timeout, 5xx — is a gateway failure and stays 502.
+      status = err.status >= 400 && err.status < 500 ? 400 : 502;
+      message = err.message;
+    } else {
+      clog?.error?.('console api internal error', { error: err?.stack ?? String(err) });
+    }
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    sendJson(res, status, { error: message });
+  }
+
+  function safeDecode(segment) {
+    try {
+      return decodeURIComponent(segment);
+    } catch {
+      throw new ApiError(404, 'not found');
+    }
+  }
+
+  async function handle(req, res, session) {
+    try {
+      if (!session || !session.email) throw new ApiError(401, 'unauthenticated');
+      const method = req.method ?? 'GET';
+      let pathname;
+      let searchParams;
+      try {
+        const parsed = new URL(req.url ?? '/', 'http://console.internal');
+        pathname = parsed.pathname;
+        searchParams = parsed.searchParams;
+      } catch {
+        throw new ApiError(400, 'invalid request path');
+      }
+      const mutating = method === 'POST' || method === 'PATCH' || method === 'DELETE';
+      if (mutating && !guard.checkOrigin(req)) {
+        throw new ApiError(403, 'cross-origin request rejected');
+      }
+
+      if (method === 'GET' && pathname === '/api/overview') {
+        return await handleOverview(res);
+      }
+      if (method === 'GET' && pathname === '/api/metrics/history') {
+        return handleMetricsHistory(res, searchParams);
+      }
+      if (method === 'GET' && pathname === '/api/session') {
+        return sendJson(res, 200, {
+          email: session.email,
+          name: session.name ?? null,
+          pic: session.pic ?? null,
+          exp: session.exp ?? null,
+        });
+      }
+      if (method === 'POST' && pathname === '/api/routes') {
+        return await handleRouteCreate(req, res);
+      }
+      const routeMatch = pathname.match(/^\/api\/routes\/([^/]+)$/);
+      if (routeMatch && method === 'PATCH') {
+        return await handleRoutePatch(req, res, safeDecode(routeMatch[1]));
+      }
+      if (routeMatch && method === 'DELETE') {
+        return await handleRouteDelete(res, safeDecode(routeMatch[1]));
+      }
+      if (method === 'POST' && pathname === '/api/servers/action') {
+        return await handleServerAction(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/servers/subdomain') {
+        return await handleServerSubdomain(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/servers/logs') {
+        return await handleServerLogs(req, res);
+      }
+      if (method === 'POST' && pathname === '/api/ports/lease') {
+        return await handlePortLease(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/ports/release') {
+        return await handlePortRelease(req, res);
+      }
+      if (method === 'POST' && pathname === '/api/ports/unassign') {
+        return await handlePortUnassign(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/docker/action') {
+        return await handleDockerAction(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/docker/logs') {
+        return await handleDockerLogs(req, res);
+      }
+      if (method === 'POST' && pathname === '/api/projects/action') {
+        return await handleProjectAction(req, res, session);
+      }
+      if (method === 'GET' && pathname === '/api/prefs') {
+        return handlePrefsGet(res);
+      }
+      if (method === 'PATCH' && pathname === '/api/prefs') {
+        return await handlePrefsPatch(req, res);
+      }
+      throw new ApiError(404, 'not found');
+    } catch (err) {
+      handleError(res, err);
+    }
+  }
+
+  return { handle };
+}

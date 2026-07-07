@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'">
+<title>DevOps Console — vr.ae</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
+<!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
+<link rel="stylesheet" href="/app.css?v=1.3.3">
+<script src="/app.js?v=1.3.3" defer></script>
+</head>
+<body>
+
+<header id="topbar">
+  <div class="tb-inner">
+    <button id="nav-toggle" class="nav-toggle" type="button"
+            aria-controls="site-nav" aria-expanded="false" aria-label="Open menu">
+      <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+    <div class="brand">
+      <svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><rect x="0.8" y="0.8" width="14.4" height="14.4" rx="3" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="3.6" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="1.2" fill="currentColor"/></svg>
+      <span class="brand-name">DevOps Console</span>
+      <span id="brand-domain" class="brand-domain"></span>
+    </div>
+    <p id="summary-line" class="summary-line">Loading the latest status…</p>
+    <div id="tb-chips" class="chips"></div>
+  </div>
+  <nav id="site-nav" class="site-nav" aria-label="Console sections">
+    <a href="#/projects" data-nav="projects">Projects <span class="nav-count" id="nav-count-projects" hidden></span></a>
+    <a href="#/servers" data-nav="servers">Servers <span class="nav-count" id="nav-count-servers" hidden></span></a>
+    <a href="#/routes" data-nav="routes">Routes <span class="nav-count" id="nav-count-routes" hidden></span></a>
+    <a href="#/docker" data-nav="docker">Docker <span class="nav-count" id="nav-count-docker" hidden></span></a>
+    <a href="#/ports" data-nav="ports">Port leases <span class="nav-count" id="nav-count-ports" hidden></span></a>
+    <a href="#/performance" data-nav="performance">Performance <span class="nav-count" id="nav-count-performance" hidden></span></a>
+  </nav>
+  <div id="banner-slot"></div>
+</header>
+
+<main id="main">
+
+  <section id="sec-projects" class="card" data-page="projects" aria-labelledby="projects-h">
+    <div class="sec-head">
+      <h2 id="projects-h">Projects <span class="count" id="projects-count" hidden></span></h2>
+      <p class="sec-sub">Every repo with its servers, databases and containers. Start, stop or restart single items or whole projects; hide idle ones — they reappear the moment an agent starts them.</p>
+    </div>
+    <div id="projects-body" class="sec-body">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-servers" class="card" data-page="servers" aria-labelledby="servers-h" hidden>
+    <div class="sec-head">
+      <h2 id="servers-h">Servers <span class="count" id="servers-count" hidden></span></h2>
+      <p class="sec-sub">Dev servers managed by the coordinator, grouped by repo. Each server's public subdomain is managed right here; click a row for logs and details.</p>
+    </div>
+    <div id="servers-body" class="sec-body">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-routes" class="card" data-page="routes" aria-labelledby="routes-h" hidden>
+    <div class="sec-head">
+      <h2 id="routes-h">Routes <span class="count" id="routes-count" hidden></span></h2>
+      <p class="sec-sub">Every public URL on this box. Server-backed routes are easiest to manage as the server's subdomain on the Servers page; fixed-port routes are created here.</p>
+    </div>
+
+    <form id="route-form" autocomplete="off" novalidate>
+      <div class="rf-grid">
+        <div class="field">
+          <label for="rf-slug">Subdomain</label>
+          <input id="rf-slug" name="slug" type="text" maxlength="63" spellcheck="false"
+                 autocapitalize="none" placeholder="myapp" aria-describedby="rf-preview">
+          <p id="rf-preview" class="preview" aria-live="polite"></p>
+        </div>
+
+        <fieldset class="field target-field">
+          <legend>Target</legend>
+          <div class="seg" role="radiogroup" aria-label="Route target type">
+            <label class="segopt"><input type="radio" name="rf-kind" value="port" checked><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Fixed port</span></label>
+            <label class="segopt"><input type="radio" name="rf-kind" value="server"><span data-ui-allow-overlap="segmented-control label sits under its own transparent radio input for a whole-label click target">Managed server</span></label>
+          </div>
+          <div id="rf-port-wrap" class="target-input">
+            <label class="visually-hidden" for="rf-port">Port on 127.0.0.1</label>
+            <input id="rf-port" type="number" inputmode="numeric" min="1" max="65535" placeholder="Port on 127.0.0.1, e.g. 3000">
+          </div>
+          <div id="rf-server-wrap" class="target-input" hidden>
+            <label class="visually-hidden" for="rf-server">Coordinator server</label>
+            <select id="rf-server"><option value="">Loading servers…</option></select>
+          </div>
+        </fieldset>
+
+        <div class="field">
+          <label for="rf-title">Title <span class="opt">(optional)</span></label>
+          <input id="rf-title" type="text" maxlength="80" placeholder="e.g. Client preview">
+        </div>
+
+        <div class="field access-field">
+          <span class="field-label" id="rf-access-label">Access</span>
+          <button type="button" id="rf-access" class="switch" role="switch" aria-checked="true"
+                  aria-labelledby="rf-access-label rf-access-text">
+            <span class="knob" aria-hidden="true"></span>
+            <span class="sw-label" id="rf-access-text">Google sign-in required</span>
+          </button>
+        </div>
+
+        <div class="field submit-field">
+          <button type="submit" id="rf-submit" class="btn primary">Create route</button>
+        </div>
+      </div>
+      <p id="rf-error" class="form-error" role="alert" hidden></p>
+    </form>
+
+    <div id="routes-body" class="sec-body" aria-live="polite">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-docker" class="card" data-page="docker" aria-labelledby="docker-h" hidden>
+    <div class="sec-head">
+      <h2 id="docker-h">Docker <span class="count" id="docker-count" hidden></span></h2>
+      <p class="sec-sub">Containers on this machine. Click a row for logs.</p>
+    </div>
+    <div id="docker-body" class="sec-body">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-leases" class="card" data-page="ports" aria-labelledby="leases-h" hidden>
+    <div class="sec-head">
+      <h2 id="leases-h">Port leases <span class="count" id="leases-count" hidden></span></h2>
+      <p class="sec-sub">Ports reserved through the coordinator, so tools and agents never collide on a port.</p>
+    </div>
+
+    <form id="lease-form" autocomplete="off" novalidate>
+      <div class="rf-grid">
+        <div class="field">
+          <label for="lf-purpose">Purpose <span class="opt">(optional)</span></label>
+          <input id="lf-purpose" type="text" maxlength="120" placeholder="e.g. webpack dev server">
+        </div>
+        <div class="field">
+          <label for="lf-preferred">Preferred port <span class="opt">(optional)</span></label>
+          <input id="lf-preferred" type="number" inputmode="numeric" min="1" max="65535"
+                 placeholder="blank = next free in 3000-3999">
+        </div>
+        <div class="field">
+          <label for="lf-ttl">Expires after</label>
+          <select id="lf-ttl">
+            <option value="3600">1 hour</option>
+            <option value="28800" selected>8 hours</option>
+            <option value="86400">24 hours</option>
+            <option value="0">Never</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="lf-project">Project path <span class="opt">(optional)</span></label>
+          <input id="lf-project" type="text" spellcheck="false" placeholder="defaults to this console's repo">
+        </div>
+        <div class="field submit-field">
+          <button type="submit" id="lf-submit" class="btn primary">Lease a port</button>
+        </div>
+      </div>
+      <p id="lf-error" class="form-error" role="alert" hidden></p>
+    </form>
+
+    <div id="leases-body" class="sec-body">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-assignments" class="card" data-page="ports" aria-labelledby="assignments-h" hidden>
+    <div class="sec-head">
+      <h2 id="assignments-h">Pinned ports <span class="count" id="assignments-count" hidden></span></h2>
+      <p class="sec-sub">Each dev server permanently owns its port — pins survive stops and restarts, and no other project can take a pinned port until it is unassigned.</p>
+    </div>
+    <div id="assignments-body" class="sec-body">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-perf" class="card" data-page="performance" aria-labelledby="perf-h" hidden>
+    <div class="sec-head">
+      <h2 id="perf-h">Servers &amp; containers <span class="count" id="perf-count" hidden></span></h2>
+      <p class="sec-sub">Live CPU and memory per running server and container, with recent history. Sampled continuously by the console; history resets when the console restarts.</p>
+    </div>
+    <div id="perf-body" class="sec-body">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-usage" class="card" data-page="performance" aria-labelledby="usage-h" hidden>
+    <div class="sec-head">
+      <h2 id="usage-h">Usage by project <span class="count" id="usage-count" hidden></span></h2>
+      <p class="sec-sub">CPU and memory per project (servers + containers).</p>
+    </div>
+    <div id="usage-body" class="sec-body">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+</main>
+
+<div id="popover" role="dialog" aria-modal="false" aria-label="Details" tabindex="-1" hidden></div>
+<div id="live" class="visually-hidden" aria-live="polite"></div>
+
+<noscript>
+  <div class="noscript">This control panel needs JavaScript. Enable it and reload the page.</div>
+</noscript>
+
+</body>
+</html>

@@ -1,0 +1,206 @@
+{
+ "start_command": "python3 /home/holyglory/holyskills/skills/codex-dev-coordinator/scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876\n\nDetails: `api serve` takes exactly two flags: --host (default \"127.0.0.1\") and --port (int, default DEFAULT_API_PORT = 29876), so the flags above are technically optional. It does NOT daemonize: serve_api() creates http.server.ThreadingHTTPServer, prints exactly one JSON line to stdout on successful bind \u2014 {\"host\": \"127.0.0.1\", \"port\": 29876, \"url\": \"http://127.0.0.1:29876\"} (flush=True) \u2014 then blocks in serve_forever() until SIGINT/kill. A Node client must spawn it detached itself (e.g. child_process.spawn('python3', [script, 'api', 'serve', '--host', '127.0.0.1', '--port', '29876'], {detached: true, stdio: ['ignore', out, err]}) then unref()), and can treat the stdout JSON line as the readiness signal. If the port is already bound, ThreadingHTTPServer raises OSError and the process exits nonzero with a Python traceback on stderr (no JSON). Env var: CODEX_AGENT_COORDINATOR_HOME optionally overrides the state directory (default ~/.codex/agent-coordinator); set it identically for the API process and any CLI callers or they will see different state. Request logs go to stderr (log_message override prints \"addr - line\"). Health-check: GET http://127.0.0.1:29876/v1/ports \u2192 200 with a JSON array (lightest endpoint; avoid GET /v1/inventory as a liveness probe because it shells out to docker ps/inspect/stats and can take seconds). Server-Version header is \"CodexDevCoordinator/1\".",
+ "auth": "NONE. ApiHandler performs zero authentication: no token, no API key, no header checks, no origin checks, no TLS. Anything that can reach the socket can lease ports, start/stop servers, and run docker commands as the coordinator's OS user. The only protection is binding to 127.0.0.1 (the default). Do not bind to 0.0.0.0. The \"agent\" field in request bodies is attribution metadata only, not authentication \u2014 it is stored verbatim in records.",
+ "endpoints": [
+  {
+   "method": "GET",
+   "path": "/v1/state",
+   "params": "none (query string is ignored; path must match exactly \u2014 any other path 404s)",
+   "response": "The full raw state object: {\"version\":1, \"created_at\":ISO, \"updated_at\":ISO, \"leases\":{<lease_id>:leaseObj,...}, \"servers\":{<server_id>:serverObj,...}, \"port_assignments\":{\"<canonicalProject>::<name>\":assignmentObj,...}, \"history\":[{\"at\":ISO,\"type\":\"port.leased|port.released|port.assigned|port.unassigned|port.expired|port.stale_released|server.started|server.stopped|server.registered|docker.registered|docker.register.skipped\",\"payload\":{...}} last 200], \"docker\":{\"last_commands\":[last 20],\"stats_history\":{<containerId>:[samples, last 120]},\"metadata\":{<containerNameOrId>:sidecarObj}}}",
+   "purpose": "Dump entire coordinator state (leases/servers keyed by id as objects, not arrays)."
+  },
+  {
+   "method": "GET",
+   "path": "/v1/inventory",
+   "params": "none \u2014 NOTE: unlike the CLI (`inventory --project --backup-dir --no-docker`), the HTTP GET takes no project filter, no backup dirs, and always includes Docker",
+   "response": "{\"coordinator_home\":str, \"state_path\":str, \"project\":null, \"urls\":[{\"name\",\"project\",\"url\",\"health_url\",\"status\"} only servers with url_is_current=true], \"servers\":[serverObj... deduped, annotated with url_is_current/port_reused/port_reused_by/duplicate_count/duplicate_server_ids/process_usage], \"leases\":[leaseObj...], \"recent_events\":[last 40 history events], \"docker\":{\"available\":bool,\"containers\":[containerObj...],\"postgres\":[containerObj...],\"stats_error\"?:str} or {\"available\":false,\"error\":str,\"containers\":[],\"postgres\":[]}, \"postgres\":[same list as docker.postgres], \"backups\":[{\"path\",\"size\",\"modified_at\",\"manifest\",\"database\",\"container\",\"format\",\"sha256\"}], \"port_assignments\":[ASSIGNMENT records + \"server_status\":\"running|stopped|unhealthy|starting|unregistered\" (unregistered = record pruned but pin survives), project-filtered like leases], \"project_usage\":[{\"usage_key\":\"path:<canonical repo>\"|\"name:<key>\",\"project\":canonical path|null,\"project_key\",\"name\",\"server_count\",\"container_count\",\"process_count\",\"cpu_percent\",\"memory_bytes\",\"process_cpu_percent\",\"process_memory_bytes\",\"docker_cpu_percent\",\"docker_memory_bytes\",\"server_ids\":[uuid...],\"container_names\":[str...],\"processes\":[...],\"hot_processes\":[...]} sorted by cpu desc. MEMBERSHIP IS AUTHORITATIVE AND SHARED WITH ACTIONS: the same attribution that groups a container into a row decides whether projects/start|restart|stop acts on it. Explicit attribution (Compose labels, then coordinator sidecar metadata) wins; an unattributed container is claimed by a known repo only when exactly one known project path matches its name key; an ambiguous name match (several known repos share the key) stays in its own \"name:<key>\" row with project=null and NO whole-project action touches it. Group UIs by usage_key/server_ids/container_names, never by re-derived name heuristics]}",
+   "purpose": "Machine-wide inventory with live health re-checks (this call MUTATES state: it refreshes server status, marks dead servers stopped, releases stale leases). Slow: runs docker ps --all + docker inspect + docker stats --no-stream + ps sampling."
+  },
+  {
+   "method": "GET",
+   "path": "/v1/ports",
+   "params": "none",
+   "response": "JSON array of active lease objects (list(state[\"leases\"].values())); expired/stale leases are pruned on entry so only status:\"active\" leases appear",
+   "purpose": "List current port leases. Cheapest endpoint \u2014 good liveness probe. Returns LEASES only - durable assignments live at GET /v1/ports/assignments."
+  },
+  {
+   "method": "GET",
+   "path": "/v1/servers",
+   "params": "none",
+   "response": "JSON array of raw server objects (list(state[\"servers\"].values())) \u2014 NO live health refresh, NO dedup/url_is_current annotation; status/health are whatever was last persisted",
+   "purpose": "List raw stored server records (stale-prone; use /v1/inventory or POST /v1/servers/status for fresh health)."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/ports/lease",
+   "params": "JSON body: \"agent\" (string, REQUIRED \u2014 KeyError\u2192400 if absent), \"project\" (string, REQUIRED \u2014 canonicalized to git toplevel), \"range\" (string, optional, default \"3000-3999\", also accepts single \"3005\"), \"preferred\" (int, optional; must be inside range or ValueError), \"ttl\" (int seconds, optional, default 28800 = 8h; ttl<=0 means never expires), \"purpose\" (string, optional, default \"manual\"). Allocation skips ports durably assigned to another (project,name); an explicit \"preferred\" on a foreign-assigned port fails 400 naming the owner.",
+   "response": "leaseObj: {\"id\":uuid, \"port\":int, \"agent\":str, \"project\":canonicalPath, \"agent_metadata\":{\"agent\",\"project\",\"repo_name\",\"cwd\",\"git_branch\",\"git_commit\",\"recorded_at\",\"metadata_source\":\"port_lease\"}, \"purpose\":str, \"server_id\":null, \"status\":\"active\", \"created_at\":ISO, \"created_ts\":epochFloat, \"expires_at\":epochFloat|null, \"expires_at_iso\":ISO|null, \"range\":str}. Failure: 400 {\"error\":\"no free port available in 3000-3999\"} (RuntimeError) or preferred-out-of-range ValueError text",
+   "purpose": "Allocate a free port: skips ports with active leases, then bind-tests each candidate; preferred is tried first."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/ports/release",
+   "params": "JSON body: \"lease_id\" (string, optional) OR \"port\" (int, optional) \u2014 at least one must match an active lease; no agent/project required",
+   "response": "the removed leaseObj with \"status\":\"released\" and \"released_at\":ISO added. No match: 400 {\"error\":\"'matching lease not found'\"} (note KeyError str keeps inner quotes)",
+   "purpose": "Release a lease by id or by port number (first match wins). Releasing a lease does NOT remove the durable port assignment."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/servers/start",
+   "params": "JSON body (passed verbatim as options): \"agent\" (REQUIRED), \"project\" (REQUIRED), \"name\" (REQUIRED \u2014 KeyError\u2192400), \"cmd\" (REQUIRED \u2014 shell command template; \"{port}\" and \"{host}\" placeholders are substituted), \"cwd\" (optional, default project), \"range\" (optional, default \"3000-3999\"), \"preferred\" (optional int), \"ttl\" (optional int, default 28800), \"host\" (optional, default \"127.0.0.1\"), \"health_url\" (optional, {port}/{host} placeholders; if omitted health = TCP port_open check), \"health_timeout\" (optional float seconds, default 10 \u2014 server blocks this long waiting for health), \"env\" (optional ARRAY of \"KEY=VALUE\" strings, NOT an object; malformed entries \u2192 ValueError). Body keys are the CLI flags with dashes\u2192underscores.",
+   "response": "serverObj (see data_models) with \"status\":\"running\" if healthy within health_timeout else \"unhealthy\", plus \"health\" object. IDEMPOTENT-ish: if a server with same project+name exists and is currently healthy, returns the EXISTING record without starting anything; if it exists but is unhealthy it is stopped (port released) and relaunched.",
+   "purpose": "Lease a port, spawn `cmd` via shell (start_new_session=True, stdout+stderr appended to ~/.codex/agent-coordinator/logs/<server_id>.log), record PID, wait for health. Child env gets PORT and HOST injected (setdefault) plus any \"env\" entries. Also creates/updates the durable port assignment for (project, name)."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/servers/register",
+   "params": "JSON body: \"agent\" (REQUIRED), \"project\" (REQUIRED), \"name\" (REQUIRED, ValueError if empty), \"port\" (int) OR \"url\" (with port) \u2014 one REQUIRED (ValueError \"server register requires --port or --url with a port\"), \"host\" (optional, default from url or \"127.0.0.1\"), \"url\" (optional, default \"http://{host}:{port}\"), \"cwd\" (optional, default project), \"cmd\" (optional command template; without it record gets missing_command:true and cannot be restarted), \"pid\" (optional int; if omitted coordinator finds the listening PID via lsof), \"health_url\" (optional, defaults to url), \"health_timeout\" (optional float, default 3), \"ttl\" (optional, default 28800), \"metadata_source\" (optional, default \"server_register\")",
+   "response": "serverObj with \"adopted\":true, \"status\":\"running\"|\"unhealthy\"; if running and pid known, an attached lease is created (purpose \"server:<name>\", occupied_existing:true, owner_pid) and lease_id set. Failure: 400 with identity reason if the listener PID's cwd is outside the project (e.g. \"port 3000 is owned by PID 123 in /other, outside project /repo\"), or \"port N already has an active lease for <project>\"",
+   "purpose": "Adopt an already-running listener into coordinator state instead of starting a duplicate. Ownership is verified via /proc/<pid>/cwd (or lsof) against the canonical project root. Also creates/updates the durable port assignment for (project, name)."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/servers/stop",
+   "params": "JSON body: \"agent\" (REQUIRED \u2014 ValueError otherwise), then \"server_id\" OR (\"project\" AND \"name\") to locate the server (KeyError \"'server-id or project/name is required'\" / \"'matching server not found'\" \u2192 400), \"release_port\" (optional bool, DEFAULT TRUE \u2014 pass false to keep the lease), \"reason\" (optional string, default \"Stopped by coordinator\"). If project is passed it must canonically match the record's project (ValueError \"server stop project does not match the registered server project\").",
+   "response": "the stopped serverObj: status \"stopped\", stopped_at (ISO), stopped_ts (epoch), stopped_reason, refreshed health, agent/agent_metadata overwritten with the stopping agent. Special case: if the recorded PID now belongs to a foreign project, the coordinator does NOT kill it \u2014 it just marks the record stopped (stale metadata) and stale-releases the lease.",
+   "purpose": "SIGTERM the process group (os.killpg), wait up to 5s (GRACE_SECONDS), then SIGKILL; release the attached port lease by default."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/servers/restart",
+   "params": "JSON body: \"agent\" (REQUIRED), \"project\" (REQUIRED), \"name\" (REQUIRED), \"range\" (optional \u2014 defaults to \"<port>-<port>\" pinning the same port), \"health_timeout\" (optional, default 10)",
+   "response": "a NEW serverObj from start_server (same id is reused via find_server, new pid/lease). Failure: 400 \"'matching server not found'\" or \"server <name> is registered without a command; missing_command=true\" (registered-without-cmd servers cannot restart)",
+   "purpose": "stop_server (release port) then start_server with the stored cmd_template/cwd/host/health_url_template, preferred = old fixed port. Restart lands on the durably assigned port (assignment wins over the stale record port)."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/servers/status",
+   "params": "JSON body: \"server_id\" OR (\"project\" AND \"name\") \u2014 no agent needed",
+   "response": "serverObj with refreshed \"health\" (3 attempts, 0.3s backoff) and possibly updated \"status\": running | starting (failing health but within 20s startup grace) | unhealthy | stopped (PID dead or foreign-owner \u21d2 also stale-releases the lease). MUTATES stored state.",
+   "purpose": "Live health re-check of one server."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/servers/logs",
+   "params": "JSON body: \"server_id\" OR (\"project\" AND \"name\"), \"tail\" (optional int/str, default 200; <=0 returns whole file)",
+   "response": "{\"server\":{\"id\",\"name\",\"project\",\"status\",\"url\",\"port\",\"stopped_at\",\"stopped_reason\",\"log_path\"}, \"text\":str (last N lines, \"\" if no log_path/file), \"tail\":int}",
+   "purpose": "Tail the managed server's log file plus stop metadata."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/projects/status",
+   "params": "JSON body: \"project\" (REQUIRED \u2014 KeyError \"'project'\"\u2192400), \"runtime_file\" (optional path to a .codex/dev-runtime.json-style declaration)",
+   "response": "runtime report: {\"action\":\"status\", \"ok\":bool, \"classification\":str|null (first of), \"classifications\":[\"wrong_port\"|\"stopped_container\"|\"crashed_process\"|\"unhealthy_process\"|\"timeout\"|\"missing_dependency\"|\"stale_coordinator_metadata\"...], \"project\", \"runtime_id\", \"name\", \"config_path\":str|null, \"declared\":bool, \"urls\":[{\"name\",\"url\",\"health_url\"}], \"ports\":[{\"name\",\"port\",\"fixed_port\",\"ports\"}], \"services\":[compose/docker/server status objects each with type,name,required,status,ok,classification,recent_logs,previous_exit_reason...], \"health_checks\":[{...,\"ok\",\"status\",\"classification\",\"body_excerpt\"}], \"previous_exit_reasons\":[{\"name\",\"reason\",\"stopped_at\"}], \"logs\":[{\"name\",\"text\"}]}",
+   "purpose": "Read-only-ish full runtime picture (still refreshes server health/state). No agent required."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/projects/start",
+   "params": "JSON body: \"agent\" (REQUIRED), \"project\" (REQUIRED), \"runtime_file\" (optional), \"allow_port_change\" (optional bool \u2014 without it servers lacking a fixed port declaration error), \"dry_run\" (optional bool \u2014 docker actions become dry-run), \"force_restart\" (optional bool), \"range\"/\"preferred\"/\"health_timeout\" (optional fallbacks)",
+   "response": "same report shape as projects/status but action:\"start\" plus \"before\" (pre-start report), \"actions\":[results of compose up/docker start/server starts...], \"action_errors\":[{\"name\",\"classification\",\"error\"}]; ok forced false and classifications extended if any action_errors",
+   "purpose": "Start the declared runtime: compose up -d (only if declared in runtime config, not merely discovered), start/restart unhealthy docker deps, adopt healthy fixed-port listeners, start non-web servers then web servers. Can run for a LONG time (compose has no subprocess timeout; each server start waits health_timeout). Container discovery uses the same attribution as inventory project_usage grouping: containers explicitly attributed to another project are never included, and a name match claims a container only when this project is the single known claimant for its name key."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/projects/restart",
+   "params": "JSON body: same as projects/start (\"agent\" and \"project\" REQUIRED); internally sets force_restart=true",
+   "response": "same shape, action:\"restart\", actions = stop actions + start actions, before = pre-restart report",
+   "purpose": "Stop all declared servers (reverse order, ports released), docker restart each declared container, then full projects/start."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/projects/stop",
+   "params": "JSON body: \"agent\" (REQUIRED), \"project\" (REQUIRED), \"runtime_file\", \"dry_run\" optional",
+   "response": "report with action:\"stop\", ok forced true, classification null, \"before\", \"actions\" (server stops, docker stop per running declared container, compose stop if declared)",
+   "purpose": "Stop the declared runtime. Acts on exactly the containers inventory project_usage groups under this project (unified attribution), and records coordinator sidecar attribution for the containers it acts on (like start/restart), so grouping converges to explicit membership."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/ps",
+   "params": "JSON body: \"dry_run\" (optional bool). NOTE: no \"--all\" equivalent over HTTP (CLI has --all; the API hardcodes [\"docker\",\"ps\"]).",
+   "response": "raw run_docker result: {\"returncode\":0, \"stdout\":str (human docker ps table, NOT parsed), \"stderr\":str, \"command\":[\"docker\",\"ps\"], \"cwd\":null, \"agent\":null, \"project\":null} or dry-run {\"dry_run\":true,\"command\":[...],...}. Nonzero exit \u2192 400 {\"error\":\"docker command failed: docker ps\\n<stderr>\"}",
+   "purpose": "Raw docker ps passthrough. For parsed/structured containers (incl. stopped, labels, stats) use GET /v1/inventory instead."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/stats",
+   "params": "JSON body: \"dry_run\" (optional bool)",
+   "response": "{\"available\":true, \"stats\":[{\"id\",\"container_id\",\"name\",\"timestamp\":ISO,\"timestamp_ts\":epoch,\"live\":true,\"cpu_percent\":float|null,\"memory_percent\",\"memory_usage_bytes\",\"memory_limit_bytes\",\"network_rx_bytes\",\"network_tx_bytes\",\"block_read_bytes\",\"block_write_bytes\",\"pids\":int|null, plus when a prior sample exists: \"network_rx_rate_bytes_per_second\",\"network_tx_rate_bytes_per_second\",\"block_read_rate_bytes_per_second\",\"block_write_rate_bytes_per_second\"}]} or {\"available\":false,\"error\":str,\"stats\":[]} or {\"dry_run\":true,\"command\":[...]}",
+   "purpose": "One docker stats --no-stream sample; also appended to per-container stats_history (cap 120)."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/compose-up",
+   "params": "JSON body: \"agent\" (REQUIRED \u2014 mutating), \"project\" (REQUIRED), \"cwd\" (optional but effectively needed \u2014 compose runs in it), \"file\" (optional ARRAY of compose file names \u2192 -f each), \"detach\" (optional bool \u2192 -d), \"dry_run\" (optional bool)",
+   "response": "run_docker result {\"returncode\",\"stdout\",\"stderr\",\"command\",\"cwd\",\"agent\",\"project\"}; failure \u2192 400 with stderr in error string",
+   "purpose": "Run `docker compose [-f file]... up [-d]` in cwd, recorded in docker.last_commands."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/compose-down",
+   "params": "JSON body: \"agent\" (REQUIRED), \"project\" (REQUIRED), \"cwd\", \"file\" (array), \"dry_run\" \u2014 same as compose-up minus detach",
+   "response": "same run_docker result shape",
+   "purpose": "Run `docker compose [-f file]... down` in cwd."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/logs",
+   "params": "JSON body: \"container\" (REQUIRED \u2014 KeyError \"'container'\"\u2192400), \"tail\" (optional, default \"80\"), \"dry_run\" (optional)",
+   "response": "run_docker result; log text is in \"stdout\" (or \"stderr\" for some images)",
+   "purpose": "docker logs --tail N <container> (non-mutating; no agent needed)."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/start",
+   "params": "JSON body: \"container\" (REQUIRED), \"agent\" (REQUIRED \u2014 mutating), \"project\" (REQUIRED), \"role\" (optional), \"dry_run\" (optional)",
+   "response": "run_docker result plus \"metadata\": the sidecar registration payload (container auto-registered to agent/project) \u2014 {\"container\",\"id\",\"project\",\"agent\",\"role\",\"metadata_source\":\"coordinator_sidecar\",\"adopted\":true,\"agent_metadata\",\"updated_at\"} or skipped variant when compose labels already exist",
+   "purpose": "docker start <container> + attach coordinator sidecar metadata."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/stop",
+   "params": "same as /v1/docker/start",
+   "response": "same shape",
+   "purpose": "docker stop <container> + sidecar metadata."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/restart",
+   "params": "same as /v1/docker/start",
+   "response": "same shape",
+   "purpose": "docker restart <container> + sidecar metadata."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/docker/register",
+   "params": "JSON body: \"container\" (REQUIRED, ValueError if empty), \"agent\" (REQUIRED), \"project\" (REQUIRED), \"role\" (optional), \"cwd\" (optional), \"force\" (optional bool \u2014 override when compose labels already exist), \"dry_run\" (optional bool \u2014 skips docker inspect)",
+   "response": "registered: {\"container\",\"id\":12charOrNull,\"project\",\"agent\",\"role\",\"metadata_source\":\"coordinator_sidecar\",\"adopted\":true,\"agent_metadata\",\"updated_at\"}; or when container already has compose labels and not force: {\"container\",\"project\":composeWorkingDir,\"agent\",\"role\",\"metadata_source\":\"docker_labels\",\"adopted\":false,\"skipped\":true,\"message\":\"container already has Docker Compose project metadata\",\"agent_metadata\",\"updated_at\"}",
+   "purpose": "Attach coordinator-side project/agent metadata to an unlabeled container so inventory groups it under the right repo."
+  },
+  {
+   "method": "GET",
+   "path": "/v1/ports/assignments",
+   "params": "none (exact path match; no query strings)",
+   "response": "JSON array of ASSIGNMENT records sorted by port: {\"key\":\"<canonicalProject>::<name>\", \"project\", \"name\", \"port\":int, \"agent\", \"source\":\"server_start|server_register|port_assign|seed_existing_servers\", \"created_at\":ISO, \"updated_at\":ISO}",
+   "purpose": "List durable (project, server-name) -> port pins. Unlike leases these persist while servers are stopped."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/ports/assign",
+   "params": "JSON body: \"agent\" (REQUIRED), \"project\" (REQUIRED, canonicalized), \"name\" (REQUIRED), \"port\" (REQUIRED int 1-65535), \"force\" (optional bool: skip the foreign-active-lease check)",
+   "response": "the ASSIGNMENT record. Failures 400: port assigned to another (project,name) (\"port N is durably assigned to server ...\"), or port actively leased by another project without force.",
+   "purpose": "Pin a port to a repo server ahead of its first start, or move a pin explicitly."
+  },
+  {
+   "method": "POST",
+   "path": "/v1/ports/unassign",
+   "params": "JSON body: \"agent\" (REQUIRED), then either \"name\" (+ \"project\", REQUIRED with name) or \"port\" (int). Removing another project's pin by port requires \"force\": true.",
+   "response": "the removed ASSIGNMENT with \"status\":\"unassigned\", \"unassigned_at\", \"unassigned_by\". 400 {\"error\":\"'matching port assignment not found'\"} when nothing matches (KeyError quoting).",
+   "purpose": "The ONLY way a durable pin is released. Server stop / port release never unassign."
+  }
+ ],
+ "data_models": "SERVER record (state.servers[id], returned by servers/start|register|stop|restart|status and in inventory): {\"id\": uuid, \"key\": \"<canonicalProject>::<name>\", \"name\", \"agent\", \"project\": canonical git-toplevel path, \"cwd\", \"cmd_template\": raw template with {port}/{host}, \"cmd\": formatted command actually run, \"port\": int, \"host\" (default \"127.0.0.1\"), \"url\": \"http://<host>:<port>\", \"health_url\", \"health_url_template\", \"lease_id\": uuid|null, \"pid\": int|null, \"log_path\": \"<home>/logs/<server_id>.log\"|null, \"adopted\": bool (true for register/adoption), \"missing_command\": bool (registered without cmd \u2014 cannot restart), \"metadata_source\": \"server_start\"|\"server_register\"|\"project_adoption\", \"agent_metadata\": {\"agent\",\"project\",\"repo_name\",\"cwd\",\"git_branch\",\"git_commit\",\"recorded_at\":ISO,\"metadata_source\"}, \"status\": \"starting\"|\"running\"|\"unhealthy\"|\"stopped\", \"created_at\":ISO, \"created_ts\":epoch, \"updated_at\":ISO; when stopped also \"stopped_at\":ISO, \"stopped_ts\":epoch, \"stopped_reason\":str. \"health\": {\"ok\":bool, \"pid_alive\":bool|null, \"check\":{\"ok\":bool, \"status\"?:int, \"reason\"?:str, \"error\"?:str, \"skipped\"?:str, \"classification\"?:\"timeout\"}, \"identity\":{\"ok\":bool|null, \"pid\",\"cwd\",\"project\",\"reason\"?,\"skipped\"?}, \"attempts\":int, \"classification\":\"healthy\"|\"starting\"|\"unhealthy\"|\"wrong-listener\"|\"stopped\"}. Health semantics: pid dead \u21d2 stopped; failing health inside 20s STARTUP_GRACE \u21d2 \"starting\"; listener cwd outside project \u21d2 \"wrong-listener\" (stale metadata; never killed). Inventory-only annotations: \"url_is_current\":bool, \"port_reused\":bool, \"port_reused_by\":{\"type\":\"server\"|\"process\",...}, \"duplicate_count\", \"duplicate_server_ids\", \"process_usage\":{\"source\",\"root_pids\",\"pids\",\"process_count\",\"cpu_percent\",\"rss_bytes\",\"memory_bytes\",\"processes\":[{\"pid\",\"ppid\",\"cpu_percent\",\"rss_bytes\",\"command\"}],\"hot_processes\":[top5],\"sampled_at\",\"project\",\"server_id\",\"server_name\"}. Stopped records pruned after 7 days or beyond 100 records.\n\nLEASE record: {\"id\": uuid, \"port\": int, \"agent\", \"project\": canonical path, \"agent_metadata\": {...same shape, metadata_source \"port_lease\"|\"port_lease_existing\"}, \"purpose\": \"manual\"|\"server:<name>\"|custom, \"server_id\": uuid|null, \"status\": \"active\" (while stored; transitions to \"released\"|\"expired\"|\"stale_released\" on the returned copy / in history), \"created_at\":ISO, \"created_ts\":epoch, \"expires_at\": epochFloat|null, \"expires_at_iso\": ISO|null, \"range\": \"3000-3999\"; register-adopted leases add \"occupied_existing\":true and \"owner_pid\":int; released add \"released_at\":ISO; stale add \"stale_reason\":str. Leases attached to a live linked server never expire by TTL; leases whose linked server is stopped/dead/foreign are auto stale-released on every request.\n\nDOCKER container (inventory docker.containers[] and postgres[]): {\"id\": 12-char, \"name\", \"image\", \"status\": raw docker status string (e.g. \"Up 2 hours\", \"Exited (0) 3 days ago\" \u2014 stopped detection = contains exited/created/dead/stopped), \"ports\": raw docker ports string, \"stats\": latest sample|absent, \"stats_history\":[last 120 samples], \"labels\":{...}|absent, \"compose_project\": label value|absent, \"project\": resolved path from compose working_dir label or sidecar, \"metadata_source\": \"docker_labels\"|\"coordinator_sidecar\"|\"none\", \"agent\",\"role\",\"adopted\",\"agent_metadata\" (sidecar only)}. Stats sample fields: id, container_id, name, timestamp, timestamp_ts, live:true, cpu_percent, memory_percent, memory_usage_bytes, memory_limit_bytes, network_rx_bytes, network_tx_bytes, block_read_bytes, block_write_bytes, pids, and *_rate_bytes_per_second deltas. Docker-dependency status objects (in project reports): {\"type\":\"docker\",\"name\",\"container\",\"required\",\"status\" (\"missing\" if absent),\"image\",\"ports\",\"project\",\"metadata_source\",\"agent\",\"adopted\",\"declared_ports\",\"ok\":bool,\"classification\":null|\"missing_dependency\"|\"stopped_container\"|\"unhealthy_process\"|\"wrong_port\",\"previous_exit_reason\",\"recent_logs\"}.\n\nDATABASES: no first-class DB model. Postgres visibility = inventory \"postgres\" array (containers whose name/image/ports contain \"postgres\" or \"5432\"). Backups list: {\"path\",\"size\",\"modified_at\",\"manifest\":pathOrNull,\"database\",\"container\",\"format\",\"sha256\"} read from <project>/.codex-db-backups manifests.\n\nPROJECT report classifications (treat ok=false as not ready): wrong_port, stopped_container, crashed_process, unhealthy_process, timeout, missing_dependency, stale_coordinator_metadata. ASSIGNMENT record (state.port_assignments[\"<canonicalProject>::<name>\"]): {\"key\", \"project\", \"name\", \"port\":int, \"agent\", \"source\", \"created_at\":ISO, \"updated_at\":ISO}. Inventory copies add \"server_status\" (\"unregistered\" when the server record was pruned - the pin still blocks the port and steers the next start).",
+ "state_layout": "Default home: ~/.codex/agent-coordinator/ \u2014 override with env CODEX_AGENT_COORDINATOR_HOME (expanded+resolved). Files: state.json (whole state, pretty-printed sorted-keys JSON, written atomically via .json.tmp rename), state.lock (fcntl.flock exclusive lock taken around EVERY CLI command and EVERY HTTP request), logs/<server_id>.log (managed server stdout+stderr, append mode). Corrupt state.json is renamed to state.json.corrupt-<epoch> and replaced with fresh defaults (warning to stderr). The state dir is intentionally shared by all agents/runtimes on the machine \u2014 the Node client must use the same home the CLI users use. PROJECT_ROOT attribution: every \"project\" value is canonicalized by canonical_project(): `git -C <path> rev-parse --show-toplevel` (3s timeout) falling back to the resolved absolute path \u2014 so passing any path inside a repo attributes to the repo toplevel. Mutating operations require both \"agent\" and \"project\" (require_identity raises \"<command> requires --agent so the coordinator can attribute the action\" / \"requires --project with the canonical repo path\"); agent_metadata additionally records repo_name, cwd, git_branch, git_commit, recorded_at. Server identity key = \"<canonicalProject>::<name>\". Per-repo runtime declarations are read from <project>/.codex/dev-runtime.json (also .codex/codex-dev-runtime.json or codex-dev-runtime.json), overridable per-request with \"runtime_file\". state.json also holds port_assignments (durable pins; survive every prune; cleared only by unassign/state reset).",
+ "port_leasing": "CLI lease: python3 /home/holyglory/holyskills/skills/codex-dev-coordinator/scripts/dev_coordinator.py port lease --agent \"$USER\" --project \"$PROJECT_ROOT\" --range 3000-3999 [--preferred 3005] [--ttl 28800] [--purpose my-task]   \u2192 prints the lease JSON (grab .id and .port). CLI release: ... port release --lease-id <uuid>   OR   ... port release --port 3005. CLI list: ... port list. HTTP lease: POST http://127.0.0.1:29876/v1/ports/lease with body {\"agent\":\"node-client\",\"project\":\"/abs/repo\",\"range\":\"3000-3999\",\"preferred\":3005,\"ttl\":28800,\"purpose\":\"manual\"} (only agent+project required) \u2192 200 lease object; save lease.id and lease.port. HTTP release: POST /v1/ports/release with {\"lease_id\":\"<uuid>\"} or {\"port\":3005} \u2192 200 released lease; 400 {\"error\":\"'matching lease not found'\"} if already gone. Semantics: allocation skips ports already under an active lease AND bind-tests the port (SO_REUSEADDR bind on 127.0.0.1); preferred outside range \u2192 400 ValueError; exhaustion \u2192 400 \"no free port available in <range>\". Default TTL 8h; ttl<=0 \u2192 non-expiring (expires_at null). Expired leases are pruned lazily on every request. Leases created by servers/start|register carry purpose \"server:<name>\" + server_id and are auto-released when the server stops (release_port default true) or stale-released when the linked server dies. Releasing by port with multiple matches releases only the first found. DURABLE PORT ASSIGNMENTS (added 2026-07-06): state.port_assignments maps \"<canonicalProject>::<name>\" -> ASSIGNMENT record. Created automatically by servers/start and servers/register (and re-pinned when an explicit preferred/range lands the owner on a different port); NEVER removed by server stop, lease release/expiry/stale-reclaim, or stopped-record pruning - only by POST /v1/ports/unassign (or state reset / corrupt-state recovery, after which existing server records re-seed pins; on a contested port the most recently stopped record wins). Allocation consequences: lease_port skips every port assigned to another (project,name); an explicit preferred on a foreign assigned port fails 400 'port N is durably assigned to server X of /repo'; the owning server started without an explicit range pins hard to its assigned port and fails loudly if a foreign process occupies it.",
+ "notes": "1) ERROR FORMAT: every error body is {\"error\": \"<message>\"}. POST: any exception (missing key, bad value, docker failure, no free port) \u2192 HTTP 400. GET: exception \u2192 HTTP 500. Unknown path \u2192 404 {\"error\":\"not found\"}. Missing required body fields surface as Python KeyError strings WITH quotes, e.g. {\"error\":\"'agent'\"} or {\"error\":\"'matching server not found'\"} \u2014 match loosely. Only status codes used: 200, 400, 404, 500. All success responses are 200 (even mutations); Content-Type application/json; bodies pretty-printed with sorted keys.\n2) CONCURRENCY: ThreadingHTTPServer, but every request (GET included) takes an exclusive fcntl lock on state.lock for its entire duration \u2014 requests fully serialize. A long POST /v1/projects/start (compose up has NO subprocess timeout; each server start blocks up to health_timeout, default 10s) will stall ALL other requests including health probes. Give your Node HTTP client generous per-endpoint timeouts (projects/*: minutes; inventory: 30s+; ports/*: seconds) and never issue parallel calls expecting concurrency.\n3) DAEMONIZATION: none. Spawn detached from Node, capture the single stdout JSON line as readiness, keep stderr for request logs. Bind conflict = process exits nonzero with traceback, no JSON.\n4) READS MUTATE: GET /v1/inventory and POST /v1/servers/status and /v1/projects/status refresh health and can flip servers to stopped/unhealthy and stale-release leases \u2014 that is by design (write_state runs on every request via locked_state, even pure GETs).\n5) \"env\" on servers/start is an ARRAY of \"KEY=VALUE\" strings, not an object; child process automatically gets PORT=<port> and HOST=<host> env vars; cmd and health_url support literal \"{port}\" and \"{host}\" placeholders. Commands run via shell=True in a new session; logs append to <home>/logs/<server_id>.log.\n6) servers/start is idempotent for healthy servers (returns existing record \u2014 compare returned pid/created_at to detect this); unhealthy existing servers are stopped and relaunched, possibly on a DIFFERENT port unless you pin range/preferred.\n7) HTTP API gaps vs CLI: no inventory project filter / --backup-dir / --no-docker over HTTP; no `docker ps --all` over HTTP (use GET /v1/inventory for structured all-containers data); no `state reset`, `port list`, `server list` POSTs (use GET /v1/ports, GET /v1/servers, GET /v1/state).\n8) /v1/docker/ps|compose-*|logs return RAW docker stdout/stderr strings, not parsed JSON; nonzero docker exit \u2192 400 with stderr embedded in error text. dry_run:true is supported on all docker endpoints and project start/stop for validation without side effects.\n9) Numbers: created_ts/expires_at/stopped_ts/timestamp_ts are epoch floats; *_at fields are ISO strings \"%Y-%m-%dT%H:%M:%SZ\" (UTC).\n10) HEALTH: default HTTP health accepts 2xx/3xx; 4xx is unhealthy. No health_url \u21d2 plain TCP connect check. server status retries 3x with 0.3s backoff; a failing server younger than 20s reports classification \"starting\" not \"unhealthy\". Never treat a project report with ok:false as running even if urls[] is non-empty \u2014 honor \"classification\".\n11) SAFETY: coordinator never kills PIDs whose cwd belongs to another project (marks stale_coordinator_metadata instead); server register refuses to adopt listeners owned by other repos (400 with reason). Compose up via projects/start only fires when compose files are DECLARED in .codex/dev-runtime.json \u2014 discovered-only files yield a skipped action with classification missing_dependency.\n12) State caps to expect: history 200, recent_events 40, docker.last_commands 20, stats_history 120/container, stopped servers 100 or 7 days.\n13) DURABLE ASSIGNMENTS: see port_leasing. The pruning caps (7-day/100-record stopped servers, 8h lease TTL) do NOT apply to port_assignments."
+}
