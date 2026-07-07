@@ -439,7 +439,11 @@ sparklines). Docker/Ports lists are grouped by repo with project subheaders.
 (persisted server-side via `/api/prefs`, shared across devices); anything the
 coordinator reports as running is auto-unhidden on the next poll, and every
 page with hidden items shows a "Show N hidden items" reveal toggle with
-per-row unhide. Charts are inline SVG built via `createElementNS` — user data
+per-row unhide. **Stable ordering:** rows and project groups keep a
+deterministic order across polls (running-first, then name/key via
+`projectGroupOrder`) — live CPU/memory readings are never an ordering key,
+so nothing reshuffles under the pointer between refreshes. Charts are inline
+SVG built via `createElementNS` — user data
 never goes through `innerHTML`. Must implement the repo's ten
 interaction-affordance requirements (badge-detail, row-hit-target,
 navigation-cursor, transient-disclosure, disclosure-scrollbar, icon-meaning,

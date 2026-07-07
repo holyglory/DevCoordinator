@@ -632,10 +632,19 @@
       });
     }
 
-    groups.sort((a, b) => (b.runningCount ? 1 : 0) - (a.runningCount ? 1 : 0)
-      || (b.row?.cpu_percent || 0) - (a.row?.cpu_percent || 0)
-      || String(a.name).localeCompare(String(b.name)));
+    groups.sort(projectGroupOrder);
     return groups;
+  }
+
+  // Stable project-group order: groups with something running first, then
+  // name, then key. Live CPU/memory must NEVER be an ordering key on
+  // persistent lists — fluctuating readings would reshuffle the groups on
+  // every poll, so nothing stays where the user is about to click
+  // (docs/journeys.md "Stable ordering contract").
+  function projectGroupOrder(a, b) {
+    return (b.runningCount ? 1 : 0) - (a.runningCount ? 1 : 0)
+      || String(a.name).localeCompare(String(b.name))
+      || String(a.key).localeCompare(String(b.key));
   }
 
   const groupsByProjectPath = (o) => {
@@ -2786,10 +2795,11 @@
       out.push(emptyState('Nothing to chart yet — start a dev server or container and its CPU/memory history appears here.'));
       return out;
     }
-    const lastCpu = (e) => (e.points.length ? e.points[e.points.length - 1][1] : 0);
+    // Same stable-ordering contract as the list pages: running cards first,
+    // then name/key — never current load, which changes every sample.
     entities.sort((a, b) => (running.has(b.key) ? 1 : 0) - (running.has(a.key) ? 1 : 0)
-      || lastCpu(b) - lastCpu(a)
-      || String(a.name).localeCompare(String(b.name)));
+      || String(a.name).localeCompare(String(b.name))
+      || String(a.key).localeCompare(String(b.key)));
     out.push(h('div', { class: 'perf-grid' }, entities.map((e) => perfCard(e, running.has(e.key)))));
     return out;
   }

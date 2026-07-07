@@ -475,6 +475,10 @@ def check_devops_console() -> None:
         "servers page lists docker web servers": "visible.push(dockerServerItem(o, c, isHidden));",
         "docker server rows detected by published ports or route": "function isWebServerContainer(",
         "docker server row actions hit docker endpoint": "'data-fk': `srv-dock-${action}:${name}`",
+        # Stable ordering contract (docs/journeys.md): list order never keys
+        # on live metrics, or every poll reshuffles the page under the user.
+        "stable project-group comparator": "function projectGroupOrder(",
+        "project groups sorted through the stable comparator": "groups.sort(projectGroupOrder)",
     }
     haystack = "\n".join([source_text, app_js, app_css, index_html, dev_cert_helper])
     missing = [label for label, needle in required.items() if needle not in haystack]
@@ -484,6 +488,17 @@ def check_devops_console() -> None:
     for banned in ("TODO", "FIXME", "wired later"):
         if banned in source_text or banned in app_js or banned in app_css or banned in index_html:
             raise SystemExit(f"DevOpsConsole guardrail found prohibited marker: {banned}")
+
+    # Live CPU/memory readings must never be a list ordering key — that
+    # class reshuffled the Servers page on every poll (2026-07-07 incident;
+    # see test/unit.uiorder.test.mjs for the behavioral guardrail).
+    ui_prohibited = {
+        "group order keyed on live cpu": "cpu_percent || 0) - (a",
+        "performance cards ordered by current load": "lastCpu(b) - lastCpu(a)",
+    }
+    ui_present = [label for label, needle in ui_prohibited.items() if needle in app_js]
+    if ui_present:
+        raise SystemExit("DevOpsConsole guardrail found prohibited pattern: " + ", ".join(ui_present))
 
     if package_json.get("dependencies") or package_json.get("devDependencies"):
         raise SystemExit("DevOpsConsole must stay zero-dependency; package.json declares dependencies")

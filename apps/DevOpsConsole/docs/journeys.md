@@ -569,6 +569,14 @@ header is identical on every page):
 
 ## QA And Acceptance
 
+- Stable ordering contract: rows and project groups on persistent list pages
+  (Projects, Servers, Routes, Docker, Port leases) keep a deterministic order
+  across refresh polls. Live CPU/memory readings must NEVER be an ordering
+  key on these pages — fluctuating metrics would reshuffle the list every
+  poll and make targets impossible to click. Order may change only on state
+  transitions (running ↔ stopped), membership changes, or user action.
+  The Performance page follows the same rule: cards order by running state
+  and name, not by current load.
 - Happy-path scenarios: J1 healthy glance; J2 create fixed-port route → open
   URL → copy; J3 expand → logs → restart → healthy; J4 public toggle with
   confirm then revert; J5 container stop/start with logs; J6 lease with a
