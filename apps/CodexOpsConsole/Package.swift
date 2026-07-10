@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "CodexOpsConsole", targets: ["CodexOpsConsole"])
     ],
     targets: [
-        .executableTarget(name: "CodexOpsConsole")
+        .executableTarget(name: "CodexOpsConsole"),
+        .testTarget(name: "CodexOpsConsoleTests", dependencies: ["CodexOpsConsole"])
     ]
 )

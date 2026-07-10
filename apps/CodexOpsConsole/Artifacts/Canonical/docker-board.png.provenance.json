@@ -1,0 +1,10 @@
+{
+  "artifact_type" : "test-fixture-snapshot",
+  "fixture_id" : "codex-ops-console-neutral-v1",
+  "generator" : "apps\/CodexOpsConsole\/Tools\/SnapshotMain.swift",
+  "height" : 1024,
+  "schema_version" : 1,
+  "sha256" : "f41ad9bb9f39883a592bc8bc3a53711a3318cdee88ef0bf36f019a1cffaaedc7",
+  "source" : "isolated-test-fixture",
+  "width" : 1440
+}

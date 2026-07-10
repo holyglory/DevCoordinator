@@ -4,29 +4,43 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import copy
 import contextlib
 import errno
 import fcntl
+import hmac
 import http.server
+import ipaddress
 import json
 import os
 import re
+import secrets
+import shlex
+import shutil
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 
-VERSION = 1
+VERSION = 2
 DEFAULT_RANGE = "3000-3999"
 DEFAULT_TTL_SECONDS = 8 * 60 * 60
 DEFAULT_API_PORT = 29876
+API_BODY_LIMIT_BYTES = 64 * 1024
+API_MAX_CONCURRENT_REQUESTS = 16
+API_REQUEST_TIMEOUT_SECONDS = 10
+API_TOKEN_MAX_BYTES = 4096
 GRACE_SECONDS = 5
 # A server that fails its health check but was created within this window is
 # reported as "starting" rather than "unhealthy" so slow-booting servers do not
@@ -42,6 +56,25 @@ HEALTH_RETRY_BACKOFF_SECONDS = 0.3
 STOPPED_SERVER_RETENTION_SECONDS = 7 * 24 * 60 * 60
 STOPPED_SERVER_LIMIT = 100
 DOCKER_STATS_HISTORY_LIMIT = 120
+DOCKER_OBSERVATION_TIMEOUT_SECONDS = 8.0
+DOCKER_LIFECYCLE_TIMEOUT_SECONDS = 45.0
+DOCKER_STANDARD_LOCATIONS = (
+    "/usr/local/bin/docker",
+    "/opt/homebrew/bin/docker",
+    "/Applications/Docker.app/Contents/Resources/bin/docker",
+    "/Applications/OrbStack.app/Contents/MacOS/xbin/docker",
+    "~/.orbstack/bin/docker",
+    "~/.docker/bin/docker",
+)
+OPERATION_STALE_SECONDS = 60 * 60
+_PROJECT_ROOT_CACHE: dict[str, str] = {}
+_GIT_IDENTITY_CONTEXT = threading.local()
+_STATE_LOCK_CONTEXT = threading.local()
+_PROJECT_OPERATION_CONTEXT = threading.local()
+_SERVER_RESTART_CONTEXT = threading.local()
+_PROCESS_INSTANCE_ID = uuid.uuid4().hex
+_PROCESS_INSTANCE_PID = os.getpid()
+_PROCESS_OWNER_MARKERS: dict[str, tuple[Path, int]] = {}
 PROJECT_RUNTIME_FILES = (
     ".codex/dev-runtime.json",
     ".codex/codex-dev-runtime.json",
@@ -70,6 +103,180 @@ SERVICE_ROLE_TOKENS = {
     "web",
     "worker",
 }
+
+
+class StructuredCoordinatorError(RuntimeError):
+    """A user-actionable failure whose machine-readable evidence must survive."""
+
+    def __init__(self, message: str, payload: dict[str, Any]):
+        super().__init__(message)
+        self.payload = {"error": message, **payload}
+
+
+class DockerCapabilityError(StructuredCoordinatorError):
+    """Docker cannot be executed in this process environment."""
+
+
+class DockerCommandTimeoutError(StructuredCoordinatorError):
+    """A bounded Docker invocation exceeded its deadline."""
+
+
+def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, StructuredCoordinatorError):
+        return copy.deepcopy(exc.payload)
+    return {"error": str(exc), "code": "internal_error", "classification": "unhealthy_process"}
+
+
+def executable_file(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def resolve_docker_executable(
+    *,
+    environment: dict[str, str] | None = None,
+    standard_locations: list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Resolve Docker without assuming an interactive-shell PATH.
+
+    macOS GUI processes commonly inherit launchd's minimal PATH.  Respect an
+    explicit absolute override first, then the supplied PATH, then well-known
+    Docker Desktop, OrbStack, Homebrew, and user installation locations.
+    """
+
+    env = os.environ if environment is None else environment
+    configured = str(env.get("CODEX_DOCKER_CLI") or "").strip()
+    searched: list[str] = []
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            message = "CODEX_DOCKER_CLI must be an absolute executable path"
+            raise DockerCapabilityError(
+                message,
+                {
+                    "code": "docker_cli_unavailable",
+                    "classification": "missing_dependency",
+                    "capability": {
+                        "name": "docker_cli",
+                        "code": "docker_cli_unavailable",
+                        "configured_path": configured,
+                        "searched": [configured],
+                    },
+                },
+            )
+        searched.append(str(configured_path))
+        if executable_file(configured_path):
+            # Preserve the executable entry-point path. Multicall CLIs such as
+            # OrbStack select behavior from argv[0]; resolving `docker` to its
+            # `docker-tools` symlink target breaks an otherwise valid command.
+            return str(configured_path.absolute())
+        message = f"Docker CLI is unavailable at configured path: {configured_path}"
+        raise DockerCapabilityError(
+            message,
+            {
+                "code": "docker_cli_unavailable",
+                "classification": "missing_dependency",
+                "capability": {
+                    "name": "docker_cli",
+                    "code": "docker_cli_unavailable",
+                    "configured_path": str(configured_path),
+                    "searched": searched,
+                },
+            },
+        )
+
+    path_value = str(env.get("PATH") or "")
+    on_path = shutil.which("docker", path=path_value)
+    if on_path:
+        on_path_value = Path(on_path).expanduser()
+        searched.append(str(on_path_value))
+        if executable_file(on_path_value):
+            return str(on_path_value.absolute())
+
+    candidates = DOCKER_STANDARD_LOCATIONS if standard_locations is None else standard_locations
+    for raw_candidate in candidates:
+        candidate = Path(raw_candidate).expanduser()
+        candidate_text = str(candidate)
+        if candidate_text not in searched:
+            searched.append(candidate_text)
+        if executable_file(candidate):
+            return str(candidate.absolute())
+
+    message = "Docker CLI is unavailable in PATH or standard installation locations"
+    raise DockerCapabilityError(
+        message,
+        {
+            "code": "docker_cli_unavailable",
+            "classification": "missing_dependency",
+            "capability": {
+                "name": "docker_cli",
+                "code": "docker_cli_unavailable",
+                "searched": searched,
+            },
+        },
+    )
+
+
+def configured_docker_timeout(*, lifecycle: bool) -> float:
+    default = DOCKER_LIFECYCLE_TIMEOUT_SECONDS if lifecycle else DOCKER_OBSERVATION_TIMEOUT_SECONDS
+    variable = "CODEX_DOCKER_LIFECYCLE_TIMEOUT_SECONDS" if lifecycle else "CODEX_DOCKER_OBSERVATION_TIMEOUT_SECONDS"
+    raw = os.environ.get(variable)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(0.1, min(value, 600.0))
+
+
+def execute_docker_subprocess(
+    command: list[str],
+    *,
+    cwd: str | None = None,
+    lifecycle: bool = False,
+    executable: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str, float]:
+    if not command or command[0] != "docker":
+        raise ValueError("Docker commands must begin with the semantic 'docker' executable")
+    executable = executable or resolve_docker_executable()
+    resolved_command = [executable, *command[1:]]
+    timeout_seconds = configured_docker_timeout(lifecycle=lifecycle)
+    try:
+        completed = subprocess.run(
+            resolved_command,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        # The executable can disappear after resolution; keep the same
+        # actionable capability classification rather than leaking ENOENT.
+        raise DockerCapabilityError(
+            f"Docker CLI disappeared before execution: {executable}",
+            {
+                "code": "docker_cli_unavailable",
+                "classification": "missing_dependency",
+                "capability": {
+                    "name": "docker_cli",
+                    "code": "docker_cli_unavailable",
+                    "resolved_path": executable,
+                },
+            },
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DockerCommandTimeoutError(
+            f"Docker command timed out after {timeout_seconds:g} seconds: {' '.join(command)}",
+            {
+                "code": "docker_command_timeout",
+                "classification": "timeout",
+                "command": command,
+                "docker_executable": executable,
+                "timeout_seconds": timeout_seconds,
+            },
+        ) from exc
+    return completed, executable, timeout_seconds
 
 DEPLOYMENT_QUALIFIER_TOKENS = {
     "copy",
@@ -111,14 +318,165 @@ def logs_dir() -> Path:
     return coordinator_home() / "logs"
 
 
+def api_token_path() -> Path:
+    configured = os.environ.get("CODEX_AGENT_COORDINATOR_TOKEN_FILE")
+    if configured:
+        return Path(configured).expanduser().absolute()
+    return coordinator_home() / "api-token"
+
+
+def ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        path.chmod(0o700)
+
+
+def atomic_write_private(path: Path, content: str) -> None:
+    ensure_private_directory(path.parent)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        path.chmod(0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def read_private_api_token(token_file: Path) -> str:
+    """Read one regular private token without following its final symlink."""
+
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("API token safety requires O_NOFOLLOW support")
+    try:
+        fd = os.open(token_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP or token_file.is_symlink():
+            raise PermissionError(f"API token file must not be a symbolic link: {token_file}") from exc
+        raise
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError(f"API token file must be a regular file: {token_file}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise PermissionError(f"API token file must not be accessible by group or others: {token_file}")
+        if metadata.st_size > API_TOKEN_MAX_BYTES:
+            raise ValueError(f"API token file exceeds {API_TOKEN_MAX_BYTES} bytes: {token_file}")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            token = handle.read(API_TOKEN_MAX_BYTES + 1).strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(token) < 32:
+        raise ValueError(f"API token file is empty or too short: {token_file}")
+    return token
+
+
+def open_api_token_initialization_lock(token_file: Path) -> int:
+    """Open the persistent token-specific creation lock without following it."""
+
+    lock_file = token_file.with_name(f".{token_file.name}.initialization.lock")
+    try:
+        fd = os.open(
+            lock_file,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ELOOP or lock_file.is_symlink():
+            raise PermissionError(f"API token initialization lock must not be a symbolic link: {lock_file}") from exc
+        raise
+    metadata = os.fstat(fd)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(fd)
+        raise PermissionError(f"API token initialization lock must be a regular file: {lock_file}")
+    os.fchmod(fd, 0o600)
+    return fd
+
+
+def load_or_create_api_token(path: Path | None = None) -> str:
+    """Load the shared credential or win its exclusive first creation.
+
+    Multiple API processes can start at the same time. Exactly one caller may
+    create the token; every loser reopens and returns that winner's credential.
+    The final path is never pre-resolved or followed as a symbolic link.
+    """
+
+    token_file = (path or api_token_path()).expanduser().absolute()
+    # Create a missing dedicated parent privately, but never chmod an existing
+    # caller-supplied parent such as /tmp or a shared workspace directory.
+    token_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("API token safety requires O_NOFOLLOW support")
+    lock_fd = open_api_token_initialization_lock(token_file)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            try:
+                return read_private_api_token(token_file)
+            except FileNotFoundError:
+                pass
+
+            token = secrets.token_urlsafe(48)
+            try:
+                fd = os.open(
+                    token_file,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+            except FileExistsError:
+                # A creator outside this process may not use our lock. Reopen
+                # the complete credential under the same no-follow checks.
+                return read_private_api_token(token_file)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP or token_file.is_symlink():
+                    raise PermissionError(f"API token file must not be a symbolic link: {token_file}") from exc
+                raise
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = -1
+                    handle.write(token + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                directory_fd = os.open(token_file.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except BaseException:
+                if fd >= 0:
+                    os.close(fd)
+                with contextlib.suppress(OSError):
+                    token_file.unlink()
+                raise
+            return token
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
 def default_state() -> dict[str, Any]:
     return {
         "version": VERSION,
+        "revision": 0,
         "created_at": iso_timestamp(),
         "updated_at": iso_timestamp(),
         "leases": {},
         "servers": {},
         "history": [],
+        "operations": {},
         "docker": {"last_commands": [], "stats_history": {}, "metadata": {}},
     }
 
@@ -143,11 +501,14 @@ def read_state() -> dict[str, Any]:
         )
         return default_state()
     data.setdefault("version", VERSION)
+    data["version"] = VERSION
+    data.setdefault("revision", 0)
     data.setdefault("created_at", iso_timestamp())
     data.setdefault("updated_at", iso_timestamp())
     data.setdefault("leases", {})
     data.setdefault("servers", {})
     data.setdefault("history", [])
+    data.setdefault("operations", {})
     data.setdefault("docker", {"last_commands": []})
     data["docker"].setdefault("last_commands", [])
     data["docker"].setdefault("stats_history", {})
@@ -157,25 +518,34 @@ def read_state() -> dict[str, Any]:
 
 def write_state(state: dict[str, Any]) -> None:
     home = coordinator_home()
-    home.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(home)
+    state["version"] = VERSION
+    state["revision"] = int(state.get("revision") or 0) + 1
     state["updated_at"] = iso_timestamp()
-    tmp = state_path().with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(state_path())
+    atomic_write_private(state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 @contextlib.contextmanager
 def locked_state() -> Any:
     home = coordinator_home()
-    home.mkdir(parents=True, exist_ok=True)
-    with lock_path().open("a+") as lock:
+    ensure_private_directory(home)
+    lock_fd = os.open(lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_fd, "a+") as lock:
+        with contextlib.suppress(OSError):
+            lock_path().chmod(0o600)
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        state = read_state()
-        prune_expired_leases(state)
-        prune_stopped_servers(state)
-        yield state
-        write_state(state)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        previous_depth = int(getattr(_STATE_LOCK_CONTEXT, "depth", 0))
+        _STATE_LOCK_CONTEXT.depth = previous_depth + 1
+        try:
+            state = read_state()
+            reconcile_operations(state)
+            prune_expired_leases(state)
+            prune_stopped_servers(state)
+            yield state
+            write_state(state)
+        finally:
+            _STATE_LOCK_CONTEXT.depth = previous_depth
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def parse_range(raw: str) -> tuple[int, int]:
@@ -463,7 +833,19 @@ def prune_expired_leases(state: dict[str, Any]) -> None:
     for lease_id, lease in list(state["leases"].items()):
         expires_at = lease.get("expires_at")
         server_id = lease.get("server_id")
+        if lease.get("pending_operation_id"):
+            # Exact-lease server attachment owns this lease until it commits or
+            # rolls back; another lock holder must not expire it mid-operation.
+            continue
         if server_id:
+            if str(lease.get("attachment_status") or "").startswith("failed_after_launch") or lease.get(
+                "attachment_status"
+            ) == "launch_outcome_unknown":
+                # A manual lease that reached process launch is quarantined
+                # until an attributed server stop or port release explicitly
+                # clears it.  Stale-process pruning must not make a port look
+                # reusable merely because cleanup observed that process exit.
+                continue
             if lease_has_stale_server(state, lease):
                 mark_lease_stale_released(state, lease_id, lease, "linked server is stopped, missing, or no longer alive")
                 continue
@@ -485,9 +867,6 @@ def lease_has_stale_server(state: dict[str, Any], lease: dict[str, Any]) -> bool
     if server.get("status") == "stopped":
         return True
     pid = server.get("pid")
-    identity = server_listener_identity(server)
-    if identity.get("ok") is False:
-        return True
     return bool(pid) and not pid_alive(int(pid))
 
 
@@ -522,7 +901,9 @@ def reclaim_stale_leases_for_port(
         if lease.get("server_id"):
             continue
         purpose = str(lease.get("purpose") or "")
-        can_reclaim_unattached = purpose.startswith("server:") and (port_available(port) or allow_occupied_unattached)
+        can_reclaim_unattached = purpose.startswith("server:") and (
+            allow_occupied_unattached or port_available(port)
+        )
         if can_reclaim_unattached:
             released.append(mark_lease_stale_released(state, lease_id, lease, reason))
     return released
@@ -532,6 +913,378 @@ def record_event(state: dict[str, Any], event_type: str, payload: dict[str, Any]
     history = state.setdefault("history", [])
     history.append({"at": iso_timestamp(), "type": event_type, "payload": payload})
     del history[:-200]
+
+
+def pending_operation_for_target(state: dict[str, Any], target: str) -> dict[str, Any] | None:
+    for operation in state.setdefault("operations", {}).values():
+        if operation.get("target") == target and operation.get("status") == "pending":
+            return operation
+    return None
+
+
+def process_owner_marker_path(pid: int, instance_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", instance_id):
+        raise ValueError("invalid coordinator process instance identity")
+    return coordinator_home() / "process-owners" / f"{pid}-{instance_id}.lock"
+
+
+def ensure_process_owner_marker() -> str:
+    """Hold a process-instance lock that distinguishes PID reuse after crashes."""
+
+    if os.getpid() != _PROCESS_INSTANCE_PID:
+        reset_process_owner_identity_after_fork()
+    home_key = str(coordinator_home())
+    existing = _PROCESS_OWNER_MARKERS.get(home_key)
+    if existing:
+        return _PROCESS_INSTANCE_ID
+    marker = process_owner_marker_path(os.getpid(), _PROCESS_INSTANCE_ID)
+    ensure_private_directory(marker.parent)
+    fd = os.open(marker, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.write(fd, f"{os.getpid()} {_PROCESS_INSTANCE_ID}\n".encode("ascii"))
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        raise
+    _PROCESS_OWNER_MARKERS[home_key] = (marker, fd)
+    return _PROCESS_INSTANCE_ID
+
+
+def cleanup_process_owner_markers() -> None:
+    for marker, fd in list(_PROCESS_OWNER_MARKERS.values()):
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            marker.unlink()
+    _PROCESS_OWNER_MARKERS.clear()
+
+
+def reset_process_owner_identity_after_fork() -> None:
+    global _PROCESS_INSTANCE_ID, _PROCESS_INSTANCE_PID
+    for _marker, fd in list(_PROCESS_OWNER_MARKERS.values()):
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    _PROCESS_OWNER_MARKERS.clear()
+    _PROCESS_INSTANCE_ID = uuid.uuid4().hex
+    _PROCESS_INSTANCE_PID = os.getpid()
+
+
+atexit.register(cleanup_process_owner_markers)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=reset_process_owner_identity_after_fork)
+
+
+def operation_owner_instance_alive(operation: dict[str, Any]) -> bool | None:
+    """Return True/False for verified identity, or None for legacy evidence."""
+
+    owner_pid = int(operation.get("owner_pid") or 0)
+    instance_id = str(operation.get("owner_instance_id") or "")
+    if not owner_pid or not instance_id:
+        return None
+    if owner_pid == os.getpid() and instance_id == _PROCESS_INSTANCE_ID:
+        owner_thread = int(operation.get("owner_thread") or 0)
+        if not owner_thread:
+            return True
+        return any(
+            thread.ident == owner_thread and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+    if not pid_alive(owner_pid):
+        return False
+    try:
+        marker = process_owner_marker_path(owner_pid, instance_id)
+    except ValueError:
+        return False
+    try:
+        fd = os.open(marker, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) & 0o077:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            return False
+    finally:
+        os.close(fd)
+
+
+def operation_target_kind(target: str) -> str:
+    return target.split(":", 1)[0] if ":" in target else target
+
+
+def delegated_project_operation_id() -> str | None:
+    value = getattr(_SERVER_RESTART_CONTEXT, "operation_id", None) or getattr(
+        _PROJECT_OPERATION_CONTEXT,
+        "operation_id",
+        None,
+    )
+    return str(value) if value else None
+
+
+@contextlib.contextmanager
+def delegated_project_operation(operation: dict[str, Any]) -> Any:
+    """Authorize synchronous child mutations for one pending project operation."""
+
+    previous_id = getattr(_PROJECT_OPERATION_CONTEXT, "operation_id", None)
+    previous_project = getattr(_PROJECT_OPERATION_CONTEXT, "project", None)
+    _PROJECT_OPERATION_CONTEXT.operation_id = str(operation["id"])
+    _PROJECT_OPERATION_CONTEXT.project = str(operation["project"])
+    try:
+        yield
+    finally:
+        _PROJECT_OPERATION_CONTEXT.operation_id = previous_id
+        _PROJECT_OPERATION_CONTEXT.project = previous_project
+
+
+@contextlib.contextmanager
+def delegated_server_restart_operation(operation: dict[str, Any]) -> Any:
+    """Authorize exact stop/start children inside one direct server restart."""
+
+    previous_id = getattr(_SERVER_RESTART_CONTEXT, "operation_id", None)
+    previous_project = getattr(_SERVER_RESTART_CONTEXT, "project", None)
+    _SERVER_RESTART_CONTEXT.operation_id = str(operation["id"])
+    _SERVER_RESTART_CONTEXT.project = str(operation["project"])
+    try:
+        yield
+    finally:
+        _SERVER_RESTART_CONTEXT.operation_id = previous_id
+        _SERVER_RESTART_CONTEXT.project = previous_project
+
+
+def pending_conflicting_operation(
+    state: dict[str, Any],
+    *,
+    target: str,
+    project: str,
+    action: str,
+    delegated_parent_id: str | None,
+) -> dict[str, Any] | None:
+    candidate_kind = operation_target_kind(target)
+    candidate_is_project = candidate_kind == "project"
+    candidate_is_child = candidate_kind in {"server", "docker", "docker-metadata"}
+    for operation in state.setdefault("operations", {}).values():
+        if operation.get("status") != "pending":
+            continue
+        operation_id = str(operation.get("id") or "")
+        if operation_id == delegated_parent_id:
+            parent_target = str(operation.get("target") or "")
+            parent_kind = operation_target_kind(parent_target)
+            project_child_allowed = parent_kind == "project" and candidate_is_child
+            restart_child_allowed = (
+                parent_kind == "server"
+                and operation.get("action") == "server.restart"
+                and target == parent_target
+                and action in {"server.stop", "server.start"}
+            )
+            if str(operation.get("project") or "") != project or not (
+                project_child_allowed or restart_child_allowed
+            ):
+                raise RuntimeError("delegated child operation does not match its pending parent capability")
+            continue
+        existing_target = str(operation.get("target") or "")
+        if existing_target == target:
+            return operation
+        if str(operation.get("project") or "") != project:
+            continue
+        existing_kind = operation_target_kind(existing_target)
+        existing_is_project = existing_kind == "project"
+        existing_is_child = existing_kind in {"server", "docker", "docker-metadata"}
+        if (candidate_is_project and existing_is_child) or (candidate_is_child and existing_is_project):
+            return operation
+    return None
+
+
+def begin_operation(
+    state: dict[str, Any],
+    *,
+    action: str,
+    target: str,
+    agent: str,
+    project: str,
+    generation: int,
+    lease_id: str | None = None,
+    server_id: str | None = None,
+) -> dict[str, Any]:
+    project = canonical_project(project)
+    delegated_parent_id = delegated_project_operation_id()
+    context_project = getattr(_SERVER_RESTART_CONTEXT, "project", None) or getattr(
+        _PROJECT_OPERATION_CONTEXT,
+        "project",
+        None,
+    )
+    if delegated_parent_id and str(context_project or "") != project:
+        raise RuntimeError("delegated child operation project does not match its parent capability")
+    existing = pending_conflicting_operation(
+        state,
+        target=target,
+        project=project,
+        action=action,
+        delegated_parent_id=delegated_parent_id,
+    )
+    if existing:
+        raise RuntimeError(
+            f"operation already in progress for {target}: {existing.get('action')} ({existing.get('id')})"
+        )
+    owner_instance_id = ensure_process_owner_marker()
+    operation = {
+        "id": str(uuid.uuid4()),
+        "action": action,
+        "target": target,
+        "agent": agent,
+        "project": project,
+        "generation": generation,
+        "status": "pending",
+        "phase": "reserved",
+        "owner_pid": os.getpid(),
+        "owner_thread": threading.get_ident(),
+        "owner_instance_id": owner_instance_id,
+        "lease_id": lease_id,
+        "server_id": server_id,
+        "created_at": iso_timestamp(),
+        "created_ts": now(),
+        "updated_at": iso_timestamp(),
+    }
+    if delegated_parent_id:
+        operation["parent_operation_id"] = delegated_parent_id
+    state.setdefault("operations", {})[operation["id"]] = operation
+    record_event(state, "operation.started", {**operation})
+    return operation
+
+
+def finish_operation(
+    state: dict[str, Any], operation_id: str, *, status: str, phase: str, error: str | None = None
+) -> dict[str, Any] | None:
+    operation = state.setdefault("operations", {}).get(operation_id)
+    if not operation:
+        return None
+    operation["status"] = status
+    operation["phase"] = phase
+    operation["updated_at"] = iso_timestamp()
+    operation["finished_at"] = iso_timestamp()
+    if error:
+        operation["error"] = error
+    record_event(state, f"operation.{status}", {**operation})
+    # Keep a bounded amount of completed operation evidence.
+    completed = sorted(
+        (item for item in state["operations"].values() if item.get("status") != "pending"),
+        key=lambda item: str(item.get("finished_at") or item.get("updated_at") or ""),
+    )
+    for stale in completed[:-100]:
+        state["operations"].pop(str(stale.get("id")), None)
+    return operation
+
+
+def reconcile_operations(state: dict[str, Any]) -> None:
+    """Fail abandoned reservations and release their unused leases."""
+
+    for operation in list(state.setdefault("operations", {}).values()):
+        if operation.get("status") != "pending":
+            continue
+        owner_pid = int(operation.get("owner_pid") or 0)
+        owner_thread = int(operation.get("owner_thread") or 0)
+        try:
+            age = max(0.0, now() - float(operation.get("created_ts") or 0))
+        except (TypeError, ValueError):
+            age = OPERATION_STALE_SECONDS + 1
+        owner_identity_alive = operation_owner_instance_alive(operation)
+        if owner_identity_alive is True:
+            continue
+        if owner_identity_alive is None:
+            if owner_pid == os.getpid() and owner_thread:
+                owner_alive = any(
+                    thread.ident == owner_thread and thread.is_alive()
+                    for thread in threading.enumerate()
+                )
+            else:
+                owner_alive = bool(owner_pid and pid_alive(owner_pid))
+            # Legacy operations have no process-instance marker. Preserve a
+            # recently live owner, but age may retire this unverifiable state.
+            if owner_alive and age <= OPERATION_STALE_SECONDS:
+                continue
+        server_id = operation.get("server_id")
+        server = state.setdefault("servers", {}).get(server_id) if server_id else None
+        live_reserved_process = bool(
+            server
+            and server.get("operation_id") == operation.get("id")
+            and server.get("pid")
+            and pid_alive(int(server.get("pid") or 0))
+        )
+        lease_id = operation.get("lease_id")
+        lease = state.setdefault("leases", {}).get(lease_id) if lease_id else None
+        manual_lease_attachment = operation.get("lease_source") == "manual"
+        launch_outcome_uncertain = str(operation.get("phase") or "") in {
+            "launching",
+            "launched",
+            "health-check",
+        }
+        if manual_lease_attachment and lease:
+            lease.pop("pending_operation_id", None)
+            lease.pop("pending_server_id", None)
+            lease["last_attachment_failure"] = {
+                "at": iso_timestamp(),
+                "operation_id": operation.get("id"),
+                "process_launched": bool(live_reserved_process or launch_outcome_uncertain),
+                "reason": "coordinator operation owner exited before completion",
+            }
+            if live_reserved_process or launch_outcome_uncertain:
+                lease["original_purpose"] = lease.get("original_purpose") or "manual"
+                lease["purpose"] = f"server:{(server or {}).get('name') or 'unknown'}"
+                lease["server_id"] = server_id
+                lease["attachment_status"] = "launch_outcome_unknown"
+                lease["reconciliation_required"] = True
+            else:
+                lease["purpose"] = lease.get("original_purpose") or "manual"
+                lease["server_id"] = None
+                lease["attachment_status"] = "rolled_back_before_launch"
+                lease["reconciliation_required"] = False
+        if live_reserved_process or (manual_lease_attachment and launch_outcome_uncertain):
+            if not server:
+                # The operation evidence is still sufficient to quarantine the
+                # lease even if a corrupt state lost the reserved server row.
+                server = None
+            else:
+                server["status"] = "orphaned"
+                server["reconciliation_required"] = True
+                server["stopped_reason"] = (
+                    "Coordinator operation owner exited after launch may have begun"
+                )
+                server["updated_at"] = iso_timestamp()
+        elif manual_lease_attachment:
+            if server and server.get("operation_id") == operation.get("id"):
+                server["failed_lease_id"] = lease_id
+                server["lease_id"] = None
+                mark_server_stopped(
+                    state,
+                    server,
+                    reason="Coordinator operation owner exited before manual-lease launch began",
+                )
+        else:
+            if lease_id and lease_id in state.setdefault("leases", {}):
+                with contextlib.suppress(KeyError):
+                    release_port(state, lease_id=str(lease_id))
+            if server and server.get("operation_id") == operation.get("id"):
+                mark_server_stopped(state, server, reason="Coordinator operation owner exited before launch completed")
+        finish_operation(
+            state,
+            str(operation["id"]),
+            status="failed",
+            phase="reconciled",
+            error="operation owner exited before completion",
+        )
 
 
 def active_lease_ports(state: dict[str, Any]) -> set[int]:
@@ -658,15 +1411,68 @@ def lease_existing_server_port(
     return lease
 
 
-def release_port(state: dict[str, Any], *, lease_id: str | None = None, port: int | None = None) -> dict[str, Any]:
+def release_port(
+    state: dict[str, Any],
+    *,
+    lease_id: str | None = None,
+    port: int | None = None,
+    acting_agent: str | None = None,
+    acting_project: str | None = None,
+) -> dict[str, Any]:
     for existing_id, lease in list(state["leases"].items()):
         if (lease_id and existing_id == lease_id) or (port is not None and int(lease["port"]) == port):
             state["leases"].pop(existing_id, None)
             lease["status"] = "released"
             lease["released_at"] = iso_timestamp()
+            if acting_agent and acting_project:
+                lease["released_by"] = agent_metadata(
+                    agent=acting_agent,
+                    project=acting_project,
+                    source="port_release",
+                )
             record_event(state, "port.released", lease)
             return lease
     raise KeyError("matching lease not found")
+
+
+def release_port_for_identity(
+    state: dict[str, Any],
+    *,
+    agent: str,
+    project: str,
+    lease_id: str | None = None,
+    port: int | None = None,
+) -> dict[str, Any]:
+    agent = str(agent or "").strip()
+    project = str(project or "").strip()
+    if not agent:
+        raise ValueError("port release requires --agent so the coordinator can attribute the action")
+    if not project:
+        raise ValueError("port release requires --project with the canonical repo path")
+    project = canonical_project(project)
+    matching = None
+    for candidate_id, lease in state.get("leases", {}).items():
+        if (lease_id and candidate_id == lease_id) or (
+            port is not None and int(lease.get("port") or 0) == int(port)
+        ):
+            matching = lease
+            break
+    if not matching:
+        raise KeyError("matching lease not found")
+    if matching.get("pending_operation_id"):
+        raise RuntimeError(
+            f"port lease has an attachment operation in progress: {matching['pending_operation_id']}"
+        )
+    lease_project = matching.get("project")
+    if not lease_project or canonical_project(str(lease_project)) != project:
+        raise PermissionError("port release project does not match the lease owner project")
+    return release_port(
+        state,
+        lease_id=lease_id,
+        port=port,
+        acting_agent=agent,
+        acting_project=project,
+    )
 
 
 def server_key(project: str, name: str) -> str:
@@ -674,47 +1480,112 @@ def server_key(project: str, name: str) -> str:
 
 
 def canonical_project(project: str) -> str:
-    raw = Path(project or os.getcwd()).expanduser()
-    git_cwd = raw if raw.is_dir() else raw.parent
-    if git_cwd.exists():
-        with contextlib.suppress(Exception):
-            completed = subprocess.run(
-                ["git", "-C", str(git_cwd), "rev-parse", "--show-toplevel"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=3,
-            )
-            if completed.returncode == 0 and completed.stdout.strip():
-                return str(Path(completed.stdout.strip()).expanduser().resolve())
-    return str(raw.resolve())
+    """Resolve a project root without invoking Git.
+
+    This helper is used by state mutations, including mutations performed while
+    ``state.lock`` is held. Walking parent directories for a ``.git`` marker is
+    deterministic and keeps an arbitrarily slow Git executable out of the
+    cross-agent critical section. Worktrees are covered because their ``.git``
+    marker is a file rather than a directory.
+    """
+
+    raw = Path(project or os.getcwd()).expanduser().resolve()
+    cache_key = str(raw)
+    cached = _PROJECT_ROOT_CACHE.get(cache_key)
+    if cached:
+        return cached
+    if int(getattr(_STATE_LOCK_CONTEXT, "depth", 0)):
+        # Routed commands resolve project roots before acquiring state.lock. A
+        # legacy in-process caller that did not do so gets the resolved path,
+        # never a Git-marker walk from inside the critical section.
+        return cache_key
+    candidate = raw if raw.is_dir() else raw.parent
+    for directory in (candidate, *candidate.parents):
+        if (directory / ".git").exists():
+            resolved = str(directory)
+            _PROJECT_ROOT_CACHE[cache_key] = resolved
+            _PROJECT_ROOT_CACHE[resolved] = resolved
+            return resolved
+    _PROJECT_ROOT_CACHE[cache_key] = cache_key
+    return cache_key
 
 
-def git_value(project: str, *args: str) -> str | None:
-    with contextlib.suppress(Exception):
-        completed = subprocess.run(
-            ["git", "-C", project, *args],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=3,
-        )
-        if completed.returncode == 0:
-            value = completed.stdout.strip()
-            return value or None
+def git_directory(project: str) -> Path | None:
+    marker = Path(project) / ".git"
+    if marker.is_dir():
+        return marker
+    if marker.is_file():
+        with contextlib.suppress(OSError):
+            prefix, _, value = marker.read_text(encoding="utf-8", errors="replace").strip().partition(":")
+            if prefix.strip().lower() == "gitdir" and value.strip():
+                path = Path(value.strip()).expanduser()
+                if not path.is_absolute():
+                    path = marker.parent / path
+                return path.resolve()
     return None
+
+
+def read_git_head_identity(project: str) -> tuple[str | None, str | None]:
+    """Read branch/commit identity from Git metadata without a subprocess."""
+
+    directory = git_directory(project)
+    if not directory:
+        return None, None
+    with contextlib.suppress(OSError):
+        head = (directory / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        if head.startswith("ref:"):
+            reference = head.split(":", 1)[1].strip()
+            branch = reference.removeprefix("refs/heads/")
+            commit = None
+            reference_path = directory / reference
+            with contextlib.suppress(OSError):
+                commit = reference_path.read_text(encoding="utf-8", errors="replace").strip()
+            if not commit:
+                with contextlib.suppress(OSError):
+                    for line in (directory / "packed-refs").read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines():
+                        value, separator, name = line.partition(" ")
+                        if separator and name == reference:
+                            commit = value
+                            break
+            return branch or None, commit[:7] if commit else None
+        return "HEAD", head[:7] if head else None
+    return None, None
+
+
+def prime_git_head_identity(project: str) -> tuple[str | None, str | None]:
+    resolved_project = canonical_project(project)
+    identity = read_git_head_identity(resolved_project)
+    identities = getattr(_GIT_IDENTITY_CONTEXT, "identities", None)
+    if identities is None:
+        identities = {}
+        _GIT_IDENTITY_CONTEXT.identities = identities
+    identities[resolved_project] = identity
+    return identity
+
+
+def git_head_identity(project: str) -> tuple[str | None, str | None]:
+    resolved_project = canonical_project(project)
+    identities = getattr(_GIT_IDENTITY_CONTEXT, "identities", {})
+    if resolved_project in identities:
+        return identities[resolved_project]
+    if int(getattr(_STATE_LOCK_CONTEXT, "depth", 0)):
+        return None, None
+    return read_git_head_identity(resolved_project)
 
 
 def agent_metadata(*, agent: str, project: str, source: str, cwd: str | None = None) -> dict[str, Any]:
     resolved_project = canonical_project(project)
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else resolved_project
+    git_branch, git_commit = git_head_identity(resolved_project)
     return {
         "agent": agent,
         "project": resolved_project,
         "repo_name": Path(resolved_project).name,
         "cwd": resolved_cwd,
-        "git_branch": git_value(resolved_project, "rev-parse", "--abbrev-ref", "HEAD"),
-        "git_commit": git_value(resolved_project, "rev-parse", "--short", "HEAD"),
+        "git_branch": git_branch,
+        "git_commit": git_commit,
         "recorded_at": iso_timestamp(),
         "metadata_source": source,
     }
@@ -728,6 +1599,7 @@ def require_identity(options: dict[str, Any], command: str) -> tuple[str, str]:
     if not project:
         raise ValueError(f"{command} requires --project with the canonical repo path")
     resolved_project = canonical_project(project)
+    prime_git_head_identity(resolved_project)
     options["agent"] = agent
     options["project"] = resolved_project
     return agent, resolved_project
@@ -1092,31 +1964,98 @@ def normalize_env(values: list[str] | None) -> dict[str, str]:
     return env
 
 
+@dataclass(frozen=True)
+class LaunchSpec:
+    """A shell-free, attributable process launch contract."""
+
+    argv: tuple[str, ...]
+    cwd: str
+    env_extra: dict[str, str]
+    agent: str
+    project: str
+    source: str
+
+    def as_state(self) -> dict[str, Any]:
+        return {
+            "argv": list(self.argv),
+            "cwd": self.cwd,
+            "env": dict(self.env_extra),
+            "agent": self.agent,
+            "project": self.project,
+            "source": self.source,
+        }
+
+
+def parse_legacy_command(command: str) -> list[str]:
+    """Parse compatibility command text as argv, never as shell source.
+
+    Shell control syntax is rejected rather than silently changing meaning. A
+    caller that needs a literal punctuation argument can use structured argv.
+    """
+
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("server command must not be empty")
+    if "\x00" in command or "\n" in command or "\r" in command:
+        raise ValueError("unsafe shell syntax in server command: control character")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        argv = list(lexer)
+    except ValueError as exc:
+        raise ValueError(f"invalid quoted server command: {exc}") from exc
+    dangerous = {";", "&", "&&", "|", "||", "<", ">", ">>", "<<", "(", ")"}
+    for token in argv:
+        if token in dangerous or (token and all(char in ";&|<>()" for char in token)):
+            raise ValueError(f"unsafe shell syntax in server command: {token!r}; use structured argv")
+    if not argv:
+        raise ValueError("server command must not be empty")
+    return argv
+
+
+def command_argv(options: dict[str, Any]) -> list[str]:
+    structured = options.get("argv")
+    if structured is not None:
+        if not isinstance(structured, (list, tuple)) or not structured:
+            raise ValueError("server argv must be a non-empty array of strings")
+        if not all(isinstance(item, str) and "\x00" not in item for item in structured):
+            raise ValueError("server argv entries must be NUL-free strings")
+        return list(structured)
+    command = options.get("cmd") or options.get("command")
+    return parse_legacy_command(str(command or ""))
+
+
+def format_argv(argv: list[str] | tuple[str, ...], *, port: int, host: str) -> list[str]:
+    return [item.replace("{port}", str(port)).replace("{host}", host) for item in argv]
+
+
 def format_command(command: str, *, port: int, host: str) -> str:
     return command.replace("{port}", str(port)).replace("{host}", host)
 
 
 def start_process(
     *,
-    command: str,
-    cwd: str,
-    env_extra: dict[str, str],
+    launch: LaunchSpec,
     server_id: str,
 ) -> tuple[int, str]:
-    logs_dir().mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(logs_dir())
     log_path = logs_dir() / f"{server_id}.log"
-    log_file = log_path.open("ab", buffering=0)
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    log_file = os.fdopen(log_fd, "ab", buffering=0)
     env = os.environ.copy()
-    env.update(env_extra)
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=env,
-        shell=True,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    env.update(launch.env_extra)
+    try:
+        process = subprocess.Popen(
+            list(launch.argv),
+            cwd=launch.cwd,
+            env=env,
+            shell=False,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_file.close()
     return process.pid, str(log_path)
 
 
@@ -1233,20 +2172,21 @@ def server_health(
     }
 
 
-def docker_available_command(args: list[str]) -> dict[str, Any]:
+def docker_available_command(args: list[str], *, cwd: str | None = None) -> dict[str, Any]:
     command = ["docker", *args]
     try:
-        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
-    except FileNotFoundError:
-        return {"ok": False, "command": command, "error": "Docker CLI was not found on PATH"}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "command": command, "error": "Docker command timed out"}
+        completed, executable, timeout_seconds = execute_docker_subprocess(command, cwd=cwd)
+    except Exception as exc:
+        return {"ok": False, "command": command, **coordinator_exception_payload(exc)}
     return {
         "ok": completed.returncode == 0,
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "command": command,
+        "cwd": cwd,
+        "docker_executable": executable,
+        "timeout_seconds": timeout_seconds,
     }
 
 
@@ -1269,6 +2209,22 @@ def inspect_docker_container(container: str) -> dict[str, Any] | None:
         with contextlib.suppress(json.JSONDecodeError):
             return json.loads(line)
     return None
+
+
+def docker_container_operation_identity(
+    container: str | None,
+    inspected: dict[str, Any] | None = None,
+) -> str | None:
+    """Normalize a name/short-id alias to Docker's immutable full container id."""
+
+    normalized = normalize_container_name(container)
+    if not normalized:
+        return None
+    evidence = inspected if inspected is not None else inspect_docker_container(normalized)
+    immutable_id = str((evidence or {}).get("Id") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{12,64}", immutable_id):
+        return f"container-id:{immutable_id}"
+    return f"container-alias:{normalized}"
 
 
 def compose_project_from_inspection(inspected: dict[str, Any] | None) -> str | None:
@@ -1296,7 +2252,10 @@ def register_docker_metadata(state: dict[str, Any], options: dict[str, Any]) -> 
         raise ValueError("docker register requires --container")
     force = bool(options.get("force"))
     dry_run = bool(options.get("dry_run"))
-    inspected = None if dry_run else inspect_docker_container(container)
+    if "_coordinator_inspected_container" in options:
+        inspected = options.get("_coordinator_inspected_container")
+    else:
+        inspected = None if dry_run else inspect_docker_container(container)
     compose_project = compose_project_from_inspection(inspected)
     if compose_project and not force:
         payload = {
@@ -1691,6 +2650,7 @@ def normalize_server_definition(raw: dict[str, Any], project: str) -> dict[str, 
         "project": project,
         "cwd": cwd,
         "cmd": raw.get("cmd") or raw.get("command"),
+        "argv": raw.get("argv"),
         "port": port,
         "host": raw.get("host") or "127.0.0.1",
         "health_url": raw.get("health_url"),
@@ -1717,11 +2677,15 @@ def normalize_docker_dependency(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "docker",
         "name": str(name),
+        "service": raw.get("service"),
         "container": raw.get("container") or raw.get("name"),
         "image": raw.get("image"),
         "required": raw.get("required", True) is not False,
         "ports": ports,
         "health_url": raw.get("health_url"),
+        "declared": True,
+        "mutation_authorized": True,
+        "ownership_source": "runtime_declaration",
     }
 
 
@@ -1750,6 +2714,25 @@ def matching_project_containers(project: str, containers: list[dict[str, Any]]) 
         if project_key_from_resource_name(container.get("name") or container.get("image")) == key:
             matches.append(container)
     return matches
+
+
+def container_has_authorized_project_provenance(container: dict[str, Any], project: str) -> bool:
+    """Return whether Docker/coordinator evidence—not a name—owns this container."""
+
+    container_project = container.get("project")
+    if not container_project or canonical_project(str(container_project)) != canonical_project(project):
+        return False
+    source = container.get("metadata_source")
+    if source == "docker_labels":
+        return True
+    if source != "coordinator_sidecar" or not container.get("agent"):
+        return False
+    metadata = container.get("agent_metadata") or {}
+    metadata_project = metadata.get("project")
+    return bool(
+        metadata_project
+        and canonical_project(str(metadata_project)) == canonical_project(project)
+    )
 
 
 def build_project_runtime_spec(
@@ -1841,6 +2824,7 @@ def build_project_runtime_spec(
     } if compose_files else None
 
     docker_dependencies: list[dict[str, Any]] = []
+    docker_evidence: list[dict[str, Any]] = []
     for item in runtime_list(docker_config.get("containers")):
         if isinstance(item, dict):
             docker_dependencies.append(normalize_docker_dependency(item))
@@ -1852,18 +2836,25 @@ def build_project_runtime_spec(
     for container in matching_project_containers(resolved_project, docker.get("containers", [])):
         name = container.get("name")
         if name and name not in known_containers:
-            docker_dependencies.append(
-                {
-                    "type": "docker",
-                    "name": name,
-                    "container": name,
-                    "image": container.get("image"),
-                    "required": True,
-                    "ports": [],
-                    "health_url": None,
-                    "discovered": True,
-                }
-            )
+            authorized = container_has_authorized_project_provenance(container, resolved_project)
+            discovered = {
+                "type": "docker",
+                "name": name,
+                "container": name,
+                "image": container.get("image"),
+                "required": authorized,
+                "ports": [],
+                "health_url": None,
+                "declared": False,
+                "discovered": True,
+                "mutation_authorized": authorized,
+                "ownership_source": container.get("metadata_source") if authorized else "name_heuristic",
+                "read_only_evidence": not authorized,
+            }
+            if authorized:
+                docker_dependencies.append(discovered)
+            else:
+                docker_evidence.append(discovered)
 
     health_checks = [
         normalize_health_check(item)
@@ -1880,6 +2871,7 @@ def build_project_runtime_spec(
         "servers": server_defs,
         "compose": compose,
         "docker_dependencies": docker_dependencies,
+        "docker_evidence": docker_evidence,
         "health_checks": health_checks,
         "docker": docker,
     }
@@ -1962,6 +2954,11 @@ def docker_dependency_status(dep: dict[str, Any], containers: list[dict[str, Any
         "classification": classification,
         "previous_exit_reason": exit_reason,
         "recent_logs": logs,
+        "declared": dep.get("declared", False),
+        "discovered": dep.get("discovered", False),
+        "mutation_authorized": dep.get("mutation_authorized", False),
+        "ownership_source": dep.get("ownership_source"),
+        "read_only_evidence": dep.get("read_only_evidence", False),
     }
 
 
@@ -2073,8 +3070,10 @@ def project_runtime_report(state: dict[str, Any], spec: dict[str, Any], *, actio
         if compose.get("declared"):
             concrete_services.append(compose)
     docker_services = [docker_dependency_status(dep, containers) for dep in spec.get("docker_dependencies", [])]
+    docker_evidence = [docker_dependency_status(dep, containers) for dep in spec.get("docker_evidence", [])]
     server_services = [server_status_for_runtime(state, server_def) for server_def in spec.get("servers", [])]
     services.extend(docker_services)
+    services.extend(docker_evidence)
     services.extend(server_services)
     concrete_services.extend(docker_services)
     concrete_services.extend(server_services)
@@ -2156,8 +3155,18 @@ def start_runtime_server(state: dict[str, Any], server_def: dict[str, Any], opti
             port=int(fixed_port),
             reason=f"project start reclaimed stale fixed-port lease for {server_def['name']}",
         )
-    command = server_def.get("cmd") or (existing or {}).get("cmd_template")
-    if not command:
+    declared_command = server_def.get("cmd")
+    declared_argv = server_def.get("argv")
+    if declared_argv is not None:
+        command = None
+        argv_template = declared_argv
+    elif declared_command:
+        command = declared_command
+        argv_template = None
+    else:
+        command = (existing or {}).get("cmd_template")
+        argv_template = (existing or {}).get("argv_template")
+    if not command and not argv_template:
         raise RuntimeError(f"project server {server_def['name']} has no command declaration")
     start_options = {
         "agent": options.get("agent") or os.environ.get("USER") or "codex-agent",
@@ -2165,6 +3174,7 @@ def start_runtime_server(state: dict[str, Any], server_def: dict[str, Any], opti
         "name": server_def["name"],
         "cwd": server_def.get("cwd") or (existing or {}).get("cwd") or server_def["project"],
         "cmd": command,
+        "argv": argv_template,
         "range": f"{fixed_port}-{fixed_port}" if fixed_port else options.get("range") or DEFAULT_RANGE,
         "preferred": int(fixed_port) if fixed_port else options.get("preferred"),
         "host": server_def.get("host") or (existing or {}).get("host") or "127.0.0.1",
@@ -2187,7 +3197,7 @@ def ensure_runtime_docker_metadata(state: dict[str, Any], spec: dict[str, Any], 
         return []
     actions = []
     containers = spec.get("docker", {}).get("containers", [])
-    for dep in spec.get("docker_dependencies", []):
+    for dep in mutable_runtime_docker_dependencies(spec):
         container_name = dep.get("container") or dep.get("name")
         container = docker_container_by_name(containers, container_name)
         if not container or container.get("metadata_source") != "none":
@@ -2236,7 +3246,7 @@ def project_runtime_start(state: dict[str, Any], options: dict[str, Any]) -> dic
         )
     actions.extend(ensure_runtime_docker_metadata(state, spec, options))
     containers = spec.get("docker", {}).get("containers", [])
-    for dep in spec.get("docker_dependencies", []):
+    for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
         status = docker_dependency_status(dep, containers)
         if status.get("ok"):
             continue
@@ -2280,7 +3290,7 @@ def project_runtime_restart(state: dict[str, Any], options: dict[str, Any]) -> d
         server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
         if existing:
             actions.append(stop_server(state, {"server_id": server_id, "agent": agent, "project": existing["project"], "name": existing["name"], "release_port": True, "reason": "Restarted by project runtime"}))
-    for dep in spec.get("docker_dependencies", []):
+    for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
         container_name = dep.get("container") or dep.get("name")
         actions.append(run_docker(state, ["docker", "restart", container_name], dry_run=dry_run, project=spec["project"], agent=agent, container=container_name))
     started = project_runtime_start(state, options)
@@ -2300,7 +3310,7 @@ def project_runtime_stop(state: dict[str, Any], options: dict[str, Any]) -> dict
         server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
         if existing and existing.get("status") != "stopped":
             actions.append(stop_server(state, {"server_id": server_id, "agent": agent, "project": existing["project"], "name": existing["name"], "reason": "Stopped by project runtime"}))
-    for dep in spec.get("docker_dependencies", []):
+    for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
         container_name = dep.get("container") or dep.get("name")
         current = docker_dependency_status(dep, spec.get("docker", {}).get("containers", []))
         if current.get("status") != "missing" and not is_stopped_container_status(str(current.get("status") or "")):
@@ -2429,7 +3439,9 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
     host, port, url = parse_server_endpoint(options)
     cwd = str(Path(options.get("cwd") or project).expanduser().resolve())
     command_template = options.get("cmd") or options.get("command")
-    command = format_command(command_template, port=port, host=host) if command_template else None
+    argv_template = command_argv(options) if command_template or options.get("argv") else None
+    argv = format_argv(argv_template, port=port, host=host) if argv_template else None
+    command = shlex.join(argv) if argv else None
     health_url_template = options.get("health_url") or url
     health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
     pid = options.get("pid")
@@ -2456,6 +3468,8 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
         "project": project,
         "cwd": cwd,
         "cmd_template": command_template or previous.get("cmd_template"),
+        "argv_template": argv_template or previous.get("argv_template"),
+        "argv": argv or previous.get("argv"),
         "cmd": command or previous.get("cmd"),
         "port": port,
         "host": host,
@@ -2466,7 +3480,7 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
         "pid": int(pid) if pid else None,
         "log_path": previous.get("log_path"),
         "adopted": True,
-        "missing_command": not bool(command_template or previous.get("cmd_template")),
+        "missing_command": not bool(argv_template or previous.get("argv_template") or previous.get("cmd_template")),
         "metadata_source": options.get("metadata_source") or "server_register",
         "agent_metadata": agent_metadata(agent=agent, project=project, cwd=cwd, source=options.get("metadata_source") or "server_register"),
         "created_at": previous.get("created_at") or iso_timestamp(),
@@ -2518,6 +3532,7 @@ def adopt_runtime_server_if_running(state: dict[str, Any], server_def: dict[str,
             "name": server_def["name"],
             "cwd": server_def.get("cwd") or server_def["project"],
             "cmd": server_def.get("cmd"),
+            "argv": server_def.get("argv"),
             "port": port,
             "host": host,
             "url": f"http://{host}:{port}",
@@ -2547,6 +3562,12 @@ def stop_pid(pid: int) -> None:
             os.kill(pid, signal.SIGTERM)
     deadline = now() + GRACE_SECONDS
     while now() < deadline:
+        try:
+            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            reaped_pid = 0
+        if reaped_pid == pid:
+            return
         if not pid_alive(pid):
             return
         time.sleep(0.1)
@@ -2559,6 +3580,7 @@ def stop_pid(pid: int) -> None:
 
 def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
     agent, project = require_identity(options, "server start")
+    argv_template = command_argv(options)
     name = options["name"]
     existing_id, existing = find_server(state, project=project, name=name)
     if existing and server_health(existing).get("ok"):
@@ -2581,14 +3603,16 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
     )
     port = int(lease["port"])
     host = options.get("host") or "127.0.0.1"
-    command = format_command(options["cmd"], port=port, host=host)
+    argv = format_argv(argv_template, port=port, host=host)
+    command = shlex.join(argv)
     cwd = str(Path(options.get("cwd") or project).expanduser().resolve())
     health_url_template = options.get("health_url")
     health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
     env_extra = normalize_env(options.get("env") or [])
     env_extra.setdefault("PORT", str(port))
     env_extra.setdefault("HOST", host)
-    pid, log_path = start_process(command=command, cwd=cwd, env_extra=env_extra, server_id=server_id)
+    launch = LaunchSpec(tuple(argv), cwd, env_extra, agent, project, "server_start")
+    pid, log_path = start_process(launch=launch, server_id=server_id)
     server = {
         "id": server_id,
         "key": server_key(project, name),
@@ -2596,7 +3620,11 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
         "agent": agent,
         "project": str(Path(project).expanduser().resolve()),
         "cwd": cwd,
-        "cmd_template": options["cmd"],
+        "cmd_template": options.get("cmd"),
+        "argv_template": argv_template,
+        "argv": argv,
+        "launch_spec": launch.as_state(),
+        "env": env_extra,
         "cmd": command,
         "port": port,
         "host": host,
@@ -2667,7 +3695,7 @@ def restart_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, 
     server_id, server = find_server(state, project=project, name=options["name"])
     if not server:
         raise KeyError("matching server not found")
-    if not server.get("cmd_template"):
+    if not server.get("argv_template") and not server.get("cmd_template"):
         raise RuntimeError(f"server {server.get('name')} is registered without a command; missing_command=true")
     fixed_port = int(server["port"])
     restart_options = {
@@ -2675,15 +3703,2017 @@ def restart_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, 
         "project": server["project"],
         "name": server["name"],
         "cwd": server["cwd"],
-        "cmd": server["cmd_template"],
+        "cmd": server.get("cmd_template"),
+        "argv": server.get("argv_template"),
         "range": options.get("range") or f"{fixed_port}-{fixed_port}",
         "preferred": fixed_port,
         "host": server.get("host") or "127.0.0.1",
         "health_url": server.get("health_url_template") or server.get("health_url"),
         "health_timeout": options.get("health_timeout") or 10,
+        "env": [f"{key}={value}" for key, value in (server.get("env") or {}).items() if key not in {"PORT", "HOST"}],
     }
     stop_server(state, {"server_id": server_id, "agent": agent, "project": server["project"], "name": server["name"], "release_port": True})
     return start_server(state, restart_options)
+
+
+def recorded_expired_lease(state: dict[str, Any], lease_id: str) -> bool:
+    return any(
+        event.get("type") == "port.expired"
+        and str((event.get("payload") or {}).get("id") or "") == lease_id
+        for event in reversed(state.get("history", []))
+    )
+
+
+def finalize_manual_lease_start_failure(
+    *,
+    operation_id: str,
+    server_id: str,
+    lease_id: str,
+    reason: str,
+    process_launched: bool,
+    process_active: bool = False,
+    pid: int | None = None,
+    log_path: str | None = None,
+    health: dict[str, Any] | None = None,
+) -> None:
+    """Close one failed exact-lease reservation without inventing reuse safety."""
+
+    with locked_state() as state:
+        operation = state.get("operations", {}).get(operation_id)
+        server = state.get("servers", {}).get(server_id)
+        lease = state.get("leases", {}).get(lease_id)
+        failure = {
+            "at": iso_timestamp(),
+            "operation_id": operation_id,
+            "process_launched": process_launched,
+            "process_active": process_active,
+            "reason": reason,
+        }
+        lease_reservation_owner = str((lease or {}).get("pending_operation_id") or "")
+        may_finalize_lease = bool(
+            lease
+            and lease_reservation_owner in {"", operation_id}
+        )
+        if may_finalize_lease and lease:
+            lease.pop("pending_operation_id", None)
+            lease.pop("pending_server_id", None)
+            lease["last_attachment_failure"] = failure
+            if process_launched:
+                lease["original_purpose"] = lease.get("original_purpose") or "manual"
+                lease["purpose"] = f"server:{(server or {}).get('name') or 'unknown'}"
+                lease["server_id"] = server_id
+                lease["attachment_status"] = (
+                    "failed_after_launch_reconciliation_required"
+                    if process_active
+                    else "failed_after_launch_stopped"
+                )
+                lease["reconciliation_required"] = process_active
+            else:
+                lease["purpose"] = lease.get("original_purpose") or "manual"
+                lease["server_id"] = None
+                lease["attachment_status"] = "rolled_back_before_launch"
+                lease["reconciliation_required"] = False
+        if server and server.get("operation_id") == operation_id:
+            if pid is not None:
+                server["pid"] = pid
+            if log_path:
+                server["log_path"] = log_path
+            if health is not None:
+                server["health"] = health
+            server["last_start_failure"] = failure
+            if process_launched:
+                server["status"] = "orphaned" if process_active else "stopped"
+                server["reconciliation_required"] = process_active
+                server["stopped_reason"] = reason
+                server["stopped_at"] = iso_timestamp()
+                server["stopped_ts"] = now()
+                server["updated_at"] = iso_timestamp()
+            else:
+                server["failed_lease_id"] = lease_id
+                server["lease_id"] = None
+                mark_server_stopped(state, server, reason=reason)
+        if operation and operation.get("status") == "pending":
+            finish_operation(
+                state,
+                operation_id,
+                status="failed",
+                phase="failed-after-launch" if process_launched else "rolled-back-before-launch",
+                error=reason,
+            )
+        record_event(
+            state,
+            "server.manual_lease_start_failed",
+            {
+                "server_id": server_id,
+                "lease_id": lease_id,
+                **failure,
+            },
+        )
+
+
+def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, Any]:
+    """Attach one exact active manual lease to a structured server launch."""
+
+    prepared = dict(options)
+    agent, project = require_identity(prepared, "server start --lease-id")
+    name = str(prepared.get("name") or "").strip()
+    if not name:
+        raise ValueError("server start --lease-id requires --name")
+    lease_id = str(prepared.get("lease_id") or "").strip()
+    if not lease_id:
+        raise ValueError("server start --lease-id requires a lease id")
+    if prepared.get("argv") is None or prepared.get("cmd") or prepared.get("command"):
+        raise ValueError("server start --lease-id requires structured --argv and does not accept --cmd")
+    argv_template = command_argv(prepared)
+    cwd = str(Path(prepared.get("cwd") or project).expanduser().resolve())
+    if not Path(cwd).is_dir():
+        raise FileNotFoundError(f"server cwd does not exist or is not a directory: {cwd}")
+    target = f"server:{server_key(project, name)}"
+    host = str(prepared.get("host") or "127.0.0.1")
+
+    with locked_state() as state:
+        lease = state.get("leases", {}).get(lease_id)
+        if not lease:
+            if recorded_expired_lease(state, lease_id):
+                raise ValueError(f"manual lease {lease_id} expired")
+            raise KeyError(f"manual lease not found: {lease_id}")
+        if lease.get("status") != "active":
+            raise ValueError(f"manual lease {lease_id} is not active")
+        expires_at = lease.get("expires_at")
+        if expires_at is not None and now() > float(expires_at):
+            raise ValueError(f"manual lease {lease_id} expired")
+        if str(lease.get("agent") or "") != agent:
+            raise ValueError(f"manual lease {lease_id} agent does not match server start agent")
+        lease_project = canonical_project(str(lease.get("project") or ""))
+        if lease_project != project:
+            raise ValueError(f"manual lease {lease_id} project does not match server start project")
+        if lease.get("server_id") or lease.get("pending_operation_id"):
+            raise ValueError(f"manual lease {lease_id} is already bound or being attached")
+        if str(lease.get("purpose") or "") != "manual":
+            raise ValueError(f"server start --lease-id requires a manual lease, got {lease.get('purpose')!r}")
+        port = int(lease["port"])
+        preferred = prepared.get("preferred")
+        if preferred is not None and int(preferred) != port:
+            raise ValueError(f"manual lease {lease_id} owns port {port}, not preferred port {preferred}")
+        existing_id, existing = find_server(state, project=project, name=name)
+        if existing and (
+            existing.get("status") != "stopped"
+            or pid_alive(int(existing.get("pid") or 0))
+        ):
+            raise RuntimeError(f"server {name} already exists and must be stopped before exact-lease start")
+        server_id = existing_id or str(uuid.uuid4())
+        generation = int((existing or {}).get("generation") or 0) + 1
+        operation = begin_operation(
+            state,
+            action="server.start",
+            target=target,
+            agent=agent,
+            project=project,
+            generation=generation,
+            lease_id=lease_id,
+            server_id=server_id,
+        )
+        operation["lease_source"] = "manual"
+        operation["lease_port"] = port
+        operation["phase"] = "reserved"
+        lease["pending_operation_id"] = operation["id"]
+        lease["pending_server_id"] = server_id
+        lease["attachment_status"] = "reserved"
+        lease["original_purpose"] = "manual"
+        lease["updated_at"] = iso_timestamp()
+
+        argv = format_argv(argv_template, port=port, host=host)
+        health_url_template = prepared.get("health_url")
+        health_url = (
+            format_command(health_url_template, port=port, host=host)
+            if health_url_template
+            else None
+        )
+        env_extra = normalize_env(prepared.get("env") or [])
+        env_extra.setdefault("PORT", str(port))
+        env_extra.setdefault("HOST", host)
+        launch = LaunchSpec(tuple(argv), cwd, env_extra, agent, project, "manual_lease_start")
+        previous = existing or {}
+        server = {
+            "id": server_id,
+            "key": server_key(project, name),
+            "name": name,
+            "agent": agent,
+            "project": project,
+            "cwd": cwd,
+            "cmd_template": None,
+            "argv_template": argv_template,
+            "cmd": shlex.join(argv),
+            "argv": argv,
+            "launch_spec": launch.as_state(),
+            "env": env_extra,
+            "port": port,
+            "host": host,
+            "url": f"http://{host}:{port}",
+            "health_url": health_url,
+            "health_url_template": health_url_template,
+            "lease_id": lease_id,
+            "lease_source": "manual",
+            "pid": None,
+            "log_path": previous.get("log_path"),
+            "adopted": False,
+            "missing_command": False,
+            "metadata_source": "manual_lease_start",
+            "agent_metadata": agent_metadata(
+                agent=agent,
+                project=project,
+                cwd=cwd,
+                source="manual_lease_start",
+            ),
+            "status": "starting",
+            "operation_id": operation["id"],
+            "generation": generation,
+            "created_at": previous.get("created_at") or iso_timestamp(),
+            "created_ts": now(),
+            "updated_at": iso_timestamp(),
+        }
+        state["servers"][server_id] = server
+        record_event(
+            state,
+            "server.manual_lease_reserved",
+            {
+                "server_id": server_id,
+                "lease_id": lease_id,
+                "port": port,
+                "operation_id": operation["id"],
+                "project": project,
+                "agent": agent,
+            },
+        )
+
+    if not port_available(port, host):
+        reason = f"manual lease {lease_id} port is no longer available: {host}:{port}"
+        finalize_manual_lease_start_failure(
+            operation_id=operation["id"],
+            server_id=server_id,
+            lease_id=lease_id,
+            reason=reason,
+            process_launched=False,
+        )
+        raise RuntimeError(reason)
+
+    with locked_state() as state:
+        current_operation = state.get("operations", {}).get(operation["id"])
+        current_lease = state.get("leases", {}).get(lease_id)
+        reservation_changed = bool(
+            not current_operation
+            or current_operation.get("status") != "pending"
+            or not current_lease
+            or current_lease.get("pending_operation_id") != operation["id"]
+        )
+        if not reservation_changed:
+            current_operation["phase"] = "launching"
+            current_operation["updated_at"] = iso_timestamp()
+            current_lease["attachment_status"] = "launching"
+            current_lease["updated_at"] = iso_timestamp()
+    if reservation_changed:
+        reason = "manual lease start reservation changed before process launch"
+        finalize_manual_lease_start_failure(
+            operation_id=operation["id"],
+            server_id=server_id,
+            lease_id=lease_id,
+            reason=reason,
+            process_launched=False,
+        )
+        raise RuntimeError(reason)
+
+    try:
+        pid, log_path = start_process(launch=launch, server_id=server_id)
+    except Exception as exc:
+        reason = f"server launch failed using manual lease {lease_id}: {exc}"
+        finalize_manual_lease_start_failure(
+            operation_id=operation["id"],
+            server_id=server_id,
+            lease_id=lease_id,
+            reason=reason,
+            process_launched=False,
+            log_path=str(logs_dir() / f"{server_id}.log"),
+        )
+        raise RuntimeError(reason) from exc
+
+    with locked_state() as state:
+        current = state.get("servers", {}).get(server_id)
+        current_operation = state.get("operations", {}).get(operation["id"])
+        current_lease = state.get("leases", {}).get(lease_id)
+        commit_allowed = bool(
+            current
+            and current.get("generation") == generation
+            and current.get("operation_id") == operation["id"]
+            and current_operation
+            and current_operation.get("status") == "pending"
+            and current_lease
+            and current_lease.get("pending_operation_id") == operation["id"]
+        )
+        if commit_allowed:
+            current["pid"] = pid
+            current["log_path"] = log_path
+            current["updated_at"] = iso_timestamp()
+            current_operation["phase"] = "health-check"
+            current_operation["launched_pid"] = pid
+            current_operation["updated_at"] = iso_timestamp()
+            current_lease["attachment_status"] = "health-check"
+            current_lease["process_launched"] = True
+            current_lease["updated_at"] = iso_timestamp()
+            server_for_health = copy.deepcopy(current)
+    if not commit_allowed:
+        stop_pid(pid)
+        process_active = pid_alive(pid) or not port_available(port, host)
+        reason = "manual lease start reservation was superseded after process launch"
+        finalize_manual_lease_start_failure(
+            operation_id=operation["id"],
+            server_id=server_id,
+            lease_id=lease_id,
+            reason=reason,
+            process_launched=True,
+            process_active=process_active,
+            pid=pid,
+            log_path=log_path,
+        )
+        raise RuntimeError(reason)
+
+    health = wait_for_health(server_for_health, float(prepared.get("health_timeout") or 10))
+    if not health.get("ok"):
+        stop_pid(pid)
+        process_active = pid_alive(pid) or not port_available(port, host)
+        reason = (
+            f"server failed health check using manual lease {lease_id}: "
+            f"{health.get('classification') or health.get('error') or 'unhealthy'}"
+        )
+        finalize_manual_lease_start_failure(
+            operation_id=operation["id"],
+            server_id=server_id,
+            lease_id=lease_id,
+            reason=reason,
+            process_launched=True,
+            process_active=process_active,
+            pid=pid,
+            log_path=log_path,
+            health=health,
+        )
+        raise RuntimeError(reason)
+
+    with locked_state() as state:
+        current = state.get("servers", {}).get(server_id)
+        current_operation = state.get("operations", {}).get(operation["id"])
+        current_lease = state.get("leases", {}).get(lease_id)
+        if (
+            not current
+            or current.get("generation") != generation
+            or current.get("operation_id") != operation["id"]
+            or not current_operation
+            or current_operation.get("status") != "pending"
+            or not current_lease
+            or current_lease.get("pending_operation_id") != operation["id"]
+        ):
+            committed = None
+        else:
+            current["health"] = health
+            current["status"] = "running"
+            current["updated_at"] = iso_timestamp()
+            current_lease.pop("pending_operation_id", None)
+            current_lease.pop("pending_server_id", None)
+            current_lease["original_purpose"] = "manual"
+            current_lease["purpose"] = f"server:{name}"
+            current_lease["server_id"] = server_id
+            current_lease["attachment_status"] = "attached"
+            current_lease["process_launched"] = True
+            current_lease["reconciliation_required"] = False
+            current_lease["attached_at"] = iso_timestamp()
+            current_lease["updated_at"] = iso_timestamp()
+            record_event(state, "server.started", current)
+            record_event(
+                state,
+                "server.manual_lease_attached",
+                {
+                    "server_id": server_id,
+                    "lease_id": lease_id,
+                    "port": port,
+                    "operation_id": operation["id"],
+                },
+            )
+            finish_operation(state, operation["id"], status="completed", phase="committed")
+            committed = copy.deepcopy(current)
+    if committed is None:
+        stop_pid(pid)
+        process_active = pid_alive(pid) or not port_available(port, host)
+        reason = "manual lease start was superseded before final commit"
+        finalize_manual_lease_start_failure(
+            operation_id=operation["id"],
+            server_id=server_id,
+            lease_id=lease_id,
+            reason=reason,
+            process_launched=True,
+            process_active=process_active,
+            pid=pid,
+            log_path=log_path,
+            health=health,
+        )
+        raise RuntimeError(reason)
+    return committed
+
+
+def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
+    """Start a process with only reservation/commit phases under the state lock."""
+
+    if options.get("lease_id"):
+        return coordinated_start_server_with_lease(options)
+    agent, project = require_identity(options, "server start")
+    name = str(options.get("name") or "").strip()
+    if not name:
+        raise ValueError("server start requires --name")
+    argv_template = command_argv(options)  # Validate before reserving any state.
+    cwd = str(Path(options.get("cwd") or project).expanduser().resolve())
+    if not Path(cwd).is_dir():
+        raise FileNotFoundError(f"server cwd does not exist or is not a directory: {cwd}")
+    target = f"server:{server_key(project, name)}"
+
+    with locked_state() as state:
+        existing_id, existing = find_server(state, project=project, name=name)
+        existing_snapshot = copy.deepcopy(existing) if existing else None
+    if existing_snapshot:
+        existing_health = server_health(existing_snapshot)
+        if existing_health.get("ok"):
+            with locked_state() as state:
+                current = state["servers"].get(existing_id)
+                if not current or server_lifecycle_fingerprint(current) != server_lifecycle_fingerprint(
+                    existing_snapshot
+                ):
+                    raise RuntimeError(
+                        f"server {name} changed while its existing health was checked; retry start"
+                    )
+                current["health"] = existing_health
+                current["status"] = "running"
+                current["updated_at"] = iso_timestamp()
+                return copy.deepcopy(current)
+        if existing_snapshot.get("status") != "stopped" or pid_alive(int(existing_snapshot.get("pid") or 0)):
+            coordinated_stop_server(
+                {
+                    "server_id": existing_id,
+                    "agent": agent,
+                    "project": project,
+                    "name": name,
+                    "release_port": True,
+                    "reason": "Replaced by coordinator start",
+                }
+            )
+
+    with locked_state() as state:
+        existing_id, existing = find_server(state, project=project, name=name)
+        server_id = existing_id or str(uuid.uuid4())
+        generation = int((existing or {}).get("generation") or 0) + 1
+        lease = lease_port(
+            state,
+            agent=agent,
+            project=project,
+            port_range=options.get("range") or DEFAULT_RANGE,
+            preferred=options.get("preferred"),
+            ttl=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+            purpose=f"server:{name}",
+            server_id=server_id,
+        )
+        operation = begin_operation(
+            state,
+            action="server.start",
+            target=target,
+            agent=agent,
+            project=project,
+            generation=generation,
+            lease_id=str(lease["id"]),
+            server_id=server_id,
+        )
+        port = int(lease["port"])
+        host = str(options.get("host") or "127.0.0.1")
+        argv = format_argv(argv_template, port=port, host=host)
+        health_url_template = options.get("health_url")
+        health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
+        env_extra = normalize_env(options.get("env") or [])
+        env_extra.setdefault("PORT", str(port))
+        env_extra.setdefault("HOST", host)
+        launch = LaunchSpec(tuple(argv), cwd, env_extra, agent, project, "server_start")
+        previous = existing or {}
+        server = {
+            "id": server_id,
+            "key": server_key(project, name),
+            "name": name,
+            "agent": agent,
+            "project": project,
+            "cwd": cwd,
+            "cmd_template": options.get("cmd"),
+            "argv_template": argv_template,
+            "cmd": shlex.join(argv),
+            "argv": argv,
+            "launch_spec": launch.as_state(),
+            "env": env_extra,
+            "port": port,
+            "host": host,
+            "url": f"http://{host}:{port}",
+            "health_url": health_url,
+            "health_url_template": health_url_template,
+            "lease_id": lease["id"],
+            "pid": None,
+            "log_path": previous.get("log_path"),
+            "adopted": False,
+            "missing_command": False,
+            "metadata_source": "server_start",
+            "agent_metadata": agent_metadata(agent=agent, project=project, cwd=cwd, source="server_start"),
+            "status": "starting",
+            "operation_id": operation["id"],
+            "generation": generation,
+            "created_at": previous.get("created_at") or iso_timestamp(),
+            "created_ts": now(),
+            "updated_at": iso_timestamp(),
+        }
+        state["servers"][server_id] = server
+
+    try:
+        pid, log_path = start_process(launch=launch, server_id=server_id)
+    except Exception as exc:
+        with locked_state() as state:
+            current = state["servers"].get(server_id)
+            if current and current.get("operation_id") == operation["id"]:
+                current["log_path"] = str(logs_dir() / f"{server_id}.log")
+                mark_server_stopped(state, current, reason=f"Process launch failed: {exc}")
+            if lease["id"] in state["leases"]:
+                with contextlib.suppress(KeyError):
+                    release_port(state, lease_id=str(lease["id"]))
+            finish_operation(state, operation["id"], status="failed", phase="launch", error=str(exc))
+        raise
+
+    with locked_state() as state:
+        current = state["servers"].get(server_id)
+        current_operation = state["operations"].get(operation["id"])
+        if not current or current.get("generation") != generation or not current_operation or current_operation.get("status") != "pending":
+            commit_allowed = False
+        else:
+            commit_allowed = True
+            current["pid"] = pid
+            current["log_path"] = log_path
+            current["updated_at"] = iso_timestamp()
+            current_operation["phase"] = "launched"
+            current_operation["launched_pid"] = pid
+            current_operation["updated_at"] = iso_timestamp()
+            server_for_health = copy.deepcopy(current)
+    if not commit_allowed:
+        stop_pid(pid)
+        raise RuntimeError("server start reservation was superseded before launch commit")
+
+    health = wait_for_health(server_for_health, float(options.get("health_timeout") or 10))
+    with locked_state() as state:
+        current = state["servers"].get(server_id)
+        if not current or current.get("generation") != generation or current.get("operation_id") != operation["id"]:
+            finish_operation(
+                state,
+                operation["id"],
+                status="failed",
+                phase="commit",
+                error="server generation changed before commit",
+            )
+            committed = None
+        else:
+            current["health"] = health
+            current["status"] = "running" if health.get("ok") else "unhealthy"
+            current["updated_at"] = iso_timestamp()
+            state["leases"][lease["id"]]["server_id"] = server_id
+            record_event(state, "server.started", current)
+            finish_operation(state, operation["id"], status="completed", phase="committed")
+            committed = copy.deepcopy(current)
+    if committed is None:
+        stop_pid(pid)
+        raise RuntimeError("server start was superseded before state commit")
+    return committed
+
+
+def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(options)
+    agent = str(prepared.get("agent") or "").strip()
+    if not agent:
+        raise ValueError("server stop requires --agent so the coordinator can attribute the action")
+    if prepared.get("project"):
+        project_hint = canonical_project(str(prepared["project"]))
+    elif prepared.get("server_id"):
+        snapshot = snapshot_coordinator_state()
+        hinted_server = snapshot.get("servers", {}).get(prepared["server_id"])
+        if not hinted_server or not hinted_server.get("project"):
+            raise KeyError("matching server not found")
+        project_hint = canonical_project(str(hinted_server["project"]))
+    else:
+        raise KeyError("server-id or project/name is required")
+    prepared["project"] = project_hint
+    prime_git_head_identity(project_hint)
+    with locked_state() as state:
+        server_id = prepared.get("server_id")
+        server = state["servers"].get(server_id) if server_id else None
+        if not server:
+            if not prepared.get("project") or not prepared.get("name"):
+                raise KeyError("server-id or project/name is required")
+            server_id, server = find_server(state, project=prepared["project"], name=prepared["name"])
+        if not server or not server_id:
+            raise KeyError("matching server not found")
+        project = project_hint
+        if str(server.get("project") or "") != project:
+            raise ValueError("server stop project does not match the registered server project")
+        target = f"server:{server_key(project, str(server.get('name') or ''))}"
+        generation = int(server.get("generation") or 0) + 1
+        operation = begin_operation(
+            state,
+            action="server.stop",
+            target=target,
+            agent=agent,
+            project=project,
+            generation=generation,
+            lease_id=server.get("lease_id"),
+            server_id=server_id,
+        )
+        server["generation"] = generation
+        server["operation_id"] = operation["id"]
+        server["status"] = "stopping"
+        server["updated_at"] = iso_timestamp()
+        snapshot = copy.deepcopy(server)
+
+    health = server_health(snapshot)
+    identity_wrong = (health.get("identity") or {}).get("ok") is False
+    if not identity_wrong:
+        stop_pid(int(snapshot.get("pid") or 0))
+    final_health = server_health(snapshot)
+
+    with locked_state() as state:
+        current = state["servers"].get(server_id)
+        if not current or current.get("generation") != generation or current.get("operation_id") != operation["id"]:
+            finish_operation(
+                state,
+                operation["id"],
+                status="failed",
+                phase="commit",
+                error="server generation changed before stop commit",
+            )
+            raise RuntimeError("server stop was superseded before state commit")
+        current["health"] = final_health
+        current["agent"] = agent
+        current["agent_metadata"] = agent_metadata(agent=agent, project=project, cwd=current.get("cwd"), source="server_stop")
+        reason = stop_reason_from_health(current, health) if identity_wrong else prepared.get("reason") or "Stopped by coordinator"
+        mark_server_stopped(state, current, reason=reason)
+        if prepared.get("release_port", True) and current.get("lease_id") and current["lease_id"] in state["leases"]:
+            with contextlib.suppress(KeyError):
+                release_port(state, lease_id=str(current["lease_id"]))
+        finish_operation(state, operation["id"], status="completed", phase="committed")
+        return copy.deepcopy(current)
+
+
+def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
+    agent, project = require_identity(options, "server restart")
+    with locked_state() as state:
+        server_id, server = find_server(state, project=project, name=options["name"])
+        if not server:
+            raise KeyError("matching server not found")
+        if not server.get("argv_template") and not server.get("cmd_template"):
+            raise RuntimeError(f"server {server.get('name')} is registered without a command; missing_command=true")
+        snapshot = copy.deepcopy(server)
+        operation = begin_operation(
+            state,
+            action="server.restart",
+            target=f"server:{server_key(project, str(server.get('name') or ''))}",
+            agent=agent,
+            project=project,
+            generation=int(server.get("generation") or 0) + 1,
+            server_id=server_id,
+        )
+    fixed_port = int(snapshot["port"])
+    restart_options = {
+        "agent": agent,
+        "project": snapshot["project"],
+        "name": snapshot["name"],
+        "cwd": snapshot["cwd"],
+        "cmd": snapshot.get("cmd_template"),
+        "argv": snapshot.get("argv_template"),
+        "range": options.get("range") or f"{fixed_port}-{fixed_port}",
+        "preferred": fixed_port,
+        "host": snapshot.get("host") or "127.0.0.1",
+        "health_url": snapshot.get("health_url_template") or snapshot.get("health_url"),
+        "health_timeout": options.get("health_timeout") or 10,
+        "env": [f"{key}={value}" for key, value in (snapshot.get("env") or {}).items() if key not in {"PORT", "HOST"}],
+    }
+    try:
+        with delegated_server_restart_operation(operation):
+            coordinated_stop_server(
+                {
+                    "server_id": server_id,
+                    "agent": agent,
+                    "project": project,
+                    "name": snapshot["name"],
+                    "release_port": True,
+                    "reason": "Restarted by coordinator",
+                }
+            )
+            result = coordinated_start_server(restart_options)
+    except Exception as exc:
+        with locked_state() as state:
+            finish_operation(
+                state,
+                operation["id"],
+                status="failed",
+                phase="child-failed",
+                error=str(exc),
+            )
+        raise
+    with locked_state() as state:
+        current_operation = state.get("operations", {}).get(operation["id"])
+        if not current_operation or current_operation.get("status") != "pending":
+            raise RuntimeError("server restart reservation was superseded before commit")
+        current_operation["result"] = {
+            "server_id": result.get("id"),
+            "status": result.get("status"),
+            "generation": result.get("generation"),
+        }
+        finish_operation(state, operation["id"], status="completed", phase="committed")
+    return result
+
+
+def snapshot_coordinator_state() -> dict[str, Any]:
+    """Take a consistent state snapshot and release the lock immediately."""
+
+    with locked_state() as state:
+        return copy.deepcopy(state)
+
+
+def snapshot_runtime_observation(*, project: str | None = None) -> dict[str, Any]:
+    """Reserve a monotonic per-server observation ticket and return its snapshot."""
+
+    with locked_state() as state:
+        for server in state.get("servers", {}).values():
+            if project and str(server.get("project") or "") != project:
+                continue
+            server["observation_generation"] = int(server.get("observation_generation") or 0) + 1
+        return copy.deepcopy(state)
+
+
+def server_lifecycle_fingerprint(server: dict[str, Any] | None) -> tuple[Any, ...]:
+    if not server:
+        return ()
+    return (
+        server.get("generation"),
+        server.get("operation_id"),
+        server.get("pid"),
+        server.get("lease_id"),
+        server.get("created_at"),
+    )
+
+
+def server_observation_fingerprint(server: dict[str, Any] | None) -> tuple[Any, ...]:
+    return (*server_lifecycle_fingerprint(server), (server or {}).get("observation_generation"))
+
+
+SERVER_OBSERVATION_FIELDS = (
+    "health",
+    "status",
+    "updated_at",
+    "stopped_at",
+    "stopped_ts",
+    "stopped_reason",
+    "reconciliation_required",
+)
+
+
+def merge_docker_stats_history(state: dict[str, Any], observed: dict[str, Any]) -> None:
+    current_histories = state.setdefault("docker", {}).setdefault("stats_history", {})
+    observed_histories = observed.get("docker", {}).get("stats_history", {})
+    for key, samples in observed_histories.items():
+        current = current_histories.setdefault(str(key), [])
+        known = {
+            (item.get("timestamp_ts"), item.get("id"), item.get("name"))
+            for item in current
+            if isinstance(item, dict)
+        }
+        for sample in samples:
+            if not isinstance(sample, dict):
+                continue
+            identity = (sample.get("timestamp_ts"), sample.get("id"), sample.get("name"))
+            if identity in known:
+                continue
+            current.append(copy.deepcopy(sample))
+            known.add(identity)
+        del current[:-DOCKER_STATS_HISTORY_LIMIT]
+
+
+def commit_runtime_observations(baseline: dict[str, Any], observed: dict[str, Any]) -> None:
+    """Commit health/stat observations only when the observed server is current.
+
+    Slow process, HTTP, Docker, and filesystem checks run against ``observed``
+    after the state lock has been released. This optimistic commit intentionally
+    skips a server whose lifecycle generation changed while the checks ran.
+    """
+
+    with locked_state() as state:
+        baseline_servers = baseline.get("servers", {})
+        for server_id, observed_server in observed.get("servers", {}).items():
+            baseline_server = baseline_servers.get(server_id)
+            current = state.get("servers", {}).get(server_id)
+            if not baseline_server or not current:
+                continue
+            if server_observation_fingerprint(current) != server_observation_fingerprint(baseline_server):
+                continue
+            previous_status = current.get("status")
+            for field in SERVER_OBSERVATION_FIELDS:
+                if field in observed_server:
+                    current[field] = copy.deepcopy(observed_server[field])
+                elif field in current and field in baseline_server:
+                    current.pop(field, None)
+            if previous_status != "stopped" and current.get("status") == "stopped":
+                record_event(state, "server.stopped", current)
+        observed_leases = observed.get("leases", {})
+        for lease_id, baseline_lease in baseline.get("leases", {}).items():
+            if lease_id in observed_leases:
+                continue
+            current_lease = state.get("leases", {}).get(lease_id)
+            if not current_lease or current_lease != baseline_lease:
+                continue
+            server = observed.get("servers", {}).get(baseline_lease.get("server_id"))
+            reason = (server or {}).get("stopped_reason") or "health observation marked linked server stale"
+            mark_lease_stale_released(state, str(lease_id), current_lease, str(reason))
+        merge_docker_stats_history(state, observed)
+
+
+def coordinated_status_server(options: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(options)
+    if prepared.get("project"):
+        prepared["project"] = canonical_project(str(prepared["project"]))
+    baseline = snapshot_runtime_observation(project=prepared.get("project"))
+    observed = copy.deepcopy(baseline)
+    result = copy.deepcopy(status_server(observed, prepared))
+    commit_runtime_observations(baseline, observed)
+    return result
+
+
+def coordinated_server_logs(options: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(options)
+    if prepared.get("project"):
+        prepared["project"] = canonical_project(str(prepared["project"]))
+    return server_logs(snapshot_coordinator_state(), prepared)
+
+
+def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
+    """Inspect and health-check an adopted server outside ``state.lock``."""
+
+    prepared = dict(options)
+    agent, project = require_identity(prepared, "server register")
+    name = str(prepared.get("name") or "").strip()
+    if not name:
+        raise ValueError("server register requires --name")
+    host, port, url = parse_server_endpoint(prepared)
+    cwd = str(Path(prepared.get("cwd") or project).expanduser().resolve())
+    command_template = prepared.get("cmd") or prepared.get("command")
+    argv_template = command_argv(prepared) if command_template or prepared.get("argv") else None
+    argv = format_argv(argv_template, port=port, host=host) if argv_template else None
+    command = shlex.join(argv) if argv else None
+    health_url_template = prepared.get("health_url") or url
+    health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
+    pid = prepared.get("pid")
+    if pid is None:
+        pid = listening_pid_for_port(port)
+    identity = server_listener_identity(
+        {"pid": int(pid) if pid else None, "project": project, "port": port, "host": host}
+    )
+    if identity.get("ok") is False:
+        raise RuntimeError(str(identity.get("reason") or f"PID {pid or 'unknown'} is outside project {project}"))
+
+    target = f"server:{server_key(project, name)}"
+    with locked_state() as state:
+        server_id, existing = find_server(state, project=project, name=name)
+        server_id = server_id or str(uuid.uuid4())
+        generation = int((existing or {}).get("generation") or 0) + 1
+        operation = begin_operation(
+            state,
+            action="server.register",
+            target=target,
+            agent=agent,
+            project=project,
+            generation=generation,
+            server_id=server_id,
+        )
+        previous = copy.deepcopy(existing or {})
+
+    candidate = {
+        "id": server_id,
+        "key": server_key(project, name),
+        "name": name,
+        "agent": agent,
+        "project": project,
+        "cwd": cwd,
+        "cmd_template": command_template or previous.get("cmd_template"),
+        "argv_template": argv_template or previous.get("argv_template"),
+        "argv": argv or previous.get("argv"),
+        "cmd": command or previous.get("cmd"),
+        "port": port,
+        "host": host,
+        "url": url,
+        "health_url": health_url,
+        "health_url_template": health_url_template,
+        "lease_id": previous.get("lease_id"),
+        "pid": int(pid) if pid else None,
+        "log_path": previous.get("log_path"),
+        "adopted": True,
+        "missing_command": not bool(
+            argv_template or previous.get("argv_template") or previous.get("cmd_template")
+        ),
+        "metadata_source": prepared.get("metadata_source") or "server_register",
+        "agent_metadata": agent_metadata(
+            agent=agent,
+            project=project,
+            cwd=cwd,
+            source=prepared.get("metadata_source") or "server_register",
+        ),
+        "generation": generation,
+        "operation_id": operation["id"],
+        "created_at": previous.get("created_at") or iso_timestamp(),
+        "updated_at": iso_timestamp(),
+    }
+    try:
+        health = wait_for_health(candidate, float(prepared.get("health_timeout") or 3))
+        candidate["health"] = health
+        candidate["status"] = "running" if health.get("ok") else "unhealthy"
+    except Exception as exc:
+        with locked_state() as state:
+            finish_operation(state, operation["id"], status="failed", phase="observe", error=str(exc))
+        raise
+
+    with locked_state() as state:
+        current_operation = state.get("operations", {}).get(operation["id"])
+        if not current_operation or current_operation.get("status") != "pending":
+            raise RuntimeError("server registration reservation was superseded before commit")
+        try:
+            reclaim_stale_leases_for_port(
+                state,
+                project=project,
+                port=port,
+                reason=f"server register reclaimed stale lease for {name}",
+                allow_occupied_unattached=True,
+            )
+            if candidate["status"] == "running" and candidate.get("pid"):
+                lease = lease_existing_server_port(
+                    state,
+                    agent=agent,
+                    project=project,
+                    port=port,
+                    purpose=f"server:{name}",
+                    server_id=server_id,
+                    owner_pid=int(candidate["pid"]),
+                    ttl=int(prepared.get("ttl") or DEFAULT_TTL_SECONDS),
+                )
+                candidate["lease_id"] = lease["id"]
+                current_operation["lease_id"] = lease["id"]
+            state["servers"][server_id] = copy.deepcopy(candidate)
+            record_event(state, "server.registered", candidate)
+            finish_operation(state, operation["id"], status="completed", phase="committed")
+        except Exception as exc:
+            finish_operation(state, operation["id"], status="failed", phase="commit", error=str(exc))
+            raise
+    return candidate
+
+
+def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(options)
+    agent, project = require_identity(prepared, "docker register")
+    container = normalize_container_name(prepared.get("container"))
+    if not container:
+        raise ValueError("docker register requires --container")
+    inspected = None if prepared.get("dry_run") else inspect_docker_container(container)
+    if not prepared.get("dry_run") and not inspected:
+        raise RuntimeError(
+            f"cannot register Docker metadata for {container}: immutable container identity was not verified"
+        )
+    prepared["_coordinator_inspected_container"] = inspected
+    target_identity = (
+        f"container-alias:{container}"
+        if prepared.get("dry_run")
+        else docker_container_operation_identity(container, inspected)
+    )
+    with locked_state() as state:
+        operation = begin_operation(
+            state,
+            action="docker.register",
+            target=f"docker-metadata:{target_identity}",
+            agent=agent,
+            project=project,
+            generation=int(state.get("revision") or 0) + 1,
+        )
+        observed = copy.deepcopy(state)
+    try:
+        result = register_docker_metadata(observed, prepared)
+    except Exception as exc:
+        with locked_state() as state:
+            finish_operation(state, operation["id"], status="failed", phase="observe", error=str(exc))
+        raise
+    observed_metadata = observed.get("docker", {}).get("metadata", {})
+    with locked_state() as state:
+        current_operation = state.get("operations", {}).get(operation["id"])
+        if not current_operation or current_operation.get("status") != "pending":
+            raise RuntimeError("Docker metadata registration was superseded before commit")
+        try:
+            metadata = docker_metadata_store(state)
+            for key, value in observed_metadata.items():
+                if value == result:
+                    metadata[key] = copy.deepcopy(value)
+            record_event(
+                state,
+                "docker.register.skipped" if result.get("skipped") else "docker.registered",
+                result,
+            )
+            finish_operation(state, operation["id"], status="completed", phase="committed")
+        except Exception as exc:
+            finish_operation(state, operation["id"], status="failed", phase="commit", error=str(exc))
+            raise
+    return result
+
+
+def coordinated_sample_docker_stats(*, dry_run: bool = False) -> dict[str, Any]:
+    if dry_run:
+        return sample_docker_stats({}, dry_run=True)
+    baseline = snapshot_coordinator_state()
+    observed = copy.deepcopy(baseline)
+    result = sample_docker_stats(observed)
+    with locked_state() as state:
+        merge_docker_stats_history(state, observed)
+    return result
+
+
+def coordinated_build_inventory(
+    *, project: str | None = None, include_docker: bool = True, backup_dirs: list[str] | None = None
+) -> dict[str, Any]:
+    prepared_project = canonical_project(project) if project else None
+    baseline = snapshot_runtime_observation(project=prepared_project)
+    observed = copy.deepcopy(baseline)
+    result = build_inventory(
+        observed,
+        project=prepared_project,
+        include_docker=include_docker,
+        backup_dirs=backup_dirs,
+    )
+    commit_runtime_observations(baseline, observed)
+    return result
+
+
+def observe_project_runtime(
+    options: dict[str, Any], *, action: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    prepared = dict(options)
+    prepared["project"] = canonical_project(str(prepared["project"]))
+    baseline = snapshot_runtime_observation(project=prepared["project"])
+    observed = copy.deepcopy(baseline)
+    spec = build_project_runtime_spec(
+        observed,
+        project=prepared["project"],
+        runtime_file=prepared.get("runtime_file"),
+    )
+    report = project_runtime_report(observed, spec, action=action)
+    commit_runtime_observations(baseline, observed)
+    return spec, report
+
+
+def begin_project_operation(options: dict[str, Any], action: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    prepared = dict(options)
+    agent, project = require_identity(prepared, f"project {action}")
+    with locked_state() as state:
+        operation = begin_operation(
+            state,
+            action=f"project.{action}",
+            target=f"project:{project}",
+            agent=agent,
+            project=project,
+            generation=int(state.get("revision") or 0) + 1,
+        )
+        operation["runtime_file"] = prepared.get("runtime_file")
+        operation["dry_run"] = bool(prepared.get("dry_run"))
+    return prepared, operation
+
+
+def finish_project_operation(
+    operation_id: str,
+    *,
+    result: dict[str, Any] | None = None,
+    error: BaseException | None = None,
+) -> None:
+    with locked_state() as state:
+        operation = state.get("operations", {}).get(operation_id)
+        if not operation or operation.get("status") != "pending":
+            return
+        incomplete = bool(result is not None and result.get("ok") is False)
+        if result is not None:
+            operation["result"] = {
+                "action": result.get("action"),
+                "ok": result.get("ok"),
+                "classification": result.get("classification"),
+                "action_error_count": len(result.get("action_errors") or []),
+                "service_count": len(result.get("services") or []),
+                "partial": bool(result.get("partial")),
+                "preflight_failed": bool(result.get("preflight_failed")),
+            }
+        if error is not None:
+            operation["failure"] = coordinator_exception_payload(error)
+        finish_operation(
+            state,
+            operation_id,
+            status="failed" if error or incomplete else "completed",
+            phase="failed" if error else ("committed-incomplete" if incomplete else "committed"),
+            error=str(error) if error else None,
+        )
+
+
+def record_project_status_evidence(report: dict[str, Any]) -> None:
+    with locked_state() as state:
+        record_event(
+            state,
+            "project.status",
+            {
+                "project": report.get("project"),
+                "runtime_id": report.get("runtime_id"),
+                "ok": report.get("ok"),
+                "classification": report.get("classification"),
+                "service_count": len(report.get("services") or []),
+                "at": iso_timestamp(),
+            },
+        )
+
+
+def coordinated_project_runtime_status(options: dict[str, Any]) -> dict[str, Any]:
+    _spec, report = observe_project_runtime(options, action="status")
+    record_project_status_evidence(report)
+    return report
+
+
+def coordinated_reclaim_runtime_port(*, project: str, port: int, reason: str) -> list[dict[str, Any]]:
+    """Release only same-project server leases proven stale outside the lock."""
+
+    if not port_available(port):
+        return []
+    baseline = snapshot_coordinator_state()
+    candidates: list[str] = []
+    for lease_id, lease in baseline.get("leases", {}).items():
+        if lease.get("status") != "active" or int(lease.get("port") or 0) != int(port):
+            continue
+        lease_project = lease.get("project")
+        if not lease_project or canonical_project(str(lease_project)) != canonical_project(project):
+            continue
+        if not str(lease.get("purpose") or "").startswith("server:"):
+            continue
+        server = baseline.get("servers", {}).get(lease.get("server_id")) if lease.get("server_id") else None
+        if not server or server.get("status") == "stopped" or not pid_alive(int(server.get("pid") or 0)):
+            candidates.append(str(lease_id))
+    released: list[dict[str, Any]] = []
+    with locked_state() as state:
+        for lease_id in candidates:
+            current = state.get("leases", {}).get(lease_id)
+            original = baseline.get("leases", {}).get(lease_id)
+            if not current or current != original:
+                continue
+            released.append(mark_lease_stale_released(state, lease_id, current, reason))
+    return released
+
+
+def runtime_server_start_options(
+    state: dict[str, Any], server_def: dict[str, Any], options: dict[str, Any]
+) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
+    server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
+    fixed_port = server_def.get("port") or (existing or {}).get("port")
+    if server_def.get("missing_fixed_port") and not options.get("allow_port_change"):
+        raise RuntimeError(f"project server {server_def['name']} has no fixed port declaration")
+    if fixed_port is None and not options.get("allow_port_change"):
+        raise RuntimeError(f"project server {server_def['name']} has no fixed port; add .codex/dev-runtime.json")
+    declared_command = server_def.get("cmd")
+    declared_argv = server_def.get("argv")
+    if declared_argv is not None:
+        command = None
+        argv_template = declared_argv
+    elif declared_command:
+        command = declared_command
+        argv_template = None
+    else:
+        command = (existing or {}).get("cmd_template")
+        argv_template = (existing or {}).get("argv_template")
+    if not command and not argv_template:
+        raise RuntimeError(f"project server {server_def['name']} has no command declaration")
+    start_options = {
+        "agent": options.get("agent") or os.environ.get("USER") or "codex-agent",
+        "project": server_def["project"],
+        "name": server_def["name"],
+        "cwd": server_def.get("cwd") or (existing or {}).get("cwd") or server_def["project"],
+        "cmd": command,
+        "argv": argv_template,
+        "range": f"{fixed_port}-{fixed_port}" if fixed_port else options.get("range") or DEFAULT_RANGE,
+        "preferred": int(fixed_port) if fixed_port else options.get("preferred"),
+        "host": server_def.get("host") or (existing or {}).get("host") or "127.0.0.1",
+        "health_url": server_def.get("health_url")
+        or (existing or {}).get("health_url_template")
+        or (existing or {}).get("health_url"),
+        "health_timeout": server_def.get("health_timeout") or options.get("health_timeout") or 10,
+        "env": server_def.get("env") or [],
+    }
+    return start_options, server_id, copy.deepcopy(existing) if existing else None
+
+
+def coordinated_start_runtime_server(server_def: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(options)
+    require_identity(prepared, "project start")
+    snapshot = snapshot_coordinator_state()
+    start_options, server_id, existing = runtime_server_start_options(snapshot, server_def, prepared)
+    fixed_port = start_options.get("preferred")
+    if existing:
+        existing_health = server_health(existing)
+        if existing_health.get("ok"):
+            return coordinated_status_server(
+                {"server_id": server_id, "project": server_def["project"], "name": server_def["name"]}
+            )
+
+    if fixed_port is not None and port_open(str(start_options["host"]), int(fixed_port)):
+        belongs, owner = listener_belongs_to_project(int(fixed_port), server_def["project"])
+        if not belongs:
+            raise RuntimeError(
+                f"refusing to adopt {server_def['name']} on port {fixed_port}: "
+                f"{owner.get('reason') or 'listener does not belong to project'}"
+            )
+        health_url_template = server_def.get("health_url")
+        health_url = (
+            format_command(health_url_template, port=int(fixed_port), host=str(start_options["host"]))
+            if health_url_template
+            else None
+        )
+        adoption_healthy = not health_url or http_health(
+            health_url, timeout=float(server_def.get("health_timeout") or 3)
+        ).get("ok")
+        if adoption_healthy:
+            return coordinated_register_server(
+                {
+                    "agent": prepared.get("agent"),
+                    "project": server_def["project"],
+                    "name": server_def["name"],
+                    "cwd": server_def.get("cwd") or server_def["project"],
+                    "cmd": server_def.get("cmd"),
+                    "argv": server_def.get("argv"),
+                    "port": int(fixed_port),
+                    "pid": owner.get("pid"),
+                    "host": start_options["host"],
+                    "url": f"http://{start_options['host']}:{fixed_port}",
+                    "health_url": health_url_template or f"http://{start_options['host']}:{fixed_port}",
+                    "metadata_source": "project_adoption",
+                    "health_timeout": server_def.get("health_timeout") or prepared.get("health_timeout") or 3,
+                }
+            )
+
+    if existing and server_id:
+        coordinated_stop_server(
+            {
+                "server_id": server_id,
+                "agent": prepared["agent"],
+                "project": server_def["project"],
+                "name": server_def["name"],
+                "release_port": True,
+                "reason": "Replaced by project runtime",
+            }
+        )
+    if fixed_port is not None:
+        coordinated_reclaim_runtime_port(
+            project=server_def["project"],
+            port=int(fixed_port),
+            reason=f"project start reclaimed stale fixed-port lease for {server_def['name']}",
+        )
+    return coordinated_start_server(start_options)
+
+
+def planned_runtime_server_action(server_def: dict[str, Any], action: str) -> dict[str, Any]:
+    return {
+        "dry_run": True,
+        "action": f"server.{action}",
+        "name": server_def.get("name"),
+        "role": server_def.get("role"),
+        "project": server_def.get("project"),
+        "port": server_def.get("port"),
+    }
+
+
+def ensure_runtime_docker_metadata_coordinated(
+    spec: dict[str, Any], options: dict[str, Any]
+) -> list[dict[str, Any]]:
+    if not options.get("agent"):
+        return []
+    actions: list[dict[str, Any]] = []
+    containers = spec.get("docker", {}).get("containers", [])
+    for dep in mutable_runtime_docker_dependencies(spec):
+        container_name = dep.get("container") or dep.get("name")
+        container = docker_container_by_name(containers, container_name)
+        if not container or container.get("metadata_source") != "none":
+            continue
+        payload = {
+            "container": container.get("name") or container_name,
+            "agent": options.get("agent"),
+            "project": spec["project"],
+            "cwd": spec["project"],
+            "role": dep.get("role") or dep.get("name") or "docker",
+        }
+        if options.get("dry_run"):
+            actions.append({**payload, "dry_run": True, "metadata_source": "planned_coordinator_sidecar"})
+        else:
+            actions.append(coordinated_register_docker_metadata(payload))
+    return actions
+
+
+def dependency_owned_by_compose(spec: dict[str, Any], dependency: dict[str, Any]) -> bool:
+    """Return whether declared Compose owns this dependency's lifecycle.
+
+    The dependency remains in `docker_dependencies` for health, readiness, and
+    identity evidence.  Only lifecycle execution is deduplicated.  `service`
+    is the preferred unambiguous mapping; for compatibility, a dependency name
+    that exactly matches a declared Compose service is also accepted.
+    """
+
+    compose = spec.get("compose") or {}
+    if not compose.get("declared") or not compose.get("autostart"):
+        return False
+    declared_services = {str(item) for item in compose.get("services") or [] if item}
+    service = str(dependency.get("service") or "").strip()
+    if service:
+        return not declared_services or service in declared_services
+    name = str(dependency.get("name") or "").strip()
+    return bool(name and name in declared_services)
+
+
+def mutable_runtime_docker_dependencies(
+    spec: dict[str, Any], *, exclude_compose_owned: bool = False
+) -> list[dict[str, Any]]:
+    """Return dependencies with mutation authority, optionally deduplicated."""
+
+    dependencies = [
+        dep
+        for dep in spec.get("docker_dependencies", [])
+        if dep.get("mutation_authorized") is True
+    ]
+    if exclude_compose_owned:
+        dependencies = [dep for dep in dependencies if not dependency_owned_by_compose(spec, dep)]
+    return dependencies
+
+
+def project_docker_requirement_reasons(spec: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    compose = spec.get("compose") or {}
+    if compose.get("declared") and compose.get("autostart"):
+        reasons.append("declared_compose")
+    if mutable_runtime_docker_dependencies(spec):
+        reasons.append("declared_or_attributed_container")
+    return reasons
+
+
+def require_docker_capability_probe(
+    args: list[str], *, capability_name: str, unavailable_code: str
+) -> dict[str, Any]:
+    result = docker_available_command(args)
+    if result.get("ok"):
+        return {
+            "name": capability_name,
+            "ok": True,
+            "command": result.get("command"),
+            "docker_executable": result.get("docker_executable"),
+            "timeout_seconds": result.get("timeout_seconds"),
+        }
+    timed_out = result.get("code") == "docker_command_timeout"
+    code = "docker_command_timeout" if timed_out else unavailable_code
+    classification = "timeout" if timed_out else "missing_dependency"
+    detail = str(result.get("error") or result.get("stderr") or "").strip()
+    message = f"Required Docker capability is unavailable: {capability_name}"
+    if detail:
+        message = f"{message}: {detail}"
+    raise StructuredCoordinatorError(
+        message,
+        {
+            "code": code,
+            "classification": classification,
+            "capability": {
+                "name": capability_name,
+                "code": code,
+                "command": result.get("command"),
+                "returncode": result.get("returncode"),
+                "stderr": str(result.get("stderr") or "").strip(),
+                "timeout_seconds": result.get("timeout_seconds"),
+            },
+        },
+    )
+
+
+def compose_command_prefix(compose: dict[str, Any]) -> list[str]:
+    command = ["compose"]
+    for file_name in compose.get("files") or []:
+        command.extend(["-f", str(file_name)])
+    return command
+
+
+def require_compose_service_query(
+    spec: dict[str, Any], suffix: list[str], *, purpose: str
+) -> list[str]:
+    compose = spec.get("compose") or {}
+    args = [*compose_command_prefix(compose), *suffix]
+    result = docker_available_command(args, cwd=compose.get("cwd"))
+    if not result.get("ok"):
+        detail = str(result.get("error") or result.get("stderr") or "").strip()
+        message = f"Docker Compose {purpose} query failed"
+        if detail:
+            message = f"{message}: {detail}"
+        raise StructuredCoordinatorError(
+            message,
+            {
+                "code": "docker_compose_status_unavailable",
+                "classification": result.get("classification") or "missing_dependency",
+                "capability": {
+                    "name": "docker_compose_status",
+                    "code": "docker_compose_status_unavailable",
+                    "command": result.get("command"),
+                    "returncode": result.get("returncode"),
+                    "stderr": str(result.get("stderr") or "").strip(),
+                },
+            },
+        )
+    return [line.strip() for line in str(result.get("stdout") or "").splitlines() if line.strip()]
+
+
+def compose_restart_service_plan(
+    spec: dict[str, Any], *, allow_queries: bool = True
+) -> dict[str, Any]:
+    """Split Compose services into safe restart versus start/recovery groups."""
+
+    compose = spec.get("compose") or {}
+    declared_services = [str(item) for item in compose.get("services") or [] if item]
+    if not declared_services:
+        if allow_queries:
+            declared_services = require_compose_service_query(
+                spec,
+                ["config", "--services"],
+                purpose="configuration",
+            )
+        else:
+            return {
+                "restart_services": [],
+                "start_services": [],
+                "declared_services": [],
+                "all_services_action": "restart",
+                "observation": "dry_run_without_docker",
+            }
+    containers = spec.get("docker", {}).get("containers", [])
+    mapped_dependencies: dict[str, dict[str, Any]] = {}
+    for dependency in mutable_runtime_docker_dependencies(spec):
+        if not dependency_owned_by_compose(spec, dependency):
+            continue
+        service = str(dependency.get("service") or dependency.get("name") or "").strip()
+        if service:
+            mapped_dependencies[service] = dependency
+
+    restart_services: list[str] = []
+    start_services: list[str] = []
+    unresolved: list[str] = []
+    for service in declared_services:
+        dependency = mapped_dependencies.get(service)
+        container = None
+        if dependency:
+            container = docker_container_by_name(
+                containers,
+                dependency.get("container") or dependency.get("name"),
+            )
+        if container is None:
+            container = next(
+                (
+                    item
+                    for item in containers
+                    if str((item.get("labels") or {}).get("com.docker.compose.service") or "")
+                    == service
+                ),
+                None,
+            )
+        if container is None and dependency is None:
+            unresolved.append(service)
+            continue
+        status = str((container or {}).get("status") or "missing")
+        if container is None or is_stopped_container_status(status):
+            start_services.append(service)
+        else:
+            restart_services.append(service)
+
+    if unresolved:
+        if allow_queries:
+            existing = set(
+                require_compose_service_query(
+                    spec,
+                    ["ps", "--services", "--all"],
+                    purpose="existing-service",
+                )
+            )
+            running = set(
+                require_compose_service_query(
+                    spec,
+                    ["ps", "--services", "--status", "running"],
+                    purpose="running-service",
+                )
+            )
+            for service in unresolved:
+                if service in existing and service in running:
+                    restart_services.append(service)
+                else:
+                    start_services.append(service)
+        else:
+            restart_services.extend(unresolved)
+
+    return {
+        "restart_services": restart_services,
+        "start_services": start_services,
+        "declared_services": declared_services,
+    }
+
+
+def preflight_project_docker(
+    spec: dict[str, Any], *, action: str, dry_run: bool
+) -> dict[str, Any]:
+    reasons = project_docker_requirement_reasons(spec)
+    if not reasons:
+        return {"required": False, "capability": "docker_cli", "reasons": []}
+    if dry_run:
+        compose = spec.get("compose") or {}
+        compose_restart_plan = None
+        if action == "restart" and compose.get("declared") and compose.get("autostart"):
+            compose_restart_plan = compose_restart_service_plan(spec, allow_queries=False)
+        return {
+            "required": True,
+            "capability": "docker_cli",
+            "reasons": reasons,
+            "skipped": "dry_run",
+            "compose_restart_plan": compose_restart_plan,
+        }
+    try:
+        executable = resolve_docker_executable()
+    except DockerCapabilityError as exc:
+        payload = coordinator_exception_payload(exc)
+        capability = payload.setdefault("capability", {})
+        capability["project"] = spec.get("project")
+        capability["project_action"] = action
+        capability["reasons"] = reasons
+        raise DockerCapabilityError(str(exc), payload) from exc
+    probes = [
+        require_docker_capability_probe(
+            ["info", "--format", "{{json .ServerVersion}}"],
+            capability_name="docker_daemon",
+            unavailable_code="docker_daemon_unavailable",
+        )
+    ]
+    compose = spec.get("compose") or {}
+    if compose.get("declared") and compose.get("autostart"):
+        probes.append(
+            require_docker_capability_probe(
+                ["compose", "version", "--short"],
+                capability_name="docker_compose",
+                unavailable_code="docker_compose_unavailable",
+            )
+        )
+    compose_restart_plan = None
+    if action == "restart" and compose.get("declared") and compose.get("autostart"):
+        compose_restart_plan = compose_restart_service_plan(spec)
+    return {
+        "required": True,
+        "capability": "docker_cli",
+        "reasons": reasons,
+        "docker_executable": executable,
+        "probes": probes,
+        "compose_restart_plan": compose_restart_plan,
+    }
+
+
+def project_action_error_from_exception(
+    exc: BaseException, *, name: str = "docker", fallback_classification: str = "unhealthy_process"
+) -> dict[str, Any]:
+    payload = coordinator_exception_payload(exc)
+    classification = str(payload.get("classification") or fallback_classification)
+    result: dict[str, Any] = {
+        "name": name,
+        "classification": classification,
+        "code": payload.get("code") or "action_failed",
+        "error": payload.get("error") or str(exc),
+    }
+    if payload.get("capability"):
+        result["capability"] = copy.deepcopy(payload["capability"])
+    for key in ("command", "timeout_seconds", "docker_executable"):
+        if payload.get(key) is not None:
+            result[key] = copy.deepcopy(payload[key])
+    return result
+
+
+def project_preflight_failure_report(
+    before: dict[str, Any], *, action: str, exc: BaseException
+) -> dict[str, Any]:
+    action_error = project_action_error_from_exception(exc)
+    classification = str(action_error["classification"])
+    result = copy.deepcopy(before)
+    result["action"] = action
+    result["ok"] = False
+    result["classification"] = classification
+    result["classifications"] = sorted(
+        set([classification, *[str(item) for item in before.get("classifications") or [] if item]])
+    )
+    result["before"] = copy.deepcopy(before)
+    result["actions"] = []
+    result["action_errors"] = [action_error]
+    result["partial"] = False
+    result["preflight_failed"] = True
+    return result
+
+
+def execute_project_start(
+    options: dict[str, Any],
+    spec: dict[str, Any],
+    before: dict[str, Any],
+    *,
+    skip_compose_lifecycle: bool = False,
+) -> dict[str, Any]:
+    agent = str(options["agent"])
+    dry_run = bool(options.get("dry_run"))
+    actions: list[dict[str, Any]] = []
+    action_errors: list[dict[str, Any]] = []
+    compose = spec.get("compose")
+    if compose and compose.get("autostart") and not skip_compose_lifecycle:
+        command = ["docker", "compose"]
+        for file_name in compose.get("files") or []:
+            command.extend(["-f", file_name])
+        command.extend(["up", "-d"])
+        command.extend(compose.get("services") or [])
+        try:
+            actions.append(
+                coordinated_run_docker(
+                    command,
+                    cwd=compose["cwd"],
+                    dry_run=dry_run,
+                    project=spec["project"],
+                    agent=agent,
+                )
+            )
+        except Exception as exc:
+            action_errors.append(
+                project_action_error_from_exception(
+                    exc,
+                    name=str(compose.get("name") or "docker-compose"),
+                    fallback_classification="unhealthy_process",
+                )
+            )
+    elif compose and compose.get("discovered"):
+        actions.append(
+            {
+                "skipped": True,
+                "name": compose.get("name"),
+                "classification": "missing_dependency",
+                "reason": "Docker Compose file was discovered but not declared in .codex/dev-runtime.json; project start will not create a duplicate Compose stack.",
+                "files": compose.get("files") or [],
+            }
+        )
+    try:
+        actions.extend(ensure_runtime_docker_metadata_coordinated(spec, options))
+    except Exception as exc:
+        action_errors.append(
+            project_action_error_from_exception(
+                exc,
+                name="docker-metadata",
+                fallback_classification="unhealthy_process",
+            )
+        )
+    containers = spec.get("docker", {}).get("containers", [])
+    for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
+        status = docker_dependency_status(dep, containers)
+        if status.get("ok"):
+            continue
+        container_name = dep.get("container") or dep.get("name")
+        action = "restart" if status.get("classification") == "unhealthy_process" else "start"
+        try:
+            actions.append(
+                coordinated_run_docker(
+                    ["docker", action, container_name],
+                    dry_run=dry_run,
+                    project=spec["project"],
+                    agent=agent,
+                    container=container_name,
+                )
+            )
+        except Exception as exc:
+            action_errors.append(
+                project_action_error_from_exception(
+                    exc,
+                    name=str(dep.get("name") or container_name or "docker"),
+                    fallback_classification=str(
+                        status.get("classification") or "unhealthy_process"
+                    ),
+                )
+            )
+    ordered_servers = sorted(
+        spec.get("servers", []),
+        key=lambda item: str(item.get("role")).lower() in {"web", "frontend"},
+    )
+    for server_def in ordered_servers:
+        try:
+            if dry_run:
+                actions.append(planned_runtime_server_action(server_def, "start"))
+            else:
+                actions.append(coordinated_start_runtime_server(server_def, options))
+        except Exception as exc:
+            action_errors.append(
+                project_action_error_from_exception(
+                    exc,
+                    name=str(server_def.get("name") or "server"),
+                    fallback_classification="missing_dependency",
+                )
+            )
+    _refreshed, after = observe_project_runtime(options, action="start")
+    after["before"] = before
+    after["actions"] = actions
+    after["action_errors"] = action_errors
+    after["partial"] = bool(actions and action_errors)
+    if action_errors:
+        after["ok"] = False
+        after["classifications"] = sorted(
+            set(after.get("classifications", []) + [item["classification"] for item in action_errors])
+        )
+        after["classification"] = after["classifications"][0]
+    return after
+
+
+def coordinated_project_runtime_start(options: dict[str, Any]) -> dict[str, Any]:
+    prepared, operation = begin_project_operation(options, "start")
+    try:
+        with delegated_project_operation(operation):
+            spec, before = observe_project_runtime(prepared, action="pre-start")
+            try:
+                preflight = preflight_project_docker(
+                    spec,
+                    action="start",
+                    dry_run=bool(prepared.get("dry_run")),
+                )
+            except StructuredCoordinatorError as exc:
+                result = project_preflight_failure_report(before, action="start", exc=exc)
+            else:
+                result = execute_project_start(prepared, spec, before)
+                result["preflight"] = preflight
+    except Exception as exc:
+        finish_project_operation(operation["id"], error=exc)
+        raise
+    finish_project_operation(operation["id"], result=result)
+    return result
+
+
+def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, Any]:
+    prepared, operation = begin_project_operation(options, "restart")
+    delegation = delegated_project_operation(operation)
+    delegation.__enter__()
+    try:
+        spec, before = observe_project_runtime(prepared, action="pre-restart")
+        dry_run = bool(prepared.get("dry_run"))
+        try:
+            preflight = preflight_project_docker(
+                spec,
+                action="restart",
+                dry_run=dry_run,
+            )
+        except StructuredCoordinatorError as exc:
+            result = project_preflight_failure_report(before, action="restart", exc=exc)
+        else:
+            actions: list[dict[str, Any]] = []
+            action_errors: list[dict[str, Any]] = []
+            snapshot = snapshot_coordinator_state()
+            for server_def in reversed(spec.get("servers", [])):
+                server_id, existing = find_server(
+                    snapshot, project=server_def["project"], name=server_def["name"]
+                )
+                if not existing:
+                    continue
+                try:
+                    if dry_run:
+                        actions.append(planned_runtime_server_action(server_def, "stop"))
+                    else:
+                        actions.append(
+                            coordinated_stop_server(
+                                {
+                                    "server_id": server_id,
+                                    "agent": prepared["agent"],
+                                    "project": existing["project"],
+                                    "name": existing["name"],
+                                    "release_port": True,
+                                    "reason": "Restarted by project runtime",
+                                }
+                            )
+                        )
+                except Exception as exc:
+                    action_errors.append(
+                        project_action_error_from_exception(
+                            exc,
+                            name=str(server_def.get("name") or "server"),
+                            fallback_classification="unhealthy_process",
+                        )
+                    )
+            for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
+                container_name = dep.get("container") or dep.get("name")
+                try:
+                    actions.append(
+                        coordinated_run_docker(
+                            ["docker", "restart", container_name],
+                            dry_run=dry_run,
+                            project=spec["project"],
+                            agent=prepared["agent"],
+                            container=container_name,
+                        )
+                    )
+                except Exception as exc:
+                    action_errors.append(
+                        project_action_error_from_exception(
+                            exc,
+                            name=str(dep.get("name") or container_name or "docker"),
+                        )
+                    )
+            compose = spec.get("compose")
+            if compose and compose.get("autostart"):
+                restart_plan = preflight.get("compose_restart_plan") or {}
+                compose_prefix = ["docker", *compose_command_prefix(compose)]
+                lifecycle_commands: list[list[str]] = []
+                restart_services = list(restart_plan.get("restart_services") or [])
+                start_services = list(restart_plan.get("start_services") or [])
+                all_services_action = restart_plan.get("all_services_action")
+                if start_services:
+                    lifecycle_commands.append([*compose_prefix, "up", "-d", *start_services])
+                if restart_services:
+                    lifecycle_commands.append([*compose_prefix, "restart", *restart_services])
+                if all_services_action == "restart" and not lifecycle_commands:
+                    lifecycle_commands.append([*compose_prefix, "restart"])
+                for command in lifecycle_commands:
+                    try:
+                        actions.append(
+                            coordinated_run_docker(
+                                command,
+                                cwd=compose["cwd"],
+                                dry_run=dry_run,
+                                project=spec["project"],
+                                agent=prepared["agent"],
+                            )
+                        )
+                    except Exception as exc:
+                        action_errors.append(
+                            project_action_error_from_exception(
+                                exc,
+                                name=str(compose.get("name") or "docker-compose"),
+                            )
+                        )
+            refreshed_spec, _unused = observe_project_runtime(prepared, action="restart-start")
+            started = execute_project_start(
+                prepared,
+                refreshed_spec,
+                before,
+                skip_compose_lifecycle=bool(compose and compose.get("autostart")),
+            )
+            started["action"] = "restart"
+            started["before"] = before
+            started["actions"] = actions + started.get("actions", [])
+            started["action_errors"] = action_errors + started.get("action_errors", [])
+            started["partial"] = bool(started["actions"] and started["action_errors"])
+            if started["action_errors"]:
+                started["ok"] = False
+                started["classifications"] = sorted(
+                    set(
+                        [str(item) for item in started.get("classifications") or [] if item]
+                        + [str(item["classification"]) for item in started["action_errors"]]
+                    )
+                )
+                started["classification"] = started["classifications"][0]
+            started["preflight"] = preflight
+            result = started
+    except Exception as exc:
+        finish_project_operation(operation["id"], error=exc)
+        raise
+    finally:
+        delegation.__exit__(None, None, None)
+    finish_project_operation(operation["id"], result=result)
+    return result
+
+
+def coordinated_project_runtime_stop(options: dict[str, Any]) -> dict[str, Any]:
+    prepared, operation = begin_project_operation(options, "stop")
+    delegation = delegated_project_operation(operation)
+    delegation.__enter__()
+    try:
+        spec, before = observe_project_runtime(prepared, action="pre-stop")
+        dry_run = bool(prepared.get("dry_run"))
+        try:
+            preflight = preflight_project_docker(
+                spec,
+                action="stop",
+                dry_run=dry_run,
+            )
+        except StructuredCoordinatorError as exc:
+            result = project_preflight_failure_report(before, action="stop", exc=exc)
+        else:
+            actions: list[dict[str, Any]] = []
+            action_errors: list[dict[str, Any]] = []
+            snapshot = snapshot_coordinator_state()
+            for server_def in reversed(spec.get("servers", [])):
+                server_id, existing = find_server(
+                    snapshot, project=server_def["project"], name=server_def["name"]
+                )
+                if not existing or existing.get("status") == "stopped":
+                    continue
+                try:
+                    if dry_run:
+                        actions.append(planned_runtime_server_action(server_def, "stop"))
+                    else:
+                        actions.append(
+                            coordinated_stop_server(
+                                {
+                                    "server_id": server_id,
+                                    "agent": prepared["agent"],
+                                    "project": existing["project"],
+                                    "name": existing["name"],
+                                    "reason": "Stopped by project runtime",
+                                }
+                            )
+                        )
+                except Exception as exc:
+                    action_errors.append(
+                        project_action_error_from_exception(
+                            exc,
+                            name=str(server_def.get("name") or "server"),
+                            fallback_classification="unhealthy_process",
+                        )
+                    )
+            for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
+                container_name = dep.get("container") or dep.get("name")
+                current = docker_dependency_status(dep, spec.get("docker", {}).get("containers", []))
+                if current.get("status") == "missing" or is_stopped_container_status(
+                    str(current.get("status") or "")
+                ):
+                    continue
+                try:
+                    actions.append(
+                        coordinated_run_docker(
+                            ["docker", "stop", container_name],
+                            dry_run=dry_run,
+                            project=spec["project"],
+                            agent=prepared["agent"],
+                            container=container_name,
+                        )
+                    )
+                except Exception as exc:
+                    action_errors.append(
+                        project_action_error_from_exception(
+                            exc,
+                            name=str(dep.get("name") or container_name or "docker"),
+                        )
+                    )
+            compose = spec.get("compose")
+            if compose and compose.get("autostart"):
+                command = ["docker", "compose"]
+                for file_name in compose.get("files") or []:
+                    command.extend(["-f", file_name])
+                command.append("stop")
+                command.extend(compose.get("services") or [])
+                try:
+                    actions.append(
+                        coordinated_run_docker(
+                            command,
+                            cwd=compose["cwd"],
+                            dry_run=dry_run,
+                            project=spec["project"],
+                            agent=prepared["agent"],
+                        )
+                    )
+                except Exception as exc:
+                    action_errors.append(
+                        project_action_error_from_exception(
+                            exc,
+                            name=str(compose.get("name") or "docker-compose"),
+                        )
+                    )
+            _refreshed, after = observe_project_runtime(prepared, action="stop")
+            after["ok"] = not action_errors
+            after["before"] = before
+            after["actions"] = actions
+            after["action_errors"] = action_errors
+            after["partial"] = bool(actions and action_errors)
+            after["preflight"] = preflight
+            if action_errors:
+                after["classifications"] = sorted(
+                    set(
+                        [str(item) for item in after.get("classifications") or [] if item]
+                        + [str(item["classification"]) for item in action_errors]
+                    )
+                )
+                after["classification"] = after["classifications"][0]
+            else:
+                after["classification"] = None
+                after["classifications"] = []
+            result = after
+    except Exception as exc:
+        finish_project_operation(operation["id"], error=exc)
+        raise
+    finally:
+        delegation.__exit__(None, None, None)
+    finish_project_operation(operation["id"], result=result)
+    return result
 
 
 def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
@@ -2759,14 +5789,61 @@ def server_logs(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any
     }
 
 
+COMPOSE_OPTIONS_WITH_VALUES = {
+    "-f",
+    "--file",
+    "-p",
+    "--project-name",
+    "--profile",
+    "--env-file",
+    "--parallel",
+    "--ansi",
+    "--progress",
+    "--project-directory",
+}
+COMPOSE_MUTATING_COMMANDS = {
+    "build",
+    "create",
+    "down",
+    "kill",
+    "pause",
+    "pull",
+    "push",
+    "restart",
+    "rm",
+    "run",
+    "start",
+    "stop",
+    "unpause",
+    "up",
+}
+
+
+def docker_compose_subcommand(command: list[str]) -> str | None:
+    if len(command) < 3 or command[:2] != ["docker", "compose"]:
+        return None
+    index = 2
+    while index < len(command):
+        token = command[index]
+        if token == "--":
+            index += 1
+            return command[index] if index < len(command) else None
+        if token in COMPOSE_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return None
+
+
 def docker_command_is_mutating(command: list[str]) -> bool:
     if len(command) < 2 or command[0] != "docker":
         return False
     if command[1] in {"start", "stop", "restart"}:
         return True
-    if len(command) >= 3 and command[1] == "compose" and command[2] in {"up", "down", "stop", "restart"}:
-        return True
-    return False
+    return docker_compose_subcommand(command) in COMPOSE_MUTATING_COMMANDS
 
 
 def record_docker_command(
@@ -2790,6 +5867,25 @@ def record_docker_command(
         }
     )
     del history[:-20]
+
+
+def docker_command_failed_error(result: dict[str, Any]) -> StructuredCoordinatorError:
+    command = [str(item) for item in result.get("command") or []]
+    stderr = str(result.get("stderr") or "").strip()
+    message = f"docker command failed: {' '.join(command)}"
+    if stderr:
+        message = f"{message}\n{stderr}"
+    return StructuredCoordinatorError(
+        message,
+        {
+            "code": "docker_command_failed",
+            "classification": "unhealthy_process",
+            "command": command,
+            "returncode": result.get("returncode"),
+            "stderr": stderr,
+            "docker_executable": result.get("docker_executable"),
+        },
+    )
 
 
 def run_docker(
@@ -2817,7 +5913,24 @@ def run_docker(
             )
         record_docker_command(state, command, cwd, result, project, agent)
         return result
-    completed = subprocess.run(command, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    mutating = docker_command_is_mutating(command)
+    try:
+        completed, executable, timeout_seconds = execute_docker_subprocess(
+            command,
+            cwd=cwd,
+            lifecycle=mutating,
+        )
+    except Exception as exc:
+        result = {
+            "returncode": None,
+            "command": command,
+            "cwd": cwd,
+            "agent": agent,
+            "project": project,
+            **coordinator_exception_payload(exc),
+        }
+        record_docker_command(state, command, cwd, result, project, agent)
+        raise
     result = {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
@@ -2826,16 +5939,159 @@ def run_docker(
         "cwd": cwd,
         "agent": agent,
         "project": project,
+        "docker_executable": executable,
+        "timeout_seconds": timeout_seconds,
     }
     if completed.returncode != 0:
         record_docker_command(state, command, cwd, result, project, agent)
-        raise RuntimeError(f"docker command failed: {' '.join(command)}\n{completed.stderr}")
+        raise docker_command_failed_error(result)
     if container and agent and project:
         result["metadata"] = register_docker_metadata(
             state,
             {"container": container, "agent": agent, "project": project, "cwd": cwd, "role": role},
         )
     record_docker_command(state, command, cwd, result, project, agent)
+    return result
+
+
+def coordinated_run_docker(
+    command: list[str],
+    *,
+    cwd: str | None = None,
+    dry_run: bool = False,
+    project: str | None = None,
+    agent: str | None = None,
+    container: str | None = None,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Run Docker outside the state lock, then atomically record the result."""
+
+    mutating = docker_command_is_mutating(command)
+    if mutating:
+        agent, project = require_identity(
+            {"agent": agent, "project": project}, "docker " + " ".join(command[1:3])
+        )
+    elif project:
+        project = canonical_project(project)
+    if dry_run:
+        result: dict[str, Any] = {
+            "dry_run": True,
+            "command": command,
+            "cwd": cwd,
+            "agent": agent,
+            "project": project,
+        }
+        if container and agent and project:
+            result["metadata"] = coordinated_register_docker_metadata(
+                {
+                    "container": container,
+                    "agent": agent,
+                    "project": project,
+                    "cwd": cwd,
+                    "role": role,
+                    "dry_run": True,
+                }
+            )
+        with locked_state() as state:
+            record_docker_command(state, command, cwd, result, project, agent)
+        return result
+
+    try:
+        docker_executable = resolve_docker_executable()
+    except Exception as exc:
+        failure_result = {
+            "returncode": None,
+            "command": command,
+            "cwd": cwd,
+            "agent": agent,
+            "project": project,
+            **coordinator_exception_payload(exc),
+        }
+        with locked_state() as state:
+            record_docker_command(state, command, cwd, failure_result, project, agent)
+        raise
+
+    operation_id: str | None = None
+    if mutating:
+        if container:
+            target_suffix = docker_container_operation_identity(container)
+            if not target_suffix or not target_suffix.startswith("container-id:"):
+                raise RuntimeError(
+                    f"cannot mutate Docker container {container}: immutable container identity was not verified"
+                )
+        else:
+            target_suffix = canonical_project(project or cwd or "")
+        with locked_state() as state:
+            compose_action = docker_compose_subcommand(command)
+            operation_action = compose_action if command[1] == "compose" else command[1]
+            operation = begin_operation(
+                state,
+                action=f"docker.{command[1]}.{operation_action}" if command[1] == "compose" else f"docker.{operation_action}",
+                target=f"docker:{target_suffix}",
+                agent=str(agent),
+                project=str(project),
+                generation=int(state.get("revision") or 0) + 1,
+            )
+            operation_id = str(operation["id"])
+
+    try:
+        completed, executable, timeout_seconds = execute_docker_subprocess(
+            command,
+            cwd=cwd,
+            lifecycle=mutating,
+            executable=docker_executable,
+        )
+        result = {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "command": command,
+            "cwd": cwd,
+            "agent": agent,
+            "project": project,
+            "docker_executable": executable,
+            "timeout_seconds": timeout_seconds,
+        }
+    except Exception as exc:
+        failure_result = {
+            "returncode": None,
+            "command": command,
+            "cwd": cwd,
+            "agent": agent,
+            "project": project,
+            "docker_executable": docker_executable,
+            **coordinator_exception_payload(exc),
+        }
+        with locked_state() as state:
+            record_docker_command(state, command, cwd, failure_result, project, agent)
+            if operation_id:
+                finish_operation(state, operation_id, status="failed", phase="execute", error=str(exc))
+        raise
+
+    if completed.returncode == 0 and container and agent and project:
+        try:
+            result["metadata"] = coordinated_register_docker_metadata(
+                {"container": container, "agent": agent, "project": project, "cwd": cwd, "role": role}
+            )
+        except Exception as exc:
+            result["metadata_error"] = str(exc)
+            with locked_state() as state:
+                record_docker_command(state, command, cwd, result, project, agent)
+                if operation_id:
+                    finish_operation(state, operation_id, status="failed", phase="metadata", error=str(exc))
+            raise
+    with locked_state() as state:
+        record_docker_command(state, command, cwd, result, project, agent)
+        if operation_id:
+            finish_operation(
+                state,
+                operation_id,
+                status="completed" if completed.returncode == 0 else "failed",
+                phase="committed",
+                error=completed.stderr.strip() if completed.returncode != 0 else None,
+            )
+    if completed.returncode != 0:
+        raise docker_command_failed_error(result)
     return result
 
 
@@ -2848,6 +6104,16 @@ def print_result(value: Any, *, as_json: bool = True) -> None:
 
 def add_common_json(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", default=True, help=argparse.SUPPRESS)
+
+
+def parse_argv_json(raw: str) -> list[str]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--argv must be a JSON array: {exc}") from exc
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+        raise argparse.ArgumentTypeError("--argv must be a non-empty JSON array of strings")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2864,6 +6130,8 @@ def build_parser() -> argparse.ArgumentParser:
     state_sub.add_parser("show")
     reset = state_sub.add_parser("reset")
     reset.add_argument("--force", action="store_true", required=True)
+    reset.add_argument("--agent", required=True)
+    reset.add_argument("--project", required=True)
 
     port = sub.add_parser("port")
     port_sub = port.add_subparsers(dest="action", required=True)
@@ -2877,6 +6145,8 @@ def build_parser() -> argparse.ArgumentParser:
     release = port_sub.add_parser("release")
     release.add_argument("--lease-id")
     release.add_argument("--port", type=int)
+    release.add_argument("--agent", required=True)
+    release.add_argument("--project", required=True)
     port_sub.add_parser("list")
 
     server = sub.add_parser("server")
@@ -2886,7 +6156,13 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--project", required=True)
     start.add_argument("--name", required=True)
     start.add_argument("--cwd")
-    start.add_argument("--cmd", required=True)
+    start_command = start.add_mutually_exclusive_group(required=True)
+    start_command.add_argument("--cmd")
+    start_command.add_argument("--argv", type=parse_argv_json)
+    start.add_argument(
+        "--lease-id",
+        help="attach an existing active manual lease; requires structured --argv",
+    )
     start.add_argument("--range", default=DEFAULT_RANGE)
     start.add_argument("--preferred", type=int)
     start.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
@@ -2899,7 +6175,9 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--project", required=True)
     register.add_argument("--name", required=True)
     register.add_argument("--cwd")
-    register.add_argument("--cmd")
+    register_command = register.add_mutually_exclusive_group()
+    register_command.add_argument("--cmd")
+    register_command.add_argument("--argv", type=parse_argv_json)
     register.add_argument("--url")
     register.add_argument("--port", type=int)
     register.add_argument("--pid", type=int)
@@ -2975,6 +6253,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve = api_sub.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=DEFAULT_API_PORT)
+    serve.add_argument("--token-file")
     return parser
 
 
@@ -2986,18 +6265,105 @@ def handle_cli(args: argparse.Namespace) -> Any:
     if args.group == "state" and args.action == "reset":
         if not args.force:
             raise SystemExit("--force is required")
+        identity = namespace_to_options(args)
+        agent, project = require_identity(identity, "state reset")
         with locked_state() as state:
+            prior = {
+                "revision": state.get("revision"),
+                "lease_count": len(state.get("leases", {})),
+                "server_count": len(state.get("servers", {})),
+                "pending_operation_count": sum(
+                    1
+                    for operation in state.get("operations", {}).values()
+                    if operation.get("status") == "pending"
+                ),
+            }
             state.clear()
             state.update(default_state())
-            return state
-    with locked_state() as state:
-        if args.group == "inventory":
-            return build_inventory(
+            record_event(
                 state,
-                project=args.project,
-                include_docker=not args.no_docker,
-                backup_dirs=args.backup_dir,
+                "state.reset",
+                {
+                    "agent": agent,
+                    "project": project,
+                    "agent_metadata": agent_metadata(
+                        agent=agent,
+                        project=project,
+                        source="state_reset",
+                    ),
+                    "prior": prior,
+                },
             )
+            return state
+    if args.group == "server" and args.action == "start":
+        return coordinated_start_server(namespace_to_options(args))
+    if args.group == "server" and args.action == "stop":
+        return coordinated_stop_server(namespace_to_options(args))
+    if args.group == "server" and args.action == "restart":
+        return coordinated_restart_server(namespace_to_options(args))
+    if args.group == "server" and args.action == "register":
+        return coordinated_register_server(namespace_to_options(args))
+    if args.group == "server" and args.action == "status":
+        return coordinated_status_server(namespace_to_options(args))
+    if args.group == "server" and args.action == "logs":
+        return coordinated_server_logs(namespace_to_options(args))
+    if args.group == "project" and args.action == "status":
+        return coordinated_project_runtime_status(namespace_to_options(args))
+    if args.group == "project" and args.action == "start":
+        return coordinated_project_runtime_start(namespace_to_options(args))
+    if args.group == "project" and args.action == "restart":
+        return coordinated_project_runtime_restart(namespace_to_options(args))
+    if args.group == "project" and args.action == "stop":
+        return coordinated_project_runtime_stop(namespace_to_options(args))
+    if args.group == "inventory":
+        return coordinated_build_inventory(
+            project=args.project,
+            include_docker=not args.no_docker,
+            backup_dirs=args.backup_dir,
+        )
+    if args.group == "docker" and args.action == "ps":
+        command = ["docker", "ps"]
+        if args.all:
+            command.append("--all")
+        return coordinated_run_docker(command, dry_run=args.dry_run)
+    if args.group == "docker" and args.action in {"compose-up", "compose-down"}:
+        command = ["docker", "compose"]
+        for file_name in args.file:
+            command.extend(["-f", file_name])
+        command.append("up" if args.action == "compose-up" else "down")
+        if args.action == "compose-up" and args.detach:
+            command.append("-d")
+        return coordinated_run_docker(
+            command,
+            cwd=args.cwd,
+            dry_run=args.dry_run,
+            project=args.project,
+            agent=args.agent,
+        )
+    if args.group == "docker" and args.action == "logs":
+        return coordinated_run_docker(
+            ["docker", "logs", "--tail", str(args.tail), args.container], dry_run=args.dry_run
+        )
+    if args.group == "docker" and args.action in {"start", "stop", "restart"}:
+        return coordinated_run_docker(
+            ["docker", args.action, args.container],
+            dry_run=args.dry_run,
+            project=args.project,
+            agent=args.agent,
+            container=args.container,
+            role=args.role,
+        )
+    if args.group == "docker" and args.action == "stats":
+        return coordinated_sample_docker_stats(dry_run=args.dry_run)
+    if args.group == "docker" and args.action == "register":
+        return coordinated_register_docker_metadata(namespace_to_options(args))
+    if args.group == "port" and args.action == "lease":
+        args.project = canonical_project(args.project)
+        prime_git_head_identity(args.project)
+    if args.group == "port" and args.action == "release":
+        args.project = canonical_project(args.project)
+        prime_git_head_identity(args.project)
+    with locked_state() as state:
         if args.group == "state" and args.action == "show":
             return state
         if args.group == "port" and args.action == "lease":
@@ -3011,108 +6377,276 @@ def handle_cli(args: argparse.Namespace) -> Any:
                 purpose=args.purpose,
             )
         if args.group == "port" and args.action == "release":
-            return release_port(state, lease_id=args.lease_id, port=args.port)
+            return release_port_for_identity(
+                state,
+                agent=args.agent,
+                project=args.project,
+                lease_id=args.lease_id,
+                port=args.port,
+            )
         if args.group == "port" and args.action == "list":
             return list(state["leases"].values())
-        if args.group == "server" and args.action == "start":
-            return start_server(state, namespace_to_options(args))
-        if args.group == "server" and args.action == "register":
-            return register_server(state, namespace_to_options(args))
-        if args.group == "server" and args.action == "stop":
-            return stop_server(state, namespace_to_options(args))
-        if args.group == "server" and args.action == "restart":
-            return restart_server(state, namespace_to_options(args))
-        if args.group == "server" and args.action == "status":
-            return status_server(state, namespace_to_options(args))
-        if args.group == "server" and args.action == "logs":
-            return server_logs(state, namespace_to_options(args))
         if args.group == "server" and args.action == "list":
             return list(state["servers"].values())
-        if args.group == "project" and args.action == "status":
-            return project_runtime_status(state, namespace_to_options(args))
-        if args.group == "project" and args.action == "start":
-            return project_runtime_start(state, namespace_to_options(args))
-        if args.group == "project" and args.action == "restart":
-            return project_runtime_restart(state, namespace_to_options(args))
-        if args.group == "project" and args.action == "stop":
-            return project_runtime_stop(state, namespace_to_options(args))
-        if args.group == "docker":
-            if args.action == "ps":
-                command = ["docker", "ps"]
-                if args.all:
-                    command.append("--all")
-                return run_docker(state, command, dry_run=args.dry_run)
-            if args.action == "stats":
-                return sample_docker_stats(state, dry_run=args.dry_run)
-            if args.action in {"compose-up", "compose-down"}:
-                command = ["docker", "compose"]
-                for file_name in args.file:
-                    command.extend(["-f", file_name])
-                command.append("up" if args.action == "compose-up" else "down")
-                if args.action == "compose-up" and args.detach:
-                    command.append("-d")
-                return run_docker(state, command, cwd=args.cwd, dry_run=args.dry_run, project=args.project, agent=args.agent)
-            if args.action == "logs":
-                return run_docker(
-                    state,
-                    ["docker", "logs", "--tail", str(args.tail), args.container],
-                    dry_run=args.dry_run,
-                )
-            if args.action in {"start", "stop", "restart"}:
-                result = run_docker(
-                    state,
-                    ["docker", args.action, args.container],
-                    dry_run=args.dry_run,
-                    project=args.project,
-                    agent=args.agent,
-                    container=args.container,
-                    role=args.role,
-                )
-                return result
-            if args.action == "register":
-                return register_docker_metadata(state, namespace_to_options(args))
     raise SystemExit("unsupported command")
 
 
+def validate_api_bind_host(host: str) -> str:
+    candidate = str(host or "").strip()
+    if candidate.lower() == "localhost":
+        return candidate
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError as exc:
+        raise ValueError("coordinator API host must be an explicit loopback address or localhost") from exc
+    if not address.is_loopback:
+        raise ValueError("coordinator API refuses non-loopback bind addresses")
+    if address.version != 4:
+        raise ValueError(
+            "coordinator API currently supports IPv4 loopback only; use 127.0.0.1 instead of an IPv6 address"
+        )
+    return candidate
+
+
+def request_hostname(raw: str) -> str | None:
+    try:
+        return urlparse(f"//{raw}").hostname
+    except ValueError:
+        return None
+
+
+def loopback_hostname(host: str | None) -> bool:
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(host).is_loopback
+    return False
+
+
+class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = API_MAX_CONCURRENT_REQUESTS * 2
+
+    def __init__(self, server_address: tuple[str, int], handler: type[http.server.BaseHTTPRequestHandler], *, token: str):
+        self.api_token = token
+        self._request_slots = threading.BoundedSemaphore(API_MAX_CONCURRENT_REQUESTS)
+        super().__init__(server_address, handler)
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        self._request_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 class ApiHandler(http.server.BaseHTTPRequestHandler):
-    server_version = "CodexDevCoordinator/1"
+    server_version = "CodexDevCoordinator/2"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(API_REQUEST_TIMEOUT_SECONDS)
 
     def _send(self, status: int, payload: Any) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if status == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="codex-dev-coordinator"')
         self.end_headers()
         self.wfile.write(body)
 
     def _read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if not length:
-            return {}
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        if self.headers.get("Transfer-Encoding"):
+            raise ValueError("transfer encoding is not supported")
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise TypeError("POST requests require Content-Type: application/json")
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            raise ValueError("Content-Length is required")
+        try:
+            length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > API_BODY_LIMIT_BYTES:
+            raise OverflowError(f"request body exceeds {API_BODY_LIMIT_BYTES} bytes")
+        try:
+            value = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid JSON request body: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError("JSON request body must be an object")
+        return value
+
+    def _request_boundary_ok(self) -> bool:
+        host = request_hostname(self.headers.get("Host") or "")
+        if not loopback_hostname(host):
+            self._send(400, {"error": "invalid Host header"})
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed = urlparse(origin)
+            server_port = int(self.server.server_address[1])
+            origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if parsed.scheme not in {"http", "https"} or not loopback_hostname(parsed.hostname) or origin_port != server_port:
+                self._send(403, {"error": "cross-origin requests are forbidden"})
+                return False
+        return True
+
+    def _authorized(self) -> bool:
+        header = self.headers.get("Authorization") or ""
+        scheme, _, supplied = header.partition(" ")
+        expected = str(getattr(self.server, "api_token", ""))
+        return scheme.lower() == "bearer" and bool(supplied) and hmac.compare_digest(supplied, expected)
+
+    def _require_authorization(self) -> bool:
+        if self._authorized():
+            return True
+        self._send(401, {"error": "unauthorized"})
+        return False
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format % args}", file=sys.stderr)
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._request_boundary_ok():
+            return
+        if self.path == "/healthz":
+            self._send(200, {"ok": True, "service": "codex-dev-coordinator", "version": VERSION})
+            return
+        if not self._require_authorization():
+            return
         try:
-            with locked_state() as state:
+            if self.path == "/v1/inventory":
+                result: Any = coordinated_build_inventory()
+            elif self.path in {"/v1/state", "/v1/ports", "/v1/servers"}:
+                snapshot = snapshot_coordinator_state()
                 if self.path == "/v1/state":
-                    self._send(200, state)
-                elif self.path == "/v1/inventory":
-                    self._send(200, build_inventory(state))
+                    result = snapshot
                 elif self.path == "/v1/ports":
-                    self._send(200, list(state["leases"].values()))
-                elif self.path == "/v1/servers":
-                    self._send(200, list(state["servers"].values()))
+                    result = list(snapshot["leases"].values())
                 else:
-                    self._send(404, {"error": "not found"})
+                    result = list(snapshot["servers"].values())
+            else:
+                self._send(404, {"error": "not found"})
+                return
+            self._send(200, result)
         except Exception as exc:  # pragma: no cover - defensive endpoint wrapper
             self._send(500, {"error": str(exc)})
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._request_boundary_ok():
+            return
+        if not self._require_authorization():
+            return
         try:
             payload = self._read_json()
+            if self.path == "/v1/servers/start":
+                self._send(200, coordinated_start_server(payload))
+                return
+            if self.path == "/v1/servers/stop":
+                self._send(200, coordinated_stop_server(payload))
+                return
+            if self.path == "/v1/servers/restart":
+                self._send(200, coordinated_restart_server(payload))
+                return
+            if self.path == "/v1/servers/register":
+                self._send(200, coordinated_register_server(payload))
+                return
+            if self.path == "/v1/servers/status":
+                self._send(200, coordinated_status_server(payload))
+                return
+            if self.path == "/v1/servers/logs":
+                self._send(200, coordinated_server_logs(payload))
+                return
+            if self.path == "/v1/projects/status":
+                self._send(200, coordinated_project_runtime_status(payload))
+                return
+            if self.path == "/v1/projects/start":
+                self._send(200, coordinated_project_runtime_start(payload))
+                return
+            if self.path == "/v1/projects/restart":
+                self._send(200, coordinated_project_runtime_restart(payload))
+                return
+            if self.path == "/v1/projects/stop":
+                self._send(200, coordinated_project_runtime_stop(payload))
+                return
+            if self.path == "/v1/docker/stats":
+                self._send(200, coordinated_sample_docker_stats(dry_run=bool(payload.get("dry_run"))))
+                return
+            if self.path == "/v1/docker/register":
+                self._send(200, coordinated_register_docker_metadata(payload))
+                return
+            if self.path == "/v1/docker/ps":
+                command = ["docker", "ps"]
+                if payload.get("all"):
+                    command.append("--all")
+                self._send(200, coordinated_run_docker(command, dry_run=bool(payload.get("dry_run"))))
+                return
+            if self.path in {"/v1/docker/compose-up", "/v1/docker/compose-down"}:
+                command = ["docker", "compose"]
+                for file_name in payload.get("file") or []:
+                    command.extend(["-f", file_name])
+                command.append("up" if self.path.endswith("compose-up") else "down")
+                if self.path.endswith("compose-up") and payload.get("detach"):
+                    command.append("-d")
+                self._send(
+                    200,
+                    coordinated_run_docker(
+                        command,
+                        cwd=payload.get("cwd"),
+                        dry_run=bool(payload.get("dry_run")),
+                        project=payload.get("project"),
+                        agent=payload.get("agent"),
+                    ),
+                )
+                return
+            if self.path == "/v1/docker/logs":
+                self._send(
+                    200,
+                    coordinated_run_docker(
+                        ["docker", "logs", "--tail", str(payload.get("tail") or "80"), payload["container"]],
+                        dry_run=bool(payload.get("dry_run")),
+                    ),
+                )
+                return
+            if self.path in {"/v1/docker/start", "/v1/docker/stop", "/v1/docker/restart"}:
+                docker_action = self.path.rsplit("/", 1)[-1]
+                self._send(
+                    200,
+                    coordinated_run_docker(
+                        ["docker", docker_action, payload["container"]],
+                        dry_run=bool(payload.get("dry_run")),
+                        project=payload.get("project"),
+                        agent=payload.get("agent"),
+                        container=payload.get("container"),
+                        role=payload.get("role"),
+                    ),
+                )
+                return
+            if self.path == "/v1/ports/lease":
+                payload["project"] = canonical_project(payload["project"])
+                prime_git_head_identity(payload["project"])
+            elif self.path == "/v1/ports/release":
+                release_agent, release_project = require_identity(payload, "port release")
+                payload["agent"] = release_agent
+                payload["project"] = release_project
+            else:
+                self._send(404, {"error": "not found"})
+                return
             with locked_state() as state:
                 if self.path == "/v1/ports/lease":
                     result = lease_port(
@@ -3125,76 +6659,31 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                         purpose=payload.get("purpose") or "manual",
                     )
                 elif self.path == "/v1/ports/release":
-                    result = release_port(state, lease_id=payload.get("lease_id"), port=payload.get("port"))
-                elif self.path == "/v1/servers/start":
-                    result = start_server(state, payload)
-                elif self.path == "/v1/servers/register":
-                    result = register_server(state, payload)
-                elif self.path == "/v1/servers/stop":
-                    result = stop_server(state, payload)
-                elif self.path == "/v1/servers/restart":
-                    result = restart_server(state, payload)
-                elif self.path == "/v1/servers/status":
-                    result = status_server(state, payload)
-                elif self.path == "/v1/servers/logs":
-                    result = server_logs(state, payload)
-                elif self.path == "/v1/projects/status":
-                    result = project_runtime_status(state, payload)
-                elif self.path == "/v1/projects/start":
-                    result = project_runtime_start(state, payload)
-                elif self.path == "/v1/projects/restart":
-                    result = project_runtime_restart(state, payload)
-                elif self.path == "/v1/projects/stop":
-                    result = project_runtime_stop(state, payload)
-                elif self.path == "/v1/docker/ps":
-                    result = run_docker(state, ["docker", "ps"], dry_run=bool(payload.get("dry_run")))
-                elif self.path == "/v1/docker/stats":
-                    result = sample_docker_stats(state, dry_run=bool(payload.get("dry_run")))
-                elif self.path in {"/v1/docker/compose-up", "/v1/docker/compose-down"}:
-                    command = ["docker", "compose"]
-                    for file_name in payload.get("file") or []:
-                        command.extend(["-f", file_name])
-                    command.append("up" if self.path.endswith("compose-up") else "down")
-                    if self.path.endswith("compose-up") and payload.get("detach"):
-                        command.append("-d")
-                    result = run_docker(
+                    result = release_port_for_identity(
                         state,
-                        command,
-                        cwd=payload.get("cwd"),
-                        dry_run=bool(payload.get("dry_run")),
-                        project=payload.get("project"),
-                        agent=payload.get("agent"),
+                        agent=payload["agent"],
+                        project=payload["project"],
+                        lease_id=payload.get("lease_id"),
+                        port=payload.get("port"),
                     )
-                elif self.path == "/v1/docker/logs":
-                    result = run_docker(
-                        state,
-                        ["docker", "logs", "--tail", str(payload.get("tail") or "80"), payload["container"]],
-                        dry_run=bool(payload.get("dry_run")),
-                    )
-                elif self.path in {"/v1/docker/start", "/v1/docker/stop", "/v1/docker/restart"}:
-                    docker_action = self.path.rsplit("/", 1)[-1]
-                    result = run_docker(
-                        state,
-                        ["docker", docker_action, payload["container"]],
-                        dry_run=bool(payload.get("dry_run")),
-                        project=payload.get("project"),
-                        agent=payload.get("agent"),
-                        container=payload.get("container"),
-                        role=payload.get("role"),
-                    )
-                elif self.path == "/v1/docker/register":
-                    result = register_docker_metadata(state, payload)
-                else:
-                    self._send(404, {"error": "not found"})
-                    return
             self._send(200, result)
+        except OverflowError as exc:
+            self._send(413, {"error": str(exc)})
+        except TypeError as exc:
+            self._send(415, {"error": str(exc)})
         except Exception as exc:
             self._send(400, {"error": str(exc)})
 
 
-def serve_api(host: str, port: int) -> None:
-    server = http.server.ThreadingHTTPServer((host, port), ApiHandler)
-    print(json.dumps({"host": host, "port": port, "url": f"http://{host}:{port}"}), flush=True)
+def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
+    host = validate_api_bind_host(host)
+    token_path = Path(token_file).expanduser().absolute() if token_file else api_token_path()
+    token = load_or_create_api_token(token_path)
+    server = BoundedThreadingHTTPServer((host, port), ApiHandler, token=token)
+    print(
+        json.dumps({"host": host, "port": port, "url": f"http://{host}:{port}", "token_file": str(token_path)}),
+        flush=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -3205,13 +6694,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.group == "api" and args.action == "serve":
-        serve_api(args.host, args.port)
-        return 0
+        try:
+            serve_api(args.host, args.port, token_file=args.token_file)
+            return 0
+        except Exception as exc:
+            print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)
+            return 1
     try:
         print_result(handle_cli(args))
         return 0
     except Exception as exc:
-        print(json.dumps({"error": str(exc)}, indent=2, sort_keys=True), file=sys.stderr)
+        print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)
         return 1
 
 

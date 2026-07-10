@@ -3,6 +3,8 @@
 # Local editor and runtime state
 .idea/
 .vscode/
+.claude/settings.local.json
+node_modules/
 *.log
 
 # Python caches used by skill harness scripts

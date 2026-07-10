@@ -31,7 +31,9 @@ coordinator is the source of truth.
 Every mutating coordinator command must identify the agent and canonical repo
 path. Use `PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`
 before starting, stopping, restarting, registering, or changing dev servers,
-Docker containers, Docker Compose services, or local databases.
+Docker containers, Docker Compose services, local databases, port leases, or
+destructive coordinator state. Port release is restricted to the lease-owning
+project, and destructive state reset retains attributed prior-state evidence.
 
 ## Shared State
 
@@ -41,20 +43,45 @@ The bundled script stores leases and server metadata under:
 ~/.codex/agent-coordinator/
 ```
 
-This default is intentionally shared by every runtime on the machine: Codex and
-Claude Code sessions must use the same state directory so they see each other's
-leases, servers, and containers. Do not point one runtime at a different state
-home unless every agent on the machine moves with it.
+The default is relative to the current process's resolved home. It is shared
+only by runtimes executing as the same OS user with the same home. A sandboxed
+desktop runtime, VM, or different account can resolve another directory. Run
+`inventory` in each runtime and compare its `coordinator_home` field before
+assuming that leases and operations are mutually visible.
 
-For multiple OS users, Parallels VMs, or separate agent accounts that need one
-shared memory, set the same writable path in every agent shell:
+For multiple runtimes owned by one OS user, set the same absolute private path
+in every runtime when shared coordination is required:
 
 ```bash
 export CODEX_AGENT_COORDINATOR_HOME=/path/to/shared/codex-agent-coordinator
 ```
 
+Do not use one coordinator home across different OS users or VM security
+boundaries. The directory is deliberately `0700` and the coordinator has no
+multi-user ACL, authentication, or ownership protocol. Keep separate homes and
+aggregate their read-only inventories through an explicitly source-aware tool
+when cross-boundary visibility is needed.
+
 The script uses a lock file in that directory so concurrent agents cannot lease
-the same port.
+the same port. The lock protects short state snapshot, reservation, and commit
+phases; it is not held while starting or stopping processes, polling health,
+running Docker, inspecting listeners, scanning inventory/backups, or writing an
+HTTP response. Same-target lifecycle mutations are rejected while an operation
+is pending, while unrelated projects and leases continue independently. A
+pending project lifecycle also excludes direct server and Docker mutations for
+that canonical project. Only synchronous child work carrying the exact internal
+parent-operation capability may run inside it; callers cannot supply that
+capability through CLI or HTTP payloads.
+
+The coordinator home is mode `0700`; state, lock, API-token, and log files are
+private. State writes use an exclusive temporary file, `fsync`, and atomic
+replacement. State schema v2 includes a monotonic revision and a bounded
+operation journal. Abandoned pre-launch reservations release their leases; a
+still-live process whose operation owner disappeared is retained as `orphaned`
+evidence rather than having its lease silently reassigned. Pending operations
+record a locked process-instance identity, so age alone never retires a verified
+live owner and a reused PID cannot impersonate the process that made the
+reservation.
 
 ## Quick Start
 
@@ -95,6 +122,59 @@ python3 scripts/dev_coordinator.py server start \
   --health-url 'http://127.0.0.1:{port}/'
 ```
 
+`--cmd` is compatibility input. It is parsed into argv and is never evaluated
+by a shell; shell control operators such as `;`, `&&`, pipes, redirects, and
+newlines are rejected. Prefer structured argv when quoting would be ambiguous:
+
+```bash
+python3 scripts/dev_coordinator.py server start \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --name web \
+  --cwd "$PROJECT_ROOT" \
+  --argv '["npm","run","dev","--","--host","127.0.0.1","--port","{port}"]' \
+  --range 3000-3999
+```
+
+When a preceding workflow already owns an active lease whose purpose is
+`manual`, attach that exact lease instead of releasing it and racing to lease
+the port again. Exact-lease start accepts structured argv only:
+
+```bash
+LEASE_ID="$({
+  python3 scripts/dev_coordinator.py port lease \
+    --agent "$USER" \
+    --project "$PROJECT_ROOT" \
+    --range 3000-3999 \
+    --purpose manual
+} | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+
+python3 scripts/dev_coordinator.py server start \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --name web \
+  --cwd "$PROJECT_ROOT" \
+  --argv '["npm","run","dev","--","--host","127.0.0.1","--port","{port}"]' \
+  --lease-id "$LEASE_ID" \
+  --health-url 'http://127.0.0.1:{port}/'
+```
+
+The lease must still be active and unexpired, have purpose `manual`, be
+unbound, and belong to the same agent and canonical project. The start reserves
+the server lifecycle and exact lease in one outer operation, uses its exact ID
+and port, and never allocates a replacement lease. Port release and direct
+project/server lifecycle mutations that conflict with that attachment are
+rejected until it completes. A failure before process launch restores the
+manual lease as unbound. Once process launch has occurred, a failed health
+check or uncertain outcome keeps the lease attached as explicit failure or
+reconciliation evidence until an attributed stop or release clears it; it is
+never silently returned to the manual pool.
+
+Project runtime declarations may likewise provide `"argv": [...]` instead of
+`"cmd"`. The persisted `LaunchSpec` contains argv, cwd, declared environment,
+agent, project, and source provenance, so restart retains the explicitly
+declared environment.
+
 If a server is already running on the declared fixed port but is not registered,
 adopt it instead of starting a duplicate. Adoption is allowed only when the
 listener PID can be attributed to the canonical project root. If the occupied
@@ -118,6 +198,9 @@ python3 scripts/dev_coordinator.py server restart --agent "$USER" --project "$PR
 python3 scripts/dev_coordinator.py server stop --agent "$USER" --project "$PROJECT_ROOT" --name web
 python3 scripts/dev_coordinator.py server logs --project "$PROJECT_ROOT" --name web --tail 200
 ```
+
+Direct server restart holds one outer reservation across its delegated stop and
+start children, so another stop/start/restart cannot interleave in the gap.
 
 The coordinator keeps managed server log paths and stopped server records. When
 a managed server stops or its PID exits, inventory exposes `stopped_at`,
@@ -152,6 +235,24 @@ Run a single coordinator endpoint when agents prefer tool-style JSON calls:
 python3 scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876
 ```
 
+The API is a local capability endpoint, not a remote administration service.
+It supports `localhost` or IPv4 loopback binds such as `127.0.0.1`; wildcard,
+non-loopback, and IPv6 binds are rejected before the server is created. At first start it creates
+`~/.codex/agent-coordinator/api-token` with mode `0600` (override with
+`CODEX_AGENT_COORDINATOR_TOKEN_FILE` or `--token-file`). Only `GET /healthz` is
+anonymous. Every `/v1/*` request must send:
+
+```text
+Authorization: Bearer <contents of api-token>
+```
+
+The server validates loopback `Host`, same-origin browser requests, JSON
+content type, and a 64 KiB body limit, and bounds concurrent request workers.
+Do not print, commit, or put the token in a URL. A group/world-readable or
+symlinked token file is rejected. Concurrent first starts converge on one
+exclusively created token; every process reopens the winning credential rather
+than replacing it with a different token.
+
 Useful endpoints:
 
 - `GET /v1/inventory`
@@ -181,11 +282,15 @@ Useful endpoints:
 - `POST /v1/docker/restart`
 
 POST bodies are JSON and use the same option names as the CLI without leading
-dashes, for example:
+dashes. Prefer the `argv` array over a legacy `cmd` string, for example:
 
 ```json
-{"agent":"codex-a","project":"/repo","name":"web","cwd":"/repo","cmd":"npm run dev -- --port {port}","range":"3000-3999"}
+{"agent":"codex-a","project":"/repo","name":"web","cwd":"/repo","argv":["npm","run","dev","--","--port","{port}"],"range":"3000-3999"}
 ```
+
+To consume an existing manual lease through the API, include its exact
+`"lease_id"` in the same `/v1/servers/start` payload. The same ownership,
+expiry, source, binding, structured-argv, and rollback rules apply.
 
 ## Docker
 
@@ -207,11 +312,53 @@ python3 scripts/dev_coordinator.py docker restart --agent "$USER" --project "$PR
 Use `--dry-run` when Docker may not be installed or when validating the command
 shape without changing containers.
 
+Docker execution does not assume an interactive-shell `PATH`. The coordinator
+resolves `CODEX_DOCKER_CLI` when it names an absolute executable, then the
+current `PATH`, then standard Homebrew, Docker Desktop, OrbStack, and per-user
+installation locations. It preserves the discovered `docker` entry-point path
+instead of canonicalizing a multicall symlink to a differently named target.
+Real Docker calls are bounded by observation and lifecycle timeouts; dry-run
+never requires a Docker installation.
+
+Project start, restart, and stop preflight Docker before mutating any managed
+process whenever the declaration includes Compose or an attributed container.
+The bounded preflight verifies the Docker executable, daemon, and—when
+declared—the Compose plugin. An unavailable capability returns a complete project report with
+`ok=false`, `classification=missing_dependency`, `actions=[]`,
+`partial=false`, and structured `action_errors[].capability` evidence instead
+of partially changing the runtime or exposing a raw `FileNotFoundError`.
+Failures after one or more successful actions return the same report shape with
+`partial=true`, the completed `actions`, and structured `action_errors`.
+
 Existing Docker labels cannot be rewritten for running containers. When Docker
 does not provide Compose project labels, register coordinator-side metadata with
 `docker register` or let `docker start/stop/restart` attach it automatically
 from `--agent` and `--project`. Inventory merges real Docker Compose labels
 first, then coordinator sidecar metadata for unlabeled containers.
+
+When a declared dependency is also owned by declared Compose, keep the
+dependency for health/readiness evidence and map its lifecycle explicitly with
+`"service": "<compose-service>"` (preferred), or give it a `name` that exactly
+matches an entry in `docker.services`. Compose then exclusively owns its
+start/stop/restart lifecycle, while unrelated declared containers retain direct
+container lifecycle management. Project restart safely uses `compose restart`
+for observed running services and `compose up -d` for missing or stopped
+services; recovery actions run before dependent restarts, and the coordinator
+does not force-recreate containers or risk writable-layer data.
+
+A container name or image that resembles a repository name is discovery
+evidence only. Project start, restart, and stop may mutate a container only when
+it is explicitly declared in the runtime, has a Compose working-directory label
+for the canonical project, or has prior coordinator-side registration with
+matching project and agent metadata. Name-only matches remain visible as
+`read_only_evidence=true` and `mutation_authorized=false`; they must never be
+auto-registered or passed to a Docker lifecycle command.
+
+Docker lifecycle reservations normalize container names and short IDs through
+`docker inspect` to the immutable full container ID before reserving state. Two
+aliases for the same container therefore conflict as one mutation target. If
+that immutable identity cannot be verified, lifecycle mutation and sidecar
+registration fail closed.
 
 When a project runtime declaration names an existing unlabeled container,
 `project start` adopts that container into coordinator-side metadata before it
@@ -338,11 +485,34 @@ reporting success.
 - A corrupt state file (for example a partial write after a crash) is backed up
   to `state.json.corrupt-<epoch>` and replaced with a fresh default state, so
   read-only commands like `inventory` recover instead of failing.
+- Managed server and project start, stop, and restart plus direct Docker
+  lifecycle calls reserve and commit state in short locked phases. Process
+  spawn, health polling, termination, Docker execution/inspection, project
+  discovery, inventory collection, server registration, and Docker statistics
+  happen outside the cross-agent lock, so an unrelated lease is not blocked by
+  a slow service operation. Project mutations retain bounded operation-journal
+  evidence with the committed result summary.
+- Read-only health/inventory routes use a consistent state snapshot and commit
+  observations optimistically. Each observation reserves a monotonic per-server
+  ticket; only the newest ticket with the same lifecycle fingerprint may
+  commit. A slow older check or a health result measured before a stop/restart
+  can be returned for its own request, but cannot overwrite the newer server
+  record. Docker statistics histories merge by sample identity instead of
+  replacing concurrent samples.
+- Repository roots, branches, and short commits are read from local `.git`
+  metadata; state-critical paths do not invoke the Git executable or a Git
+  credential/network helper while holding the coordinator lock.
+- Failed process launches release their reserved leases and retain failed
+  operation evidence for coordinator-allocated leases. Exact manual-lease
+  starts instead restore the unbound manual lease only when no process was
+  launched; after launch they quarantine the lease with explicit failure
+  evidence until attributed cleanup. Generation checks keep a superseded
+  operation from overwriting a newer server record.
 
 ## Safety Notes
 
-- The coordinator does not grant permissions. It runs commands as the current
-  OS user and shells out to the local Docker CLI.
+- The coordinator does not grant permissions. It runs structured argv as the
+  current OS user and invokes the local Docker CLI without a command shell.
 - Use project-specific `--name` values. Avoid generic names like `server` when a
   repo has multiple services.
 - Set `--ttl` for short-lived port leases that are not attached to a managed

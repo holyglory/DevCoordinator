@@ -1,0 +1,12 @@
+{
+  "name": "holyskills-ci-playwright",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Locked Playwright runtime for repository validation",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "dependencies": {
+    "playwright": "1.61.1"
+  }
+}

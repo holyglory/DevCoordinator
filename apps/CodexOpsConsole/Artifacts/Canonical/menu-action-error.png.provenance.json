@@ -1,0 +1,10 @@
+{
+  "artifact_type" : "test-fixture-snapshot",
+  "fixture_id" : "codex-ops-menu-neutral-v1",
+  "generator" : "apps\/CodexOpsConsole\/Tools\/MenuBarSnapshotMain.swift",
+  "height" : 600,
+  "schema_version" : 1,
+  "sha256" : "83fde7a3413fd7918d9116878821f65a51cfd02bdb12101cac31fe2f27a4ee0f",
+  "source" : "isolated-test-fixture",
+  "width" : 430
+}

@@ -103,7 +103,7 @@ struct SplitSizingTest {
         let staleApi = server(
             id: "old-api",
             name: "api",
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             port: 4000,
             status: "stopped",
             updatedAt: "2026-06-27T21:28:11Z"
@@ -111,7 +111,7 @@ struct SplitSizingTest {
         let newerApi = server(
             id: "new-api",
             name: "api",
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             port: 4000,
             status: "stopped",
             updatedAt: "2026-06-28T14:09:19Z"
@@ -119,7 +119,7 @@ struct SplitSizingTest {
         let web = server(
             id: "web",
             name: "web",
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             port: 3004,
             status: "stopped",
             updatedAt: "2026-06-28T14:09:18Z"
@@ -133,7 +133,7 @@ struct SplitSizingTest {
         let inventory = Inventory(
             coordinatorHome: nil,
             statePath: nil,
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             urls: [],
             servers: [staleApi, newerApi, web],
             leases: [],
@@ -143,7 +143,7 @@ struct SplitSizingTest {
             backups: [],
             projectUsage: [
                 ProjectUsage(
-                    project: "/Users/holyglory/src/XFoilFOAM",
+                    project: "/fixtures/projects/XFoilFOAM",
                     projectKey: "xfoilfoam",
                     name: "XFoilFOAM",
                     serverCount: 2,
@@ -221,7 +221,7 @@ struct SplitSizingTest {
             image: "postgres:16-alpine",
             status: "Up 8 days",
             ports: "0.0.0.0:5544->5432/tcp",
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             agent: "codex",
             role: "postgres",
             metadataSource: "coordinator_sidecar",
@@ -255,7 +255,7 @@ struct SplitSizingTest {
         let stoppedForeignPID = server(
             id: "stale-pid",
             name: "web",
-            project: "/Users/holyglory/src/benzovozka",
+            project: "/fixtures/projects/sample-commerce",
             port: 3000,
             status: "stopped",
             updatedAt: "2026-07-01T08:39:42Z",
@@ -268,7 +268,7 @@ struct SplitSizingTest {
         let staleServer = server(
             id: "skydivelive-web-old",
             name: "skydivelive-web",
-            project: "/Users/holyglory/src/skydivelive",
+            project: "/fixtures/projects/sample-dashboard",
             port: 3001,
             status: "stopped",
             updatedAt: "2026-06-21T19:47:48Z",
