@@ -4,6 +4,22 @@ These instructions apply to every coding agent working in this repository
 (Codex and Claude Code alike). "The agent" below means whichever assistant is
 doing the work.
 
+## Repository Freshness Preflight
+
+- Before a repository-wide audit, broad refactor, migration, history rewrite,
+  or repository split, run
+  `python3 scripts/check_repository_freshness.py --repo "$PWD" --json` and
+  inspect the freshly fetched remote-default-branch ancestry.
+- `current` and `ahead` are safe ancestry states. `behind`, `diverged`, and
+  `dirty-on-stale-base` require reconciliation before implementation;
+  `remote-unavailable` is unknown, never evidence that the checkout is current.
+- Never discard or rewrite a dirty checkout to make it current. Preserve the
+  work, establish a clean checkout from the remote baseline, and use an
+  evidence-backed three-way merge. Do not pull, rebase, reset, stash, or clean
+  valuable local changes as a freshness shortcut.
+- If remote truth is unavailable, pause architecture-changing work until it is
+  restored or the user explicitly authorizes an offline baseline.
+
 ## Agent Implementation Mistake Protocol
 
 When the user reports an implementation mistake likely made by the agent,

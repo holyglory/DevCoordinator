@@ -568,6 +568,7 @@ def check_interaction_label_parity() -> None:
 
 
 def main() -> int:
+    run([sys.executable, str(ROOT / "scripts" / "check_repository_freshness_self_test.py")])
     check_vendor_sync()
     check_interaction_label_parity()
     check_include_glob_exclusions()
