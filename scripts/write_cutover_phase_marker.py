@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create one durable, private, no-follow cutover phase marker."""
+"""Create one durable, private, no-follow cutover transaction marker."""
 
 from __future__ import annotations
 
@@ -17,8 +17,17 @@ class MarkerError(RuntimeError):
     pass
 
 
+SUPPORTED_PHASES = (
+    "cutover-run-started",
+    "service-stop-attempted",
+    "state-migration-attempted",
+    "relocation-attempted",
+    "cutover-success",
+)
+
+
 def write_marker(path: Path, phase: str) -> dict[str, object]:
-    if phase not in {"state-migration-attempted", "relocation-attempted"}:
+    if phase not in SUPPORTED_PHASES:
         raise MarkerError(f"unsupported cutover phase: {phase}")
     payload_object = {
         "schema_version": 1,
@@ -55,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--phase",
         required=True,
-        choices=("state-migration-attempted", "relocation-attempted"),
+        choices=SUPPORTED_PHASES,
     )
     args = parser.parse_args(argv)
     try:

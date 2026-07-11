@@ -137,6 +137,11 @@ These rules apply to Codex and Claude Code in this repository.
   a residual race: protect it with `KillMode=process` and require the immediate
   post-stop exact process-identity, cgroup, and listener verifier before any
   state copy.
+  Treat every repo helper invoked by a private cutover script as an executable
+  interface contract. Before the script may touch a service, exercise every
+  exact helper subcommand, enum/phase value, and required flag against the
+  deployed commit in an isolated private fixture. `bash -n`, source review, and
+  direct-function tests do not prove an argparse/CLI boundary.
   Never treat state copied while a writer is active as lossless; checkpoint
   only after verified shutdown and immediately before relocation, and bind
   rollback to durable phase markers. Parse Linux `/proc/PID/stat` around its

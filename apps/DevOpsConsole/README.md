@@ -332,6 +332,15 @@ Node/old-coordinator cgroup and listener topology. Remove any success marker on
 failure; create it only after a complete manifest verification, then bind that
 marker with one final verified manifest refresh.
 
+Shell syntax is not helper-interface validation. Before the script may touch a
+service, use a throwaway private directory to run the exact deployed
+`write_cutover_phase_marker.py` CLI for every phase the transaction uses:
+`cutover-run-started`, `service-stop-attempted`,
+`state-migration-attempted`, `relocation-attempted`, and `cutover-success`.
+Likewise run `--help` or a no-mutation fixture for every other repo helper's
+exact subcommand and required flags. A candidate whose helper CLI matrix has
+not passed against the pinned commit is not executable cutover evidence.
+
 ```bash
 set -euo pipefail
 OLD_PROJECT="$LEGACY_ROOT"

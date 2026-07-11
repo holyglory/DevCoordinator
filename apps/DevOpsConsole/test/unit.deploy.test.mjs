@@ -190,6 +190,9 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'Retain the backup, script, ledgers, and manifest after success or failure',
     'not a kernel-continuous monitor',
     'can leave the ledger `running` or otherwise incomplete',
+    '`cutover-run-started`, `service-stop-attempted`',
+    '`state-migration-attempted`, `relocation-attempted`, and `cutover-success`',
+    'Shell syntax is not helper-interface validation',
   ]) assert.ok(cutover.includes(marker), marker);
 
   assert.doesNotMatch(cutover, /systemctl restart dev-coordinator\.service/);
