@@ -548,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_coordinator_auth_boundary.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_write_cutover_phase_marker.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_check_legacy_cutover_stopped.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_loaded_systemd_paths.py")])
     run([sys.executable, str(ROOT / "scripts" / "check_repository_boundaries.py"), "--repo", str(ROOT)])
     check_ops_console_interaction_guardrails(run_macos_app_checks=False)
     check_devops_console()

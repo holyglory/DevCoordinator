@@ -112,6 +112,69 @@ def main() -> int:
         module = importlib.util.module_from_spec(spec)
         sys.modules["boundary_guard"] = module
         spec.loader.exec_module(module)
+        unsafe_system_unit = """[Unit]
+Description=realistic system service
+Documentation=file://%h/app/README.md
+[Service]
+User = app
+EnvironmentFile=%h/.config/app/env
+Environment=STATE_HOME=%h/.local/state/app
+ExecStartPre=/usr/bin/test -r %h/.config/app/token
+ExecStart=/usr/bin/app --token-file %h/.config/app/token
+ReadWritePaths=%h/.local/state/app
+"""
+        unsafe_home_findings = module.unsafe_system_unit_home_findings(
+            "deploy/app.service", unsafe_system_unit
+        )
+        check(
+            len(unsafe_home_findings) == 6
+            and all(item.rule == "system-unit-manager-home" for item in unsafe_home_findings),
+            f"system-manager %h paths were not caught: {unsafe_home_findings}",
+        )
+        safe_system_unit = """[Unit]
+Description=explicit service home
+[Service]
+User=fixture
+# Documentation may mention %h without becoming a directive.
+Environment=STATE_HOME=/home/fixture/.local/state/app
+Environment=LITERAL_SPECIFIER=%%h
+ExecStart=/usr/bin/app --token-file /home/fixture/.config/app/token
+"""
+        check(
+            not module.unsafe_system_unit_home_findings("deploy/app.service", safe_system_unit),
+            "explicit service-account paths or comments were falsely flagged",
+        )
+        root_system_unit = """[Service]
+User = root
+Environment=ROOT_STATE=%h/.local/state/root-app
+"""
+        check(
+            not module.unsafe_system_unit_home_findings("deploy/root-app.service", root_system_unit),
+            "root system service's intentional manager-home path was falsely flagged",
+        )
+        integrated_unsafe = repo / "deploy" / "worker.service"
+        integrated_safe = repo / "deploy" / "root-worker.service"
+        write(integrated_unsafe, unsafe_system_unit)
+        write(integrated_safe, root_system_unit + "Environment=LITERAL=%%h\n")
+        git(repo, "add", integrated_unsafe.relative_to(repo).as_posix(), integrated_safe.relative_to(repo).as_posix())
+        integrated_findings = module.scan_tip(repo)
+        check(
+            any(
+                item.rule == "system-unit-manager-home" and item.path == "deploy/worker.service"
+                for item in integrated_findings
+            ),
+            "tracked extra system unit bypassed the repository-wide manager-home scan",
+        )
+        check(
+            not any(
+                item.rule == "system-unit-manager-home" and item.path == "deploy/root-worker.service"
+                for item in integrated_findings
+            ),
+            "intentional root service or escaped specifier was falsely flagged by integrated scan",
+        )
+        git(repo, "reset", "-q", "--", integrated_unsafe.relative_to(repo).as_posix(), integrated_safe.relative_to(repo).as_posix())
+        integrated_unsafe.unlink()
+        integrated_safe.unlink()
         check(module.forbidden_history_path("apps/DevOpsConsole/.env.example") is None, ".env.example was flagged")
         check(module.forbidden_history_path("skills/postgres-docker-backup/SKILL.md") is None, "skill name was flagged")
         check(

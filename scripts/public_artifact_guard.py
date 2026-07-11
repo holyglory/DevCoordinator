@@ -40,6 +40,18 @@ PLACEHOLDER_SECRET_PREFIXES = (
     "do_not_leak_",
     "not-a-secret-",
 )
+PINNED_DEPLOYMENT_HOME_FILES = {
+    "apps/DevOpsConsole/deploy/dev-coordinator.service",
+    "apps/DevOpsConsole/deploy/devops-console.service",
+    "apps/DevOpsConsole/test/unit.deploy.test.mjs",
+    "scripts/check_repository_boundaries.py",
+    "scripts/self_test_loaded_systemd_paths.py",
+}
+PINNED_DEPLOYMENT_HOME_SUFFIXES = (
+    "/.codex/agent-coordinator",
+    "/.config/devops-console",
+    "/.local/state/devops-console",
+)
 
 HOME_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9])/(?:Users|home)/([A-Za-z0-9._-]+)(?=/)"),
@@ -106,13 +118,24 @@ def placeholder_secret(value: str) -> bool:
     return re.fullmatch(r"<[A-Za-z0-9 _./:-]+>", normalized) is not None
 
 
+def approved_pinned_deployment_home(rel_path: Path, line: str, match: re.Match[str]) -> bool:
+    if rel_path.as_posix() not in PINNED_DEPLOYMENT_HOME_FILES or match.group(1) != "holyglory":
+        return False
+    suffix = line[match.end() :]
+    return any(suffix.startswith(expected) for expected in PINNED_DEPLOYMENT_HOME_SUFFIXES)
+
+
 def scan_text(rel_path: Path, text: str) -> list[Finding]:
     findings: list[Finding] = []
     for line_number, line in enumerate(text.splitlines(), start=1):
         for pattern in HOME_PATTERNS:
             for match in pattern.finditer(line):
                 username = match.group(1)
-                if username.lower() not in PORTABLE_USERS and not suppressed(line, "text-private-home"):
+                if (
+                    username.lower() not in PORTABLE_USERS
+                    and not approved_pinned_deployment_home(rel_path, line, match)
+                    and not suppressed(line, "text-private-home")
+                ):
                     findings.append(Finding("text-private-home", rel_path.as_posix(), line_number, "literal private home path"))
                     break
         agent_match = AGENT_PATTERN.search(line)

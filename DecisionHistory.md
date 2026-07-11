@@ -1,5 +1,30 @@
 # Decision History
 
+## 2026-07-11 - System units pin the service account home
+
+Decision: Production system-level units pin `/home/holyglory` anywhere they
+address Console or coordinator runtime data. They must not use `%h` for those
+paths. The repository boundary detector and deployment tests reject active
+`%h` directives in a non-root system service, while permitting comments and
+explicit service-account paths. The deployment runbook verifies the paths
+resolved by systemd before the first process start.
+
+Why: During the first split-unit cutover, `dev-coordinator.service` was loaded
+by the system manager with `User=holyglory`, but `%h` expanded to `/root` in
+both `CODEX_AGENT_COORDINATOR_HOME` and `--token-file`. The service correctly
+failed with permission denied, the token-required layout gate prevented the
+Console from starting, and the committed phase-aware rollback restored the
+legacy topology and public TLS health. Source tests had asserted that the `%h`
+text was present instead of modeling the system-manager expansion, so they
+certified the defect.
+
+Result: The incident exposed a missed-detection class rather than corrupted
+state: no new Console listener opened, the pre-relocation state checksum was
+restored, and the legacy Console/coordinator returned on ports 80, 443, and
+29876 with `/healthz` at HTTP 200. The same resolved-path check now covers both
+units and every external env, token, coordinator, Console state, and ACME path
+before a second cutover attempt.
+
 ## 2026-07-11 - Cutover preconditions are sampled and revalidated after legacy stop
 
 Decision: An existing-host Console cutover requires five consecutive one-second

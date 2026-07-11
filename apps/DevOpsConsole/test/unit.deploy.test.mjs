@@ -14,10 +14,12 @@ test('production units split coordinator ownership and keep runtime data outside
   const consoleUnit = await fsp.readFile(path.join(APP_ROOT, 'deploy', 'devops-console.service'), 'utf8');
 
   assert.match(coordinator, /api serve --host 127\.0\.0\.1 --port 29876/);
+  assert.match(coordinator, /^User=holyglory$/m);
+  assert.match(coordinator, /^Group=holyglory$/m);
   assert.match(coordinator, /WorkingDirectory=\/home\/DevCoordinator/);
   assert.match(coordinator, /\/home\/DevCoordinator\/skills\/codex-dev-coordinator\/scripts\/dev_coordinator\.py/);
-  assert.match(coordinator, /--token-file %h\/\.codex\/agent-coordinator\/api-token/);
-  assert.match(coordinator, /CODEX_AGENT_COORDINATOR_HOME=%h\/\.codex\/agent-coordinator/);
+  assert.match(coordinator, /--token-file \/home\/holyglory\/\.codex\/agent-coordinator\/api-token/);
+  assert.match(coordinator, /CODEX_AGENT_COORDINATOR_HOME=\/home\/holyglory\/\.codex\/agent-coordinator/);
   assert.match(coordinator, /^KillMode=process$/m);
   assert.doesNotMatch(coordinator, /^KillMode=(?:control-group|mixed)$/m);
   assert.doesNotMatch(
@@ -29,21 +31,33 @@ test('production units split coordinator ownership and keep runtime data outside
 
   assert.match(consoleUnit, /Requires=dev-coordinator\.service/);
   assert.match(consoleUnit, /After=.*dev-coordinator\.service/);
-  assert.match(consoleUnit, /EnvironmentFile=%h\/\.config\/devops-console\/console\.env/);
+  assert.match(consoleUnit, /^User=holyglory$/m);
+  assert.match(consoleUnit, /^Group=holyglory$/m);
+  assert.match(consoleUnit, /EnvironmentFile=\/home\/holyglory\/\.config\/devops-console\/console\.env/);
   assert.match(consoleUnit, /WorkingDirectory=\/home\/DevCoordinator\/apps\/DevOpsConsole/);
   assert.match(consoleUnit, /ExecStartPre=\/usr\/bin\/python3 \/home\/DevCoordinator\/scripts\/check_production_layout\.py/);
+  const preflightLine = consoleUnit.split('\n').find((value) => value.startsWith('ExecStartPre='));
+  assert.ok(preflightLine);
+  for (const expectedPath of [
+    '/home/holyglory',
+    '/home/holyglory/.config/devops-console/console.env',
+    '/home/holyglory/.local/state/devops-console',
+    '/home/holyglory/.local/state/devops-console/acme',
+    '/home/holyglory/.codex/agent-coordinator',
+    '/home/holyglory/.codex/agent-coordinator/api-token',
+  ]) assert.ok(preflightLine.includes(expectedPath), expectedPath);
   assert.match(consoleUnit, /ExecStartPre=.*--require-token --wait-token-seconds 10/);
   assert.match(consoleUnit, /ExecStart=\/usr\/bin\/env DEVCOORDINATOR_ROOT=\/home\/DevCoordinator/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_AUTOSTART=0/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_URL=http:\/\/127\.0\.0\.1:29876/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_SCRIPT=\/home\/DevCoordinator\/skills\/codex-dev-coordinator\/scripts\/dev_coordinator\.py/);
-  assert.match(consoleUnit, /ExecStart=.*COORDINATOR_TOKEN_FILE=%h\/\.codex\/agent-coordinator\/api-token/);
-  assert.match(consoleUnit, /ExecStart=.*CODEX_AGENT_COORDINATOR_HOME=%h\/\.codex\/agent-coordinator/);
-  assert.match(consoleUnit, /ExecStart=.*STATE_DIR=%h\/\.local\/state\/devops-console/);
-  assert.match(consoleUnit, /ExecStart=.*ACME_WEBROOT=%h\/\.local\/state\/devops-console\/acme/);
-  assert.match(consoleUnit, /--env-file %h\/\.config\/devops-console\/console\.env/);
+  assert.match(consoleUnit, /ExecStart=.*COORDINATOR_TOKEN_FILE=\/home\/holyglory\/\.codex\/agent-coordinator\/api-token/);
+  assert.match(consoleUnit, /ExecStart=.*CODEX_AGENT_COORDINATOR_HOME=\/home\/holyglory\/\.codex\/agent-coordinator/);
+  assert.match(consoleUnit, /ExecStart=.*STATE_DIR=\/home\/holyglory\/\.local\/state\/devops-console/);
+  assert.match(consoleUnit, /ExecStart=.*ACME_WEBROOT=\/home\/holyglory\/\.local\/state\/devops-console\/acme/);
+  assert.match(consoleUnit, /--env-file \/home\/holyglory\/\.config\/devops-console\/console\.env/);
   assert.doesNotMatch(consoleUnit, /^Environment=(?:DEVCOORDINATOR_ROOT|COORDINATOR_|CODEX_AGENT_COORDINATOR_HOME|STATE_DIR)/m);
-  assert.match(consoleUnit, /ReadWritePaths=%h\/\.local\/state\/devops-console/);
+  assert.match(consoleUnit, /ReadWritePaths=\/home\/holyglory\/\.local\/state\/devops-console/);
   assert.match(consoleUnit, /UMask=0077/);
   assert.match(consoleUnit, /^KillMode=control-group$/m);
   assert.match(consoleUnit, /^PrivateTmp=true$/m);
@@ -51,6 +65,7 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(consoleUnit, /^ProtectHome=read-only$/m);
   assert.match(consoleUnit, /^NoNewPrivileges=true$/m);
   assert.doesNotMatch(`${coordinator}\n${consoleUnit}`, /\/home\/holyglory\/holyskills|apps\/DevOpsConsole\/\.env/i);
+  assert.doesNotMatch(`${coordinator}\n${consoleUnit}`, /%h|\/root\//, 'system units must not resolve runtime paths from the manager home');
   assert.doesNotMatch(consoleUnit, /holyskills|spawn python3/i);
 });
 
@@ -73,7 +88,7 @@ test('ExecStart assignments override malicious EnvironmentFile values', async ()
   for (const [key, value] of Object.entries(expected)) assert.equal(actual[key], value, key);
   assert.equal(actual.COORDINATOR_AUTOSTART, '0');
   assert.equal(actual.COORDINATOR_URL, 'http://127.0.0.1:29876');
-  assert.equal(actual.STATE_DIR, '%h/.local/state/devops-console');
+  assert.equal(actual.STATE_DIR, '/home/holyglory/.local/state/devops-console');
 });
 
 test('deployment runbook preserves an existing production environment file', async () => {
@@ -152,6 +167,8 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'sudo rm -f /etc/systemd/system/dev-coordinator.service',
     'systemctl reset-failed dev-coordinator.service devops-console.service',
     'check_coordinator_auth_boundary.py',
+    'check_loaded_systemd_paths.py',
+    'resolved-unit-paths.json',
     'sha256sum --check SHA256SUMS',
   ]) assert.ok(cutover.includes(marker), marker);
 
@@ -221,6 +238,7 @@ test('existing-host runbook models the legacy Console child-coordinator topology
   const relocationMarker = cutover.indexOf('relocation.attempted');
   const installUnits = cutover.indexOf('sudo install -m 0644', relocate);
   const startCoordinator = cutover.indexOf('systemctl start dev-coordinator.service', installUnits);
+  const resolvedUnitPaths = cutover.indexOf('check_loaded_systemd_paths.py', installUnits);
   const startConsole = cutover.indexOf('systemctl start devops-console.service', startCoordinator);
   const rollbackStateDecision = cutover.indexOf('ROLLBACK_STATE=');
   assert.ok(
@@ -231,7 +249,8 @@ test('existing-host runbook models the legacy Console child-coordinator topology
       && finalLayoutPreflight < migrationMarker && migrationMarker < finalSync
       && finalSync < preRelocateCheckpoint && preRelocateCheckpoint < relocationMarker
       && relocationMarker < relocate && relocate < installUnits
-      && installUnits < startCoordinator && startCoordinator < startConsole,
+      && installUnits < resolvedUnitPaths && resolvedUnitPaths < startCoordinator
+      && startCoordinator < startConsole,
     'legacy cgroup must stop and relocate before split units start',
   );
   assert.equal(stoppedBoundaryChecks.length, 2);

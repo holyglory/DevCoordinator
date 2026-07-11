@@ -102,6 +102,13 @@ These rules apply to Codex and Claude Code in this repository.
 - Before destructive PostgreSQL-in-Docker work, create and verify a backup with
   `postgres-docker-backup` and bind every live operation to the expected
   immutable container ID.
+- In system-level systemd units, never use `%h` to address a non-root
+  `User=` service account's home. The system manager resolves `%h` from its
+  own root context before the service changes user. Pin the intended account
+  home (or use a deliberately configured systemd-managed directory), reject
+  manager-home paths in deterministic unit checks, and inspect resolved
+  `ExecStart`, `Environment`, and file paths with `systemctl show` before the
+  first production start.
 - During an existing-host Console cutover, preserve checksummed per-process
   evidence for repeated clean cgroup samples and recheck immediately before
   stop. Every copied mutation phase must enable fail-fast shell semantics.

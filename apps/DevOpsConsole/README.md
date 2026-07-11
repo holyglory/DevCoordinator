@@ -190,6 +190,9 @@ the legacy cgroup and listeners are stopped.
 ```bash
 DEVCOORDINATOR_ROOT=/home/DevCoordinator
 set -euo pipefail
+test "$(id -un)" = holyglory
+test "$HOME" = /home/holyglory
+test "$(getent passwd holyglory | cut -d: -f6)" = /home/holyglory
 LEGACY_ROOT="$HOME/holyskills"
 LEGACY_ENV="$LEGACY_ROOT/apps/DevOpsConsole/.env"
 LEGACY_STATE="$LEGACY_ROOT/apps/DevOpsConsole/state"
@@ -241,7 +244,9 @@ chmod -R go-rwx "$CUTOVER_BACKUP"
 ```
 
 Validate the external layout before starting either service, then verify both
-candidate units. Do not install/reload them over a running legacy service; the
+candidate units. `systemd-analyze verify` is a syntax gate; after installation,
+also inspect systemd's resolved path properties because syntax validation does
+not prove which account home a specifier selects. Do not install/reload them over a running legacy service; the
 existing-host sequence below installs them only after the old cgroup is down.
 The first preflight intentionally does not require the API token because the
 coordinator creates it on first start.
@@ -270,6 +275,8 @@ sudo install -m 0644 \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service" \
   /etc/systemd/system/
 sudo systemctl daemon-reload
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_loaded_systemd_paths.py" \
+  --evidence "$CUTOVER_BACKUP/resolved-unit-paths.json"
 sudo systemctl enable dev-coordinator.service devops-console.service
 sudo systemctl start dev-coordinator.service
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
@@ -520,6 +527,8 @@ sudo install -m 0644 \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service" \
   /etc/systemd/system/
 sudo systemctl daemon-reload
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_loaded_systemd_paths.py" \
+  --evidence "$CUTOVER_BACKUP/resolved-unit-paths.json"
 sudo systemctl enable dev-coordinator.service devops-console.service
 sudo systemctl start dev-coordinator.service
 

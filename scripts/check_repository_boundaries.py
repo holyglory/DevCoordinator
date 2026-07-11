@@ -133,6 +133,54 @@ def production_dependency_paths(paths: list[str]) -> list[str]:
     return selected
 
 
+def unsafe_system_unit_home_findings(path: str, text: str) -> list[Finding]:
+    """Reject service-user home paths resolved from the system manager's `%h`."""
+    findings: list[Finding] = []
+    service_user = ""
+    section = ""
+    active_lines: list[tuple[int, str]] = []
+    for line_number, raw in enumerate(text.splitlines(), start=1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+            continue
+        active_lines.append((line_number, stripped))
+        user_match = re.fullmatch(r"User\s*=\s*(.+)", stripped) if section == "Service" else None
+        if user_match:
+            service_user = user_match.group(1).strip()
+
+    def has_home_specifier(value: str) -> bool:
+        index = 0
+        while index < len(value):
+            if value[index] != "%":
+                index += 1
+                continue
+            if index + 1 < len(value) and value[index + 1] == "%":
+                index += 2
+                continue
+            if index + 1 < len(value) and value[index + 1] == "h":
+                return True
+            index += 1
+        return False
+
+    if service_user and service_user not in {"0", "root"}:
+        for line_number, line in active_lines:
+            if has_home_specifier(line):
+                findings.append(
+                    Finding(
+                        "system-unit-manager-home",
+                        path,
+                        (
+                            f"line {line_number}: system unit User={service_user} uses %h; "
+                            "the system manager can resolve it to /root instead of the service account home"
+                        ),
+                    )
+                )
+    return findings
+
+
 def scan_tip(repo: Path) -> list[Finding]:
     findings: list[Finding] = []
     skills_root = repo / "skills"
@@ -151,6 +199,15 @@ def scan_tip(repo: Path) -> list[Finding]:
         findings.append(Finding("tip-legacy-app", "apps/CodexOpsConsole", "legacy app path exists at the current tip"))
 
     paths = tracked_paths(repo)
+    for relative in sorted(path for path in paths if Path(path).suffix == ".service"):
+        unit_path = repo / relative
+        if not unit_path.is_file() or unit_path.is_symlink():
+            continue
+        try:
+            unit_text = unit_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        findings.extend(unsafe_system_unit_home_findings(relative, unit_text))
     for relative in production_dependency_paths(paths):
         path = repo / relative
         if not path.is_file() or path.is_symlink():
@@ -178,6 +235,7 @@ def scan_tip(repo: Path) -> list[Finding]:
         "board runtime locator": repo / "apps/DevOpsBoard/Sources/DevOpsBoard/Models.swift",
         "production preflight": repo / "scripts/check_production_layout.py",
         "legacy runtime migration": repo / "scripts/migrate_legacy_console_runtime.py",
+        "loaded unit preflight": repo / "scripts/check_loaded_systemd_paths.py",
         "skill link manager": repo / "scripts/manage_skill_links.py",
     }
     texts: dict[str, str] = {}
@@ -217,19 +275,23 @@ def scan_tip(repo: Path) -> list[Finding]:
         },
         "coordinator unit": {
             "loopback bind": "api serve --host 127.0.0.1 --port 29876",
-            "external state": "CODEX_AGENT_COORDINATOR_HOME=%h/.codex/agent-coordinator",
-            "external token": "--token-file %h/.codex/agent-coordinator/api-token",
+            "service identity": "User=holyglory",
+            "service group": "Group=holyglory",
+            "external state": "CODEX_AGENT_COORDINATOR_HOME=/home/holyglory/.codex/agent-coordinator",
+            "external token": "--token-file /home/holyglory/.codex/agent-coordinator/api-token",
             "managed-server-preserving stop": "KillMode=process",
         },
         "console unit": {
             "unit dependency": "Requires=dev-coordinator.service",
-            "external env": "EnvironmentFile=%h/.config/devops-console/console.env",
-            "server-side token": "COORDINATOR_TOKEN_FILE=%h/.codex/agent-coordinator/api-token",
-            "external state": "ReadWritePaths=%h/.local/state/devops-console",
+            "service identity": "User=holyglory",
+            "service group": "Group=holyglory",
+            "external env": "EnvironmentFile=/home/holyglory/.config/devops-console/console.env",
+            "server-side token": "COORDINATOR_TOKEN_FILE=/home/holyglory/.codex/agent-coordinator/api-token",
+            "external state": "ReadWritePaths=/home/holyglory/.local/state/devops-console",
             "console cgroup ownership": "KillMode=control-group",
             "pinned production environment": "ExecStart=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator COORDINATOR_AUTOSTART=0",
             "pinned coordinator script": "COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py",
-            "pinned ACME state": "ACME_WEBROOT=%h/.local/state/devops-console/acme",
+            "pinned ACME state": "ACME_WEBROOT=/home/holyglory/.local/state/devops-console/acme",
             "read-only checkout home": "ProtectHome=read-only",
             "fail-closed production preflight": "ExecStartPre=/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py",
         },
@@ -260,6 +322,17 @@ def scan_tip(repo: Path) -> list[Finding]:
             "late state source revalidation": "legacy state changed after staging; destination was not replaced",
             "cross-phase rollback": "migration failed and was rolled back",
             "same-filesystem state rollback": "state backup and destination must share a filesystem",
+        },
+        "loaded unit preflight": {
+            "exact loaded properties": "def require_exact(",
+            "exact loaded commands": "def require_command(",
+            "manager-home refusal": 'if "/root/" in combined:',
+            "unresolved-home refusal": 'if "%h" in combined:',
+            "drop-in refusal": '"DropInPaths": ""',
+            "exact coordinator token": 'f"api serve --host 127.0.0.1 --port 29876 --token-file {COORDINATOR_HOME}/api-token"',
+            "exact Console environment": 'CONSOLE_ENV = f"{SERVICE_HOME}/.config/devops-console/console.env"',
+            "exact Console sandbox": 'CONSOLE_STATE = f"{SERVICE_HOME}/.local/state/devops-console"',
+            "exact Console root": '"/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator COORDINATOR_AUTOSTART=0 "',
         },
         "skill link manager": {
             "real canonical skills directory": "repository skills directory must be a real in-repository directory",

@@ -86,6 +86,7 @@ def main() -> int:
         private_home = "/" + "Users" + "/real.operator/Projects/customer-console"
         private_linux_home = "/" + "home" + "/realoperator/work/customer-console"
         private_windows_home = "C:" + "\\Users\\realoperator\\work\\customer-console"
+        pinned_service_home = "/" + "home" + "/holyglory"
         dollar_bearing_secret = "realprod" + "$" + "LeakedPass123"
         write(
             tmp / "docs" / "unsafe.md",
@@ -115,6 +116,20 @@ def main() -> int:
                     "API_TOKEN=fixture-token",
                 ]
             ),
+        )
+        write(
+            tmp / "apps/DevOpsConsole/deploy/dev-coordinator.service",
+            "[Service]\nUser=holyglory\n"
+            f"Environment=STATE={pinned_service_home}/.codex/agent-coordinator\n",
+        )
+        write(
+            tmp / "apps/DevOpsConsole/deploy/devops-console.service",
+            "[Service]\nUser=holyglory\n"
+            f"EnvironmentFile={pinned_service_home}/.ssh/production.env\n",
+        )
+        write(
+            tmp / "docs" / "misplaced-pinned-home.md",
+            f"This unrelated file must not publish {pinned_service_home}/.codex/agent-coordinator.\n",
         )
         write(tmp / "docs" / "dollar-secret.env", f"DEPLOY_TOKEN={dollar_bearing_secret}\n")
 
@@ -169,6 +184,18 @@ def main() -> int:
         check(not any(item["path"].startswith("ignored/") for item in report["findings"]), "ignored local-only files must not be scanned")
         check(any(item["path"] == "docs/external-link.md" for item in report["findings"]), "external symlink must be rejected before following it")
         check(any(item["path"] == "docs/internal-link.md" for item in report["findings"]), "internal symlink must require explicit policy opt-in")
+        check(
+            not any(item["path"] == "apps/DevOpsConsole/deploy/dev-coordinator.service" and item["rule"] == "text-private-home" for item in report["findings"]),
+            "exact documented deployment-state roots must be publishable only in the pinned deployment surface",
+        )
+        check(
+            any(item["path"] == "apps/DevOpsConsole/deploy/devops-console.service" and item["rule"] == "text-private-home" for item in report["findings"]),
+            "an unrelated private path in an allowed unit file must still be caught",
+        )
+        check(
+            any(item["path"] == "docs/misplaced-pinned-home.md" and item["rule"] == "text-private-home" for item in report["findings"]),
+            "an allowed deployment-state root outside the pinned files must still be caught",
+        )
 
         for path in [
             tmp / "docs" / "unsafe.md",
@@ -180,6 +207,8 @@ def main() -> int:
             untracked_private,
             untracked_png,
             tmp / "docs" / "external-link.md",
+            tmp / "apps/DevOpsConsole/deploy/devops-console.service",
+            tmp / "docs" / "misplaced-pinned-home.md",
         ]:
             path.unlink()
 

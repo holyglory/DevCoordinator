@@ -10,12 +10,12 @@ Type=simple
 User=holyglory
 Group=holyglory
 WorkingDirectory=/home/DevCoordinator/apps/DevOpsConsole
-EnvironmentFile=%h/.config/devops-console/console.env
+EnvironmentFile=/home/holyglory/.config/devops-console/console.env
 # EnvironmentFile values are intentionally overridden in ExecStart for every
 # production-critical control/path; /usr/bin/env assignments are applied to the
 # child after systemd loads the file.
-ExecStartPre=/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py --repo-root /home/DevCoordinator --home %h --env-file %h/.config/devops-console/console.env --state-dir %h/.local/state/devops-console --acme-webroot %h/.local/state/devops-console/acme --coordinator-home %h/.codex/agent-coordinator --token-file %h/.codex/agent-coordinator/api-token --require-token --wait-token-seconds 10
-ExecStart=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator COORDINATOR_AUTOSTART=0 COORDINATOR_URL=http://127.0.0.1:29876 COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py COORDINATOR_TOKEN_FILE=%h/.codex/agent-coordinator/api-token CODEX_AGENT_COORDINATOR_HOME=%h/.codex/agent-coordinator STATE_DIR=%h/.local/state/devops-console ACME_WEBROOT=%h/.local/state/devops-console/acme /usr/bin/node bin/devops-console.mjs --env-file %h/.config/devops-console/console.env
+ExecStartPre=/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py --repo-root /home/DevCoordinator --home /home/holyglory --env-file /home/holyglory/.config/devops-console/console.env --state-dir /home/holyglory/.local/state/devops-console --acme-webroot /home/holyglory/.local/state/devops-console/acme --coordinator-home /home/holyglory/.codex/agent-coordinator --token-file /home/holyglory/.codex/agent-coordinator/api-token --require-token --wait-token-seconds 10
+ExecStart=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator COORDINATOR_AUTOSTART=0 COORDINATOR_URL=http://127.0.0.1:29876 COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py COORDINATOR_TOKEN_FILE=/home/holyglory/.codex/agent-coordinator/api-token CODEX_AGENT_COORDINATOR_HOME=/home/holyglory/.codex/agent-coordinator STATE_DIR=/home/holyglory/.local/state/devops-console ACME_WEBROOT=/home/holyglory/.local/state/devops-console/acme /usr/bin/node bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env
 # SIGHUP reloads the TLS certificate from disk (after certbot renewal).
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -33,7 +33,7 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=read-only
 PrivateTmp=true
-ReadWritePaths=%h/.local/state/devops-console
+ReadWritePaths=/home/holyglory/.local/state/devops-console
 LimitNOFILE=65536
 
 [Install]
