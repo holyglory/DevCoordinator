@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import re
@@ -13,12 +14,16 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from linux_proc_identity import ProcIdentityError, read_stable_process_identity
-from secure_cutover_io import SecureIOError
+from secure_cutover_io import SecureIOError, read_private_regular
 from verify_legacy_cutover_boundary import BoundaryError, LedgerWriter, verify_ledger_pair
+from verify_post_cutover_registration import (
+    RegistrationGraphError,
+    verify_current_registration_graph,
+)
 
 
 class RollbackReadinessError(RuntimeError):
@@ -36,6 +41,9 @@ class RollbackReadinessInterrupted(RollbackReadinessError):
 UnitProbe = Callable[[float], dict[str, object]]
 ListenerProbe = Callable[[tuple[int, ...], float], str]
 HealthProbe = Callable[[str, float], dict[str, object]]
+InventoryProbe = Callable[[str, float], dict[str, Any]]
+
+MAX_INVENTORY_BYTES = 8 * 1024 * 1024
 
 
 def utc_now() -> str:
@@ -167,6 +175,303 @@ def curl_health_probe(
     }
 
 
+def validate_legacy_inventory_url(url: str) -> int:
+    """Return the coupled coordinator port for one credential-free loopback URL."""
+
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as error:
+        raise RollbackReadinessError("legacy inventory URL is invalid") from error
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/v1/inventory"
+        or parsed.query
+        or parsed.fragment
+        or port is None
+        or parsed.netloc != f"127.0.0.1:{port}"
+    ):
+        raise RollbackReadinessError(
+            "legacy inventory URL must be credential-free IPv4 loopback HTTP "
+            "with an explicit port and exact /v1/inventory path"
+        )
+    return port
+
+
+def credential_free_inventory_probe(url: str, timeout: float) -> dict[str, Any]:
+    """Fetch legacy inventory without sending authentication or persisting its body."""
+
+    port = validate_legacy_inventory_url(url)
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request(
+            "GET",
+            "/v1/inventory",
+            headers={"Accept": "application/json"},
+        )
+        response = connection.getresponse()
+        content_type = (
+            response.getheader("Content-Type") or ""
+        ).split(";", 1)[0].strip().lower()
+        body = response.read(MAX_INVENTORY_BYTES + 1)
+    except http.client.HTTPException as error:
+        raise RollbackReadinessError(
+            f"legacy inventory HTTP protocol failed: {type(error).__name__}"
+        ) from error
+    except OSError as error:
+        raise RollbackReadinessError(
+            f"legacy inventory transport failed: {type(error).__name__}"
+        ) from error
+    finally:
+        connection.close()
+    if response.status != 200:
+        raise RollbackReadinessError(
+            f"legacy inventory returned HTTP {response.status}, expected 200"
+        )
+    if content_type != "application/json":
+        raise RollbackReadinessError("legacy inventory Content-Type is not application/json")
+    if len(body) > MAX_INVENTORY_BYTES:
+        raise RollbackReadinessError("legacy inventory response exceeds the safe size limit")
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RollbackReadinessError("legacy inventory JSON is invalid") from error
+    if not isinstance(value, dict):
+        raise RollbackReadinessError("legacy inventory JSON root must be an object")
+    return value
+
+
+def read_expected_identities(path: Path) -> tuple[str, str]:
+    try:
+        raw = read_private_regular(path, label="pre-cutover expected identities")
+        value = json.loads(raw.decode("utf-8"))
+    except (SecureIOError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RollbackReadinessError(
+            "pre-cutover expected identities are unreadable or invalid"
+        ) from error
+    if not isinstance(value, dict):
+        raise RollbackReadinessError(
+            "pre-cutover expected identities JSON root must be an object"
+        )
+    server_id = value.get("server_id")
+    if (
+        not isinstance(server_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", server_id)
+    ):
+        raise RollbackReadinessError(
+            "pre-cutover expected identities must contain one safe non-empty server_id"
+        )
+    lease_id = value.get("lease_id")
+    if (
+        not isinstance(lease_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", lease_id)
+    ):
+        raise RollbackReadinessError(
+            "pre-cutover expected identities must contain one safe non-empty lease_id"
+        )
+    return server_id, lease_id
+
+
+def _inventory_rows(inventory: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = inventory.get(key)
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise RollbackReadinessError(
+            "legacy registration inventory has a malformed required row collection"
+        )
+    return value
+
+
+def _inventory_integer(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _inside_project(value: Any, project: str) -> bool:
+    return isinstance(value, str) and (
+        value == project or value.startswith(project.rstrip("/") + "/")
+    )
+
+
+def classify_legacy_registration_snapshot(
+    inventory: dict[str, Any],
+    *,
+    project: str,
+    name: str,
+    port: int,
+    main_pid: int,
+    expected_server_id: str,
+    expected_lease_id: str,
+) -> tuple[str, dict[str, Any]]:
+    """Accept the exact graph or the one exact stopped precursor."""
+
+    try:
+        report = verify_current_registration_graph(
+            inventory,
+            project=project,
+            name=name,
+            port=port,
+            main_pid=main_pid,
+            expected_server_id=expected_server_id,
+            schema_contract="legacy",
+        )
+    except RegistrationGraphError:
+        pass
+    else:
+        if report.get("lease_id") == expected_lease_id or any(
+            row.get("id") == expected_lease_id
+            for row in inventory.get("leases", [])
+        ):
+            raise RollbackReadinessError(
+                "unsafe legacy registration graph: captured lease survived the ready graph"
+            )
+        return "ready", report
+
+    assignments = _inventory_rows(inventory, "port_assignments")
+    servers = _inventory_rows(inventory, "servers")
+    leases = _inventory_rows(inventory, "leases")
+    expected_key = f"{project}::{name}"
+    relevant_assignments = [
+        row
+        for row in assignments
+        if _inventory_integer(row.get("port")) == port
+        or (row.get("project") == project and row.get("name") == name)
+    ]
+    target_servers = [
+        row for row in servers if row.get("project") == project and row.get("name") == name
+    ]
+    captured_id_rows = [row for row in servers if row.get("id") == expected_server_id]
+    current_port_servers = [
+        row
+        for row in servers
+        if _inventory_integer(row.get("port")) == port and row.get("status") != "stopped"
+    ]
+    current_target_servers = [row for row in target_servers if row.get("status") != "stopped"]
+    active_relevant_leases = [
+        row
+        for row in leases
+        if row.get("status") == "active"
+        and (
+            _inventory_integer(row.get("port")) == port
+            or row.get("server_id") == expected_server_id
+            or (
+                row.get("project") == project
+                and row.get("purpose") == f"server:{name}"
+            )
+        )
+    ]
+
+    # Registration is persisted atomically. Any current claim that failed the
+    # exact shared verifier is a conflict, never a partially complete write.
+    if current_port_servers or current_target_servers:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: a current server failed exact identity validation"
+        )
+    if active_relevant_leases:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: a relevant active lease survived locked-state pruning"
+        )
+    if len(captured_id_rows) > 1:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: captured server identity is ambiguous"
+        )
+
+    if not relevant_assignments and not target_servers:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: captured server identity is absent"
+        )
+
+    if len(relevant_assignments) != 1:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: relevant durable assignment is ambiguous"
+        )
+    assignment = relevant_assignments[0]
+    for key, expected in {
+        "key": expected_key,
+        "project": project,
+        "name": name,
+        "port": port,
+    }.items():
+        if assignment.get(key) != expected:
+            raise RollbackReadinessError(
+                "unsafe legacy registration graph: durable assignment identity conflicts"
+            )
+
+    if not target_servers:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: assignment has lost the captured server identity"
+        )
+
+    if len(target_servers) != 1:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: target stopped server is ambiguous"
+        )
+    server = target_servers[0]
+    for key, expected in {
+        "id": expected_server_id,
+        "key": expected_key,
+        "project": project,
+        "name": name,
+        "port": port,
+        "status": "stopped",
+    }.items():
+        if server.get(key) != expected:
+            raise RollbackReadinessError(
+                "unsafe legacy registration graph: stopped server identity conflicts"
+            )
+    if captured_id_rows != [server]:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: captured server identity is detached"
+        )
+    if assignment.get("server_status") != "stopped":
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: stopped assignment status conflicts"
+        )
+    if not _inside_project(server.get("cwd"), project):
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: stopped server cwd is outside the project"
+        )
+    recorded_pid = _inventory_integer(server.get("pid"))
+    if recorded_pid is None or recorded_pid <= 1 or recorded_pid == main_pid:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: stopped server PID conflicts"
+        )
+    health = server.get("health")
+    expected_stopped_health = {
+        "ok": False,
+        "pid_alive": False,
+        "classification": "stopped",
+        "check": {"ok": False, "skipped": "recorded process is not alive"},
+        "identity": {
+            "ok": True,
+            "skipped": "not checked because recorded process is not alive",
+        },
+    }
+    if health != expected_stopped_health:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: stopped health is not the exact 40a dead-process proof"
+        )
+
+    lease_id = server.get("lease_id")
+    if lease_id != expected_lease_id:
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: stopped server lost the captured lease identity"
+        )
+    if any(row.get("id") == expected_lease_id for row in leases):
+        raise RollbackReadinessError(
+            "unsafe legacy registration graph: captured lease reference is not dangling after pruning"
+        )
+
+    return "pending-stopped-baseline", {
+        "reason": "exact captured legacy server is stopped with its pruned lease dangling",
+        "server_id": expected_server_id,
+        "captured_lease_id": expected_lease_id,
+        "recorded_dead_pid": recorded_pid,
+        "dangling_captured_lease": True,
+    }
+
+
 def _read_members(path: Path) -> list[int]:
     try:
         members = [int(raw) for raw in path.read_text(encoding="utf-8").splitlines() if raw.strip()]
@@ -208,7 +513,9 @@ def _captured_identity(record: dict[str, object], *, role: str) -> tuple[str, li
     return start_ticks, command
 
 
-def _is_legacy_coordinator(command: list[str], old_coordinator_script: str) -> bool:
+def _is_legacy_coordinator(
+    command: list[str], old_coordinator_script: str, coordinator_port: int
+) -> bool:
     return (
         len(command) == 8
         and Path(command[0]).name == "python3"
@@ -219,7 +526,7 @@ def _is_legacy_coordinator(command: list[str], old_coordinator_script: str) -> b
             "--host",
             "127.0.0.1",
             "--port",
-            "29876",
+            str(coordinator_port),
         ]
     )
 
@@ -369,6 +676,12 @@ def wait_for_legacy_console_rollback(
     expected_cgroup: str,
     old_coordinator_script: str,
     health_url: str,
+    inventory_url: str,
+    expected_server_id: str,
+    expected_lease_id: str,
+    registration_project: str,
+    registration_name: str,
+    registration_port: int,
     evidence_path: Path,
     timeout_seconds: float = 30.0,
     poll_interval_seconds: float = 0.1,
@@ -377,6 +690,7 @@ def wait_for_legacy_console_rollback(
     unit_probe: UnitProbe,
     listener_probe: ListenerProbe,
     health_probe: HealthProbe,
+    inventory_probe: InventoryProbe,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
@@ -386,6 +700,32 @@ def wait_for_legacy_console_rollback(
         raise RollbackReadinessError("restored cgroup must be an absolute cgroup path")
     if not old_coordinator_script.startswith("/"):
         raise RollbackReadinessError("legacy coordinator script must be an absolute path")
+    coordinator_port = validate_legacy_inventory_url(inventory_url)
+    if (
+        not registration_project.startswith("/")
+        or ".." in Path(registration_project).parts
+    ):
+        raise RollbackReadinessError("legacy registration project must be an absolute safe path")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", registration_name):
+        raise RollbackReadinessError("legacy registration name is invalid")
+    if registration_port != 443:
+        raise RollbackReadinessError(
+            "legacy Console registration port must match the proven public TLS listener on 443"
+        )
+    if (
+        not isinstance(expected_server_id, str)
+        or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", expected_server_id
+        )
+    ):
+        raise RollbackReadinessError("captured legacy server id is invalid")
+    if (
+        not isinstance(expected_lease_id, str)
+        or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", expected_lease_id
+        )
+    ):
+        raise RollbackReadinessError("captured legacy lease id is invalid")
     try:
         parsed_health = urlsplit(health_url)
         health_hostname = parsed_health.hostname
@@ -418,7 +758,7 @@ def wait_for_legacy_console_rollback(
     started = clock()
     deadline = started + timeout_seconds
     ledger: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "running",
         "started_at": utc_now(),
         "unit": unit,
@@ -426,6 +766,13 @@ def wait_for_legacy_console_rollback(
         "expected_cgroup": expected_cgroup,
         "old_coordinator_script": old_coordinator_script,
         "health_url": health_url,
+        "inventory_url": inventory_url,
+        "expected_server_id": expected_server_id,
+        "expected_lease_id": expected_lease_id,
+        "registration_project": registration_project,
+        "registration_name": registration_name,
+        "registration_port": registration_port,
+        "coordinator_port": coordinator_port,
         "timeout_seconds": timeout_seconds,
         "poll_interval_seconds": poll_interval_seconds,
         "observations": [],
@@ -495,7 +842,9 @@ def wait_for_legacy_console_rollback(
                     continue
                 command = record.get("command")
                 if isinstance(command, list) and all(isinstance(item, str) for item in command):
-                    if _is_legacy_coordinator(command, old_coordinator_script):
+                    if _is_legacy_coordinator(
+                        command, old_coordinator_script, coordinator_port
+                    ):
                         coordinator_candidates.append(record)
             if len(coordinator_candidates) > 1:
                 raise RollbackReadinessError("restored cgroup has ambiguous legacy coordinator processes")
@@ -523,14 +872,14 @@ def wait_for_legacy_console_rollback(
             # incomplete. Do not defer a wrong public/coordinator owner merely
             # because the exact child coordinator has not been captured yet.
             early_snapshot = listener_probe(
-                (80, 443, 29876),
+                (80, 443, coordinator_port),
                 _remaining_seconds(deadline=deadline, clock=clock),
             )
             _remaining_seconds(deadline=deadline, clock=clock)
             observation["early_listener_snapshot"] = early_snapshot.splitlines()
             early_owners, _early_missing = _parse_listener_owners(
                 early_snapshot,
-                ports=(80, 443, 29876),
+                ports=(80, 443, coordinator_port),
             )
             observation["early_listener_owners"] = {
                 str(port): pids for port, pids in early_owners.items()
@@ -542,13 +891,13 @@ def wait_for_legacy_console_rollback(
             if coordinator_identity is not None:
                 _require_present_listener_owners(
                     early_owners,
-                    expected={29876: int(coordinator_identity["pid"])},
+                    expected={coordinator_port: int(coordinator_identity["pid"])},
                 )
-            elif 29876 in early_owners:
-                coordinator_owners = early_owners[29876]
+            elif coordinator_port in early_owners:
+                coordinator_owners = early_owners[coordinator_port]
                 if len(coordinator_owners) != 1:
                     raise RollbackReadinessError(
-                        "restored listener ownership on port 29876 is ambiguous: "
+                        f"restored listener ownership on port {coordinator_port} is ambiguous: "
                         f"observed {coordinator_owners}"
                     )
                 listener_pid = coordinator_owners[0]
@@ -556,15 +905,17 @@ def wait_for_legacy_console_rollback(
                 if current_owner_records:
                     owner_record = current_owner_records[0]
                     _owner_start, owner_command = _captured_identity(
-                        owner_record, role="port 29876 owner"
+                        owner_record, role=f"port {coordinator_port} owner"
                     )
-                    if not _is_legacy_coordinator(owner_command, old_coordinator_script):
+                    if not _is_legacy_coordinator(
+                        owner_command, old_coordinator_script, coordinator_port
+                    ):
                         raise RollbackReadinessError(
-                            "restored listener ownership on port 29876 belongs to a process "
+                            f"restored listener ownership on port {coordinator_port} belongs to a process "
                             "that is not the exact legacy coordinator"
                         )
                     raise RollbackReadinessError(
-                        "exact port 29876 owner was not captured as the restored coordinator"
+                        f"exact port {coordinator_port} owner was not captured as the restored coordinator"
                     )
 
                 # The coordinator may have joined the cgroup between the
@@ -587,14 +938,16 @@ def wait_for_legacy_console_rollback(
                     or expected_main_pid not in listener_members_after
                 ):
                     raise RollbackReadinessError(
-                        "restored listener ownership on port 29876 is outside the stable legacy cgroup"
+                        f"restored listener ownership on port {coordinator_port} is outside the stable legacy cgroup"
                     )
                 _owner_start, owner_command = _captured_identity(
-                    owner_record, role="concurrent port 29876 owner"
+                    owner_record, role=f"concurrent port {coordinator_port} owner"
                 )
-                if not _is_legacy_coordinator(owner_command, old_coordinator_script):
+                if not _is_legacy_coordinator(
+                    owner_command, old_coordinator_script, coordinator_port
+                ):
                     raise RollbackReadinessError(
-                        "restored listener ownership on port 29876 belongs to a process "
+                        f"restored listener ownership on port {coordinator_port} belongs to a process "
                         "that is not the exact legacy coordinator"
                     )
                 confirmed_owner = _read_identity(proc_root, listener_pid)
@@ -654,18 +1007,22 @@ def wait_for_legacy_console_rollback(
                 continue
 
             snapshot = listener_probe(
-                (80, 443, 29876),
+                (80, 443, coordinator_port),
                 _remaining_seconds(deadline=deadline, clock=clock),
             )
             _remaining_seconds(deadline=deadline, clock=clock)
             observation["candidate_listener_snapshot"] = snapshot.splitlines()
             owners, missing = _parse_listener_owners(
                 snapshot,
-                ports=(80, 443, 29876),
+                ports=(80, 443, coordinator_port),
             )
             _require_present_listener_owners(
                 owners,
-                expected={80: expected_main_pid, 443: expected_main_pid, 29876: coordinator_pid},
+                expected={
+                    80: expected_main_pid,
+                    443: expected_main_pid,
+                    coordinator_port: coordinator_pid,
+                },
             )
             observation["candidate_listener_owners"] = {
                 str(port): pids for port, pids in owners.items()
@@ -724,18 +1081,22 @@ def wait_for_legacy_console_rollback(
                 continue
 
             final_snapshot = listener_probe(
-                (80, 443, 29876),
+                (80, 443, coordinator_port),
                 _remaining_seconds(deadline=deadline, clock=clock),
             )
             _remaining_seconds(deadline=deadline, clock=clock)
             observation["final_listener_snapshot"] = final_snapshot.splitlines()
             final_owners, final_missing = _parse_listener_owners(
                 final_snapshot,
-                ports=(80, 443, 29876),
+                ports=(80, 443, coordinator_port),
             )
             _require_present_listener_owners(
                 final_owners,
-                expected={80: expected_main_pid, 443: expected_main_pid, 29876: coordinator_pid},
+                expected={
+                    80: expected_main_pid,
+                    443: expected_main_pid,
+                    coordinator_port: coordinator_pid,
+                },
             )
             observation["listener_owners"] = {
                 str(port): pids for port, pids in final_owners.items()
@@ -767,6 +1128,93 @@ def wait_for_legacy_console_rollback(
                 sleep(min(poll_interval_seconds, max(0.0, deadline - clock())))
                 continue
 
+            inventory = inventory_probe(
+                inventory_url,
+                _remaining_seconds(deadline=deadline, clock=clock),
+            )
+            _remaining_seconds(deadline=deadline, clock=clock)
+            registration_state, registration_report = (
+                classify_legacy_registration_snapshot(
+                    inventory,
+                    project=registration_project,
+                    name=registration_name,
+                    port=registration_port,
+                    main_pid=expected_main_pid,
+                    expected_server_id=expected_server_id,
+                    expected_lease_id=expected_lease_id,
+                )
+            )
+            # Persist only the verifier's small allowlisted report. The raw
+            # inventory may contain commands, paths, or future sensitive data.
+            observation["registration"] = {
+                "state": registration_state,
+                **registration_report,
+            }
+            if registration_state != "ready":
+                observation["classification"] = (
+                    f"waiting_for_registration_{registration_state.removeprefix('pending-')}"
+                )
+                writer.write(ledger)
+                sleep(min(poll_interval_seconds, max(0.0, deadline - clock())))
+                continue
+
+            post_registration_snapshot = listener_probe(
+                (80, 443, coordinator_port),
+                _remaining_seconds(deadline=deadline, clock=clock),
+            )
+            _remaining_seconds(deadline=deadline, clock=clock)
+            observation["post_registration_listener_snapshot"] = (
+                post_registration_snapshot.splitlines()
+            )
+            post_registration_owners, post_registration_missing = (
+                _parse_listener_owners(
+                    post_registration_snapshot,
+                    ports=(80, 443, coordinator_port),
+                )
+            )
+            _require_present_listener_owners(
+                post_registration_owners,
+                expected={
+                    80: expected_main_pid,
+                    443: expected_main_pid,
+                    coordinator_port: coordinator_pid,
+                },
+            )
+            observation["post_registration_listener_owners"] = {
+                str(port): pids
+                for port, pids in post_registration_owners.items()
+            }
+            if post_registration_missing:
+                observation["classification"] = (
+                    "waiting_for_post_registration_listeners"
+                )
+                observation["missing_ports"] = post_registration_missing
+                writer.write(ledger)
+                sleep(min(poll_interval_seconds, max(0.0, deadline - clock())))
+                continue
+
+            post_registration: dict[str, object] = {}
+            observation["post_registration_topology"] = post_registration
+            post_registration_exact = _confirm_fixed_topology(
+                unit_probe=unit_probe,
+                members_path=members_path,
+                proc_root=proc_root,
+                expected_main_pid=expected_main_pid,
+                expected_cgroup=expected_cgroup,
+                main_identity=main_identity,
+                coordinator_identity=coordinator_identity,
+                deadline=deadline,
+                clock=clock,
+                report=post_registration,
+            )
+            if not post_registration_exact:
+                observation["classification"] = (
+                    "post_registration_transient_cgroup_members"
+                )
+                writer.write(ledger)
+                sleep(min(poll_interval_seconds, max(0.0, deadline - clock())))
+                continue
+
             _remaining_seconds(deadline=deadline, clock=clock)
             observation["classification"] = "ready"
             ledger["status"] = "success"
@@ -775,8 +1223,11 @@ def wait_for_legacy_console_rollback(
                 "main_pid": expected_main_pid,
                 "coordinator_pid": coordinator_pid,
                 "cgroup": expected_cgroup,
-                "listener_owners": observation["listener_owners"],
+                "listener_owners": observation[
+                    "post_registration_listener_owners"
+                ],
                 "health": health,
+                "registration": registration_report,
             }
             writer.write(ledger)
             verify_ledger_pair(evidence_path)
@@ -804,6 +1255,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cgroup", required=True)
     parser.add_argument("--old-coordinator-script", required=True)
     parser.add_argument("--health-url", default="https://console.vr.ae/healthz")
+    parser.add_argument("--inventory-url", required=True)
+    parser.add_argument("--expected-identities", required=True, type=Path)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--port", required=True, type=int)
     parser.add_argument("--evidence", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument("--poll-interval-seconds", type=float, default=0.1)
@@ -826,6 +1282,7 @@ def main(argv: list[str] | None = None) -> int:
         ss=args.ss,
     )
     health_probe = lambda url, timeout: curl_health_probe(url, timeout, curl=args.curl)
+    inventory_probe = lambda url, timeout: credential_free_inventory_probe(url, timeout)
     handled_signals = [signal.SIGINT, signal.SIGTERM]
     if hasattr(signal, "SIGHUP"):
         handled_signals.append(signal.SIGHUP)
@@ -839,12 +1296,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for handled_signal in handled_signals:
             previous_handlers[handled_signal] = signal.signal(handled_signal, interrupt)
+        expected_server_id, expected_lease_id = read_expected_identities(
+            args.expected_identities
+        )
         report = wait_for_legacy_console_rollback(
             unit=args.unit,
             expected_main_pid=args.main_pid,
             expected_cgroup=args.cgroup,
             old_coordinator_script=args.old_coordinator_script,
             health_url=args.health_url,
+            inventory_url=args.inventory_url,
+            expected_server_id=expected_server_id,
+            expected_lease_id=expected_lease_id,
+            registration_project=args.project,
+            registration_name=args.name,
+            registration_port=args.port,
             evidence_path=Path(args.evidence),
             timeout_seconds=args.timeout_seconds,
             poll_interval_seconds=args.poll_interval_seconds,
@@ -853,6 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
             unit_probe=unit_probe,
             listener_probe=listener_probe,
             health_probe=health_probe,
+            inventory_probe=inventory_probe,
         )
     except (
         BoundaryError,

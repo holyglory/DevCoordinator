@@ -578,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, str(ROOT / "scripts" / "self_test_legacy_console_rollback_ready.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_legacy_console_rollback_ready.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_loaded_systemd_paths.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_cutover_helper_cli_contracts.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_cutover_helper_cli_contracts.py")])
     run([sys.executable, str(ROOT / "scripts" / "check_repository_boundaries.py"), "--repo", str(ROOT)])
     check_ops_console_interaction_guardrails(run_macos_app_checks=False)
     check_devops_console()

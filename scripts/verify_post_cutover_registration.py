@@ -46,6 +46,14 @@ def _require_equal(row: dict[str, Any], key: str, expected: Any, *, label: str) 
         )
 
 
+def _require_project_cwd(value: Any, *, project: str, label: str) -> None:
+    project_prefix = project.rstrip("/") + "/"
+    if not isinstance(value, str) or not (
+        value == project or value.startswith(project_prefix)
+    ):
+        raise RegistrationGraphError(f"{label} cwd is outside project")
+
+
 def _is_current_server(row: dict[str, Any]) -> bool:
     return row.get("status") != "stopped"
 
@@ -58,12 +66,20 @@ def verify_current_registration_graph(
     port: int,
     main_pid: int,
     expected_server_id: str | None = None,
+    schema_contract: str = "current",
 ) -> dict[str, Any]:
     """Require the exact current assignment/server/lease graph.
 
     This is the reusable production-readiness contract.  Historical cutover
     assertions (retired checkout ownership and replacement lease identity) are
     deliberately layered on top by :func:`verify_registration_graph`.
+
+    ``schema_contract="legacy"`` is only for rollback observation through the
+    restored pre-split coordinator.  That binary predates registration socket
+    identity and lease assignment-key fields.  The legacy contract therefore
+    requires every identity/link field that binary actually emits, while the
+    rollback observer separately proves exact listener ownership.  The default
+    current contract remains unchanged and fail-closed on those newer fields.
     """
 
     if not isinstance(inventory, dict):
@@ -81,6 +97,8 @@ def verify_current_registration_graph(
         not isinstance(expected_server_id, str) or not expected_server_id.strip()
     ):
         raise RegistrationGraphError("expected server id must be non-empty when supplied")
+    if schema_contract not in {"current", "legacy"}:
+        raise RegistrationGraphError("registration graph schema contract is invalid")
 
     assignments = _rows(inventory, "port_assignments")
     servers = _rows(inventory, "servers")
@@ -130,6 +148,8 @@ def verify_current_registration_graph(
     _require_equal(server, "port", port, label="Console server")
     _require_equal(server, "pid", main_pid, label="Console server")
     _require_equal(server, "status", "running", label="Console server")
+    if schema_contract == "legacy":
+        _require_project_cwd(server.get("cwd"), project=project, label="Console server")
     server_id_rows = [row for row in servers if row.get("id") == server_id]
     identity_label = "captured id" if expected_server_id is not None else "current id"
     if _one(server_id_rows, label=f"server row with the {identity_label}") is not server:
@@ -137,30 +157,30 @@ def verify_current_registration_graph(
             f"{identity_label} resolves to a different inventory row"
         )
 
-    registration_identity = server.get("registration_identity")
-    if not isinstance(registration_identity, dict):
-        raise RegistrationGraphError("Console server registration identity evidence is missing")
-    _require_equal(registration_identity, "ok", True, label="registration identity")
-    _require_equal(registration_identity, "pid", main_pid, label="registration identity")
-    _require_equal(registration_identity, "project", project, label="registration identity")
-    _require_equal(registration_identity, "host", "127.0.0.1", label="registration identity")
-    _require_equal(registration_identity, "port", port, label="registration identity")
-    _require_equal(registration_identity, "source", "proc_pid_fd", label="registration identity")
-    identity_cwd = registration_identity.get("cwd")
-    project_prefix = project.rstrip("/") + "/"
-    if not isinstance(identity_cwd, str) or not (
-        identity_cwd == project or identity_cwd.startswith(project_prefix)
-    ):
-        raise RegistrationGraphError(
-            f"registration identity cwd is outside project: {identity_cwd!r}"
+    if schema_contract == "current":
+        registration_identity = server.get("registration_identity")
+        if not isinstance(registration_identity, dict):
+            raise RegistrationGraphError("Console server registration identity evidence is missing")
+        _require_equal(registration_identity, "ok", True, label="registration identity")
+        _require_equal(registration_identity, "pid", main_pid, label="registration identity")
+        _require_equal(registration_identity, "project", project, label="registration identity")
+        _require_equal(registration_identity, "host", "127.0.0.1", label="registration identity")
+        _require_equal(registration_identity, "port", port, label="registration identity")
+        _require_equal(registration_identity, "source", "proc_pid_fd", label="registration identity")
+        _require_project_cwd(
+            registration_identity.get("cwd"),
+            project=project,
+            label="registration identity",
         )
-    listener_inodes = registration_identity.get("listener_inodes")
-    if (
-        not isinstance(listener_inodes, list)
-        or not listener_inodes
-        or any(not isinstance(value, str) or not value.isdigit() for value in listener_inodes)
-    ):
-        raise RegistrationGraphError("registration identity has no exact LISTEN socket inode evidence")
+        listener_inodes = registration_identity.get("listener_inodes")
+        if (
+            not isinstance(listener_inodes, list)
+            or not listener_inodes
+            or any(not isinstance(value, str) or not value.isdigit() for value in listener_inodes)
+        ):
+            raise RegistrationGraphError(
+                "registration identity has no exact LISTEN socket inode evidence"
+            )
 
     health = server.get("health")
     if not isinstance(health, dict):
@@ -176,21 +196,24 @@ def verify_current_registration_graph(
     current_identity = health["identity"]
     _require_equal(current_identity, "pid", main_pid, label="current health identity")
     _require_equal(current_identity, "project", project, label="current health identity")
-    _require_equal(current_identity, "host", "127.0.0.1", label="current health identity")
-    _require_equal(current_identity, "port", port, label="current health identity")
-    _require_equal(current_identity, "source", "proc_pid_fd", label="current health identity")
-    current_cwd = current_identity.get("cwd")
-    if not isinstance(current_cwd, str) or not (
-        current_cwd == project or current_cwd.startswith(project_prefix)
-    ):
-        raise RegistrationGraphError(f"current health identity cwd is outside project: {current_cwd!r}")
-    current_inodes = current_identity.get("listener_inodes")
-    if (
-        not isinstance(current_inodes, list)
-        or not current_inodes
-        or any(not isinstance(value, str) or not value.isdigit() for value in current_inodes)
-    ):
-        raise RegistrationGraphError("current health identity has no exact LISTEN socket inode evidence")
+    _require_project_cwd(
+        current_identity.get("cwd"),
+        project=project,
+        label="current health identity",
+    )
+    if schema_contract == "current":
+        _require_equal(current_identity, "host", "127.0.0.1", label="current health identity")
+        _require_equal(current_identity, "port", port, label="current health identity")
+        _require_equal(current_identity, "source", "proc_pid_fd", label="current health identity")
+        current_inodes = current_identity.get("listener_inodes")
+        if (
+            not isinstance(current_inodes, list)
+            or not current_inodes
+            or any(not isinstance(value, str) or not value.isdigit() for value in current_inodes)
+        ):
+            raise RegistrationGraphError(
+                "current health identity has no exact LISTEN socket inode evidence"
+            )
 
     active_leases = [row for row in leases if row.get("status") == "active"]
     active_on_port = [row for row in active_leases if _integer(row.get("port")) == port]
@@ -215,7 +238,10 @@ def verify_current_registration_graph(
     _require_equal(lease, "purpose", f"server:{name}", label="active Console lease")
     _require_equal(lease, "server_id", server_id, label="active Console lease")
     _require_equal(lease, "owner_pid", main_pid, label="active Console lease")
-    _require_equal(lease, "assignment_key", expected_key, label="active Console lease")
+    if schema_contract == "current":
+        _require_equal(lease, "assignment_key", expected_key, label="active Console lease")
+    elif "assignment_key" in lease:
+        _require_equal(lease, "assignment_key", expected_key, label="active Console lease")
     lease_id_rows = [row for row in leases if row.get("id") == lease_id]
     if _one(lease_id_rows, label="lease row with the replacement id") is not lease:
         raise RegistrationGraphError("replacement lease id resolves to a different inventory row")

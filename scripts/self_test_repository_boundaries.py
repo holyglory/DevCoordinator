@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from shutil import rmtree
+from shutil import copy2, rmtree
 
 
 SCRIPT = Path(__file__).with_name("check_repository_boundaries.py")
@@ -301,6 +301,61 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         real_repo = SCRIPT.parents[1]
         real_report = run(real_repo, 0)
         check(real_report["ok"] is True, "real clean repository failed integrated boundary guard")
+
+        # Realistic must-catch control for the tracked private-cutover CLI
+        # interface matrix: materialize the current tracked repository in an
+        # isolated Git index, then drift one exact candidate option.  This
+        # proves the boundary guard owns the executable contract rather than
+        # merely accepting its own marker table.
+        contract_repo = temp / "cutover-cli-contract-repo"
+        contract_repo.mkdir()
+        git(contract_repo, "init", "-q")
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=real_repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout.split(b"\0")
+        relative_paths = {item.decode("utf-8") for item in tracked if item}
+        relative_paths.add("scripts/self_test_cutover_helper_cli_contracts.py")
+        for relative in sorted(relative_paths):
+            source = real_repo / relative
+            if not source.exists() and not source.is_symlink():
+                continue
+            destination = contract_repo / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_symlink():
+                destination.symlink_to(source.readlink())
+            elif source.is_file():
+                copy2(source, destination)
+        git(contract_repo, "add", "-A")
+        clean_contract_findings = module.scan_tip(contract_repo)
+        check(
+            not any(
+                item.rule in {"required-contract-file", "required-contract-marker"}
+                and item.path == "scripts/self_test_cutover_helper_cli_contracts.py"
+                for item in clean_contract_findings
+            ),
+            f"clean cutover CLI contract fixture was flagged: {clean_contract_findings}",
+        )
+        contract_test = contract_repo / "scripts/self_test_cutover_helper_cli_contracts.py"
+        contract_body = contract_test.read_text(encoding="utf-8")
+        check('"--inventory-output",' in contract_body, "CLI contract fixture omitted inventory evidence argv")
+        contract_test.write_text(
+            contract_body.replace('"--inventory-output",', '"--renamed-inventory-output",', 1),
+            encoding="utf-8",
+        )
+        drift_findings = module.scan_tip(contract_repo)
+        check(
+            any(
+                item.rule == "required-contract-marker"
+                and item.path == "scripts/self_test_cutover_helper_cli_contracts.py"
+                and "authenticated inventory evidence argv" in item.detail
+                for item in drift_findings
+            ),
+            "cutover helper CLI option drift was not caught by the repository boundary guard",
+        )
         print("repository boundary self-test ok")
         return 0
     finally:

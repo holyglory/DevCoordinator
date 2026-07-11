@@ -3,13 +3,17 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import http.server
 import json
 import os
 import signal
+import socketserver
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -17,6 +21,7 @@ from typing import Callable
 from verify_legacy_console_rollback_ready import (
     RollbackReadinessError,
     RollbackReadinessTimeout,
+    credential_free_inventory_probe,
     wait_for_legacy_console_rollback,
 )
 
@@ -28,6 +33,13 @@ MAIN_PID = 101
 COORDINATOR_PID = 202
 EXTRA_PID = 303
 OLD_COORDINATOR = "/srv/legacy/skills/codex-dev-coordinator/scripts/dev_coordinator.py"
+PROJECT = "/srv/legacy"
+NAME = "devops-console"
+PORT = 443
+SERVER_ID = "legacy-console-server-id"
+LEASE_ID = "legacy-console-active-lease"
+CAPTURED_LEASE_ID = "legacy-console-pre-cutover-lease"
+SECRET_SENTINEL = "must-never-appear-in-rollback-evidence"
 MAIN_COMMAND = ["/usr/bin/node", "bin/devops-console.mjs"]
 COORDINATOR_COMMAND = [
     "/usr/bin/python3",
@@ -39,6 +51,168 @@ COORDINATOR_COMMAND = [
     "--port",
     "29876",
 ]
+
+
+def ready_inventory() -> dict[str, object]:
+    key = f"{PROJECT}::{NAME}"
+    return {
+        "private_future_field": SECRET_SENTINEL,
+        "port_assignments": [
+            {
+                "key": key,
+                "project": PROJECT,
+                "name": NAME,
+                "port": PORT,
+                "server_status": "running",
+            }
+        ],
+        "servers": [
+            {
+                "id": SERVER_ID,
+                "key": key,
+                "project": PROJECT,
+                "name": NAME,
+                "cwd": f"{PROJECT}/apps/DevOpsConsole",
+                "port": PORT,
+                "pid": MAIN_PID,
+                "status": "running",
+                "lease_id": LEASE_ID,
+                "health": {
+                    "ok": True,
+                    "pid_alive": True,
+                    "classification": "healthy",
+                    "check": {"ok": True, "status": 200},
+                    "identity": {
+                        "ok": True,
+                        "pid": MAIN_PID,
+                        "project": PROJECT,
+                        "cwd": f"{PROJECT}/apps/DevOpsConsole",
+                    },
+                },
+            },
+            {
+                "id": "unrelated-stopped-history",
+                "key": "/srv/history::console",
+                "project": "/srv/history",
+                "name": "console",
+                "cwd": "/srv/history",
+                "port": PORT,
+                "pid": 909,
+                "status": "stopped",
+                "lease_id": "unrelated-inactive-history",
+                "health": {
+                    "ok": False,
+                    "pid_alive": False,
+                    "classification": "stopped",
+                },
+            },
+        ],
+        "leases": [
+            {
+                "id": LEASE_ID,
+                "project": PROJECT,
+                "port": PORT,
+                "status": "active",
+                "purpose": f"server:{NAME}",
+                "server_id": SERVER_ID,
+                "owner_pid": MAIN_PID,
+            },
+            {
+                "id": "unrelated-inactive-history",
+                "project": "/srv/history",
+                "port": PORT,
+                "status": "released",
+                "purpose": "server:console",
+                "server_id": "unrelated-stopped-history",
+                "owner_pid": 909,
+            },
+        ],
+    }
+
+
+def absent_inventory() -> dict[str, object]:
+    return {
+        "private_future_field": SECRET_SENTINEL,
+        "port_assignments": [
+            {
+                "key": f"{PROJECT}::api",
+                "project": PROJECT,
+                "name": "api",
+                "port": 8443,
+                "server_status": "running",
+            }
+        ],
+        "servers": [
+            {
+                "id": "unrelated-current-server",
+                "key": f"{PROJECT}::api",
+                "project": PROJECT,
+                "name": "api",
+                "cwd": f"{PROJECT}/services/api",
+                "port": 8443,
+                "pid": 707,
+                "status": "running",
+                "lease_id": "unrelated-current-lease",
+            }
+        ],
+        "leases": [
+            {
+                "id": "unrelated-current-lease",
+                "project": PROJECT,
+                "port": 8443,
+                "status": "active",
+                "purpose": "server:api",
+                "server_id": "unrelated-current-server",
+                "owner_pid": 707,
+            }
+        ],
+    }
+
+
+def stopped_inventory() -> dict[str, object]:
+    key = f"{PROJECT}::{NAME}"
+    return {
+        "private_future_field": SECRET_SENTINEL,
+        "port_assignments": [
+            {
+                "key": key,
+                "project": PROJECT,
+                "name": NAME,
+                "port": PORT,
+                "server_status": "stopped",
+            }
+        ],
+        "servers": [
+            {
+                "id": SERVER_ID,
+                "key": key,
+                "project": PROJECT,
+                "name": NAME,
+                "cwd": f"{PROJECT}/apps/DevOpsConsole",
+                "port": PORT,
+                "pid": 909,
+                "status": "stopped",
+                "lease_id": CAPTURED_LEASE_ID,
+                "health": {
+                    "ok": False,
+                    "pid_alive": False,
+                    "classification": "stopped",
+                    "check": {
+                        "ok": False,
+                        "skipped": "recorded process is not alive",
+                    },
+                    "identity": {
+                        "ok": True,
+                        "skipped": "not checked because recorded process is not alive",
+                    },
+                },
+            }
+        ],
+        # locked_state prunes the dead PID's active lease before
+        # build_inventory normalizes the server, so server.lease_id is the
+        # exact captured dangling identity and no lease row remains.
+        "leases": [],
+    }
 
 
 def require(condition: bool, message: str) -> None:
@@ -123,17 +297,30 @@ def call_wait(
     unit_probe: Callable[[], dict[str, object]] | None = None,
     listener_probe: Callable[[tuple[int, ...]], str] | None = None,
     health_probe: Callable[[str, float], dict[str, object]] = healthy,
+    inventory_probe: Callable[[str, float], dict[str, object]] | None = None,
+    inventory_url: str = "http://127.0.0.1:29876/v1/inventory",
+    expected_server_id: str = SERVER_ID,
+    expected_lease_id: str = CAPTURED_LEASE_ID,
     timeout: float = 3.0,
     poll: float = 0.1,
 ) -> dict[str, object]:
     selected_unit_probe = unit_probe or fixture.unit_state
     selected_listener_probe = listener_probe or (lambda _ports: listener_snapshot())
+    selected_inventory_probe = inventory_probe or (
+        lambda _url, _timeout: copy.deepcopy(ready_inventory())
+    )
     return wait_for_legacy_console_rollback(
         unit=UNIT,
         expected_main_pid=MAIN_PID,
         expected_cgroup=CGROUP,
         old_coordinator_script=OLD_COORDINATOR,
         health_url="https://console.example.test/healthz",
+        inventory_url=inventory_url,
+        expected_server_id=expected_server_id,
+        expected_lease_id=expected_lease_id,
+        registration_project=PROJECT,
+        registration_name=NAME,
+        registration_port=PORT,
         evidence_path=evidence,
         timeout_seconds=timeout,
         poll_interval_seconds=poll,
@@ -142,6 +329,7 @@ def call_wait(
         unit_probe=lambda _timeout: selected_unit_probe(),
         listener_probe=lambda ports, _timeout: selected_listener_probe(ports),
         health_probe=health_probe,
+        inventory_probe=selected_inventory_probe,
         clock=clock,
         sleep=clock.sleep,
     )
@@ -173,6 +361,61 @@ def read_ledger(path: Path) -> dict[str, object]:
 def write_executable(path: Path, payload: str) -> None:
     path.write_text(payload, encoding="utf-8")
     os.chmod(path, 0o700)
+
+
+class FastThreadingServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class LoopbackInventoryServer:
+    def __init__(
+        self,
+        *,
+        body: bytes,
+        status: int = 200,
+        content_type: str = "application/json",
+    ) -> None:
+        self.requests: list[dict[str, object]] = []
+        requests = self.requests
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
+                requests.append(
+                    {
+                        "path": self.path,
+                        "authorization": self.headers.get("Authorization"),
+                        "cookie": self.headers.get("Cookie"),
+                    }
+                )
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        # HTTPServer.server_bind performs reverse DNS through getfqdn, which
+        # can hang deterministic macOS tests. TCPServer preserves the real
+        # HTTP handler semantics without that hostname lookup.
+        self.server = FastThreadingServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def port(self) -> int:
+        return int(self.server.server_address[1])
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/v1/inventory"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 def main() -> int:
@@ -235,6 +478,323 @@ def main() -> int:
         ):
             require(expected in classifications, f"delayed fixture never recorded {expected}")
         require(delayed_clock() >= 1.0, "delayed fixture passed before TLS readiness")
+
+        # Reproduce the real 40a rollback boundary: locked_state has pruned the
+        # old active lease, build_inventory preserves the captured stopped
+        # server with its dangling captured lease ID, and registration later
+        # restores the same server ID with a replacement active lease.
+        registration_root = root / "delayed-registration"
+        registration_root.mkdir(mode=0o700)
+        registration_fixture = RuntimeFixture(registration_root)
+        registration_clock = FakeClock()
+        registration_snapshots = [
+            stopped_inventory(),
+            ready_inventory(),
+        ]
+        registration_calls = [0]
+
+        def delayed_registration(
+            _url: str, _timeout: float
+        ) -> dict[str, object]:
+            index = min(registration_calls[0], len(registration_snapshots) - 1)
+            registration_calls[0] += 1
+            return copy.deepcopy(registration_snapshots[index])
+
+        registration_evidence = registration_root / "rollback-readiness.json"
+        registration_result = call_wait(
+            registration_fixture,
+            registration_evidence,
+            clock=registration_clock,
+            inventory_probe=delayed_registration,
+        )
+        require(
+            registration_result["registration"]["server_id"] == SERVER_ID,
+            "registration readiness lost the captured server identity",
+        )
+        registration_ledger = read_ledger(registration_evidence)
+        registration_classifications = [
+            item["classification"] for item in registration_ledger["observations"]
+        ]
+        require(
+            "waiting_for_registration_stopped-baseline" in registration_classifications,
+            "exact stopped registration was not retried",
+        )
+        stopped_observation = next(
+            item
+            for item in registration_ledger["observations"]
+            if item["classification"] == "waiting_for_registration_stopped-baseline"
+        )
+        require(
+            stopped_observation["registration"]["captured_lease_id"]
+            == CAPTURED_LEASE_ID
+            and stopped_observation["registration"]["dangling_captured_lease"]
+            is True,
+            "production-shaped stopped graph lost its dangling captured lease identity",
+        )
+        require(registration_classifications[-1] == "ready", "registration never converged")
+        require(registration_calls[0] == 2, "rollback passed before the ready graph")
+        require(registration_clock() >= 0.1, "registration convergence incurred no polling")
+        require(
+            SECRET_SENTINEL not in registration_evidence.read_text(encoding="utf-8"),
+            "raw inventory content leaked into rollback evidence",
+        )
+
+        registration_timeout_root = root / "registration-timeout"
+        registration_timeout_root.mkdir(mode=0o700)
+        registration_timeout_fixture = RuntimeFixture(registration_timeout_root)
+        registration_timeout_clock = FakeClock()
+        expect_failure(
+            lambda: call_wait(
+                registration_timeout_fixture,
+                registration_timeout_root / "rollback-readiness.json",
+                clock=registration_timeout_clock,
+                inventory_probe=lambda _url, _timeout: stopped_inventory(),
+                timeout=0.3,
+            ),
+            contains="did not become ready",
+            error_type=RollbackReadinessTimeout,
+        )
+        timeout_ledger = read_ledger(
+            registration_timeout_root / "rollback-readiness.json"
+        )
+        require(timeout_ledger["status"] == "timeout", "stopped registration did not time out")
+        require(
+            timeout_ledger["observations"][-1]["classification"]
+            == "waiting_for_registration_stopped-baseline",
+            "stopped registration timeout lost its last safe pending state",
+        )
+
+        identity_loss_inventories = {
+            "clean-absence": absent_inventory(),
+            "assignment-only-unregistered": {
+                "port_assignments": [
+                    {
+                        "key": f"{PROJECT}::{NAME}",
+                        "project": PROJECT,
+                        "name": NAME,
+                        "port": PORT,
+                        "server_status": "unregistered",
+                    }
+                ],
+                "servers": [],
+                "leases": [],
+            },
+        }
+        for label, identity_loss in identity_loss_inventories.items():
+            case_root = root / f"identity-loss-{label}"
+            case_root.mkdir(mode=0o700)
+            case_fixture = RuntimeFixture(case_root)
+            case_clock = FakeClock()
+            evidence = case_root / "rollback-readiness.json"
+            expect_failure(
+                lambda identity_loss=identity_loss: call_wait(
+                    case_fixture,
+                    evidence,
+                    clock=case_clock,
+                    inventory_probe=lambda _url, _timeout: copy.deepcopy(
+                        identity_loss
+                    ),
+                ),
+                contains="captured server identity",
+            )
+            require(case_clock() == 0.0, f"{label} identity loss was retried")
+            require(
+                read_ledger(evidence)["status"] == "failed",
+                f"{label} identity loss was not terminal",
+            )
+
+        stopped_precursor_failures: list[
+            tuple[str, Callable[[dict[str, object]], None]]
+        ] = [
+            (
+                "wrong-captured-lease-id",
+                lambda value: value["servers"][0].update(
+                    {"lease_id": "different-captured-lease"}
+                ),
+            ),
+            (
+                "unpruned-active-lease",
+                lambda value: value["leases"].append(
+                    {
+                        "id": CAPTURED_LEASE_ID,
+                        "project": PROJECT,
+                        "port": PORT,
+                        "status": "active",
+                        "purpose": f"server:{NAME}",
+                        "server_id": SERVER_ID,
+                        "owner_pid": 909,
+                    }
+                ),
+            ),
+            (
+                "rollback-main-pid-still-stopped",
+                lambda value: value["servers"][0].update({"pid": MAIN_PID}),
+            ),
+            (
+                "health-ok",
+                lambda value: value["servers"][0]["health"].update({"ok": True}),
+            ),
+            (
+                "health-classification",
+                lambda value: value["servers"][0]["health"].update(
+                    {"classification": "unhealthy_process"}
+                ),
+            ),
+            (
+                "health-check",
+                lambda value: value["servers"][0]["health"]["check"].update(
+                    {"skipped": "different reason"}
+                ),
+            ),
+            (
+                "health-identity",
+                lambda value: value["servers"][0]["health"]["identity"].update(
+                    {"ok": False}
+                ),
+            ),
+        ]
+        for label, mutate in stopped_precursor_failures:
+            case_root = root / f"stopped-precursor-{label}"
+            case_root.mkdir(mode=0o700)
+            case_fixture = RuntimeFixture(case_root)
+            case_clock = FakeClock()
+            broken = copy.deepcopy(stopped_inventory())
+            mutate(broken)
+            evidence = case_root / "rollback-readiness.json"
+            expect_failure(
+                lambda broken=broken: call_wait(
+                    case_fixture,
+                    evidence,
+                    clock=case_clock,
+                    inventory_probe=lambda _url, _timeout: copy.deepcopy(broken),
+                ),
+                contains="unsafe legacy registration graph",
+            )
+            require(case_clock() == 0.0, f"{label} was retried")
+            require(
+                read_ledger(evidence)["status"] == "failed",
+                f"{label} did not fail terminally",
+            )
+
+        wrong_lease_identity_root = root / "wrong-expected-lease-identity"
+        wrong_lease_identity_root.mkdir(mode=0o700)
+        wrong_lease_identity_fixture = RuntimeFixture(wrong_lease_identity_root)
+        wrong_lease_identity_clock = FakeClock()
+        expect_failure(
+            lambda: call_wait(
+                wrong_lease_identity_fixture,
+                wrong_lease_identity_root / "rollback-readiness.json",
+                clock=wrong_lease_identity_clock,
+                inventory_probe=lambda _url, _timeout: stopped_inventory(),
+                expected_lease_id="different-pre-cutover-lease",
+            ),
+            contains="captured lease identity",
+        )
+        require(
+            wrong_lease_identity_clock() == 0.0,
+            "wrong captured lease identity was retried",
+        )
+
+        # Every current or foreign claim is an atomic conflict. None may be
+        # retried as startup convergence after TLS/listener readiness.
+        graph_failures: list[tuple[str, Callable[[dict[str, object]], None]]] = [
+            (
+                "wrong-server-id",
+                lambda value: value["servers"][0].update({"id": "wrong-server-id"}),
+            ),
+            (
+                "wrong-main-pid",
+                lambda value: value["servers"][0].update({"pid": 999}),
+            ),
+            (
+                "wrong-health-identity",
+                lambda value: value["servers"][0]["health"]["identity"].update(
+                    {"pid": 999}
+                ),
+            ),
+            (
+                "wrong-lease-link",
+                lambda value: value["servers"][0].update({"lease_id": "detached-lease"}),
+            ),
+            (
+                "wrong-lease-owner",
+                lambda value: value["leases"][0].update({"owner_pid": 999}),
+            ),
+            (
+                "reused-captured-lease",
+                lambda value: (
+                    value["servers"][0].update(
+                        {"lease_id": CAPTURED_LEASE_ID}
+                    ),
+                    value["leases"][0].update({"id": CAPTURED_LEASE_ID}),
+                ),
+            ),
+            (
+                "retained-captured-lease-history",
+                lambda value: value["leases"].append(
+                    {
+                        "id": CAPTURED_LEASE_ID,
+                        "project": PROJECT,
+                        "port": PORT,
+                        "status": "released",
+                        "purpose": f"server:{NAME}",
+                        "server_id": SERVER_ID,
+                        "owner_pid": 909,
+                    }
+                ),
+            ),
+            (
+                "wrong-assignment",
+                lambda value: value["port_assignments"][0].update(
+                    {"key": "/srv/foreign::devops-console"}
+                ),
+            ),
+            (
+                "foreign-current-server",
+                lambda value: value["servers"][0].update(
+                    {
+                        "key": "/srv/foreign::console",
+                        "project": "/srv/foreign",
+                        "name": "console",
+                        "cwd": "/srv/foreign",
+                    }
+                ),
+            ),
+        ]
+        for label, mutate in graph_failures:
+            case_root = root / f"registration-{label}"
+            case_root.mkdir(mode=0o700)
+            case_fixture = RuntimeFixture(case_root)
+            case_clock = FakeClock()
+            broken = copy.deepcopy(ready_inventory())
+            mutate(broken)
+            evidence = case_root / "rollback-readiness.json"
+            expect_failure(
+                lambda broken=broken: call_wait(
+                    case_fixture,
+                    evidence,
+                    clock=case_clock,
+                    inventory_probe=lambda _url, _timeout: copy.deepcopy(broken),
+                ),
+                contains="unsafe legacy registration graph",
+            )
+            require(case_clock() == 0.0, f"{label} was retried")
+            require(read_ledger(evidence)["status"] == "failed", f"{label} was not terminal")
+
+        wrong_expected_root = root / "registration-wrong-captured-id"
+        wrong_expected_root.mkdir(mode=0o700)
+        wrong_expected_fixture = RuntimeFixture(wrong_expected_root)
+        wrong_expected_clock = FakeClock()
+        expect_failure(
+            lambda: call_wait(
+                wrong_expected_fixture,
+                wrong_expected_root / "rollback-readiness.json",
+                clock=wrong_expected_clock,
+                expected_server_id="different-captured-server-id",
+            ),
+            contains="unsafe legacy registration graph",
+        )
+        require(wrong_expected_clock() == 0.0, "wrong captured server id was retried")
 
         # An accepting coordinator listener must not hide permanently missing
         # public listeners—the exact false-negative surface from production.
@@ -569,6 +1129,63 @@ def main() -> int:
             "terminal evidence omitted the post-health listener-owner swap",
         )
 
+        # Inventory may take long enough for port ownership to change while
+        # the same PIDs remain in the same cgroup. The final evidence must come
+        # from a fresh listener probe made after the graph response.
+        post_inventory_snapshots = {
+            "wrong": listener_snapshot(main_pid=999),
+            "ambiguous": listener_snapshot().replace(
+                'pid=101,fd=20))',
+                'pid=101,fd=20),("foreign",pid=999,fd=21))',
+                1,
+            ),
+        }
+        for label, changed_snapshot in post_inventory_snapshots.items():
+            case_root = root / f"post-inventory-listener-{label}"
+            case_root.mkdir(mode=0o700)
+            case_fixture = RuntimeFixture(case_root)
+            case_clock = FakeClock()
+            inventory_returned = [False]
+            listener_calls_after_graph = [0]
+
+            def mark_inventory_returned(
+                _url: str, _timeout: float
+            ) -> dict[str, object]:
+                inventory_returned[0] = True
+                return copy.deepcopy(ready_inventory())
+
+            def change_after_inventory(_ports: tuple[int, ...]) -> str:
+                listener_calls_after_graph[0] += 1
+                return changed_snapshot if inventory_returned[0] else listener_snapshot()
+
+            evidence = case_root / "rollback-readiness.json"
+            expect_failure(
+                lambda: call_wait(
+                    case_fixture,
+                    evidence,
+                    clock=case_clock,
+                    listener_probe=change_after_inventory,
+                    inventory_probe=mark_inventory_returned,
+                ),
+                contains="listener ownership",
+            )
+            require(inventory_returned[0], f"{label} fixture changed before inventory")
+            require(
+                listener_calls_after_graph[0] == 4,
+                f"{label} fixture did not reach the post-registration listener probe",
+            )
+            require(case_clock() == 0.0, f"post-inventory {label} owner was retried")
+            post_inventory_ledger = read_ledger(evidence)
+            require(
+                any(
+                    "pid=999" in line
+                    for line in post_inventory_ledger["observations"][-1][
+                        "post_registration_listener_snapshot"
+                    ]
+                ),
+                f"post-inventory {label} evidence omitted the changed owner",
+            )
+
         terminal_extra_root = root / "post-health-transient-extra"
         terminal_extra_root.mkdir(mode=0o700)
         terminal_extra_fixture = RuntimeFixture(terminal_extra_root)
@@ -642,11 +1259,86 @@ def main() -> int:
             "invalid numeric input created success-shaped evidence",
         )
 
+        valid_http = LoopbackInventoryServer(
+            body=json.dumps(ready_inventory()).encode("utf-8")
+        )
+        try:
+            fetched = credential_free_inventory_probe(valid_http.url, 2.0)
+            require(
+                fetched["private_future_field"] == SECRET_SENTINEL,
+                "real HTTP inventory body was not decoded",
+            )
+            require(len(valid_http.requests) == 1, "inventory endpoint was queried unexpectedly")
+            require(
+                valid_http.requests[0]
+                == {
+                    "path": "/v1/inventory",
+                    "authorization": None,
+                    "cookie": None,
+                },
+                "credential-free legacy request sent credentials or used the wrong path",
+            )
+        finally:
+            valid_http.close()
+
+        for label, status, content_type, body, message in (
+            ("http", 503, "application/json", b"{}", "HTTP 503"),
+            ("content-type", 200, "text/plain", b"{}", "Content-Type"),
+            ("json", 200, "application/json", b"{broken", "JSON is invalid"),
+            ("root", 200, "application/json", b"[]", "root must be an object"),
+        ):
+            bad_server = LoopbackInventoryServer(
+                body=body,
+                status=status,
+                content_type=content_type,
+            )
+            try:
+                expect_failure(
+                    lambda bad_server=bad_server: credential_free_inventory_probe(
+                        bad_server.url, 2.0
+                    ),
+                    contains=message,
+                )
+            finally:
+                bad_server.close()
+
+        for unsafe_url in (
+            "https://127.0.0.1:29876/v1/inventory",
+            "http://user@127.0.0.1:29876/v1/inventory",
+            "http://localhost:29876/v1/inventory",
+            "http://127.0.0.1:29876/v1/inventory?token=secret",
+            "http://127.0.0.1:29876/v1/inventory/no-docker",
+        ):
+            expect_failure(
+                lambda unsafe_url=unsafe_url: credential_free_inventory_probe(
+                    unsafe_url, 2.0
+                ),
+                contains="credential-free IPv4 loopback",
+            )
+
         # Exercise the exact subprocess CLI with isolated fake systemd, sudo,
         # ss, and curl executables; no host PATH or listener can affect it.
         cli_root = root / "cli"
         cli_root.mkdir(mode=0o700)
+        cli_inventory_server = LoopbackInventoryServer(
+            body=json.dumps(ready_inventory()).encode("utf-8")
+        )
         cli_fixture = RuntimeFixture(cli_root)
+        write_process(
+            cli_fixture.proc_root,
+            COORDINATOR_PID,
+            "22002",
+            [
+                "/usr/bin/python3",
+                OLD_COORDINATOR,
+                "api",
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(cli_inventory_server.port),
+            ],
+        )
         bin_root = cli_root / "bin"
         bin_root.mkdir(mode=0o700)
         systemctl = bin_root / "systemctl"
@@ -664,7 +1356,8 @@ def main() -> int:
             "#!/bin/sh\nprintf '%s\\n' "
             "'LISTEN 0 511 *:80 *:* users:((\"node\",pid=101,fd=20))' "
             "'LISTEN 0 511 *:443 *:* users:((\"node\",pid=101,fd=21))' "
-            "'LISTEN 0 511 127.0.0.1:29876 0.0.0.0:* users:((\"python3\",pid=202,fd=3))'\n",
+            f"'LISTEN 0 511 127.0.0.1:{cli_inventory_server.port} 0.0.0.0:* "
+            "users:((\"python3\",pid=202,fd=3))'\n",
         )
         write_executable(
             curl,
@@ -683,7 +1376,16 @@ def main() -> int:
             "if [ ! -e \"$0.state\" ]; then : > \"$0.state\"; exit 7; fi\n"
             "printf 'status=200 tls=0 remote=127.0.0.1\\n'\n",
         )
-        cli_evidence = cli_root / "rollback-readiness.json"
+        expected_identities = cli_root / "pre-cutover-identities.json"
+        expected_identities.write_text(
+            json.dumps(
+                {"server_id": SERVER_ID, "lease_id": CAPTURED_LEASE_ID}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(expected_identities, 0o600)
+
         def cli_arguments(
             evidence: Path,
             *,
@@ -691,10 +1393,11 @@ def main() -> int:
             curl_path: Path = curl,
             timeout: str = "5",
             poll: str = "0.01",
+            optimized: bool = False,
         ) -> list[str]:
+            prefix = [sys.executable, "-O", str(SCRIPT)] if optimized else [sys.executable, str(SCRIPT)]
             return [
-                sys.executable,
-                str(SCRIPT),
+                *prefix,
                 "--unit",
                 UNIT,
                 "--main-pid",
@@ -705,6 +1408,16 @@ def main() -> int:
                 OLD_COORDINATOR,
                 "--health-url",
                 "https://console.example.test/healthz",
+                "--inventory-url",
+                cli_inventory_server.url,
+                "--expected-identities",
+                str(expected_identities),
+                "--project",
+                PROJECT,
+                "--name",
+                NAME,
+                "--port",
+                str(PORT),
                 "--evidence",
                 str(evidence),
                 "--timeout-seconds",
@@ -726,23 +1439,43 @@ def main() -> int:
             ]
 
         isolated_env = {"PATH": "/nonexistent", "PYTHONHASHSEED": "0"}
-        completed = subprocess.run(
-            cli_arguments(cli_evidence),
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=isolated_env,
-            timeout=10,
-        )
-        require(completed.returncode == 0, f"rollback readiness CLI failed: {completed.stderr}")
-        require(json.loads(completed.stdout)["ok"] is True, "rollback readiness CLI output was not successful")
-        cli_ledger = read_ledger(cli_evidence)
-        require(cli_ledger["status"] == "success", "CLI evidence was not terminal success")
-        require(
-            any(item.get("classification") == "waiting_for_tls_transport" for item in cli_ledger["observations"]),
-            "real curl exit 7 was not retried before CLI success",
-        )
+        for optimized in (False, True):
+            suffix = "optimized" if optimized else "normal"
+            cli_evidence = cli_root / f"rollback-readiness-{suffix}.json"
+            completed = subprocess.run(
+                cli_arguments(cli_evidence, optimized=optimized),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=isolated_env,
+                timeout=10,
+            )
+            require(
+                completed.returncode == 0,
+                f"rollback readiness CLI ({suffix}) failed: {completed.stderr}",
+            )
+            require(
+                json.loads(completed.stdout)["ok"] is True,
+                f"rollback readiness CLI ({suffix}) output was not successful",
+            )
+            cli_ledger = read_ledger(cli_evidence)
+            require(
+                cli_ledger["status"] == "success",
+                f"CLI ({suffix}) evidence was not terminal success",
+            )
+            if not optimized:
+                require(
+                    any(
+                        item.get("classification") == "waiting_for_tls_transport"
+                        for item in cli_ledger["observations"]
+                    ),
+                    "real curl exit 7 was not retried before CLI success",
+                )
+            require(
+                SECRET_SENTINEL not in cli_evidence.read_text(encoding="utf-8"),
+                f"CLI ({suffix}) persisted raw inventory content",
+            )
 
         bad_tls_curl = bin_root / "curl-bad-tls"
         write_executable(bad_tls_curl, "#!/bin/sh\nexit 60\n")
@@ -827,10 +1560,11 @@ def main() -> int:
         require(interrupted_stdout == "", "interrupted CLI emitted success output")
         require("SIGTERM" in interrupted_stderr, "interrupted CLI omitted its signal")
         require(read_ledger(interrupted_evidence)["status"] == "interrupted", "SIGTERM left running evidence")
+        cli_inventory_server.close()
 
     print(
         "legacy rollback readiness self-test ok "
-        "(delayed startup, transient child, exact owners, identity drift, TLS, timeout, CLI)"
+        "(delayed startup/registration, exact owners/graph, HTTP/JSON, timeout, CLI normal/-O)"
     )
     return 0
 

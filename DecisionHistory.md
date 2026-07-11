@@ -1,5 +1,103 @@
 # Decision History
 
+## 2026-07-11 - Legacy rollback readiness includes coordinator registration
+
+Decision: Rollback terminal success now requires the restored Console's exact
+current coordinator graph in addition to systemd identity, process/cgroup
+identity, listener ownership, and public TLS. The verifier queries only the
+credential-free IPv4-loopback legacy `/v1/inventory` endpoint, binds its port
+to the exact child argv/listener already under observation, and uses the
+captured pre-cutover server ID with the old project, `devops-console`, port 443,
+and restored systemd MainPID. It retries only the captured server's exact 40a
+stopped/dead graph: exact old PID/cwd/project, exact stopped health/check/
+identity proof, and the captured pre-cutover lease ID dangling after its lease
+row was pruned. Clean absence and assignment-only unregistered state are
+terminal identity loss because old `register_server` creates a new UUID when
+the server record is absent. Any relevant active lease or current graph that
+fails identity, health, assignment, or linkage; any foreign claim; and any
+transport, HTTP, protocol, or JSON failure is terminal. A ready graph may use
+only the replacement lease created while restoring the captured server ID;
+its lease ID must differ from the captured pre-cutover ID and no row with the
+captured lease ID may survive. One
+monotonic deadline covers topology, TLS, graph convergence, a fresh post-graph
+listener-owner snapshot, and the final topology confirmation. Evidence contains
+only the small allowlisted verifier result, never raw inventory or credentials.
+
+Why: The legacy Node process catches a failed coordinator `server register`
+attempt and continues serving HTTPS. The previous rollback verifier could
+therefore declare success after proving listeners and TLS while the restored
+Console was still absent from coordinator inventory. Production evidence also
+showed that the old coordinator predates `registration_identity`, listener
+inode fields, and lease `assignment_key`; applying the new binary's schema
+literally would reject the real healthy legacy graph. The shared graph verifier
+now has an explicit legacy contract that keeps every assignment, server,
+MainPID, cwd, health identity/check, active lease, and bidirectional link the
+old binary can emit. Its default current contract remains unchanged, while the
+rollback verifier separately proves exact listener PIDs. The retained
+pre-relocate checkpoint and an isolated real 40a API reproduction also proved
+the exact precursor the earlier fixtures missed: `locked_state` prunes the dead
+PID's active lease first; `build_inventory` then marks the captured server
+stopped while preserving the now-dangling old lease ID. Absence cannot preserve
+identity because registration generates a fresh UUID.
+
+Result: Realistic regression fixtures cover delayed stopped-to-ready
+registration, permanent timeout, terminal absent/unregistered identity loss,
+wrong captured/current server and lease identity, MainPID, exact stopped
+health/check/identity/classification, assignment, and foreign current
+claims. Actual loopback HTTP fixtures cover credential omission, status,
+content type, malformed JSON, and non-object roots; both normal and `python -O`
+CLI paths pass and raw future inventory fields are proven absent from the
+private checksummed ledger. Production-shaped coverage accepts only the exact
+stopped server with a dangling captured lease ID and rejects surviving active
+lease state, malformed stopped proof, or rollback MainPID. Post-inventory wrong and ambiguous
+listener-owner swaps are also terminal, and the HTTP fixture avoids macOS
+reverse-DNS binding by using `ThreadingMixIn` with `TCPServer`.
+
+## 2026-07-11 - Private cutover helpers have a tracked executable CLI contract
+
+Decision: Validation invokes all seven repository helpers used by the private
+production cutover as real subprocess CLIs with the exact candidate flag
+combinations. The matrix covers token-required layout waiting, state-only
+migration, captured coordinator termination, the three stopped-listener ports,
+authenticated inventory evidence, every Console registration readiness flag,
+and loaded-unit evidence. It runs normally and with optimized Python, rejects
+argparse/usage exit 2 explicitly, and uses private fake systemd, socket, HTTP,
+process, and state fixtures instead of production resources.
+
+Why: Shell syntax checks and direct function tests cannot prove that a private
+retry script still matches a deployed helper's argparse interface. A renamed,
+missing, or misclassified option could otherwise remain invisible until after
+the legacy service had been stopped.
+
+Result: CLI drift is now a pre-cutover validation failure. Linux exercises the
+complete MainPID/procfs and loaded-systemd success paths; platforms without the
+required Linux kernel surfaces must still reach an exact helper-specific
+post-parse result and can never pass on an argparse error. No service, private
+cutover script, or server state is touched by this matrix.
+
+## 2026-07-11 - Executable validation follows Git semantics across safe umasks
+
+Decision: Deployment tests require the Console readiness helper to retain all
+three executable bits and reject world-writable materializations. They accept
+both the ordinary `0755` checkout mode and the safe group-shared `0775` mode.
+The detector carries explicit true controls for both modes and must-catch
+controls for non-executable `0644`/`0664` and world-writable `0757`/`0777`.
+
+Why: The exact server-side validation reproduced one failure after all six CI
+jobs and a local fresh clone passed. Git's index correctly recorded the helper
+as `100755`, but `/home/DevCoordinator` is a group-shared checkout with umask
+`0002`, so Git materialized the executable as `0775`. The test compared the
+complete permission value to `0755`, confusing a host checkout policy with
+Git's executable-bit contract. Every CI and local clone used an environment
+that materialized `0755`, so none exercised the legitimate shared-checkout
+case.
+
+Result: The detector still fails if the helper loses executable permission or
+becomes writable by unrelated users, while validation is portable across the
+two actual checkout policies. The production service was not touched while the
+gap was reproduced and corrected; the server remained on its healthy legacy
+unit throughout.
+
 ## 2026-07-11 - Console readiness is the registered MainPID graph, not process creation
 
 Decision: `devops-console.service` has one pinned `ExecStartPost` that receives

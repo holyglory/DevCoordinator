@@ -9,6 +9,11 @@ import { fileURLToPath } from 'node:url';
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const execFileAsync = promisify(execFile);
 
+function isSafeGitExecutableMode(mode) {
+  const permissions = mode & 0o777;
+  return permissions === 0o755 || permissions === 0o775;
+}
+
 test('production units split coordinator ownership and keep runtime data outside Git', async () => {
   const coordinator = await fsp.readFile(path.join(APP_ROOT, 'deploy', 'dev-coordinator.service'), 'utf8');
   const consoleUnit = await fsp.readFile(path.join(APP_ROOT, 'deploy', 'devops-console.service'), 'utf8');
@@ -162,7 +167,18 @@ test('cutover process identity and signaling are Linux-format and PID-reuse safe
   assert.match(authBoundary, /if observed != expected:/);
   assert.doesNotMatch(authBoundary, /\bassert\b/);
   assert.doesNotMatch(registrationReady, /\bassert\b/);
-  assert.equal((await fsp.stat(registrationReadyPath)).mode & 0o777, 0o755);
+  for (const mode of [0o755, 0o775]) {
+    assert.equal(isSafeGitExecutableMode(mode), true, `safe checkout mode ${mode.toString(8)}`);
+  }
+  for (const mode of [0o111, 0o311, 0o644, 0o664, 0o757, 0o777]) {
+    assert.equal(isSafeGitExecutableMode(mode), false, `unsafe checkout mode ${mode.toString(8)}`);
+  }
+  const registrationMode = (await fsp.stat(registrationReadyPath)).mode & 0o777;
+  assert.equal(
+    isSafeGitExecutableMode(registrationMode),
+    true,
+    `registration helper mode ${registrationMode.toString(8)} must be 755 or 775`,
+  );
 });
 
 test('existing-host runbook models the legacy Console child-coordinator topology', async () => {
@@ -204,6 +220,14 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'verify_legacy_console_rollback_ready.py',
     'rollback-readiness.json',
     '--main-pid "$ROLLBACK_MAIN_PID" --cgroup "$ROLLBACK_CGROUP"',
+    '--inventory-url http://127.0.0.1:29876/v1/inventory',
+    '--expected-identities "$CUTOVER_BACKUP/pre-cutover-identities.json"',
+    '--project "$OLD_PROJECT" --name devops-console --port 443',
+    'captured lease ID still dangling after `locked_state` pruned',
+    'Clean absence and an assignment-only unregistered state fail',
+    'no inventory row with that captured lease ID may survive',
+    'listener-owner snapshot after the inventory response',
+    'Raw inventory is never persisted to rollback evidence',
     '--timeout-seconds 30 --poll-interval-seconds 0.1',
     'verify_post_cutover_registration.py',
     'post-cutover-registration-graph.json',

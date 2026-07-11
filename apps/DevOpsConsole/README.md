@@ -795,6 +795,9 @@ python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_console_rollback_ready.py" \
   --main-pid "$ROLLBACK_MAIN_PID" --cgroup "$ROLLBACK_CGROUP" \
   --old-coordinator-script "$OLD_COORDINATOR" \
   --health-url https://console.vr.ae/healthz \
+  --inventory-url http://127.0.0.1:29876/v1/inventory \
+  --expected-identities "$CUTOVER_BACKUP/pre-cutover-identities.json" \
+  --project "$OLD_PROJECT" --name devops-console --port 443 \
   --evidence "$CUTOVER_BACKUP/rollback-readiness.json" \
   --timeout-seconds 30 --poll-interval-seconds 0.1
 ```
@@ -802,17 +805,37 @@ python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_console_rollback_ready.py" \
 The rollback readiness verifier fixes the systemd MainPID and cgroup at start,
 then revalidates both process start/argv identities on every observation. A
 temporarily missing child coordinator, transient attributed child, missing
-listener, or pre-bind TLS transport is retried only within the bounded timeout.
+listener, pre-bind TLS transport, or the exact captured stopped Console record
+is retried only within the single bounded timeout. The only safe registration
+precursor has the captured server ID, old PID/cwd/project, exact 40a stopped
+health proof, and captured lease ID still dangling after `locked_state` pruned
+its lease row. Clean absence and an assignment-only unregistered state fail
+immediately: the old `register_server` would generate a new UUID and could not
+recover the captured server identity.
 Wrong, ambiguous, or unobservable listener ownership and any fixed identity
-change fail immediately. Success requires ports 80 and 443 to belong only to
-the restored Node MainPID, port 29876 to belong only to its exact old-checkout
+change fail immediately. A current, foreign, malformed, or conflicting
+registration graph, any relevant active lease, wrong HTTP response,
+or invalid JSON also fails immediately. Success requires ports 80 and 443 to
+belong only to the restored Node MainPID, port 29876 to belong only to its exact old-checkout
 coordinator child, and the locally owned TLS listener to answer the public
 hostname with exactly HTTP 200 and successful certificate verification. The
 probe bypasses proxies and DNS routing, preserves SNI with the public hostname,
 and records an exact `127.0.0.1` remote address; externally routed public
-reachability remains a separate post-rollback check. The complete observation
-ledger and terminal result remain private and checksummed beside the rollback
-evidence. `SIGINT`, `SIGTERM`, and `SIGHUP` produce terminal `interrupted`
+reachability remains a separate post-rollback check. Terminal success also
+queries the credential-free old-coordinator loopback API and requires the
+captured server ID to resolve to the exact legacy project/name/port/MainPID,
+healthy identity, durable assignment, and unique linked replacement active
+lease. The replacement ID must differ from the captured pre-cutover lease ID,
+and no inventory row with that captured lease ID may survive. The old
+binary predates registration socket-inode and lease assignment-key fields, so
+the rollback graph contract requires every identity/link field it can emit and
+the same helper independently proves exact listener PIDs. It takes a fresh
+listener-owner snapshot after the inventory response, then confirms process
+and cgroup identities again; the terminal result uses that post-registration
+listener evidence.
+Raw inventory is never persisted to rollback evidence. The complete sanitized
+observation ledger and terminal result remain private and checksummed beside
+the rollback evidence. `SIGINT`, `SIGTERM`, and `SIGHUP` produce terminal `interrupted`
 evidence. `SIGKILL`, power loss, or storage failure can still leave `running`
 or incomplete evidence, which must never be accepted as rollback readiness.
 
