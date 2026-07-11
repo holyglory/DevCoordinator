@@ -107,6 +107,31 @@ cross-platform deterministic test injects `PermissionError` and requires
 `None`, while the real Linux nondumpable listener remains the must-catch
 integration fixture.
 
+The adjacent cross-platform audit then found the same semantic boundary in
+`lsof`: exit 1 represents both a clean empty selection and execution or
+permission errors. The old listener and cwd probes treated every exit 1 as an
+observable no-match. On macOS, a permission diagnostic could therefore become
+`wrong-listener`, and read-only status could mark a live registered server
+stopped and release its lease. Managed servers without `registration_identity`
+had an additional gap: any unobservable cwd was returned as `ok=true`, so stop
+could signal the PID. The lsof probes now accept a clean no-match only when no
+diagnostic is present; cwd observation carries `observable=false` through every
+live server identity. Deterministic macOS fixtures require both registered
+status and managed stop to preserve PID, lifecycle, and lease without signals,
+while clean empty lsof results remain valid negative controls.
+The consumer boundary is deliberately stricter than the probe result: a clean
+empty query proves only that lsof completed without diagnostics, not that a
+still-live PID belongs to the recorded project. The lifecycle identity remains
+unverified without a concrete cwd. A reviewer reproduced the pre-commit gap as
+an HTTP-healthy managed row that was signalled and had its active lease removed;
+the managed clean-no-match fixture now requires no signal and no state change.
+That stricter consumer exposed a separate lifecycle fact in the existing
+adopted-server restart test: `kill(pid, 0)` reports an unreaped child zombie as
+alive, even though it cannot own a listener and its cwd is gone. The coordinator
+now confirms non-zombie process state before treating a retained PID as live.
+This preserves the ownership gate for genuinely live processes without adding
+a broad stopped-row exemption that could hide a failed termination.
+
 ## 2026-07-11 - Loaded-unit checks model omitted undefined properties narrowly
 
 Decision: The loaded-systemd checker accepts an omitted property as empty only

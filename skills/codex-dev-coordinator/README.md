@@ -88,6 +88,14 @@ is returned as `unverified-listener` (`health.ok=null`,
 `identity.observable=false`) and does not upgrade/downgrade the stored
 lifecycle or release its lease. Authenticated inventory through the
 capability-matched API is the strict current-ownership surface.
+The same rule applies to every managed server and to non-Linux `lsof`
+observation. A clean empty lsof selection is observable; permission or
+execution diagnostics are unknown and cannot become wrong-owner proof.
+Even a clean empty result cannot positively attribute a live managed PID to a
+project, so lifecycle status remains unverified until a concrete cwd is found.
+An unreaped zombie is terminated, not live: the coordinator checks process
+state in addition to `kill(pid, 0)` so retained stopped-PID evidence cannot
+block a legitimate restart.
 Server and whole-project start, stop, and restart also fail before any
 operation record, signal, process launch, lease change, Docker action, or
 sidecar metadata write when a target listener is unobservable. Unknown

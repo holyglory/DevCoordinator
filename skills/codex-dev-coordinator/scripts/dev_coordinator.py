@@ -611,14 +611,51 @@ def parse_range(raw: str) -> tuple[int, int]:
     return start, end
 
 
+def _non_zombie_process_observation(pid: int) -> bool | None:
+    """Return whether an existing PID is a non-zombie process when observable."""
+
+    if sys.platform.startswith("linux"):
+        try:
+            stat_text = (Path("/proc") / str(int(pid)) / "stat").read_text(encoding="utf-8")
+        except (FileNotFoundError, ProcessLookupError):
+            return False
+        except OSError:
+            return None
+        _prefix, separator, suffix = stat_text.rpartition(") ")
+        if not separator or not suffix:
+            return None
+        return suffix[0] not in {"Z", "X"}
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(int(pid))],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    states = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if states:
+        return states[0][0].upper() not in {"Z", "X"}
+    if completed.returncode in {0, 1} and not completed.stderr.strip():
+        return False
+    return None
+
+
 def pid_alive(pid: int | None) -> bool:
     if not pid:
         return False
     try:
         os.kill(pid, 0)
     except OSError as exc:
-        return exc.errno == errno.EPERM
-    return True
+        if exc.errno != errno.EPERM:
+            return False
+    # kill(pid, 0) succeeds for an unreaped zombie. A zombie cannot own a
+    # listener or be stopped again, and treating it as live turns retained PID
+    # metadata into a false unobservable-ownership block during restart.
+    non_zombie = _non_zombie_process_observation(int(pid))
+    return non_zombie is not False
 
 
 def port_open(host: str, port: int) -> bool:
@@ -760,6 +797,11 @@ def _lsof_listener_observation(
             endpoint_host = endpoint_host.strip("[]")
             if endpoint_host == "*" or _listener_address_matches(host, endpoint_host):
                 return True, current_pid
+        if completed.stderr.strip():
+            # lsof uses exit 1 for both a clean empty selection and errors.
+            # Diagnostic output means the query was not a complete negative
+            # observation (for example, proc/process permission denial).
+            return False, None
         return True, None
     except (OSError, subprocess.SubprocessError):
         return False, None
@@ -792,18 +834,16 @@ def registration_pid_identity(*, pid: int, host: str, port: int, project: str) -
     resolved_project = canonical_project(project)
     if pid <= 1 or not pid_alive(pid):
         raise RuntimeError(f"registration PID {pid} is not alive")
-    cwd = process_cwd(pid)
+    cwd_observation = process_cwd_observation(pid)
+    if cwd_observation.get("observable") is False:
+        raise ListenerIdentityUnobservable(
+            str(
+                cwd_observation.get("reason")
+                or f"registration PID {pid} working directory is not observable by this process"
+            )
+        )
+    cwd = cwd_observation.get("cwd")
     if not cwd:
-        if sys.platform.startswith("linux"):
-            try:
-                raw_cwd = os.readlink(Path("/proc") / str(pid) / "cwd")
-                Path(raw_cwd).resolve(strict=True)
-            except PermissionError as exc:
-                raise ListenerIdentityUnobservable(
-                    f"registration PID {pid} working directory is not observable by this process"
-                ) from exc
-            except OSError:
-                pass
         raise RuntimeError(f"registration PID {pid} working directory could not be identified")
     owner_project = canonical_project(cwd)
     if owner_project != resolved_project and not path_inside(cwd, resolved_project):
@@ -894,6 +934,45 @@ def resolve_registration_pid(options: dict[str, Any], *, host: str, port: int, p
     return None, None
 
 
+def _proc_process_cwd_observation(pid: int) -> dict[str, Any]:
+    proc_cwd = Path("/proc") / str(int(pid)) / "cwd"
+    try:
+        raw = os.readlink(proc_cwd)
+    except PermissionError:
+        return {
+            "observable": False,
+            "cwd": None,
+            "reason": f"PID {pid} working directory is not observable by this process",
+        }
+    except (FileNotFoundError, ProcessLookupError):
+        return {
+            "observable": False,
+            "cwd": None,
+            "reason": f"PID {pid} working directory disappeared during observation",
+        }
+    except OSError:
+        return {
+            "observable": False,
+            "cwd": None,
+            "reason": f"PID {pid} working directory could not be observed through procfs",
+        }
+    if not os.path.isabs(raw):
+        return {
+            "observable": False,
+            "cwd": None,
+            "reason": f"PID {pid} procfs cwd target is not absolute",
+        }
+    try:
+        cwd = str(Path(raw).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return {
+            "observable": False,
+            "cwd": None,
+            "reason": f"PID {pid} procfs cwd target could not be resolved strictly",
+        }
+    return {"observable": True, "cwd": cwd, "reason": None}
+
+
 def process_cwd_from_proc(pid: int) -> str | None:
     """Read one Linux cwd symlink without converting denial into a path.
 
@@ -903,24 +982,11 @@ def process_cwd_from_proc(pid: int) -> str | None:
     require the resulting directory to resolve strictly.
     """
 
-    proc_cwd = Path("/proc") / str(int(pid)) / "cwd"
+    return _proc_process_cwd_observation(pid).get("cwd")
+
+
+def _lsof_process_cwd_observation(pid: int) -> tuple[bool, str | None]:
     try:
-        raw = os.readlink(proc_cwd)
-        if not os.path.isabs(raw):
-            return None
-        return str(Path(raw).resolve(strict=True))
-    except (OSError, RuntimeError, ValueError):
-        return None
-
-
-def process_cwd(pid: int | None) -> str | None:
-    if not pid:
-        return None
-    if sys.platform.startswith("linux"):
-        # Do not fall back to lsof after procfs denial. That is an unknown
-        # observation boundary, not permission to synthesize a cwd.
-        return process_cwd_from_proc(int(pid))
-    with contextlib.suppress(Exception):
         completed = subprocess.run(
             ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
             text=True,
@@ -928,11 +994,37 @@ def process_cwd(pid: int | None) -> str | None:
             stderr=subprocess.PIPE,
             timeout=3,
         )
-        if completed.returncode == 0:
-            for line in completed.stdout.splitlines():
-                if line.startswith("n"):
-                    return str(Path(line[1:]).expanduser().resolve())
-    return None
+    except (OSError, subprocess.SubprocessError):
+        return False, None
+    if completed.returncode not in {0, 1}:
+        return False, None
+    for line in completed.stdout.splitlines():
+        if not line.startswith("n"):
+            continue
+        try:
+            return True, str(Path(line[1:]).expanduser().resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            return False, None
+    if completed.stderr.strip():
+        return False, None
+    return True, None
+
+
+def process_cwd_observation(pid: int | None) -> dict[str, Any]:
+    if not pid:
+        return {"observable": True, "cwd": None, "reason": "process PID is absent"}
+    if sys.platform.startswith("linux"):
+        return _proc_process_cwd_observation(int(pid))
+    observable, cwd = _lsof_process_cwd_observation(int(pid))
+    return {
+        "observable": observable,
+        "cwd": cwd,
+        "reason": None if observable else f"PID {pid} working directory is not observable by this process",
+    }
+
+
+def process_cwd(pid: int | None) -> str | None:
+    return process_cwd_observation(pid).get("cwd")
 
 
 def path_inside(child: str | None, parent: str | None) -> bool:
@@ -945,9 +1037,16 @@ def path_inside(child: str | None, parent: str | None) -> bool:
 
 def listener_owner_for_port(port: int, *, host: str | None = None) -> dict[str, Any]:
     pid = listening_pid_for_endpoint(host, port) if host else listening_pid_for_port(port)
-    cwd = process_cwd(pid)
+    cwd_observation = process_cwd_observation(pid)
+    cwd = cwd_observation.get("cwd")
     owner_project = canonical_project(cwd) if cwd else None
-    return {"pid": pid, "cwd": cwd, "project": owner_project}
+    return {
+        "pid": pid,
+        "cwd": cwd,
+        "project": owner_project,
+        "observable": cwd_observation.get("observable"),
+        "reason": cwd_observation.get("reason"),
+    }
 
 
 def listener_belongs_to_project(port: int, project: str, *, host: str | None = None) -> tuple[bool, dict[str, Any]]:
@@ -960,7 +1059,9 @@ def listener_belongs_to_project(port: int, project: str, *, host: str | None = N
         return False, owner
     if not owner.get("cwd") or not owner_project:
         owner["observable"] = False
-        owner["reason"] = f"port {port} is owned by PID {owner['pid']}, but its working directory could not be identified"
+        owner["reason"] = owner.get("reason") or (
+            f"port {port} is owned by PID {owner['pid']}, but its working directory could not be identified"
+        )
         return False, owner
     if owner_project != resolved_project and not path_inside(str(owner.get("cwd")), resolved_project):
         owner["observable"] = True
@@ -1096,7 +1197,29 @@ def server_process_identity(server: dict[str, Any]) -> dict[str, Any]:
     pid = int(server.get("pid") or 0)
     if not pid or not pid_alive(pid):
         return {"ok": True, "pid": pid, "cwd": None, "project": None}
-    cwd = process_cwd(pid)
+    cwd_observation = process_cwd_observation(pid)
+    if cwd_observation.get("observable") is False:
+        return {
+            "ok": None,
+            "observable": False,
+            "pid": pid,
+            "cwd": None,
+            "project": None,
+            "reason": cwd_observation.get("reason") or f"PID {pid} working directory is not observable",
+        }
+    cwd = cwd_observation.get("cwd")
+    if not cwd:
+        return {
+            "ok": None,
+            "observable": False,
+            "pid": pid,
+            "cwd": None,
+            "project": None,
+            "reason": (
+                f"PID {pid} working directory was not present in a completed observation; "
+                "project ownership cannot be proved"
+            ),
+        }
     server_project = server.get("project")
     owner_project = canonical_project(cwd) if cwd else None
     if cwd and server_project:
@@ -1117,7 +1240,7 @@ def server_process_identity(server: dict[str, Any]) -> dict[str, Any]:
 
 def server_listener_identity(server: dict[str, Any]) -> dict[str, Any]:
     identity = server_process_identity(server)
-    if identity.get("ok") is False:
+    if identity.get("ok") is False or identity.get("observable") is False:
         return identity
     pid = int(server.get("pid") or 0)
     if pid and pid_alive(pid):
@@ -2768,7 +2891,7 @@ def annotate_server_process_usage(servers: list[dict[str, Any]]) -> dict[int, di
         pid = int(server.get("pid") or 0)
         if pid in process_table:
             identity = (server.get("health") or {}).get("identity") or {}
-            if identity.get("ok") is not False:
+            if identity.get("ok") is not False and identity.get("observable") is not False:
                 roots.add(pid)
 
         port = int(server.get("port") or 0)

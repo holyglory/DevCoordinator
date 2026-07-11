@@ -423,6 +423,207 @@ def check_registration_pid_guards() -> None:
     finally:
         module.os.readlink = original_readlink
 
+    original_run = module.subprocess.run
+    try:
+        module.subprocess.run = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 1, stdout="", stderr="lsof: permission denied\n"
+        )
+        check(
+            module._lsof_process_cwd_observation(424242) == (False, None),
+            "lsof cwd permission denial must remain unobservable",
+        )
+        check(
+            module._lsof_listener_observation("127.0.0.1", 43210, expected_pid=424242)
+            == (False, None),
+            "lsof listener permission denial must remain unobservable",
+        )
+        module.subprocess.run = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 1, stdout="", stderr=""
+        )
+        check(
+            module._lsof_process_cwd_observation(424242) == (True, None),
+            "clean lsof cwd no-match should remain observable",
+        )
+        check(
+            module._lsof_listener_observation("127.0.0.1", 43210, expected_pid=424242)
+            == (True, None),
+            "clean lsof listener no-match should remain observable",
+        )
+    finally:
+        module.subprocess.run = original_run
+
+    if not sys.platform.startswith("linux"):
+        original_pid_alive = module.pid_alive
+        original_port_open = module.port_open
+        original_http_health = module.http_health
+        original_stop_pid = module.stop_pid
+
+        def permission_denied_lsof(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            if "-d" in command and "cwd" in command:
+                return subprocess.CompletedProcess(command, 0, stdout=f"p424242\nn{project}\n", stderr="")
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="lsof: permission denied\n"
+            )
+
+        try:
+            module.subprocess.run = permission_denied_lsof
+            module.pid_alive = lambda _pid: True
+            module.port_open = lambda _host, _port: True
+            module.http_health = lambda *_args, **_kwargs: {"ok": True, "status": 200}
+            try:
+                module.registration_pid_identity(
+                    pid=424242,
+                    host="127.0.0.1",
+                    port=43210,
+                    project=str(project),
+                )
+            except module.ListenerIdentityUnobservable:
+                pass
+            else:
+                raise AssertionError("non-Linux listener permission denial was treated as wrong ownership")
+
+            lease_id = "lsof-permission-lease"
+            server_id = "lsof-permission-server"
+            state = module.default_state()
+            state["leases"][lease_id] = {
+                "id": lease_id,
+                "status": "active",
+                "project": str(project),
+                "port": 43210,
+                "server_id": server_id,
+            }
+            state["servers"][server_id] = {
+                "id": server_id,
+                "key": module.server_key(str(project), "lsof-permission"),
+                "name": "lsof-permission",
+                "project": str(project),
+                "cwd": str(project),
+                "pid": 424242,
+                "port": 43210,
+                "host": "127.0.0.1",
+                "health_url": "http://127.0.0.1:43210/healthz",
+                "registration_identity": {"pid": 424242},
+                "lease_id": lease_id,
+                "status": "running",
+            }
+            observed = module.status_server(
+                state,
+                {"server_id": server_id, "project": str(project), "name": "lsof-permission"},
+            )
+            check(
+                observed.get("status") == "running"
+                and (observed.get("health") or {}).get("classification") == "unverified-listener"
+                and lease_id in state["leases"],
+                "read-only status destroyed state after lsof permission denial",
+            )
+
+            module.subprocess.run = lambda command, **_kwargs: subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="lsof: permission denied\n"
+            )
+            signals: list[int] = []
+            module.stop_pid = lambda pid: signals.append(int(pid))
+            managed_lease_id = "managed-lsof-permission-lease"
+            managed_server_id = "managed-lsof-permission-server"
+            managed_state = module.default_state()
+            managed_state["leases"][managed_lease_id] = {
+                "id": managed_lease_id,
+                "status": "active",
+                "project": str(project),
+                "port": 43211,
+                "server_id": managed_server_id,
+            }
+            managed_state["servers"][managed_server_id] = {
+                "id": managed_server_id,
+                "key": module.server_key(str(project), "managed-lsof-permission"),
+                "name": "managed-lsof-permission",
+                "project": str(project),
+                "cwd": str(project),
+                "pid": 424243,
+                "port": 43211,
+                "host": "127.0.0.1",
+                "health_url": "http://127.0.0.1:43211/healthz",
+                "lease_id": managed_lease_id,
+                "status": "running",
+            }
+            try:
+                module.stop_server(
+                    managed_state,
+                    {
+                        "agent": "lsof-guard",
+                        "project": str(project),
+                        "name": "managed-lsof-permission",
+                    },
+                )
+            except module.ListenerIdentityUnobservable:
+                pass
+            else:
+                raise AssertionError("managed server stop accepted an unobservable lsof cwd")
+            check(
+                not signals
+                and managed_state["servers"][managed_server_id]["status"] == "running"
+                and managed_lease_id in managed_state["leases"],
+                "managed server lsof denial signalled its PID or released its lease",
+            )
+
+            module.subprocess.run = lambda command, **_kwargs: subprocess.CompletedProcess(
+                command, 1, stdout="", stderr=""
+            )
+            signals.clear()
+            empty_lease_id = "managed-lsof-empty-lease"
+            empty_server_id = "managed-lsof-empty-server"
+            empty_state = module.default_state()
+            empty_state["leases"][empty_lease_id] = {
+                "id": empty_lease_id,
+                "status": "active",
+                "project": str(project),
+                "port": 43212,
+                "server_id": empty_server_id,
+            }
+            empty_state["servers"][empty_server_id] = {
+                "id": empty_server_id,
+                "key": module.server_key(str(project), "managed-lsof-empty"),
+                "name": "managed-lsof-empty",
+                "project": str(project),
+                "cwd": str(project),
+                "pid": 424244,
+                "port": 43212,
+                "host": "127.0.0.1",
+                "health_url": "http://127.0.0.1:43212/healthz",
+                "lease_id": empty_lease_id,
+                "status": "running",
+            }
+            empty_health = module.server_health(empty_state["servers"][empty_server_id])
+            check(
+                empty_health.get("ok") is None
+                and empty_health.get("classification") == "unverified-listener",
+                "live managed PID with an empty lsof cwd was treated as positively owned",
+            )
+            try:
+                module.stop_server(
+                    empty_state,
+                    {
+                        "agent": "lsof-guard",
+                        "project": str(project),
+                        "name": "managed-lsof-empty",
+                    },
+                )
+            except module.ListenerIdentityUnobservable:
+                pass
+            else:
+                raise AssertionError("managed server stop accepted an empty lsof cwd")
+            check(
+                not signals
+                and empty_state["servers"][empty_server_id]["status"] == "running"
+                and empty_lease_id in empty_state["leases"],
+                "managed server empty lsof cwd signalled its PID or released its lease",
+            )
+        finally:
+            module.subprocess.run = original_run
+            module.pid_alive = original_pid_alive
+            module.port_open = original_port_open
+            module.http_health = original_http_health
+            module.stop_pid = original_stop_pid
+
     def spawn_listener(cwd: Path, *, nondumpable: bool = False) -> tuple[subprocess.Popen[str], int]:
         port = free_port()
         code = HTTP_FIXTURE_CODE
@@ -561,6 +762,25 @@ def check_registration_pid_guards() -> None:
                     process.kill()
         rmtree(root, ignore_errors=True)
     check(True, "loopback HTTPS health checks should pass against self-signed certs")
+
+
+def check_zombie_pid_detection(module: object) -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and module.pid_alive(process.pid):
+            time.sleep(0.02)
+        check(
+            not module.pid_alive(process.pid),
+            "zombie PID must not be treated as a live managed process",
+        )
+    finally:
+        process.wait(timeout=5)
 
 
 def check_port_relocation_guards(module: object, tmp: Path, base_env: dict[str, str]) -> None:
@@ -1381,6 +1601,7 @@ def main() -> int:
             sys.path.insert(0, str(ROOT / "scripts"))
         import dev_coordinator as dc
 
+        check_zombie_pid_detection(dc)
         check_atomic_write_cleanup_preserves_primary(dc, tmp)
         check_port_relocation_guards(dc, tmp, env)
         check_unobservable_listener_lifecycle_guards(dc, tmp)

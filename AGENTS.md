@@ -171,3 +171,16 @@ These rules apply to Codex and Claude Code in this repository.
   never use a best-effort path normalization that can turn `EACCES` into a
   path-like error string. Permission denial is unknown ownership, not foreign
   ownership evidence.
+- Preserve that ownership tri-state for every managed and adopted server, not
+  only rows carrying explicit registration evidence. On non-Linux platforms,
+  `lsof` exit 1 is a clean no-match only when it has no diagnostic output;
+  permission/error diagnostics make the observation unknown. Read-only status
+  and inventory must never convert observer failure into a stopped row or
+  release its lease.
+- A successfully completed process-cwd probe with no concrete cwd is only a
+  negative probe result. It is not positive project attribution for a live
+  managed PID. Preserve that live server as unverified and forbid lifecycle
+  mutation until a concrete cwd proves ownership.
+- Do not use `kill(pid, 0)` alone as process-liveness evidence: it succeeds for
+  unreaped zombies. Prove that a PID is non-zombie before treating retained PID
+  metadata as a live ownership boundary; keep observer failure conservative.

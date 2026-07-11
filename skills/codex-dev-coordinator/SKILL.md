@@ -595,6 +595,15 @@ reporting success.
   running/unhealthy lifecycle and active lease; inability to observe is not
   evidence that another process owns the port. Use the capability-matched,
   authenticated production API inventory for a fresh strict ownership proof.
+- Apply the same tri-state rule to managed servers without explicit
+  registration evidence and to non-Linux lsof probes. lsof exit 1 with no
+  output is a clean no-match; permission or execution diagnostics mean
+  `observable=false`, never `wrong-listener`.
+- Treat that clean no-match as negative probe evidence only. If a managed PID
+  is still live but no concrete cwd was returned, project ownership remains
+  unverified and every mutating lifecycle path must fail closed.
+- Treat an unreaped zombie as terminated even though `kill(pid, 0)` succeeds;
+  confirm non-zombie process state before applying the live-PID ownership gate.
 - Server and project start, stop, and restart fail closed on that unknown
   identity before recording an operation, signaling or launching a process,
   changing a lease, acting on Docker, or writing sidecar metadata. Run the
