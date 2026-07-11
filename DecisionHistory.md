@@ -12,15 +12,25 @@ Why: The first public DevCoordinator matrix exposed two assumptions hidden by
 the development and Linux environments. A macOS runner returned its temporary
 directory through `/var`, which is a platform alias for `/private/var`, so the
 production-layout self-test accidentally supplied a symlinked fixture root and
-failed before reaching its intended assertions. Separately, `pg_isready`
+failed before reaching its intended assertions. The next matrix run proved the
+same contamination in the legacy-runtime migration self-test, and a deliberate
+`TMPDIR=/var/tmp` sweep reproduced it in the link-manager self-test before CI
+could reach that stage. Continuing that sweep found a coordinator relocation
+assertion comparing a canonical persisted project to the lexical test root.
+Separately, `pg_isready`
 succeeded during official-image initialization before `POSTGRES_DB=appdb` had
 been created, and the next backup query failed with `database "appdb" does not
 exist`. Weakening the production guard or adding a blind delay would have hidden
 the respective safety and lifecycle boundaries instead of proving them.
 
 Result: The layout self-test canonicalizes its newly created infrastructure
-root, deterministically models the `/var` alias, and separately proves that an
-operator-supplied intermediate symlink is still rejected. The Docker
+root; migration and link-manager self-tests now apply the same boundary. Each
+suite separately proves that an operator-supplied path component symlink is
+still rejected, and the layout suite deterministically models the `/var`
+alias. Repository policy now requires this fixture/production distinction for
+future strict-path tests. Every test-owned temporary root used in path identity,
+provenance, or standalone-copy checks is canonicalized, and the complete gate
+is exercised with `TMPDIR=/var/tmp`. The Docker
 integration performs a bounded `psql -X -qAt -v ON_ERROR_STOP=1 -U app -d
 appdb -c "SELECT 1;"` probe against `127.0.0.1`. Binding the probe to TCP also
 distinguishes the final server from the official image's socket-only temporary

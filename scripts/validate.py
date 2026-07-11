@@ -26,7 +26,7 @@ def run(args: list[str], *, cwd: Path = ROOT) -> None:
 
 
 def check_standalone_skill(skill: Path) -> None:
-    tmp = Path(tempfile.mkdtemp(prefix=f"{skill.name}-standalone-"))
+    tmp = Path(tempfile.mkdtemp(prefix=f"{skill.name}-standalone-")).resolve(strict=True)
     try:
         copied = tmp / skill.name
         shutil.copytree(skill, copied)

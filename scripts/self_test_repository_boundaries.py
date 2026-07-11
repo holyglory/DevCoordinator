@@ -74,7 +74,7 @@ def provenance(image: bytes, source_path: str, source: bytes) -> str:
 
 
 def main() -> int:
-    temp = Path(tempfile.mkdtemp(prefix="devcoordinator-boundary-self-test-"))
+    temp = Path(tempfile.mkdtemp(prefix="devcoordinator-boundary-self-test-")).resolve(strict=True)
     try:
         repo = temp / "repo"
         repo.mkdir()

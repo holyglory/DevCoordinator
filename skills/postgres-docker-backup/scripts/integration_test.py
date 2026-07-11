@@ -141,7 +141,7 @@ def raise_after_cleanup(primary_error: BaseException | None, cleanup_error: Base
 
 
 def cleanup_contract_self_test() -> int:
-    test_root = Path(tempfile.mkdtemp(prefix="postgres-backup-cleanup-contract-"))
+    test_root = Path(tempfile.mkdtemp(prefix="postgres-backup-cleanup-contract-")).resolve(strict=True)
     failing_tmp = test_root / "failing-run"
     failing_tmp.mkdir()
     (failing_tmp / "evidence.txt").write_text("fixture\n", encoding="utf-8")
@@ -348,7 +348,7 @@ def main() -> int:
 
     before = labeled_container_ids()
     container = f"devcoordinator-pg-it-{uuid.uuid4().hex[:12]}"
-    tmp = Path(tempfile.mkdtemp(prefix="postgres-backup-docker-integration-"))
+    tmp = Path(tempfile.mkdtemp(prefix="postgres-backup-docker-integration-")).resolve(strict=True)
     created = False
     primary_error: BaseException | None = None
     try:

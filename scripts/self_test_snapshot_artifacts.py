@@ -68,7 +68,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    temporary = Path(tempfile.mkdtemp(prefix="snapshot-artifact-self-test-"))
+    temporary = Path(tempfile.mkdtemp(prefix="snapshot-artifact-self-test-")).resolve(strict=True)
     try:
         regions = (
             VERIFIER.RegionSpec("top-left", 0, 0, 60, 40, 16),

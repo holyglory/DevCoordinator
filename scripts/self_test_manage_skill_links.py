@@ -551,6 +551,14 @@ def test_input_guards(base: Path) -> None:
     root_link = base / "root link"
     os.symlink(str(target), root_link)
     expect_error(manager.build_plan, repository, [root_link], contains="real directory")
+    repository_link = base / "canonical repository link"
+    os.symlink(str(repository), repository_link)
+    expect_error(
+        manager.build_plan,
+        repository_link,
+        [target],
+        contains="not a symlink",
+    )
     nested = target / "nested runtime"
     nested.mkdir()
     expect_error(manager.build_plan, repository, [target, nested], contains="must not be nested")
@@ -604,7 +612,10 @@ def test_help_names_devcoordinator() -> None:
 
 
 def main() -> int:
-    base = Path(tempfile.mkdtemp(prefix="devcoordinator-link-self-test-"))
+    # The fixture owns this temporary root. Canonicalize it before deriving
+    # repository and runtime paths so macOS's platform-managed /var alias does
+    # not contaminate strict operator-path checks.
+    base = Path(tempfile.mkdtemp(prefix="devcoordinator-link-self-test-")).resolve(strict=True)
     try:
         test_plan_apply_verify_rollback_and_unrelated(base)
         test_divergence_requires_explicit_acceptance(base)

@@ -118,7 +118,11 @@ def migrate(
 
 
 def main() -> int:
-    root = Path(tempfile.mkdtemp(prefix="devcoordinator-legacy-migration-"))
+    # The fixture owns this temporary root. Canonicalize it before passing
+    # derived paths into the production migration's strict symlink guard so a
+    # platform alias such as macOS /var -> /private/var is not mistaken for an
+    # operator-supplied runtime path.
+    root = Path(tempfile.mkdtemp(prefix="devcoordinator-legacy-migration-")).resolve(strict=True)
     try:
         paths = fixture(root / "happy")
         backup = root / "happy-backup"
@@ -222,6 +226,19 @@ def main() -> int:
         linked_before = migration.tree_manifest(linked["state_dir"])
         expect_error(lambda: migrate(linked, root / "linked-backup", sync_state_only=True), "symlink")
         check(migration.tree_manifest(linked["state_dir"]) == linked_before, "symlink rejection changed destination")
+
+        # Canonicalizing test-owned infrastructure must not make a real
+        # operator-supplied checkout alias acceptable.
+        operator_target = root / "operator-checkout-target"
+        operator_paths = fixture(operator_target)
+        operator_alias = root / "operator-checkout-alias"
+        operator_alias.symlink_to(operator_target, target_is_directory=True)
+        aliased_paths = dict(operator_paths)
+        aliased_paths["repo"] = operator_alias / "DevCoordinator"
+        expect_error(
+            lambda: migrate(aliased_paths, root / "operator-alias-backup", env_only=True),
+            "symlink component",
+        )
 
         changing = fixture(root / "changing-source")
         changing_before = migration.tree_manifest(changing["state_dir"])

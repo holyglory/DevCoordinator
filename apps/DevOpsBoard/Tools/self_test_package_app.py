@@ -184,7 +184,7 @@ def check_runtime_contract_detector() -> None:
 
 def main() -> int:
     check_runtime_contract_detector()
-    temp = Path(tempfile.mkdtemp(prefix="devops-board-app-package-test-"))
+    temp = Path(tempfile.mkdtemp(prefix="devops-board-app-package-test-")).resolve(strict=True)
     original_app_root = packager.APP_ROOT
     original_repository_root = packager.REPOSITORY_ROOT
     original_run = packager.run

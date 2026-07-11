@@ -135,7 +135,7 @@ def main() -> int:
         raise AssertionError(f"freshness detector is missing: {DETECTOR}")
 
     with tempfile.TemporaryDirectory(prefix="repository-freshness-self-test-") as raw_tmp:
-        tmp = Path(raw_tmp)
+        tmp = Path(raw_tmp).resolve(strict=True)
 
         current = make_world(tmp / "current")
         # Default-branch discovery is part of the public CLI contract.

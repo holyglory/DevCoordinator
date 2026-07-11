@@ -30,6 +30,13 @@ These rules apply to Codex and Claude Code in this repository.
   standard binary fallbacks, ignored/generated files, credentials, ports, and
   runtime state. A developer machine's installed tools or leftovers must not
   make a negative fixture pass or fail.
+- When a deterministic test passes its own temporary paths into production
+  code that rejects symlink components, canonicalize only the test-created
+  temporary root before deriving fixture paths. Keep a separate must-catch
+  case proving that an operator-supplied path component symlink is rejected;
+  never weaken the production guard for a host-managed alias such as macOS
+  `/var -> /private/var`. Canonicalize other test-owned temporary roots before
+  asserting path identity, provenance, or persisted canonical paths.
 - When a body operation and its cleanup, rollback, diagnostic collection, or
   restoration can both fail, the top-level redacted structured error must
   retain every operator-relevant failure. Tests must inject returned failures

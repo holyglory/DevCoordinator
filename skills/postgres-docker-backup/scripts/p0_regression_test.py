@@ -168,7 +168,7 @@ def test_partial_publication_rollback(root: Path) -> None:
 
 
 def main() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="postgres-backup-p0-regression-"))
+    tmp = Path(tempfile.mkdtemp(prefix="postgres-backup-p0-regression-")).resolve(strict=True)
     try:
         test_partial_publication_rollback(tmp / "publication-rollback")
         fake_bin = tmp / "bin"

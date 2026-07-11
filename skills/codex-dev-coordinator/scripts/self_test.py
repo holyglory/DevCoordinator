@@ -311,7 +311,7 @@ def check_listener_and_health_helpers() -> None:
 
     if not _which("openssl"):
         return  # cert generation needs openssl; skip gracefully where absent
-    cert_dir = Path(tempfile.mkdtemp(prefix="coordinator-health-tls-"))
+    cert_dir = Path(tempfile.mkdtemp(prefix="coordinator-health-tls-")).resolve(strict=True)
     try:
         cert = cert_dir / "cert.pem"
         key = cert_dir / "key.pem"
@@ -697,7 +697,7 @@ class _HealthzHandler(http.server.BaseHTTPRequestHandler):
 
 def main() -> int:
     check_listener_and_health_helpers()
-    tmp = Path(tempfile.mkdtemp(prefix="codex-dev-coordinator-self-test-"))
+    tmp = Path(tempfile.mkdtemp(prefix="codex-dev-coordinator-self-test-")).resolve(strict=True)
     env = os.environ.copy()
     env["CODEX_AGENT_COORDINATOR_HOME"] = str(tmp / "state")
     # Project-runtime tests must never inherit a real local Docker Desktop

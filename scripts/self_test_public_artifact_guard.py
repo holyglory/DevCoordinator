@@ -78,7 +78,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="public-artifact-guard-self-test-"))
+    tmp = Path(tempfile.mkdtemp(prefix="public-artifact-guard-self-test-")).resolve(strict=True)
     external_target = tmp.parent / f"{tmp.name}-external.md"
     try:
         git(tmp, "init", "-q")

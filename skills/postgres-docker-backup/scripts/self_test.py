@@ -516,7 +516,7 @@ def main() -> int:
     )
     test_throwable_cleanup_guards()
 
-    tmp = Path(tempfile.mkdtemp(prefix="postgres-docker-backup-self-test-"))
+    tmp = Path(tempfile.mkdtemp(prefix="postgres-docker-backup-self-test-")).resolve(strict=True)
     try:
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
