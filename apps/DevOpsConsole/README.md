@@ -189,6 +189,7 @@ the legacy cgroup and listeners are stopped.
 
 ```bash
 DEVCOORDINATOR_ROOT=/home/DevCoordinator
+set -euo pipefail
 LEGACY_ROOT="$HOME/holyskills"
 LEGACY_ENV="$LEGACY_ROOT/apps/DevOpsConsole/.env"
 LEGACY_STATE="$LEGACY_ROOT/apps/DevOpsConsole/state"
@@ -246,6 +247,7 @@ The first preflight intentionally does not require the API token because the
 coordinator creates it on first start.
 
 ```bash
+set -euo pipefail
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
   --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
   --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
@@ -262,6 +264,7 @@ preflight, verify the anonymous/authenticated API boundary, and then start the
 Console:
 
 ```bash
+set -euo pipefail
 sudo install -m 0644 \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/dev-coordinator.service" \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service" \
@@ -275,25 +278,8 @@ python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
   --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
   --token-file "$COORDINATOR_HOME/api-token" --require-token --wait-token-seconds 10
 
-python3 - <<'PY'
-import http.client
-from pathlib import Path
-
-token = (Path.home() / ".codex/agent-coordinator/api-token").read_text(encoding="utf-8").strip()
-def status(path, bearer=None):
-    connection = http.client.HTTPConnection("127.0.0.1", 29876, timeout=60)
-    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
-    connection.request("GET", path, headers=headers)
-    response = connection.getresponse()
-    response.read()
-    connection.close()
-    return response.status
-
-assert status("/healthz") == 200
-assert status("/v1/inventory") == 401
-assert status("/v1/inventory", token) == 200
-print("coordinator health/auth boundary ok")
-PY
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
+  --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876
 
 sudo systemctl start devops-console.service
 systemctl status dev-coordinator.service devops-console.service
@@ -308,6 +294,7 @@ capture the Console main PID, cgroup, exact child coordinator PID/start time/
 command, listener evidence, exact lease ID, and exact Console server ID.
 
 ```bash
+set -euo pipefail
 OLD_PROJECT="$LEGACY_ROOT"
 OLD_COORDINATOR="$OLD_PROJECT/skills/codex-dev-coordinator/scripts/dev_coordinator.py"
 umask 077
@@ -357,7 +344,13 @@ for raw in members.read_text(encoding="utf-8").splitlines():
     try:
         command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         command = [part.decode("utf-8", errors="replace") for part in command if part]
-        start_ticks = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21]
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        opening = stat_text.find("(")
+        closing = stat_text.rfind(")")
+        after_comm = stat_text[closing + 1:].split() if opening > 0 and closing > opening else []
+        if len(after_comm) < 20 or not after_comm[19].isdigit():
+            raise ValueError(f"invalid /proc stat for PID {pid}")
+        start_ticks = after_comm[19]
     except (FileNotFoundError, ProcessLookupError):
         continue
     records.append({"pid": pid, "start_ticks": start_ticks, "command": command})
@@ -375,11 +368,13 @@ if len(records) != 2:
         "legacy Console cgroup contains additional managed processes; "
         "classify/move those attributed process trees before cutover"
     )
-output.write_text(json.dumps({
-    "console": consoles[0],
-    "cgroup": cgroup,
-    "coordinator": coordinators[0],
-}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+with output.open("x", encoding="utf-8") as handle:
+    json.dump({
+        "console": consoles[0],
+        "cgroup": cgroup,
+        "coordinator": coordinators[0],
+    }, handle, indent=2, sort_keys=True)
+    handle.write("\n")
 os.chmod(output, 0o600)
 PY
 sudo ss -ltnp '( sport = :80 or sport = :443 or sport = :29876 )' \
@@ -387,71 +382,107 @@ sudo ss -ltnp '( sport = :80 or sport = :443 or sport = :29876 )' \
 chmod 600 "$CUTOVER_BACKUP/pre-cutover-listeners.txt"
 ```
 
+Immediately before applying the runtime override, require five consecutive
+one-second clean legacy cgroup samples. The sampler writes a private,
+independently checksummed JSON
+ledger after every sample, including the start time and exact argv of every
+accessible member. A mismatch therefore preserves attribution evidence before
+failing. Retry only with a new backup after the extra process is attributed and
+has exited or been moved/stopped through its own lifecycle. Refresh the backup
+manifest after adding the later process, listener, identity, and sample
+evidence.
+
+```bash
+set -euo pipefail
+python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_cutover_boundary.py" \
+  --evidence "$CUTOVER_BACKUP/legacy-processes.json" \
+  --ledger "$CUTOVER_BACKUP/cgroup-samples.stable.json" \
+  --samples 5 --interval-seconds 1
+
+MANIFEST_TMP="$(mktemp "$CUTOVER_BACKUP/.SHA256SUMS.XXXXXX")"
+(cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS \
+  ! -name '.SHA256SUMS.*' -print0 | LC_ALL=C sort -z | \
+  xargs -0 sha256sum > "$MANIFEST_TMP")
+mv -f "$MANIFEST_TMP" "$CUTOVER_BACKUP/SHA256SUMS"
+chmod 600 "$CUTOVER_BACKUP/SHA256SUMS"
+```
+
 Before stopping the legacy unit, apply a runtime-only `KillMode=process`
 override and verify it loaded. This prevents an agent-created process appearing
 after the cgroup snapshot from being silently killed. Stop terminates only the
 Console main process; the guarded cleanup sends TERM (then bounded KILL) only
 when the captured coordinator PID still has the captured start time and exact
-command. The following check requires both exact process instances, all three
+command. The sampler runs once more after the override reload and directly
+before stop, binding a second checksummed ledger to the actual stop boundary.
+The following check requires both exact process instances, all three
 listeners, and the old cgroup to be empty. Any extra survivor is a hard blocker:
 move its attributed process tree to a dedicated scope or stop/restart it
 explicitly with health evidence before reusing the unit name. Then remove the
 runtime override and perform the final staged state sync.
 
+From the successful stop boundary until relocation completes, this is an
+operator-exclusive coordinator mutation window. Do not run another coordinator
+API or CLI against `COORDINATOR_HOME`; a same-user process outside the stopped
+service cgroup is not covered by the process gate. If that exclusivity cannot
+be guaranteed, abort and restore the legacy unit before continuing.
+
 ```bash
+set -euo pipefail
+OVERRIDE_ACTIVE=0
+cleanup_cutover_override() {
+  exit_status="$?"
+  if [ "$OVERRIDE_ACTIVE" -eq 1 ]; then
+    set +e
+    sudo rm -f /run/systemd/system/devops-console.service.d/90-cutover-killmode.conf
+    sudo systemctl daemon-reload
+  fi
+  exit "$exit_status"
+}
+trap cleanup_cutover_override EXIT
 sudo install -d -m 0755 /run/systemd/system/devops-console.service.d
+OVERRIDE_ACTIVE=1
 printf '[Service]\nKillMode=process\n' | \
   sudo tee /run/systemd/system/devops-console.service.d/90-cutover-killmode.conf >/dev/null
 sudo systemctl daemon-reload
 test "$(systemctl show --property KillMode --value devops-console.service)" = process
+python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_cutover_boundary.py" \
+  --evidence "$CUTOVER_BACKUP/legacy-processes.json" \
+  --ledger "$CUTOVER_BACKUP/cgroup-samples.prestop-final.json" \
+  --samples 1 --interval-seconds 0
 sudo systemctl stop devops-console.service
-python3 - "$CUTOVER_BACKUP/legacy-processes.json" <<'PY'
-import json, os, signal, sys, time
-from pathlib import Path
+python3 "$DEVCOORDINATOR_ROOT/scripts/terminate_captured_legacy_process.py" \
+  --evidence "$CUTOVER_BACKUP/legacy-processes.json" --role coordinator \
+  --timeout-seconds 5
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_legacy_cutover_stopped.py" \
+  --evidence "$CUTOVER_BACKUP/legacy-processes.json" --ports 80 443 29876
 
-item = json.load(open(sys.argv[1], encoding="utf-8"))["coordinator"]
-stat = Path(f"/proc/{item['pid']}/stat")
-if stat.exists() and stat.read_text(encoding="utf-8").split()[21] == item["start_ticks"]:
-    command = [part.decode("utf-8", errors="replace") for part in Path(
-        f"/proc/{item['pid']}/cmdline"
-    ).read_bytes().split(b"\0") if part]
-    if command != item["command"]:
-        raise SystemExit("captured coordinator PID was reused or changed command; refusing to signal it")
-    os.kill(item["pid"], signal.SIGTERM)
-    deadline = time.monotonic() + 5
-    while stat.exists() and time.monotonic() < deadline:
-        time.sleep(0.1)
-    if stat.exists() and stat.read_text(encoding="utf-8").split()[21] == item["start_ticks"]:
-        os.kill(item["pid"], signal.SIGKILL)
-PY
-python3 - "$CUTOVER_BACKUP/legacy-processes.json" <<'PY'
-import json, socket, sys
-from pathlib import Path
-
-evidence = json.load(open(sys.argv[1], encoding="utf-8"))
-for item in (evidence["console"], evidence["coordinator"]):
-    stat = Path(f"/proc/{item['pid']}/stat")
-    if not stat.exists():
-        continue
-    current_start = stat.read_text(encoding="utf-8").split()[21]
-    if current_start == item["start_ticks"]:
-        raise SystemExit(f"captured legacy process is still alive: {item['pid']}")
-for port in (80, 443, 29876):
-    with socket.socket() as probe:
-        probe.settimeout(0.3)
-        if probe.connect_ex(("127.0.0.1", port)) == 0:
-            raise SystemExit(f"legacy listener still accepts connections on {port}")
-print("legacy Console/coordinator processes and listeners stopped")
-PY
-
-if [ -r "/sys/fs/cgroup${OLD_CONSOLE_CGROUP}/cgroup.procs" ] && \
-   grep -q '[0-9]' "/sys/fs/cgroup${OLD_CONSOLE_CGROUP}/cgroup.procs"; then
-  echo "legacy cgroup still has managed processes; refusing to reuse unit name" >&2
-  exit 1
-fi
+# This is the first lossless state checkpoint: every captured legacy writer
+# and listener has been proved stopped, so the state cannot change underneath
+# the copy.
+install -m 600 "$COORDINATOR_HOME/state.json" \
+  "$CUTOVER_BACKUP/coordinator-state.poststop.json"
+sha256sum "$CUTOVER_BACKUP/coordinator-state.poststop.json" \
+  > "$CUTOVER_BACKUP/coordinator-state.poststop.sha256"
+sha256sum --check "$CUTOVER_BACKUP/coordinator-state.poststop.sha256"
+sync -f "$CUTOVER_BACKUP"
 sudo rm -f /run/systemd/system/devops-console.service.d/90-cutover-killmode.conf
 sudo systemctl daemon-reload
+OVERRIDE_ACTIVE=0
+trap - EXIT
 
+# The legacy processes may have rewritten external state after the initial
+# preparation. Normalize and validate only after every legacy writer is gone.
+find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type d -exec chmod 700 {} +
+find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
+  --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
+  --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
+  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
+  --token-file "$COORDINATOR_HOME/api-token"
+
+python3 "$DEVCOORDINATOR_ROOT/scripts/write_cutover_phase_marker.py" \
+  --marker "$CUTOVER_BACKUP/state-migration.attempted" \
+  --phase state-migration-attempted
 python3 "$DEVCOORDINATOR_ROOT/scripts/migrate_legacy_console_runtime.py" \
   --legacy-env "$LEGACY_ENV" --legacy-state "$LEGACY_STATE" \
   --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
@@ -459,12 +490,18 @@ python3 "$DEVCOORDINATOR_ROOT/scripts/migrate_legacy_console_runtime.py" \
   --devcoordinator-root "$DEVCOORDINATOR_ROOT" \
   --backup-dir "$CUTOVER_BACKUP/legacy-migration-final" --sync-state-only
 
-install -m 600 "$COORDINATOR_HOME/state.json" "$CUTOVER_BACKUP/coordinator-state.final.json"
-sha256sum "$CUTOVER_BACKUP/coordinator-state.final.json" \
-  > "$CUTOVER_BACKUP/coordinator-state.final.sha256"
+install -m 600 "$COORDINATOR_HOME/state.json" \
+  "$CUTOVER_BACKUP/coordinator-state.pre-relocate.json"
+sha256sum "$CUTOVER_BACKUP/coordinator-state.pre-relocate.json" \
+  > "$CUTOVER_BACKUP/coordinator-state.pre-relocate.sha256"
+sha256sum --check "$CUTOVER_BACKUP/coordinator-state.pre-relocate.sha256"
+sync -f "$CUTOVER_BACKUP"
 
 LEASE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lease_id"])' \
   "$CUTOVER_BACKUP/pre-cutover-identities.json")"
+python3 "$DEVCOORDINATOR_ROOT/scripts/write_cutover_phase_marker.py" \
+  --marker "$CUTOVER_BACKUP/relocation.attempted" \
+  --phase relocation-attempted
 python3 "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
   port relocate --agent "$USER" \
   --old-project "$OLD_PROJECT" --new-project "$DEVCOORDINATOR_ROOT" \
@@ -477,6 +514,7 @@ Run the token-required layout preflight and the anonymous/authenticated probe
 from the fresh-host section before starting the new Console.
 
 ```bash
+set -euo pipefail
 sudo install -m 0644 \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/dev-coordinator.service" \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service" \
@@ -485,7 +523,13 @@ sudo systemctl daemon-reload
 sudo systemctl enable dev-coordinator.service devops-console.service
 sudo systemctl start dev-coordinator.service
 
-# Rerun the token-required preflight and the Python health/auth probe above.
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
+  --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
+  --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
+  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
+  --token-file "$COORDINATOR_HOME/api-token" --require-token --wait-token-seconds 10
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
+  --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876
 sudo systemctl start devops-console.service
 sleep 2
 python3 "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
@@ -512,9 +556,23 @@ for collection in (after.get("port_assignments", []), after.get("servers", []), 
         raise SystemExit("current coordinator state still points port 443 at the retired checkout")
 print("post-cutover assignment/server/lease identity ok")
 PY
-systemctl --no-pager --full status dev-coordinator.service devops-console.service
-journalctl --no-pager -u dev-coordinator.service -u devops-console.service --since '-5 minutes'
-curl --fail --silent --show-error https://console.vr.ae/healthz >/dev/null
+systemctl --no-pager --full status dev-coordinator.service devops-console.service \
+  | tee "$CUTOVER_BACKUP/post-cutover-systemd-status.txt"
+journalctl --no-pager -u dev-coordinator.service -u devops-console.service --since '-5 minutes' \
+  | tee "$CUTOVER_BACKUP/post-cutover-journal.txt"
+curl --fail --silent --show-error --output /dev/null \
+  --write-out 'status=%{http_code} remote=%{remote_ip} tls=%{ssl_verify_result}\n' \
+  https://console.vr.ae/healthz > "$CUTOVER_BACKUP/post-cutover-public-health.txt"
+chmod 600 "$CUTOVER_BACKUP"/post-cutover-*.txt
+
+MANIFEST_TMP="$(mktemp "$CUTOVER_BACKUP/.SHA256SUMS.XXXXXX")"
+(cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS \
+  ! -name '.SHA256SUMS.*' -print0 | LC_ALL=C sort -z | \
+  xargs -0 sha256sum > "$MANIFEST_TMP")
+mv -f "$MANIFEST_TMP" "$CUTOVER_BACKUP/SHA256SUMS"
+chmod 600 "$CUTOVER_BACKUP/SHA256SUMS"
+(cd "$CUTOVER_BACKUP" && sha256sum --check SHA256SUMS)
+sync -f "$CUTOVER_BACKUP"
 ```
 
 The verifier requires assignment, current server, and active lease for port 443
@@ -523,21 +581,59 @@ record. Separately confirm no current process, unit, helper, or environment
 value references the retired checkout. Historical events may retain the old
 path as evidence.
 
-On any failure, stop the split services, validate
-`coordinator-state.final.sha256`, restore that private state copy, and restore
-the exact unit topology captured before cutover. In particular, the real
+On any failure, stop every possible writer and choose state restoration by the
+durable phase marker. If relocation was attempted, restore `pre-relocate`; if
+only final migration was attempted, restore the exact writer-free `poststop`
+checkpoint. Before either marker, leave the current state untouched—an
+active-writer snapshot is never treated as lossless. A required but invalid
+checkpoint is a hard blocker rather than a reason to guess. Restore the exact
+unit topology captured before cutover. In particular, the real
 legacy host had no `dev-coordinator.service`; rollback must disable and remove
 that new-only unit before the old Console is allowed to autostart its child
 coordinator:
 
 ```bash
-sudo systemctl stop devops-console.service dev-coordinator.service || true
-sudo systemctl disable dev-coordinator.service || true
+set -euo pipefail
+sudo systemctl stop devops-console.service
+test "$(systemctl is-active devops-console.service || true)" != active
+COORDINATOR_LOAD_STATE="$(systemctl show --property LoadState --value \
+  dev-coordinator.service 2>/dev/null || true)"
+if [ "$COORDINATOR_LOAD_STATE" != not-found ] && [ -n "$COORDINATOR_LOAD_STATE" ]; then
+  sudo systemctl stop dev-coordinator.service
+  test "$(systemctl is-active dev-coordinator.service || true)" != active
+fi
+if [ -f "$CUTOVER_BACKUP/legacy-processes.json" ]; then
+  python3 "$DEVCOORDINATOR_ROOT/scripts/terminate_captured_legacy_process.py" \
+    --evidence "$CUTOVER_BACKUP/legacy-processes.json" --role coordinator \
+    --timeout-seconds 5
+fi
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_legacy_cutover_stopped.py" \
+  --evidence "$CUTOVER_BACKUP/legacy-processes.json" --ports 80 443 29876
+if grep -qx absent "$CUTOVER_BACKUP/dev-coordinator.service.preexisting" && \
+   systemctl cat dev-coordinator.service >/dev/null 2>&1; then
+  sudo systemctl disable dev-coordinator.service
+fi
 sudo rm -f /run/systemd/system/devops-console.service.d/90-cutover-killmode.conf
-sha256sum --check "$CUTOVER_BACKUP/coordinator-state.final.sha256"
-install -m 600 "$CUTOVER_BACKUP/coordinator-state.final.json" \
-  "$COORDINATOR_HOME/.state.json.rollback"
-mv -f "$COORDINATOR_HOME/.state.json.rollback" "$COORDINATOR_HOME/state.json"
+
+ROLLBACK_STATE=
+if [ -f "$CUTOVER_BACKUP/relocation.attempted" ]; then
+  test -f "$CUTOVER_BACKUP/coordinator-state.pre-relocate.json"
+  test -f "$CUTOVER_BACKUP/coordinator-state.pre-relocate.sha256"
+  sha256sum --check "$CUTOVER_BACKUP/coordinator-state.pre-relocate.sha256"
+  ROLLBACK_STATE="$CUTOVER_BACKUP/coordinator-state.pre-relocate.json"
+elif [ -f "$CUTOVER_BACKUP/state-migration.attempted" ]; then
+  test -f "$CUTOVER_BACKUP/coordinator-state.poststop.json"
+  test -f "$CUTOVER_BACKUP/coordinator-state.poststop.sha256"
+  sha256sum --check "$CUTOVER_BACKUP/coordinator-state.poststop.sha256"
+  ROLLBACK_STATE="$CUTOVER_BACKUP/coordinator-state.poststop.json"
+else
+  echo "no state mutation phase marker; preserving current coordinator state"
+fi
+if [ -n "$ROLLBACK_STATE" ]; then
+  install -m 600 "$ROLLBACK_STATE" \
+    "$COORDINATOR_HOME/.state.json.rollback"
+  mv -f "$COORDINATOR_HOME/.state.json.rollback" "$COORDINATOR_HOME/state.json"
+fi
 
 if grep -qx present "$CUTOVER_BACKUP/dev-coordinator.service.preexisting"; then
   sudo install -m 0644 "$CUTOVER_BACKUP/dev-coordinator.service.previous" \
@@ -548,6 +644,22 @@ fi
 sudo install -m 0644 "$CUTOVER_BACKUP/devops-console.service.previous" \
   /etc/systemd/system/devops-console.service
 sudo systemctl daemon-reload
+
+restore_enablement() {
+  unit="$1"
+  state="$(head -n 1 "$CUTOVER_BACKUP/$unit.enabled")"
+  case "$state" in
+    enabled) sudo systemctl enable "$unit" ;;
+    enabled-runtime) sudo systemctl enable --runtime "$unit" ;;
+    disabled) sudo systemctl disable "$unit" ;;
+    static|indirect|generated|transient|alias) ;;
+    *) echo "unsupported captured enablement for $unit: $state" >&2; return 1 ;;
+  esac
+}
+restore_enablement devops-console.service
+if grep -qx present "$CUTOVER_BACKUP/dev-coordinator.service.preexisting"; then
+  restore_enablement dev-coordinator.service
+fi
 sudo systemctl reset-failed dev-coordinator.service devops-console.service || true
 sudo systemctl start devops-console.service
 ```

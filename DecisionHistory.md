@@ -1,5 +1,46 @@
 # Decision History
 
+## 2026-07-11 - Cutover preconditions are sampled and revalidated after legacy stop
+
+Decision: An existing-host Console cutover requires five consecutive one-second
+cgroup samples containing only the exact captured Node and coordinator process
+instances, plus one final sample immediately before stop. A reusable sampler
+atomically preserves an independently checksummed JSON ledger with accessible
+process identity for every sample, including mismatches. Every mutation block
+uses fail-fast shell semantics. A writer-free post-stop checkpoint, a
+pre-relocation checkpoint, and durable migration/relocation phase markers make
+rollback valid without restoring an active-writer snapshot. Linux process
+start time is parsed after the final parenthesized `comm` delimiter, and exact
+termination uses an immutable pidfd instead of a racy numeric PID. After the legacy
+writers are gone, reset both external state trees to directory mode `0700` and
+file mode `0600`, then rerun the production-layout preflight before final state
+sync, ownership relocation, or split-unit start.
+
+Why: The final live audit briefly observed a third cgroup PID that exited before
+privileged attribution; five later samples contained only the two expected
+processes. It also found `state.json` at `0644` even though the preparation phase
+had normalized it earlier. The legacy coordinator can rewrite state while it
+remains active, so an old clean snapshot or early chmod is not proof of the
+actual cutover boundary.
+
+Result: The runbook now fails closed if sampling, KillMode verification,
+process/listener shutdown verification, permission repair, layout preflight,
+migration, or relocation fails. A transient extra cgroup member leaves private
+timestamped command/start evidence rather than only a terminal message. The
+permission repair runs only after listener/process shutdown, when the legacy
+writer cannot undo it, and proves the complete external layout again before
+mutation continues. Recall tests exercise an extra real process, PID reuse,
+the exact five/one-second cadence, fail-closed shell behavior, ordering, and
+phase-aware rollback. Tests include process names containing spaces and `)`, a
+realistic extra-process fixture arriving mid-sample, changed argv, missing
+process evidence, duplicate role PIDs, symlinked evidence parents, concurrent
+ledger writers, checksum tampering,
+PID reuse during stat/cmdline reading and handle binding, a surviving
+no-listener cgroup process during rollback, and a verifier failure that must
+not reach relocation. The temporary KillMode override is removed by an exit
+trap on every pre-stop abort, and optimized Python cannot disable the explicit
+auth checks.
+
 ## 2026-07-11 - Every macOS HTTP fixture uses the fast-bind server
 
 Decision: Ban bare `python -m http.server` argv from coordinator self-tests and

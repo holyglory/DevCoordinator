@@ -102,3 +102,17 @@ These rules apply to Codex and Claude Code in this repository.
 - Before destructive PostgreSQL-in-Docker work, create and verify a backup with
   `postgres-docker-backup` and bind every live operation to the expected
   immutable container ID.
+- During an existing-host Console cutover, preserve checksummed per-process
+  evidence for repeated clean cgroup samples and recheck immediately before
+  stop. Every copied mutation phase must enable fail-fast shell semantics.
+  Never treat state copied while a writer is active as lossless; checkpoint
+  only after verified shutdown and immediately before relocation, and bind
+  rollback to durable phase markers. Parse Linux `/proc/PID/stat` around its
+  final parenthesized `comm` delimiter and use pidfds for signaling so PID reuse
+  cannot redirect a signal. After the legacy writers are stopped, normalize both external
+  state trees to private modes and rerun production layout preflight before
+  state migration, relocation, or new-unit start.
+- Treat the writer-free post-stop checkpoint through successful relocation as
+  an operator-exclusive coordinator mutation window. Do not run another API or
+  coordinator CLI against that home until relocation is committed or rollback
+  is complete.

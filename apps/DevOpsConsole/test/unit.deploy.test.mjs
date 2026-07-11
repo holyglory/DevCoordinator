@@ -99,6 +99,22 @@ test('deployment runbook preserves an existing production environment file', asy
   assert.match(readme, /\$HOME\/\.config\/devops-console\/console\.env/);
 });
 
+test('cutover process identity and signaling are Linux-format and PID-reuse safe', async () => {
+  const scripts = path.resolve(APP_ROOT, '..', '..', 'scripts');
+  const parser = await fsp.readFile(path.join(scripts, 'linux_proc_identity.py'), 'utf8');
+  const sampler = await fsp.readFile(path.join(scripts, 'verify_legacy_cutover_boundary.py'), 'utf8');
+  const terminator = await fsp.readFile(path.join(scripts, 'terminate_captured_legacy_process.py'), 'utf8');
+  const authBoundary = await fsp.readFile(path.join(scripts, 'check_coordinator_auth_boundary.py'), 'utf8');
+  assert.match(parser, /stat_text\.rfind\("\)"\)/);
+  assert.match(parser, /after_comm\[19\]/);
+  assert.doesNotMatch(`${parser}\n${sampler}\n${terminator}`, /split\(\)\[21\]/);
+  assert.match(terminator, /os, "pidfd_open"/);
+  assert.match(terminator, /signal, "pidfd_send_signal"/);
+  assert.doesNotMatch(terminator, /os\.kill\(/);
+  assert.match(authBoundary, /if observed != expected:/);
+  assert.doesNotMatch(authBoundary, /\bassert\b/);
+});
+
 test('existing-host runbook models the legacy Console child-coordinator topology', async () => {
   const readme = await fsp.readFile(path.join(APP_ROOT, 'README.md'), 'utf8');
   const cutover = readme.split('### Existing-host checkout cutover')[1]?.split('Both units run as')[0] ?? '';
@@ -107,43 +123,121 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'ControlGroup --value devops-console.service',
     'legacy-processes.json',
     '"console": consoles[0]',
-    'current_start == item["start_ticks"]',
-    'command != item["command"]',
+    'stat_text.rfind(")")',
     'if len(records) != 2:',
+    'verify_legacy_cutover_boundary.py',
+    'terminate_captured_legacy_process.py',
+    'check_legacy_cutover_stopped.py',
+    '--samples 5 --interval-seconds 1',
+    '--samples 1 --interval-seconds 0',
+    'cgroup-samples.stable.json',
+    'cgroup-samples.prestop-final.json',
+    'find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +',
     '90-cutover-killmode.conf',
     'KillMode --value devops-console.service',
-    'legacy cgroup still has managed processes; refusing to reuse unit name',
     'pre-cutover-identities.json',
     '"server_id": servers[0]["id"]',
     '--sync-state-only',
-    'captured legacy process is still alive',
-    'legacy listener still accepts connections',
+    'coordinator-state.poststop.json',
+    'coordinator-state.pre-relocate.json',
+    'state-migration.attempted',
+    'relocation.attempted',
+    'no state mutation phase marker; preserving current coordinator state',
+    'trap cleanup_cutover_override EXIT',
+    'trap - EXIT',
+    'restore_enablement devops-console.service',
     'post-cutover Console server did not reuse the exact relocated identity',
     'systemctl disable dev-coordinator.service',
     'dev-coordinator.service.preexisting',
     'sudo rm -f /etc/systemd/system/dev-coordinator.service',
     'systemctl reset-failed dev-coordinator.service devops-console.service',
+    'check_coordinator_auth_boundary.py',
+    'sha256sum --check SHA256SUMS',
   ]) assert.ok(cutover.includes(marker), marker);
 
   assert.doesNotMatch(cutover, /systemctl restart dev-coordinator\.service/);
   assert.doesNotMatch(cutover, /MainPID --value dev-coordinator\.service/);
   assert.doesNotMatch(cutover, /\[ -s [^\n]*cgroup\.procs/);
-  assert.match(cutover, /grep -q '\[0-9\]' "\/sys\/fs\/cgroup\$\{OLD_CONSOLE_CGROUP\}\/cgroup\.procs"/);
+  assert.doesNotMatch(cutover, /assert status\(/);
+  assert.equal((cutover.match(/\.rfind\("\)"\)/g) ?? []).length, 1);
+  assert.match(cutover, /--samples 1 --interval-seconds 0\nsudo systemctl stop devops-console\.service/);
   assert.equal(
     (cutover.match(/sudo rm -f \/run\/systemd\/system\/devops-console\.service\.d\/90-cutover-killmode\.conf/g) ?? []).length,
-    2,
-    'normal cutover and rollback must both remove the temporary KillMode override',
+    3,
+    'normal cutover, failure trap, and rollback must remove the temporary KillMode override',
   );
+  assert.equal(
+    (cutover.match(/scripts\/terminate_captured_legacy_process\.py/g) ?? []).length,
+    2,
+    'normal stop and rollback must share the exact guarded termination helper',
+  );
+  assert.equal(
+    (cutover.match(/scripts\/check_legacy_cutover_stopped\.py/g) ?? []).length,
+    2,
+    'normal cutover and rollback must both prove captured processes, cgroup, and listeners stopped',
+  );
+  const bashBlocks = [...cutover.matchAll(/```bash\n([\s\S]*?)```/g)].map((match) => match[1]);
+  for (const marker of [
+    'legacy-processes.json',
+    'cgroup-samples.stable.json',
+    'systemctl stop devops-console.service',
+    'systemctl start dev-coordinator.service',
+    'ROLLBACK_STATE=',
+  ]) {
+    const block = bashBlocks.find((candidate) => candidate.includes(marker));
+    assert.ok(block, `missing executable cutover block for ${marker}`);
+    assert.match(block, /^set -euo pipefail\n/, `${marker} block must fail closed`);
+  }
+
+  const stopBlock = bashBlocks.find((candidate) => candidate.includes('systemctl stop devops-console.service'));
+  const shellGuard = stopBlock.split('\n', 1)[0];
+  let failClosedResult;
+  try {
+    await execFileAsync('/bin/bash', [
+      '-c',
+      `${shellGuard}\nverify_post_stop() { return 23; }\nrelocate() { printf 'relocation-sentinel'; }\nverify_post_stop\nrelocate`,
+    ]);
+    assert.fail('a failing post-stop verifier unexpectedly reached the next command');
+  } catch (error) {
+    failClosedResult = error;
+  }
+  assert.equal(failClosedResult.code, 23);
+  assert.doesNotMatch(failClosedResult.stdout ?? '', /relocation-sentinel/);
+
   const stopLegacy = cutover.indexOf('systemctl stop devops-console.service');
   const safeKillOverride = cutover.indexOf('90-cutover-killmode.conf');
+  const stableSamples = cutover.indexOf('cgroup-samples.stable.json');
+  const finalSamples = cutover.indexOf('cgroup-samples.prestop-final.json');
+  const poststopCheckpoint = cutover.indexOf('coordinator-state.poststop.json');
+  const trapCleared = cutover.indexOf('trap - EXIT');
+  const stoppedBoundaryChecks = [...cutover.matchAll(/scripts\/check_legacy_cutover_stopped\.py/g)]
+    .map((match) => match.index);
   const relocate = cutover.indexOf('port relocate --agent');
-  const installUnits = cutover.indexOf('sudo install -m 0644');
-  const startCoordinator = cutover.indexOf('systemctl start dev-coordinator.service');
-  const startConsole = cutover.indexOf('systemctl start devops-console.service');
+  const finalModeRepair = cutover.indexOf('find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +');
+  const finalLayoutPreflight = cutover.indexOf('scripts/check_production_layout.py', finalModeRepair);
+  const migrationMarker = cutover.indexOf('state-migration.attempted');
+  const finalSync = cutover.indexOf('--sync-state-only');
+  const preRelocateCheckpoint = cutover.indexOf('coordinator-state.pre-relocate.json');
+  const relocationMarker = cutover.indexOf('relocation.attempted');
+  const installUnits = cutover.indexOf('sudo install -m 0644', relocate);
+  const startCoordinator = cutover.indexOf('systemctl start dev-coordinator.service', installUnits);
+  const startConsole = cutover.indexOf('systemctl start devops-console.service', startCoordinator);
+  const rollbackStateDecision = cutover.indexOf('ROLLBACK_STATE=');
   assert.ok(
-    safeKillOverride >= 0 && safeKillOverride < stopLegacy
-      && stopLegacy < relocate && relocate < installUnits
+    stableSamples >= 0 && stableSamples < safeKillOverride && safeKillOverride < finalSamples
+      && finalSamples < stopLegacy
+      && stopLegacy < poststopCheckpoint && poststopCheckpoint < trapCleared
+      && trapCleared < finalModeRepair && finalModeRepair < finalLayoutPreflight
+      && finalLayoutPreflight < migrationMarker && migrationMarker < finalSync
+      && finalSync < preRelocateCheckpoint && preRelocateCheckpoint < relocationMarker
+      && relocationMarker < relocate && relocate < installUnits
       && installUnits < startCoordinator && startCoordinator < startConsole,
     'legacy cgroup must stop and relocate before split units start',
+  );
+  assert.equal(stoppedBoundaryChecks.length, 2);
+  assert.ok(
+    stopLegacy < stoppedBoundaryChecks[0] && stoppedBoundaryChecks[0] < poststopCheckpoint
+      && stoppedBoundaryChecks[1] < rollbackStateDecision,
+    'rollback must recheck the old cgroup before any state restoration decision',
   );
 });
