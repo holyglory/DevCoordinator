@@ -1,5 +1,54 @@
 # Decision History
 
+## 2026-07-11 - Every macOS HTTP fixture uses the fast-bind server
+
+Decision: Ban bare `python -m http.server` argv from coordinator self-tests and
+enforce the ban with an AST-based realistic must-catch fixture plus a
+socketserver false-positive control. All executable HTTP fixtures use
+`HTTP_FIXTURE_CODE`, which binds through `socketserver.TCPServer` without the
+reverse-DNS work in `HTTPServer.server_bind`.
+
+Why: The repository had already documented and fixed this macOS failure class,
+but two later exact-lease tests still used raw module argv. Local Homebrew Python
+3.13 reproduced the failure twice: the child stayed in `starting` until the
+manual-lease health deadline expired. Text search showed exactly two
+contradicting lists; the public matrix had not failed there consistently because
+reverse-DNS behavior varies by Python build and host configuration.
+
+Result: Both CLI and API exact-lease fixtures now use the fast-bind code path.
+The structural self-guard detects a realistic `['python', '-m', 'http.server',
+...]` argv list regardless of formatting while permitting the intended `-c`
+socketserver fixture. Dynamically constructed and shell commands remain a
+review-policy boundary; a tracked-tree search found no such executable use.
+Direct Python 3.9 and 3.13 self-tests exercise the literal guard before any
+server lifecycle test.
+
+## 2026-07-11 - Concurrency fixtures isolate pre-lock capabilities
+
+Decision: A concurrency fixture must make every prerequisite before its target
+lock deterministic, explicitly prove that its worker reached the intended
+blocking boundary, and surface any worker error when that boundary is not
+reached. Capability discovery is tested separately from lock serialization.
+
+Why: After the macOS path fixtures were repaired, both hosted macOS jobs reached
+the coordinator's Docker name/ID alias serialization test and timed out waiting
+for its fake subprocess. The fixture mocked container inspection and
+`subprocess.run`, but left Docker executable discovery real. GitHub's macOS
+runner has no Docker CLI, so the worker failed before reserving the immutable-ID
+operation; the generic event timeout misreported this prerequisite failure as a
+concurrency failure. Developer and Linux hosts with Docker masked the gap.
+
+Result: The alias fixture supplies a sentinel Docker executable, verifies both
+alias attempts used that resolver while only the winning attempt reached the
+fake external command, and includes worker evidence if its gate is not reached.
+The adjacent unverified-identity refusal uses the same isolated capability
+boundary. Token creation, idempotent start, delegated restart, exact-lease
+attachment, and Docker alias event fixtures now include worker evidence on
+gate failure, restore patches even when startup fails, and assert every worker
+terminated. Resolver call count is deliberately not pinned because
+capability-check/lock ordering is not the behavior under test. The production
+resolver and lifecycle locking are unchanged.
+
 ## 2026-07-11 - CI fixtures must prove canonical paths and usable database readiness
 
 Decision: Keep production path validation strict about every symlink component,

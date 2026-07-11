@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import copy
 import http.client
 import http.server
@@ -202,6 +203,45 @@ def wait_for_tcp(port: int) -> None:
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def literal_raw_http_server_argv_lines(source: str) -> list[int]:
+    findings: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        values = [
+            element.value if isinstance(element, ast.Constant) and isinstance(element.value, str) else None
+            for element in node.elts
+        ]
+        if any(
+            values[index] == "-m" and values[index + 1] == "http.server"
+            for index in range(len(values) - 1)
+        ):
+            findings.append(int(node.lineno))
+    return sorted(set(findings))
+
+
+def check_http_fixture_policy() -> None:
+    realistic_raw_fixture = "argv = ['python3', '-m', 'http.server', '{port}', '--bind', '127.0.0.1']\n"
+    safe_fast_bind_fixture = (
+        "argv = ['python3', '-c', "
+        "'import socketserver, http.server; socketserver.TCPServer((\\\"127.0.0.1\\\", 0), "
+        "http.server.SimpleHTTPRequestHandler).serve_forever()']\n"
+    )
+    check(
+        literal_raw_http_server_argv_lines(realistic_raw_fixture) == [1],
+        "raw http.server argv detector missed a realistic macOS-hanging fixture",
+    )
+    check(
+        literal_raw_http_server_argv_lines(safe_fast_bind_fixture) == [],
+        "raw http.server argv detector rejected the fast-bind socketserver control",
+    )
+    current_findings = literal_raw_http_server_argv_lines(Path(__file__).read_text(encoding="utf-8"))
+    check(
+        current_findings == [],
+        f"bare python -m http.server fixtures are forbidden; use HTTP_FIXTURE_CODE: {current_findings}",
+    )
 
 
 def _load_module():
@@ -696,6 +736,7 @@ class _HealthzHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    check_http_fixture_policy()
     check_listener_and_health_helpers()
     tmp = Path(tempfile.mkdtemp(prefix="codex-dev-coordinator-self-test-")).resolve(strict=True)
     env = os.environ.copy()
@@ -1495,11 +1536,9 @@ exit 0
                 json.dumps(
                     [
                         sys.executable,
-                        "-m",
-                        "http.server",
+                        "-c",
+                        HTTP_FIXTURE_CODE,
                         "{port}",
-                        "--bind",
-                        "127.0.0.1",
                     ]
                 ),
                 "--lease-id",
@@ -3593,11 +3632,9 @@ else:
                 "cwd": str(tmp),
                 "argv": [
                     sys.executable,
-                    "-m",
-                    "http.server",
+                    "-c",
+                    HTTP_FIXTURE_CODE,
                     "{port}",
-                    "--bind",
-                    "127.0.0.1",
                 ],
                 "lease_id": api_exact_lease["id"],
                 "health_url": "http://127.0.0.1:{port}/",
@@ -3775,7 +3812,7 @@ else:
         def paused_token_writer(fd: int, mode: str = "r", *args: object, **kwargs: object):
             if str(mode).startswith("w") and not writer_has_created.is_set():
                 writer_has_created.set()
-                release_writer.wait(timeout=5)
+                release_writer.wait(timeout=15)
             return original_fdopen(fd, mode, *args, **kwargs)
 
         def initialize_token() -> None:
@@ -3792,19 +3829,28 @@ else:
         loser_waited_for_winner = False
         try:
             winner = threading.Thread(target=initialize_token)
-            token_threads.append(winner)
             winner.start()
-            check(writer_has_created.wait(timeout=5), "token winner should reach the pre-write fixture gate")
+            token_threads.append(winner)
+            check(
+                writer_has_created.wait(timeout=15),
+                "token winner should reach the pre-write fixture gate; "
+                f"results={token_results} errors={token_errors}",
+            )
             loser = threading.Thread(target=initialize_token)
-            token_threads.append(loser)
             loser.start()
+            token_threads.append(loser)
             time.sleep(0.2)
             loser_waited_for_winner = loser.is_alive() and not token_errors and not token_results
         finally:
             release_writer.set()
             for thread in token_threads:
-                thread.join(timeout=10)
+                thread.join(timeout=15)
             dc.os.fdopen = original_fdopen
+        token_threads_alive = [thread.name for thread in token_threads if thread.is_alive()]
+        check(
+            not token_threads_alive,
+            f"concurrent token workers did not terminate: {token_threads_alive}; errors={token_errors}",
+        )
         check(loser_waited_for_winner, "a concurrent token loser must wait while the winner's file is incomplete")
         check(not token_errors, f"concurrent token initialization should not fail: {token_errors}")
         check(len(token_results) == 2, f"both concurrent token callers should return: {token_results}")
@@ -4647,7 +4693,7 @@ else:
 
         def delayed_existing_health(server: dict) -> dict:
             start_health_entered.set()
-            release_start_health.wait(timeout=5)
+            release_start_health.wait(timeout=15)
             return {"ok": True, "classification": "healthy"}
 
         def idempotent_start_worker() -> None:
@@ -4670,9 +4716,16 @@ else:
             )
         dc.server_health = delayed_existing_health
         start_race_thread = threading.Thread(target=idempotent_start_worker)
+        start_race_thread_started = False
+        start_race_thread_alive = False
         try:
             start_race_thread.start()
-            check(start_health_entered.wait(timeout=5), "idempotent start should reach its delayed health check")
+            start_race_thread_started = True
+            check(
+                start_health_entered.wait(timeout=15),
+                "idempotent start should reach its delayed health check; "
+                f"worker evidence: {start_race_result}",
+            )
             with dc.locked_state() as coordinator_state:
                 stopped_server = coordinator_state["servers"][observation_server_id]
                 stopped_server.update(
@@ -4684,10 +4737,16 @@ else:
                     }
                 )
             release_start_health.set()
-            start_race_thread.join(timeout=10)
         finally:
             release_start_health.set()
+            if start_race_thread_started:
+                start_race_thread.join(timeout=15)
+                start_race_thread_alive = start_race_thread.is_alive()
             dc.server_health = original_server_health
+        check(
+            not start_race_thread_alive,
+            f"idempotent-start worker did not terminate: {start_race_result}",
+        )
         raced_server = dc.snapshot_coordinator_state()["servers"][observation_server_id]
         check(
             "changed while" in str(start_race_result.get("error") or "")
@@ -4755,7 +4814,7 @@ else:
 
         def delegated_gap_start(options: dict) -> dict:
             restart_gap_entered.set()
-            release_restart_gap.wait(timeout=5)
+            release_restart_gap.wait(timeout=15)
             with dc.locked_state() as coordinator_state:
                 current = coordinator_state["servers"][restart_server_id]
                 child_generation = int(current.get("generation") or 0) + 1
@@ -4804,9 +4863,16 @@ else:
         }
         dc.coordinated_start_server = delegated_gap_start
         restart_thread = threading.Thread(target=atomic_restart_worker)
+        restart_thread_started = False
+        restart_thread_alive = False
         try:
             restart_thread.start()
-            check(restart_gap_entered.wait(timeout=5), "restart should reach the delegated stop/start gap")
+            restart_thread_started = True
+            check(
+                restart_gap_entered.wait(timeout=15),
+                "restart should reach the delegated stop/start gap; "
+                f"worker evidence: {restart_thread_result}",
+            )
             try:
                 dc.coordinated_stop_server(
                     {
@@ -4824,9 +4890,15 @@ else:
                 raise AssertionError("a direct stop must not interleave between restart stop/start children")
         finally:
             release_restart_gap.set()
-            restart_thread.join(timeout=10)
+            if restart_thread_started:
+                restart_thread.join(timeout=15)
+                restart_thread_alive = restart_thread.is_alive()
             dc.coordinated_start_server = original_start_server
             dc.server_health = original_server_health
+        check(
+            not restart_thread_alive,
+            f"delegated-restart worker did not terminate: {restart_thread_result}",
+        )
         check(
             not restart_thread_result.get("error")
             and (restart_thread_result.get("value") or {}).get("status") == "running",
@@ -4865,7 +4937,7 @@ else:
         def delayed_lease_port_available(port: int, host: str = "127.0.0.1") -> bool:
             if int(port) == lease_interleave_port:
                 lease_port_check_entered.set()
-                release_lease_port_check.wait(timeout=5)
+                release_lease_port_check.wait(timeout=15)
                 return True
             return original_port_available(port, host)
 
@@ -4886,12 +4958,16 @@ else:
 
         dc.port_available = delayed_lease_port_available
         lease_interleave_thread = threading.Thread(target=lease_interleave_worker)
+        lease_interleave_thread_started = False
+        lease_interleave_thread_alive = False
         pending_operation_id = ""
         try:
             lease_interleave_thread.start()
+            lease_interleave_thread_started = True
             check(
-                lease_port_check_entered.wait(timeout=5),
-                "exact-lease start should reserve state before its external port check",
+                lease_port_check_entered.wait(timeout=15),
+                "exact-lease start should reserve state before its external port check; "
+                f"worker evidence: {lease_interleave_result}",
             )
             with dc.locked_state() as coordinator_state:
                 pending_lease = coordinator_state["leases"][lease_interleave["id"]]
@@ -4928,8 +5004,14 @@ else:
                 pending_lease.pop("pending_server_id", None)
         finally:
             release_lease_port_check.set()
-            lease_interleave_thread.join(timeout=10)
+            if lease_interleave_thread_started:
+                lease_interleave_thread.join(timeout=15)
+                lease_interleave_thread_alive = lease_interleave_thread.is_alive()
             dc.port_available = original_port_available
+        check(
+            not lease_interleave_thread_alive,
+            f"exact-lease worker did not terminate: {lease_interleave_result}",
+        )
         check(
             "reservation changed before process launch" in str(lease_interleave_result.get("error") or ""),
             f"changed pre-launch reservation should fail deterministically: {lease_interleave_result}",
@@ -5161,6 +5243,7 @@ else:
         # Docker name and short/full-id aliases must serialize on the immutable
         # inspected container id, not on the caller's spelling.
         original_inspect_container = dc.inspect_docker_container
+        original_resolve_docker = dc.resolve_docker_executable
         original_subprocess_run = dc.subprocess.run
         alias_project = tmp / "docker-alias-owner"
         alias_project.mkdir()
@@ -5168,6 +5251,7 @@ else:
         docker_command_entered = threading.Event()
         release_docker_command = threading.Event()
         docker_command_calls: list[list[str]] = []
+        docker_resolver_calls: list[str] = []
         first_docker_call = True
 
         class FakeDockerCompleted:
@@ -5181,14 +5265,19 @@ else:
             if first_docker_call:
                 first_docker_call = False
                 docker_command_entered.set()
-                release_docker_command.wait(timeout=5)
+                release_docker_command.wait(timeout=15)
             return FakeDockerCompleted()
+
+        def fixture_docker_resolver() -> str:
+            docker_resolver_calls.append("resolved")
+            return "/fixture/docker"
 
         dc.inspect_docker_container = lambda container: {
             "Id": immutable_container_id,
             "Name": "/alias-db",
             "Config": {"Labels": {}},
         }
+        dc.resolve_docker_executable = fixture_docker_resolver
         dc.subprocess.run = blocking_docker_run
         first_alias_result: dict[str, object] = {}
 
@@ -5204,9 +5293,16 @@ else:
                 first_alias_result["error"] = str(exc)
 
         first_alias_thread = threading.Thread(target=first_alias_worker)
+        first_alias_thread_started = False
+        first_alias_thread_alive = False
         try:
             first_alias_thread.start()
-            check(docker_command_entered.wait(timeout=5), "first Docker alias should reach the external command")
+            first_alias_thread_started = True
+            check(
+                docker_command_entered.wait(timeout=15),
+                "first Docker alias should reach the external command; "
+                f"worker evidence: {first_alias_result}",
+            )
             try:
                 dc.coordinated_run_docker(
                     ["docker", "stop", immutable_container_id[:12]],
@@ -5223,13 +5319,26 @@ else:
                 raise AssertionError("name and id aliases of one container must not mutate concurrently")
         finally:
             release_docker_command.set()
-            first_alias_thread.join(timeout=10)
+            if first_alias_thread_started:
+                first_alias_thread.join(timeout=15)
+                first_alias_thread_alive = first_alias_thread.is_alive()
             dc.inspect_docker_container = original_inspect_container
+            dc.resolve_docker_executable = original_resolve_docker
             dc.subprocess.run = original_subprocess_run
+        check(
+            not first_alias_thread_alive,
+            f"Docker alias worker did not terminate: {first_alias_result}",
+        )
         check(not first_alias_result.get("error"), f"winning Docker alias should complete: {first_alias_result}")
         check(
             len(docker_command_calls) == 1,
             f"the conflicting alias must be rejected before a second Docker command: {docker_command_calls}",
+        )
+        check(
+            docker_resolver_calls and docker_command_calls[0][0] == "/fixture/docker",
+            "Docker alias serialization fixture must isolate executable discovery "
+            f"before testing the immutable-id lock: resolvers={docker_resolver_calls}, "
+            f"commands={docker_command_calls}",
         )
         alias_state = dc.snapshot_coordinator_state()
         check(
@@ -5241,6 +5350,7 @@ else:
             "Docker lifecycle evidence should use the immutable inspected container id",
         )
         dc.inspect_docker_container = lambda container: None
+        dc.resolve_docker_executable = fixture_docker_resolver
         dc.subprocess.run = lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("Docker mutation must not execute without immutable identity")
         )
@@ -5261,6 +5371,7 @@ else:
                 raise AssertionError("Docker mutation must fail closed when inspect cannot verify identity")
         finally:
             dc.inspect_docker_container = original_inspect_container
+            dc.resolve_docker_executable = original_resolve_docker
             dc.subprocess.run = original_subprocess_run
 
         print("self-test ok")

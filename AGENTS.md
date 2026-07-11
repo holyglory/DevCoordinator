@@ -30,6 +30,15 @@ These rules apply to Codex and Claude Code in this repository.
   standard binary fallbacks, ignored/generated files, credentials, ports, and
   runtime state. A developer machine's installed tools or leftovers must not
   make a negative fixture pass or fail.
+- A concurrency test must stub every capability check that precedes its
+  intended blocking boundary, prove the worker reached that boundary, and
+  include any worker error in a timeout failure. Do not mistake failure to
+  satisfy a prerequisite for evidence about serialization or locking.
+- Never launch a bare `python -m http.server` test fixture on macOS-capable
+  paths. Its inherited `HTTPServer.server_bind` can block on reverse DNS after
+  bind but before listen. Use the repository's fast-bind socketserver fixture,
+  and keep the AST recall/control guard that rejects literal raw http.server
+  argv in the coordinator self-test.
 - When a deterministic test passes its own temporary paths into production
   code that rejects symlink components, canonicalize only the test-created
   temporary root before deriving fixture paths. Keep a separate must-catch
