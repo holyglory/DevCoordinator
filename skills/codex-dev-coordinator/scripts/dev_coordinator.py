@@ -796,7 +796,8 @@ def registration_pid_identity(*, pid: int, host: str, port: int, project: str) -
     if not cwd:
         if sys.platform.startswith("linux"):
             try:
-                os.readlink(Path("/proc") / str(pid) / "cwd")
+                raw_cwd = os.readlink(Path("/proc") / str(pid) / "cwd")
+                Path(raw_cwd).resolve(strict=True)
             except PermissionError as exc:
                 raise ListenerIdentityUnobservable(
                     f"registration PID {pid} working directory is not observable by this process"
@@ -893,14 +894,32 @@ def resolve_registration_pid(options: dict[str, Any], *, host: str, port: int, p
     return None, None
 
 
+def process_cwd_from_proc(pid: int) -> str | None:
+    """Read one Linux cwd symlink without converting denial into a path.
+
+    Some older pathlib versions return a best-effort pseudo-path containing a
+    ``readlink: Permission denied`` suffix from ``Path.resolve()`` on procfs.
+    That string is not ownership evidence. Read the kernel link directly and
+    require the resulting directory to resolve strictly.
+    """
+
+    proc_cwd = Path("/proc") / str(int(pid)) / "cwd"
+    try:
+        raw = os.readlink(proc_cwd)
+        if not os.path.isabs(raw):
+            return None
+        return str(Path(raw).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def process_cwd(pid: int | None) -> str | None:
     if not pid:
         return None
-    proc_cwd = Path("/proc") / str(pid) / "cwd"
-    with contextlib.suppress(Exception):
-        if not proc_cwd.exists():
-            raise FileNotFoundError(str(proc_cwd))
-        return str(proc_cwd.resolve())
+    if sys.platform.startswith("linux"):
+        # Do not fall back to lsof after procfs denial. That is an unknown
+        # observation boundary, not permission to synthesize a cwd.
+        return process_cwd_from_proc(int(pid))
     with contextlib.suppress(Exception):
         completed = subprocess.run(
             ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],

@@ -397,6 +397,32 @@ def check_registration_pid_guards() -> None:
     foreign_project.mkdir()
     processes: list[subprocess.Popen[str]] = []
 
+    # Cross-version guard: Python 3.9 Path.resolve() can turn an unreadable
+    # procfs symlink into a pseudo-path containing the readlink error. Direct
+    # proc observation must instead preserve permission denial as unknown.
+    original_readlink = module.os.readlink
+    synthetic_proc_cwd = "/proc/424242/cwd"
+    try:
+        def denied_proc_readlink(path: object) -> str:
+            if str(path) == synthetic_proc_cwd:
+                raise PermissionError("denied")
+            return original_readlink(path)
+
+        module.os.readlink = denied_proc_readlink
+        check(
+            module.process_cwd_from_proc(424242) is None,
+            "unreadable proc cwd must not become a synthetic foreign path",
+        )
+        module.os.readlink = lambda path: (
+            str(project) if str(path) == synthetic_proc_cwd else original_readlink(path)
+        )
+        check(
+            module.process_cwd_from_proc(424242) == str(project.resolve()),
+            "readable proc cwd should resolve to the concrete project path",
+        )
+    finally:
+        module.os.readlink = original_readlink
+
     def spawn_listener(cwd: Path, *, nondumpable: bool = False) -> tuple[subprocess.Popen[str], int]:
         port = free_port()
         code = HTTP_FIXTURE_CODE

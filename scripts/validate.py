@@ -280,6 +280,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "server listener identity": "def server_listener_identity(",
         "listener ownership guard": "listener_belongs_to_project(",
         "strict registration PID ownership": "def registration_pid_identity(",
+        "direct proc cwd observation": "def process_cwd_from_proc(",
         "endpoint-specific registration ownership": "def _listening_inodes_for_endpoint(",
         "API capability inheritance clear": "def clear_exec_capability_inheritance(",
         "registration PID false-positive guard": "registration accepted invalid PID",

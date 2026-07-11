@@ -166,3 +166,8 @@ These rules apply to Codex and Claude Code in this repository.
   reservation. A pending operation can legitimately cause the observed state
   change; report that actionable conflict instead of misclassifying it as a
   generic retry race.
+- Treat procfs symlink readability as a tri-state security boundary. Read
+  `/proc/PID/cwd` with `os.readlink` and require a concrete strict target;
+  never use a best-effort path normalization that can turn `EACCES` into a
+  path-like error string. Permission denial is unknown ownership, not foreign
+  ownership evidence.

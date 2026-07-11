@@ -96,6 +96,17 @@ now checked without mutation before interpreting fingerprint drift, and
 concurrent start/stop test retains the actual stdout/stderr in its failure so a
 future ordering regression is diagnosable from clean-clone evidence.
 
+The next Linux matrix run exposed a Python-version-specific procfs observation
+failure before the capability integration executed. Python 3.9 represented an
+unreadable `Path('/proc/PID/cwd').resolve()` as a pseudo-path containing
+`readlink: Permission denied`; registration then misclassified that string as
+a concrete foreign cwd instead of the expected unobservable identity. Linux
+cwd discovery now uses direct `os.readlink`, requires an absolute strictly
+resolvable target, and never falls back to `lsof` after procfs denial. A
+cross-platform deterministic test injects `PermissionError` and requires
+`None`, while the real Linux nondumpable listener remains the must-catch
+integration fixture.
+
 ## 2026-07-11 - Loaded-unit checks model omitted undefined properties narrowly
 
 Decision: The loaded-systemd checker accepts an omitted property as empty only
