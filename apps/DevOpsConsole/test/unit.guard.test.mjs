@@ -164,7 +164,13 @@ test('sessionFrom: valid session accepted, allowlist re-checked on EVERY request
 
   // No cookie / tampered cookie.
   assert.equal(guard2.sessionFrom({ headers: {} }), null);
-  const tampered = cookieHeader.slice(0, -2) + (cookieHeader.endsWith('A') ? 'B' : 'A') + cookieHeader.slice(-1);
+  const encodedToken = cookieHeader.slice(cookieHeader.indexOf('=') + 1);
+  const [body, encodedSignature] = encodedToken.split('.');
+  const originalSignature = Buffer.from(encodedSignature, 'base64url');
+  const tamperedSignature = Buffer.from(originalSignature);
+  tamperedSignature[0] ^= 0x01;
+  assert.notDeepEqual(tamperedSignature, originalSignature);
+  const tampered = `dc_session=${body}.${tamperedSignature.toString('base64url')}`;
   assert.equal(guard2.sessionFrom({ headers: { cookie: tampered } }), null);
 });
 

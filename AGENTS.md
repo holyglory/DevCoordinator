@@ -30,6 +30,10 @@ These rules apply to Codex and Claude Code in this repository.
   standard binary fallbacks, ignored/generated files, credentials, ports, and
   runtime state. A developer machine's installed tools or leftovers must not
   make a negative fixture pass or fail.
+- Tamper tests for base64/base64url or other encoded cryptographic material
+  must change a decoded byte (or assert the decoded bytes changed). Do not
+  mutate a trailing encoded character and assume it changed the payload;
+  alternate encodings can differ only in unused padding bits.
 - A concurrency test must stub every capability check that precedes its
   intended blocking boundary, prove the worker reached that boundary, and
   include any worker error in a timeout failure. Do not mistake failure to

@@ -1,5 +1,26 @@
 # Decision History
 
+## 2026-07-11 - Authentication tamper fixtures change decoded bytes
+
+Decision: Cookie/session tamper tests mutate an actual decoded signature byte
+and re-encode it before expecting authentication rejection. Encoded-string
+edits are valid only when the test proves the decoded bytes differ.
+
+Why: A macOS Python 3.9 CI job landed on a session signature whose penultimate
+character was already `A` while its final character was not. The old fixture
+chose its replacement by inspecting the final character but replaced the
+penultimate one, so it reproduced the original token and then expected the
+valid token to fail. Trailing base64url edits can also differ only in unused
+bits, so encoded-string mutation is the wrong proof boundary. Production
+timing-safe verification behaved correctly. A 200-run local loop did not hit
+the same timestamp-dependent HMAC, showing why probabilistic string mutation
+was a weak guard.
+
+Result: The exact CI failure is covered deterministically, the production
+session code remains unchanged, and the adjacent session tests already mutate
+significant leading characters. Repeated and clean-clone Console suites no
+longer depend on random HMAC trailing bits.
+
 ## 2026-07-11 - System units pin the service account home
 
 Decision: Production system-level units pin `/home/holyglory` anywhere they
