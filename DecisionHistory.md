@@ -33,6 +33,16 @@ recall is portable to hosts and CI runners with deliberately empty global Git
 configuration. The server gate must be rerun after this correction; a green
 developer checkout alone is not accepted as Linux evidence.
 
+That rerun exposed the same class of contamination in the coordinator's Docker
+capability test. Its negative case used macOS launchd's real minimal system
+`PATH`, assuming Docker could not be installed there; `/usr/bin/docker` is a
+normal Linux installation, so the test found the host binary through the very
+fallback behavior it was meant to validate. The negative fixture now uses a
+private empty executable directory and a missing explicit standard location,
+while separate positive controls still prove normal-PATH, absolute fallback,
+and multicall-symlink discovery. Host Docker availability can no longer turn a
+deterministic missing-capability test into a false failure.
+
 ## 2026-07-11 - DevCoordinator became the independent owner of operations tooling
 
 Decision: Extract the coordinator, PostgreSQL protection skill, DevOps Board,

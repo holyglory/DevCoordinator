@@ -678,11 +678,14 @@ def main() -> int:
 
         check_port_relocation_guards(dc, tmp, env)
 
-        # A GUI-launched process commonly receives launchd's minimal PATH.  The
-        # resolver must report a capability failure when neither that PATH nor
-        # a standard absolute installation location contains Docker, and it
-        # must still find both normal-PATH and standard-location installations.
-        launchd_environment = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+        # A GUI-launched process commonly receives launchd's minimal PATH.  A
+        # Linux validation host may legitimately install Docker in /usr/bin,
+        # so an absence fixture must not reuse real system directories.  Keep
+        # every discovery channel controlled while proving the same missing-
+        # PATH and missing-standard-location contract.
+        isolated_launchd_path = tmp / "isolated-launchd-path"
+        isolated_launchd_path.mkdir()
+        launchd_environment = {"PATH": str(isolated_launchd_path)}
         missing_standard_docker = tmp / "missing-standard-location" / "docker"
         try:
             dc.resolve_docker_executable(
