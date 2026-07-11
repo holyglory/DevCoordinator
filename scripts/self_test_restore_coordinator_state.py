@@ -48,7 +48,9 @@ def command(snapshot: Path, checksum: Path, home: Path) -> list[str]:
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="restore-coordinator-state-") as raw:
+    # macOS exposes /var as a symlink to /private/var; secure rollback inputs
+    # intentionally reject symlinked parent chains, so use the direct HOME.
+    with tempfile.TemporaryDirectory(prefix=".restore-coordinator-state-", dir=Path.home()) as raw:
         root = private_directory(Path(raw))
         home = private_directory(root / "coordinator")
         old_payload = b'{"revision":1,"leases":{},"servers":{},"history":[],"port_assignments":{"old":{}}}\n'

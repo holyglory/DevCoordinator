@@ -267,7 +267,10 @@ def require_apply_failure(
 
 
 def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="retired-assignment-self-test-") as raw:
+    # macOS exposes /var as a symlink to /private/var. Production evidence
+    # deliberately rejects any symlink in its parent chain. A checkout-local
+    # fixture would also canonicalize to the repository root, so use HOME.
+    with tempfile.TemporaryDirectory(prefix=".retired-assignment-self-test-", dir=Path.home()) as raw:
         root = private_directory(Path(raw))
         old = private_directory(root / "legacy")
         private_directory(old / "apps" / "DevOpsConsole")
