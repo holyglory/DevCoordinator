@@ -113,6 +113,11 @@ These rules apply to Codex and Claude Code in this repository.
   manager-home paths in deterministic unit checks, and inspect resolved
   `ExecStart`, `Environment`, and file paths with `systemctl show` before the
   first production start.
+- Effective-unit tests must use the target systemd version's real `show`
+  serialization, including properties it omits when undefined. Treat a missing
+  property as empty only for an explicit per-unit allowlist backed by real
+  output and must-reject non-empty override fixtures; never apply a global
+  missing-as-empty normalization to security-relevant unit properties.
 - During an existing-host Console cutover, preserve checksummed per-process
   evidence for repeated clean cgroup samples and recheck immediately before
   stop. Every copied mutation phase must enable fail-fast shell semantics.

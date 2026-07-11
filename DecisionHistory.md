@@ -1,5 +1,28 @@
 # Decision History
 
+## 2026-07-11 - Loaded-unit checks model omitted undefined properties narrowly
+
+Decision: The loaded-systemd checker accepts an omitted property as empty only
+for `dev-coordinator.service`'s undefined `EnvironmentFiles` and
+`ExecStartPre`. Every other expected property remains mandatory, and a
+non-empty value for either optional field is rejected. The self-test fixture is
+copied from the target systemd 257 output and includes must-reject extra env
+file and pre-start command overrides.
+
+Why: The second split-unit cutover reached the new pre-start gate with both
+units safely inactive. All effective paths and commands were correct, but
+systemd 257 omitted those two undefined coordinator properties instead of
+printing `key=`. The synthetic fixture had printed empty keys, so the checker
+mistook a semantically empty real unit for missing evidence. The gate failed
+closed before listeners opened, and phase-aware rollback again restored the
+legacy service at HTTP 200 with valid TLS.
+
+Result: Missing-as-empty is not generalized: `DropInPaths`, fragment, identity,
+working directory, environment, commands, and write paths remain exact. The
+original real output now passes, while injected coordinator environment files
+or pre-start commands fail. Each cutover attempt keeps its own immutable backup
+and process/property evidence.
+
 ## 2026-07-11 - Authentication tamper fixtures change decoded bytes
 
 Decision: Cookie/session tamper tests mutate an actual decoded signature byte

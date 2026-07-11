@@ -23,8 +23,6 @@ User=holyglory
 Group=holyglory
 WorkingDirectory=/home/DevCoordinator
 Environment=CODEX_AGENT_COORDINATOR_HOME=/home/holyglory/.codex/agent-coordinator
-EnvironmentFiles=
-ExecStartPre=
 ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876 --token-file /home/holyglory/.codex/agent-coordinator/api-token ; ignore_errors=no ; start_time=[n/a] ; }
 ReadWritePaths=
 """
@@ -58,9 +56,12 @@ def main() -> int:
     must_fail(COORDINATOR.replace(f"{home}/.codex", "%h/.codex"), CONSOLE, "unresolved manager home")
     must_fail(COORDINATOR.replace("/etc/systemd/system", "/run/systemd/transient"), CONSOLE, "wrong coordinator fragment")
     must_fail(COORDINATOR.replace("DropInPaths=", "DropInPaths=/run/systemd/system/dev-coordinator.service.d/override.conf", 1), CONSOLE, "coordinator drop-in")
+    must_fail(COORDINATOR + "EnvironmentFiles=/tmp/attacker.env (ignore_errors=no)\n", CONSOLE, "coordinator extra environment file")
+    must_fail(COORDINATOR + "ExecStartPre={ path=/tmp/hook ; argv[]=/tmp/hook ; ignore_errors=no ; }\n", CONSOLE, "coordinator extra pre-start command")
     must_fail(COORDINATOR.replace("WorkingDirectory=/home/DevCoordinator", "WorkingDirectory=/tmp"), CONSOLE, "coordinator working directory")
     must_fail(COORDINATOR.replace("/home/DevCoordinator/skills", f"{home}/holyskills/skills"), CONSOLE, "stale coordinator executable")
     must_fail(COORDINATOR.replace("path=/usr/bin/python3", "path=/tmp/python3"), CONSOLE, "coordinator executable path")
+    must_fail(COORDINATOR.replace("ExecStart=", "MissingExecStart=", 1), CONSOLE, "missing coordinator command")
     must_fail(COORDINATOR, CONSOLE.replace(f"{home}/.config", "/root/.config"), "environment file")
     must_fail(COORDINATOR, CONSOLE.replace(f"--home {home}", "--home /root"), "preflight home")
     must_fail(COORDINATOR, CONSOLE.replace(f"--state-dir {home}/.local", "--state-dir /root/.local"), "preflight state")
@@ -72,6 +73,7 @@ def main() -> int:
     must_fail(COORDINATOR, CONSOLE.replace("WorkingDirectory=/home/DevCoordinator/apps/DevOpsConsole", "WorkingDirectory=/tmp"), "Console working directory")
     must_fail(COORDINATOR, CONSOLE.replace("COORDINATOR_SCRIPT=/home/DevCoordinator/skills", f"COORDINATOR_SCRIPT={home}/holyskills/skills"), "stale Console coordinator helper")
     must_fail(COORDINATOR, CONSOLE.replace("path=/usr/bin/env", "path=/tmp/env"), "Console executable path")
+    must_fail(COORDINATOR, CONSOLE.replace("ExecStart=", "MissingExecStart=", 1), "missing Console command")
     must_fail(COORDINATOR, CONSOLE.replace("FragmentPath=/etc/systemd/system", "FragmentPath=/tmp"), "wrong Console fragment")
 
     print("loaded systemd path self-test ok")

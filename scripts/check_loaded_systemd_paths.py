@@ -64,11 +64,18 @@ def parse_properties(raw: str) -> dict[str, str]:
 
 
 def require_exact(
-    violations: list[str], unit: str, properties: dict[str, str], key: str, expected: str
+    violations: list[str],
+    unit: str,
+    properties: dict[str, str],
+    key: str,
+    expected: str,
+    *,
+    allow_omitted_empty: bool = False,
 ) -> None:
     actual = properties.get(key)
     if actual is None:
-        violations.append(f"{unit} did not expose {key}")
+        if not (allow_omitted_empty and expected == ""):
+            violations.append(f"{unit} did not expose {key}")
     elif actual != expected:
         violations.append(f"{unit} {key} does not match the pinned production contract")
 
@@ -96,11 +103,10 @@ def require_command(
     actual = properties.get(key)
     if actual is None:
         violations.append(f"{unit} did not expose {key}")
+        return
     executable_paths = re.findall(r"\{ path=([^ ;]+) ; argv\[\]=", actual)
     expected_executable = expected.partition(" ")[0]
-    if actual is not None and (
-        executable_paths != [expected_executable] or command_argv(actual) != [expected]
-    ):
+    if executable_paths != [expected_executable] or command_argv(actual) != [expected]:
         violations.append(f"{unit} {key} does not contain exactly the pinned production command")
 
 
@@ -129,7 +135,14 @@ def validate_loaded_unit_outputs(coordinator_raw: str, console_raw: str) -> dict
         "ExecStartPre": "",
         "ReadWritePaths": "",
     }.items():
-        require_exact(violations, "dev-coordinator.service", coordinator, key, expected)
+        require_exact(
+            violations,
+            "dev-coordinator.service",
+            coordinator,
+            key,
+            expected,
+            allow_omitted_empty=key in {"EnvironmentFiles", "ExecStartPre"},
+        )
     require_command(violations, "dev-coordinator.service", coordinator, "ExecStart", COORDINATOR_ARGV)
 
     console = units["devops-console.service"]
