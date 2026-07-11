@@ -97,6 +97,36 @@ def run_fail(args: list[str], *, env: dict[str, str], expected: str) -> None:
         raise AssertionError(f"failure did not mention {expected!r}: {' '.join(args)}\n{haystack}")
 
 
+def request_http(
+    port: int,
+    method: str,
+    path: str,
+    *,
+    payload: dict | None = None,
+    token: str | None = None,
+    headers: dict[str, str] | None = None,
+    expected_status: int = 200,
+) -> tuple[dict[str, str], bytes]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    body = json.dumps(payload) if payload is not None else None
+    request_headers = dict(headers or {})
+    if payload is not None:
+        request_headers.setdefault("Content-Type", "application/json")
+    if token:
+        request_headers["Authorization"] = f"Bearer {token}"
+    conn.request(method, path, body=body, headers=request_headers)
+    response = conn.getresponse()
+    response_headers = {name.lower(): value for name, value in response.getheaders()}
+    response_body = response.read()
+    conn.close()
+    if response.status != expected_status:
+        raise AssertionError(
+            f"{method} {path} returned {response.status}, expected {expected_status}: "
+            f"{response_body.decode('utf-8', errors='replace')}"
+        )
+    return response_headers, response_body
+
+
 def request_json(
     port: int,
     method: str,
@@ -107,19 +137,16 @@ def request_json(
     headers: dict[str, str] | None = None,
     expected_status: int = 200,
 ) -> dict | list:
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    body = json.dumps(payload) if payload is not None else None
-    request_headers = dict(headers or {})
-    if payload is not None:
-        request_headers.setdefault("Content-Type", "application/json")
-    if token:
-        request_headers["Authorization"] = f"Bearer {token}"
-    conn.request(method, path, body=body, headers=request_headers)
-    response = conn.getresponse()
-    data = json.loads(response.read().decode("utf-8"))
-    conn.close()
-    if response.status != expected_status:
-        raise AssertionError(f"{method} {path} returned {response.status}, expected {expected_status}: {data}")
+    _, response_body = request_http(
+        port,
+        method,
+        path,
+        payload=payload,
+        token=token,
+        headers=headers,
+        expected_status=expected_status,
+    )
+    data = json.loads(response_body.decode("utf-8"))
     return data
 
 
@@ -264,6 +291,342 @@ def check_listener_and_health_helpers() -> None:
     check(True, "loopback HTTPS health checks should pass against self-signed certs")
 
 
+def check_port_relocation_guards(module: object, tmp: Path, base_env: dict[str, str]) -> None:
+    """Prove exact, atomic checkout ownership transfer and listener recall."""
+
+    root = tmp / "port-relocation"
+    old_project = root / "old-checkout"
+    new_project = root / "new-checkout"
+    foreign_project = root / "foreign-checkout"
+    for project in (old_project, new_project, foreign_project):
+        project.mkdir(parents=True)
+
+    name = "devops-console"
+    lease_id = "relocation-lease-exact"
+    server_id = "relocation-server-exact"
+
+    def fixture(port: int) -> dict:
+        state = module.default_state()
+        old_key = module.server_key(str(old_project), name)
+        state["port_assignments"] = {
+            old_key: {
+                "key": old_key,
+                "project": str(old_project.resolve()),
+                "name": name,
+                "port": port,
+                "agent": "old-agent",
+                "source": "server_register",
+                "created_at": module.iso_timestamp(),
+                "updated_at": module.iso_timestamp(),
+            }
+        }
+        state["servers"] = {
+            server_id: {
+                "id": server_id,
+                "key": old_key,
+                "project": str(old_project.resolve()),
+                "name": name,
+                "cwd": str(old_project / "apps" / "DevOpsConsole"),
+                "port": port,
+                "pid": 999_999_999,
+                "lease_id": lease_id,
+                "status": "stopped",
+                "cmd": f"node {old_project}/apps/DevOpsConsole/bin/devops-console.mjs",
+                "cmd_template": f"node {old_project}/apps/DevOpsConsole/bin/devops-console.mjs",
+                "health": {"ok": False, "pid_alive": False},
+                "created_at": module.iso_timestamp(),
+                "updated_at": module.iso_timestamp(),
+                "stopped_at": module.iso_timestamp(),
+                "stopped_ts": module.now(),
+            }
+        }
+        state["leases"] = {
+            lease_id: {
+                "id": lease_id,
+                "agent": "devops-console",
+                "project": str(old_project.resolve()),
+                "port": port,
+                "status": "active",
+                "purpose": f"server:{name}",
+                "server_id": server_id,
+                "created_at": module.iso_timestamp(),
+                "expires_at": module.now() + 3600,
+            }
+        }
+        return state
+
+    def prepare(case: str, state: dict) -> tuple[dict[str, str], Path]:
+        home = root / f"state-{case}"
+        home.mkdir(mode=0o700)
+        state_file = home / "state.json"
+        state_file.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        state_file.chmod(0o600)
+        case_env = base_env.copy()
+        case_env["CODEX_AGENT_COORDINATOR_HOME"] = str(home)
+        return case_env, state_file
+
+    def relocate_args(port: int, *, expected_lease: str = lease_id) -> list[str]:
+        return [
+            "port",
+            "relocate",
+            "--agent",
+            "cutover-agent",
+            "--old-project",
+            str(old_project),
+            "--new-project",
+            str(new_project),
+            "--name",
+            name,
+            "--port",
+            str(port),
+            "--lease-id",
+            expected_lease,
+        ]
+
+    happy_port = free_port()
+    happy_env, happy_file = prepare("happy", fixture(happy_port))
+    result = run(relocate_args(happy_port), env=happy_env)
+    happy_state = json.loads(happy_file.read_text(encoding="utf-8"))
+    new_key = module.server_key(str(new_project), name)
+    check(result.get("ok") is True, f"port relocation should succeed: {result}")
+    check(
+        list(happy_state["port_assignments"]) == [new_key]
+        and happy_state["port_assignments"][new_key]["port"] == happy_port,
+        f"relocation should move exactly one durable assignment: {happy_state['port_assignments']}",
+    )
+    migrated = happy_state["servers"][server_id]
+    check(
+        migrated["project"] == str(new_project.resolve())
+        and migrated["key"] == new_key
+        and migrated["cwd"] == str(new_project / "apps" / "DevOpsConsole")
+        and migrated["status"] == "stopped"
+        and migrated["pid"] is None
+        and migrated["lease_id"] is None
+        and migrated["cmd"] is None,
+        f"relocation should preserve one reusable stopped record without stale process paths: {migrated}",
+    )
+    check(
+        not any(
+            item.get("status") == "active" and item.get("project") == str(old_project.resolve())
+            for item in happy_state["leases"].values()
+        ),
+        "relocation must leave no active lease pointing at the retired checkout",
+    )
+    check(
+        happy_state["history"][-1]["type"] == "port.relocated"
+        and happy_state["history"][-1]["payload"]["agent"] == "cutover-agent",
+        "relocation should retain attributed history",
+    )
+    relocated_listener = subprocess.Popen(
+        [sys.executable, "-c", HTTP_FIXTURE_CODE, str(happy_port)],
+        cwd=new_project,
+        env=happy_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        wait_for_http(happy_port)
+        registered = run(
+            [
+                "server",
+                "register",
+                "--agent",
+                "devops-console",
+                "--project",
+                str(new_project),
+                "--name",
+                name,
+                "--cwd",
+                str(new_project),
+                "--port",
+                str(happy_port),
+                "--url",
+                f"http://127.0.0.1:{happy_port}",
+                "--health-url",
+                f"http://127.0.0.1:{happy_port}/",
+            ],
+            env=happy_env,
+        )
+        check(
+            registered.get("id") == server_id and registered.get("project") == str(new_project.resolve()),
+            f"new listener registration should reuse the relocated server id: {registered}",
+        )
+        registered_state = json.loads(happy_file.read_text(encoding="utf-8"))
+        check(
+            not any(
+                assignment.get("project") == str(old_project.resolve())
+                for assignment in registered_state["port_assignments"].values()
+            )
+            and not any(
+                server.get("project") == str(old_project.resolve()) and server.get("name") == name
+                for server in registered_state["servers"].values()
+            )
+            and not any(
+                lease.get("status") == "active" and lease.get("project") == str(old_project.resolve())
+                for lease in registered_state["leases"].values()
+            ),
+            "assignment, server, and active lease state must no longer point at the retired checkout",
+        )
+    finally:
+        if relocated_listener.poll() is None:
+            relocated_listener.terminate()
+            try:
+                relocated_listener.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                relocated_listener.kill()
+
+    def expect_unchanged(case: str, state: dict, args: list[str], expected: str) -> None:
+        case_env, state_file = prepare(case, state)
+        before = state_file.read_bytes()
+        run_fail(args, env=case_env, expected=expected)
+        check(state_file.read_bytes() == before, f"failed relocation {case} must not write coordinator state")
+
+    wrong_owner_port = free_port()
+    wrong_owner = fixture(wrong_owner_port)
+    old_key = module.server_key(str(old_project), name)
+    wrong_owner["port_assignments"][old_key]["project"] = str(foreign_project.resolve())
+    expect_unchanged("wrong-owner", wrong_owner, relocate_args(wrong_owner_port), "exact project/name/port")
+
+    wrong_lease_port = free_port()
+    expect_unchanged(
+        "wrong-lease",
+        fixture(wrong_lease_port),
+        relocate_args(wrong_lease_port, expected_lease="not-the-captured-lease"),
+        "missing without stale-release evidence",
+    )
+
+    foreign_lease_port = free_port()
+    foreign_lease = fixture(foreign_lease_port)
+    foreign_lease["leases"]["foreign-active-lease"] = {
+        "id": "foreign-active-lease",
+        "agent": "foreign-agent",
+        "project": str(foreign_project.resolve()),
+        "port": foreign_lease_port,
+        "status": "active",
+        "purpose": "manual",
+        "created_at": module.iso_timestamp(),
+        "expires_at": module.now() + 3600,
+    }
+    expect_unchanged(
+        "foreign-lease",
+        foreign_lease,
+        relocate_args(foreign_lease_port),
+        "foreign active lease",
+    )
+
+    pending_lease_port = free_port()
+    pending_lease = fixture(pending_lease_port)
+    pending_lease["leases"][lease_id]["pending_operation_id"] = "pending-lease-operation"
+    expect_unchanged(
+        "pending-lease",
+        pending_lease,
+        relocate_args(pending_lease_port),
+        "has pending operation",
+    )
+
+    pending_operation_port = free_port()
+    pending_operation = fixture(pending_operation_port)
+    pending_operation["operations"]["pending-server-operation"] = {
+        "id": "pending-server-operation",
+        "action": "server.stop",
+        "target": f"server:{module.server_key(str(old_project), name)}",
+        "agent": "old-agent",
+        "project": str(old_project.resolve()),
+        "generation": 1,
+        "status": "pending",
+        "phase": "reserved",
+        "owner_pid": os.getpid(),
+        "owner_thread": threading.get_ident(),
+        "created_at": module.iso_timestamp(),
+        "created_ts": module.now(),
+        "updated_at": module.iso_timestamp(),
+    }
+    expect_unchanged(
+        "pending-operation",
+        pending_operation,
+        relocate_args(pending_operation_port),
+        "pending coordinator operation",
+    )
+
+    live_pid_port = free_port()
+    live_pid = fixture(live_pid_port)
+    live_pid["servers"][server_id]["pid"] = os.getpid()
+    expect_unchanged(
+        "live-recorded-pid",
+        live_pid,
+        relocate_args(live_pid_port),
+        "is still alive",
+    )
+
+    ambiguous_port = free_port()
+    ambiguous = fixture(ambiguous_port)
+    ambiguous["servers"]["ambiguous-old-record"] = {
+        **ambiguous["servers"][server_id],
+        "id": "ambiguous-old-record",
+        "port": free_port(),
+    }
+    expect_unchanged(
+        "ambiguous-server",
+        ambiguous,
+        relocate_args(ambiguous_port),
+        "ambiguous old server identity",
+    )
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        live_port = int(listener.getsockname()[1])
+        expect_unchanged("live-listener", fixture(live_port), relocate_args(live_port), "live listener")
+    finally:
+        listener.close()
+
+    # Bind-based availability checks falsely reject a free privileged port
+    # when an unprivileged process gets EACCES. Prove relocation uses only
+    # positive listener evidence by making the legacy bind probe explode.
+    privileged_home = root / "state-privileged-eacces"
+    privileged_home.mkdir(mode=0o700)
+    (privileged_home / "state.json").write_text(
+        json.dumps(fixture(443), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (privileged_home / "state.json").chmod(0o600)
+    original_home = os.environ.get("CODEX_AGENT_COORDINATOR_HOME")
+    original_listener_evidence = module.listener_evidence_for_port
+    original_port_available = module.port_available
+    os.environ["CODEX_AGENT_COORDINATOR_HOME"] = str(privileged_home)
+    module.listener_evidence_for_port = lambda port: {
+        "present": False,
+        "port": port,
+        "pid": None,
+        "proc_listen_socket_count": 0,
+        "loopback_reachable": False,
+    }
+    module.port_available = lambda *args, **kwargs: (_ for _ in ()).throw(
+        PermissionError(13, "simulated EACCES from privileged bind probe")
+    )
+    try:
+        with module.locked_state() as state:
+            low_result = module.relocate_port_assignment(
+                state,
+                agent="cutover-agent",
+                old_project=str(old_project),
+                new_project=str(new_project),
+                name=name,
+                port=443,
+                lease_id=lease_id,
+            )
+        check(low_result.get("ok") is True, "free privileged port must not be rejected by a bind EACCES")
+    finally:
+        module.listener_evidence_for_port = original_listener_evidence
+        module.port_available = original_port_available
+        if original_home is None:
+            os.environ.pop("CODEX_AGENT_COORDINATOR_HOME", None)
+        else:
+            os.environ["CODEX_AGENT_COORDINATOR_HOME"] = original_home
+
+
 class _HealthzHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         return
@@ -312,6 +675,8 @@ def main() -> int:
         if str(ROOT / "scripts") not in sys.path:
             sys.path.insert(0, str(ROOT / "scripts"))
         import dev_coordinator as dc
+
+        check_port_relocation_guards(dc, tmp, env)
 
         # A GUI-launched process commonly receives launchd's minimal PATH.  The
         # resolver must report a capability failure when neither that PATH nor
@@ -2975,6 +3340,100 @@ else:
         check(stat.S_IMODE(token_file.stat().st_mode) == 0o600, "API token file must be mode 0600")
         health = get_json(api_port, "/healthz")
         check(set(health) == {"ok", "service", "version"}, "anonymous health must not disclose coordinator state")
+        health_get_headers, health_get_body = request_http(api_port, "GET", "/healthz")
+        health_head_headers, health_head_body = request_http(api_port, "HEAD", "/healthz")
+        check(not health_head_body, "HEAD /healthz must return headers only")
+        check(
+            health_head_headers.get("content-length") == health_get_headers.get("content-length")
+            == str(len(health_get_body)),
+            "HEAD /healthz must advertise the same representation length as GET without sending a body",
+        )
+
+        # Authentication is a route boundary, not an accident of the two
+        # methods with product handlers. Real clients, scanners, and mistaken
+        # integrations send other standard methods; BaseHTTPRequestHandler's
+        # inherited 501 path must never run before /v1 authorization.
+        protected_method_matrix = (
+            ("POST", "/v1/state", "GET"),
+            ("GET", "/v1/projects/status", "POST"),
+            ("HEAD", "/v1/state", "GET"),
+            ("PUT", "/v1/state", "GET"),
+            ("DELETE", "/v1/projects/status", "POST"),
+            ("PATCH", "/v1/ports/lease", "POST"),
+            ("OPTIONS", "/v1/state", "GET"),
+            ("PROPFIND", "/v1/state", "GET"),
+        )
+        for method, path, allowed_method in protected_method_matrix:
+            anonymous_headers, anonymous_body = request_http(
+                api_port,
+                method,
+                path,
+                expected_status=401,
+            )
+            check(
+                anonymous_headers.get("www-authenticate") == 'Bearer realm="codex-dev-coordinator"',
+                f"anonymous {method} {path} must receive the bearer challenge",
+            )
+            if method == "HEAD":
+                check(not anonymous_body, "HEAD responses must not include a body")
+            else:
+                check(
+                    json.loads(anonymous_body.decode("utf-8")).get("error") == "unauthorized",
+                    f"anonymous {method} {path} must fail at the auth boundary",
+                )
+
+            authenticated_headers, authenticated_body = request_http(
+                api_port,
+                method,
+                path,
+                token=api_token,
+                expected_status=405,
+            )
+            check(
+                authenticated_headers.get("allow") == allowed_method,
+                f"authenticated {method} {path} must advertise {allowed_method} as the allowed method",
+            )
+            if method == "HEAD":
+                check(not authenticated_body, "authenticated HEAD error responses must not include a body")
+                check(
+                    int(authenticated_headers.get("content-length") or 0) > 0,
+                    "authenticated HEAD 405 must describe the body a non-HEAD request would receive",
+                )
+            else:
+                check(
+                    json.loads(authenticated_body.decode("utf-8")).get("error") == "method not allowed",
+                    f"authenticated {method} {path} must receive a JSON 405",
+                )
+
+        health_put_headers, health_put_body = request_http(
+            api_port,
+            "PUT",
+            "/healthz",
+            expected_status=405,
+        )
+        check(
+            health_put_headers.get("allow") == "GET, HEAD"
+            and json.loads(health_put_body.decode("utf-8")).get("error") == "method not allowed",
+            "anonymous health must allow only GET and HEAD",
+        )
+        outside_headers, outside_body = request_http(
+            api_port,
+            "DELETE",
+            "/not-an-api-route",
+            expected_status=404,
+        )
+        check(
+            "www-authenticate" not in outside_headers
+            and json.loads(outside_body.decode("utf-8")).get("error") == "not found",
+            "non-v1 unsupported requests must fail as JSON 404 without an auth challenge",
+        )
+        _, outside_head_body = request_http(
+            api_port,
+            "HEAD",
+            "/not-an-api-route",
+            expected_status=404,
+        )
+        check(not outside_head_body, "non-v1 HEAD 404 must not include a body")
         unauthorized = request_json(api_port, "GET", "/v1/state", expected_status=401)
         check(unauthorized.get("error") == "unauthorized", "protected API state must reject missing bearer credentials")
         wrong_token = request_json(api_port, "GET", "/v1/state", token="definitely-not-the-token", expected_status=401)

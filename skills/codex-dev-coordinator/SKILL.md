@@ -66,7 +66,10 @@ The script uses a lock file in that directory so concurrent agents cannot lease
 the same port. The lock protects short state snapshot, reservation, and commit
 phases; it is not held while starting or stopping processes, polling health,
 running Docker, inspecting listeners, scanning inventory/backups, or writing an
-HTTP response. Same-target lifecycle mutations are rejected while an operation
+HTTP response. The sole deliberate exception is `port relocate`'s bounded
+final positive-listener check inside its state transaction; that closes the
+race between proving the old listener stopped and moving durable ownership.
+Same-target lifecycle mutations are rejected while an operation
 is pending, while unrelated projects and leases continue independently. A
 pending project lifecycle also excludes direct server and Docker mutations for
 that canonical project. Only synchronous child work carrying the exact internal
@@ -159,6 +162,30 @@ orphan left by a moved or renamed repo); without `--force` foreign pins are
 protected. Pre-assignment state files are migrated automatically: every
 existing server record seeds a pin for its recorded port, and when two records
 contest one port the most recently stopped record wins.
+
+For an operator-approved checkout ownership migration, do not unassign and
+race to re-create the pin. Capture the exact active lease ID from inventory,
+stop and verify the old listener, privately back up `state.json`, then transfer
+the assignment and reusable stopped server identity in one locked operation:
+
+```bash
+python3 scripts/dev_coordinator.py port relocate \
+  --agent "$USER" \
+  --old-project /absolute/old/checkout \
+  --new-project /absolute/new/checkout \
+  --name devops-console \
+  --port 443 \
+  --lease-id EXACT_PRE_CUTOVER_LEASE_ID
+```
+
+`port relocate` is deliberately strict. It rejects a live listener, live
+recorded PID, pending lease/operation, wrong or ambiguous assignment/server,
+foreign active lease, destination collision, or a missing lease without exact
+retained stale-release evidence. It uses positive listener evidence and never
+tries to bind the port, because an unprivileged bind to a free port such as 443
+can fail with `EACCES`. A successful relocation clears obsolete process/launch
+fields, marks the migrated server stopped, records attributed history, and
+allows the new listener's `server register` to reuse the same server ID.
 
 `--cmd` is compatibility input. It is parsed into argv and is never evaluated
 by a shell; shell control operators such as `;`, `&&`, pipes, redirects, and

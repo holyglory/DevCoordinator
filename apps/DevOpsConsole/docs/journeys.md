@@ -1,9 +1,8 @@
 # DevOps Console — User Journeys
 
 Journey documentation for the control panel at `https://console.vr.ae/`
-(`src/ui/`). Structured after
-`skills/user-journey-docs-audit/references/journey_doc_template.md` so it can
-feed `user-journey-docs-audit` and `ui-implementation-audit` directly.
+(`src/ui/`). It is self-contained product truth for implementation, testing,
+and review; no external audit-skill checkout is required.
 
 ## App Idea
 
@@ -524,8 +523,7 @@ Prioritized: top rows are the most frequent and most important.
 
 ## Interaction And Metadata Model
 
-Binding affordance rules — these are the ten `ui-implementation-audit`
-labels, made concrete for this app:
+Binding affordance rules, made concrete for this app:
 
 | Label | Rule in this app |
 | --- | --- |
@@ -551,7 +549,7 @@ labels, made concrete for this app:
 | Port leases | J6 | Screenshots: form + populated table incl. countdown warning; lease→release round trip | empty, degraded, ticking countdown, form error, release confirm | none | Attribution = console user |
 | Performance | J7 | Screenshots: populated chart cards (running + dimmed stale), usage bars; row sparkline popover | collecting (no history yet), populated, sampler-error note, degraded | none | CPU normalized to observed peak |
 | Nav | All | Screenshots: desktop tabs with counts + active state; mobile drawer open/closed | drawer open/closed, active page marked, counts hidden when unknown | none | None |
-| Global | All | `formal-web-ui-verification` at 1440px and 390px per page: no horizontal document scroll, no clipped text, visible scrollbar inventory (expected: document vertical + log boxes + popover when open); the ten labels above each marked pass with evidence | error banner, 401 reload, reduced-motion, focus-visible pass | none | None |
+| Global | All | Deterministic browser verification at 1440px and 390px per page: no horizontal document scroll, no clipped text, visible scrollbar inventory (expected: document vertical + log boxes + popover when open); the ten labels above each marked pass with evidence | error banner, 401 reload, reduced-motion, focus-visible pass | none | None |
 
 Do not turn this table into a fixed layout recipe: grouping, exact widgets and
 visual treatments stay with the implementation, provided every decision above

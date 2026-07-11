@@ -203,6 +203,8 @@ def main() -> int:
         write(binary, "current executable bytes\n", executable=True)
 
         calls: list[list[str]] = []
+        git_status_output = ""
+        head_mismatch_paths: set[str] = set()
 
         def fake_run(command: list[str], *, cwd: Path = app_root, capture: bool = False) -> str:
             del cwd, capture
@@ -215,8 +217,17 @@ def main() -> int:
                 return "1" * 40
             if command[:3] == ["git", "rev-parse", "HEAD^{tree}"]:
                 return "2" * 40
+            if command[:2] == ["git", "rev-parse"] and command[2].startswith("HEAD:"):
+                return "3" * 40
+            if command[:2] == ["git", "hash-object"]:
+                relative = next(
+                    item.removeprefix("--path=")
+                    for item in command
+                    if item.startswith("--path=")
+                )
+                return ("4" if relative in head_mismatch_paths else "3") * 40
             if command[:3] == ["git", "status", "--porcelain"]:
-                return ""
+                return git_status_output
             if command and command[0] == "plutil":
                 with Path(command[-1]).open("rb") as stream:
                     plistlib.load(stream)
@@ -317,6 +328,48 @@ def main() -> int:
             check(bundled.is_file() and not bundled.is_symlink(), f"bundled helper missing or linked: {relative}")
             check(digest(canonical) == digest(bundled), f"bundled helper drifted: {relative}")
         check(len(provenance["runtime_helpers"]) == len(packager.RUNTIME_SCRIPTS), "runtime provenance is incomplete")
+
+        # A commit id is not reproducible provenance when tracked source is
+        # dirty. The packager must fail even if the modified file is outside
+        # the immediate helper copy loop.
+        git_status_output = " M apps/DevOpsBoard/Sources/DevOpsBoard/Main.swift\n"
+        expect_packaging_error(
+            lambda: packager.package_app(
+                configuration="debug",
+                output=temp / "dirty-tracked-source.app",
+                version="1.0.0",
+                build="1",
+                skip_build=True,
+                sign=False,
+                force=False,
+            ),
+            "packager accepted a tracked-dirty checkout while claiming HEAD provenance",
+            contains="tracked changes",
+        )
+        git_status_output = ""
+
+        # Prove the per-input blob detector independently of status output: a
+        # stale or compromised status implementation must not let either a
+        # Swift input or bundled helper differ from the recorded commit.
+        for relative in (
+            "apps/DevOpsBoard/Sources/DevOpsBoard/Main.swift",
+            packager.RUNTIME_SCRIPTS[0].as_posix(),
+        ):
+            head_mismatch_paths.add(relative)
+            expect_packaging_error(
+                lambda relative=relative: packager.package_app(
+                    configuration="debug",
+                    output=temp / f"head-mismatch-{Path(relative).name}.app",
+                    version="1.0.0",
+                    build="1",
+                    skip_build=True,
+                    sign=False,
+                    force=False,
+                ),
+                f"packager accepted input bytes not reconstructible from HEAD: {relative}",
+                contains="recorded HEAD blob",
+            )
+            head_mismatch_paths.remove(relative)
 
         # Current-source skip-build is the intentional safe control. It must
         # consume the matching build sidecar without even requesting Swift.

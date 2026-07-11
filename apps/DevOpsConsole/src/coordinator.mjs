@@ -99,29 +99,81 @@ export function createCoordinator({ config, log }) {
   function readToken() {
     const tokenFile = String(config.coordinatorTokenFile || '').trim();
     if (!tokenFile) return null;
-    let stat;
-    try {
-      stat = fs.lstatSync(tokenFile);
-    } catch (err) {
-      if (err?.code === 'ENOENT') return null;
-      throw new CoordError(`coordinator credential cannot be inspected: ${err?.code ?? err?.message ?? err}`, {
+    const noFollow = fs.constants.O_NOFOLLOW;
+    if (!Number.isInteger(noFollow) || noFollow <= 0) {
+      throw new CoordError('coordinator credential cannot be opened safely on this platform', {
         status: 503,
       });
     }
-    if (stat.isSymbolicLink() || !stat.isFile()) {
-      throw new CoordError('coordinator credential must be a regular non-symlink file', { status: 503 });
+
+    // Open the caller-named path once and inspect/read that descriptor. A
+    // separate lstat(path) followed by readFile(path) lets the final component
+    // be replaced with a symlink between validation and use. O_NONBLOCK keeps
+    // a malicious FIFO from hanging this server-side request path.
+    const flags = fs.constants.O_RDONLY | noFollow | (fs.constants.O_NONBLOCK ?? 0);
+    let fd = null;
+    try {
+      fd = fs.openSync(tokenFile, flags);
+    } catch (err) {
+      if (err?.code === 'ENOENT') return null;
+      if (err?.code === 'ELOOP') {
+        throw new CoordError('coordinator credential must be a regular non-symlink file', { status: 503 });
+      }
+      throw new CoordError(`coordinator credential cannot be opened: ${err?.code ?? err?.message ?? err}`, {
+        status: 503,
+      });
     }
-    if ((stat.mode & 0o777) !== 0o600) {
-      throw new CoordError('coordinator credential permissions are unsafe; expected mode 0600', { status: 503 });
+
+    try {
+      const before = fs.fstatSync(fd);
+      if (!before.isFile()) {
+        throw new CoordError('coordinator credential must be a regular non-symlink file', { status: 503 });
+      }
+      if ((before.mode & 0o777) !== 0o600) {
+        throw new CoordError('coordinator credential permissions are unsafe; expected mode 0600', { status: 503 });
+      }
+      if (before.size > TOKEN_MAX_BYTES) {
+        throw new CoordError('coordinator credential file is oversized', { status: 503 });
+      }
+
+      const bytes = Buffer.alloc(TOKEN_MAX_BYTES + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const count = fs.readSync(fd, bytes, length, bytes.length - length, null);
+        if (count === 0) break;
+        length += count;
+      }
+      if (length > TOKEN_MAX_BYTES) {
+        throw new CoordError('coordinator credential file is oversized', { status: 503 });
+      }
+
+      const after = fs.fstatSync(fd);
+      if (
+        !after.isFile()
+        || after.dev !== before.dev
+        || after.ino !== before.ino
+        || after.size !== before.size
+        || after.size !== length
+      ) {
+        throw new CoordError('coordinator credential changed while being read', { status: 503 });
+      }
+      if ((after.mode & 0o777) !== 0o600) {
+        throw new CoordError('coordinator credential permissions are unsafe; expected mode 0600', { status: 503 });
+      }
+
+      const token = bytes.subarray(0, length).toString('utf8').trim();
+      if (token.length < 32) {
+        throw new CoordError('coordinator credential is empty or too short', { status: 503 });
+      }
+      return token;
+    } catch (err) {
+      if (err instanceof CoordError) throw err;
+      throw new CoordError(`coordinator credential cannot be read: ${err?.code ?? err?.message ?? err}`, {
+        status: 503,
+      });
+    } finally {
+      fs.closeSync(fd);
     }
-    if (stat.size > TOKEN_MAX_BYTES) {
-      throw new CoordError('coordinator credential file is oversized', { status: 503 });
-    }
-    const token = fs.readFileSync(tokenFile, 'utf8').trim();
-    if (token.length < 32) {
-      throw new CoordError('coordinator credential is empty or too short', { status: 503 });
-    }
-    return token;
   }
 
   async function fetchJson(method, apiPath, body, timeoutMs) {

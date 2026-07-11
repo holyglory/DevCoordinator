@@ -254,7 +254,7 @@ POSTGRES_BACKUP_INTEGRATION_INVENTORY_CHECKED=1 \
 ```
 
 It creates only uniquely named containers labeled
-`com.holyskills.postgres-backup.disposable=true`, publishes no ports, uses
+`com.devcoordinator.postgres-backup.disposable=true`, publishes no ports, uses
 `--network none`, verifies database backup/restore and whole-cluster
 test-restore, and checks that no disposable containers leaked.
 

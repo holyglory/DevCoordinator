@@ -697,6 +697,30 @@ def listener_belongs_to_project(port: int, project: str) -> tuple[bool, dict[str
     return True, owner
 
 
+def listener_evidence_for_port(port: int) -> dict[str, Any]:
+    """Return positive listener evidence without trying to bind the port.
+
+    Bind probes are not an availability detector for privileged ports: an
+    unprivileged process can receive EACCES for a free port such as 443.  A
+    relocation is therefore blocked only by a kernel LISTEN socket, an
+    identified listening PID, or a successful loopback connection.
+    """
+
+    port = int(port)
+    inodes = _listening_inodes_for_port(port)
+    pid = _pid_owning_socket_inodes(inodes) if inodes else None
+    if pid is None:
+        pid = listening_pid_for_port(port)
+    reachable = port_open("127.0.0.1", port)
+    return {
+        "present": bool(inodes or pid is not None or reachable),
+        "port": port,
+        "pid": pid,
+        "proc_listen_socket_count": len(inodes),
+        "loopback_reachable": reachable,
+    }
+
+
 def read_process_table() -> dict[int, dict[str, Any]]:
     with contextlib.suppress(Exception):
         completed = subprocess.run(
@@ -1711,6 +1735,287 @@ def unassign_port(
         record_event(state, "port.unassigned", removed)
         return removed
     raise KeyError("matching port assignment not found")
+
+
+def _relocated_path(value: Any, *, old_project: str, new_project: str) -> str | None:
+    if not value:
+        return None
+    candidate = Path(str(value)).expanduser().resolve()
+    old_root = Path(old_project).expanduser().resolve()
+    try:
+        relative = candidate.relative_to(old_root)
+    except ValueError:
+        return str(candidate)
+    return str(Path(new_project).expanduser().resolve() / relative)
+
+
+def _stale_release_evidence(
+    state: dict[str, Any],
+    *,
+    lease_id: str,
+    old_project: str,
+    port: int,
+) -> dict[str, Any] | None:
+    for event in reversed(state.get("history") or []):
+        if event.get("type") != "port.stale_released":
+            continue
+        payload = event.get("payload") or {}
+        if str(payload.get("id") or "") != lease_id:
+            continue
+        if int(payload.get("port") or 0) != port:
+            raise RuntimeError(f"lease {lease_id} stale-release evidence names the wrong port")
+        lease_project = str(payload.get("project") or "")
+        if not lease_project or canonical_project(lease_project) != old_project:
+            raise RuntimeError(f"lease {lease_id} stale-release evidence names the wrong project")
+        return payload
+    return None
+
+
+def relocate_port_assignment(
+    state: dict[str, Any],
+    *,
+    agent: str,
+    old_project: str,
+    new_project: str,
+    name: str,
+    port: int,
+    lease_id: str,
+) -> dict[str, Any]:
+    """Atomically transfer one stopped server identity to a new checkout.
+
+    Callers must execute this function inside ``locked_state``.  Every
+    precondition is checked before the first mutation, so an exception causes
+    the context manager to leave the on-disk state byte-for-byte unchanged.
+    """
+
+    if not int(getattr(_STATE_LOCK_CONTEXT, "depth", 0)):
+        raise RuntimeError("port relocation requires the coordinator state lock")
+    agent = str(agent or "").strip()
+    name = str(name or "").strip()
+    lease_id = str(lease_id or "").strip()
+    if not agent:
+        raise ValueError("port relocate requires --agent so the action is attributable")
+    if not name:
+        raise ValueError("port relocate requires --name")
+    if not lease_id:
+        raise ValueError("port relocate requires --lease-id from the pre-cutover inventory")
+    port = int(port)
+    if port < 1 or port > 65535:
+        raise ValueError(f"port {port} is outside 1-65535")
+    old_project = canonical_project(old_project)
+    new_project = canonical_project(new_project)
+    if old_project == new_project:
+        raise ValueError("port relocate requires different old and new projects")
+
+    old_key = server_key(old_project, name)
+    new_key = server_key(new_project, name)
+    assignments = state.setdefault("port_assignments", {})
+    assignment = assignments.get(old_key)
+    if not assignment:
+        raise KeyError(f"no durable assignment exists for {old_project}::{name}")
+    assignment_project = str(assignment.get("project") or "")
+    if (
+        not assignment_project
+        or canonical_project(assignment_project) != old_project
+        or str(assignment.get("name") or "") != name
+        or int(assignment.get("port") or 0) != port
+    ):
+        raise RuntimeError("old durable assignment does not match the exact project/name/port precondition")
+    if new_key in assignments:
+        raise RuntimeError(f"destination already has a durable assignment for {new_project}::{name}")
+    for key, candidate in assignments.items():
+        if key != old_key and int(candidate.get("port") or 0) == port:
+            raise RuntimeError(
+                f"port {port} has a foreign durable assignment for "
+                f"{candidate.get('project')}::{candidate.get('name')}"
+            )
+
+    active_on_port = [
+        (candidate_id, candidate)
+        for candidate_id, candidate in state.setdefault("leases", {}).items()
+        if candidate.get("status") == "active" and int(candidate.get("port") or 0) == port
+    ]
+    foreign_leases = [(candidate_id, candidate) for candidate_id, candidate in active_on_port if candidate_id != lease_id]
+    if foreign_leases:
+        candidate_id, candidate = foreign_leases[0]
+        raise RuntimeError(
+            f"port {port} has foreign active lease {candidate_id} for {candidate.get('project') or 'unknown project'}"
+        )
+    matching_lease = state["leases"].get(lease_id)
+    stale_evidence = None
+    if matching_lease:
+        if matching_lease.get("status") != "active":
+            raise RuntimeError(f"lease {lease_id} is not active")
+        if matching_lease.get("pending_operation_id"):
+            raise RuntimeError(
+                f"lease {lease_id} has pending operation {matching_lease['pending_operation_id']}"
+            )
+        lease_project = str(matching_lease.get("project") or "")
+        if not lease_project or canonical_project(lease_project) != old_project:
+            raise RuntimeError(f"lease {lease_id} is owned by the wrong project")
+        if int(matching_lease.get("port") or 0) != port:
+            raise RuntimeError(f"lease {lease_id} is for the wrong port")
+        if str(matching_lease.get("purpose") or "") != f"server:{name}":
+            raise RuntimeError(f"lease {lease_id} is not the server:{name} lease")
+    else:
+        # locked_state may have pruned a stopped/dead linked server's lease in
+        # this transaction, or an earlier inventory may already have done so.
+        # Accept only exact retained stale-release evidence; an arbitrary
+        # missing lease remains a hard failure.
+        stale_evidence = _stale_release_evidence(
+            state,
+            lease_id=lease_id,
+            old_project=old_project,
+            port=port,
+        )
+        if stale_evidence is None:
+            raise KeyError(f"expected old lease {lease_id} is missing without stale-release evidence")
+        if str(stale_evidence.get("purpose") or "") != f"server:{name}":
+            raise RuntimeError(f"lease {lease_id} stale-release evidence is not for server:{name}")
+
+    old_servers: list[tuple[str, dict[str, Any]]] = []
+    new_servers: list[tuple[str, dict[str, Any]]] = []
+    for server_id, server in state.setdefault("servers", {}).items():
+        server_project = str(server.get("project") or "")
+        resolved = canonical_project(server_project) if server_project else None
+        if str(server.get("name") or "") != name:
+            continue
+        if resolved == old_project:
+            old_servers.append((server_id, server))
+        elif resolved == new_project:
+            new_servers.append((server_id, server))
+    if len(old_servers) > 1:
+        raise RuntimeError(f"ambiguous old server identity: found {len(old_servers)} {name!r} records")
+    if new_servers:
+        raise RuntimeError(f"destination already has {len(new_servers)} {name!r} server record(s)")
+    matching_server = old_servers[0] if old_servers else None
+    if matching_server and int(matching_server[1].get("port") or 0) != port:
+        raise RuntimeError("old server record names the wrong port")
+    if matching_lease and matching_lease.get("server_id"):
+        if not matching_server or str(matching_server[0]) != str(matching_lease.get("server_id")):
+            raise RuntimeError("old lease is linked to an ambiguous or different server record")
+    if matching_server:
+        recorded_pid = int(matching_server[1].get("pid") or 0)
+        if recorded_pid and pid_alive(recorded_pid):
+            raise RuntimeError(
+                f"old server record PID {recorded_pid} is still alive; stop and verify the exact old process first"
+            )
+
+    pending_targets = {f"server:{old_key}", f"port:{port}", f"project:{old_project}"}
+    for operation in state.setdefault("operations", {}).values():
+        if operation.get("status") != "pending":
+            continue
+        targets_relocation = (
+            str(operation.get("target") or "") in pending_targets
+            or str(operation.get("lease_id") or "") == lease_id
+            or bool(matching_server and str(operation.get("server_id") or "") == str(matching_server[0]))
+        )
+        if targets_relocation:
+            raise RuntimeError(
+                f"pending coordinator operation {operation.get('id') or 'unknown'} targets the old server or port"
+            )
+
+    listener = listener_evidence_for_port(port)
+    if listener.get("present"):
+        raise RuntimeError(
+            f"port {port} still has a live listener; stop the exact old service before relocation "
+            f"(pid={listener.get('pid') or 'unknown'})"
+        )
+
+    relocated_at = iso_timestamp()
+    assignments.pop(old_key)
+    relocated_assignment = {
+        **assignment,
+        "key": new_key,
+        "project": new_project,
+        "name": name,
+        "port": port,
+        "agent": agent,
+        "source": "port_relocate",
+        "updated_at": relocated_at,
+        "relocated_from": old_project,
+        "relocated_at": relocated_at,
+    }
+    assignments[new_key] = relocated_assignment
+
+    relocated_lease: dict[str, Any] | None = None
+    if matching_lease:
+        matching_lease["project"] = new_project
+        matching_lease["assignment_key"] = new_key
+        matching_lease["relocated_from"] = old_project
+        matching_lease["relocated_at"] = relocated_at
+        relocated_lease = mark_lease_stale_released(
+            state,
+            lease_id,
+            matching_lease,
+            "port ownership relocated after the old listener stopped",
+        )
+
+    relocated_server: dict[str, Any] | None = None
+    if matching_server:
+        server_id, server = matching_server
+        server["key"] = new_key
+        server["project"] = new_project
+        server["cwd"] = _relocated_path(server.get("cwd"), old_project=old_project, new_project=new_project) or new_project
+        server["pid"] = None
+        server["lease_id"] = None
+        server["status"] = "stopped"
+        server["stopped_at"] = relocated_at
+        server["stopped_ts"] = now()
+        server["stopped_reason"] = "Checkout ownership relocated; awaiting exact listener registration"
+        server["health"] = {
+            "ok": False,
+            "pid_alive": False,
+            "classification": "stopped",
+            "reason": "awaiting registration after checkout relocation",
+        }
+        server["updated_at"] = relocated_at
+        server["metadata_source"] = "port_relocate"
+        server["agent_metadata"] = agent_metadata(
+            agent=agent,
+            project=new_project,
+            source="port_relocate",
+            cwd=str(server["cwd"]),
+        )
+        server["relocated_from"] = old_project
+        server["relocated_at"] = relocated_at
+        # A registered external service is rediscovered from its new listener.
+        # Retaining a stale checkout launch command or PID would allow the new
+        # record to point back at the source repository being retired.
+        for field in (
+            "argv",
+            "argv_template",
+            "cmd",
+            "cmd_template",
+            "log_path",
+            "operation_id",
+            "pending_operation_id",
+        ):
+            server[field] = None
+        relocated_server = server
+
+    event_payload = {
+        "agent": agent,
+        "agent_metadata": agent_metadata(agent=agent, project=new_project, source="port_relocate"),
+        "old_project": old_project,
+        "new_project": new_project,
+        "name": name,
+        "port": port,
+        "old_key": old_key,
+        "new_key": new_key,
+        "lease_id": lease_id,
+        "lease_status": "stale_released" if (relocated_lease or stale_evidence) else "missing",
+        "server_id": matching_server[0] if matching_server else None,
+        "listener_evidence": listener,
+    }
+    record_event(state, "port.relocated", event_payload)
+    return {
+        "ok": True,
+        "assignment": relocated_assignment,
+        "lease": relocated_lease or stale_evidence,
+        "server": relocated_server,
+        "relocation": event_payload,
+    }
 
 
 def list_port_assignments(state: dict[str, Any], *, project: str | None = None) -> list[dict[str, Any]]:
@@ -6671,6 +6976,17 @@ def build_parser() -> argparse.ArgumentParser:
     assign.add_argument("--name", required=True)
     assign.add_argument("--port", type=int, required=True)
     assign.add_argument("--force", action="store_true")
+    relocate = port_sub.add_parser("relocate")
+    relocate.add_argument("--agent", required=True)
+    relocate.add_argument("--old-project", required=True)
+    relocate.add_argument("--new-project", required=True)
+    relocate.add_argument("--name", required=True)
+    relocate.add_argument("--port", type=int, required=True)
+    relocate.add_argument(
+        "--lease-id",
+        required=True,
+        help="exact active/stale-released lease identity captured before cutover",
+    )
     unassign = port_sub.add_parser("unassign")
     unassign.add_argument("--agent", required=True)
     unassign.add_argument("--project", required=True)
@@ -6896,6 +7212,11 @@ def handle_cli(args: argparse.Namespace) -> Any:
     if args.group == "port" and args.action == "release":
         args.project = canonical_project(args.project)
         prime_git_head_identity(args.project)
+    if args.group == "port" and args.action == "relocate":
+        args.old_project = canonical_project(args.old_project)
+        args.new_project = canonical_project(args.new_project)
+        prime_git_head_identity(args.old_project)
+        prime_git_head_identity(args.new_project)
     with locked_state() as state:
         if args.group == "state" and args.action == "show":
             return state
@@ -6927,6 +7248,16 @@ def handle_cli(args: argparse.Namespace) -> Any:
                 name=args.name,
                 port=args.port,
                 force=bool(args.force),
+            )
+        if args.group == "port" and args.action == "relocate":
+            return relocate_port_assignment(
+                state,
+                agent=args.agent,
+                old_project=args.old_project,
+                new_project=args.new_project,
+                name=args.name,
+                port=args.port,
+                lease_id=args.lease_id,
             )
         if args.group == "port" and args.action == "unassign":
             return unassign_port(
@@ -7015,6 +7346,44 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
             self._request_slots.release()
 
 
+API_GET_ROUTES = frozenset(
+    {
+        "/v1/inventory",
+        "/v1/state",
+        "/v1/ports",
+        "/v1/ports/assignments",
+        "/v1/servers",
+    }
+)
+API_POST_ROUTES = frozenset(
+    {
+        "/v1/servers/start",
+        "/v1/servers/stop",
+        "/v1/servers/restart",
+        "/v1/servers/register",
+        "/v1/servers/status",
+        "/v1/servers/logs",
+        "/v1/projects/status",
+        "/v1/projects/start",
+        "/v1/projects/restart",
+        "/v1/projects/stop",
+        "/v1/docker/stats",
+        "/v1/docker/register",
+        "/v1/docker/ps",
+        "/v1/docker/compose-up",
+        "/v1/docker/compose-down",
+        "/v1/docker/logs",
+        "/v1/docker/start",
+        "/v1/docker/stop",
+        "/v1/docker/restart",
+        "/v1/ports/lease",
+        "/v1/ports/release",
+        "/v1/ports/assign",
+        "/v1/ports/unassign",
+    }
+)
+
+
 class ApiHandler(http.server.BaseHTTPRequestHandler):
     server_version = "CodexDevCoordinator/2"
 
@@ -7022,7 +7391,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(API_REQUEST_TIMEOUT_SECONDS)
 
-    def _send(self, status: int, payload: Any) -> None:
+    def _send(self, status: int, payload: Any, *, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -7031,8 +7400,16 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         if status == 401:
             self.send_header("WWW-Authenticate", 'Bearer realm="codex-dev-coordinator"')
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        # HEAD describes the same representation as the corresponding request
+        # while never writing that representation to the connection.
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _method_not_allowed(self, allowed: tuple[str, ...]) -> None:
+        self._send(405, {"error": "method not allowed"}, headers={"Allow": ", ".join(allowed)})
 
     def _read_json(self) -> dict[str, Any]:
         if self.headers.get("Transfer-Encoding"):
@@ -7087,24 +7464,17 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format % args}", file=sys.stderr)
 
-    def do_GET(self) -> None:  # noqa: N802
-        if not self._request_boundary_ok():
-            return
-        if self.path == "/healthz":
-            self._send(200, {"ok": True, "service": "codex-dev-coordinator", "version": VERSION})
-            return
-        if not self._require_authorization():
-            return
+    def _handle_get(self, path: str) -> None:
         try:
-            if self.path == "/v1/inventory":
+            if path == "/v1/inventory":
                 result: Any = coordinated_build_inventory()
-            elif self.path in {"/v1/state", "/v1/ports", "/v1/ports/assignments", "/v1/servers"}:
+            elif path in {"/v1/state", "/v1/ports", "/v1/ports/assignments", "/v1/servers"}:
                 snapshot = snapshot_coordinator_state()
-                if self.path == "/v1/state":
+                if path == "/v1/state":
                     result = snapshot
-                elif self.path == "/v1/ports":
+                elif path == "/v1/ports":
                     result = list(snapshot["leases"].values())
-                elif self.path == "/v1/ports/assignments":
+                elif path == "/v1/ports/assignments":
                     result = list_port_assignments(snapshot)
                 else:
                     result = list(snapshot["servers"].values())
@@ -7115,61 +7485,57 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:  # pragma: no cover - defensive endpoint wrapper
             self._send(500, {"error": str(exc)})
 
-    def do_POST(self) -> None:  # noqa: N802
-        if not self._request_boundary_ok():
-            return
-        if not self._require_authorization():
-            return
+    def _handle_post(self, path: str) -> None:
         try:
             payload = self._read_json()
-            if self.path == "/v1/servers/start":
+            if path == "/v1/servers/start":
                 self._send(200, coordinated_start_server(payload))
                 return
-            if self.path == "/v1/servers/stop":
+            if path == "/v1/servers/stop":
                 self._send(200, coordinated_stop_server(payload))
                 return
-            if self.path == "/v1/servers/restart":
+            if path == "/v1/servers/restart":
                 self._send(200, coordinated_restart_server(payload))
                 return
-            if self.path == "/v1/servers/register":
+            if path == "/v1/servers/register":
                 self._send(200, coordinated_register_server(payload))
                 return
-            if self.path == "/v1/servers/status":
+            if path == "/v1/servers/status":
                 self._send(200, coordinated_status_server(payload))
                 return
-            if self.path == "/v1/servers/logs":
+            if path == "/v1/servers/logs":
                 self._send(200, coordinated_server_logs(payload))
                 return
-            if self.path == "/v1/projects/status":
+            if path == "/v1/projects/status":
                 self._send(200, coordinated_project_runtime_status(payload))
                 return
-            if self.path == "/v1/projects/start":
+            if path == "/v1/projects/start":
                 self._send(200, coordinated_project_runtime_start(payload))
                 return
-            if self.path == "/v1/projects/restart":
+            if path == "/v1/projects/restart":
                 self._send(200, coordinated_project_runtime_restart(payload))
                 return
-            if self.path == "/v1/projects/stop":
+            if path == "/v1/projects/stop":
                 self._send(200, coordinated_project_runtime_stop(payload))
                 return
-            if self.path == "/v1/docker/stats":
+            if path == "/v1/docker/stats":
                 self._send(200, coordinated_sample_docker_stats(dry_run=bool(payload.get("dry_run"))))
                 return
-            if self.path == "/v1/docker/register":
+            if path == "/v1/docker/register":
                 self._send(200, coordinated_register_docker_metadata(payload))
                 return
-            if self.path == "/v1/docker/ps":
+            if path == "/v1/docker/ps":
                 command = ["docker", "ps"]
                 if payload.get("all"):
                     command.append("--all")
                 self._send(200, coordinated_run_docker(command, dry_run=bool(payload.get("dry_run"))))
                 return
-            if self.path in {"/v1/docker/compose-up", "/v1/docker/compose-down"}:
+            if path in {"/v1/docker/compose-up", "/v1/docker/compose-down"}:
                 command = ["docker", "compose"]
                 for file_name in payload.get("file") or []:
                     command.extend(["-f", file_name])
-                command.append("up" if self.path.endswith("compose-up") else "down")
-                if self.path.endswith("compose-up") and payload.get("detach"):
+                command.append("up" if path.endswith("compose-up") else "down")
+                if path.endswith("compose-up") and payload.get("detach"):
                     command.append("-d")
                 self._send(
                     200,
@@ -7182,7 +7548,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     ),
                 )
                 return
-            if self.path == "/v1/docker/logs":
+            if path == "/v1/docker/logs":
                 self._send(
                     200,
                     coordinated_run_docker(
@@ -7191,8 +7557,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     ),
                 )
                 return
-            if self.path in {"/v1/docker/start", "/v1/docker/stop", "/v1/docker/restart"}:
-                docker_action = self.path.rsplit("/", 1)[-1]
+            if path in {"/v1/docker/start", "/v1/docker/stop", "/v1/docker/restart"}:
+                docker_action = path.rsplit("/", 1)[-1]
                 self._send(
                     200,
                     coordinated_run_docker(
@@ -7205,14 +7571,14 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     ),
                 )
                 return
-            if self.path == "/v1/ports/lease":
+            if path == "/v1/ports/lease":
                 payload["project"] = canonical_project(payload["project"])
                 prime_git_head_identity(payload["project"])
-            elif self.path == "/v1/ports/release":
+            elif path == "/v1/ports/release":
                 release_agent, release_project = require_identity(payload, "port release")
                 payload["agent"] = release_agent
                 payload["project"] = release_project
-            elif self.path in {"/v1/ports/assign", "/v1/ports/unassign"}:
+            elif path in {"/v1/ports/assign", "/v1/ports/unassign"}:
                 assignment_agent = str(payload.get("agent") or "").strip()
                 if not assignment_agent:
                     raise ValueError("port assignment mutation requires agent attribution")
@@ -7224,7 +7590,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
                 return
             with locked_state() as state:
-                if self.path == "/v1/ports/lease":
+                if path == "/v1/ports/lease":
                     result = lease_port(
                         state,
                         agent=payload["agent"],
@@ -7234,7 +7600,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                         ttl=int(payload.get("ttl") or DEFAULT_TTL_SECONDS),
                         purpose=payload.get("purpose") or "manual",
                     )
-                elif self.path == "/v1/ports/release":
+                elif path == "/v1/ports/release":
                     result = release_port_for_identity(
                         state,
                         agent=payload["agent"],
@@ -7242,7 +7608,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                         lease_id=payload.get("lease_id"),
                         port=payload.get("port"),
                     )
-                elif self.path == "/v1/ports/assign":
+                elif path == "/v1/ports/assign":
                     result = assign_port(
                         state,
                         agent=payload["agent"],
@@ -7251,7 +7617,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                         port=payload["port"],
                         force=bool(payload.get("force")),
                     )
-                elif self.path == "/v1/ports/unassign":
+                elif path == "/v1/ports/unassign":
                     result = unassign_port(
                         state,
                         agent=payload["agent"],
@@ -7267,6 +7633,73 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             self._send(415, {"error": str(exc)})
         except Exception as exc:
             self._send(400, {"error": str(exc)})
+
+    def _handle_request(self) -> None:
+        if not self._request_boundary_ok():
+            return
+
+        method = self.command.upper()
+        path = urlparse(self.path).path
+        if path == "/healthz":
+            if method in {"GET", "HEAD"}:
+                self._send(200, {"ok": True, "service": "codex-dev-coordinator", "version": VERSION})
+            else:
+                self._method_not_allowed(("GET", "HEAD"))
+            return
+
+        protected = path == "/v1" or path.startswith("/v1/")
+        if not protected:
+            self._send(404, {"error": "not found"})
+            return
+
+        # Authenticate the protected namespace before route or method
+        # dispatch. Otherwise BaseHTTPRequestHandler's inherited unsupported
+        # method path leaks a 501 before the bearer boundary is evaluated.
+        if not self._require_authorization():
+            return
+
+        if path in API_GET_ROUTES:
+            if method != "GET":
+                self._method_not_allowed(("GET",))
+                return
+            self._handle_get(path)
+            return
+        if path in API_POST_ROUTES:
+            if method != "POST":
+                self._method_not_allowed(("POST",))
+                return
+            self._handle_post(path)
+            return
+        self._send(404, {"error": "not found"})
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._handle_request()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._handle_request()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._handle_request()
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._handle_request()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._handle_request()
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._handle_request()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self._handle_request()
+
+    def __getattr__(self, name: str) -> Any:
+        # BaseHTTPRequestHandler otherwise emits an unauthenticated HTML 501
+        # for extension methods (for example WebDAV PROPFIND). Route every
+        # syntactically accepted HTTP method through the same boundary.
+        if name.startswith("do_") and len(name) > 3:
+            return self._handle_request
+        raise AttributeError(name)
 
 
 def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:

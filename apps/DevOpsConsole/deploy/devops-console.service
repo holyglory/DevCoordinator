@@ -1,6 +1,6 @@
 [Unit]
 Description=DevOps Console - TLS edge, subdomain proxy, and control panel for vr.ae
-Documentation=file://%h/../DevCoordinator/apps/DevOpsConsole/README.md
+Documentation=file:///home/DevCoordinator/apps/DevOpsConsole/README.md
 Requires=dev-coordinator.service
 After=network-online.target dev-coordinator.service
 Wants=network-online.target
@@ -9,18 +9,19 @@ Wants=network-online.target
 Type=simple
 User=holyglory
 Group=holyglory
-WorkingDirectory=%h/../DevCoordinator/apps/DevOpsConsole
+WorkingDirectory=/home/DevCoordinator/apps/DevOpsConsole
 EnvironmentFile=%h/.config/devops-console/console.env
-Environment=DEVCOORDINATOR_ROOT=/home/DevCoordinator
-Environment=COORDINATOR_AUTOSTART=0
-Environment=COORDINATOR_URL=http://127.0.0.1:29876
-Environment=COORDINATOR_TOKEN_FILE=%h/.codex/agent-coordinator/api-token
-Environment=CODEX_AGENT_COORDINATOR_HOME=%h/.codex/agent-coordinator
-ExecStart=/usr/bin/node bin/devops-console.mjs
+# EnvironmentFile values are intentionally overridden in ExecStart for every
+# production-critical control/path; /usr/bin/env assignments are applied to the
+# child after systemd loads the file.
+ExecStartPre=/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py --repo-root /home/DevCoordinator --home %h --env-file %h/.config/devops-console/console.env --state-dir %h/.local/state/devops-console --acme-webroot %h/.local/state/devops-console/acme --coordinator-home %h/.codex/agent-coordinator --token-file %h/.codex/agent-coordinator/api-token --require-token --wait-token-seconds 10
+ExecStart=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator COORDINATOR_AUTOSTART=0 COORDINATOR_URL=http://127.0.0.1:29876 COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py COORDINATOR_TOKEN_FILE=%h/.codex/agent-coordinator/api-token CODEX_AGENT_COORDINATOR_HOME=%h/.codex/agent-coordinator STATE_DIR=%h/.local/state/devops-console ACME_WEBROOT=%h/.local/state/devops-console/acme /usr/bin/node bin/devops-console.mjs --env-file %h/.config/devops-console/console.env
 # SIGHUP reloads the TLS certificate from disk (after certbot renewal).
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3
+KillMode=control-group
+UMask=0077
 
 # Bind 80/443 without root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -30,6 +31,7 @@ NoNewPrivileges=true
 # The console never starts the coordinator. Runtime state and credentials are
 # external to the Git checkout; TLS material remains read-only.
 ProtectSystem=full
+ProtectHome=read-only
 PrivateTmp=true
 ReadWritePaths=%h/.local/state/devops-console
 LimitNOFILE=65536

@@ -36,9 +36,13 @@ User journeys: [docs/journeys.md](docs/journeys.md).
 
 ```bash
 cd apps/DevOpsConsole
-cp .env.example .env          # then fill in the values below
-node bin/devops-console.mjs --check-config
-node bin/devops-console.mjs   # needs CAP_NET_BIND_SERVICE for ports 80/443 — use systemd (below)
+install -d -m 700 "$HOME/.config/devops-console" "$HOME/.local/state/devops-console"
+if [ ! -e "$HOME/.config/devops-console/console.env" ]; then
+  install -m 600 .env.example "$HOME/.config/devops-console/console.env"
+fi
+# Fill in the external file, then:
+node bin/devops-console.mjs --env-file "$HOME/.config/devops-console/console.env" --check-config
+node bin/devops-console.mjs --env-file "$HOME/.config/devops-console/console.env"
 ```
 
 Run the tests (spawns an isolated coordinator + local OIDC issuer; no network,
@@ -48,7 +52,7 @@ no fixed ports):
 node --test test/*.test.mjs
 ```
 
-## Configuration (`.env`)
+## Configuration (`console.env`)
 
 See [.env.example](.env.example) for the full annotated list. The important
 ones:
@@ -60,7 +64,7 @@ ones:
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth client (setup below). Empty = degraded mode: public routes still proxy, everything auth-gated shows a setup page. |
 | `ALLOWED_EMAILS` | Comma-separated Google accounts allowed to sign in. Everyone else gets a 403 after Google auth. |
 | `SESSION_SECRET` | 64 hex chars (`openssl rand -hex 32`). Rotating it signs everyone out. |
-| `COORDINATOR_URL` | Coordinator API, default `http://127.0.0.1:29876`. |
+| `COORDINATOR_URL` | Coordinator API origin, default `http://127.0.0.1:29876`; only loopback `http(s)` origins without credentials, paths, queries, or fragments are accepted. |
 | `COORDINATOR_TOKEN_FILE` | Private mode-0600 bearer token created by the coordinator and read only by the server-side Console client. |
 | `COORDINATOR_AUTOSTART` | Optional local fallback; production sets `0` and uses `dev-coordinator.service`. |
 | `METRICS_INTERVAL_MS` | CPU/memory sampling cadence for the history charts (default `10000`, floor `2000`). Each sample reads coordinator inventory, which shells out to `docker stats` when Docker is present. |
@@ -73,14 +77,17 @@ ones:
    application**:
    - Authorized JavaScript origin: `https://console.vr.ae`
    - Authorized redirect URI: `https://console.vr.ae/auth/callback`
-3. Put the client ID/secret in `.env`, `systemctl restart devops-console`.
+3. Put the client ID/secret in
+   `$HOME/.config/devops-console/console.env`, then run
+   `systemctl restart devops-console`.
 
 The login page shows these exact values in degraded mode, so you can copy them
 from there too.
 
 ## TLS certificate runbook (Let's Encrypt DNS-01, out-of-band)
 
-The app never speaks ACME; it just reads the PEMs in `.env` and hot-reloads
+The app never speaks ACME; it reads the PEM paths from
+`$HOME/.config/devops-console/console.env` and hot-reloads
 them when the files change. `certs/dev/` is gitignored — the test suite
 generates a throwaway self-signed `*.vr.ae` cert there on demand
 (`test/helpers/dev-cert.mjs`), and the same generated pair can serve as a
@@ -101,7 +108,8 @@ sudo certbot certonly --webroot -w "$HOME/.local/state/devops-console/acme" \
   -d console.vr.ae -d vr.ae \
   --non-interactive --agree-tos -m ja@vr.ae --cert-name vr.ae
 sudo setfacl -R -m u:holyglory:rX /etc/letsencrypt/live/vr.ae /etc/letsencrypt/archive/vr.ae
-# point .env at the issued files, then RESTART (a path change needs a restart;
+# point $HOME/.config/devops-console/console.env at the issued files, then
+# RESTART (a path change needs a restart;
 # SIGHUP/reload only re-reads the already-configured path):
 #   TLS_CERT_FILE=/etc/letsencrypt/live/vr.ae/fullchain.pem
 #   TLS_KEY_FILE=/etc/letsencrypt/live/vr.ae/privkey.pem
@@ -126,7 +134,8 @@ Encrypt issues wildcards **only** via DNS-01 — a `_acme-challenge.vr.ae` TXT
 record at the authoritative DNS (`vr.ae` is hosted at 101domain, which has no
 API credential on this box, so the record is published by hand). The live cert
 `/etc/letsencrypt/live/vr.ae/{fullchain,privkey}.pem` covers `vr.ae` +
-`*.vr.ae`; `.env` points at it and the console serves it for every host.
+`*.vr.ae`; the external `console.env` points at it and the Console serves it
+for every host.
 
 **Renewal is fully automated via the 101domain REST API** — no manual TXT
 steps. certbot's `manual_auth_hook`/`manual_cleanup_hook` create and delete the
@@ -163,27 +172,417 @@ Cert files are root-owned; the service user reads them via a default ACL
 (`sudo setfacl -R -d -m u:holyglory:rX /etc/letsencrypt/{live,archive}`) so
 renewed files stay readable. A renewal deploy hook
 (`/etc/letsencrypt/renewal-hooks/deploy/devops-console`) reloads the service
-(SIGHUP) after any renewal. Note: changing the cert **path** in `.env` needs a
-full restart; a same-path renewal only needs a reload.
+(SIGHUP) after any renewal. Note: changing the cert **path** in the external
+`console.env` needs a full restart; a same-path renewal only needs a reload.
 
 ## Deploy (systemd)
 
+Production source lives at `/home/DevCoordinator`; mutable data and secrets do
+not. Never copy `.env.example` over an existing production environment. Before
+changing units or processes, capture coordinator inventory and make a private,
+checksummed rollback copy:
+
+On an existing host the first migration phase is deliberately `--env-only`:
+it preserves secrets and rewrites external path keys without reading the live
+legacy state/log tree. The exact, checksum-verified state sync runs only after
+the legacy cgroup and listeners are stopped.
+
 ```bash
-sudo install -m 0644 deploy/dev-coordinator.service deploy/devops-console.service /etc/systemd/system/
+DEVCOORDINATOR_ROOT=/home/DevCoordinator
+LEGACY_ROOT="$HOME/holyskills"
+LEGACY_ENV="$LEGACY_ROOT/apps/DevOpsConsole/.env"
+LEGACY_STATE="$LEGACY_ROOT/apps/DevOpsConsole/state"
+CONSOLE_ENV="$HOME/.config/devops-console/console.env"
+CONSOLE_STATE="$HOME/.local/state/devops-console"
+COORDINATOR_HOME="$HOME/.codex/agent-coordinator"
+ACME_WEBROOT="$CONSOLE_STATE/acme"
+BACKUP_ROOT="$HOME/.local/state/devcoordinator-cutover-backups"
+CUTOVER_BACKUP="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)"
+
+umask 077
+install -d -m 700 \
+  "$HOME/.config/devops-console" "$CONSOLE_STATE" "$ACME_WEBROOT" \
+  "$COORDINATOR_HOME" "$BACKUP_ROOT" "$CUTOVER_BACKUP"
+if [ ! -e "$CONSOLE_ENV" ]; then
+  if [ -f "$LEGACY_ENV" ]; then
+    python3 "$DEVCOORDINATOR_ROOT/scripts/migrate_legacy_console_runtime.py" \
+      --legacy-env "$LEGACY_ENV" --legacy-state "$LEGACY_STATE" \
+      --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
+      --coordinator-home "$COORDINATOR_HOME" \
+      --devcoordinator-root "$DEVCOORDINATOR_ROOT" \
+      --backup-dir "$CUTOVER_BACKUP/legacy-migration-initial" --env-only
+  else
+    install -m 600 "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/.env.example" "$CONSOLE_ENV"
+  fi
+fi
+chmod 600 "$CONSOLE_ENV"
+find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type d -exec chmod 700 {} +
+find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +
+
+cp -a "$CONSOLE_ENV" "$CUTOVER_BACKUP/console.env"
+cp -a "$CONSOLE_STATE" "$CUTOVER_BACKUP/devops-console-state"
+cp -a "$COORDINATOR_HOME" "$CUTOVER_BACKUP/agent-coordinator"
+if [ -d "$LEGACY_STATE" ]; then
+  cp -a "$LEGACY_STATE" "$CUTOVER_BACKUP/legacy-console-state.initial"
+fi
+for unit in dev-coordinator.service devops-console.service; do
+  if [ -f "/etc/systemd/system/$unit" ]; then
+    cp -a "/etc/systemd/system/$unit" "$CUTOVER_BACKUP/$unit.previous"
+    printf 'present\n' > "$CUTOVER_BACKUP/$unit.preexisting"
+  else
+    printf 'absent\n' > "$CUTOVER_BACKUP/$unit.preexisting"
+  fi
+  systemctl is-enabled "$unit" > "$CUTOVER_BACKUP/$unit.enabled" 2>&1 || true
+done
+(cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS -print0 \
+  | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS)
+chmod -R go-rwx "$CUTOVER_BACKUP"
+```
+
+Validate the external layout before starting either service, then verify both
+candidate units. Do not install/reload them over a running legacy service; the
+existing-host sequence below installs them only after the old cgroup is down.
+The first preflight intentionally does not require the API token because the
+coordinator creates it on first start.
+
+```bash
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
+  --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
+  --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
+  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
+  --token-file "$COORDINATOR_HOME/api-token"
+
+sudo systemd-analyze verify \
+  "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/dev-coordinator.service" \
+  "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service"
+```
+
+For a fresh host, start only the coordinator, rerun the token-required
+preflight, verify the anonymous/authenticated API boundary, and then start the
+Console:
+
+```bash
+sudo install -m 0644 \
+  "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/dev-coordinator.service" \
+  "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service" \
+  /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now dev-coordinator.service devops-console.service
+sudo systemctl enable dev-coordinator.service devops-console.service
+sudo systemctl start dev-coordinator.service
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
+  --repo-root "$DEVCOORDINATOR_ROOT" --home "$HOME" \
+  --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
+  --acme-webroot "$ACME_WEBROOT" --coordinator-home "$COORDINATOR_HOME" \
+  --token-file "$COORDINATOR_HOME/api-token" --require-token --wait-token-seconds 10
+
+python3 - <<'PY'
+import http.client
+from pathlib import Path
+
+token = (Path.home() / ".codex/agent-coordinator/api-token").read_text(encoding="utf-8").strip()
+def status(path, bearer=None):
+    connection = http.client.HTTPConnection("127.0.0.1", 29876, timeout=60)
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+    connection.request("GET", path, headers=headers)
+    response = connection.getresponse()
+    response.read()
+    connection.close()
+    return response.status
+
+assert status("/healthz") == 200
+assert status("/v1/inventory") == 401
+assert status("/v1/inventory", token) == 200
+print("coordinator health/auth boundary ok")
+PY
+
+sudo systemctl start devops-console.service
 systemctl status dev-coordinator.service devops-console.service
 ```
+
+### Existing-host checkout cutover
+
+The deployed legacy topology has one `devops-console.service`; its Node process
+autostarts the coordinator as a detached child in the same systemd cgroup.
+There is no old `dev-coordinator.service` to restart. Before stopping anything,
+capture the Console main PID, cgroup, exact child coordinator PID/start time/
+command, listener evidence, exact lease ID, and exact Console server ID.
+
+```bash
+OLD_PROJECT="$LEGACY_ROOT"
+OLD_COORDINATOR="$OLD_PROJECT/skills/codex-dev-coordinator/scripts/dev_coordinator.py"
+umask 077
+python3 "$OLD_COORDINATOR" inventory --project "$OLD_PROJECT" --no-docker \
+  > "$CUTOVER_BACKUP/pre-cutover-inventory.json"
+python3 - "$CUTOVER_BACKUP/pre-cutover-inventory.json" "$OLD_PROJECT" \
+  "$CUTOVER_BACKUP/pre-cutover-identities.json" <<'PY'
+import json, sys
+inventory = json.load(open(sys.argv[1], encoding="utf-8"))
+leases = [
+    item for item in inventory.get("leases", [])
+    if item.get("status") == "active"
+    and item.get("project") == sys.argv[2]
+    and int(item.get("port") or 0) == 443
+    and item.get("purpose") == "server:devops-console"
+]
+servers = [
+    item for item in inventory.get("servers", [])
+    if item.get("project") == sys.argv[2]
+    and item.get("name") == "devops-console"
+    and int(item.get("port") or 0) == 443
+]
+if len(leases) != 1 or len(servers) != 1:
+    raise SystemExit(f"expected one exact lease/server, found {len(leases)}/{len(servers)}")
+with open(sys.argv[3], "x", encoding="utf-8") as handle:
+    json.dump({"lease_id": leases[0]["id"], "server_id": servers[0]["id"]}, handle)
+    handle.write("\n")
+PY
+chmod 600 "$CUTOVER_BACKUP/pre-cutover-identities.json"
+
+OLD_CONSOLE_PID="$(systemctl show --property MainPID --value devops-console.service)"
+OLD_CONSOLE_CGROUP="$(systemctl show --property ControlGroup --value devops-console.service)"
+test "$OLD_CONSOLE_PID" -gt 1
+test -n "$OLD_CONSOLE_CGROUP"
+python3 - "$OLD_CONSOLE_PID" "$OLD_CONSOLE_CGROUP" "$OLD_COORDINATOR" \
+  "$CUTOVER_BACKUP/legacy-processes.json" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+console_pid, cgroup, expected_script, output = int(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4])
+members = Path("/sys/fs/cgroup", cgroup.lstrip("/"), "cgroup.procs")
+if not members.is_file():
+    raise SystemExit(f"legacy cgroup process list is unavailable: {members}")
+records = []
+for raw in members.read_text(encoding="utf-8").splitlines():
+    pid = int(raw)
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        command = [part.decode("utf-8", errors="replace") for part in command if part]
+        start_ticks = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21]
+    except (FileNotFoundError, ProcessLookupError):
+        continue
+    records.append({"pid": pid, "start_ticks": start_ticks, "command": command})
+consoles = [item for item in records if item["pid"] == console_pid]
+if len(consoles) != 1:
+    raise SystemExit("systemd Console MainPID is not in its reported cgroup")
+coordinators = [
+    item for item in records
+    if expected_script in item["command"] and "api" in item["command"] and "serve" in item["command"]
+]
+if len(coordinators) != 1:
+    raise SystemExit(f"expected one legacy child coordinator, found {len(coordinators)}")
+if len(records) != 2:
+    raise SystemExit(
+        "legacy Console cgroup contains additional managed processes; "
+        "classify/move those attributed process trees before cutover"
+    )
+output.write_text(json.dumps({
+    "console": consoles[0],
+    "cgroup": cgroup,
+    "coordinator": coordinators[0],
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.chmod(output, 0o600)
+PY
+sudo ss -ltnp '( sport = :80 or sport = :443 or sport = :29876 )' \
+  > "$CUTOVER_BACKUP/pre-cutover-listeners.txt"
+chmod 600 "$CUTOVER_BACKUP/pre-cutover-listeners.txt"
+```
+
+Before stopping the legacy unit, apply a runtime-only `KillMode=process`
+override and verify it loaded. This prevents an agent-created process appearing
+after the cgroup snapshot from being silently killed. Stop terminates only the
+Console main process; the guarded cleanup sends TERM (then bounded KILL) only
+when the captured coordinator PID still has the captured start time and exact
+command. The following check requires both exact process instances, all three
+listeners, and the old cgroup to be empty. Any extra survivor is a hard blocker:
+move its attributed process tree to a dedicated scope or stop/restart it
+explicitly with health evidence before reusing the unit name. Then remove the
+runtime override and perform the final staged state sync.
+
+```bash
+sudo install -d -m 0755 /run/systemd/system/devops-console.service.d
+printf '[Service]\nKillMode=process\n' | \
+  sudo tee /run/systemd/system/devops-console.service.d/90-cutover-killmode.conf >/dev/null
+sudo systemctl daemon-reload
+test "$(systemctl show --property KillMode --value devops-console.service)" = process
+sudo systemctl stop devops-console.service
+python3 - "$CUTOVER_BACKUP/legacy-processes.json" <<'PY'
+import json, os, signal, sys, time
+from pathlib import Path
+
+item = json.load(open(sys.argv[1], encoding="utf-8"))["coordinator"]
+stat = Path(f"/proc/{item['pid']}/stat")
+if stat.exists() and stat.read_text(encoding="utf-8").split()[21] == item["start_ticks"]:
+    command = [part.decode("utf-8", errors="replace") for part in Path(
+        f"/proc/{item['pid']}/cmdline"
+    ).read_bytes().split(b"\0") if part]
+    if command != item["command"]:
+        raise SystemExit("captured coordinator PID was reused or changed command; refusing to signal it")
+    os.kill(item["pid"], signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while stat.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if stat.exists() and stat.read_text(encoding="utf-8").split()[21] == item["start_ticks"]:
+        os.kill(item["pid"], signal.SIGKILL)
+PY
+python3 - "$CUTOVER_BACKUP/legacy-processes.json" <<'PY'
+import json, socket, sys
+from pathlib import Path
+
+evidence = json.load(open(sys.argv[1], encoding="utf-8"))
+for item in (evidence["console"], evidence["coordinator"]):
+    stat = Path(f"/proc/{item['pid']}/stat")
+    if not stat.exists():
+        continue
+    current_start = stat.read_text(encoding="utf-8").split()[21]
+    if current_start == item["start_ticks"]:
+        raise SystemExit(f"captured legacy process is still alive: {item['pid']}")
+for port in (80, 443, 29876):
+    with socket.socket() as probe:
+        probe.settimeout(0.3)
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            raise SystemExit(f"legacy listener still accepts connections on {port}")
+print("legacy Console/coordinator processes and listeners stopped")
+PY
+
+if [ -r "/sys/fs/cgroup${OLD_CONSOLE_CGROUP}/cgroup.procs" ] && \
+   grep -q '[0-9]' "/sys/fs/cgroup${OLD_CONSOLE_CGROUP}/cgroup.procs"; then
+  echo "legacy cgroup still has managed processes; refusing to reuse unit name" >&2
+  exit 1
+fi
+sudo rm -f /run/systemd/system/devops-console.service.d/90-cutover-killmode.conf
+sudo systemctl daemon-reload
+
+python3 "$DEVCOORDINATOR_ROOT/scripts/migrate_legacy_console_runtime.py" \
+  --legacy-env "$LEGACY_ENV" --legacy-state "$LEGACY_STATE" \
+  --env-file "$CONSOLE_ENV" --state-dir "$CONSOLE_STATE" \
+  --coordinator-home "$COORDINATOR_HOME" \
+  --devcoordinator-root "$DEVCOORDINATOR_ROOT" \
+  --backup-dir "$CUTOVER_BACKUP/legacy-migration-final" --sync-state-only
+
+install -m 600 "$COORDINATOR_HOME/state.json" "$CUTOVER_BACKUP/coordinator-state.final.json"
+sha256sum "$CUTOVER_BACKUP/coordinator-state.final.json" \
+  > "$CUTOVER_BACKUP/coordinator-state.final.sha256"
+
+LEASE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lease_id"])' \
+  "$CUTOVER_BACKUP/pre-cutover-identities.json")"
+python3 "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
+  port relocate --agent "$USER" \
+  --old-project "$OLD_PROJECT" --new-project "$DEVCOORDINATOR_ROOT" \
+  --name devops-console --port 443 --lease-id "$LEASE_ID" \
+  > "$CUTOVER_BACKUP/relocation-result.json"
+```
+
+Only now install the split units and start (not restart) the new coordinator.
+Run the token-required layout preflight and the anonymous/authenticated probe
+from the fresh-host section before starting the new Console.
+
+```bash
+sudo install -m 0644 \
+  "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/dev-coordinator.service" \
+  "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service" \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable dev-coordinator.service devops-console.service
+sudo systemctl start dev-coordinator.service
+
+# Rerun the token-required preflight and the Python health/auth probe above.
+sudo systemctl start devops-console.service
+sleep 2
+python3 "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
+  inventory --no-docker \
+  > "$CUTOVER_BACKUP/post-cutover-inventory.json"
+python3 - "$CUTOVER_BACKUP/pre-cutover-identities.json" \
+  "$CUTOVER_BACKUP/post-cutover-inventory.json" "$OLD_PROJECT" "$DEVCOORDINATOR_ROOT" <<'PY'
+import json, sys
+
+before = json.load(open(sys.argv[1], encoding="utf-8"))
+after = json.load(open(sys.argv[2], encoding="utf-8"))
+old_project, new_project = sys.argv[3], sys.argv[4]
+assignments = [item for item in after.get("port_assignments", []) if int(item.get("port") or 0) == 443]
+servers = [item for item in after.get("servers", []) if item.get("name") == "devops-console" and int(item.get("port") or 0) == 443]
+leases = [item for item in after.get("leases", []) if item.get("status") == "active" and int(item.get("port") or 0) == 443]
+if len(assignments) != 1 or assignments[0].get("project") != new_project:
+    raise SystemExit("post-cutover port 443 assignment is not uniquely owned by DevCoordinator")
+if len(servers) != 1 or servers[0].get("project") != new_project or servers[0].get("id") != before["server_id"]:
+    raise SystemExit("post-cutover Console server did not reuse the exact relocated identity")
+if len(leases) != 1 or leases[0].get("project") != new_project:
+    raise SystemExit("post-cutover port 443 lease is not uniquely owned by DevCoordinator")
+for collection in (after.get("port_assignments", []), after.get("servers", []), after.get("leases", [])):
+    if any(item.get("project") == old_project and int(item.get("port") or 0) == 443 for item in collection):
+        raise SystemExit("current coordinator state still points port 443 at the retired checkout")
+print("post-cutover assignment/server/lease identity ok")
+PY
+systemctl --no-pager --full status dev-coordinator.service devops-console.service
+journalctl --no-pager -u dev-coordinator.service -u devops-console.service --since '-5 minutes'
+curl --fail --silent --show-error https://console.vr.ae/healthz >/dev/null
+```
+
+The verifier requires assignment, current server, and active lease for port 443
+to name `/home/DevCoordinator`, and the server ID to match the captured old
+record. Separately confirm no current process, unit, helper, or environment
+value references the retired checkout. Historical events may retain the old
+path as evidence.
+
+On any failure, stop the split services, validate
+`coordinator-state.final.sha256`, restore that private state copy, and restore
+the exact unit topology captured before cutover. In particular, the real
+legacy host had no `dev-coordinator.service`; rollback must disable and remove
+that new-only unit before the old Console is allowed to autostart its child
+coordinator:
+
+```bash
+sudo systemctl stop devops-console.service dev-coordinator.service || true
+sudo systemctl disable dev-coordinator.service || true
+sudo rm -f /run/systemd/system/devops-console.service.d/90-cutover-killmode.conf
+sha256sum --check "$CUTOVER_BACKUP/coordinator-state.final.sha256"
+install -m 600 "$CUTOVER_BACKUP/coordinator-state.final.json" \
+  "$COORDINATOR_HOME/.state.json.rollback"
+mv -f "$COORDINATOR_HOME/.state.json.rollback" "$COORDINATOR_HOME/state.json"
+
+if grep -qx present "$CUTOVER_BACKUP/dev-coordinator.service.preexisting"; then
+  sudo install -m 0644 "$CUTOVER_BACKUP/dev-coordinator.service.previous" \
+    /etc/systemd/system/dev-coordinator.service
+else
+  sudo rm -f /etc/systemd/system/dev-coordinator.service
+fi
+sudo install -m 0644 "$CUTOVER_BACKUP/devops-console.service.previous" \
+  /etc/systemd/system/devops-console.service
+sudo systemctl daemon-reload
+sudo systemctl reset-failed dev-coordinator.service devops-console.service || true
+sudo systemctl start devops-console.service
+```
+
+Verify the restored Console cgroup again contains its exact Node main process
+and one child coordinator on 29876, while the split coordinator unit is absent
+or restored to its recorded prior state. Re-run TLS health and login before
+ending rollback. Do not delete the old checkout or private backup after a
+successful cutover.
 
 Both units run as `holyglory`. The coordinator binds only loopback and owns the
 external coordinator state and private token. The Console requires that unit,
 runs with `CAP_NET_BIND_SERVICE` only (no root), and `ExecReload` sends SIGHUP
-for cert reloads. Put private Console configuration in
-`~/.config/devops-console/console.env` (mode `0600`) and create
-`~/.local/state/devops-console` and `~/.codex/agent-coordinator` with mode
-`0700` before starting the units. On startup the Console registers itself with
-the coordinator (`server register`, port 443) so it appears in inventory
-alongside everything it manages.
+for cert reloads. On startup it registers itself with the coordinator (`server
+register`, port 443) so it appears in inventory alongside everything it
+manages.
+
+`dev-coordinator.service` deliberately uses `KillMode=process`. Managed dev
+servers are independent attributed resources; `start_new_session` separates
+their signals but does not move them out of the service cgroup. The default
+control-group kill would therefore terminate every coordinator-launched server
+when restarting only the API. Project/server stop actions remain the explicit
+way to terminate those managed processes.
+
+The coordinator unit intentionally does not set `PrivateTmp`, `ProtectSystem`,
+`ReadWritePaths`, `NoNewPrivileges`, or a unit-wide `UMask`. Systemd applies
+those properties to every child in the service cgroup, and
+`start_new_session` changes only process-session/signal relationships. A
+generic coordinator must not silently give launched apps a private `/tmp`, a
+restricted filesystem, disabled privilege transitions, or an unexpected
+creation mask; surviving children would also retain an obsolete private mount
+namespace after an API restart. Workloads that need stronger isolation must be
+launched into their own explicitly configured transient systemd scopes/units,
+not inherit policy from the coordinator API unit. The Console remains hardened
+because it owns no managed children when `COORDINATOR_AUTOSTART=0`.
 
 ## Exposing a dev server
 

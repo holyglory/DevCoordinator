@@ -7,11 +7,10 @@ import assert from 'node:assert/strict';
 import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { loadConfig, ConfigError } from '../src/config.mjs';
+import { DEV_CERT, DEV_KEY, ensureDevCert } from './helpers/dev-cert.mjs';
 
-const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HEX64 = 'ab'.repeat(32);
 
 async function makeTmp(t) {
@@ -173,6 +172,7 @@ test('fatal: SESSION_SECRET must be exactly 64 hex characters', async (t) => {
 test('HTTP_PORT=0 is valid outside dev mode: plain listener disabled, TLS still required', async (t) => {
   const dir = await makeTmp(t);
   const envFile = await emptyEnvFile(dir);
+  ensureDevCert();
   const cfg = loadConfig({
     envFile,
     env: {
@@ -188,8 +188,8 @@ test('HTTP_PORT=0 is valid outside dev mode: plain listener disabled, TLS still 
   assert.equal(cfg.httpPort, 0);
   assert.equal(cfg.httpsPort, 443);
   assert.equal(cfg.devInsecureHttp, false);
-  assert.equal(cfg.tlsCertFile, path.join(APP_ROOT, 'certs/dev/wildcard.vr.ae.crt'));
-  assert.equal(cfg.tlsKeyFile, path.join(APP_ROOT, 'certs/dev/wildcard.vr.ae.key'));
+  assert.equal(cfg.tlsCertFile, DEV_CERT);
+  assert.equal(cfg.tlsKeyFile, DEV_KEY);
   assert.equal(cfg.consoleOrigin, 'https://console.vr.ae'); // no :443 suffix
 });
 
@@ -232,6 +232,33 @@ test('invalid ports are each reported', async (t) => {
       return true;
     },
   );
+});
+
+test('coordinator URL is restricted to a credential-safe loopback origin', async (t) => {
+  const dir = await makeTmp(t);
+  const envFile = await emptyEnvFile(dir);
+
+  for (const bad of [
+    'https://coordinator.example.test:29876',
+    'http://192.0.2.10:29876',
+    'http://user:password@127.0.0.1:29876',
+    'http://127.0.0.1:29876/v1',
+  ]) {
+    assert.throws(
+      () => loadConfig({ envFile, env: minimalEnv(dir, { COORDINATOR_URL: bad }) }),
+      (err) => {
+        const problem = err.errors.find((item) => item.key === 'COORDINATOR_URL');
+        assert.ok(problem, `expected COORDINATOR_URL rejection for ${bad}`);
+        assert.match(problem.message, /loopback/);
+        return true;
+      },
+    );
+  }
+
+  for (const safe of ['http://127.0.0.1:29876', 'http://localhost:29876/']) {
+    const config = loadConfig({ envFile, env: minimalEnv(dir, { COORDINATOR_URL: safe }) });
+    assert.match(config.coordinatorUrl, /^http:\/\/(?:127\.0\.0\.1|localhost):29876$/);
+  }
 });
 
 test('explicitly requested env file that does not exist is fatal', async (t) => {

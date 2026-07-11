@@ -76,6 +76,7 @@ function redactedConfig(config) {
 function buildProxy({ log, pages, config }) {
   return createProxy({
     log,
+    sessionCookieName: config.cookieName,
     renderBadGateway: (req, res, { kind, target }) => {
       const detail =
         kind === 'timeout'

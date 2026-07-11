@@ -108,6 +108,94 @@ for (const mode of [0o644, 0o700]) {
   });
 }
 
+test('symlink token file is rejected before its target can become an Authorization header', async (t) => {
+  const { client, tokenFile, requests } = await fixture(t);
+  const target = path.join(path.dirname(tokenFile), 'symlink-target-token');
+  const targetToken = 'symlink-target-secret-0123456789abcdef';
+  fs.writeFileSync(target, `${targetToken}\n`, { mode: 0o600 });
+  fs.unlinkSync(tokenFile);
+  fs.symlinkSync(target, tokenFile);
+
+  await assert.rejects(
+    () => client.inventory({ maxAgeMs: 0 }),
+    (err) => {
+      assert.ok(err instanceof CoordError);
+      assert.equal(err.status, 503);
+      assert.match(err.message, /regular non-symlink file/);
+      assert.doesNotMatch(err.message, new RegExp(targetToken));
+      return true;
+    },
+  );
+  assert.equal(requests.length, 0);
+  assert.doesNotMatch(String(client.status().lastError), new RegExp(targetToken));
+});
+
+test('non-regular token file is rejected without attempting to read it', async (t) => {
+  const { client, tokenFile, requests } = await fixture(t);
+  fs.unlinkSync(tokenFile);
+  fs.mkdirSync(tokenFile, { mode: 0o700 });
+
+  await assert.rejects(
+    () => client.inventory({ maxAgeMs: 0 }),
+    (err) => err instanceof CoordError && err.status === 503 && /regular non-symlink file/.test(err.message),
+  );
+  assert.equal(requests.length, 0);
+});
+
+test('oversized token file is rejected before token material is read or sent', async (t) => {
+  const { client, tokenFile, requests } = await fixture(t);
+  const oversizedSecret = `oversized-secret-${'x'.repeat(4097)}`;
+  fs.writeFileSync(tokenFile, oversizedSecret, { mode: 0o600 });
+
+  await assert.rejects(
+    () => client.inventory({ maxAgeMs: 0 }),
+    (err) => {
+      assert.ok(err instanceof CoordError);
+      assert.equal(err.status, 503);
+      assert.match(err.message, /oversized/);
+      assert.doesNotMatch(err.message, /oversized-secret/);
+      return true;
+    },
+  );
+  assert.equal(requests.length, 0);
+  assert.doesNotMatch(String(client.status().lastError), /oversized-secret/);
+});
+
+test('token path replacement at open time fails closed instead of following the replacement', async (t) => {
+  const { client, tokenFile, requests } = await fixture(t);
+  const replacement = path.join(path.dirname(tokenFile), 'replacement-token');
+  const replacementToken = 'replacement-secret-0123456789abcdef';
+  fs.writeFileSync(replacement, `${replacementToken}\n`, { mode: 0o600 });
+
+  const originalOpenSync = fs.openSync;
+  let replacementInjected = false;
+  fs.openSync = function guardedOpenSync(file, flags, ...rest) {
+    if (!replacementInjected && path.resolve(String(file)) === path.resolve(tokenFile)) {
+      replacementInjected = true;
+      fs.unlinkSync(tokenFile);
+      fs.symlinkSync(replacement, tokenFile);
+    }
+    return originalOpenSync.call(this, file, flags, ...rest);
+  };
+  try {
+    await assert.rejects(
+      () => client.inventory({ maxAgeMs: 0 }),
+      (err) => {
+        assert.ok(err instanceof CoordError);
+        assert.equal(err.status, 503);
+        assert.match(err.message, /regular non-symlink file/);
+        assert.doesNotMatch(err.message, new RegExp(replacementToken));
+        return true;
+      },
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+  assert.equal(replacementInjected, true, 'fixture must replace the path immediately before the credential open');
+  assert.equal(requests.length, 0);
+  assert.doesNotMatch(String(client.status().lastError), new RegExp(replacementToken));
+});
+
 test('HTTP 200 project reports with ok=false remain failures with structured evidence', async (t) => {
   const { client } = await fixture(t);
   await assert.rejects(

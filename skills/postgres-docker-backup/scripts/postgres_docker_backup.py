@@ -26,7 +26,7 @@ TOOL_VERSION = "2.1.0"
 MANIFEST_SCHEMA_VERSION = 2
 DATABASE_SCOPE = "database"
 CLUSTER_SCOPE = "cluster"
-DISPOSABLE_LABEL = "com.holyskills.postgres-backup.disposable=true"
+DISPOSABLE_LABEL = "com.devcoordinator.postgres-backup.disposable=true"
 DOCKER_SHORT_ID_LENGTH = 12
 DOCKER_FULL_ID_LENGTH = 64
 DOCKER_ID_RE = re.compile(r"^[0-9a-fA-F]+$")

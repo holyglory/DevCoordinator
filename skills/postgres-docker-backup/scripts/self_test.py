@@ -816,7 +816,7 @@ def main() -> int:
         cluster_sequence = docker_log(log_path)
         run_command = next(command for command in cluster_sequence if command and command[0] == "run")
         check("--network" in run_command and run_command[run_command.index("--network") + 1] == "none", "disposable verification cluster must have no network")
-        check("--label" in run_command and "com.holyskills.postgres-backup.disposable=true" in run_command, "disposable target must be labeled")
+        check("--label" in run_command and "com.devcoordinator.postgres-backup.disposable=true" in run_command, "disposable target must be labeled")
         cluster_restore = next(command for command in cluster_sequence if command[:2] == ["exec", "-i"] and "psql" in command)
         check(cluster_restore[2].startswith("codex-pg-verify-"), "cluster SQL must be piped only into the disposable target")
         source_targets = {"pg-fixture", "pg123", SOURCE_ID}

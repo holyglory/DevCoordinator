@@ -23,7 +23,7 @@ from shutil import rmtree
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "postgres_docker_backup.py"
 IMAGE = os.environ.get("POSTGRES_BACKUP_INTEGRATION_IMAGE", "postgres:16-alpine")
-DISPOSABLE_LABEL = "com.holyskills.postgres-backup.disposable=true"
+DISPOSABLE_LABEL = "com.devcoordinator.postgres-backup.disposable=true"
 
 
 def command(args: list[str], *, expect: int = 0, timeout: float = 90) -> subprocess.CompletedProcess[str]:
@@ -110,7 +110,7 @@ def main() -> int:
         return 1 if required else 0
 
     before = labeled_container_ids()
-    container = f"holyskills-pg-it-{uuid.uuid4().hex[:12]}"
+    container = f"devcoordinator-pg-it-{uuid.uuid4().hex[:12]}"
     tmp = Path(tempfile.mkdtemp(prefix="postgres-backup-docker-integration-"))
     created = False
     try:

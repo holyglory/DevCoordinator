@@ -1,126 +1,78 @@
-# Repo Agent Instructions
+# DevCoordinator Agent Instructions
 
-These instructions apply to every coding agent working in this repository
-(Codex and Claude Code alike). "The agent" below means whichever assistant is
-doing the work.
+These rules apply to Codex and Claude Code in this repository.
 
-## Repository Freshness Preflight
+## Repository freshness
 
 - Before a repository-wide audit, broad refactor, migration, history rewrite,
-  or repository split, run
-  `python3 scripts/check_repository_freshness.py --repo "$PWD" --json` and
-  inspect the freshly fetched remote-default-branch ancestry.
-- `current` and `ahead` are safe ancestry states. `behind`, `diverged`, and
-  `dirty-on-stale-base` require reconciliation before implementation;
-  `remote-unavailable` is unknown, never evidence that the checkout is current.
-- Never discard or rewrite a dirty checkout to make it current. Preserve the
-  work, establish a clean checkout from the remote baseline, and use an
-  evidence-backed three-way merge. Do not pull, rebase, reset, stash, or clean
-  valuable local changes as a freshness shortcut.
-- If remote truth is unavailable, pause architecture-changing work until it is
-  restored or the user explicitly authorizes an offline baseline.
+  or split, run `python3 scripts/check_repository_freshness.py --repo "$PWD" --json`
+  and inspect fetched remote-default ancestry.
+- `current` and `ahead` are safe ancestry states. Reconcile `behind`,
+  `diverged`, and `dirty-on-stale-base` before implementation.
+  `remote-unavailable` is unknown, not proof of freshness.
+- Never reset, rebase, stash, clean, or overwrite valuable dirty work to make a
+  checkout current. Preserve it and reconcile from an isolated remote-fresh
+  clone with an evidence-backed three-way merge.
 
-## Agent Implementation Mistake Protocol
+## Incident and detector work
 
-When the user reports an implementation mistake likely made by the agent,
-handle it as a prevention-first incident unless the evidence shows the user
-changed their mind or the requested behavior changed after implementation.
+- Reproduce a user-reported error through the original surface before fixing
+  it when reproduction is reasonable. Trace user intent, requirements,
+  implementation, tests, tooling, and the missed-detection path first.
+- Update the nearest durable guardrail before the product fix when practical.
+  Keep one-off incident narratives in `DecisionHistory.md`, not policy.
+- Detector changes must prove realistic recall for every advertised class and
+  include false-positive controls for common intentional patterns.
+- Re-test the original reproduction, the guardrail, and adjacent failure paths
+  before reporting completion.
 
-1. Reproduce the reported error through the same surface the user saw whenever
-   it is possible and reasonable. If it cannot be reproduced, record why and
-   gather the closest concrete evidence available.
-2. Check whether the failure is actually a changed requirement. Compare the
-   original request, later clarifications, accepted plans, project docs, and
-   delivered behavior before treating it as an agent mistake.
-3. If the request was not changed, trace why the mistake happened before
-   changing product code. Inspect the user intent, how the agent perceived the
-   request, requirements, journey docs, design handoff, implementation, tests,
-   verifier rules, audit outputs, tool choices, policies, skills, context, and
-   handoff assumptions.
-4. Identify the nearest durable guardrail that allowed the mistake: local
-   `AGENTS.md`, project documentation, acceptance criteria, tests, verifier,
-   skill instructions, checklist, policy, or context source.
-5. Before editing `AGENTS.md` or another policy file, check guardrail scope and
-   proportionality. A repo `AGENTS.md` is repo policy, not global policy.
-   Policy text must be a generalized reusable rule, not an explanation of a
-   specific incident. Put incident narratives, timelines, and one-off root
-   causes in the root-cause report, `DecisionHistory.md`, or a targeted test.
-6. Fix that system guardrail first when practical. If a skill or audit missed
-   the issue, update the skill or deterministic check and rerun it against the
-   same evidence so it now catches the gap.
-7. Audit the testing procedure that failed to catch the mistake. Look for other
-   likely missed failures in adjacent journeys, edge cases, failure paths,
-   integrations, generated artifacts, and user-visible acceptance criteria.
-   Add or update tests for those risks, not only the one reported symptom.
-8. Close the implementation gap only after the prevention layer is patched, or
-   explicitly explain why the product fix had to be done first.
-9. After the detected gap is closed, run comprehensive tests that prove the
-   user gets the expected result. Include the original reproduction path, the
-   new or updated guardrail/check, and the broader tests from the testing
-   procedure audit before reporting done.
+## Canonical skill ownership
 
-Keep one-off local mistakes separate from broad process changes, but bias
-toward durable prevention when the same class of mistake could recur.
+- This repository is the only writable source for exactly
+  `codex-dev-coordinator` and `postgres-docker-backup`.
+- Install them only through `scripts/manage_skill_links.py` as direct absolute
+  symlinks to this checkout. Never hand-edit a Codex, Claude, Parall, or other
+  installed copy.
+- Before relying on an installed skill, verify both direct `readlink` and
+  canonical `realpath`. Preserve drift in a private rollback transaction and
+  port intentional unique work here before replacement.
+- Keep `SKILL.md` authoritative and mirror enforceable safety behavior in the
+  deterministic self-tests.
 
-## Skill Development
+## Repository independence and public history
 
-- Before fixing errors, reproduce the issue or policy gap you are changing.
-- Keep each skill's `SKILL.md` contract authoritative and mirror enforceable
-  behavior in deterministic self-tests where possible.
-- Test the changed path the same way it was reproduced.
-- For detector-style skills (verifiers, auditors, linters, monitors), the
-  self-test must prove recall as well as precision: include at least one
-  realistic must-catch fixture per detection class the `SKILL.md` advertises,
-  built the way real applications break rather than the way the detector
-  measures, plus false-positive guards for common intentional patterns. A
-  detector change is not validated while an advertised detection class has no
-  realistic failing fixture.
-- When a test or verifier missed a user-visible mistake, audit neighboring
-  testing gaps and add comprehensive post-fix coverage before delivery.
-- Never deliver static mocks, fake plumbing, no-op UI, synthetic data flows, or
-  "wired later" implementations as completed work.
+- DevCoordinator must not acquire a source, build, runtime, test, CI, or pinned
+  dependency on holyskills. `DEVCOORDINATOR_ROOT` is the only repository-root
+  override for these products.
+- Preserve the legacy Board bundle identifier/settings lookup solely for
+  application identity migration; do not use it to resolve source.
+- Keep actual environment files, credentials, private keys, runtime state,
+  backups, logs, and rollback transactions outside Git. Only `.env.example`
+  and provenance-bound deterministic fixtures may be published.
+- Do not add non-canonical screenshots to reachable history. Run
+  `scripts/check_repository_boundaries.py` before release.
+- Record architectural decisions and later contradictions in
+  `DecisionHistory.md`, including expected behavioral consequences.
 
-## Skill Installation Source Of Truth
+## macOS app workflow
 
-- This repository is the only writable canonical source for its eight skills.
-  Do not hand-edit copies under Codex, Claude, Parall, or another runtime home.
-- Install each repo-owned skill through `scripts/manage_skill_links.py` as a
-  direct symlink to `skills/<skill>`. Preserve unrelated runtime/system skills.
-- Before relying on an installed repo skill, verify its direct `readlink` and
-  canonical `realpath`. Treat copied directories, chained links, broken links,
-  or content drift as installation failures and repair them from this repo with
-  a hash-verified rollback record.
+- Load and use the Build macOS Apps plugin before building, testing,
+  snapshotting, packaging, launching, debugging, or automating DevOps Board.
+- Do not use direct `swift`, `swiftc`, `xcodebuild`, XCUI, `open`, ad-hoc mouse,
+  or keyboard control as a substitute.
+- If the plugin is unavailable, stop the native gate and report it as pending;
+  continue only non-native work.
 
-## macOS App Build And Test Workflow
+## Services, Docker, and databases
 
-- For this repository's Swift/macOS app, load and follow the Build macOS Apps
-  plugin before building, testing, packaging, launching, debugging, or running
-  native UI automation.
-- Do not take over the user's desktop, drive the app through ad-hoc mouse or
-  keyboard control, invoke `open`, or substitute direct `swift`, `swiftc`,
-  `xcodebuild`, or XCUI commands for the plugin workflow.
-- If the plugin is not installed or unavailable in the current session, stop
-  the Swift/macOS validation path and report it as pending. Continue only work
-  that does not build, launch, or control the app until the plugin is available.
-
-## Local Services, Docker, And Databases
-
-- Before starting, stopping, restarting, or replacing any dev/test server,
-  Docker Compose service, Docker container, or local database stack, use
-  `$codex-dev-coordinator`, set
-  `PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`, and run
-  its `inventory --project "$PROJECT_ROOT"` command.
-- Every mutating coordinator call must include both `--agent "$USER"` and
-  `--project "$PROJECT_ROOT"` so the coordinator can attribute servers,
-  Docker containers, databases, and leases to the repo that requested them.
-- Do not start services on default ports directly. Do not follow the pattern
-  "try the default port, then try another one if busy." Lease ports or manage
-  servers through the coordinator.
-- If a dev server or Docker container is already running outside coordinator
-  state, register it through `$codex-dev-coordinator` (`server register` or
-  `docker register`) instead of launching a duplicate.
-- Reuse a healthy coordinator-managed URL when it matches the task instead of
-  launching a duplicate server.
-- Before destructive PostgreSQL-in-Docker operations such as migrations, resets,
-  imports, seed rewrites, `DROP`, or `TRUNCATE`, use `$postgres-docker-backup`
-  to create and verify a backup.
+- Before starting, stopping, restarting, or replacing a service, Docker
+  resource, or local database stack, set
+  `PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"` and run
+  `python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py inventory --project "$PROJECT_ROOT"`.
+- Every mutation must include `--agent "$USER"` and
+  `--project "$PROJECT_ROOT"`. Lease ports; do not probe a default port and
+  silently move after a collision.
+- Register an already-running owned resource rather than creating a duplicate.
+- Before destructive PostgreSQL-in-Docker work, create and verify a backup with
+  `postgres-docker-backup` and bind every live operation to the expected
+  immutable container ID.

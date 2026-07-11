@@ -211,9 +211,15 @@ export function loadConfig({ envFile, env = process.env } = {}) {
   try {
     const u = new URL(coordinatorUrl);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('bad scheme');
+    if (u.hostname !== '127.0.0.1' && u.hostname !== 'localhost') {
+      throw new Error('coordinator must be loopback');
+    }
+    if (u.username || u.password || u.search || u.hash || (u.pathname && u.pathname !== '/')) {
+      throw new Error('coordinator URL must name the loopback origin only');
+    }
     coordinatorUrl = coordinatorUrl.replace(/\/+$/, '');
   } catch {
-    fail('COORDINATOR_URL', `must be an http(s) URL: ${coordinatorUrl}`);
+    fail('COORDINATOR_URL', `must be a loopback http(s) origin: ${coordinatorUrl}`);
   }
 
   const rawAutostart = get('COORDINATOR_AUTOSTART');

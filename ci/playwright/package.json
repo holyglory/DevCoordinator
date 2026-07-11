@@ -1,5 +1,5 @@
 {
-  "name": "holyskills-ci-playwright",
+  "name": "devcoordinator-ci-playwright",
   "version": "1.0.0",
   "private": true,
   "description": "Locked Playwright runtime for repository validation",

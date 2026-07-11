@@ -18,7 +18,7 @@ from typing import Any
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PNG_METADATA_CHUNKS = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
-PORTABLE_USERS = {"example", "fixture", "runner", "root", "test", "user", "username"}
+PORTABLE_USERS = {"devcoordinator", "example", "fixture", "runner", "root", "test", "user", "username"}
 PORTABLE_AGENT_MARKERS = ("fixture", "example", "test", "codex", "claude", "agent", "sample")
 AGENT_GRAMMAR_WORDS = {"a", "and", "for", "or", "so", "the", "to", "with"}
 PLACEHOLDER_SECRET_VALUES = {

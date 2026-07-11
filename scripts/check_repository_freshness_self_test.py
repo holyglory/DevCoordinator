@@ -21,7 +21,7 @@ GIT_IDENTITY = [
     "-c",
     "user.name=freshness-self-test",
     "-c",
-    "user.email=freshness-self-test@holyskills.local",
+    "user.email=freshness-self-test@devcoordinator.invalid",
 ]
 
 

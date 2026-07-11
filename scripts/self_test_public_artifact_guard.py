@@ -107,6 +107,7 @@ def main() -> int:
                 [
                     "Use $HOME/.codex or ~/.codex rather than a private absolute path.",
                     "Portable examples may say /Users/<username>/src or /home/example/src.",
+                    "The public deployment checkout is /home/DevCoordinator/apps/DevOpsConsole.",
                     "Use --agent \"$USER\" or --agent fixture-agent in tests.",
                     "Authorization: Bearer <contents-of-token>",
                     "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan, apply, verify, and roll back canonical Holy Skills symlinks.
+"""Plan, apply, verify, and roll back canonical DevCoordinator skill links.
 
 The command deliberately requires every installation root to be named.  It
 never derives a target from HOME because desktop runtimes can override HOME.
@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 
-VERSION = 2
+VERSION = 3
+SUPPORTED_JOURNAL_VERSIONS = {2, VERSION}
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 JOURNAL_NAME = "journal.json"
 SAFE_APPLY_STATES = {"missing", "copied_match", "direct_link"}
@@ -136,15 +137,27 @@ def tree_digest(root: Path) -> str:
 
 
 def canonical_repository(raw: str | Path) -> Path:
-    repository = require_absolute(str(raw), "--repo-root")
-    if repository.is_symlink():
-        raise LinkManagerError(f"repository root must not itself be a symlink: {repository}")
+    lexical = require_absolute(str(raw), "--repo-root")
+    repository = Path(os.path.abspath(os.fspath(lexical)))
     try:
-        repository = repository.resolve(strict=True)
+        repository_mode = repository.lstat().st_mode
     except FileNotFoundError as error:
         raise LinkManagerError(f"repository root does not exist: {repository}") from error
-    if not (repository / "skills").is_dir():
-        raise LinkManagerError(f"repository has no skills directory: {repository}")
+    if stat.S_ISLNK(repository_mode) or not stat.S_ISDIR(repository_mode):
+        raise LinkManagerError(f"repository root must be a real directory, not a symlink: {repository}")
+    try:
+        resolved = repository.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise LinkManagerError(f"repository root does not exist: {repository}") from error
+    if resolved != repository:
+        raise LinkManagerError(f"repository root must not contain symlinked path components: {repository}")
+    skills = repository / "skills"
+    try:
+        skills_mode = skills.lstat().st_mode
+    except FileNotFoundError as error:
+        raise LinkManagerError(f"repository has no skills directory: {repository}") from error
+    if stat.S_ISLNK(skills_mode) or not stat.S_ISDIR(skills_mode):
+        raise LinkManagerError(f"repository skills directory must be a real in-repository directory: {skills}")
     return repository
 
 
@@ -280,11 +293,24 @@ def fsync_locked_root(locked: LockedRoot) -> None:
 
 
 def managed_skills(repository: Path, selected: Iterable[str] | None = None) -> list[str]:
-    available = {
-        path.name
-        for path in (repository / "skills").iterdir()
-        if path.is_dir() and not path.is_symlink() and (path / "SKILL.md").is_file()
-    }
+    skills_root = repository / "skills"
+    symlinks = sorted(
+        path.relative_to(repository).as_posix()
+        for path in skills_root.rglob("*")
+        if path.is_symlink()
+    )
+    if symlinks:
+        raise LinkManagerError(
+            "canonical skills tree must not contain symlinks: " + ", ".join(symlinks)
+        )
+    available: set[str] = set()
+    for path in skills_root.iterdir():
+        if not path.is_dir() or path.is_symlink():
+            continue
+        skill_file = path / "SKILL.md"
+        if not skill_file.is_file() or skill_file.is_symlink():
+            continue
+        available.add(path.name)
     if selected:
         names = set(selected)
         invalid = sorted(name for name in names if Path(name).name != name or name in {".", ".."})
@@ -307,7 +333,65 @@ def resolved_link_target(path: Path) -> tuple[str, Path]:
     return raw, target
 
 
-def classify_installation(destination: Path, source: Path, source_digest: str) -> dict[str, Any]:
+def source_snapshot(repository: Path, skill: str) -> dict[str, Any]:
+    """Capture the canonical source identities and bytes without following links."""
+
+    checked = canonical_repository(repository)
+    if checked != repository:
+        raise LinkManagerError(f"canonical repository identity changed: {repository}")
+    if managed_skills(checked, [skill]) != [skill]:
+        raise LinkManagerError(f"canonical skill is unavailable: {skill}")
+    skills_root = checked / "skills"
+    source = skills_root / skill
+    repository_metadata = checked.lstat()
+    skills_metadata = skills_root.lstat()
+    source_metadata = source.lstat()
+    return {
+        "repository_device": repository_metadata.st_dev,
+        "repository_inode": repository_metadata.st_ino,
+        "skills_device": skills_metadata.st_dev,
+        "skills_inode": skills_metadata.st_ino,
+        "source_device": source_metadata.st_dev,
+        "source_inode": source_metadata.st_ino,
+        "digest": tree_digest(source),
+    }
+
+
+def require_source_snapshot(source: Path, expected: dict[str, Any]) -> None:
+    repository = source.parent.parent
+    try:
+        actual = source_snapshot(repository, source.name)
+    except (LinkManagerError, OSError) as error:
+        raise LinkManagerError(f"canonical source changed after planning: {source}: {error}") from error
+    if actual != expected:
+        raise LinkManagerError(f"canonical source identity or content changed after planning: {source}")
+
+
+def direct_link_path_matches(destination: Path, source: Path) -> bool:
+    """Match only the exact link text; safe for rollback even if source drifted."""
+
+    if not destination.is_symlink():
+        return False
+    raw, target = resolved_link_target(destination)
+    return raw == str(source) and target == source
+
+
+def direct_link_matches(destination: Path, source: Path, expected_source: dict[str, Any]) -> bool:
+    if not direct_link_path_matches(destination, source):
+        return False
+    try:
+        require_source_snapshot(source, expected_source)
+    except LinkManagerError:
+        return False
+    return True
+
+
+def classify_installation(
+    destination: Path,
+    source: Path,
+    source_digest: str,
+    expected_source: dict[str, Any],
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "destination": str(destination),
         "source": str(source),
@@ -316,7 +400,7 @@ def classify_installation(destination: Path, source: Path, source_digest: str) -
         raw, target = resolved_link_target(destination)
         result["link_target"] = raw
         result["resolved_link_target"] = str(target.resolve(strict=False))
-        if raw == str(source) and target == source and source.is_dir():
+        if raw == str(source) and target == source and direct_link_matches(destination, source, expected_source):
             result["status"] = "direct_link"
         elif target.is_symlink():
             result["status"] = "chained_link"
@@ -351,12 +435,25 @@ def build_plan_from_canonical(
     selected_skills: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     skills = managed_skills(repository, selected_skills)
-    digests = {name: tree_digest(repository / "skills" / name) for name in skills}
+    source_snapshots = {name: source_snapshot(repository, name) for name in skills}
+    digests = {name: source_snapshots[name]["digest"] for name in skills}
     entries: list[dict[str, Any]] = []
     for root_index, root in enumerate(target_roots):
         for skill in skills:
-            entry = classify_installation(root / skill, repository / "skills" / skill, digests[skill])
-            entry.update({"root_index": root_index, "target_root": str(root), "skill": skill})
+            entry = classify_installation(
+                root / skill,
+                repository / "skills" / skill,
+                digests[skill],
+                source_snapshots[skill],
+            )
+            entry.update(
+                {
+                    "root_index": root_index,
+                    "target_root": str(root),
+                    "skill": skill,
+                    "source_snapshot": source_snapshots[skill],
+                }
+            )
             entries.append(entry)
     return {
         "version": VERSION,
@@ -375,13 +472,6 @@ def build_plan(
     repository = canonical_repository(repository_raw)
     target_roots = canonical_target_roots(target_roots_raw, repository)
     return build_plan_from_canonical(repository, target_roots, selected_skills)
-
-
-def direct_link_matches(destination: Path, source: Path) -> bool:
-    if not destination.is_symlink():
-        return False
-    raw, target = resolved_link_target(destination)
-    return raw == str(source) and target == source and source.is_dir()
 
 
 def render_plan(plan: dict[str, Any]) -> str:
@@ -432,8 +522,21 @@ def journal_entries(plan: dict[str, Any], transaction: Path) -> list[dict[str, A
                 "skill": entry["skill"],
                 "destination": entry["destination"],
                 "source": entry["source"],
+                "source_snapshot": entry["source_snapshot"],
                 "backup": str(backup),
-                "before": {key: value for key, value in entry.items() if key not in {"root_index", "target_root", "skill", "destination", "source"}},
+                "before": {
+                    key: value
+                    for key, value in entry.items()
+                    if key
+                    not in {
+                        "root_index",
+                        "target_root",
+                        "skill",
+                        "destination",
+                        "source",
+                        "source_snapshot",
+                    }
+                },
                 "stage": "pending",
             }
         )
@@ -477,7 +580,8 @@ def remove_tree_at(parent_descriptor: int, name: str) -> None:
 
 
 def validate_journal(journal: dict[str, Any], transaction: Path) -> None:
-    if journal.get("version") != VERSION:
+    journal_version = journal.get("version")
+    if journal_version not in SUPPORTED_JOURNAL_VERSIONS:
         raise LinkManagerError("unsupported or missing transaction journal version")
     repository = Path(journal.get("repository_root", ""))
     roots = [Path(item) for item in journal.get("target_roots", [])]
@@ -503,6 +607,21 @@ def validate_journal(journal: dict[str, Any], transaction: Path) -> None:
             raise LinkManagerError("transaction journal destination escaped its target root")
         if Path(entry.get("source", "")) != expected_source:
             raise LinkManagerError("transaction journal source escaped the canonical skills directory")
+        if journal_version >= 3:
+            snapshot = entry.get("source_snapshot")
+            required_snapshot_keys = {
+                "repository_device",
+                "repository_inode",
+                "skills_device",
+                "skills_inode",
+                "source_device",
+                "source_inode",
+            }
+            if not isinstance(snapshot, dict) or not all(
+                isinstance(snapshot.get(key), int) and snapshot[key] >= 0
+                for key in required_snapshot_keys
+            ) or not isinstance(snapshot.get("digest"), str) or len(snapshot["digest"]) != 64:
+                raise LinkManagerError("transaction journal has an invalid canonical source snapshot")
         if Path(entry.get("backup", "")) != expected_backup:
             raise LinkManagerError("transaction journal backup escaped its transaction directory")
 
@@ -566,10 +685,10 @@ def preflight_rollback(
         destination_exists = lexical_exists_at(locked, entry["skill"])
         if backup_exists and not matches_before(backup, before):
             raise LinkManagerError(f"transaction backup no longer matches its recorded pre-apply state: {backup}")
-        if backup_exists and destination_exists and not force and not direct_link_matches(destination, source):
+        if backup_exists and destination_exists and not force and not direct_link_path_matches(destination, source):
             raise LinkManagerError(f"refusing to overwrite a post-apply change during rollback: {destination}")
         if not backup_exists and before.get("status") == "missing":
-            if destination_exists and not force and not direct_link_matches(destination, source):
+            if destination_exists and not force and not direct_link_path_matches(destination, source):
                 raise LinkManagerError(f"refusing to remove a post-apply change during rollback: {destination}")
         elif not backup_exists and entry.get("stage") not in {"pending", "prepared", "rolled_back"}:
             if not matches_before(destination, before):
@@ -603,14 +722,14 @@ def rollback_locked(
 
         if backup_exists:
             if destination_exists:
-                if not force and not direct_link_matches(destination, source):
+                if not force and not direct_link_path_matches(destination, source):
                     raise LinkManagerError(f"refusing to overwrite a post-apply change during rollback: {destination}")
                 remove_path_at(locked, entry["skill"])
             os.replace(backup, entry["skill"], dst_dir_fd=locked.descriptor)
             fsync_locked_root(locked)
         elif before_status == "missing":
             if destination_exists:
-                if not force and not direct_link_matches(destination, source):
+                if not force and not direct_link_path_matches(destination, source):
                     raise LinkManagerError(f"refusing to remove a post-apply change during rollback: {destination}")
                 remove_path_at(locked, entry["skill"])
                 fsync_locked_root(locked)
@@ -677,6 +796,14 @@ def apply_links(
         save_journal(transaction, journal)
         linked = 0
         try:
+            # prepare_transaction is deliberately overridable in the failure
+            # harness and may also block on filesystem work. Revalidate every
+            # source after that boundary, before touching an installation.
+            for plan_entry in plan["entries"]:
+                require_source_snapshot(
+                    Path(plan_entry["source"]),
+                    plan_entry["source_snapshot"],
+                )
             for entry in journal["entries"]:
                 locked = locked_roots[entry["root_index"]]
                 revalidate_locked_root(locked)
@@ -715,7 +842,8 @@ def apply_links(
                     entry["stage"] = "backup_moved"
                     save_journal(transaction, journal)
 
-                temporary_name = f".{entry['skill']}.holyskills-{uuid.uuid4().hex}"
+                require_source_snapshot(source, entry["source_snapshot"])
+                temporary_name = f".{entry['skill']}.devcoordinator-{uuid.uuid4().hex}"
                 try:
                     os.symlink(str(source), temporary_name, dir_fd=locked.descriptor)
                     os.replace(
@@ -731,7 +859,7 @@ def apply_links(
                 entry["stage"] = "linked"
                 save_journal(transaction, journal)
                 revalidate_locked_root(locked)
-                if not direct_link_matches(destination, source):
+                if not direct_link_matches(destination, source, entry["source_snapshot"]):
                     raise LinkManagerError(f"direct link verification failed immediately after apply: {destination}")
                 linked += 1
                 if failure_after is not None and linked >= failure_after:
@@ -740,7 +868,11 @@ def apply_links(
             for plan_entry in plan["entries"]:
                 locked = locked_roots[plan_entry["root_index"]]
                 revalidate_locked_root(locked)
-                if not direct_link_matches(Path(plan_entry["destination"]), Path(plan_entry["source"])):
+                if not direct_link_matches(
+                    Path(plan_entry["destination"]),
+                    Path(plan_entry["source"]),
+                    plan_entry["source_snapshot"],
+                ):
                     raise LinkManagerError(f"final direct link verification failed: {plan_entry['destination']}")
             journal["status"] = "applied"
             save_journal(transaction, journal)

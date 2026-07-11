@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Repo-level validation for Holy Skills."""
+"""Validate the independent DevCoordinator repository."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import shutil
@@ -15,21 +14,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HARNESS = ROOT / "full_repo_harness"
 SKILLS = [
     ROOT / "skills" / "codex-dev-coordinator",
-    ROOT / "skills" / "formal-web-ui-verification",
-    ROOT / "skills" / "full-repo-audit",
-    ROOT / "skills" / "full-repo-test-coverage-audit",
     ROOT / "skills" / "postgres-docker-backup",
-    ROOT / "skills" / "trace-fix-root-causes",
-    ROOT / "skills" / "ui-implementation-audit",
-    ROOT / "skills" / "user-journey-docs-audit",
-]
-HARNESS_SKILLS = [
-    ROOT / "skills" / "full-repo-audit",
-    ROOT / "skills" / "full-repo-test-coverage-audit",
-    ROOT / "skills" / "ui-implementation-audit",
 ]
 
 
@@ -38,106 +25,12 @@ def run(args: list[str], *, cwd: Path = ROOT) -> None:
     subprocess.run(args, cwd=cwd, check=True)
 
 
-def tree_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    source_files = []
-    for item in path.rglob("*"):
-        if not item.is_file():
-            continue
-        if "__pycache__" in item.parts or item.suffix == ".pyc":
-            continue
-        source_files.append(item)
-    for file_path in sorted(source_files):
-        rel = file_path.relative_to(path).as_posix()
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(file_path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def check_vendor_sync() -> None:
-    expected = tree_digest(HARNESS)
-    for skill in HARNESS_SKILLS:
-        vendor = skill / "scripts" / "_vendor" / "full_repo_harness"
-        if not vendor.is_dir():
-            raise SystemExit(f"Missing vendored harness: {vendor}")
-        actual = tree_digest(vendor)
-        if actual != expected:
-            raise SystemExit(f"Vendored harness is stale: {vendor}")
-
-
 def check_standalone_skill(skill: Path) -> None:
     tmp = Path(tempfile.mkdtemp(prefix=f"{skill.name}-standalone-"))
     try:
-        if skill in HARNESS_SKILLS:
-            stale_parent_harness = tmp / "full_repo_harness"
-            stale_parent_harness.mkdir()
-            (stale_parent_harness / "__init__.py").write_text("", encoding="utf-8")
-            (stale_parent_harness / "queue.py").write_text(
-                "raise RuntimeError('stale parent harness imported')\n",
-                encoding="utf-8",
-            )
         copied = tmp / skill.name
         shutil.copytree(skill, copied)
         run([sys.executable, str(copied / "scripts" / "self_test.py")])
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def check_include_glob_exclusions() -> None:
-    tmp = Path(tempfile.mkdtemp(prefix="include-glob-exclusion-"))
-    try:
-        repo = tmp / "repo"
-        (repo / "src").mkdir(parents=True)
-        (repo / "node_modules" / "pkg").mkdir(parents=True)
-        (repo / "src" / "app.py").write_text("print(1)\n", encoding="utf-8")
-        (repo / "node_modules" / "pkg" / "index.py").write_text("print(2)\n", encoding="utf-8")
-        # Explicit identity so the test does not depend on a machine-global
-        # git user.name/user.email being configured.
-        git_identity = [
-            "-c", "user.name=holyskills-validate",
-            "-c", "user.email=validate@holyskills.local",
-        ]
-        run(["git", "init", "-q"], cwd=repo)
-        run(["git", "add", "src/app.py"], cwd=repo)
-        run(["git", *git_identity, "commit", "-q", "-m", "init"], cwd=repo)
-
-        broad_out = tmp / "broad"
-        run(
-            [
-                sys.executable,
-                "skills/full-repo-audit/scripts/build_audit_batches.py",
-                "--repo",
-                str(repo),
-                "--out",
-                str(broad_out),
-                "--include-glob",
-                "**/*.py",
-            ]
-        )
-        broad_manifest = json.loads((broad_out / "manifest.json").read_text(encoding="utf-8"))
-        broad_files = {item["rel_path"] for item in broad_manifest["source_files"]}
-        if "node_modules/pkg/index.py" in broad_files:
-            raise SystemExit("Broad --include-glob unexpectedly included vendor path node_modules/pkg/index.py")
-
-        explicit_out = tmp / "explicit"
-        run(
-            [
-                sys.executable,
-                "skills/full-repo-audit/scripts/build_audit_batches.py",
-                "--repo",
-                str(repo),
-                "--out",
-                str(explicit_out),
-                "--include-glob",
-                "node_modules/**/*.py",
-            ]
-        )
-        explicit_manifest = json.loads((explicit_out / "manifest.json").read_text(encoding="utf-8"))
-        explicit_files = {item["rel_path"] for item in explicit_manifest["source_files"]}
-        if "node_modules/pkg/index.py" not in explicit_files:
-            raise SystemExit("Explicit --include-glob should include targeted vendor path node_modules/pkg/index.py")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -491,43 +384,11 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     if present:
         raise SystemExit("DevOpsBoard interaction guardrail found prohibited pattern: " + ", ".join(present))
 
-    if not run_macos_app_checks:
-        return
-    if shutil.which("swiftc") is None:
-        raise SystemExit("DevOpsBoard native checks requested but swiftc is unavailable; use --skip-macos-app")
-    qa_dir = ops_console / ".build" / "qa"
-    qa_dir.mkdir(parents=True, exist_ok=True)
-    split_test = qa_dir / "SplitSizingTest"
-    menu_snapshot = qa_dir / "MenuBarSnapshot"
-    run(
-        [
-            "swiftc",
-            "-parse-as-library",
-            "-o",
-            str(split_test),
-            "Sources/DevOpsBoard/Models.swift",
-            "Sources/DevOpsBoard/OpsStore.swift",
-            "Sources/DevOpsBoard/Views.swift",
-            "Tools/SplitSizingTest.swift",
-        ],
-        cwd=ops_console,
-    )
-    run([str(split_test)], cwd=ops_console)
-    run(
-        [
-            "swiftc",
-            "-parse-as-library",
-            "-o",
-            str(menu_snapshot),
-            "Sources/DevOpsBoard/Models.swift",
-            "Sources/DevOpsBoard/OpsStore.swift",
-            "Sources/DevOpsBoard/Views.swift",
-            "Sources/DevOpsBoard/MenuBarViews.swift",
-            "Tools/SnapshotProvenance.swift",
-            "Tools/MenuBarSnapshotMain.swift",
-        ],
-        cwd=ops_console,
-    )
+    if run_macos_app_checks:
+        raise SystemExit(
+            "DevOps Board native validation is owned by Build macOS Apps; "
+            "run this repository gate with --skip-macos-app"
+        )
 
 
 def check_devops_console() -> None:
@@ -558,6 +419,10 @@ def check_devops_console() -> None:
         "timing-safe session compare": "crypto.timingSafeEqual(given, expected)",
         "proxy pinned to loopback": "const LOOPBACK = '127.0.0.1'",
         "hop-by-hop header stripping": "HOP_BY_HOP",
+        "parent-domain auth cookies stripped from upstream requests": "const protectedCookieNames = new Set([sessionCookieName, FLOW_COOKIE_NAME]);",
+        "parent-domain auth cookies stripped from HTTP responses": "filterResponseHeaders(r.headers, protectedCookieNames)",
+        "parent-domain auth cookies stripped from WebSocket responses": "appendSafeRawHeaders(lines, upstreamRes.rawHeaders, protectedCookieNames)",
+        "proxy receives configured session-cookie identity": "sessionCookieName: config.cookieName",
         "oidc nonce enforcement": "id_token nonce mismatch",
         "oidc verified-email enforcement": "payload.email_verified !== true",
         "csrf origin check on mutations": "mutating && !guard.checkOrigin(req)",
@@ -653,42 +518,8 @@ def check_devops_console() -> None:
     run(["npm", "test"], cwd=console)
 
 
-def check_interaction_label_parity() -> None:
-    """The interaction checklist labels must live only in the shared harness.
-
-    They are the single source of truth for the UI 'hard reporting gate'. If a
-    verifier hardcodes its own copy of the tuple, the gate can silently drift
-    between skills, so fail if the canonical constant name appears anywhere but
-    the shared harness (root + vendored copies).
-    """
-    canonical = HARNESS / "verify_common.py"
-    text = canonical.read_text(encoding="utf-8")
-    labels = [
-        "badge-detail",
-        "row-hit-target",
-        "navigation-cursor",
-        "transient-disclosure",
-        "disclosure-scrollbar",
-        "icon-meaning",
-        "stable-expansion-width",
-        "hover-copy",
-        "status-summary",
-        "message-metadata",
-    ]
-    for label in labels:
-        if label not in text:
-            raise SystemExit(f"Canonical interaction checklist label missing from verify_common.py: {label}")
-    for skill in SKILLS:
-        for verifier in (skill / "scripts").glob("verify_*.py"):
-            body = verifier.read_text(encoding="utf-8")
-            if "INTERACTION_CHECKLIST_LABELS" in body:
-                raise SystemExit(
-                    f"{verifier} redefines INTERACTION_CHECKLIST_LABELS; import it from full_repo_harness.verify_common instead"
-                )
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate Holy Skills, DevOps Board, and DevOps Console.")
+    parser = argparse.ArgumentParser(description="Validate DevCoordinator, DevOps Board, and DevOps Console.")
     parser.add_argument(
         "--skip-macos-app",
         action="store_true",
@@ -702,16 +533,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if not args.skip_macos_app:
+        raise SystemExit(
+            "native validation must run through Build macOS Apps; "
+            "this CLI only supports --skip-macos-app"
+        )
     run([sys.executable, str(ROOT / "scripts" / "check_repository_freshness_self_test.py")])
-    check_vendor_sync()
-    check_interaction_label_parity()
-    check_include_glob_exclusions()
-    check_ops_console_interaction_guardrails(run_macos_app_checks=not args.skip_macos_app)
+    run([sys.executable, str(ROOT / "scripts" / "self_test_repository_boundaries.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_production_layout.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_migrate_legacy_console_runtime.py")])
+    run([sys.executable, str(ROOT / "scripts" / "check_repository_boundaries.py"), "--repo", str(ROOT)])
+    check_ops_console_interaction_guardrails(run_macos_app_checks=False)
     check_devops_console()
     run([sys.executable, str(ROOT / "scripts" / "self_test_manage_skill_links.py")])
-    run([sys.executable, str((ROOT / "scripts" / "merge_findings_self_test.py"))])
     run([sys.executable, str(ROOT / "scripts" / "self_test_public_artifact_guard.py")])
-    run([sys.executable, str(ROOT / "scripts" / "public_artifact_guard.py")])
+    run([sys.executable, str(ROOT / "scripts" / "public_artifact_guard.py"), "--repo", str(ROOT)])
     run([sys.executable, str(ROOT / "scripts" / "self_test_snapshot_artifacts.py")])
     snapshot_arguments = [sys.executable, str(ROOT / "scripts" / "verify_snapshot_artifacts.py")]
     if args.skip_macos_app:
@@ -731,15 +567,8 @@ def main(argv: list[str] | None = None) -> int:
             "-m",
             "compileall",
             "scripts",
-            "full_repo_harness",
             "skills/codex-dev-coordinator/scripts",
-            "skills/formal-web-ui-verification/scripts",
-            "skills/full-repo-audit/scripts",
-            "skills/full-repo-test-coverage-audit/scripts",
             "skills/postgres-docker-backup/scripts",
-            "skills/trace-fix-root-causes/scripts",
-            "skills/ui-implementation-audit/scripts",
-            "skills/user-journey-docs-audit/scripts",
             "apps/DevOpsBoard/Tools",
         ]
     )
@@ -751,13 +580,7 @@ def main(argv: list[str] | None = None) -> int:
         # the safe validation path so stale Swift binaries cannot evade the
         # guardrail merely because the required native plugin is unavailable.
         run([sys.executable, "Tools/self_test_package_app.py"], cwd=ops_console)
-    if ops_console.is_dir() and not args.skip_macos_app:
-        run(["swift", "build"], cwd=ops_console)
-        run(["swift", "test"], cwd=ops_console)
-    if args.skip_macos_app:
-        print("validation ok (macOS app checks skipped; run them through Build macOS Apps)")
-    else:
-        print("validation ok")
+    print("validation ok (native DevOps Board gate remains Build macOS Apps-owned)")
     return 0
 
 

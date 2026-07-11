@@ -13,6 +13,8 @@ honestly does and does not provide.
 - A locked, private, atomically written state file shared by cooperating local
   agent sessions.
 - Port leasing with expiry and stale-lease reclamation.
+- Atomic, exact-precondition transfer of a stopped server's durable port and
+  reusable identity when an operator moves ownership to a new checkout.
 - Structured-argv process launch, including atomic attachment of an existing
   manual lease by exact ID, plus adoption, status, logs, stop, and restart.
 - Project-level status/start/restart/stop driven by
@@ -28,9 +30,12 @@ superseded action is not silently presented as successful.
 ## Concurrency Model
 
 The cross-agent file lock is held only for state snapshots, reservations, and
-commits. Process lifecycle work, health and listener checks, Docker commands and
-inspection, project/inventory discovery, backup scans, and HTTP response writes
-run after the lock is released. A pending lifecycle mutation blocks another
+commits. Process lifecycle work, health and ordinary listener checks, Docker
+commands and inspection, project/inventory discovery, backup scans, and HTTP
+response writes run after the lock is released. The rare `port relocate`
+administrative transaction performs one bounded final positive-listener check
+under that lock so listener-stop evidence and ownership transfer cannot race.
+A pending lifecycle mutation blocks another
 mutation for the same server, Docker target, or project; it does not block an
 unrelated port lease or project. Project reservations form a hierarchy: they
 exclude direct server/Docker mutations for that project, while only internal
@@ -43,6 +48,14 @@ dead or PID-reused owner, so elapsed time by itself cannot dissolve a valid
 reservation. Direct server restart likewise owns one outer reservation across
 its delegated stop/start children. Docker name and ID aliases are normalized to
 the inspected immutable container ID before lifecycle reservation.
+
+The exceptional `port relocate` administration path runs as one locked state
+transaction after the old listener stops. It validates the exact old
+assignment and captured lease identity, refuses live/pending/foreign or
+ambiguous state, migrates the stopped server record, and retains attributed
+history. It detects listeners from positive socket/PID/connect evidence rather
+than a bind probe, so lack of permission to bind a free privileged port cannot
+be mistaken for a live listener.
 
 Status and inventory collect evidence from a consistent snapshot. Their health
 and telemetry observations reserve monotonic per-server tickets and commit only
@@ -138,7 +151,8 @@ fixture processes. It covers state recovery, unique concurrent leases,
 same-target lifecycle exclusion, unrelated-operation progress during slow
 project/health/Docker work, durable operation evidence, exact manual-lease
 attachment and rollback/interleaving behavior, structured launch, project
-runtime classification, Docker metadata/telemetry command paths, and API
+runtime classification, exact/atomic port relocation and listener false-
+positive guards, Docker metadata/telemetry command paths, and API
 authentication, concurrent token initialization, token-file safety, and
 request boundaries.
 

@@ -7,6 +7,7 @@ import http from 'node:http';
 
 const LOOPBACK = '127.0.0.1';
 const CONNECT_TIMEOUT_MS = 5_000;
+const FLOW_COOKIE_NAME = 'dc_flow';
 
 const HOP_BY_HOP = new Set([
   'connection',
@@ -39,11 +40,65 @@ function stripHopByHop(headers) {
   return out;
 }
 
-export function createProxy({ log, renderBadGateway }) {
+function cookieName(value) {
+  const text = String(value ?? '');
+  const firstSemicolon = text.indexOf(';');
+  const pair = firstSemicolon === -1 ? text : text.slice(0, firstSemicolon);
+  const equals = pair.indexOf('=');
+  return equals > 0 ? pair.slice(0, equals).trim() : null;
+}
+
+function filterRequestCookieHeader(value, protectedNames) {
+  if (value === undefined) return undefined;
+  const text = Array.isArray(value) ? value.join('; ') : String(value);
+  const kept = text
+    .split(';')
+    .map((part) => part.trim())
+    .filter((part) => part !== '' && !protectedNames.has(cookieName(part)));
+  return kept.length > 0 ? kept.join('; ') : undefined;
+}
+
+function filterResponseHeaders(headers, protectedNames) {
+  const out = stripHopByHop(headers);
+  const raw = out['set-cookie'];
+  if (raw === undefined) return out;
+
+  // Node represents multiple Set-Cookie fields as an array. Keep each field
+  // whole: commas are legal inside Expires and must never be used as a split
+  // boundary. Returning an array also preserves independent attributes.
+  const kept = (Array.isArray(raw) ? raw : [raw]).filter(
+    (line) => !protectedNames.has(cookieName(line)),
+  );
+  if (kept.length > 0) out['set-cookie'] = kept;
+  else delete out['set-cookie'];
+  return out;
+}
+
+function appendSafeRawHeaders(lines, rawHeaders, protectedNames, excludedNames = new Set()) {
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    const name = rawHeaders[i];
+    const value = rawHeaders[i + 1];
+    const lower = name.toLowerCase();
+    if (excludedNames.has(lower)) continue;
+    if (lower === 'set-cookie' && protectedNames.has(cookieName(value))) continue;
+    lines.push(`${name}: ${value}`);
+  }
+}
+
+export function createProxy({ log, renderBadGateway, sessionCookieName }) {
+  if (typeof sessionCookieName !== 'string' || sessionCookieName === '') {
+    throw new TypeError('createProxy requires the configured Console session cookie name');
+  }
+  // The edge consumes these credentials for access control. Routed projects
+  // are separate trust domains and must never receive or mutate them.
+  const protectedCookieNames = new Set([sessionCookieName, FLOW_COOKIE_NAME]);
   const agent = new http.Agent({ keepAlive: true, maxSockets: 256 });
 
   function buildRequestHeaders(req, target, { upgrade }) {
     const headers = stripHopByHop(req.headers);
+    const safeCookie = filterRequestCookieHeader(headers.cookie, protectedCookieNames);
+    if (safeCookie === undefined) delete headers.cookie;
+    else headers.cookie = safeCookie;
     // Host preserved: dev servers see the real vhost (Vite server.allowedHosts).
     headers.host = target.publicHost;
     const clientIp = req.socket.remoteAddress || '';
@@ -116,7 +171,11 @@ export function createProxy({ log, renderBadGateway }) {
       settled = true;
       clearTimeout(connectTimer);
       try {
-        res.writeHead(r.statusCode || 502, r.statusMessage || '', stripHopByHop(r.headers));
+        res.writeHead(
+          r.statusCode || 502,
+          r.statusMessage || '',
+          filterResponseHeaders(r.headers, protectedCookieNames),
+        );
       } catch (err) {
         log.warn('proxy response relay failed', { slug: target.slug, error: err.message });
         r.destroy();
@@ -219,8 +278,7 @@ export function createProxy({ log, renderBadGateway }) {
       const lines = [
         `HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage || 'Switching Protocols'}`,
       ];
-      const raw = upstreamRes.rawHeaders;
-      for (let i = 0; i < raw.length; i += 2) lines.push(`${raw[i]}: ${raw[i + 1]}`);
+      appendSafeRawHeaders(lines, upstreamRes.rawHeaders, protectedCookieNames);
       try {
         socket.write(lines.join('\r\n') + '\r\n\r\n');
         if (upstreamHead && upstreamHead.length > 0) socket.write(upstreamHead);
@@ -256,21 +314,14 @@ export function createProxy({ log, renderBadGateway }) {
       const status = upstreamRes.statusCode || 502;
       const reason = upstreamRes.statusMessage || http.STATUS_CODES[status] || 'Error';
       const lines = [`HTTP/1.1 ${status} ${reason}`];
-      const raw = upstreamRes.rawHeaders;
-      for (let i = 0; i < raw.length; i += 2) {
-        const lower = raw[i].toLowerCase();
-        // Body is re-framed as close-delimited, so drop framing headers.
-        if (
-          lower === 'connection' ||
-          lower === 'keep-alive' ||
-          lower === 'transfer-encoding' ||
-          lower === 'content-length' ||
-          lower === 'upgrade'
-        ) {
-          continue;
-        }
-        lines.push(`${raw[i]}: ${raw[i + 1]}`);
-      }
+      // Body is re-framed as close-delimited, so drop framing headers while
+      // applying the same auth-cookie boundary as normal and 101 responses.
+      appendSafeRawHeaders(
+        lines,
+        upstreamRes.rawHeaders,
+        protectedCookieNames,
+        new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-length', 'upgrade']),
+      );
       lines.push('Connection: close');
       try {
         socket.write(lines.join('\r\n') + '\r\n\r\n');

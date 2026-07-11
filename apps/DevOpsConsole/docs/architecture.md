@@ -179,7 +179,7 @@ domain. Invalid → fall back to `/`.
 ## Proxy (`src/proxy.mjs`)
 
 ```js
-export function createProxy({ log }) // → { forward(req, res, target), forwardUpgrade(req, socket, head, target), close() }
+export function createProxy({ log, sessionCookieName }) // → { forward(req, res, target), forwardUpgrade(req, socket, head, target), close() }
 // target = { port, slug, host: '127.0.0.1', publicHost, route }  (pages via closure? NO —
 // proxy takes an `onError(req,res,kind,target)` callback supplied by router at construction:
 //   createProxy({ log, renderBadGateway(req, res, { kind: 'connect'|'timeout'|'reset', target }) })
@@ -190,6 +190,13 @@ export function createProxy({ log }) // → { forward(req, res, target), forward
 - Strip hop-by-hop request AND response headers: `connection` + every token it
   names, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`,
   `trailer`, `transfer-encoding`, `upgrade` (except the upgrade path).
+- The domain-wide Console session cookie (`sessionCookieName`) and host-only
+  OIDC flow cookie (`dc_flow`) terminate at this trust boundary. Strip only
+  those two names from upstream HTTP and WebSocket request `Cookie` headers,
+  and remove only those names from every upstream `Set-Cookie` response
+  (ordinary HTTP, 101, and upgrade refusal). Preserve unrelated application
+  cookies and their attributes exactly. Treat each Node `Set-Cookie` array
+  entry as one field; never comma-split because `Expires` contains a comma.
 - Add `X-Forwarded-For` (append client IP), `X-Forwarded-Proto: https` (or
   http in dev mode), `X-Forwarded-Host: <original host>`.
 - Stream both directions (`req.pipe(upstream)`, `upstreamRes.pipe(res)`); no
@@ -515,5 +522,8 @@ name: 'devops-console', port: 443 })`, swallow+log failure.
 4. `rt` open-redirect guard; flow cookie signed; `state`+`nonce`+PKCE all
    enforced; ID-token signature verified against Google JWKS.
 5. Cookies: HttpOnly, Secure (prod), SameSite=Lax, HMAC-SHA256, timing-safe
-   compare. Session parse re-checks the allowlist on every request.
+   compare. Session parse re-checks the allowlist on every request. The edge
+   consumes `cookieName` and `dc_flow` for authentication but never forwards
+   them to routed HTTP/WebSocket projects or accepts those names from upstream
+   `Set-Cookie`; unrelated project cookies remain end-to-end.
 6. No secrets in logs; no directory traversal; HTML escaping in every page.

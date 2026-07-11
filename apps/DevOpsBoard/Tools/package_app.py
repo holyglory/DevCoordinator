@@ -99,21 +99,73 @@ def build_inputs_sha256(inputs: list[dict[str, str]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def repository_revision() -> dict[str, Any]:
-    """Record the one DevCoordinator revision that owns both bundled helpers."""
+def repository_input_paths(inputs: list[dict[str, str]]) -> list[Path]:
+    """Return every tracked source path whose HEAD bytes must reproduce the app."""
 
-    commit = run(["git", "rev-parse", "HEAD"], cwd=REPOSITORY_ROOT, capture=True)
-    tree = run(["git", "rev-parse", "HEAD^{tree}"], cwd=REPOSITORY_ROOT, capture=True)
-    dirty = bool(
-        run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
+    app_relative = APP_ROOT.relative_to(REPOSITORY_ROOT)
+    paths = [app_relative / item["path"] for item in inputs]
+    paths.extend(RUNTIME_SCRIPTS)
+    return sorted(set(paths), key=lambda item: item.as_posix())
+
+
+def require_head_inputs(paths: list[Path]) -> None:
+    """Prove each packaged input is the exact blob recorded by HEAD.
+
+    A clean-looking revision string is not provenance when helper or Swift
+    bytes come from an uncommitted worktree.  Compare Git's filtered blob id
+    for every current input with the blob id named by HEAD, in addition to the
+    repository-wide tracked-change guard below.
+    """
+
+    for relative in paths:
+        if relative.is_absolute() or relative.as_posix() != str(relative):
+            raise PackagingError(f"packaging input is not a portable repository path: {relative}")
+        source = REPOSITORY_ROOT / relative
+        if not source.is_file() or source.is_symlink():
+            raise PackagingError(f"packaging input is missing or unsafe: {relative}")
+        try:
+            recorded = run(
+                ["git", "rev-parse", f"HEAD:{relative.as_posix()}"],
+                cwd=REPOSITORY_ROOT,
+                capture=True,
+            )
+        except PackagingError as error:
+            raise PackagingError(f"packaging input is not tracked at HEAD: {relative}") from error
+        current = run(
+            [
+                "git",
+                "hash-object",
+                f"--path={relative.as_posix()}",
+                str(source),
+            ],
             cwd=REPOSITORY_ROOT,
             capture=True,
         )
+        if not recorded or current != recorded:
+            raise PackagingError(
+                f"packaging input differs from the recorded HEAD blob: {relative}; "
+                "commit the exact source before packaging"
+            )
+
+
+def repository_revision(inputs: list[dict[str, str]]) -> dict[str, Any]:
+    """Return the reproducible DevCoordinator revision owning all package inputs."""
+
+    commit = run(["git", "rev-parse", "HEAD"], cwd=REPOSITORY_ROOT, capture=True)
+    tree = run(["git", "rev-parse", "HEAD^{tree}"], cwd=REPOSITORY_ROOT, capture=True)
+    tracked_changes = run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=REPOSITORY_ROOT,
+        capture=True,
     )
     if len(commit) != 40 or len(tree) != 40:
         raise PackagingError("DevCoordinator Git revision is unavailable or invalid")
-    return {"commit": commit, "tree": tree, "tracked_changes": dirty}
+    if tracked_changes:
+        raise PackagingError(
+            "DevCoordinator has tracked changes; commit the exact source before packaging"
+        )
+    require_head_inputs(repository_input_paths(inputs))
+    return {"commit": commit, "tree": tree, "tracked_changes": False}
 
 
 def build_provenance_path(configuration: str) -> Path:
@@ -325,7 +377,7 @@ def verify_packaged_app(app: Path, *, require_signature: bool) -> dict[str, Any]
         or len(repository["commit"]) != 40
         or not isinstance(repository.get("tree"), str)
         or len(repository["tree"]) != 40
-        or not isinstance(repository.get("tracked_changes"), bool)
+        or repository.get("tracked_changes") is not False
     ):
         raise PackagingError("runtime provenance is missing the DevCoordinator revision")
 
@@ -346,6 +398,9 @@ def verify_packaged_app(app: Path, *, require_signature: bool) -> dict[str, Any]
         raise PackagingError("packaged executable build inputs differ from current Swift source")
     if executable_record.get("build_inputs_sha256") != build_inputs_sha256(current_inputs):
         raise PackagingError("packaged executable build-input fingerprint is invalid")
+    current_revision = repository_revision(current_inputs)
+    if repository != current_revision:
+        raise PackagingError("packaged app revision differs from the current reproducible DevCoordinator revision")
 
     recorded = {
         item.get("path"): item.get("sha256")
@@ -414,6 +469,8 @@ def package_app(
         )
         write_build_provenance(configuration, build_provenance)
 
+    revision_before_packaging = repository_revision(build_provenance["build_inputs"])
+
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{PRODUCT_NAME}.staging-", suffix=".app", dir=output.parent))
     try:
@@ -443,11 +500,14 @@ def package_app(
             plistlib.dump(info_plist(version, build), stream, fmt=plistlib.FMT_XML, sort_keys=True)
         (contents / "PkgInfo").write_bytes(b"APPL????")
         runtime_evidence = copy_runtime_scripts(resources)
+        revision_after_copy = repository_revision(build_provenance["build_inputs"])
+        if revision_after_copy != revision_before_packaging:
+            raise PackagingError("DevCoordinator revision changed while the app was being packaged")
         provenance = {
             "schema_version": PACKAGED_PROVENANCE_SCHEMA,
             "product": PRODUCT_NAME,
             "configuration": configuration,
-            "repository": repository_revision(),
+            "repository": revision_after_copy,
             "executable": {
                 "path": f"Contents/MacOS/{PRODUCT_NAME}",
                 "sha256": packaged_binary_hash,

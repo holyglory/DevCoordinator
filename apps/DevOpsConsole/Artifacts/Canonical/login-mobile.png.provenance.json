@@ -11,7 +11,7 @@
     "width": 390,
     "height": 844
   },
-  "source_sha256": "eeb5bbb31965c95dedf387fc33d5429f6134e0af215016b53a7b9ef09facdc8d",
+  "source_sha256": "dcae08294bd668c0f3863a8364a8e488e001aafd56e88de0c14920ba5df365ea",
   "source_files": [
     {
       "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
@@ -47,11 +47,11 @@
     },
     {
       "path": "ci/playwright/package-lock.json",
-      "sha256": "06fc624e79f3025afb049c49f0248c537544f54fb4c9bedb3a66ebdec5b7afe3"
+      "sha256": "76e70830821318e276ba76742129a4b8a3e3c8811fa7d8771f15e3f5cc1aa58c"
     },
     {
       "path": "ci/playwright/package.json",
-      "sha256": "40ceae65fbbe4290409f95e4726ca81d3fcb67da5da0e79ca1c1102c0effb0e7"
+      "sha256": "cbb5d2d262322d7151f47170a77ebe912915d0672d9ec7fa304a6465a7d0733b"
     }
   ]
 }

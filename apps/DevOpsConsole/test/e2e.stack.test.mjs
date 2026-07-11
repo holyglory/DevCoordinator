@@ -402,6 +402,7 @@ else:
         'x-hop': 'do-not-forward',
         connection: 'x-hop', // names x-hop as hop-by-hop
         'x-end-to-end': 'keep-me',
+        cookie: 'app_session=upstream-visible',
       },
     });
     assert.equal(res.status, 200);
@@ -420,8 +421,10 @@ else:
     assert.equal(echoed.headers['x-hop'], undefined, 'headers named by Connection are hop-by-hop');
     // End-to-end headers do cross.
     assert.equal(echoed.headers['x-end-to-end'], 'keep-me');
-    // The session cookie rides along to the upstream like any browser cookie.
-    assert.match(String(echoed.headers.cookie ?? ''), /dc_session=/);
+    // The edge consumes the Console session but never exposes it to the routed
+    // dev server. Unrelated application cookies remain available upstream.
+    assert.doesNotMatch(String(echoed.headers.cookie ?? ''), /dc_session=|dc_flow=/);
+    assert.match(String(echoed.headers.cookie ?? ''), /app_session=upstream-visible/);
 
     // SSE: three events must arrive incrementally, not as one buffered blob.
     const sse = await new Promise((resolve, reject) => {

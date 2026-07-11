@@ -71,6 +71,21 @@ async function startUpstream(t) {
         headers.connection = 'x-resp-hop'; // names the extra to strip
         headers['keep-alive'] = 'timeout=7';
       }
+      if (req.url.startsWith('/resp-cookies')) {
+        headers['set-cookie'] = [
+          'dc_session=stolen-session; Domain=.vr.ae; Path=/; HttpOnly',
+          'dc_flow=poisoned-flow; Domain=.vr.ae; Path=/',
+          'app_session=keep-me; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT; HttpOnly',
+          'dc_session_backup=also-keep; Path=/; SameSite=Lax',
+        ];
+      }
+      if (req.url.startsWith('/resp-custom-cookie')) {
+        headers['set-cookie'] = [
+          'console_auth=stolen-custom-session; Domain=.vr.ae; Path=/',
+          'dc_flow=poisoned-flow; Domain=.vr.ae; Path=/',
+          'dc_session=project-owned-name; Path=/; HttpOnly',
+        ];
+      }
       res.writeHead(200, headers);
       res.end(payload);
     });
@@ -82,6 +97,10 @@ async function startUpstream(t) {
         'Upgrade: websocket\r\n' +
         'Connection: Upgrade\r\n' +
         'Sec-WebSocket-Accept: test-accept\r\n' +
+        'Set-Cookie: dc_session=stolen-session; Domain=.vr.ae; Path=/\r\n' +
+        'Set-Cookie: dc_flow=poisoned-flow; Domain=.vr.ae; Path=/\r\n' +
+        'Set-Cookie: app_session=keep-me; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT\r\n' +
+        'Set-Cookie: dc_flow_backup=also-keep; Path=/; SameSite=Lax\r\n' +
         '\r\n',
     );
     socket.end();
@@ -92,10 +111,14 @@ async function startUpstream(t) {
 }
 
 // Real edge wired to a fresh proxy instance per test (isolated keep-alive pool).
-async function startEdge(t, { upstreamPort, publicHost = 'slug.vr.ae', tls = false }) {
+async function startEdge(
+  t,
+  { upstreamPort, publicHost = 'slug.vr.ae', tls = false, sessionCookieName = 'dc_session' },
+) {
   const badGatewayCalls = [];
   const proxy = createProxy({
     log: silentLog,
+    sessionCookieName,
     renderBadGateway: (req, res, { kind }) => {
       badGatewayCalls.push(kind);
       res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
@@ -251,6 +274,64 @@ test('response direction: hop-by-hop headers stripped, incl. Connection-named ex
   JSON.parse(res.body); // body intact
 });
 
+test('HTTP proxy isolates Console auth cookies while preserving unrelated cookies and Set-Cookie attributes', async (t) => {
+  const upstream = await startUpstream(t);
+  const edge = await startEdge(t, { upstreamPort: upstream.port });
+
+  const res = await request({
+    port: edge.port,
+    method: 'GET',
+    path: '/resp-cookies',
+    headers: {
+      host: 'slug.vr.ae',
+      connection: 'close',
+      cookie: [
+        'dc_session=real-console-session',
+        'dc_flow=real-login-flow',
+        'app_session=keep=with=equals',
+        'theme=dark',
+        'dc_session_backup=keep-too',
+      ].join('; '),
+    },
+  });
+
+  assert.equal(res.status, 200);
+  const echoed = JSON.parse(res.body);
+  assert.equal(
+    echoed.headers.cookie,
+    'app_session=keep=with=equals; theme=dark; dc_session_backup=keep-too',
+  );
+  assert.doesNotMatch(String(echoed.headers.cookie ?? ''), /real-console-session|real-login-flow/);
+  assert.deepEqual(res.headers['set-cookie'], [
+    'app_session=keep-me; Path=/; Expires=Wed, 21 Oct 2030 07:28:00 GMT; HttpOnly',
+    'dc_session_backup=also-keep; Path=/; SameSite=Lax',
+  ]);
+});
+
+test('cookie isolation follows the configured session name and does not reserve the default name', async (t) => {
+  const upstream = await startUpstream(t);
+  const edge = await startEdge(t, {
+    upstreamPort: upstream.port,
+    sessionCookieName: 'console_auth',
+  });
+
+  const res = await request({
+    port: edge.port,
+    method: 'GET',
+    path: '/resp-custom-cookie',
+    headers: {
+      host: 'slug.vr.ae',
+      connection: 'close',
+      cookie: 'console_auth=real-custom-session; dc_flow=real-flow; dc_session=project-owned-name',
+    },
+  });
+
+  assert.equal(res.status, 200);
+  const echoed = JSON.parse(res.body);
+  assert.equal(echoed.headers.cookie, 'dc_session=project-owned-name');
+  assert.deepEqual(res.headers['set-cookie'], ['dc_session=project-owned-name; Path=/; HttpOnly']);
+});
+
 test('X-Forwarded-Proto is https when the edge terminates TLS', async (t) => {
   const upstream = await startUpstream(t);
   const edge = await startEdge(t, { upstreamPort: upstream.port, publicHost: 'slug.vr.ae', tls: true });
@@ -284,6 +365,7 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
       'Upgrade: websocket',
       'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
       'Sec-WebSocket-Version: 13',
+      'Cookie: dc_session=real-console-session; dc_flow=real-login-flow; app_session=keep-me; dc_flow_backup=keep-too',
       'X-Hop: sneak',
       '',
       '',
@@ -293,6 +375,9 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
   // Client got the genuine 101 from upstream.
   assert.match(raw, /^HTTP\/1\.1 101 /);
   assert.match(raw, /Sec-WebSocket-Accept: test-accept/);
+  assert.doesNotMatch(raw, /Set-Cookie: (?:dc_session|dc_flow)=/i);
+  assert.match(raw, /Set-Cookie: app_session=keep-me; Path=\/; Expires=Wed, 21 Oct 2030 07:28:00 GMT/i);
+  assert.match(raw, /Set-Cookie: dc_flow_backup=also-keep; Path=\/; SameSite=Lax/i);
 
   // Upstream saw a proper upgrade request with the hop-extras removed.
   assert.equal(upstream.upgrades.length, 1);
@@ -302,6 +387,8 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
   assert.equal(h['sec-websocket-key'], 'dGhlIHNhbXBsZSBub25jZQ==');
   assert.equal(h['sec-websocket-version'], '13');
   assert.equal(h['x-hop'], undefined, 'Connection-named extra must not reach upstream');
+  assert.equal(h.cookie, 'app_session=keep-me; dc_flow_backup=keep-too');
+  assert.doesNotMatch(String(h.cookie ?? ''), /real-console-session|real-login-flow/);
   assert.equal(h.host, 'slug.vr.ae');
   assert.equal(h['x-forwarded-proto'], 'http');
   assert.equal(h['x-forwarded-host'], 'edgehost.vr.ae');

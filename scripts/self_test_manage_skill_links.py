@@ -9,6 +9,8 @@ import multiprocessing as mp
 import os
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -70,7 +72,7 @@ def interrupted_apply_worker(repository: Path, target: Path, transaction: Path) 
     original_symlink = local_manager.os.symlink
 
     def interrupt_on_install(source, destination, *args, **kwargs):
-        if ".holyskills-" in str(destination):
+        if ".devcoordinator-" in str(destination):
             os._exit(77)
         return original_symlink(source, destination, *args, **kwargs)
 
@@ -168,6 +170,28 @@ def test_divergence_requires_explicit_acceptance(base: Path) -> None:
     assert_direct(target / "alpha-skill", repository / "skills" / "alpha-skill")
     manager.rollback_transaction(transaction)
     check((target / "alpha-skill" / "SKILL.md").read_text(encoding="utf-8") == "local divergent content\n", "divergent copy was not preserved exactly")
+
+
+def test_v2_transaction_remains_rollback_compatible(base: Path) -> None:
+    repository = base / "legacy transaction canonical"
+    make_skill(repository, "alpha-skill", "canonical")
+    target = base / "legacy transaction target"
+    target.mkdir()
+    copy_skill(repository, target, "alpha-skill")
+    transaction = base / "legacy transaction"
+    manager.apply_links(repository, [target], transaction)
+
+    journal_path = transaction / manager.JOURNAL_NAME
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["version"] = 2
+    for entry in journal["entries"]:
+        entry.pop("source_snapshot", None)
+    manager.atomic_json_write(journal_path, journal)
+
+    rolled_back = manager.rollback_transaction(transaction)
+    check(rolled_back["status"] == "rolled_back", "v2 rollback transaction was rejected")
+    restored = target / "alpha-skill"
+    check(restored.is_dir() and not restored.is_symlink(), "v2 rollback did not restore copied skill")
 
 
 def test_broken_and_chained_links(base: Path) -> None:
@@ -373,6 +397,45 @@ def test_post_plan_change_is_preserved_before_move(base: Path) -> None:
     check(journal["status"] == "rolled_back", "preserved post-plan change should leave a closed transaction")
 
 
+def test_canonical_source_swap_rolls_back_without_linking_external_tree(base: Path) -> None:
+    repository = base / "source-swap canonical"
+    source = make_skill(repository, "alpha-skill", "canonical")
+    external_repository = base / "source-swap external"
+    external_source = make_skill(external_repository, "alpha-skill", "external")
+    target = base / "source-swap target"
+    target.mkdir()
+    installed = copy_skill(repository, target, "alpha-skill")
+    installed_before = manager.tree_digest(installed)
+    moved_source = base / "source-swap preserved canonical"
+    original_prepare = manager.prepare_transaction
+
+    def swap_source_after_plan(path, canonical_repository, roots):
+        transaction = original_prepare(path, canonical_repository, roots)
+        source.rename(moved_source)
+        os.symlink(str(external_source), source)
+        return transaction
+
+    manager.prepare_transaction = swap_source_after_plan
+    transaction = base / "source-swap transaction"
+    try:
+        expect_error(
+            manager.apply_links,
+            repository,
+            [target],
+            transaction,
+            contains="canonical source changed after planning",
+        )
+    finally:
+        manager.prepare_transaction = original_prepare
+
+    check(source.is_symlink(), "source-swap fixture did not replace the canonical skill")
+    check(source.resolve() == external_source.resolve(), "source-swap fixture points at the wrong external tree")
+    check(installed.is_dir() and not installed.is_symlink(), "source swap installed an external direct link")
+    check(manager.tree_digest(installed) == installed_before, "source-swap rollback changed the installed copy")
+    journal = json.loads((transaction / manager.JOURNAL_NAME).read_text(encoding="utf-8"))
+    check(journal["status"] == "rolled_back", "source-swap failure did not close its rollback transaction")
+
+
 def test_unrelated_post_plan_change_is_not_a_false_positive(base: Path) -> None:
     repository = base / "unrelated-change canonical"
     make_skill(repository, "alpha-skill", "alpha")
@@ -492,23 +555,73 @@ def test_input_guards(base: Path) -> None:
     nested.mkdir()
     expect_error(manager.build_plan, repository, [target, nested], contains="must not be nested")
 
+    # The canonical checkout may contain unrelated symlinks, but neither its
+    # skills directory nor anything inside a managed skill may redirect to a
+    # second writable source tree.
+    unrelated_target = base / "unrelated documentation target"
+    unrelated_target.mkdir()
+    (repository / "docs").mkdir()
+    os.symlink(str(unrelated_target), repository / "docs" / "external-reference")
+    clean_plan = manager.build_plan(repository, [target])
+    check(clean_plan["skills"] == ["alpha-skill"], "unrelated repository symlink was a false positive")
+
+    external_repository = base / "external skill source"
+    external_source = make_skill(external_repository, "alpha-skill", "external")
+    redirected_repository = base / "redirected canonical"
+    redirected_repository.mkdir()
+    os.symlink(str(external_source.parent), redirected_repository / "skills")
+    expect_error(
+        manager.build_plan,
+        redirected_repository,
+        [target],
+        contains="skills directory must be a real",
+    )
+
+    nested_link_repository = base / "nested-link canonical"
+    nested_skill = make_skill(nested_link_repository, "alpha-skill", "canonical")
+    external_payload = base / "external payload.txt"
+    external_payload.write_text("must not become canonical\n", encoding="utf-8")
+    os.symlink(str(external_payload), nested_skill / "payload.txt")
+    expect_error(
+        manager.build_plan,
+        nested_link_repository,
+        [target],
+        contains="skills tree must not contain symlinks",
+    )
+
+
+def test_help_names_devcoordinator() -> None:
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    check(completed.returncode == 0, f"--help failed: {completed.stderr}")
+    check("DevCoordinator" in completed.stdout, "--help must identify the canonical repository")
+    check("Holy Skills" not in completed.stdout, "--help retained the former repository name")
+
 
 def main() -> int:
-    base = Path(tempfile.mkdtemp(prefix="holy skills link self test "))
+    base = Path(tempfile.mkdtemp(prefix="devcoordinator-link-self-test-"))
     try:
         test_plan_apply_verify_rollback_and_unrelated(base)
         test_divergence_requires_explicit_acceptance(base)
+        test_v2_transaction_remains_rollback_compatible(base)
         test_broken_and_chained_links(base)
         test_noncanonical_links_and_unexpected_objects(base)
         test_partial_failure_rolls_back_everything(base)
         test_rollback_refuses_post_apply_changes(base)
         test_concurrent_applies_serialize_and_replan(base)
         test_post_plan_change_is_preserved_before_move(base)
+        test_canonical_source_swap_rolls_back_without_linking_external_tree(base)
         test_unrelated_post_plan_change_is_not_a_false_positive(base)
         test_target_root_replacement_cannot_redirect_mutation(base)
         test_rollback_refuses_replaced_root_and_recovers_after_restore(base)
         test_abrupt_interruption_can_be_rolled_back(base)
         test_input_guards(base)
+        test_help_names_devcoordinator()
         print("skill link manager self-test ok")
         return 0
     finally:

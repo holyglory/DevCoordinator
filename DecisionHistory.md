@@ -1,5 +1,191 @@
 # Decision History
 
+## 2026-07-11 - Fresh-clone validation is a publication gate, not a duplicate smoke test
+
+Decision: Keep the unpublished DevCoordinator history free of credential-shaped
+detector source by constructing the realistic private-key fixture at test
+runtime, and make the Console configuration test create its declared TLS
+fixture before loading non-development configuration. Validate again from a
+new clone with no ignored files before creating the public repository.
+
+Why: The in-place repository gate was green, but the first bundle clone exposed
+two testing-procedure defects. The reachable-history scanner correctly treated
+its self-test's literal private-key header as suspicious; allowing a special
+path or comment would have created a blind spot, so the unpublished commit is
+amended instead. Separately, the `HTTP_PORT=0` unit test assumed that an ignored
+development certificate already existed because another test had generated it
+in the long-lived checkout. That ordering and filesystem contamination do not
+exist in a clean clone.
+
+Result: The secret detector still exercises the exact unmarked key material in
+the temporary Git repository, while no detector source blob contains it. The
+Console test explicitly calls the concurrency-safe on-demand certificate
+fixture and still verifies app-root-relative TLS path resolution. Publication
+now requires the full non-native suite in a newly created clone, preventing
+ignored build/runtime artifacts from masking prerequisites.
+
+## 2026-07-11 - DevCoordinator became the independent owner of operations tooling
+
+Decision: Extract the coordinator, PostgreSQL protection skill, DevOps Board,
+and DevOps Console from the verified unified holyskills commit `8c416e2` into
+the public `DevCoordinator` repository. The filtered equivalent was `1d33b3e`;
+after removing every reachable non-canonical `design-qa-*.png` artifact it
+became `335d2c6`. The final original-to-scrubbed mapping is tracked under
+`docs/history/`, while commit authors, committers, timestamps, messages, and
+retained file changes remain attributed to their original authors.
+
+DevCoordinator now owns exactly `codex-dev-coordinator` and
+`postgres-docker-backup`, plus `DevOpsBoard`, `DevOpsConsole`, their tests,
+packaging/provenance, deterministic fixtures, runtime declaration, and
+deployment units. Holyskills owns the remaining six audit/verification skills.
+Neither repository imports, checks out, pins, or requires the other's source in
+build, runtime, tests, or CI. `DEVCOORDINATOR_ROOT` is the only checkout-root
+override for both bundled helpers. The Board's existing
+`local.holyskills.codex-ops-console` bundle identifier and `CodexOpsConsole`
+settings migration lookup remain solely to preserve installed identity and
+preferences across the product rename.
+
+Why: Continuing to deploy the coordinator and Console from holyskills coupled
+unrelated audit-skill releases to runtime operations and made the server's
+source of truth ambiguous. A history-preserving split keeps the mature behavior
+and attribution while making ownership, packaging, deployment, and rollback
+boundaries explicit.
+
+Result: Root documentation, agent policy, skill audit, CI, link-manager naming,
+PostgreSQL disposable labels, and repository validation now describe the
+two-skill product. Production units split coordinator and Console ownership,
+require the Console to depend on the coordinator, keep the API token server-
+side, and externalize environment/state under private user paths. A new
+repository-boundary detector checks exact tip ownership, holyskills source/
+build/runtime/CI independence, required auth/unit/package contracts, current
+Console fixture source hashes, and every reachable commit/tree for unsafe
+artifact paths, missing/tampered canonical provenance, private key material,
+and supported credential patterns. Its realistic tests cover linear and
+merge-result-only history, later-deleted artifacts, tampered images/renderers,
+secrets with redacted findings, and safe placeholders/canonical controls.
+
+Native Board build, XCTest, current-source snapshots, packaging, launch, and UI
+acceptance remain exclusively owned by Build macOS Apps. The repository CLI
+refuses to substitute direct native commands. The real disposable PostgreSQL
+integration remains an environment/CI gate when a Docker daemon and image are
+available.
+
+The coordinator unit uses `KillMode=process` because systemd keeps
+coordinator-launched managed servers in the service cgroup even though each
+starts a new process session. Default control-group shutdown would turn an API
+restart into an unattributed stop of every managed server. Explicit
+coordinator project/server actions remain responsible for those lifecycles;
+the Console unit explicitly keeps `KillMode=control-group` because production
+sets `COORDINATOR_AUTOSTART=0` and it owns no coordinator-managed children.
+
+The coordinator unit intentionally omits `PrivateTmp`, `ProtectSystem`,
+`ReadWritePaths`, `NoNewPrivileges`, and unit-wide `UMask`. Like cgroup
+membership, those systemd properties are inherited by launched children;
+`start_new_session` does not escape them. Applying API-process hardening to a
+generic launcher would silently change managed application filesystem,
+privilege, temporary-directory, and file-creation semantics, and a surviving
+child could retain the old private mount namespace across API restart. Stronger
+workload isolation must instead use an explicitly configured independent
+transient scope/unit. Console hardening remains appropriate because production
+disables coordinator autostart and the Console owns no managed children.
+
+Production-critical Console values are pinned in the unit's `ExecStart` through
+`/usr/bin/env` after `EnvironmentFile` loading: coordinator autostart remains
+off, the API stays on loopback, the token/coordinator homes remain external,
+and Console state stays outside Git even if a preserved environment file has
+stale overrides. Configuration also rejects any non-loopback or path-bearing
+coordinator URL so a bearer token cannot be sent to a remote origin. The
+Console, unlike the generic coordinator launcher, retains
+`ProtectHome=read-only`, `ProtectSystem=full`, `PrivateTmp`,
+`NoNewPrivileges`, `UMask=0077`, and an explicit writable state exception.
+
+Extraction hardening also exposed three trust/provenance checks that the prior
+green suites did not enforce. First, the Console's domain-wide authentication
+and OAuth-flow cookies were forwarded to routed HTTP/WebSocket applications,
+and upstream `Set-Cookie` fields could mutate them; an old e2e assertion even
+encoded the unsafe behavior as success. The proxy now isolates the configured
+session name and `dc_flow` in both request and response directions for normal
+HTTP, WebSocket 101, and upgrade refusal while preserving unrelated application
+cookies. Real HTTP/WebSocket must-catch tests cover custom names, multiple
+cookies, similarly named controls, and comma-bearing `Expires` attributes.
+
+Second, Board package provenance allowed tracked dirty inputs and therefore
+named a commit that could not reconstruct the bundled Swift/helper bytes. The
+packager now refuses tracked changes and proves every packaged input equals its
+recorded HEAD blob; its tests include both ordinary dirty work and a status-
+clean index/worktree mismatch for Swift and helper inputs. Third, the skill-link
+manager accepted a repository `skills` directory or nested canonical source as
+a symlink to another checkout. It now requires one real in-repository skills
+directory and a symlink-free canonical source tree, with must-catch external-
+root and nested-link fixtures plus an unrelated-repository-symlink control.
+The apply path additionally snapshots repository, `skills`, and per-skill
+device/inode identity plus canonical tree content, then revalidates after
+transaction creation, immediately before and after each link, and during final
+verification. A realistic plan-to-apply source-swap fixture proves an external
+tree is never installed and rollback uses the exact original link text instead
+of following the swapped source.
+These were detector misses, not changed requirements, so the durable guards and
+realistic tests landed before deployment.
+
+The server checkout cutover uses the coordinator's first-class `port relocate`
+transaction rather than unassigning port 443 and racing to recreate ownership.
+It requires the exact old assignment and captured lease identity, refuses live
+listener/PID, pending, foreign, ambiguous, or destination-collision state,
+migrates the reusable stopped server record and checkout-relative cwd, clears
+stale process/launch fields, and records attributed history. Listener detection
+uses positive socket/PID/connect evidence rather than a bind probe, avoiding the
+false conclusion that an `EACCES` bind to a free privileged port means it is
+occupied. Tests prove wrong-owner/lease/port, foreign lease, live listener/PID,
+pending work, ambiguous record, byte-unchanged failure, pre-pruned stale lease,
+and same-ID registration after transfer.
+
+The prior deployment example also unconditionally installed `.env.example`
+over the production `console.env`, contradicting the preservation requirement
+and risking loss of OAuth, session, and TLS configuration during cutover. The
+runbook now creates the template only when the external file is absent, backs
+up and checksums the existing file before mutation, repairs its mode without
+rewriting it, and has a deterministic documentation test that rejects an
+unguarded template install.
+
+The first existing-host rewrite still modeled the legacy host as if a separate
+coordinator unit already existed and treated a live state tree like a fresh
+install. In reality the legacy Console autostarts the coordinator inside its
+own cgroup, reads secrets and routes/preferences/ACME/logs from the old
+checkout, and has no `dev-coordinator.service` to restart or restore. The
+cutover now captures exact PID/start-time/command/cgroup, listener, lease, and
+server identities before stop; migrates secrets in an env-only phase that does
+not read live logs; performs the exact state sync only after the old cgroup is
+quiescent; transfers port ownership; then installs and starts the split units.
+Rollback records whether each unit existed and removes the new-only coordinator
+unit before restoring the legacy Console topology.
+
+`migrate_legacy_console_runtime.py` is a journaled, same-filesystem transaction.
+It preserves non-path environment bytes, rewrites only required external path
+and split-service keys, publishes the environment with an atomic no-overwrite
+link, verifies source identity/hashes before and after commit, stages and
+checksum-verifies the complete state tree, and restores prior environment/state
+on every injected commit-boundary failure. Its recall suite covers live-state
+env-only isolation, symlink/special-object refusal, source mutation both during
+copy and after staging, a concurrently created valuable environment, state/env
+cross-phase rollback, post-link fsync failure, and explicit empty `acme/`
+augmentation. These guards were added before server mutation because a command
+that reports failure after partially moving production data is not a safe
+rollback mechanism.
+
+The live legacy host did not yet have a standalone coordinator unit: the old
+Console autostarted a detached coordinator child inside its own systemd cgroup,
+and kept `.env` plus routes/preferences/ACME/log state under the old checkout.
+The first split runbook draft incorrectly treated that child as an existing
+`dev-coordinator.service` MainPID and did not migrate checkout-local state. The
+binding cutover procedure now captures exact legacy Console/coordinator process
+instances, cgroup/listeners, lease and server IDs before stop; verifies the old
+cgroup and listeners are gone; performs a final staged checksummed env/state
+migration that rewrites only production path/control keys; relocates port
+ownership; then installs and starts the new coordinator unit before the
+Console. Deterministic runbook and migration tests cover the legacy topology,
+relative-state-path removal, secret/value preservation, state hash/count
+continuity, rollback evidence, and same-server-ID registration.
+
 ## 2026-07-11 - Stale-base work was recovered by a remote-first semantic merge
 
 Decision: Preserve the stale checkout at `55e64d2`, establish remote `main`
@@ -11,9 +197,9 @@ membership, Linux listener support, and later UI lifecycle behavior remain.
 The stale branch's authentication, short-lock coordinator architecture,
 Docker preflight/ownership, PostgreSQL restore safety, multi-source Board,
 typed destructive actions, provenance, link rollback, detector recall, and
-audit hardening were ported or adapted. `MERGE_IMPROVEMENT_LEDGER.md` accounts
+audit hardening were ported or adapted. The pre-split merge ledger accounted
 for each local change group and the small set of intentionally superseded
-implementations.
+implementations; current ownership is recorded in `OWNERSHIP.md`.
 
 Why: The stale work was valuable but internally complete only against the old
 base. Replacing remote code would have deleted the web Console and later
