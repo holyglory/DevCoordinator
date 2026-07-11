@@ -363,8 +363,13 @@ set -euo pipefail
 OLD_PROJECT="$LEGACY_ROOT"
 OLD_COORDINATOR="$OLD_PROJECT/skills/codex-dev-coordinator/scripts/dev_coordinator.py"
 umask 077
-python3 "$OLD_COORDINATOR" inventory --project "$OLD_PROJECT" --no-docker \
+INVENTORY_HOME="$(mktemp -d "$CUTOVER_BACKUP/.precutover-inventory-home.XXXXXX")"
+chmod 700 "$INVENTORY_HOME"
+cp -a "$COORDINATOR_HOME/." "$INVENTORY_HOME/"
+CODEX_AGENT_COORDINATOR_HOME="$INVENTORY_HOME" \
+  python3 "$OLD_COORDINATOR" inventory --no-docker \
   > "$CUTOVER_BACKUP/pre-cutover-inventory.json"
+rm -rf "$INVENTORY_HOME"
 python3 - "$CUTOVER_BACKUP/pre-cutover-inventory.json" "$OLD_PROJECT" \
   "$CUTOVER_BACKUP/pre-cutover-identities.json" <<'PY'
 import json, sys
@@ -389,6 +394,26 @@ with open(sys.argv[3], "x", encoding="utf-8") as handle:
     handle.write("\n")
 PY
 chmod 600 "$CUTOVER_BACKUP/pre-cutover-identities.json"
+
+# Every old-project assignment must be represented in a separately reviewed
+# private allowlist. Its target row has disposition "relocate"; each proven
+# stopped residue has disposition "unassign" and binds the exact key, name,
+# port, source, server id, recorded PID, cwd, command, and lease id. Never
+# derive this file by accepting every discovered stopped row, and never
+# blanket-unassign a retiring project.
+: "${RETIRED_ASSIGNMENT_ALLOWLIST:?set an absolute reviewed private allowlist path}"
+test ! -L "$RETIRED_ASSIGNMENT_ALLOWLIST"
+test "$(stat -c %u "$RETIRED_ASSIGNMENT_ALLOWLIST")" = "$(id -u)"
+test "$((8#$(stat -c %a "$RETIRED_ASSIGNMENT_ALLOWLIST") & 8#077))" = 0
+test ! -e "$CUTOVER_BACKUP/retired-assignment-allowlist.json"
+install -m 600 "$RETIRED_ASSIGNMENT_ALLOWLIST" \
+  "$CUTOVER_BACKUP/retired-assignment-allowlist.json"
+python3 "$DEVCOORDINATOR_ROOT/scripts/prepare_retired_assignment_cleanup.py" plan \
+  --inventory "$CUTOVER_BACKUP/pre-cutover-inventory.json" \
+  --allowlist "$CUTOVER_BACKUP/retired-assignment-allowlist.json" \
+  --output "$CUTOVER_BACKUP/retired-assignment-plan.json" \
+  --old-project "$OLD_PROJECT" --new-project "$DEVCOORDINATOR_ROOT" \
+  --target-name devops-console --target-port 443
 
 OLD_CONSOLE_PID="$(systemctl show --property MainPID --value devops-console.service)"
 OLD_CONSOLE_CGROUP="$(systemctl show --property ControlGroup --value devops-console.service)"
@@ -607,11 +632,35 @@ LEASE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lea
 python3 "$DEVCOORDINATOR_ROOT/scripts/write_cutover_phase_marker.py" \
   --marker "$CUTOVER_BACKUP/relocation.attempted" \
   --phase relocation-attempted
-python3 "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
+
+# Revalidate the complete global state under the coordinator's own state lock,
+# then remove the reviewed residue set as one all-or-none state commit. This is
+# deliberately before `port relocate`: the normal coordinator transaction can
+# prune old stopped-server evidence on entry. The phase marker and pre-relocate
+# snapshot already exist, so any later failure restores the original graph.
+python3 "$DEVCOORDINATOR_ROOT/scripts/prepare_retired_assignment_cleanup.py" apply \
+  --plan "$CUTOVER_BACKUP/retired-assignment-plan.json" \
+  --coordinator-script \
+    "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
+  --coordinator-home "$COORDINATOR_HOME" --agent "$USER" \
+  --output "$CUTOVER_BACKUP/retired-assignment-cleanup.json"
+
+CODEX_AGENT_COORDINATOR_HOME="$COORDINATOR_HOME" \
+  python3 "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
   port relocate --agent "$USER" \
   --old-project "$OLD_PROJECT" --new-project "$DEVCOORDINATOR_ROOT" \
   --name devops-console --port 443 --lease-id "$LEASE_ID" \
   > "$CUTOVER_BACKUP/relocation-result.json"
+
+CODEX_AGENT_COORDINATOR_HOME="$COORDINATOR_HOME" \
+  python3 "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
+  port assignments --project "$OLD_PROJECT" \
+  > "$CUTOVER_BACKUP/retired-assignment-post-cleanup.json"
+python3 - "$CUTOVER_BACKUP/retired-assignment-post-cleanup.json" <<'PY'
+import json, sys
+if json.load(open(sys.argv[1], encoding="utf-8")) != []:
+    raise SystemExit("retiring checkout still owns a durable port assignment")
+PY
 ```
 
 Only now install the split units and start (not restart) the new coordinator.
@@ -740,23 +789,26 @@ fi
 sudo rm -f /run/systemd/system/devops-console.service.d/90-cutover-killmode.conf
 
 ROLLBACK_STATE=
+ROLLBACK_CHECKSUM=
 if [ -f "$CUTOVER_BACKUP/relocation.attempted" ]; then
   test -f "$CUTOVER_BACKUP/coordinator-state.pre-relocate.json"
   test -f "$CUTOVER_BACKUP/coordinator-state.pre-relocate.sha256"
   sha256sum --check "$CUTOVER_BACKUP/coordinator-state.pre-relocate.sha256"
   ROLLBACK_STATE="$CUTOVER_BACKUP/coordinator-state.pre-relocate.json"
+  ROLLBACK_CHECKSUM="$CUTOVER_BACKUP/coordinator-state.pre-relocate.sha256"
 elif [ -f "$CUTOVER_BACKUP/state-migration.attempted" ]; then
   test -f "$CUTOVER_BACKUP/coordinator-state.poststop.json"
   test -f "$CUTOVER_BACKUP/coordinator-state.poststop.sha256"
   sha256sum --check "$CUTOVER_BACKUP/coordinator-state.poststop.sha256"
   ROLLBACK_STATE="$CUTOVER_BACKUP/coordinator-state.poststop.json"
+  ROLLBACK_CHECKSUM="$CUTOVER_BACKUP/coordinator-state.poststop.sha256"
 else
   echo "no state mutation phase marker; preserving current coordinator state"
 fi
 if [ -n "$ROLLBACK_STATE" ]; then
-  install -m 600 "$ROLLBACK_STATE" \
-    "$COORDINATOR_HOME/.state.json.rollback"
-  mv -f "$COORDINATOR_HOME/.state.json.rollback" "$COORDINATOR_HOME/state.json"
+  python3 "$DEVCOORDINATOR_ROOT/scripts/restore_coordinator_state.py" \
+    --snapshot "$ROLLBACK_STATE" --checksum "$ROLLBACK_CHECKSUM" \
+    --coordinator-home "$COORDINATOR_HOME"
 fi
 
 if grep -qx present "$CUTOVER_BACKUP/dev-coordinator.service.preexisting"; then

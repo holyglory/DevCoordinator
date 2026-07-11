@@ -205,12 +205,21 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'KillMode --value devops-console.service',
     'pre-cutover-identities.json',
     '"server_id": servers[0]["id"]',
+    '.precutover-inventory-home.XXXXXX',
+    'inventory --no-docker',
+    'retired-assignment-plan.json',
+    'Every old-project assignment must be represented',
+    'prepare_retired_assignment_cleanup.py" plan',
+    'prepare_retired_assignment_cleanup.py" apply',
+    'one all-or-none state commit',
+    'retired-assignment-post-cleanup.json',
     '--sync-state-only',
     'user-runtime.writer-free/routes.json',
     'user-runtime.writer-free/ui-prefs.json',
     'sha256sum --check "$CUTOVER_BACKUP/console.env.sha256"',
     'coordinator-state.poststop.json',
     'coordinator-state.pre-relocate.json',
+    'restore_coordinator_state.py',
     'state-migration.attempted',
     'relocation.attempted',
     'no state mutation phase marker; preserving current coordinator state',
@@ -326,6 +335,8 @@ test('existing-host runbook models the legacy Console child-coordinator topology
   const stoppedBoundaryChecks = [...cutover.matchAll(/scripts\/check_legacy_cutover_stopped\.py/g)]
     .map((match) => match.index);
   const relocate = cutover.indexOf('port relocate --agent');
+  const retiredAssignmentCleanup = cutover.indexOf('prepare_retired_assignment_cleanup.py" apply');
+  const retiredAssignmentPostCleanup = cutover.indexOf('retired-assignment-post-cleanup.json');
   const finalModeRepair = cutover.indexOf('find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +');
   const finalLayoutPreflight = cutover.indexOf('scripts/check_production_layout.py', finalModeRepair);
   const migrationMarker = cutover.indexOf('state-migration.attempted');
@@ -360,7 +371,8 @@ test('existing-host runbook models the legacy Console child-coordinator topology
       && trapCleared < finalModeRepair && finalModeRepair < finalLayoutPreflight
       && finalLayoutPreflight < migrationMarker && migrationMarker < finalSync
       && finalSync < preRelocateCheckpoint && preRelocateCheckpoint < relocationMarker
-      && relocationMarker < relocate && relocate < installUnits
+      && relocationMarker < retiredAssignmentCleanup && retiredAssignmentCleanup < relocate
+      && relocate < retiredAssignmentPostCleanup && retiredAssignmentPostCleanup < installUnits
       && installUnits < resolvedUnitPaths && resolvedUnitPaths < startCoordinator
       && startCoordinator < startConsole,
     'legacy cgroup must stop and relocate before split units start',

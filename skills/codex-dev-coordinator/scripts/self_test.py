@@ -3500,9 +3500,33 @@ exit 0
         finally:
             register_victim.terminate()
             register_victim.wait(timeout=10)
-        run(
-            ["port", "unassign", "--agent", "agent-b", "--project", str(tmp), "--name", "blocker"],
+        wrong_guard_port = 65535 if register_guard_port != 65535 else 65534
+        run_fail(
+            [
+                "port", "unassign", "--agent", "agent-b", "--project", str(tmp),
+                "--name", "blocker", "--port", str(wrong_guard_port),
+            ],
             env=env,
+            expected="matching port assignment not found",
+        )
+        blocker_assignments = run(["port", "assignments", "--project", str(tmp)], env=env)
+        check(
+            any(
+                item.get("name") == "blocker" and int(item.get("port") or 0) == register_guard_port
+                for item in blocker_assignments
+            ),
+            "name-plus-port unassign must not remove a same-named assignment on another port",
+        )
+        removed_blocker = run(
+            [
+                "port", "unassign", "--agent", "agent-b", "--project", str(tmp),
+                "--name", "blocker", "--port", str(register_guard_port),
+            ],
+            env=env,
+        )
+        check(
+            int(removed_blocker.get("port") or 0) == register_guard_port,
+            "name-plus-port unassign should return the exact removed assignment",
         )
 
         # Unassign contract: attribution required, foreign unassign needs --force,
@@ -3570,7 +3594,10 @@ exit 0
         # Healthy-existing short-circuit heals a MISSING pin (and only that):
         # unassign while running, idempotent start recreates the pin in place.
         run(
-            ["port", "unassign", "--agent", "agent-a", "--project", str(pin_project), "--name", "web"],
+            [
+                "port", "unassign", "--agent", "agent-a", "--project", str(pin_project),
+                "--name", "web", "--port", str(moved_pin_port),
+            ],
             env=env,
         )
         healed = run(

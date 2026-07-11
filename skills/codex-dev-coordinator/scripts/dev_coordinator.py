@@ -2174,13 +2174,16 @@ def unassign_port(
     if name is None and port is None:
         raise ValueError("port unassign requires --name or --port")
     resolved = canonical_project(project) if project else None
+    resolved_port = int(port) if port is not None else None
     assignments = state.setdefault("port_assignments", {})
     for key, assignment in list(assignments.items()):
         if name is not None:
             if assignment.get("name") != name or assignment.get("project") != resolved:
                 continue
+            if resolved_port is not None and int(assignment.get("port") or 0) != resolved_port:
+                continue
         else:
-            if int(assignment.get("port") or 0) != int(port):
+            if int(assignment.get("port") or 0) != resolved_port:
                 continue
             if assignment.get("project") != resolved and not force:
                 # A moved/renamed repo can orphan an assignment whose canonical
