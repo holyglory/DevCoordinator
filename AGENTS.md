@@ -25,6 +25,16 @@ These rules apply to Codex and Claude Code in this repository.
   include false-positive controls for common intentional patterns.
 - Re-test the original reproduction, the guardrail, and adjacent failure paths
   before reporting completion.
+- Deterministic tests must isolate every host-sensitive discovery channel they
+  assert is absent: global Git identity/configuration, executable `PATH`,
+  standard binary fallbacks, ignored/generated files, credentials, ports, and
+  runtime state. A developer machine's installed tools or leftovers must not
+  make a negative fixture pass or fail.
+- When a body operation and its cleanup, rollback, diagnostic collection, or
+  restoration can both fail, the top-level redacted structured error must
+  retain every operator-relevant failure. Tests must inject returned failures
+  and invocation exceptions at each boundary; causes or exception notes that
+  the CLI serializer does not expose are not sufficient evidence.
 
 ## Canonical skill ownership
 

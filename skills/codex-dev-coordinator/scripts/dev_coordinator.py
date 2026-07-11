@@ -123,6 +123,27 @@ class DockerCommandTimeoutError(StructuredCoordinatorError):
     """A bounded Docker invocation exceeded its deadline."""
 
 
+class PrivateStateWriteCleanupError(RuntimeError):
+    """A private-state write and its temporary-file cleanup both failed."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        temporary_path: Path,
+        primary_error: BaseException,
+        cleanup_error: BaseException,
+    ) -> None:
+        super().__init__(
+            f"private-state write failed for {path}: {type(primary_error).__name__}: "
+            f"{primary_error}; temporary-file cleanup also failed for {temporary_path}: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        self.primary_error = primary_error
+        self.cleanup_error = cleanup_error
+        self.temporary_path = temporary_path
+
+
 def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, StructuredCoordinatorError):
         return copy.deepcopy(exc.payload)
@@ -337,6 +358,7 @@ def atomic_write_private(path: Path, content: str) -> None:
     ensure_private_directory(path.parent)
     tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    primary_error: BaseException | None = None
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
@@ -349,9 +371,26 @@ def atomic_write_private(path: Path, content: str) -> None:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        with contextlib.suppress(FileNotFoundError):
+        try:
             tmp.unlink()
+        except FileNotFoundError:
+            pass
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            # coordinator_exception_payload serializes only str(error), so
+            # the top-level failure must contain both incidents.  Keep the
+            # requested write failure as the explicit cause.
+            raise PrivateStateWriteCleanupError(
+                path=path,
+                temporary_path=tmp,
+                primary_error=primary_error,
+                cleanup_error=cleanup_error,
+            ) from primary_error
 
 
 def read_private_api_token(token_file: Path) -> str:

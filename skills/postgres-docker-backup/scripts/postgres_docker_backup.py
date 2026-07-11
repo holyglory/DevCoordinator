@@ -402,10 +402,17 @@ def postgres_auth(container: str, password: str | None) -> Iterator[list[str]]:
         raise
     finally:
         if attempted:
-            result = docker(cleanup, capture=True, check=False, secrets=(password,))
-            if result.returncode != 0:
-                message = f"failed to remove temporary PostgreSQL credential file from {container}: {redact_text(result.stderr, (password,)).strip()}"
-                surface_cleanup_failure(body_error, message)
+            cleanup_failure_message: str | None = None
+            try:
+                result = docker(cleanup, capture=True, check=False, secrets=(password,))
+            except BaseException as cleanup_error:
+                detail = redact_text(str(cleanup_error), (password,)).strip() or type(cleanup_error).__name__
+                cleanup_failure_message = f"failed to remove temporary PostgreSQL credential file from {container}: {detail}"
+            else:
+                if result.returncode != 0:
+                    cleanup_failure_message = f"failed to remove temporary PostgreSQL credential file from {container}: {redact_text(result.stderr, (password,)).strip()}"
+            if cleanup_failure_message is not None:
+                surface_cleanup_failure(body_error, cleanup_failure_message)
 
 
 def psql_query_command(container: str, user: str, database: str, auth: list[str], sql: str) -> list[str]:
@@ -685,25 +692,41 @@ def publish_artifact(staging: Path, output: Path, manifest: dict[str, Any]) -> P
     manifest_path = manifest_path_for(output)
     if os.path.lexists(output) or os.path.lexists(manifest_path):
         raise RuntimeError(f"refusing to overwrite existing backup or manifest: {output}")
-    published = False
+    body_error: BaseException | None = None
     try:
-        os.link(staging, output)
-        published = True
-        output.chmod(0o600)
-        atomic_json_write(manifest_path, manifest, exclusive=True)
-        fsync_directory(output.parent)
-        return manifest_path
-    except FileExistsError as exc:
-        raise RuntimeError(f"refusing to overwrite existing backup or manifest: {output}") from exc
-    except Exception:
-        if published:
-            with contextlib.suppress(FileNotFoundError, OSError):
+        try:
+            os.link(staging, output)
+        except FileExistsError as exc:
+            raise RuntimeError(f"refusing to overwrite existing backup or manifest: {output}") from exc
+        try:
+            output.chmod(0o600)
+            atomic_json_write(manifest_path, manifest, exclusive=True)
+            fsync_directory(output.parent)
+            return manifest_path
+        except BaseException as error:
+            try:
                 if os.path.samefile(output, staging):
                     output.unlink()
+            except FileNotFoundError:
+                pass
+            except BaseException as rollback_error:
+                detail = str(rollback_error).strip() or type(rollback_error).__name__
+                surface_cleanup_failure(
+                    error,
+                    f"failed to roll back partially published backup {output}: {detail}",
+                )
+            raise
+    except BaseException as error:
+        body_error = error
         raise
     finally:
-        with contextlib.suppress(FileNotFoundError):
+        try:
             staging.unlink()
+        except FileNotFoundError:
+            pass
+        except BaseException as cleanup_error:
+            detail = str(cleanup_error).strip() or type(cleanup_error).__name__
+            surface_cleanup_failure(body_error, f"failed to remove backup staging file {staging}: {detail}")
 
 
 def do_backup(args: argparse.Namespace) -> dict[str, Any]:
@@ -921,10 +944,17 @@ def deep_verify_database(
             body_error = exc
             raise
         finally:
-            cleanup = docker(drop, capture=True, check=False, secrets=secrets)
-            if cleanup.returncode != 0:
-                message = f"failed to drop scratch database {scratch}: {redact_text(cleanup.stderr, secrets).strip()}"
-                surface_cleanup_failure(body_error, message)
+            cleanup_failure_message: str | None = None
+            try:
+                cleanup = docker(drop, capture=True, check=False, secrets=secrets)
+            except BaseException as cleanup_error:
+                detail = redact_text(str(cleanup_error), secrets).strip() or type(cleanup_error).__name__
+                cleanup_failure_message = f"failed to drop scratch database {scratch}: {detail}"
+            else:
+                if cleanup.returncode != 0:
+                    cleanup_failure_message = f"failed to drop scratch database {scratch}: {redact_text(cleanup.stderr, secrets).strip()}"
+            if cleanup_failure_message is not None:
+                surface_cleanup_failure(body_error, cleanup_failure_message)
     return {
         "test_restore": True,
         "verification_target": "scratch_database",
@@ -1060,7 +1090,11 @@ def deep_verify_cluster(
         if actual != expected:
             raise RuntimeError(f"restored cluster catalog does not match source provenance: expected {expected}, got {actual}")
     except BaseException as exc:
-        diagnostics = disposable_cluster_diagnostics(target) if attempted else "target creation was not attempted"
+        try:
+            diagnostics = disposable_cluster_diagnostics(target) if attempted else "target creation was not attempted"
+        except BaseException as diagnostics_error:
+            detail = str(diagnostics_error).strip() or type(diagnostics_error).__name__
+            diagnostics = f"failed to collect disposable verification diagnostics: {detail}"
         wrapped = RuntimeError(f"{exc}\ndisposable verification diagnostics:\n{diagnostics}")
         body_error = wrapped
         raise wrapped from exc

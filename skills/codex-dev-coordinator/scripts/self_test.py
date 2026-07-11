@@ -216,6 +216,62 @@ def _load_module():
     return module
 
 
+def check_atomic_write_cleanup_preserves_primary(module: object, tmp: Path) -> None:
+    target = tmp / "atomic-write-cleanup" / "state.json"
+    target.parent.mkdir()
+    target.write_text("original state\n", encoding="utf-8")
+    target.chmod(0o600)
+    original_replace = module.os.replace
+    path_type = type(target)
+    original_unlink = path_type.unlink
+    publication_failure = "simulated private-state write failure"
+    cleanup_failure = "simulated private-state temp cleanup failure"
+
+    def fail_state_replace(source: object, destination: object) -> None:
+        if Path(destination) == target:
+            raise OSError(publication_failure)
+        original_replace(source, destination)
+
+    def fail_temp_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        candidate = Path(path)
+        if candidate.parent == target.parent and candidate.name.startswith(f".{target.name}.tmp-"):
+            raise OSError(cleanup_failure)
+        original_unlink(path, *args, **kwargs)
+
+    module.os.replace = fail_state_replace
+    path_type.unlink = fail_temp_unlink
+    try:
+        try:
+            module.atomic_write_private(target, "replacement state\n")
+        except module.PrivateStateWriteCleanupError as error:
+            check(
+                publication_failure in str(error) and cleanup_failure in str(error),
+                f"top-level private-state error did not retain both failures: {error!r}",
+            )
+            check(
+                isinstance(error.__cause__, OSError) and publication_failure in str(error.__cause__),
+                f"private-state write failure was not retained as the cause: {error.__cause__!r}",
+            )
+            serialized = json.dumps(module.coordinator_exception_payload(error), sort_keys=True)
+            check(
+                publication_failure in serialized and cleanup_failure in serialized,
+                f"coordinator JSON surface omitted write or cleanup evidence: {serialized}",
+            )
+        else:
+            raise AssertionError("fault-injected private-state write unexpectedly succeeded")
+    finally:
+        module.os.replace = original_replace
+        path_type.unlink = original_unlink
+
+    check(
+        target.read_text(encoding="utf-8") == "original state\n",
+        "failed private-state write changed the existing state",
+    )
+    leftovers = sorted(target.parent.glob(f".{target.name}.tmp-*"))
+    check(len(leftovers) == 1, "failed temp cleanup did not retain exact recovery evidence")
+    original_unlink(leftovers[0])
+
+
 def check_listener_and_health_helpers() -> None:
     """Directly exercise the two host-portability paths that a CLI register
     depends on: resolving the PID that owns a listening port, and probing an
@@ -676,6 +732,7 @@ def main() -> int:
             sys.path.insert(0, str(ROOT / "scripts"))
         import dev_coordinator as dc
 
+        check_atomic_write_cleanup_preserves_primary(dc, tmp)
         check_port_relocation_guards(dc, tmp, env)
 
         # A GUI-launched process commonly receives launchd's minimal PATH.  A

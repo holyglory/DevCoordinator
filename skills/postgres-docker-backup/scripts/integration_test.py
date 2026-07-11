@@ -18,12 +18,25 @@ import time
 import uuid
 from pathlib import Path
 from shutil import rmtree
+from typing import Callable, NoReturn
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "postgres_docker_backup.py"
 IMAGE = os.environ.get("POSTGRES_BACKUP_INTEGRATION_IMAGE", "postgres:16-alpine")
 DISPOSABLE_LABEL = "com.devcoordinator.postgres-backup.disposable=true"
+
+
+class IntegrationBodyCleanupError(RuntimeError):
+    """The integration body and disposable cleanup both failed."""
+
+    def __init__(self, primary_error: BaseException, cleanup_error: BaseException) -> None:
+        super().__init__(
+            f"integration body failed: {type(primary_error).__name__}: {primary_error}; "
+            f"disposable cleanup also failed: {type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        self.primary_error = primary_error
+        self.cleanup_error = cleanup_error
 
 
 def command(args: list[str], *, expect: int = 0, timeout: float = 90) -> subprocess.CompletedProcess[str]:
@@ -76,6 +89,125 @@ def labeled_container_ids() -> set[str]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+def remove_disposable_container(container: str) -> None:
+    command(["docker", "rm", "--force", container], timeout=30)
+
+
+def cleanup_disposable_resources(
+    *,
+    created: bool,
+    container: str,
+    before: set[str],
+    tmp: Path,
+    remove_container: Callable[[str], None] = remove_disposable_container,
+    container_inventory: Callable[[], set[str]] = labeled_container_ids,
+) -> None:
+    failures: list[tuple[str, BaseException]] = []
+    leaked: set[str] = set()
+    try:
+        if created:
+            try:
+                remove_container(container)
+            except BaseException as error:
+                failures.append(("container removal", error))
+        try:
+            after = container_inventory()
+        except BaseException as error:
+            failures.append(("post-cleanup leak audit", error))
+        else:
+            leaked = after - before
+    finally:
+        rmtree(tmp, ignore_errors=True)
+
+    if not failures and not leaked:
+        return
+    details = [f"{phase} failed: {type(error).__name__}: {error}" for phase, error in failures]
+    if leaked:
+        details.append(f"leaked disposable PostgreSQL containers: {sorted(leaked)}")
+    cleanup_error = AssertionError("; ".join(details))
+    if failures:
+        raise cleanup_error from failures[0][1]
+    raise cleanup_error
+
+
+def raise_after_cleanup(primary_error: BaseException | None, cleanup_error: BaseException) -> NoReturn:
+    if primary_error is None:
+        raise cleanup_error
+    # Uncaught integration errors are rendered from str(error), so the
+    # top-level exception must include both incidents.  Keep the requested
+    # body failure as the explicit cause and retain cleanup evidence on the
+    # wrapper itself.
+    raise IntegrationBodyCleanupError(primary_error, cleanup_error) from primary_error
+
+
+def cleanup_contract_self_test() -> int:
+    test_root = Path(tempfile.mkdtemp(prefix="postgres-backup-cleanup-contract-"))
+    failing_tmp = test_root / "failing-run"
+    failing_tmp.mkdir()
+    (failing_tmp / "evidence.txt").write_text("fixture\n", encoding="utf-8")
+    before = {"preexisting-container"}
+    leaked_id = "leaked-disposable-container"
+
+    def timed_out_remove(container: str) -> None:
+        raise subprocess.TimeoutExpired(["docker", "rm", "--force", container], timeout=30)
+
+    def inventory_with_leak() -> set[str]:
+        return before | {leaked_id}
+
+    try:
+        cleanup_disposable_resources(
+            created=True,
+            container="fixture-container",
+            before=before,
+            tmp=failing_tmp,
+            remove_container=timed_out_remove,
+            container_inventory=inventory_with_leak,
+        )
+    except AssertionError as error:
+        cleanup_error = error
+    else:
+        raise AssertionError("fault-injected disposable cleanup unexpectedly succeeded")
+    if failing_tmp.exists():
+        raise AssertionError("local integration scratch data survived cleanup failure")
+    if "container removal failed" not in str(cleanup_error) or leaked_id not in str(cleanup_error):
+        raise AssertionError(f"cleanup failure lost timeout or leak evidence: {cleanup_error!r}")
+
+    primary_error = RuntimeError("simulated integration body failure")
+    try:
+        raise_after_cleanup(primary_error, cleanup_error)
+    except IntegrationBodyCleanupError as error:
+        if error.__cause__ is not primary_error:
+            raise AssertionError("integration body failure was not retained as the cause") from error
+        if (
+            str(primary_error) not in str(error)
+            or "container removal failed" not in str(error)
+            or leaked_id not in str(error)
+        ):
+            raise AssertionError(
+                f"top-level integration failure lost body, timeout, or leak evidence: {error!r}"
+            ) from error
+        if error.cleanup_error is not cleanup_error:
+            raise AssertionError("integration cleanup error was not retained on the combined failure")
+    else:
+        raise AssertionError("combined body/cleanup failure unexpectedly returned")
+
+    successful_tmp = test_root / "successful-run"
+    successful_tmp.mkdir()
+    cleanup_disposable_resources(
+        created=True,
+        container="fixture-container",
+        before=before,
+        tmp=successful_tmp,
+        remove_container=lambda _container: None,
+        container_inventory=lambda: set(before),
+    )
+    if successful_tmp.exists():
+        raise AssertionError("successful cleanup left local integration scratch data")
+    rmtree(test_root, ignore_errors=True)
+    print("docker integration cleanup contract self-test ok")
+    return 0
+
+
 def wait_ready(container: str) -> None:
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
@@ -113,6 +245,7 @@ def main() -> int:
     container = f"devcoordinator-pg-it-{uuid.uuid4().hex[:12]}"
     tmp = Path(tempfile.mkdtemp(prefix="postgres-backup-docker-integration-"))
     created = False
+    primary_error: BaseException | None = None
     try:
         command(
             [
@@ -275,20 +408,22 @@ def main() -> int:
 
         print("docker integration test ok")
         return 0
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        if created:
-            subprocess.run(
-                ["docker", "rm", "--force", container],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=30,
+        try:
+            cleanup_disposable_resources(
+                created=created,
+                container=container,
+                before=before,
+                tmp=tmp,
             )
-        rmtree(tmp, ignore_errors=True)
-        after = labeled_container_ids()
-        leaked = after - before
-        if leaked:
-            raise AssertionError(f"disposable PostgreSQL containers leaked after integration test: {sorted(leaked)}")
+        except BaseException as cleanup_error:
+            raise_after_cleanup(primary_error, cleanup_error)
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test-cleanup"]:
+        raise SystemExit(cleanup_contract_self_test())
     raise SystemExit(main())

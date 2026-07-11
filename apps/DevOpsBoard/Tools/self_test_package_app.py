@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import plistlib
@@ -403,6 +405,102 @@ def main() -> int:
             sign=False,
             force=False,
         )
+
+        # A failed atomic publication can be followed by a failed rollback.
+        # The user needs the publication error as the primary exception while
+        # still retaining both the restoration error and the old app backup
+        # as recovery evidence.
+        rollback_output = temp / "rollback-preservation.app"
+        shutil.copytree(output, rollback_output)
+        rollback_marker = rollback_output / "Contents" / "Resources" / "preexisting-marker.txt"
+        rollback_marker.write_text("original app must survive\n", encoding="utf-8")
+        rollback_backup = rollback_output.with_name(
+            f".{rollback_output.name}.previous-{os.getpid()}"
+        )
+        real_replace = packager.os.replace
+        publication_failure = "simulated staging publication failure"
+        restoration_failure = "simulated backup restoration failure"
+
+        def fail_publication_and_restoration(source_path: Any, destination_path: Any) -> None:
+            source = Path(source_path)
+            destination = Path(destination_path)
+            if destination == rollback_output and source.name.startswith(
+                f".{packager.PRODUCT_NAME}.staging-"
+            ):
+                raise OSError(publication_failure)
+            if source == rollback_backup and destination == rollback_output:
+                raise OSError(restoration_failure)
+            real_replace(source_path, destination_path)
+
+        packager.os.replace = fail_publication_and_restoration
+        try:
+            try:
+                packager.package_app(
+                    configuration="debug",
+                    output=rollback_output,
+                    version="1.0.0",
+                    build="1",
+                    skip_build=True,
+                    sign=False,
+                    force=True,
+                )
+            except packager.PublicationRollbackError as error:
+                check(
+                    publication_failure in str(error) and restoration_failure in str(error),
+                    f"top-level rollback error did not retain both failures: {error!r}",
+                )
+                check(
+                    isinstance(error.__cause__, OSError)
+                    and publication_failure in str(error.__cause__),
+                    f"original publication failure was not retained as the cause: {error.__cause__!r}",
+                )
+            else:
+                raise AssertionError("fault-injected publication unexpectedly succeeded")
+        finally:
+            packager.os.replace = real_replace
+        check(not rollback_output.exists(), "failed restoration unexpectedly created the output path")
+        check(
+            rollback_backup.is_dir()
+            and (rollback_backup / "Contents" / "Resources" / "preexisting-marker.txt").read_text(
+                encoding="utf-8"
+            )
+            == "original app must survive\n",
+            "failed restoration did not retain the original app backup",
+        )
+        real_replace(rollback_backup, rollback_output)
+
+        # Exercise the real CLI serialization path as well: package_app.main
+        # prints only str(error), so both failures must be visible there
+        # without requiring traceback or __cause__ inspection.
+        cli_stderr = io.StringIO()
+        packager.os.replace = fail_publication_and_restoration
+        try:
+            with contextlib.redirect_stderr(cli_stderr):
+                cli_status = packager.main(
+                    [
+                        "--configuration",
+                        "debug",
+                        "--output",
+                        str(rollback_output),
+                        "--skip-build",
+                        "--no-sign",
+                        "--force",
+                    ]
+                )
+        finally:
+            packager.os.replace = real_replace
+        cli_failure = cli_stderr.getvalue()
+        check(cli_status == 1, "fault-injected package CLI unexpectedly succeeded")
+        check(
+            publication_failure in cli_failure and restoration_failure in cli_failure,
+            f"package CLI omitted publication or restoration evidence: {cli_failure!r}",
+        )
+        check(
+            rollback_backup.is_dir()
+            and (rollback_backup / "Contents" / "Resources" / "preexisting-marker.txt").is_file(),
+            "package CLI did not retain the original app backup after failed restoration",
+        )
+        real_replace(rollback_backup, rollback_output)
 
         original_source = source.read_text(encoding="utf-8")
         source.write_text(original_source + "// source changed after build\n", encoding="utf-8")

@@ -1,5 +1,40 @@
 # Decision History
 
+## 2026-07-11 - Cleanup and rollback failures are transaction evidence
+
+Decision: Treat cleanup, rollback, restoration, and failure-diagnostic work as
+part of the operator-visible transaction. When the requested operation and a
+secondary boundary both fail, the top-level redacted error must name every
+failure; exception notes or causes alone are insufficient when a CLI/API
+serializes only `str(error)`. Retain the primary error as causal evidence,
+attempt every independent cleanup, preserve recovery artifacts that could not
+be restored or removed, and record their exact private paths.
+
+Why: The Python 3.13 production-host gate first showed that exception notes
+were absent from the PostgreSQL JSON error. The mandatory adjacent audit then
+reproduced the same loss at credential-file removal, scratch-database drop,
+disposable-cluster diagnostics/cleanup, partial backup publication rollback,
+legacy Console migration finalizers, Board package restoration, coordinator
+private-state temporary cleanup, and disposable integration cleanup. Existing
+tests mostly modeled a command returning nonzero; they did not model the
+cleanup invocation itself throwing, two rollback stages failing, or a later
+finalizer replacing an already-combined error.
+
+Result: Realistic fault injection now covers returned and thrown cleanup
+failures, combined body/diagnostic/cleanup errors, partial publication with an
+unremovable final artifact, migration body+rollback+finalizer failure, failed
+app restoration with a retained backup, private-state write+temp-cleanup
+failure, and integration removal timeout plus leak evidence. False-positive
+controls prove successful cleanup does not invent secondary failures. Secret-
+bearing PostgreSQL failures are redacted before combination, while CLI JSON
+tests assert the combined text itself rather than traceback-only metadata.
+
+CI now runs the complete non-native gate on Linux and macOS with Python 3.9
+and 3.13; the real disposable PostgreSQL job uses 3.13. Host-absence fixtures
+must control Git configuration, executable paths, binary fallbacks, ignored
+files, ports, credentials, and runtime state instead of relying on a developer
+or server machine not to provide them.
+
 ## 2026-07-11 - Fresh-clone validation is a publication gate, not a duplicate smoke test
 
 Decision: Keep the unpublished DevCoordinator history free of credential-shaped

@@ -37,6 +37,28 @@ class PackagingError(RuntimeError):
     """A safe, user-actionable packaging failure."""
 
 
+class PublicationRollbackError(PackagingError):
+    """Publication and restoration both failed without losing either error."""
+
+    def __init__(
+        self,
+        *,
+        output: Path,
+        backup: Path,
+        publication_error: BaseException,
+        restoration_error: BaseException,
+    ) -> None:
+        super().__init__(
+            f"app publication failed for {output}: {type(publication_error).__name__}: "
+            f"{publication_error}; backup restoration also failed: "
+            f"{type(restoration_error).__name__}: {restoration_error}; "
+            f"original app backup remains at {backup}"
+        )
+        self.publication_error = publication_error
+        self.restoration_error = restoration_error
+        self.backup = backup
+
+
 def run(command: list[str], *, cwd: Path = APP_ROOT, capture: bool = False) -> str:
     completed = subprocess.run(
         command,
@@ -535,9 +557,21 @@ def package_app(
             os.replace(output, backup)
         try:
             os.replace(staging, output)
-        except BaseException:
+        except BaseException as publication_error:
             if backup and backup.exists() and not output.exists():
-                os.replace(backup, output)
+                try:
+                    os.replace(backup, output)
+                except BaseException as restoration_error:
+                    # The CLI serializes only str(error), so the top-level
+                    # failure must contain both incidents.  Keep the original
+                    # publication exception as the explicit cause and retain
+                    # the backup for manual recovery.
+                    raise PublicationRollbackError(
+                        output=output,
+                        backup=backup,
+                        publication_error=publication_error,
+                        restoration_error=restoration_error,
+                    ) from publication_error
             raise
         if backup and backup.exists():
             shutil.rmtree(backup)

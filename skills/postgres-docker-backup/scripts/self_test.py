@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import stat
@@ -16,6 +17,7 @@ from shutil import rmtree
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "postgres_docker_backup.py"
 P0_TEST = ROOT / "scripts" / "p0_regression_test.py"
+INTEGRATION_TEST = ROOT / "scripts" / "integration_test.py"
 SOURCE_ID = "a" * 64
 SOURCE_SHORT_ID = SOURCE_ID[:12]
 REPLACEMENT_ID = "b" * 64
@@ -52,6 +54,17 @@ def run(
 
 def parse_json(result: subprocess.CompletedProcess[str]) -> dict | list:
     return json.loads(result.stdout)
+
+
+def parse_error_json(result: subprocess.CompletedProcess[str]) -> str:
+    try:
+        payload = json.loads(result.stderr)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"failure was not machine-readable JSON: {result.stderr!r}") from exc
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, str) or not error:
+        raise AssertionError(f"failure JSON did not contain a non-empty error: {payload!r}")
+    return error
 
 
 def check(condition: bool, message: str) -> None:
@@ -150,6 +163,9 @@ if is_source(container) and args[:2] == ["exec", "-i"] and "sh" in args:
     _ = sys.stdin.buffer.read()
     raise SystemExit(0)
 if is_source(container) and "rm" in args:
+    if failing("auth_cleanup"):
+        print("credential cleanup echoed DO_NOT_LEAK_7zQ", file=sys.stderr)
+        raise SystemExit(1)
     current = state()
     if os.environ.get("FAKE_DOCKER_REPLACE_AFTER_INCOMING") == "1" and current.get("incoming_drop_complete"):
         current["source_replaced"] = True
@@ -283,6 +299,200 @@ def phase_index(sequence: list[list[str]], predicate) -> int:
     return -1
 
 
+def load_production_module():
+    spec = importlib.util.spec_from_file_location("postgres_docker_backup_under_test", SCRIPT)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"could not load production module: {SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_throwable_cleanup_guards() -> None:
+    module = load_production_module()
+    secret = "AUTH_CLEANUP_SECRET_91q"
+    body_error = RuntimeError("database operation failed before credential cleanup")
+
+    def throwable_auth_docker(args, **_kwargs):
+        if "rm" in args:
+            raise RuntimeError(f"credential cleanup transport failed and echoed {secret}")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    original_docker = module.docker
+    module.docker = throwable_auth_docker
+    try:
+        try:
+            with module.postgres_auth("immutable-container", secret):
+                raise body_error
+        except RuntimeError as error:
+            check("database operation failed" in str(error), "credential cleanup invocation hid the database failure")
+            check("credential cleanup transport failed" in str(error), "credential cleanup invocation failure was hidden")
+            check(secret not in str(error) and "<redacted>" in str(error), "credential cleanup invocation leaked its password")
+            check(error.__cause__ is body_error, "credential cleanup wrapper did not retain the database error as its cause")
+            check(secret not in repr(error.__context__), "credential cleanup retained an unredacted exception context")
+        else:
+            raise AssertionError("throwable credential cleanup unexpectedly succeeded")
+    finally:
+        module.docker = original_docker
+
+    # False-positive control: successful cleanup must not wrap or replace an
+    # ordinary body failure.
+    module.docker = lambda args, **_kwargs: subprocess.CompletedProcess(args, 0, "", "")
+    control_error = RuntimeError("control database failure")
+    try:
+        try:
+            with module.postgres_auth("immutable-container", secret):
+                raise control_error
+        except RuntimeError as error:
+            check(error is control_error, "successful credential cleanup replaced the body error")
+            check("additionally" not in str(error), "successful credential cleanup invented a secondary failure")
+        else:
+            raise AssertionError("credential cleanup control unexpectedly succeeded")
+    finally:
+        module.docker = original_docker
+
+    module = load_production_module()
+    original_docker = module.docker
+    original_preflight = module.container_identity_preflight
+    module.container_identity_preflight = lambda *_args, **_kwargs: ({}, {}, {"actual_id": "immutable-container"})
+
+    def throwable_scratch_docker(args, **_kwargs):
+        if "createdb" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "pg_restore" in args:
+            return subprocess.CompletedProcess(args, 1, "", "scratch restore body failed")
+        if "dropdb" in args:
+            raise RuntimeError("scratch cleanup transport exploded")
+        raise AssertionError(f"unexpected scratch Docker command: {args}")
+
+    module.docker = throwable_scratch_docker
+    try:
+        try:
+            module.deep_verify_database(
+                Path("/dev/null"),
+                "source",
+                "app",
+                None,
+                "custom",
+                None,
+                expected_container_id=SOURCE_ID,
+                phase="throwable scratch cleanup test",
+            )
+        except RuntimeError as error:
+            check("test restore into scratch database failed" in str(error), "scratch cleanup invocation hid the restore failure")
+            check("scratch cleanup transport exploded" in str(error), "scratch cleanup invocation failure was hidden")
+            check(error.__cause__ is not None and "test restore" in str(error.__cause__), "scratch cleanup wrapper lost its body cause")
+        else:
+            raise AssertionError("throwable scratch cleanup unexpectedly succeeded")
+    finally:
+        module.docker = original_docker
+        module.container_identity_preflight = original_preflight
+
+    # False-positive control: a successful scratch drop must preserve the
+    # original restore failure without adding cleanup language.
+    module = load_production_module()
+    original_docker = module.docker
+    original_preflight = module.container_identity_preflight
+    module.container_identity_preflight = lambda *_args, **_kwargs: ({}, {}, {"actual_id": "immutable-container"})
+
+    def successful_scratch_cleanup(args, **_kwargs):
+        if "createdb" in args or "dropdb" in args:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if "pg_restore" in args:
+            return subprocess.CompletedProcess(args, 1, "", "scratch restore control failed")
+        raise AssertionError(f"unexpected scratch control command: {args}")
+
+    module.docker = successful_scratch_cleanup
+    try:
+        try:
+            module.deep_verify_database(
+                Path("/dev/null"),
+                "source",
+                "app",
+                None,
+                "custom",
+                None,
+                expected_container_id=SOURCE_ID,
+                phase="successful scratch cleanup control",
+            )
+        except RuntimeError as error:
+            check("scratch restore control failed" in str(error), "scratch cleanup control lost the restore failure")
+            check("additionally" not in str(error), "successful scratch cleanup invented a secondary failure")
+        else:
+            raise AssertionError("scratch cleanup control unexpectedly succeeded")
+    finally:
+        module.docker = original_docker
+        module.container_identity_preflight = original_preflight
+
+    manifest = {
+        "source": {
+            "container": {"id": "source-id", "image": "postgres:16"},
+            "postgres": {"catalog": {"databases": [], "roles": []}},
+        }
+    }
+    module = load_production_module()
+    original_docker = module.docker
+    original_inspect = module.inspect_container
+    original_wait = module.wait_for_disposable_cluster
+    original_diagnostics = module.disposable_cluster_diagnostics
+    original_cleanup = module.cleanup_disposable_cluster
+
+    def failing_cluster_docker(args, **_kwargs):
+        if args and args[0] == "run":
+            return subprocess.CompletedProcess(args, 0, "target-id\n", "")
+        if "psql" in args:
+            return subprocess.CompletedProcess(args, 1, "", "cluster restore body failed")
+        raise AssertionError(f"unexpected cluster Docker command: {args}")
+
+    module.docker = failing_cluster_docker
+    module.inspect_container = lambda _target: {"Id": "target-id"}
+    module.wait_for_disposable_cluster = lambda *_args, **_kwargs: None
+    module.disposable_cluster_diagnostics = lambda _target: (_ for _ in ()).throw(
+        RuntimeError("cluster diagnostics transport exploded")
+    )
+    module.cleanup_disposable_cluster = lambda _target: (_ for _ in ()).throw(
+        RuntimeError("cluster cleanup transport exploded")
+    )
+    try:
+        try:
+            module.deep_verify_cluster(Path("/dev/null"), manifest, verification_image=None, timeout=1)
+        except RuntimeError as error:
+            text = str(error)
+            check("cluster test restore failed" in text, "cluster diagnostics failure hid the restore failure")
+            check("cluster diagnostics transport exploded" in text, "cluster diagnostics failure was hidden")
+            check("cluster cleanup transport exploded" in text, "cluster cleanup failure was hidden")
+            check(error.__cause__ is not None, "combined cluster failure lost its cause chain")
+            check(
+                error.__cause__.__cause__ is not None and "cluster test restore failed" in str(error.__cause__.__cause__),
+                "combined cluster failure lost its original restore cause",
+            )
+        else:
+            raise AssertionError("combined cluster failures unexpectedly succeeded")
+    finally:
+        module.docker = original_docker
+        module.inspect_container = original_inspect
+        module.wait_for_disposable_cluster = original_wait
+        module.disposable_cluster_diagnostics = original_diagnostics
+        module.cleanup_disposable_cluster = original_cleanup
+
+    # False-positive control: successful diagnostics and cleanup should report
+    # only real restore evidence, never an invented cleanup failure.
+    module = load_production_module()
+    module.docker = failing_cluster_docker
+    module.inspect_container = lambda _target: {"Id": "target-id"}
+    module.wait_for_disposable_cluster = lambda *_args, **_kwargs: None
+    module.disposable_cluster_diagnostics = lambda _target: "state: fixture diagnostic"
+    module.cleanup_disposable_cluster = lambda _target: None
+    try:
+        module.deep_verify_cluster(Path("/dev/null"), manifest, verification_image=None, timeout=1)
+    except RuntimeError as error:
+        text = str(error)
+        check("cluster restore body failed" in text and "state: fixture diagnostic" in text, "cluster control lost body diagnostics")
+        check("failed to collect" not in text and "additionally" not in text, "cluster control invented a cleanup failure")
+    else:
+        raise AssertionError("cluster diagnostics control unexpectedly succeeded")
+
+
 def main() -> int:
     p0 = subprocess.run(
         [sys.executable, str(P0_TEST)],
@@ -292,6 +502,19 @@ def main() -> int:
         timeout=30,
     )
     check(p0.returncode == 0, f"P0 publication regression suite failed:\n{p0.stdout}\n{p0.stderr}")
+    cleanup_contract = subprocess.run(
+        [sys.executable, str(INTEGRATION_TEST), "--self-test-cleanup"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    check(
+        cleanup_contract.returncode == 0,
+        "Docker integration cleanup contract failed:\n"
+        f"{cleanup_contract.stdout}\n{cleanup_contract.stderr}",
+    )
+    test_throwable_cleanup_guards()
 
     tmp = Path(tempfile.mkdtemp(prefix="postgres-docker-backup-self-test-"))
     try:
@@ -455,9 +678,21 @@ def main() -> int:
             expect=1,
         )
         check(
-            "test restore" in combined_failure.stderr and "failed to drop scratch" in combined_failure.stderr,
+            "test restore" in parse_error_json(combined_failure) and "failed to drop scratch" in parse_error_json(combined_failure),
             "restore and cleanup failures must both remain visible",
         )
+
+        auth_cleanup_env = dict(env)
+        auth_cleanup_env["FAKE_DOCKER_FAIL"] = "dump,auth_cleanup"
+        auth_cleanup_failure = run(
+            ["backup", "--expect-container-id", SOURCE_ID, "--out-dir", str(tmp / "auth-cleanup-failure")],
+            env=auth_cleanup_env,
+            expect=1,
+        )
+        auth_cleanup_error = parse_error_json(auth_cleanup_failure)
+        check("database dump failed" in auth_cleanup_error, "credential cleanup hid the backup failure from CLI JSON")
+        check("failed to remove temporary PostgreSQL credential file" in auth_cleanup_error, "credential cleanup failure was absent from CLI JSON")
+        check("DO_NOT_LEAK_7zQ" not in auth_cleanup_error and "<redacted>" in auth_cleanup_error, "credential cleanup JSON leaked the password")
 
         unmanifested = tmp / "legacy.dump"
         unmanifested.write_bytes(backup_path.read_bytes())
@@ -841,12 +1076,21 @@ def main() -> int:
         cluster_fail_env = dict(env)
         cluster_fail_env["FAKE_DOCKER_FAIL"] = "cluster_restore"
         log_path.write_text("", encoding="utf-8")
-        run(["verify", "--file", str(cluster_path), "--test-restore"], env=cluster_fail_env, expect=1)
+        cluster_failed = run(["verify", "--file", str(cluster_path), "--test-restore"], env=cluster_fail_env, expect=1)
+        check("cluster test restore failed" in parse_error_json(cluster_failed), "cluster restore failure was absent from CLI JSON")
         check(any(command[:2] == ["rm", "--force"] for command in docker_log(log_path)), "failed cluster verification must still remove the target")
         cluster_cleanup_env = dict(env)
         cluster_cleanup_env["FAKE_DOCKER_FAIL"] = "cluster_cleanup"
         cleanup = run(["verify", "--file", str(cluster_path), "--test-restore"], env=cluster_cleanup_env, expect=1)
-        check("failed to remove disposable" in cleanup.stderr, "cluster cleanup failure must fail verification")
+        check("failed to remove disposable" in parse_error_json(cleanup), "cluster cleanup failure must fail verification")
+        combined_cluster_env = dict(env)
+        combined_cluster_env["FAKE_DOCKER_FAIL"] = "cluster_restore,cluster_cleanup"
+        combined_cluster = run(["verify", "--file", str(cluster_path), "--test-restore"], env=combined_cluster_env, expect=1)
+        combined_cluster_error = parse_error_json(combined_cluster)
+        check(
+            "cluster test restore failed" in combined_cluster_error and "failed to remove disposable" in combined_cluster_error,
+            "cluster restore and cleanup failures must both remain in CLI JSON",
+        )
 
         # No direct cluster restore path exists without declared staged
         # replacement/rollback topology.

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import stat
 import tempfile
+from contextlib import redirect_stderr
 from pathlib import Path
 from shutil import rmtree
 
@@ -145,6 +147,15 @@ def main() -> int:
         check((backup / "legacy-console.env").read_bytes() == paths["legacy_env"].read_bytes(), "legacy env backup changed")
         manifest = json.loads((backup / "migration-manifest.json").read_text(encoding="utf-8"))
         check(manifest["state"]["source"]["file_count"] == 4, "manifest file count is wrong")
+        check(
+            not list(paths["env_file"].parent.glob(f".{paths['env_file'].name}.migration-*"))
+            and not list(paths["state_dir"].parent.glob(f".{paths['state_dir'].name}.migration-*"))
+            and not any(
+                item.name.startswith((".legacy-console.env.", ".migration-manifest.json."))
+                for item in backup.iterdir()
+            ),
+            "successful migration left temporary paths or falsely reported cleanup failure",
+        )
 
         existing = fixture(root / "existing-env")
         write(existing["env_file"], "KEEP_EXISTING=1\n")
@@ -374,6 +385,114 @@ def main() -> int:
                 migration.tree_manifest(fsync_failure["state_dir"]) == fsync_state_before,
                 f"{phase_name} fsync failure changed prior state",
             )
+
+        # A finalizer failure must be added to an already wrapped body failure,
+        # never replace it as Python's ordinary finally semantics would.
+        env_finalizer = fixture(root / "env-finalizer-combined")
+        original_install = migration.install_staged_no_replace
+        original_unlink = Path.unlink
+
+        def fail_env_body(staged: Path, destination: Path) -> None:
+            raise OSError("PRIMARY_ENV_INSTALL_MARKER")
+
+        def fail_one_env_stage_cleanup(self: Path, *args, **kwargs):
+            if self.parent == env_finalizer["env_file"].parent and ".migration-" in self.name:
+                raise OSError("ENV_FINALIZER_CLEANUP_MARKER")
+            return original_unlink(self, *args, **kwargs)
+
+        migration.install_staged_no_replace = fail_env_body
+        Path.unlink = fail_one_env_stage_cleanup
+        try:
+            try:
+                migrate(env_finalizer, root / "env-finalizer-combined-backup", env_only=True)
+            except migration.MigrationError as error:
+                combined = str(error)
+                check("PRIMARY_ENV_INSTALL_MARKER" in combined, "env finalizer masked the body failure")
+                check("ENV_FINALIZER_CLEANUP_MARKER" in combined, "env finalizer cleanup failure was hidden")
+                check("temporary cleanup" in combined, "env finalizer error lacks cleanup attribution")
+            else:
+                raise AssertionError("expected combined env finalizer failure")
+        finally:
+            migration.install_staged_no_replace = original_install
+            Path.unlink = original_unlink
+        check(not env_finalizer["env_file"].exists(), "env finalizer fixture published an environment")
+
+        # Preserve a primary swap error, a failed automatic rollback, and the
+        # later stage-removal error in one operator-visible causal message.
+        full_finalizer = fixture(root / "full-finalizer-combined")
+        full_backup = root / "full-finalizer-combined-backup"
+        original_replace = migration.os.replace
+        original_rmtree = migration.shutil.rmtree
+
+        def fail_swap_and_rollback(source, destination, *args, **kwargs):
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if destination_path == full_finalizer["state_dir"]:
+                if source_path.name == "state-before":
+                    raise OSError("ROLLBACK_STATE_RESTORE_MARKER")
+                if ".migration-" in source_path.name:
+                    raise OSError("PRIMARY_STATE_SWAP_MARKER")
+            return original_replace(source, destination, *args, **kwargs)
+
+        def fail_state_stage_cleanup(path, *args, **kwargs):
+            candidate = Path(path)
+            if candidate.parent == full_finalizer["state_dir"].parent and ".migration-" in candidate.name:
+                raise OSError("STATE_FINALIZER_CLEANUP_MARKER")
+            return original_rmtree(path, *args, **kwargs)
+
+        migration.os.replace = fail_swap_and_rollback
+        migration.shutil.rmtree = fail_state_stage_cleanup
+        try:
+            try:
+                migrate(full_finalizer, full_backup)
+            except migration.MigrationError as error:
+                combined = str(error)
+                for marker in (
+                    "PRIMARY_STATE_SWAP_MARKER",
+                    "ROLLBACK_STATE_RESTORE_MARKER",
+                    "STATE_FINALIZER_CLEANUP_MARKER",
+                ):
+                    check(marker in combined, f"combined full finalizer error lost {marker}")
+                check("automatic rollback" in combined, "combined full finalizer error lost rollback attribution")
+            else:
+                raise AssertionError("expected combined full finalizer failure")
+        finally:
+            migration.os.replace = original_replace
+            migration.shutil.rmtree = original_rmtree
+        journal = json.loads((full_backup / "transaction.json").read_text(encoding="utf-8"))
+        check(journal["status"] == "rollback_failed", "full finalizer fixture lost rollback journal evidence")
+        check("ROLLBACK_STATE_RESTORE_MARKER" in journal["rollback_error"], "rollback journal lost its cause")
+
+        # --json failures must serialize the combined text itself, not notes or
+        # traceback-only context, and must normalize control characters.
+        original_migrate = migration.migrate
+
+        def fail_json_surface(**_kwargs):
+            raise migration.MigrationError("PRIMARY_JSON_MARKER\nFINALIZER_JSON_MARKER")
+
+        migration.migrate = fail_json_surface
+        stderr = io.StringIO()
+        try:
+            with redirect_stderr(stderr):
+                status = migration.main(
+                    [
+                        "--legacy-env", str(paths["legacy_env"]),
+                        "--legacy-state", str(paths["legacy_state"]),
+                        "--env-file", str(root / "json/console.env"),
+                        "--state-dir", str(root / "json/state"),
+                        "--coordinator-home", str(root / "json/coordinator"),
+                        "--devcoordinator-root", str(paths["repo"]),
+                        "--backup-dir", str(root / "json/backup"),
+                        "--json",
+                    ]
+                )
+        finally:
+            migration.migrate = original_migrate
+        payload = json.loads(stderr.getvalue())
+        check(status == 1 and payload["ok"] is False, "JSON failure surface returned the wrong status")
+        check("PRIMARY_JSON_MARKER" in payload["error"], "JSON failure lost the primary cause")
+        check("FINALIZER_JSON_MARKER" in payload["error"], "JSON failure lost the cleanup cause")
+        check("\n" not in payload["error"], "JSON failure retained unsafe control characters")
 
         no_acme = fixture(root / "no-acme")
         rmtree(no_acme["legacy_state"] / "acme")

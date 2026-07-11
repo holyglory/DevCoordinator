@@ -138,6 +138,9 @@ legacy Console environment/state migration rollback;
 public artifacts and snapshot detector recall; coordinator and PostgreSQL P0
 and self-tests; standalone copies of both skills; all DevOps Console unit/e2e
 tests; Python compilation; and the Board's Python-only packaging/tamper suite.
+CI repeats the non-native gate on Linux and macOS with Python 3.9 and 3.13 so
+host discovery and exception/cleanup semantics cannot be validated by only one
+developer environment.
 
 The unflagged native gate is intentionally plugin-owned. A passing
 `--skip-macos-app` run proves static, fixture, and non-native contracts only; it

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import stat
@@ -103,9 +104,73 @@ def mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+def load_production_module():
+    spec = importlib.util.spec_from_file_location("postgres_docker_backup_p0_under_test", SCRIPT)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"could not load production module: {SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_partial_publication_rollback(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=False)
+    module = load_production_module()
+    staging = root / "publication.partial"
+    output = root / "publication.dump"
+    staging.write_bytes(b"verified backup bytes")
+    original_atomic_json_write = module.atomic_json_write
+    original_unlink = Path.unlink
+
+    def fail_manifest(*_args, **_kwargs):
+        raise RuntimeError("manifest publication failed")
+
+    def fail_published_unlink(self, *args, **kwargs):
+        if self == output:
+            raise OSError("published backup rollback unlink failed")
+        return original_unlink(self, *args, **kwargs)
+
+    module.atomic_json_write = fail_manifest
+    Path.unlink = fail_published_unlink
+    try:
+        try:
+            module.publish_artifact(staging, output, {})
+        except RuntimeError as error:
+            text = str(error)
+            check("manifest publication failed" in text, "publication rollback hid the manifest failure")
+            check("published backup rollback unlink failed" in text, "publication rollback failure was hidden")
+            check(error.__cause__ is not None and "manifest publication failed" in str(error.__cause__), "publication rollback lost its primary cause")
+        else:
+            raise AssertionError("failed publication unexpectedly succeeded")
+    finally:
+        Path.unlink = original_unlink
+        module.atomic_json_write = original_atomic_json_write
+    check(output.exists(), "rollback-failure fixture did not leave the realistically unremovable published file")
+    output.unlink()
+
+    # False-positive control: when rollback succeeds, retain the original
+    # publication error without inventing a cleanup failure or leaving output.
+    staging = root / "publication-control.partial"
+    output = root / "publication-control.dump"
+    staging.write_bytes(b"verified backup bytes")
+    module.atomic_json_write = fail_manifest
+    try:
+        try:
+            module.publish_artifact(staging, output, {})
+        except RuntimeError as error:
+            check(str(error) == "manifest publication failed", "successful publication rollback changed the primary failure")
+            check("additionally" not in str(error), "successful publication rollback invented a secondary failure")
+        else:
+            raise AssertionError("publication rollback control unexpectedly succeeded")
+    finally:
+        module.atomic_json_write = original_atomic_json_write
+    check(not output.exists(), "successful publication rollback left a final backup")
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="postgres-backup-p0-regression-"))
     try:
+        test_partial_publication_rollback(tmp / "publication-rollback")
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
         make_fake_docker(fake_bin / "docker")

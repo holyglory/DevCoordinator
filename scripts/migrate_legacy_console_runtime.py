@@ -28,6 +28,48 @@ class EnvironmentPublicationRollbackError(MigrationError):
     pass
 
 
+MAX_OPERATOR_ERROR_CHARS = 2_000
+
+
+def operator_error_text(error: BaseException) -> str:
+    """Return bounded, single-line exception evidence without repr/traceback data."""
+
+    message = " ".join(str(error).split())
+    if len(message) > MAX_OPERATOR_ERROR_CHARS:
+        message = f"{message[:MAX_OPERATOR_ERROR_CHARS]}..."
+    return f"{type(error).__name__}: {message or '<no message>'}"
+
+
+def raise_combined_migration_error(
+    summary: str,
+    causes: list[tuple[str, BaseException]],
+    *,
+    inspect_path: Path | None = None,
+) -> None:
+    """Raise one operator-visible error that retains every distinct cause.
+
+    Exception notes are deliberately not used: ``str(exc)`` and therefore
+    common JSON CLI serializers omit them on Python versions that support
+    notes, while older supported interpreters do not provide that API.
+    """
+
+    distinct: list[tuple[str, BaseException]] = []
+    seen: set[int] = set()
+    for label, error in causes:
+        identity = id(error)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        distinct.append((label, error))
+    if not distinct:
+        raise MigrationError(summary)
+    details = "; additionally, ".join(
+        f"{label}: {operator_error_text(error)}" for label, error in distinct
+    )
+    suffix = f"; inspect {inspect_path}" if inspect_path is not None else ""
+    raise MigrationError(f"{summary}: {details}{suffix}") from distinct[0][1]
+
+
 PATH_VALUES = {
     "STATE_DIR": lambda state, coordinator, root: str(state),
     "ACME_WEBROOT": lambda state, coordinator, root: str(state / "acme"),
@@ -326,6 +368,34 @@ def atomic_json_replace(path: Path, value: dict[str, Any]) -> None:
             temporary.unlink()
 
 
+def finalize_temporary_paths(
+    temporaries: tuple[Path, ...],
+    *,
+    body_error: BaseException | None,
+    operation: str,
+) -> None:
+    """Remove every remaining stage and combine cleanup failures with the body."""
+
+    failures: list[tuple[str, BaseException]] = []
+    for temporary in temporaries:
+        if temporary == Path() or not os.path.lexists(temporary):
+            continue
+        try:
+            if temporary.is_dir() and not temporary.is_symlink():
+                shutil.rmtree(temporary)
+            else:
+                temporary.unlink()
+        except BaseException as error:
+            failures.append((f"temporary cleanup for {temporary}", error))
+    if not failures:
+        return
+    causes = ([("operation failure", body_error)] if body_error is not None else []) + failures
+    raise_combined_migration_error(
+        f"{operation} temporary cleanup failed",
+        causes,
+    )
+
+
 def install_staged_no_replace(staged: Path, destination: Path) -> None:
     """Atomically publish a private staged file without overwriting a race."""
 
@@ -524,16 +594,20 @@ def commit_environment_only(
             except BaseException:
                 pass
         if rollback_error is not None:
-            raise MigrationError(
-                f"environment migration failed ({type(error).__name__}); rollback failed; inspect {backup_dir}"
-            ) from error
+            raise_combined_migration_error(
+                "environment migration and automatic rollback both failed",
+                [("migration failure", error), ("rollback failure", rollback_error)],
+                inspect_path=backup_dir,
+            )
         raise MigrationError(
             f"environment migration failed and was rolled back: {type(error).__name__}: {error}"
         ) from error
     finally:
-        for temporary in (env_stage, backup_stage, manifest_stage):
-            if temporary != Path() and os.path.lexists(temporary):
-                temporary.unlink()
+        finalize_temporary_paths(
+            (env_stage, backup_stage, manifest_stage),
+            body_error=sys.exc_info()[1],
+            operation="environment migration",
+        )
 
 
 def migrate(
@@ -731,7 +805,7 @@ def migrate(
         atomic_json_replace(journal_path, journal)
         return report
     except BaseException as error:
-        rollback_errors: list[str] = []
+        rollback_errors: list[BaseException] = []
         try:
             if env_installed and os.path.lexists(env_file):
                 if hashlib.sha256(env_file.read_bytes()).hexdigest() != journal["environment_sha256"]:
@@ -758,27 +832,27 @@ def migrate(
             journal["error_type"] = type(error).__name__
             atomic_json_replace(journal_path, journal)
         except BaseException as rollback_error:
-            rollback_errors.append(f"{type(rollback_error).__name__}: {rollback_error}")
+            rollback_errors.append(rollback_error)
             journal["status"] = "rollback_failed"
             journal["error_type"] = type(error).__name__
-            journal["rollback_error"] = rollback_errors[0]
+            journal["rollback_error"] = operator_error_text(rollback_errors[0])
             try:
                 atomic_json_replace(journal_path, journal)
             except BaseException:
                 pass
         if rollback_errors:
-            raise MigrationError(
-                f"migration failed ({type(error).__name__}); automatic rollback failed; inspect {backup_dir}"
-            ) from error
+            raise_combined_migration_error(
+                "migration and automatic rollback both failed",
+                [("migration failure", error), *[("rollback failure", item) for item in rollback_errors]],
+                inspect_path=backup_dir,
+            )
         raise MigrationError(f"migration failed and was rolled back: {type(error).__name__}: {error}") from error
     finally:
-        for temporary in (state_stage, env_stage, legacy_env_stage, manifest_stage):
-            if temporary == Path() or not os.path.lexists(temporary):
-                continue
-            if temporary.is_dir() and not temporary.is_symlink():
-                shutil.rmtree(temporary)
-            else:
-                temporary.unlink()
+        finalize_temporary_paths(
+            (state_stage, env_stage, legacy_env_stage, manifest_stage),
+            body_error=sys.exc_info()[1],
+            operation="legacy Console migration",
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -808,7 +882,11 @@ def main(argv: list[str] | None = None) -> int:
             env_only=args.env_only,
         )
     except (MigrationError, OSError, UnicodeError) as error:
-        print(f"legacy Console migration failed: {error}", file=sys.stderr)
+        message = f"legacy Console migration failed: {operator_error_text(error)}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": message}, indent=2, sort_keys=True), file=sys.stderr)
+        else:
+            print(message, file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else "legacy Console runtime migration ok")
     return 0
