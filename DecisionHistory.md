@@ -24,6 +24,15 @@ fixture and still verifies app-root-relative TLS path resolution. Publication
 now requires the full non-native suite in a newly created clone, preventing
 ignored build/runtime artifacts from masking prerequisites.
 
+The first validation on the clean Linux production host found one further
+environment leak before service cutover: ordinary fixture commits supplied an
+inline author/committer identity, but the synthetic merge commit inherited the
+developer machine's global Git identity. The temporary repository now sets its
+own local fixture identity immediately after `git init`, so merge-history
+recall is portable to hosts and CI runners with deliberately empty global Git
+configuration. The server gate must be rerun after this correction; a green
+developer checkout alone is not accepted as Linux evidence.
+
 ## 2026-07-11 - DevCoordinator became the independent owner of operations tooling
 
 Decision: Extract the coordinator, PostgreSQL protection skill, DevOps Board,

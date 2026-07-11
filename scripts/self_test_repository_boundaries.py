@@ -79,6 +79,8 @@ def main() -> int:
         repo = temp / "repo"
         repo.mkdir()
         git(repo, "init", "-q")
+        git(repo, "config", "user.name", "boundary-fixture")
+        git(repo, "config", "user.email", "fixture@example.invalid")
         for skill in ("codex-dev-coordinator", "postgres-docker-backup"):
             write(repo / "skills" / skill / "SKILL.md", f"---\nname: {skill}\ndescription: fixture\n---\n")
         write(repo / "apps/DevOpsBoard/Sources/DevOpsBoard/App.swift")
