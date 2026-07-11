@@ -241,9 +241,11 @@ cleanup failures, transactional custom/plain restore, verified safety backups,
 missing immutable-ID rejection before Docker selection for backup, database
 verification, and restore, same-name container recreation, weak/ambiguous ID
 prefixes, restore-phase identity replacement, cluster scope, disposable
-cluster isolation/cleanup, and refusal of unsafe cluster restore. Exact full
-and unambiguous standard short IDs, plus offline/disposable cluster verification
-without a source ID, are retained as false-positive controls.
+cluster isolation/cleanup, final-server TCP application-database query
+readiness after listener startup, and refusal of unsafe cluster restore. Exact full and unambiguous
+standard short IDs, already-queryable application databases, plus
+offline/disposable cluster verification without a source ID, are retained as
+false-positive controls.
 
 After coordinator inventory, optionally run the real disposable Docker test
 when Docker and a local `postgres:16-alpine` image are available:

@@ -502,7 +502,7 @@ def main() -> int:
         timeout=30,
     )
     check(p0.returncode == 0, f"P0 publication regression suite failed:\n{p0.stdout}\n{p0.stderr}")
-    cleanup_contract = subprocess.run(
+    integration_contract = subprocess.run(
         [sys.executable, str(INTEGRATION_TEST), "--self-test-cleanup"],
         text=True,
         stdout=subprocess.PIPE,
@@ -510,9 +510,9 @@ def main() -> int:
         timeout=30,
     )
     check(
-        cleanup_contract.returncode == 0,
-        "Docker integration cleanup contract failed:\n"
-        f"{cleanup_contract.stdout}\n{cleanup_contract.stderr}",
+        integration_contract.returncode == 0,
+        "Docker integration cleanup/readiness contract failed:\n"
+        f"{integration_contract.stdout}\n{integration_contract.stderr}",
     )
     test_throwable_cleanup_guards()
 

@@ -78,9 +78,11 @@ secret exposure, scope confusion, cross-scope plain SQL, restore and cleanup
 failures, same-name container recreation, weak/ambiguous immutable-ID prefixes,
 replacement between restore phases, transactional custom/plain restores,
 safety-backup verification, disposable cluster isolation, and unsafe
-cluster-restore refusal. It also keeps false-positive guards for exact full and
-unambiguous standard short IDs, valid fixture credentials, and ordinary
-database dumps.
+cluster-restore refusal. The disposable integration contract also proves that
+an accepting PostgreSQL listener is retried until the final TCP server's
+configured application database answers `SELECT 1`. It keeps false-positive guards for an already
+queryable database, exact full and unambiguous standard short IDs, valid
+fixture credentials, and ordinary database dumps.
 
 After coordinator inventory, a real integration is available when Docker and a
 local compatible PostgreSQL image exist:

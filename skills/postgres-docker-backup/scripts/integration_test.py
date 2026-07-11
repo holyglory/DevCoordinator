@@ -204,23 +204,128 @@ def cleanup_contract_self_test() -> int:
     if successful_tmp.exists():
         raise AssertionError("successful cleanup left local integration scratch data")
     rmtree(test_root, ignore_errors=True)
-    print("docker integration cleanup contract self-test ok")
+    readiness_contract_self_test()
+    print("docker integration deterministic contract self-test ok")
     return 0
 
 
 def wait_ready(container: str) -> None:
     deadline = time.monotonic() + 45
+    probe = [
+        "docker",
+        "exec",
+        container,
+        "psql",
+        "-X",
+        "-qAt",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-U",
+        "app",
+        "-d",
+        "appdb",
+        "-c",
+        "SELECT 1;",
+    ]
+    last_error = "readiness query was not attempted"
     while time.monotonic() < deadline:
-        result = subprocess.run(
-            ["docker", "exec", container, "pg_isready", "-U", "app", "-d", "appdb"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            return
+        try:
+            result = subprocess.run(
+                probe,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            last_error = f"{type(error).__name__}: {error}"
+        else:
+            output = result.stdout.strip()
+            if result.returncode == 0 and output == "1":
+                return
+            detail = result.stderr.strip() or result.stdout.strip() or f"psql exited {result.returncode}"
+            last_error = detail[-1000:]
         time.sleep(0.5)
-    raise AssertionError("disposable source PostgreSQL did not become ready")
+    raise AssertionError(f"disposable source PostgreSQL appdb did not become query-ready: {last_error}")
+
+
+def readiness_contract_self_test() -> None:
+    expected_command = [
+        "docker",
+        "exec",
+        "fixture-container",
+        "psql",
+        "-X",
+        "-qAt",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-h",
+        "127.0.0.1",
+        "-U",
+        "app",
+        "-d",
+        "appdb",
+        "-c",
+        "SELECT 1;",
+    ]
+    original_run = subprocess.run
+    original_sleep = time.sleep
+    commands: list[list[str]] = []
+    sleeps: list[float] = []
+    psql_attempts = 0
+
+    def retrying_probe(args, **_kwargs):
+        nonlocal psql_attempts
+        command_args = list(args)
+        commands.append(command_args)
+        if "pg_isready" in command_args:
+            # This deliberately returns success so the fixture catches the old
+            # listener-only readiness implementation.
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if command_args != expected_command:
+            raise AssertionError(f"unexpected readiness command: {command_args}")
+        psql_attempts += 1
+        if psql_attempts == 1:
+            return subprocess.CompletedProcess(args, 2, "", 'FATAL: database "appdb" does not exist')
+        return subprocess.CompletedProcess(args, 0, "1\n", "")
+
+    subprocess.run = retrying_probe
+    time.sleep = lambda seconds: sleeps.append(seconds)
+    try:
+        wait_ready("fixture-container")
+    finally:
+        subprocess.run = original_run
+        time.sleep = original_sleep
+    if commands != [expected_command, expected_command]:
+        raise AssertionError(f"readiness must retry a real appdb SELECT after database initialization: {commands}")
+    if sleeps != [0.5]:
+        raise AssertionError(f"readiness retry must use one bounded backoff in this fixture: {sleeps}")
+
+    # False-positive control: a successful SELECT 1 should return immediately
+    # without a redundant probe or sleep.
+    ready_commands: list[list[str]] = []
+    ready_sleeps: list[float] = []
+
+    def ready_probe(args, **_kwargs):
+        command_args = list(args)
+        ready_commands.append(command_args)
+        if command_args != expected_command:
+            raise AssertionError(f"unexpected ready-control command: {command_args}")
+        return subprocess.CompletedProcess(args, 0, "1\n", "")
+
+    subprocess.run = ready_probe
+    time.sleep = lambda seconds: ready_sleeps.append(seconds)
+    try:
+        wait_ready("fixture-container")
+    finally:
+        subprocess.run = original_run
+        time.sleep = original_sleep
+    if ready_commands != [expected_command] or ready_sleeps:
+        raise AssertionError(
+            f"ready SELECT control should return after one probe without sleeping: commands={ready_commands}, sleeps={ready_sleeps}"
+        )
 
 
 def scalar(container: str, sql: str) -> str:

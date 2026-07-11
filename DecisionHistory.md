@@ -1,5 +1,34 @@
 # Decision History
 
+## 2026-07-11 - CI fixtures must prove canonical paths and usable database readiness
+
+Decision: Keep production path validation strict about every symlink component,
+including lexical system aliases, while canonicalizing only temporary roots
+created and owned by a test before deriving fixture paths. PostgreSQL disposable
+integration readiness must execute `SELECT 1` through `psql` against the exact
+requested application database; an accepting listener is not sufficient.
+
+Why: The first public DevCoordinator matrix exposed two assumptions hidden by
+the development and Linux environments. A macOS runner returned its temporary
+directory through `/var`, which is a platform alias for `/private/var`, so the
+production-layout self-test accidentally supplied a symlinked fixture root and
+failed before reaching its intended assertions. Separately, `pg_isready`
+succeeded during official-image initialization before `POSTGRES_DB=appdb` had
+been created, and the next backup query failed with `database "appdb" does not
+exist`. Weakening the production guard or adding a blind delay would have hidden
+the respective safety and lifecycle boundaries instead of proving them.
+
+Result: The layout self-test canonicalizes its newly created infrastructure
+root, deterministically models the `/var` alias, and separately proves that an
+operator-supplied intermediate symlink is still rejected. The Docker
+integration performs a bounded `psql -X -qAt -v ON_ERROR_STOP=1 -U app -d
+appdb -c "SELECT 1;"` probe against `127.0.0.1`. Binding the probe to TCP also
+distinguishes the final server from the official image's socket-only temporary
+initialization server. Its no-Docker contract deliberately makes a
+listener-only probe appear successful while the first database query fails,
+then proves retry-to-success; an already-queryable control proves there is no
+unnecessary retry or sleep.
+
 ## 2026-07-11 - Cleanup and rollback failures are transaction evidence
 
 Decision: Treat cleanup, rollback, restoration, and failure-diagnostic work as

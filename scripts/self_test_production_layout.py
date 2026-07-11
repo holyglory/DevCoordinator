@@ -40,7 +40,12 @@ def expect_error(call, contains: str) -> None:
 
 
 def main() -> int:
-    root = Path(tempfile.mkdtemp(prefix="devcoordinator-production-layout-"))
+    # macOS exposes /var as a platform-managed symlink to /private/var, and
+    # hosted-runner temporary directories may be returned through that
+    # lexical alias.  The fixture root is infrastructure we just created, not
+    # a user-configured production path, so canonicalize it once before
+    # deriving paths that the strict production guard validates.
+    root = Path(tempfile.mkdtemp(prefix="devcoordinator-production-layout-")).resolve(strict=True)
     try:
         repo = root / "DevCoordinator"
         mkdir(repo / "apps/DevOpsConsole", 0o755)
@@ -78,6 +83,21 @@ def main() -> int:
 
         assert check()["ok"] is True
 
+        # Model the macOS /var -> /private/var shape deterministically.  A
+        # lexical platform alias is still rejected by the production guard,
+        # while the same freshly-created fixture is safe after the test
+        # canonicalizes its infrastructure-owned root.
+        platform_target = root / "private-var/runner-temp"
+        mkdir(platform_target)
+        platform_alias = root / "var"
+        platform_alias.symlink_to(platform_target.parent, target_is_directory=True)
+        lexical_platform_temp = platform_alias / platform_target.name
+        expect_error(
+            lambda: guard.no_symlink_components(lexical_platform_temp),
+            "symlink component",
+        )
+        guard.no_symlink_components(lexical_platform_temp.resolve(strict=True))
+
         token.unlink()
         assert check(require_token=False)["ok"] is True
         expect_error(lambda: check(require_token=True), "token file is missing")
@@ -112,6 +132,21 @@ def main() -> int:
         linked = home / "linked-state"
         os.symlink(state, linked)
         expect_error(lambda: check(state_dir=linked, acme_webroot=acme), "symlink")
+
+        # Canonicalizing the test's platform-owned temp root must not weaken
+        # rejection of a path whose component was explicitly supplied as a
+        # symlink by the operator.
+        user_target = root / "user-controlled-target"
+        mkdir(user_target / "state/acme")
+        user_link = root / "user-controlled-link"
+        user_link.symlink_to(user_target, target_is_directory=True)
+        expect_error(
+            lambda: check(
+                state_dir=user_link / "state",
+                acme_webroot=user_link / "state/acme",
+            ),
+            "symlink component",
+        )
 
         print("production layout preflight self-test ok")
         return 0
