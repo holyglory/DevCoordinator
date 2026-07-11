@@ -107,12 +107,9 @@ def redacted_args(args: list[str], secrets: tuple[str, ...] | list[str] = ()) ->
 
 
 def surface_cleanup_failure(body_error: BaseException | None, message: str) -> None:
-    """Never lose cleanup failure evidence, including on Python versions without add_note."""
+    """Raise one CLI-visible error that retains body and cleanup failures."""
     if body_error is None:
         raise RuntimeError(message)
-    if hasattr(body_error, "add_note"):
-        body_error.add_note(message)
-        return
     raise RuntimeError(f"{body_error}; additionally, {message}") from body_error
 
 

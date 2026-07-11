@@ -43,6 +43,17 @@ while separate positive controls still prove normal-PATH, absolute fallback,
 and multicall-symlink discovery. Host Docker availability can no longer turn a
 deterministic missing-capability test into a false failure.
 
+The next Linux pass found a genuine PostgreSQL error-reporting gap rather than
+a fixture-only difference. On Python versions that support `BaseException`
+notes, backup cleanup attached a failed scratch-database drop as a note to the
+original restore exception. The CLI catches exceptions and serializes
+`str(exc)` as JSON, which omits notes; operators therefore lost the cleanup
+failure even though the process failed. Cleanup handling now always raises a
+combined `RuntimeError` while retaining the body error as `__cause__`, so the
+machine-readable CLI error includes both restore and cleanup failures on every
+supported Python version. The existing realistic fake-Docker scenario proves
+both causes remain visible and is rerun on the production Linux interpreter.
+
 ## 2026-07-11 - DevCoordinator became the independent owner of operations tooling
 
 Decision: Extract the coordinator, PostgreSQL protection skill, DevOps Board,
