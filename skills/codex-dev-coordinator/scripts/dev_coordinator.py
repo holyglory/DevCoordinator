@@ -1463,6 +1463,30 @@ def pending_conflicting_operation(
     return None
 
 
+def require_operation_slot(
+    state: dict[str, Any],
+    *,
+    target: str,
+    project: str,
+    action: str,
+    delegated_parent_id: str | None,
+) -> None:
+    """Reject a conflicting reservation without mutating coordinator state."""
+
+    existing = pending_conflicting_operation(
+        state,
+        target=target,
+        project=project,
+        action=action,
+        delegated_parent_id=delegated_parent_id,
+    )
+    if existing:
+        raise RuntimeError(
+            f"operation already in progress for {target}: "
+            f"{existing.get('action')} ({existing.get('id')})"
+        )
+
+
 def begin_operation(
     state: dict[str, Any],
     *,
@@ -1483,17 +1507,13 @@ def begin_operation(
     )
     if delegated_parent_id and str(context_project or "") != project:
         raise RuntimeError("delegated child operation project does not match its parent capability")
-    existing = pending_conflicting_operation(
+    require_operation_slot(
         state,
         target=target,
         project=project,
         action=action,
         delegated_parent_id=delegated_parent_id,
     )
-    if existing:
-        raise RuntimeError(
-            f"operation already in progress for {target}: {existing.get('action')} ({existing.get('id')})"
-        )
     owner_instance_id = ensure_process_owner_marker()
     operation = {
         "id": str(uuid.uuid4()),
@@ -6064,7 +6084,20 @@ def begin_project_operation(options: dict[str, Any], action: str) -> tuple[dict[
         )
     else:
         preflight_fingerprints = {}
+    target = f"project:{project}"
+    operation_action = f"project.{action}"
     with locked_state() as state:
+        # Conflict identity has precedence over a preflight fingerprint race:
+        # the pending project operation is the cause of its child server-set
+        # change, and this check is read-only. Preserve the established short,
+        # actionable conflict response before reporting generic retry advice.
+        require_operation_slot(
+            state,
+            target=target,
+            project=project,
+            action=operation_action,
+            delegated_parent_id=delegated_project_operation_id(),
+        )
         if not prepared.get("dry_run"):
             current_fingerprints = {
                 str(server_id): server_lifecycle_fingerprint(server)
@@ -6077,8 +6110,8 @@ def begin_project_operation(options: dict[str, Any], action: str) -> tuple[dict[
                 )
         operation = begin_operation(
             state,
-            action=f"project.{action}",
-            target=f"project:{project}",
+            action=operation_action,
+            target=target,
             agent=agent,
             project=project,
             generation=int(state.get("revision") or 0) + 1,

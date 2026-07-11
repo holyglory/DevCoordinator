@@ -160,3 +160,9 @@ These rules apply to Codex and Claude Code in this repository.
   Docker, or records sidecar metadata. Status and inventory may return the
   unknown observation but must preserve the last strictly proved lifecycle and
   lease. Never coerce unknown ownership to false through truthiness.
+- When a lifecycle command combines pending-operation exclusion with an
+  out-of-lock safety preflight, check the existing conflict read-only before
+  interpreting preflight fingerprint drift, then repeat the conflict check at
+  reservation. A pending operation can legitimately cause the observed state
+  change; report that actionable conflict instead of misclassifying it as a
+  generic retry race.

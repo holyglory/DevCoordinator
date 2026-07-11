@@ -4678,7 +4678,25 @@ else:
             stderr=subprocess.PIPE,
             env=slow_project_env,
         )
-        time.sleep(0.25)
+        conflict_ready_deadline = time.monotonic() + 3
+        while time.monotonic() < conflict_ready_deadline:
+            if slow_project_start.poll() is not None:
+                stdout, stderr = slow_project_start.communicate()
+                raise AssertionError(
+                    "slow project fixture exited before reserving its operation: "
+                    f"{stdout}\n{stderr}"
+                )
+            conflict_state = run(["state", "show"], env=slow_project_env)
+            if any(
+                operation.get("status") == "pending"
+                and operation.get("action") == "project.start"
+                and operation.get("project") == str(slow_project.resolve())
+                for operation in conflict_state.get("operations", {}).values()
+            ):
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("slow project fixture did not reserve its operation in time")
         conflicting_project_started = time.monotonic()
         conflicting_project = subprocess.run(
             [
@@ -4704,7 +4722,8 @@ else:
         )
         check(
             "operation already in progress" in f"{conflicting_project.stdout}\n{conflicting_project.stderr}",
-            "same-project lifecycle conflict should explain the active operation",
+            "same-project lifecycle conflict should explain the active operation; "
+            f"stdout={conflicting_project.stdout!r} stderr={conflicting_project.stderr!r}",
         )
         check(
             conflicting_project_elapsed < 0.75,

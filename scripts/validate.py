@@ -287,6 +287,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "unobservable listener preservation": "unobservable inventory upgraded an unhealthy baseline",
         "unobservable lifecycle fail closed": "signalled, launched, or changed the registration graph",
         "unobservable project atomicity": "partially mutated before identity proof",
+        "read-only lifecycle conflict priority": "def require_operation_slot(",
         "manager bounding ceiling preserved": "capability API narrowed the host's preexisting bounding ceiling",
         "child bounding ceiling inherited": "managed child capability ceiling did not inherit the API's default ceiling",
         "relocation replacement lease linkage": "replacement lease must link server, PID, purpose, and assignment",

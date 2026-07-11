@@ -84,6 +84,18 @@ children, explicit-PID false-positive guards, required production registration,
 and an executable graph verifier before another cutover can be accepted. Each
 cutover attempt retains its own immutable backup and incident evidence.
 
+The first remote fresh-clone validation of this change exposed a concurrency
+ordering regression that an earlier working-tree run did not reproduce. While
+a project start held its pending reservation and created its child server, a
+competing project stop observed the server set before and after that change.
+The new identity preflight correctly detected fingerprint drift, but reported
+generic retry advice before inspecting the already-pending project operation;
+the existing conflict test consequently failed. Pending-operation exclusion is
+now checked without mutation before interpreting fingerprint drift, and
+`begin_operation` repeats the same check at reservation. The realistic
+concurrent start/stop test retains the actual stdout/stderr in its failure so a
+future ordering regression is diagnosable from clean-clone evidence.
+
 ## 2026-07-11 - Loaded-unit checks model omitted undefined properties narrowly
 
 Decision: The loaded-systemd checker accepts an omitted property as empty only
