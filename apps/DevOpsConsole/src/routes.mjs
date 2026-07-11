@@ -94,7 +94,7 @@ export function createRouteStore({ file, config, log }) {
   const consoleLabel = String(config.consoleHost ?? '').split('.')[0];
   if (consoleLabel) reserved.add(consoleLabel);
 
-  // Routes must never point a public subdomain at the unauthenticated
+  // Routes must never point a public subdomain at the privileged
   // coordinator API (security invariant 1).
   let coordinatorPort = null;
   try {
@@ -131,7 +131,7 @@ export function createRouteStore({ file, config, log }) {
   }
 
   // True when this port would proxy a public subdomain straight into the
-  // unauthenticated, loopback-only coordinator API (security invariant #1).
+  // authenticated, loopback-only coordinator API (security invariant #1).
   function isCoordinatorPort(n) {
     return coordinatorPort !== null && Number.isInteger(n) && n === coordinatorPort;
   }

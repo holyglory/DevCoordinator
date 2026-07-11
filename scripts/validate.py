@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -141,7 +142,7 @@ def check_include_glob_exclusions() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def check_ops_console_interaction_guardrails() -> None:
+def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = True) -> None:
     ops_console = ROOT / "apps" / "DevOpsBoard"
     if not ops_console.is_dir():
         return
@@ -153,11 +154,11 @@ def check_ops_console_interaction_guardrails() -> None:
     views = (ops_console / "Sources" / "DevOpsBoard" / "Views.swift").read_text(encoding="utf-8")
     store = (ops_console / "Sources" / "DevOpsBoard" / "OpsStore.swift").read_text(encoding="utf-8")
     models = (ops_console / "Sources" / "DevOpsBoard" / "Models.swift").read_text(encoding="utf-8")
+    snapshot_main = (ops_console / "Tools" / "SnapshotMain.swift").read_text(encoding="utf-8")
     menu_snapshot = (ops_console / "Tools" / "MenuBarSnapshotMain.swift").read_text(encoding="utf-8")
+    snapshot_provenance = (ops_console / "Tools" / "SnapshotProvenance.swift").read_text(encoding="utf-8")
     split_sizing = (ops_console / "Tools" / "SplitSizingTest.swift").read_text(encoding="utf-8")
-    # Read (and thereby existence-gate) the window snapshot tool too; it is
-    # referenced by Package.swift but not compiled by the swiftc QA step.
-    window_snapshot = (ops_console / "Tools" / "SnapshotMain.swift").read_text(encoding="utf-8")
+    core_tests = (ops_console / "Tests" / "DevOpsBoardTests" / "CoreTests.swift").read_text(encoding="utf-8")
     coordinator = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "dev_coordinator.py").read_text(encoding="utf-8")
     coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
     coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
@@ -195,12 +196,59 @@ def check_ops_console_interaction_guardrails() -> None:
         "safe sidebar footer": "SidebarFooterView",
         "explicit sidebar footer width": "sidebarFooterContentWidth(totalWidth:",
         "sidebar footer geometry": "sidebarFooterContentWidth(totalWidth: proxy.size.width)",
-        "sidebar stop all constrained frame": ".frame(maxWidth: .infinity, minHeight: 30)",
+        "explicit bulk stop review": "BulkStopReviewSheet",
         "sidebar footer icon fixed frame": ".frame(width: 24, height: 24)",
+        "sidebar source management": "CoordinatorSourcesSheet",
+        "typed source configuration save": "saveCoordinatorConfiguration",
         "server sidebar toggle": "func toggle(_ server",
         "docker sidebar toggle": "func toggleDocker",
-        "stop all action": "func stopAll()",
-        "stop all button": "Stop all",
+        "combined presentation reducer UI": "presentationSnapshot",
+        "compact source health chip": "SourceHealthChip",
+        "inventory state banner": "InventoryStateBanner",
+        "partial capability warning": "Server and port lease actions remain available",
+        "launch-safe command environment": "enum CommandEnvironment",
+        "macOS system path discovery": "/etc/paths.d",
+        "every process receives resolved environment": "process.environment = environment",
+        "project Docker capability gate": "func projectMutationAvailability",
+        "partial project runtime evidence": "var partial: Bool?",
+        "minimal-path command environment regression": "testCommandEnvironmentBuildsLaunchSafePathFromAbsoluteInheritedAndSystemEntries",
+        "Docker-backed project gating regression": "testDockerBackedProjectMutationRequiresDockerButStatusAndServerOnlyProjectsRemainAvailable",
+        "failed project refresh regression": "testNonzeroProjectActionRetainsPartialEvidenceAndAlwaysRefreshesInventory",
+        "thrown project refresh regression": "testThrownProjectActionFailureStillRefreshesInventory",
+        "source provenance badges": "SourceBadge",
+        "mutation availability UI gating": "actionAllowed(store, kind:",
+        "complete server action gating": "serverActionAllowed",
+        "complete docker action gating": "dockerActionAllowed",
+        "complete database action gating": "databaseProtectionActionAllowed",
+        "retained action result drawer": "ActionResultDrawer",
+        "terminal action result dismissal": "dismissActionResult",
+        "action issue copy": "copyIssueDetails",
+        "action issue dismissal": "dismissActionIssue",
+        "exact lease result card": "LeaseResultCard",
+        "all active lease management": "ManagedLeasesPanel",
+        "discovered lease import": "LeaseActionResult(origin: origin, lease: lease",
+        "lease attachment state": "pendingOperationID",
+        "lease start eligibility": "canStartServer",
+        "lease release eligibility": "canReleaseDirectly",
+        "lease release attribution": "\"--agent\", agentID",
+        "lease release project binding": "\"--project\", project",
+        "scope-aware lease absence": "isAuthoritativelyAbsent",
+        "lease port copy": "copyLeasePort",
+        "lease-bound start action": "Start using lease",
+        "multi-source action selector": "ActionSourcePicker",
+        "start source binding": "selection: $store.startDraft.origin",
+        "lease source binding": "selection: $store.leaseOrigin",
+        "explicit bulk selection": "BulkSelectionCheckbox",
+        "bulk stop review": "BulkStopReviewSheet",
+        "bounded bulk plan preparation": "prepareBulkStop()",
+        "bounded bulk execution": "executeBulkStop(planID:",
+        "database checksum evidence": "Checksum verified",
+        "database restore-test evidence": "Restore tested",
+        "database restore confirmation": "DatabaseRestoreSheet",
+        "structured executable field": "startDraft.executable",
+        "structured argument rows": "startDraft.argumentRows",
+        "stable command argument rows": "ForEach($store.startDraft.argumentRows)",
+        "stable coordinator source rows": "ForEach($sourceRows)",
         "resource tabs": "ResourceTabBar",
         "resizable table columns": "ResizableHeaderCell",
         "column resize helper": "func resizedColumnWidth(",
@@ -217,6 +265,7 @@ def check_ops_console_interaction_guardrails() -> None:
         "docker start action": "func startDocker",
         "exact preferred port model": "preferredPort",
         "server preferred port flag": "\"--preferred\"",
+        "structured server argv": "\"--argv\", encodedArgv",
         "docker all inventory": "docker_ps_inventory(*, all_containers: bool = True, state:",
         "docker ps all command": "args.append(\"--all\")",
         "docker stats command": "\"docker\", \"stats\", \"--no-stream\"",
@@ -227,21 +276,34 @@ def check_ops_console_interaction_guardrails() -> None:
         "visibility gated auto refresh": "func setSurfaceVisible(",
         "window visibility drives refresh gating": "store.setSurfaceVisible(.window, visible)",
         "popover visibility drives refresh gating": "store?.setSurfaceVisible(.popover, true)",
-        "auto refresh interval": "static let autoRefreshInterval",
+        "configured auto refresh interval": "var refreshIntervalSeconds: Double?",
         "auto refresh pauses when hidden": "autoRefreshTask?.cancel()",
         "window occlusion tracking": "windowDidChangeOcclusionState",
         "popover visibility tracking": "popoverDidClose",
         "coalesced inventory refresh": "followUpRequested",
-        "publish inventory only on change": "guard decoded != inventory else { return }",
+        "publish inventory only on change": "if decoded != inventory { inventory = decoded }",
         "cached project groups": "@Published private(set) var projectGroups",
-        "non-blocking process wait": "process.terminationHandler",
-        "bounded subprocess watchdog": "watchdog.cancel()",
-        "inventory subprocess timeout": "timeout: .seconds(60)",
-        "deterministic failure ordering": "failures.sorted { $0.index < $1.index }",
+        "main-actor-safe detached command execution": "let worker = Task.detached(priority: .userInitiated)",
+        "pre-launch subprocess completion handler": "process.terminationHandler = { finished in",
+        "bounded subprocess watchdog": "processExit.wait(timeout:",
+        "event-driven output limit": "SpoolBudget(limit: request.maxOutputBytes) {",
+        "bounded command default timeout": "timeout: TimeInterval = 120",
+        "concurrent source refresh": "let outcomes = await withTaskGroup(",
+        "deterministic source refresh order": "ordered[outcome.index] = outcome",
         "project panel usage-key path fallback": "projectPath(fromUsageKey: name)",
+        "configured auto refresh": "Task.sleep(for: .seconds(interval))",
         "project runtime command parser": "project_sub = project.add_subparsers",
         "project runtime status": "def project_runtime_status(",
         "project runtime start": "def project_runtime_start(",
+        "launch-safe Docker executable resolution": "def resolve_docker_executable(",
+        "bounded Docker subprocess execution": "def execute_docker_subprocess(",
+        "project Docker capability preflight": "def preflight_project_docker(",
+        "safe Compose restart planning": "def compose_restart_service_plan(",
+        "minimal-path Docker capability regression": "launchd-minimal PATH without Docker must fail capability preflight",
+        "multicall Docker entrypoint regression": "Docker multicall execution must retain argv0=docker",
+        "pre-mutation Docker capability regression": "daemon/Compose capability probes must precede every server mutation",
+        "bounded Docker timeout regression": "Docker lifecycle timeout must be bounded and structured",
+        "Docker-free restart dry-run regression": "restart dry-run should expose one semantic Compose action without Docker",
         "project runtime declaration": "PROJECT_RUNTIME_FILES",
         "project dependency classification": "stopped_container",
         "project runtime skill workflow": "project start --agent \"$USER\" --project \"$PROJECT_ROOT\"",
@@ -288,10 +350,33 @@ def check_ops_console_interaction_guardrails() -> None:
         "menu bar row action cluster": ".fixedSize()",
         "menu bar error details panel": "MenuBarErrorPanel",
         "menu bar copied failure details": "copyLastErrorDetails",
+        "menu bar combined source summary": "MenuBarSourceSummary",
+        "menu bar retained result": "MenuBarActionResultPanel",
+        "menu bar source badges": "MenuSourceBadge",
         "persistent action error details": "lastErrorDetails",
         "command failure detail builder": "commandFailureDetails",
         "shell quoted command details": "func shellCommand(",
         "menu bar error qa mode": "mode == \"error\"",
+        "menu snapshot uses production menu": "let view = MenuBarRuntimeView(",
+        "menu snapshot uses isolated fixture inventory": "let fixture = try menuFixtureInventory()",
+        "snapshot renderer source provenance": "SnapshotSourceProvenance",
+        "snapshot source hash": "source_sha256",
+        "discovered lease recall test": "testDiscoveredInventoryLeaseBecomesManageableWithoutSessionCreation",
+        "multi-source selection recall test": "testMultiSourceLeaseHonorsExplicitOriginInsteadOfGuessing",
+        "stable editor row regression": "testEditableRowsKeepStableIdentityAcrossValueChangesAndRemoval",
+        "incomplete action argument regression": "testVisibleActionGatesRejectIncompleteResourceArguments",
+        "bound lease action regression": "testBoundLeaseCannotBeStartedAgainOrReleasedDirectly",
+        "scoped lease reconciliation regression": "testScopedRefreshDoesNotMisclassifyOtherProjectLeaseAsReleased",
+        "lease draft reset regression": "testGenericStartClearsEveryLeaseDerivedPortField",
+        "cross-action conflict regression": "testConflictingMutationsAreBlockedAcrossKindsAndDatabaseContainerIdentity",
+        "source selection rebinding regression": "testSourceSelectionsRebindToCurrentOriginValues",
+        "retained lease rebinding regression": "testRetainedLeaseRebindsToCurrentSourcePresentation",
+        "action request source provenance": "let origin: CoordinatorOrigin?",
+        "action issue result binding": "relatedActionID",
+        "menu current action issue priority": "MenuBarActionIssuePanel",
+        "cross-kind action conflict keys": "actionConflictKeys",
+        "project-child conflict domain": "projectPathForConflict",
+        "start draft conflict identity": "startDraftResourceIdentity",
         "status item app bridge": "StatusBarController.shared.install(store: store)",
         "window accessor bridge": "WindowAccessor",
         "minimize to menu bar": "minimizeToMenuBar",
@@ -328,27 +413,42 @@ def check_ops_console_interaction_guardrails() -> None:
         "inventory project usage": "\"project_usage\": project_usage",
         "unified container membership attribution": "def container_project_attribution(",
         "membership claim set shared by display and actions": "def known_project_paths(",
-        "ambiguous container name match stays unclaimed": "\"ambiguous_name\" if claimants else \"unclaimed\"",
-        "membership divergence must-catch fixture": "must-catch: unattributed grouprepo-db must display under the path-keyed repo",
+        "ambiguous container name match stays unclaimed": "\"ambiguous_name\"",
+        "membership divergence must-catch fixture": "must-catch: unattributed grouprepo-db must remain visible as read-only evidence",
         "membership blast radius skill contract": "shows exactly the blast radius",
         "bounded socket http health": "socket.create_connection((parsed.hostname, port), timeout=timeout)",
         # macOS runners black-hole reverse DNS: a stock HTTPServer.server_bind
         # stalls ~30s in socket.getfqdn between bind() and listen(). The API
         # server must bind without name resolution, and serve_api must use it.
         "coordinator api server skips getfqdn": "socketserver.TCPServer.server_bind(self)",
-        "coordinator api server fast-bind use": "server = FastBindThreadingHTTPServer((host, port), ApiHandler)",
+        "coordinator api server fast-bind use": "server = BoundedThreadingHTTPServer((host, port), ApiHandler, token=token)",
         "http health timeout classification": "\"classification\": \"timeout\"",
         "project usage model": "struct ProjectUsage",
         "process usage model": "struct ProcessUsage",
         "project load strip": "ProjectUsageStrip",
         "project load hot process": "hotProcessLabel(",
-        "multi coordinator home discovery": "discoveredCoordinatorHomes",
+        "multi coordinator origin discovery": "FileSystemCoordinatorOriginDiscovery",
         "coordinator env per inventory": "CODEX_AGENT_COORDINATOR_HOME",
         "process usage self-test": "inventory should expose project usage rollups",
         "hanging health self-test": "hanging HTTP health checks should be bounded",
         "project resource skill contract": "per-server process CPU/RSS",
     }
-    haystacks = "\n".join([source_text, views, store, models, menu_snapshot, split_sizing, window_snapshot, coordinator, coordinator_self_test, coordinator_skill])
+    haystacks = "\n".join(
+        [
+            source_text,
+            views,
+            store,
+            models,
+            snapshot_main,
+            menu_snapshot,
+            snapshot_provenance,
+            split_sizing,
+            core_tests,
+            coordinator,
+            coordinator_self_test,
+            coordinator_skill,
+        ]
+    )
     missing = [label for label, needle in required.items() if needle not in haystacks]
     if missing:
         raise SystemExit("DevOpsBoard interaction guardrail failed: " + ", ".join(missing))
@@ -371,14 +471,30 @@ def check_ops_console_interaction_guardrails() -> None:
         # the display/action divergence class fixed on 2026-07-07.
         "client-side name-key grouping heuristic": "projectKey(fromResourceName",
         "client-side project path guessing": "projectPathForGroup(",
+        "legacy shell command server start": "\"--cmd\"",
+        "snapshot-only duplicate menu shell": "MenuBarSnapshotRuntimeView",
+        "global one-click stop all": "Stop all",
+        "legacy stop-all entry point": "func stopAll()",
+        "obsolete stop-all button style": "SidebarStopAllButtonStyle",
+        "binary connected UI state": "store.connected",
+        "raw command text draft": "startDraft.command",
+        "boolean backup protection label": "BackupSafetyLabel(hasBackup:",
+        "fake traffic-light controls": "WindowDots",
+        "index-based command rows": "Array(store.startDraft.arguments.indices)",
+        "index-based source rows": "Array(draft.sources.indices)",
+        "unattributed lease release": "arguments: [\"port\", \"release\", \"--lease-id\", lease.leaseID]",
+        "blocking subprocess wait": ".waitUntilExit(",
+        "blocking subprocess poll": "usleep(",
     }
-    present = [label for label, needle in prohibited.items() if needle in haystacks]
+    prohibited_haystack = "\n".join([source_text, snapshot_main, menu_snapshot, snapshot_provenance])
+    present = [label for label, needle in prohibited.items() if needle in prohibited_haystack]
     if present:
         raise SystemExit("DevOpsBoard interaction guardrail found prohibited pattern: " + ", ".join(present))
 
-    if shutil.which("swiftc") is None:
-        print("skipping DevOpsBoard swiftc QA tools (no Swift toolchain on this host)")
+    if not run_macos_app_checks:
         return
+    if shutil.which("swiftc") is None:
+        raise SystemExit("DevOpsBoard native checks requested but swiftc is unavailable; use --skip-macos-app")
     qa_dir = ops_console / ".build" / "qa"
     qa_dir.mkdir(parents=True, exist_ok=True)
     split_test = qa_dir / "SplitSizingTest"
@@ -407,6 +523,7 @@ def check_ops_console_interaction_guardrails() -> None:
             "Sources/DevOpsBoard/OpsStore.swift",
             "Sources/DevOpsBoard/Views.swift",
             "Sources/DevOpsBoard/MenuBarViews.swift",
+            "Tools/SnapshotProvenance.swift",
             "Tools/MenuBarSnapshotMain.swift",
         ],
         cwd=ops_console,
@@ -530,7 +647,10 @@ def check_devops_console() -> None:
 
     for path in [*src_files, console / "src" / "ui" / "app.js"]:
         run(["node", "--check", str(path)])
-    run(["node", "--test", "test/"], cwd=console)
+    # Exercise the package's public test entry point. The explicit `.test.mjs`
+    # glob in package.json is portable across Node 20-22; Node 22 treats a
+    # bare `test/` directory argument as a missing CommonJS module.
+    run(["npm", "test"], cwd=console)
 
 
 def check_interaction_label_parity() -> None:
@@ -567,14 +687,42 @@ def check_interaction_label_parity() -> None:
                 )
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Holy Skills, DevOps Board, and DevOps Console.")
+    parser.add_argument(
+        "--skip-macos-app",
+        action="store_true",
+        help=(
+            "run all skill and static Board checks but skip Swift compilation, XCTest, "
+            "native snapshots, and app packaging; use Build macOS Apps for those checks"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     run([sys.executable, str(ROOT / "scripts" / "check_repository_freshness_self_test.py")])
     check_vendor_sync()
     check_interaction_label_parity()
     check_include_glob_exclusions()
-    check_ops_console_interaction_guardrails()
+    check_ops_console_interaction_guardrails(run_macos_app_checks=not args.skip_macos_app)
     check_devops_console()
+    run([sys.executable, str(ROOT / "scripts" / "self_test_manage_skill_links.py")])
     run([sys.executable, str((ROOT / "scripts" / "merge_findings_self_test.py"))])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_public_artifact_guard.py")])
+    run([sys.executable, str(ROOT / "scripts" / "public_artifact_guard.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_snapshot_artifacts.py")])
+    snapshot_arguments = [sys.executable, str(ROOT / "scripts" / "verify_snapshot_artifacts.py")]
+    if args.skip_macos_app:
+        snapshot_arguments.append("--skip-source-freshness")
+    run(snapshot_arguments)
+    run(
+        [
+            sys.executable,
+            str(ROOT / "skills" / "postgres-docker-backup" / "scripts" / "p0_regression_test.py"),
+        ]
+    )
     for skill in SKILLS:
         run([sys.executable, str(skill.relative_to(ROOT) / "scripts" / "self_test.py")])
     run(
@@ -582,6 +730,7 @@ def main() -> int:
             sys.executable,
             "-m",
             "compileall",
+            "scripts",
             "full_repo_harness",
             "skills/codex-dev-coordinator/scripts",
             "skills/formal-web-ui-verification/scripts",
@@ -591,17 +740,24 @@ def main() -> int:
             "skills/trace-fix-root-causes/scripts",
             "skills/ui-implementation-audit/scripts",
             "skills/user-journey-docs-audit/scripts",
+            "apps/DevOpsBoard/Tools",
         ]
     )
     for skill in SKILLS:
         check_standalone_skill(skill)
     ops_console = ROOT / "apps" / "DevOpsBoard"
     if ops_console.is_dir():
-        if shutil.which("swift"):
-            run(["swift", "build"], cwd=ops_console)
-        else:
-            print("skipping DevOpsBoard swift build (no Swift toolchain on this host)")
-    print("validation ok")
+        # This provenance/tamper suite is deliberately Python-only. Keep it in
+        # the safe validation path so stale Swift binaries cannot evade the
+        # guardrail merely because the required native plugin is unavailable.
+        run([sys.executable, "Tools/self_test_package_app.py"], cwd=ops_console)
+    if ops_console.is_dir() and not args.skip_macos_app:
+        run(["swift", "build"], cwd=ops_console)
+        run(["swift", "test"], cwd=ops_console)
+    if args.skip_macos_app:
+        print("validation ok (macOS app checks skipped; run them through Build macOS Apps)")
+    else:
+        print("validation ok")
     return 0
 
 

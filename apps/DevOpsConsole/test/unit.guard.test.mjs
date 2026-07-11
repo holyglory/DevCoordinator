@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { createGuard } from '../src/auth/guard.mjs';
 import { createSessionManager } from '../src/auth/session.mjs';
 
-const SECRET = Buffer.from('ab'.repeat(32), 'hex');
+const SECRET = Buffer.from('ab'.repeat(32), 'hex'); // public-artifact-guard: allow text-secret -- deterministic test-only HMAC key bytes
 
 const PROD_CONFIG = {
   domain: 'vr.ae',

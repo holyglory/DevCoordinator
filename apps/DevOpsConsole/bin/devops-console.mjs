@@ -121,7 +121,7 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     : await createCertManager({ certFile: config.tlsCertFile, keyFile: config.tlsKeyFile, log });
 
   const sessions = createSessionManager({
-    secret: config.sessionSecret,
+    secret: config.sessionSecret, // public-artifact-guard: allow text-secret -- runtime config reference, never literal credential material
     ttlMs: config.sessionTtlMs,
     cookieName: config.cookieName,
     cookieDomain: `.${config.domain}`,
@@ -266,7 +266,7 @@ async function main() {
 
   // Auth stack.
   const sessions = createSessionManager({
-    secret: config.sessionSecret,
+    secret: config.sessionSecret, // public-artifact-guard: allow text-secret -- runtime config reference, never literal credential material
     ttlMs: config.sessionTtlMs,
     cookieName: config.cookieName,
     cookieDomain: `.${config.domain}`,

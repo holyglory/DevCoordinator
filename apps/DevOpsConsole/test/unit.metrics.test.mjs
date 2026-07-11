@@ -133,15 +133,15 @@ describe('metrics store: ingest', () => {
       servers: [],
       docker: { available: false, containers: [] },
       project_usage: [
-        { usage_key: 'path:/home/u/work/app', project_key: 'app', project: '/home/u/work/app', name: 'app', cpu_percent: 10, memory_bytes: 100 },
-        { usage_key: 'path:/home/u/tmp/app', project_key: 'app', project: '/home/u/tmp/app', name: 'app', cpu_percent: 20, memory_bytes: 200 },
+        { usage_key: 'path:/home/example/work/app', project_key: 'app', project: '/home/example/work/app', name: 'app', cpu_percent: 10, memory_bytes: 100 },
+        { usage_key: 'path:/home/example/tmp/app', project_key: 'app', project: '/home/example/tmp/app', name: 'app', cpu_percent: 20, memory_bytes: 200 },
       ],
     }, { at: 1_000_000 });
 
     const keys = store.history().entities.map((e) => e.key).sort();
-    assert.deepEqual(keys, ['proj:path:/home/u/tmp/app', 'proj:path:/home/u/work/app'],
+    assert.deepEqual(keys, ['proj:path:/home/example/tmp/app', 'proj:path:/home/example/work/app'],
       'each usage_key gets its own history series');
-    const work = store.history().entities.find((e) => e.key === 'proj:path:/home/u/work/app');
+    const work = store.history().entities.find((e) => e.key === 'proj:path:/home/example/work/app');
     assert.deepEqual(work.points, [[1_000_000, 10, 100]], 'series must not merge same-named projects');
   });
 

@@ -1,7 +1,6 @@
 // Loopback client for the codex-dev-coordinator HTTP API (see
-// docs/coordinator-http-api.json). The coordinator takes an exclusive file
-// lock around every request, so all calls serialize through an internal FIFO
-// queue here — issuing them in parallel would only pile them up server-side.
+// docs/coordinator-http-api.json). Credentials are read only by this server-side
+// client and are never exposed to browser JavaScript, URLs, or logs.
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -10,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
 const PROJECT_ACTIONS = new Set(['start', 'stop', 'restart']);
+const TOKEN_MAX_BYTES = 4096;
 
 // Connection-level failure codes where the request never reached the
 // coordinator, making a single retry after autostart safe even for mutations.
@@ -68,7 +68,6 @@ export function createCoordinator({ config, log }) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'coordinator' }) : log;
   const baseUrl = String(config.coordinatorUrl).replace(/\/+$/, '');
 
-  let queue = Promise.resolve();
   const pendingAborts = new Set();
   let closed = false;
 
@@ -97,6 +96,34 @@ export function createCoordinator({ config, log }) {
     return path.join(config.stateDir, 'logs', 'coordinator-api.log');
   }
 
+  function readToken() {
+    const tokenFile = String(config.coordinatorTokenFile || '').trim();
+    if (!tokenFile) return null;
+    let stat;
+    try {
+      stat = fs.lstatSync(tokenFile);
+    } catch (err) {
+      if (err?.code === 'ENOENT') return null;
+      throw new CoordError(`coordinator credential cannot be inspected: ${err?.code ?? err?.message ?? err}`, {
+        status: 503,
+      });
+    }
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      throw new CoordError('coordinator credential must be a regular non-symlink file', { status: 503 });
+    }
+    if ((stat.mode & 0o777) !== 0o600) {
+      throw new CoordError('coordinator credential permissions are unsafe; expected mode 0600', { status: 503 });
+    }
+    if (stat.size > TOKEN_MAX_BYTES) {
+      throw new CoordError('coordinator credential file is oversized', { status: 503 });
+    }
+    const token = fs.readFileSync(tokenFile, 'utf8').trim();
+    if (token.length < 32) {
+      throw new CoordError('coordinator credential is empty or too short', { status: 503 });
+    }
+    return token;
+  }
+
   async function fetchJson(method, apiPath, body, timeoutMs) {
     const ac = new AbortController();
     pendingAborts.add(ac);
@@ -104,13 +131,21 @@ export function createCoordinator({ config, log }) {
     try {
       let res;
       try {
+        const token = apiPath.startsWith('/v1/') ? readToken() : null;
+        const headers = {};
+        if (body != null) headers['content-type'] = 'application/json';
+        if (token) headers.authorization = `Bearer ${token}`;
         res = await fetch(baseUrl + apiPath, {
           method,
-          headers: body == null ? undefined : { 'content-type': 'application/json' },
+          headers: Object.keys(headers).length ? headers : undefined,
           body: body == null ? undefined : JSON.stringify(body),
           signal: ac.signal,
         });
       } catch (err) {
+        if (err instanceof CoordError) {
+          noteDown(err);
+          throw err;
+        }
         let coordErr;
         if (ac.signal.aborted) {
           coordErr = new CoordError(
@@ -146,15 +181,20 @@ export function createCoordinator({ config, log }) {
           data = text;
         }
       }
-      // Any HTTP response — including a 400 — means the coordinator is alive.
-      noteAlive();
       if (res.status !== 200) {
         const raw =
           data && typeof data === 'object' && typeof data.error === 'string'
             ? data.error
             : `coordinator returned HTTP ${res.status}`;
-        throw new CoordError(cleanMessage(raw), { status: res.status, body: data });
+        const message = res.status === 401
+          ? 'coordinator authentication failed; verify COORDINATOR_TOKEN_FILE'
+          : cleanMessage(raw);
+        const coordErr = new CoordError(message, { status: res.status, body: data });
+        if (res.status === 401) noteDown(coordErr);
+        else noteAlive();
+        throw coordErr;
       }
+      noteAlive();
       return data;
     } finally {
       clearTimeout(timer);
@@ -176,15 +216,6 @@ export function createCoordinator({ config, log }) {
     }
   }
 
-  function enqueue(task) {
-    const run = queue.then(task, task);
-    queue = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
-  }
-
   function invalidateCaches() {
     invCache.value = undefined;
     invCache.at = 0;
@@ -202,17 +233,15 @@ export function createCoordinator({ config, log }) {
   async function request(method, apiPath, body, { timeoutMs } = {}) {
     if (closed) throw new CoordError('coordinator client is closed');
     const ms = timeoutMs ?? timeoutFor(apiPath);
-    const result = await enqueue(() => attempt(method, apiPath, body ?? null, ms));
+    const result = await attempt(method, apiPath, body ?? null, ms);
     if (isMutation(method, apiPath)) invalidateCaches();
     return result;
   }
 
-  // Liveness probe. Deliberately NOT routed through the FIFO queue: it must
-  // answer within 2s even while a long queued call (projects/* up to 300s)
-  // is in flight, and ensureRunning() polls it from inside queue tasks.
+  // Liveness is intentionally anonymous and independent of credential state.
   async function probe() {
     try {
-      const res = await fetch(`${baseUrl}/v1/ports`, {
+      const res = await fetch(`${baseUrl}/healthz`, {
         method: 'GET',
         signal: AbortSignal.timeout(2000),
       });
@@ -238,9 +267,19 @@ export function createCoordinator({ config, log }) {
     if (config.coordinatorHome) env.CODEX_AGENT_COORDINATOR_HOME = config.coordinatorHome;
     let child;
     try {
+      const args = [
+        config.coordinatorScript,
+        'api',
+        'serve',
+        '--host',
+        '127.0.0.1',
+        '--port',
+        String(port),
+      ];
+      if (config.coordinatorTokenFile) args.push('--token-file', config.coordinatorTokenFile);
       child = spawn(
         'python3',
-        [config.coordinatorScript, 'api', 'serve', '--host', '127.0.0.1', '--port', String(port)],
+        args,
         { detached: true, stdio: ['ignore', outFd, outFd], env },
       );
     } finally {
@@ -351,7 +390,21 @@ export function createCoordinator({ config, log }) {
     if (!PROJECT_ACTIONS.has(action)) {
       throw new CoordError(`unsupported project action '${action}'`, { status: 400 });
     }
-    return request('POST', `/v1/projects/${action}`, body);
+    const result = await request('POST', `/v1/projects/${action}`, body);
+    if (result?.ok === false) {
+      const details = Array.isArray(result.action_errors)
+        ? result.action_errors
+          .map((item) => item?.error || item?.classification || item?.name)
+          .filter(Boolean)
+          .join('; ')
+        : '';
+      const state = result.partial ? 'partially completed' : result.preflight_failed ? 'failed preflight' : 'failed';
+      throw new CoordError(
+        `project ${action} ${state}: ${details || result.classification || 'coordinator reported failure'}`,
+        { status: 409, body: result },
+      );
+    }
+    return result;
   }
 
   function status() {

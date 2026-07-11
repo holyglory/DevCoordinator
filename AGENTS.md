@@ -80,6 +80,29 @@ toward durable prevention when the same class of mistake could recur.
 - Never deliver static mocks, fake plumbing, no-op UI, synthetic data flows, or
   "wired later" implementations as completed work.
 
+## Skill Installation Source Of Truth
+
+- This repository is the only writable canonical source for its eight skills.
+  Do not hand-edit copies under Codex, Claude, Parall, or another runtime home.
+- Install each repo-owned skill through `scripts/manage_skill_links.py` as a
+  direct symlink to `skills/<skill>`. Preserve unrelated runtime/system skills.
+- Before relying on an installed repo skill, verify its direct `readlink` and
+  canonical `realpath`. Treat copied directories, chained links, broken links,
+  or content drift as installation failures and repair them from this repo with
+  a hash-verified rollback record.
+
+## macOS App Build And Test Workflow
+
+- For this repository's Swift/macOS app, load and follow the Build macOS Apps
+  plugin before building, testing, packaging, launching, debugging, or running
+  native UI automation.
+- Do not take over the user's desktop, drive the app through ad-hoc mouse or
+  keyboard control, invoke `open`, or substitute direct `swift`, `swiftc`,
+  `xcodebuild`, or XCUI commands for the plugin workflow.
+- If the plugin is not installed or unavailable in the current session, stop
+  the Swift/macOS validation path and report it as pending. Continue only work
+  that does not build, launch, or control the app until the plugin is available.
+
 ## Local Services, Docker, And Databases
 
 - Before starting, stopping, restarting, or replacing any dev/test server,

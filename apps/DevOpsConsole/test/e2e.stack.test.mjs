@@ -85,21 +85,21 @@ describe('e2e: full console stack', () => {
     };
     const psRows = [
       {
-        ID: 'e2eweb000001', Names: 'e2eweb-app-1', Image: 'e2eweb-app',
+        ID: 'eeeb00000001', Names: 'e2eweb-app-1', Image: 'e2eweb-app',
         Status: 'Up 2 minutes (healthy)',
         // Container port 3000 published on the fixture listener's host port —
         // different numbers on purpose, so resolution must use the mapping.
         Ports: `0.0.0.0:${webHostPort}->3000/tcp, :::${webHostPort}->3000/tcp`,
       },
       {
-        ID: 'e2emulti0001', Names: 'e2emulti-app-1', Image: 'e2emulti-app',
+        ID: 'eeea00000002', Names: 'e2emulti-app-1', Image: 'e2emulti-app',
         Status: 'Up 2 minutes',
         Ports: '0.0.0.0:19998->3000/tcp, 0.0.0.0:19999->9000/tcp',
       },
       {
         // Dedicated to the stale-route lifecycle test: a seeded route points
         // at container port 4000, which this container does NOT publish.
-        ID: 'e2estale0001', Names: 'e2estale-app-1', Image: 'e2estale-app',
+        ID: 'eeea00000003', Names: 'e2estale-app-1', Image: 'e2estale-app',
         Status: 'Up 2 minutes',
         Ports: '0.0.0.0:19997->3000/tcp',
       },

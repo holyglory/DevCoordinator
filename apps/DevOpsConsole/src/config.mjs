@@ -4,12 +4,23 @@
 // routes, and /auth/login shows setup instructions).
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 // appRoot = directory above src/
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function resolveConfiguredPath(value) {
+  const raw = String(value);
+  const expanded = raw === '~'
+    ? os.homedir()
+    : raw.startsWith('~/')
+      ? path.join(os.homedir(), raw.slice(2))
+      : raw;
+  return path.resolve(APP_ROOT, expanded);
+}
 
 const LOG_LEVELS = new Set(['debug', 'info', 'warn', 'error']);
 const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -127,8 +138,8 @@ export function loadConfig({ envFile, env = process.env } = {}) {
   // --- TLS -----------------------------------------------------------------
   const rawCert = get('TLS_CERT_FILE');
   const rawKey = get('TLS_KEY_FILE');
-  const tlsCertFile = rawCert ? path.resolve(APP_ROOT, rawCert) : null;
-  const tlsKeyFile = rawKey ? path.resolve(APP_ROOT, rawKey) : null;
+  const tlsCertFile = rawCert ? resolveConfiguredPath(rawCert) : null;
+  const tlsKeyFile = rawKey ? resolveConfiguredPath(rawKey) : null;
   if (!devInsecureHttp) {
     for (const [key, raw, resolved] of [
       ['TLS_CERT_FILE', rawCert, tlsCertFile],
@@ -209,12 +220,15 @@ export function loadConfig({ envFile, env = process.env } = {}) {
   const coordinatorAutostart = !(rawAutostart === '0' || rawAutostart.toLowerCase() === 'false');
 
   const projectRoot = gitToplevel(APP_ROOT) || APP_ROOT;
-  const coordinatorScript = path.resolve(
-    APP_ROOT,
+  const coordinatorScript = resolveConfiguredPath(
     get('COORDINATOR_SCRIPT') ||
       path.join(projectRoot, 'skills', 'codex-dev-coordinator', 'scripts', 'dev_coordinator.py'),
   );
   const coordinatorHome = get('CODEX_AGENT_COORDINATOR_HOME') || null;
+  const coordinatorTokenFile = resolveConfiguredPath(
+    get('COORDINATOR_TOKEN_FILE')
+      || path.join(coordinatorHome || path.join(os.homedir(), '.codex', 'agent-coordinator'), 'api-token'),
+  );
 
   // How often the console samples coordinator inventory for CPU/memory
   // history charts. Every sample can shell out to `docker stats` inside the
@@ -231,12 +245,12 @@ export function loadConfig({ envFile, env = process.env } = {}) {
   }
 
   // --- misc ----------------------------------------------------------------
-  const stateDir = path.resolve(APP_ROOT, get('STATE_DIR') || 'state');
+  const stateDir = resolveConfiguredPath(get('STATE_DIR') || 'state');
 
   // Webroot the plain-HTTP listener serves ACME HTTP-01 challenges from, so a
   // Let's Encrypt client (certbot --webroot) can validate + auto-renew certs
   // while the app permanently owns port 80. Default: <stateDir>/acme.
-  const acmeWebroot = path.resolve(APP_ROOT, get('ACME_WEBROOT') || path.join(stateDir, 'acme'));
+  const acmeWebroot = resolveConfiguredPath(get('ACME_WEBROOT') || path.join(stateDir, 'acme'));
 
   let logLevel = (get('LOG_LEVEL') || 'info').toLowerCase();
   if (!LOG_LEVELS.has(logLevel)) {
@@ -290,6 +304,7 @@ export function loadConfig({ envFile, env = process.env } = {}) {
     coordinatorAutostart,
     coordinatorScript,
     coordinatorHome,
+    coordinatorTokenFile,
     projectRoot,
     metricsIntervalMs,
     stateDir,

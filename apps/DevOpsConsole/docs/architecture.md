@@ -26,7 +26,8 @@ A single Node process that is the public edge of the VPS `vr.ae`:
 5. **Coordinator as control engine**: all server/docker/lease state and
    mutations go through the coordinator HTTP API on `127.0.0.1:29876`
    (`docs/coordinator-http-api.json` is the authoritative endpoint map). The
-   console spawns `api serve` itself if it is not running (autostart).
+   production `dev-coordinator.service` owns that process. Optional local
+   autostart is available only when `COORDINATOR_AUTOSTART=1`.
 
 ## Files and ownership (one implementation agent each)
 
@@ -69,6 +70,7 @@ single/double-quoted; no interpolation). **`process.env` wins over the file.**
   coordinatorAutostart,   // COORDINATOR_AUTOSTART default true ('0' disables)
   coordinatorScript,      // default '<repoRoot>/skills/codex-dev-coordinator/scripts/dev_coordinator.py'
   coordinatorHome,        // CODEX_AGENT_COORDINATOR_HOME passthrough or null
+  coordinatorTokenFile,   // absolute private COORDINATOR_TOKEN_FILE
   projectRoot,            // git toplevel containing the app (repo root)
   metricsIntervalMs,      // METRICS_INTERVAL_MS default 10000, floor 2000
   stateDir,               // abs, default '<appRoot>/state'; created on load
@@ -212,7 +214,7 @@ export function createSessionManager({ secret, ttlMs, cookieName, cookieDomain, 
 //     clearCookie(): string,
 //     signBlob(obj, ttlMs): string, verifyBlob(str): object|null }  // for flow cookie reuse
 ```
-Token: `base64url(JSON payload) + '.' + base64url(HMAC-SHA256(secret, payloadB64))`,
+The session value is `base64url(JSON payload) + '.' + base64url(HMAC-SHA256(secret, payloadB64))`,
 verified with `crypto.timingSafeEqual`. Payload `{ v:1, sub, email, name, pic, iat, exp }`
 (seconds). Cookie attrs: `Domain=.<domain>; Path=/; HttpOnly; SameSite=Lax;
 Max-Age=<ttl>` + `Secure` when `secure`. `parse` returns null on any
@@ -272,7 +274,7 @@ branding "DevOps Console — vr.ae". Never echo user input unescaped
 ```js
 export function createCoordinator({ config, log })
 // → { ensureRunning(): Promise<{ ok, autostarted, error? }>,
-//     probe(): Promise<boolean>,                       // GET /v1/ports, 2s timeout
+//     probe(): Promise<boolean>,                       // anonymous GET /healthz, 2s timeout
 //     inventory({ maxAgeMs = 5000 } = {}): Promise<Inventory>,   // cached + coalesced
 //     serversRaw({ maxAgeMs = 3000 } = {}): Promise<Server[]>,   // GET /v1/servers cached
 //     request(method, path, body, { timeoutMs }): Promise<any>,  // throws CoordError
@@ -282,15 +284,18 @@ export function createCoordinator({ config, log })
 //     close() }
 export class CoordError extends Error {} // .status (http), .body
 ```
-- **All requests serialize through an internal FIFO queue** (the coordinator
-  flock-serializes anyway; parallel calls just pile up). Per-path timeouts:
+- Requests may run concurrently; the coordinator serializes only short state
+  reservation/commit phases and rejects conflicting lifecycle targets. Per-path timeouts:
   `/v1/projects/*` 300s, `/v1/inventory` 60s, docker 60s, rest 15s.
 - Error bodies are `{"error": "..."}`; KeyError messages keep quotes
   (`"'agent'"`) — surface `.message` trimmed of surrounding quotes.
+- Every `/v1/*` request reads the private `COORDINATOR_TOKEN_FILE` server-side
+  and sends `Authorization: Bearer …`; `/healthz` is the only anonymous route.
 - `ensureRunning()`: probe; if down and `coordinatorAutostart`, spawn
   `python3 <coordinatorScript> api serve --host 127.0.0.1 --port <from url>`
-  detached (`stdio` → append `<stateDir>/logs/coordinator-api.log`, pass
-  `CODEX_AGENT_COORDINATOR_HOME` if set), `unref()`, poll probe up to 15s.
+  with `--token-file <coordinatorTokenFile>` detached (`stdio` → append
+  `<stateDir>/logs/coordinator-api.log`, pass `CODEX_AGENT_COORDINATOR_HOME`
+  if set), `unref()`, poll probe up to 15s.
   Called at boot and lazily on request failure (max 1 attempt/30s).
 - Attribution: every mutation body gets `agent` (`devops-console:<email>` for
   user-initiated, `devops-console` for boot-time) and `project` filled by the
@@ -372,14 +377,14 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 | `DELETE /api/routes/:slug` | → `{ ok: true }` |
 | `POST /api/servers/action` | `{ id, action: 'stop'\|'restart' }` — looks up server in `serversRaw` by id → coordinator `serverStop/serverRestart` with `{ agent: 'devops-console:'+session.email, project: server.project, name: server.name, reason }` → `{ server }` |
 | `POST /api/servers/logs` | `{ id, tail=200 }` → coordinator `serverLogs` `{ server_id: id, tail }` → passthrough |
-| `POST /api/docker/action` | `{ name, action: 'start'\|'stop'\|'restart' }` + attribution (project = config.projectRoot) → passthrough |
+| `POST /api/docker/action` | `{ name, action: 'start'\|'stop'\|'restart' }`; fresh inventory must provide verified Compose/sidecar project ownership, which is sent as mutation attribution; unattributed containers are refused |
 | `POST /api/docker/subdomain` | `{ name, slug, auth?, port? }` — assign/change/remove a container's subdomain in one call (mirrors `/api/servers/subdomain`). Fresh inventory lookup (404 unknown container); `port` is the CONTAINER-side port, required only when the container publishes several (400 lists them), validated against currently-published ports (400 on typo); empty `slug` unassigns → `{ route: null }`. Creates/updates a `kind:'docker'` route → 200/201 `{ route: RouteView }` |
 | `POST /api/docker/logs` | `{ name, tail=120 }` → passthrough `{ text }` |
 | `GET /api/metrics/history?limit=N` | `metrics.history({ limit })` → `{ now, intervalMs, maxPoints, sampler: { running, lastSampleAt, lastError }, host, entities: [{ key, kind: 'host'\|'server'\|'docker'\|'project', id, name, project, points: [[epochMs, cpuPercent, memBytes], …] }] }`. `host` is the latest whole-machine snapshot from `src/host.mjs` (`{ at, cpuPercent, cores, load[3], uptimeSec, mem: { totalBytes, usedBytes, availableBytes }, disks: [{ mount, totalBytes, usedBytes, availableBytes }] }`, `cpuPercent` null until the second sample; sampled every tick INDEPENDENTLY of coordinator health) and its cpu/mem history rides in `entities` as `kind:'host'`, key `host`. Memory "used" is total minus MemAvailable on Linux (plain free elsewhere); disks come from `fs.statfs` over `/` + home, deduped by device. `limit` caps points per entity (400 on non-positive/garbage). |
 | `POST /api/ports/lease` | `{ purpose?, preferred?, ttl?, project? }` → coordinator `leasePort` with `agent: 'devops-console:'+session.email`, `project` defaulting to `config.projectRoot`; a `preferred` port pins `range` to that port → 201 `{ lease }` |
-| `POST /api/ports/release` | `{ lease_id }` (required) → coordinator `releasePort` → `{ lease }` (status `released`). Releasing a lease never removes a durable port pin. |
+| `POST /api/ports/release` | `{ lease_id }` (required); fresh inventory supplies the owning project and the Console supplies the acting user before coordinator `releasePort` → `{ lease }`. Releasing a lease never removes a durable port pin. |
 | `POST /api/ports/unassign` | `{ name, project }` (or `{ port, force? }` for orphan cleanup) → coordinator `unassignPort` with console-user attribution → `{ assignment }` (status `unassigned`). The only console path that frees a durable port pin. |
-| `POST /api/projects/action` | `{ project, action: 'start'\|'stop'\|'restart' }` → coordinator `/v1/projects/<action>` with console-user attribution (dependencies before web servers, pinned ports preserved; up to 300s) → `{ result }` |
+| `POST /api/projects/action` | `{ project, action: 'start'\|'stop'\|'restart' }` → coordinator `/v1/projects/<action>` with console-user attribution. HTTP 200 reports with `ok:false`/`partial`/`action_errors` remain visible failures, never UI success. |
 | `GET /api/prefs` | UI preferences: `{ version, hidden: { servers: [identity keys], docker: [names], projects: [usage_keys] } }` from `<stateDir>/ui-prefs.json` |
 | `PATCH /api/prefs` | `{ hide?: { servers?, docker?, projects? }, unhide?: {…} }` — DELTAS only, merged server-side (validated: strings, trimmed, deduped, ≤500 entries × ≤300 chars) → the full prefs. Whole-list replacement is deliberately unsupported so a stale client snapshot can never wipe hides made elsewhere. Origin-guarded like every mutation. |
 | `GET /api/session` | `{ email, name, pic, exp }` |
@@ -501,9 +506,9 @@ name: 'devops-console', port: 443 })`, swallow+log failure.
 
 ## Security invariants (review will check these)
 
-1. Coordinator API is unauthenticated → console must never proxy arbitrary
-   paths to it; only the fixed endpoint set in `api.mjs`, always behind an
-   allowlisted session + Origin check.
+1. Coordinator API is loopback-only and bearer-authenticated; the token never
+   enters browser state. The console still refuses proxy routes to its port and
+   exposes only fixed server-side calls behind session + Origin checks.
 2. Default-deny: new routes default `auth:'google'`; unknown slugs
    indistinguishable from protected ones to anonymous users.
 3. Proxy targets are always `127.0.0.1` — a route can never point elsewhere.

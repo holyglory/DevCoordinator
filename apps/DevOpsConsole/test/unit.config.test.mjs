@@ -58,9 +58,10 @@ test('.env parsing: comments, blank lines, CRLF, quotes, export prefix, = in val
       `STATE_DIR=${path.join(dir, 'state')}`,
       'ALLOWED_EMAILS="  Admin@VR.AE ,second@vr.ae  "',
       'SESSION_TTL_HOURS=24',
-      'GOOGLE_CLIENT_SECRET=abc=def==',
+      'GOOGLE_CLIENT_SECRET=fixture-abc=def==',
       "LOG_LEVEL='debug'",
       'SESSION_COOKIE_NAME=my_cookie',
+      'COORDINATOR_TOKEN_FILE=~/.codex/test-console-token',
       'this line has no equals sign and is ignored',
     ],
     '\r\n', // CRLF file, as produced by Windows editors
@@ -76,10 +77,11 @@ test('.env parsing: comments, blank lines, CRLF, quotes, export prefix, = in val
   assert.equal(cfg.devInsecureHttp, true);
   assert.deepEqual(cfg.allowedEmails, new Set(['admin@vr.ae', 'second@vr.ae'])); // lowercased + trimmed
   assert.equal(cfg.sessionTtlMs, 24 * 3_600_000);
-  assert.equal(cfg.google.clientSecret, 'abc=def=='); // '=' inside values preserved
+  assert.equal(cfg.google.clientSecret, 'fixture-abc=def=='); // '=' inside values preserved
   assert.equal(cfg.google.clientId, ''); // untouched by the garbage line
   assert.equal(cfg.logLevel, 'debug');
   assert.equal(cfg.cookieName, 'my_cookie');
+  assert.equal(cfg.coordinatorTokenFile, path.join(os.homedir(), '.codex', 'test-console-token'));
   assert.ok(Buffer.isBuffer(cfg.sessionSecret));
   assert.deepEqual(cfg.sessionSecret, Buffer.from(HEX64, 'hex'));
   assert.equal(cfg.stateDir, path.join(dir, 'state'));
@@ -90,7 +92,7 @@ test('process.env wins over the .env file', async (t) => {
   const envFile = await writeEnvFile(dir, [
     'DOMAIN=file.example',
     'GOOGLE_CLIENT_ID=from-file',
-    'GOOGLE_CLIENT_SECRET=file-secret',
+    'GOOGLE_CLIENT_SECRET=fixture-file-secret',
     'LOG_LEVEL=warn',
   ]);
 
@@ -98,7 +100,7 @@ test('process.env wins over the .env file', async (t) => {
 
   assert.equal(cfg.domain, 'vr.ae'); // env overrode the file
   assert.equal(cfg.google.clientId, 'from-env'); // env overrode the file
-  assert.equal(cfg.google.clientSecret, 'file-secret'); // file used when env misses
+  assert.equal(cfg.google.clientSecret, 'fixture-file-secret'); // file used when env misses
   assert.equal(cfg.logLevel, 'warn'); // file used when env misses
 });
 

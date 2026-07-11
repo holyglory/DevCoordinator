@@ -1012,7 +1012,7 @@
           kv('URL', c.url || '—', { mono: true }),
           kv('Last OK', fmtWhen(c.lastOkAt)),
           c.lastError ? kv('Error', String(c.lastError), { mono: true }) : null,
-          h('p', { class: 'pop-hint' }, 'Servers, containers and leases cannot be managed until it answers. The console retries and autostarts it automatically; routes to fixed ports keep working meanwhile.'),
+          h('p', { class: 'pop-hint' }, 'Servers, containers and leases cannot be managed until it answers. The console keeps retrying; in production the dedicated coordinator service is restarted by systemd. Routes to fixed ports keep working meanwhile.'),
           h('div', { class: 'prob-actions' },
             h('button', {
               class: 'btn small', type: 'button', 'data-fk': 'hdr-coord-retry',

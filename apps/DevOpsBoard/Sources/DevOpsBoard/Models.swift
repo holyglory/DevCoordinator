@@ -1,6 +1,9 @@
 import Foundation
+import CryptoKit
+import Darwin
 
 struct Inventory: Decodable, Equatable {
+    var origin: CoordinatorOrigin? = nil
     var coordinatorHome: String?
     var statePath: String?
     var project: String?
@@ -43,7 +46,8 @@ struct Inventory: Decodable, Equatable {
 }
 
 struct ManagedURL: Decodable, Identifiable, Hashable {
-    var id: String { "\(project ?? ""):\(name ?? ""):\(url ?? "")" }
+    var id: String { "\(origin?.id ?? "unknown"):\(project ?? ""):\(name ?? ""):\(url ?? "")" }
+    var origin: CoordinatorOrigin? = nil
     var name: String?
     var project: String?
     var url: String?
@@ -58,6 +62,8 @@ struct ManagedURL: Decodable, Identifiable, Hashable {
 
 struct ManagedServer: Decodable, Identifiable, Hashable {
     var id: String
+    var coordinatorID: String? = nil
+    var origin: CoordinatorOrigin? = nil
     var name: String
     var agent: String?
     var project: String?
@@ -79,6 +85,8 @@ struct ManagedServer: Decodable, Identifiable, Hashable {
     var missingCommand: Bool?
     var metadataSource: String?
     var updatedAt: String?
+    var createdAt: String?
+    var createdTs: Double?
     var duplicateCount: Int?
     var duplicateServerIDs: [String]?
     var urlIsCurrent: Bool?
@@ -99,6 +107,8 @@ struct ManagedServer: Decodable, Identifiable, Hashable {
         case missingCommand = "missing_command"
         case metadataSource = "metadata_source"
         case updatedAt = "updated_at"
+        case createdAt = "created_at"
+        case createdTs = "created_ts"
         case duplicateCount = "duplicate_count"
         case duplicateServerIDs = "duplicate_server_ids"
         case urlIsCurrent = "url_is_current"
@@ -132,6 +142,7 @@ struct ProcessUsage: Decodable, Hashable, Identifiable {
     var serverName: String?
     var processes: [ProcessUsage]?
     var hotProcesses: [ProcessUsage]?
+    var origin: CoordinatorOrigin? = nil
 
     enum CodingKeys: String, CodingKey {
         case source, pid, ppid, pids, command, project, processes
@@ -148,15 +159,16 @@ struct ProcessUsage: Decodable, Hashable, Identifiable {
 }
 
 struct ProjectUsage: Decodable, Hashable, Identifiable {
-    var id: String { usageKey ?? project ?? projectKey ?? name ?? "project" }
-    var usageKey: String?
+    var id: String { "\(origin?.id ?? "unknown"):\(usageKey ?? project ?? projectKey ?? name ?? "project")" }
+    var origin: CoordinatorOrigin? = nil
+    var usageKey: String? = nil
     var project: String?
     var projectKey: String?
     var name: String?
     // Authoritative membership from the coordinator: the servers/containers a
     // row claims are exactly the ones whole-project actions act on.
-    var serverIDs: [String]?
-    var containerNames: [String]?
+    var serverIDs: [String]? = nil
+    var containerNames: [String]? = nil
     var serverCount: Int?
     var containerCount: Int?
     var processCount: Int?
@@ -210,16 +222,22 @@ struct Health: Decodable, Hashable {
 
 struct PortLease: Decodable, Identifiable, Hashable {
     var id: String
+    var coordinatorID: String? = nil
+    var origin: CoordinatorOrigin? = nil
     var port: Int
     var agent: String?
     var project: String?
     var purpose: String?
     var status: String?
     var expiresAtISO: String?
+    var serverID: String?
+    var pendingOperationID: String?
 
     enum CodingKeys: String, CodingKey {
         case id, port, agent, project, purpose, status
         case expiresAtISO = "expires_at_iso"
+        case serverID = "server_id"
+        case pendingOperationID = "pending_operation_id"
     }
 }
 
@@ -237,6 +255,7 @@ struct DockerSummary: Decodable, Hashable {
 }
 
 struct DockerContainer: Decodable, Identifiable, Hashable {
+    var origin: CoordinatorOrigin? = nil
     var id: String?
     var name: String?
     var image: String?
@@ -249,6 +268,12 @@ struct DockerContainer: Decodable, Identifiable, Hashable {
     var adopted: Bool?
     var stats: DockerStats?
     var statsHistory: [DockerStats]?
+    var database: String? = nil
+    var databaseSizeBytes: Int64? = nil
+    var databaseDiscoveryError: String? = nil
+    var startedAt: String? = nil
+    var ownershipError: String? = nil
+    var ownershipCandidates: [CoordinatorOrigin] = []
 
     enum CodingKeys: String, CodingKey {
         case id, name, image, status, ports, project, agent, role, adopted, stats
@@ -300,7 +325,8 @@ struct DockerStats: Decodable, Identifiable, Hashable {
 }
 
 struct DatabaseBackup: Decodable, Identifiable, Hashable {
-    var id: String { path }
+    var id: String { "\(origin?.id ?? "unknown"):\(path)" }
+    var origin: CoordinatorOrigin? = nil
     var path: String
     var size: Int?
     var modifiedAt: String?
@@ -317,15 +343,10 @@ struct DatabaseBackup: Decodable, Identifiable, Hashable {
 }
 
 struct RecentEvent: Decodable, Identifiable, Hashable {
-    var id: String { "\(at)-\(type)" }
+    var id: String { "\(origin?.id ?? "unknown")-\(at)-\(type)" }
+    var origin: CoordinatorOrigin? = nil
     var at: String
     var type: String
-}
-
-struct CommandResult {
-    var output: String
-    var error: String
-    var status: Int32
 }
 
 struct ServerLogPayload: Decodable {
@@ -356,6 +377,7 @@ struct ServerLogServer: Decodable {
 struct ProjectRuntimeReport: Decodable, Hashable {
     var action: String?
     var ok: Bool?
+    var partial: Bool?
     var classification: String?
     var classifications: [String]?
     var project: String?
@@ -372,12 +394,52 @@ struct ProjectRuntimeReport: Decodable, Hashable {
     var actionErrors: [ProjectRuntimeActionError]?
 
     enum CodingKeys: String, CodingKey {
-        case action, ok, classification, classifications, project, name, declared, urls, ports, services, logs
+        case action, ok, partial, classification, classifications, project, name, declared, urls, ports, services, logs
         case runtimeID = "runtime_id"
         case configPath = "config_path"
         case healthChecks = "health_checks"
         case previousExitReasons = "previous_exit_reasons"
         case actionErrors = "action_errors"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        guard values.contains(.action) || values.contains(.project) || values.contains(.runtimeID) else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "JSON is not a project runtime report")
+            )
+        }
+        action = try values.decodeIfPresent(String.self, forKey: .action)
+        ok = try values.decodeIfPresent(Bool.self, forKey: .ok)
+        partial = try values.decodeIfPresent(Bool.self, forKey: .partial)
+        classification = try values.decodeIfPresent(String.self, forKey: .classification)
+        classifications = try values.decodeIfPresent([String].self, forKey: .classifications)
+        project = try values.decodeIfPresent(String.self, forKey: .project)
+        runtimeID = try values.decodeIfPresent(String.self, forKey: .runtimeID)
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        configPath = try values.decodeIfPresent(String.self, forKey: .configPath)
+        declared = try values.decodeIfPresent(Bool.self, forKey: .declared)
+        urls = try values.decodeIfPresent([ProjectRuntimeURL].self, forKey: .urls) ?? []
+        ports = try values.decodeIfPresent([ProjectRuntimePort].self, forKey: .ports) ?? []
+        services = try values.decodeIfPresent([ProjectRuntimeService].self, forKey: .services) ?? []
+        healthChecks = try values.decodeIfPresent([ProjectRuntimeHealthCheck].self, forKey: .healthChecks) ?? []
+        previousExitReasons = try values.decodeIfPresent([ProjectRuntimeExitReason].self, forKey: .previousExitReasons) ?? []
+        logs = try values.decodeIfPresent([ProjectRuntimeLog].self, forKey: .logs) ?? []
+        actionErrors = try values.decodeIfPresent([ProjectRuntimeActionError].self, forKey: .actionErrors)
+    }
+
+    var requiresDockerRuntime: Bool {
+        services.contains { service in
+            if let container = service.container?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !container.isEmpty
+            {
+                return true
+            }
+            let type = service.type?.lowercased() ?? ""
+            return ["docker", "compose", "container", "postgres", "database"].contains {
+                type.contains($0)
+            }
+        }
     }
 }
 
@@ -507,7 +569,7 @@ enum SidebarSelection: Hashable {
 
 extension DockerContainer {
     var stableID: String {
-        id ?? name ?? "\(image ?? "container"):\(ports ?? ""):\(status ?? "")"
+        "\(origin?.id ?? "unknown"):\(id ?? name ?? "\(image ?? "container"):\(ports ?? ""):\(status ?? "")"):\(database ?? "container")"
     }
 
     var isRunning: Bool {
@@ -517,6 +579,34 @@ extension DockerContainer {
     var isPostgresLike: Bool {
         let haystack = [name, image, ports].compactMap { $0?.lowercased() }.joined(separator: " ")
         return haystack.contains("postgres") || haystack.contains("postgis") || haystack.contains("5432")
+    }
+
+    var resourceIdentity: ResourceIdentity? {
+        guard ownershipError == nil else { return nil }
+        return origin.map {
+            ResourceIdentity(
+                origin: $0,
+                kind: isPostgresLike ? .database : .docker,
+                nativeID: id ?? name ?? stableID
+            )
+        }
+    }
+
+    var databaseIdentity: DatabaseIdentity? {
+        guard let origin,
+              let container = name,
+              let database,
+              !database.isEmpty,
+              let containerID = id,
+              !containerID.isEmpty
+        else { return nil }
+        return DatabaseIdentity(origin: origin, container: container, database: database, containerID: containerID)
+    }
+}
+
+extension PortLease {
+    var resourceIdentity: ResourceIdentity? {
+        origin.map { ResourceIdentity(origin: $0, kind: .lease, nativeID: coordinatorID ?? id) }
     }
 }
 
@@ -550,12 +640,34 @@ extension ManagedServer {
         let namePart = name
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        return "\(projectPart)::\(namePart)"
+        return "\(origin?.id ?? "unknown")::\(projectPart)::\(namePart)"
     }
 
     var currentURL: String? {
         urlIsCurrent == false ? nil : url
     }
+
+    var resourceIdentity: ResourceIdentity? {
+        origin.map { ResourceIdentity(origin: $0, kind: .server, nativeID: coordinatorID ?? id) }
+    }
+
+    func uptime(now: Date) -> UptimeValue {
+        UptimeValue(startedAt: createdTs.map { Date(timeIntervalSince1970: $0) }, now: now)
+    }
+}
+
+extension DockerContainer {
+    func uptime(now: Date) -> UptimeValue {
+        UptimeValue(startedAt: startedAt.flatMap(parseISOTimestamp), now: now)
+    }
+}
+
+func parseISOTimestamp(_ value: String) -> Date? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = formatter.date(from: value) { return date }
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter.date(from: value)
 }
 
 func deduplicatedManagedServers(_ servers: [ManagedServer]) -> [ManagedServer] {
@@ -592,4 +704,1556 @@ private func managedServerRank(_ server: ManagedServer) -> (Int, String, String)
         stateRank = 0
     }
     return (stateRank, server.updatedAt ?? server.stoppedAt ?? "", server.id)
+}
+
+// MARK: - Source-aware, testable operations core
+
+struct CoordinatorOrigin: Codable, Hashable, Sendable, Identifiable {
+    let id: String
+    let label: String
+    let home: String
+    var statePath: String?
+
+    init(label: String, home: String, statePath: String? = nil) {
+        let normalizedHome = URL(fileURLWithPath: home).standardizedFileURL.path
+        self.id = normalizedHome
+        self.label = label
+        self.home = normalizedHome
+        self.statePath = statePath
+    }
+
+    static func == (lhs: CoordinatorOrigin, rhs: CoordinatorOrigin) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
+
+enum CoordinatorRefreshMode: String, Codable, Hashable, Sendable {
+    case manual
+    case interval
+}
+
+struct CoordinatorRefreshPolicy: Codable, Hashable, Sendable {
+    var mode: CoordinatorRefreshMode
+    var intervalSeconds: Double?
+
+    static let `default` = CoordinatorRefreshPolicy(mode: .interval, intervalSeconds: 2.5)
+
+    static func manual() -> CoordinatorRefreshPolicy {
+        CoordinatorRefreshPolicy(mode: .manual, intervalSeconds: nil)
+    }
+
+    static func interval(seconds: Double) -> CoordinatorRefreshPolicy {
+        CoordinatorRefreshPolicy(mode: .interval, intervalSeconds: seconds)
+    }
+
+    func validated() throws -> CoordinatorRefreshPolicy {
+        switch mode {
+        case .manual:
+            guard intervalSeconds == nil else {
+                throw CoordinatorConfigurationError.invalidRefreshPolicy("manual refresh must not declare an interval")
+            }
+            return self
+        case .interval:
+            guard let intervalSeconds, intervalSeconds.isFinite, (1...3600).contains(intervalSeconds) else {
+                throw CoordinatorConfigurationError.invalidRefreshPolicy("refresh interval must be between 1 and 3600 seconds")
+            }
+            return self
+        }
+    }
+}
+
+struct CoordinatorSourceConfiguration: Codable, Hashable, Sendable, Identifiable {
+    var id: String { normalizedHome }
+    var label: String
+    var home: String
+    var enabled: Bool
+
+    init(label: String, home: String, enabled: Bool = true) {
+        self.label = label
+        self.home = home
+        self.enabled = enabled
+    }
+
+    var normalizedHome: String {
+        URL(fileURLWithPath: home).standardizedFileURL.path
+    }
+
+    func validated() throws -> CoordinatorSourceConfiguration {
+        let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanHome = home.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanLabel.isEmpty else { throw CoordinatorConfigurationError.invalidSource("source label is empty") }
+        guard cleanHome.hasPrefix("/") else { throw CoordinatorConfigurationError.invalidSource("source home must be an absolute path") }
+        return CoordinatorSourceConfiguration(label: cleanLabel, home: normalizedHome, enabled: enabled)
+    }
+
+    var origin: CoordinatorOrigin {
+        CoordinatorOrigin(label: label, home: normalizedHome)
+    }
+}
+
+struct CoordinatorConfiguration: Codable, Hashable, Sendable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var sources: [CoordinatorSourceConfiguration]
+    var refreshPolicy: CoordinatorRefreshPolicy
+
+    init(
+        schemaVersion: Int = CoordinatorConfiguration.currentSchemaVersion,
+        sources: [CoordinatorSourceConfiguration] = [],
+        refreshPolicy: CoordinatorRefreshPolicy = .default
+    ) {
+        self.schemaVersion = schemaVersion
+        self.sources = sources
+        self.refreshPolicy = refreshPolicy
+    }
+
+    func validated() throws -> CoordinatorConfiguration {
+        guard schemaVersion == Self.currentSchemaVersion else {
+            throw CoordinatorConfigurationError.unsupportedSchema(schemaVersion)
+        }
+        let normalized = try sources.map { try $0.validated() }
+        var seen = Set<String>()
+        for source in normalized where !seen.insert(source.normalizedHome).inserted {
+            throw CoordinatorConfigurationError.duplicateSource(source.normalizedHome)
+        }
+        return CoordinatorConfiguration(
+            schemaVersion: schemaVersion,
+            sources: normalized.sorted { $0.normalizedHome < $1.normalizedHome },
+            refreshPolicy: try refreshPolicy.validated()
+        )
+    }
+
+    var enabledOrigins: [CoordinatorOrigin] {
+        sources.filter(\.enabled).map(\.origin)
+    }
+}
+
+enum CoordinatorConfigurationError: LocalizedError, Equatable {
+    case unsupportedSchema(Int)
+    case invalidSource(String)
+    case duplicateSource(String)
+    case invalidRefreshPolicy(String)
+    case unreadable(String)
+    case writeFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedSchema(let version): return "unsupported coordinator configuration schema \(version)"
+        case .invalidSource(let message): return "invalid coordinator source: \(message)"
+        case .duplicateSource(let path): return "duplicate coordinator source: \(path)"
+        case .invalidRefreshPolicy(let message): return "invalid refresh policy: \(message)"
+        case .unreadable(let message): return "coordinator configuration is unreadable: \(message)"
+        case .writeFailed(let message): return "could not save coordinator configuration: \(message)"
+        }
+    }
+}
+
+struct CoordinatorConfigurationLoadResult: Sendable {
+    let configuration: CoordinatorConfiguration?
+    let warning: String?
+    let usedLastKnownGood: Bool
+}
+
+protocol CoordinatorConfigurationPersisting: Sendable {
+    func load() -> CoordinatorConfigurationLoadResult
+    func save(_ configuration: CoordinatorConfiguration) throws
+}
+
+struct PrivateCoordinatorConfigurationStore: CoordinatorConfigurationPersisting, Sendable {
+    let configurationURL: URL
+    let lastKnownGoodURL: URL
+
+    init(configurationURL: URL? = nil) {
+        // Deliberately retain the pre-rename storage identity so existing
+        // coordinator-source settings survive the DevOps Board rename.
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("CodexOpsConsole", isDirectory: true)
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/CodexOpsConsole", isDirectory: true)
+        let selected = configurationURL ?? root.appendingPathComponent("coordinator-configuration.json")
+        self.configurationURL = selected
+        self.lastKnownGoodURL = selected.deletingPathExtension().appendingPathExtension("last-known-good.json")
+    }
+
+    func load() -> CoordinatorConfigurationLoadResult {
+        let primary = decode(configurationURL)
+        switch primary {
+        case .success(let configuration):
+            return CoordinatorConfigurationLoadResult(configuration: configuration, warning: nil, usedLastKnownGood: false)
+        case .missing:
+            switch decode(lastKnownGoodURL) {
+            case .success(let configuration):
+                return CoordinatorConfigurationLoadResult(
+                    configuration: configuration,
+                    warning: "Coordinator configuration is missing; using the last-known-good copy.",
+                    usedLastKnownGood: true
+                )
+            case .missing:
+                return CoordinatorConfigurationLoadResult(configuration: nil, warning: nil, usedLastKnownGood: false)
+            case .failure(let backupError):
+                return CoordinatorConfigurationLoadResult(
+                    configuration: nil,
+                    warning: "Coordinator configuration is missing and its last-known-good copy is invalid. \(backupError)",
+                    usedLastKnownGood: false
+                )
+            }
+        case .failure(let primaryError):
+            switch decode(lastKnownGoodURL) {
+            case .success(let configuration):
+                return CoordinatorConfigurationLoadResult(
+                    configuration: configuration,
+                    warning: "Coordinator configuration is invalid; using the last-known-good copy. \(primaryError)",
+                    usedLastKnownGood: true
+                )
+            case .missing:
+                return CoordinatorConfigurationLoadResult(
+                    configuration: nil,
+                    warning: "Coordinator configuration is invalid and no last-known-good copy is available. \(primaryError)",
+                    usedLastKnownGood: false
+                )
+            case .failure(let backupError):
+                return CoordinatorConfigurationLoadResult(
+                    configuration: nil,
+                    warning: "Coordinator configuration and its last-known-good copy are invalid. Primary: \(primaryError). Backup: \(backupError)",
+                    usedLastKnownGood: false
+                )
+            }
+        }
+    }
+
+    func save(_ configuration: CoordinatorConfiguration) throws {
+        let validated = try configuration.validated()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(validated)
+        try preparePrivateDirectory(configurationURL.deletingLastPathComponent())
+        try atomicPrivateWrite(data, to: lastKnownGoodURL)
+        try atomicPrivateWrite(data, to: configurationURL)
+    }
+
+    private enum DecodeResult {
+        case success(CoordinatorConfiguration)
+        case missing
+        case failure(String)
+    }
+
+    private func decode(_ url: URL) -> DecodeResult {
+        guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+        do {
+            let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+            guard values.isSymbolicLink != true, values.isRegularFile == true else {
+                return .failure("\(url.lastPathComponent) is not a regular file")
+            }
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            let decoded = try JSONDecoder().decode(CoordinatorConfiguration.self, from: data)
+            return .success(try decoded.validated())
+        } catch {
+            return .failure(error.localizedDescription)
+        }
+    }
+
+    private func preparePrivateDirectory(_ directory: URL) throws {
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        } catch {
+            throw CoordinatorConfigurationError.writeFailed(error.localizedDescription)
+        }
+    }
+
+    private func atomicPrivateWrite(_ data: Data, to target: URL) throws {
+        let temporary = target.deletingLastPathComponent().appendingPathComponent(".\(target.lastPathComponent).\(UUID().uuidString).tmp")
+        let fileManager = FileManager.default
+        guard fileManager.createFile(atPath: temporary.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            throw CoordinatorConfigurationError.writeFailed("could not create a private temporary file")
+        }
+        defer { try? fileManager.removeItem(at: temporary) }
+        do {
+            let handle = try FileHandle(forWritingTo: temporary)
+            try handle.write(contentsOf: data)
+            try handle.synchronize()
+            try handle.close()
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+            guard rename(temporary.path, target.path) == 0 else {
+                throw CoordinatorConfigurationError.writeFailed(String(cString: strerror(errno)))
+            }
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+            let descriptor = open(target.deletingLastPathComponent().path, O_RDONLY)
+            if descriptor >= 0 {
+                _ = fsync(descriptor)
+                close(descriptor)
+            }
+        } catch let error as CoordinatorConfigurationError {
+            throw error
+        } catch {
+            throw CoordinatorConfigurationError.writeFailed(error.localizedDescription)
+        }
+    }
+}
+
+enum ResourceKind: String, Codable, Hashable, Sendable {
+    case server
+    case docker
+    case database
+    case lease
+    case project
+}
+
+struct ResourceIdentity: Codable, Hashable, Sendable, Identifiable, Comparable {
+    let origin: CoordinatorOrigin
+    let kind: ResourceKind
+    let nativeID: String
+
+    var id: String { rawValue }
+    var rawValue: String { "\(origin.id)|\(kind.rawValue)|\(nativeID)" }
+
+    static func < (lhs: ResourceIdentity, rhs: ResourceIdentity) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+enum CoordinatorSourcePhase: String, Codable, Hashable, Sendable {
+    case loading
+    case loaded
+    case failed
+    case stale
+}
+
+struct CoordinatorSourceState: Codable, Hashable, Sendable, Identifiable {
+    var id: String { origin.id }
+    let origin: CoordinatorOrigin
+    var phase: CoordinatorSourcePhase
+    var checkedAt: Date
+    var resourceCount: Int
+    var error: String?
+
+    init(
+        origin: CoordinatorOrigin,
+        phase: CoordinatorSourcePhase,
+        checkedAt: Date,
+        resourceCount: Int = 0,
+        error: String? = nil
+    ) {
+        self.origin = origin
+        self.phase = phase
+        self.checkedAt = checkedAt
+        self.resourceCount = resourceCount
+        self.error = error
+    }
+}
+
+enum CoordinatorCapability: String, Codable, Hashable, Sendable, CaseIterable {
+    case coordinator
+    case docker
+    case database
+
+    var displayName: String {
+        switch self {
+        case .coordinator: "Coordinator"
+        case .docker: "Docker"
+        case .database: "Database"
+        }
+    }
+}
+
+enum CoordinatorCapabilityPhase: String, Codable, Hashable, Sendable {
+    case loading
+    case available
+    case unavailable
+}
+
+struct CoordinatorCapabilityState: Codable, Hashable, Sendable, Identifiable {
+    var id: String { "\(origin.id)|\(capability.rawValue)" }
+    let origin: CoordinatorOrigin
+    let capability: CoordinatorCapability
+    var phase: CoordinatorCapabilityPhase
+    var checkedAt: Date
+    var error: String?
+}
+
+enum HealthLevel: Int, Codable, Hashable, Sendable, Comparable {
+    case nominal = 0
+    case busy = 1
+    case degraded = 2
+    case unhealthy = 3
+    case unavailable = 4
+
+    static func < (lhs: HealthLevel, rhs: HealthLevel) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+struct ResourceHealthSignal: Codable, Hashable, Sendable, Identifiable {
+    var id: String { identity.rawValue }
+    let identity: ResourceIdentity
+    let level: HealthLevel
+    let reason: String
+}
+
+struct HealthSummary: Codable, Hashable, Sendable {
+    let level: HealthLevel
+    let isComplete: Bool
+    let loadedSourceCount: Int
+    let failedSourceCount: Int
+    let staleSourceCount: Int
+    let unhealthyResourceCount: Int
+    let failedActionCount: Int
+    let runningActionCount: Int
+    let generatedAt: Date
+
+    static func reduce(
+        sources: [CoordinatorSourceState],
+        resourceSignals: [ResourceHealthSignal],
+        actions: [RetainedActionResult],
+        now: Date
+    ) -> HealthSummary {
+        let loaded = sources.filter { $0.phase == .loaded }.count
+        let failed = sources.filter { $0.phase == .failed }.count
+        let stale = sources.filter { $0.phase == .stale }.count
+        let staleWithEvidence = sources.filter { $0.phase == .stale && $0.resourceCount > 0 }.count
+        let usableSources = loaded + staleWithEvidence
+        let unhealthyResources = resourceSignals.filter { $0.level >= .unhealthy }.count
+        let failedActions = actions.filter { $0.phase == .failed || $0.phase == .timedOut }.count
+        let runningActions = actions.filter { $0.phase == .queued || $0.phase == .running }.count
+        let complete = !sources.isEmpty && loaded == sources.count
+
+        let level: HealthLevel
+        if sources.isEmpty || usableSources == 0 {
+            level = .unavailable
+        } else if unhealthyResources > 0 || failedActions > 0 {
+            level = .unhealthy
+        } else if failed > 0 || stale > 0 || !complete {
+            level = .degraded
+        } else if runningActions > 0 {
+            level = .busy
+        } else {
+            level = .nominal
+        }
+        return HealthSummary(
+            level: level,
+            isComplete: complete,
+            loadedSourceCount: loaded,
+            failedSourceCount: failed,
+            staleSourceCount: stale,
+            unhealthyResourceCount: unhealthyResources,
+            failedActionCount: failedActions,
+            runningActionCount: runningActions,
+            generatedAt: now
+        )
+    }
+}
+
+enum OpsIssueKind: String, Codable, Hashable, Sendable {
+    case inventory
+    case action
+    case configuration
+}
+
+struct OpsIssue: Codable, Hashable, Sendable, Identifiable {
+    let id: UUID
+    let kind: OpsIssueKind
+    let title: String
+    let summary: String
+    let details: String
+    let createdAt: Date
+    let relatedActionID: UUID?
+
+    init(
+        id: UUID = UUID(),
+        kind: OpsIssueKind,
+        title: String,
+        summary: String,
+        details: String,
+        createdAt: Date,
+        relatedActionID: UUID? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.summary = summary
+        self.details = details
+        self.createdAt = createdAt
+        self.relatedActionID = relatedActionID
+    }
+}
+
+struct OpsPresentationSnapshot: Codable, Hashable, Sendable {
+    let health: HealthSummary
+    let level: HealthLevel
+    let statusTitle: String
+    let statusMessage: String
+    let inventoryIssue: OpsIssue?
+    let actionIssue: OpsIssue?
+    let sources: [CoordinatorSourceState]
+    let capabilities: [CoordinatorCapabilityState]
+    let unavailableCapabilityCount: Int
+
+    static func reduce(
+        health: HealthSummary,
+        sources: [CoordinatorSourceState],
+        inventoryIssue: OpsIssue?,
+        actionIssue: OpsIssue?,
+        capabilities: [CoordinatorCapabilityState] = []
+    ) -> OpsPresentationSnapshot {
+        var level = health.level
+        let unavailableCapabilityCount = capabilities.filter { $0.phase == .unavailable }.count
+        if unavailableCapabilityCount > 0 {
+            level = max(level, sources.isEmpty ? .unavailable : .degraded)
+        }
+        if inventoryIssue != nil {
+            level = max(level, sources.isEmpty ? .unavailable : .degraded)
+        }
+        if actionIssue != nil {
+            level = max(level, .unhealthy)
+        }
+        let statusTitle: String
+        switch level {
+        case .nominal: statusTitle = "All systems nominal"
+        case .busy: statusTitle = "Action in progress"
+        case .degraded:
+            statusTitle = unavailableCapabilityCount > 0 ? "Capabilities degraded" : "Inventory incomplete"
+        case .unhealthy: statusTitle = "Action or resource requires attention"
+        case .unavailable: statusTitle = "Inventory unavailable"
+        }
+        let statusMessage = inventoryIssue?.summary
+            ?? actionIssue?.summary
+            ?? statusTitle
+        return OpsPresentationSnapshot(
+            health: health,
+            level: level,
+            statusTitle: statusTitle,
+            statusMessage: statusMessage,
+            inventoryIssue: inventoryIssue,
+            actionIssue: actionIssue,
+            sources: sources.sorted { $0.origin.id < $1.origin.id },
+            capabilities: capabilities.sorted { $0.id < $1.id },
+            unavailableCapabilityCount: unavailableCapabilityCount
+        )
+    }
+}
+
+enum MutationBlockKind: String, Codable, Hashable, Sendable {
+    case unknownSource
+    case loadingSource
+    case staleSource
+    case failedSource
+    case unknownCapability
+    case unavailableCapability
+    case duplicateAction
+    case staleResource
+    case invalidResource
+    case confirmationRequired
+    case batchLimit
+}
+
+struct MutationAvailability: Codable, Hashable, Sendable {
+    let isAllowed: Bool
+    let blockKind: MutationBlockKind?
+    let message: String?
+
+    static let available = MutationAvailability(isAllowed: true, blockKind: nil, message: nil)
+
+    static func blocked(_ kind: MutationBlockKind, _ message: String) -> MutationAvailability {
+        MutationAvailability(isAllowed: false, blockKind: kind, message: message)
+    }
+}
+
+enum ActionKind: String, Codable, Hashable, Sendable {
+    case refreshInventory
+    case startServer
+    case stopServer
+    case restartServer
+    case serverLogs
+    case startDocker
+    case stopDocker
+    case restartDocker
+    case dockerLogs
+    case leasePort
+    case releasePort
+    case projectStatus
+    case projectStart
+    case projectStop
+    case projectRestart
+    case backupDatabase
+    case verifyBackup
+    case restoreDatabase
+}
+
+enum ActionPhase: String, Codable, Hashable, Sendable {
+    case queued
+    case running
+    case succeeded
+    case failed
+    case timedOut
+    case cancelled
+}
+
+struct ActionRequest: Codable, Hashable, Sendable, Identifiable {
+    let id: UUID
+    let kind: ActionKind
+    let title: String
+    let origin: CoordinatorOrigin?
+    let resource: ResourceIdentity?
+    let leaseID: String?
+    let projectPath: String?
+
+    init(
+        id: UUID = UUID(),
+        kind: ActionKind,
+        title: String,
+        origin: CoordinatorOrigin? = nil,
+        resource: ResourceIdentity? = nil,
+        leaseID: String? = nil,
+        projectPath: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.origin = origin ?? resource?.origin
+        self.resource = resource
+        self.leaseID = leaseID
+        self.projectPath = projectPath
+    }
+}
+
+struct RetainedActionResult: Codable, Hashable, Sendable, Identifiable {
+    var id: UUID { request.id }
+    let request: ActionRequest
+    var phase: ActionPhase
+    let queuedAt: Date
+    var startedAt: Date?
+    var finishedAt: Date?
+    var exitStatus: Int32?
+    var stdout: String
+    var stderr: String
+    var failure: String?
+    var coordinatorOperationID: String?
+    var outputTruncated: Bool
+
+    init(
+        request: ActionRequest,
+        phase: ActionPhase,
+        queuedAt: Date,
+        startedAt: Date? = nil,
+        finishedAt: Date? = nil,
+        exitStatus: Int32? = nil,
+        stdout: String = "",
+        stderr: String = "",
+        failure: String? = nil,
+        coordinatorOperationID: String? = nil,
+        outputTruncated: Bool = false
+    ) {
+        self.request = request
+        self.phase = phase
+        self.queuedAt = queuedAt
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+        self.exitStatus = exitStatus
+        self.stdout = stdout
+        self.stderr = stderr
+        self.failure = failure
+        self.coordinatorOperationID = coordinatorOperationID
+        self.outputTruncated = outputTruncated
+    }
+}
+
+enum LogEvidenceState: String, Codable, Hashable, Sendable {
+    case loading
+    case available
+    case empty
+    case failed
+    case timedOut
+    case cancelled
+    case unavailable
+}
+
+struct RetainedLogEvidence: Codable, Hashable, Sendable, Identifiable {
+    var id: String { resource.rawValue }
+    let resource: ResourceIdentity
+    let actionID: UUID
+    let source: CoordinatorOrigin
+    let requestedAt: Date
+    var completedAt: Date?
+    var state: LogEvidenceState
+    var displayText: String
+    var stdout: String
+    var stderr: String
+    var exitStatus: Int32?
+    var outputTruncated: Bool
+}
+
+struct LeaseCommandPayload: Decodable, Hashable, Sendable {
+    let id: String
+    let port: Int
+    let agent: String?
+    let project: String?
+    let purpose: String?
+    let status: String?
+    let expiresAtISO: String?
+    let serverID: String?
+    let pendingOperationID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, port, agent, project, purpose, status
+        case expiresAtISO = "expires_at_iso"
+        case serverID = "server_id"
+        case pendingOperationID = "pending_operation_id"
+    }
+}
+
+enum LeaseLifecyclePhase: String, Codable, Hashable, Sendable {
+    case active
+    case released
+    case expired
+    case failed
+    case unavailable
+}
+
+struct LeaseActionResult: Codable, Hashable, Sendable, Identifiable {
+    var id: String { identity.rawValue }
+    var identity: ResourceIdentity
+    let leaseID: String
+    let port: Int
+    var agent: String?
+    let project: String?
+    var purpose: String?
+    var status: String?
+    let expiresAtISO: String?
+    var serverID: String?
+    var pendingOperationID: String?
+    var phase: LeaseLifecyclePhase
+
+    init(origin: CoordinatorOrigin, payload: LeaseCommandPayload, actingAgent: String? = nil) {
+        identity = ResourceIdentity(origin: origin, kind: .lease, nativeID: payload.id)
+        leaseID = payload.id
+        port = payload.port
+        agent = payload.agent ?? actingAgent
+        project = payload.project
+        purpose = payload.purpose
+        status = payload.status
+        expiresAtISO = payload.expiresAtISO
+        serverID = payload.serverID
+        pendingOperationID = payload.pendingOperationID
+        phase = LeaseActionResult.phase(
+            status: payload.status,
+            expiresAtISO: payload.expiresAtISO,
+            serverID: payload.serverID,
+            pendingOperationID: payload.pendingOperationID,
+            now: Date()
+        )
+    }
+
+    init(origin: CoordinatorOrigin, lease: PortLease, now: Date) {
+        let nativeID = lease.coordinatorID ?? lease.id
+        identity = ResourceIdentity(origin: origin, kind: .lease, nativeID: nativeID)
+        leaseID = nativeID
+        port = lease.port
+        agent = lease.agent
+        project = lease.project
+        purpose = lease.purpose
+        status = lease.status
+        expiresAtISO = lease.expiresAtISO
+        serverID = lease.serverID
+        pendingOperationID = lease.pendingOperationID
+        phase = LeaseActionResult.phase(
+            status: lease.status,
+            expiresAtISO: lease.expiresAtISO,
+            serverID: lease.serverID,
+            pendingOperationID: lease.pendingOperationID,
+            now: now
+        )
+    }
+
+    mutating func reconcile(
+        with lease: PortLease?,
+        sourcePhase: CoordinatorSourcePhase?,
+        isAuthoritativelyAbsent: Bool,
+        now: Date
+    ) {
+        if phase == .released || phase == .expired || phase == .failed {
+            return
+        }
+        guard sourcePhase == .loaded else {
+            phase = .unavailable
+            return
+        }
+        if let lease {
+            if let currentOrigin = lease.origin { rebind(origin: currentOrigin) }
+            agent = lease.agent
+            purpose = lease.purpose
+            status = lease.status
+            serverID = lease.serverID
+            pendingOperationID = lease.pendingOperationID
+            phase = Self.phase(
+                status: lease.status,
+                expiresAtISO: lease.expiresAtISO ?? expiresAtISO,
+                serverID: lease.serverID,
+                pendingOperationID: lease.pendingOperationID,
+                now: now
+            )
+        } else if isAuthoritativelyAbsent {
+            phase = .released
+            status = "released"
+        } else {
+            phase = Self.phase(
+                status: status,
+                expiresAtISO: expiresAtISO,
+                serverID: serverID,
+                pendingOperationID: pendingOperationID,
+                now: now
+            )
+        }
+    }
+
+    mutating func rebind(origin: CoordinatorOrigin) {
+        identity = ResourceIdentity(origin: origin, kind: .lease, nativeID: leaseID)
+    }
+
+    var canStartServer: Bool {
+        phase == .active
+            && serverID == nil
+            && pendingOperationID == nil
+            && project?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            && agent?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            && purpose == "manual"
+    }
+
+    var canReleaseDirectly: Bool {
+        phase == .active
+            && serverID == nil
+            && pendingOperationID == nil
+            && project?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    var managementStatus: String {
+        guard phase == .active else { return phase.rawValue }
+        if pendingOperationID != nil { return "attaching" }
+        if serverID != nil { return "attached" }
+        return "active"
+    }
+
+    static func phase(
+        status: String?,
+        expiresAtISO: String?,
+        serverID: String?,
+        pendingOperationID: String?,
+        now: Date
+    ) -> LeaseLifecyclePhase {
+        let normalized = (status ?? "active").lowercased()
+        if normalized.contains("release") { return .released }
+        if normalized.contains("expir") { return .expired }
+        if normalized.contains("fail") { return .failed }
+        if serverID != nil || pendingOperationID != nil { return .active }
+        if let expiry = expiresAtISO.flatMap(parseISOTimestamp), expiry <= now { return .expired }
+        return .active
+    }
+}
+
+struct DatabaseIdentity: Codable, Hashable, Sendable, Identifiable {
+    var id: String { "\(origin.id)|database|\(containerID ?? "unknown-container")|\(container)|\(database)" }
+    let origin: CoordinatorOrigin
+    let container: String
+    let database: String
+    let containerID: String?
+
+    init(origin: CoordinatorOrigin, container: String, database: String, containerID: String? = nil) {
+        self.origin = origin
+        self.container = container
+        self.database = database
+        self.containerID = containerID
+    }
+
+    func isSameImmutableDatabase(as other: DatabaseIdentity) -> Bool {
+        guard origin.id == other.origin.id,
+              container == other.container,
+              database == other.database,
+              let leftID = containerID,
+              let rightID = other.containerID,
+              !leftID.isEmpty,
+              !rightID.isEmpty
+        else { return false }
+        return leftID == rightID || leftID.hasPrefix(rightID) || rightID.hasPrefix(leftID)
+    }
+}
+
+enum ChecksumState: String, Codable, Hashable, Sendable {
+    case unknown
+    case verified
+    case failed
+}
+
+enum RestoreTestState: String, Codable, Hashable, Sendable {
+    case notRun
+    case passed
+    case failed
+}
+
+struct BackupRecord: Codable, Hashable, Sendable, Identifiable {
+    var id: String { "\(identity.id)|\(path)" }
+    let identity: DatabaseIdentity
+    let path: String
+    let createdAt: Date
+    let checksum: ChecksumState
+    let restoreTest: RestoreTestState
+    var format: String?
+    var scope: String?
+    var compatibilityError: String?
+
+    var isStronglyVerified: Bool {
+        checksum == .verified && restoreTest == .passed && compatibilityError == nil
+    }
+}
+
+struct BackupManifestV2: Decodable, Sendable {
+    struct Source: Decodable, Sendable {
+        struct Container: Decodable, Sendable {
+            let name: String?
+            let id: String?
+            let image: String?
+        }
+        struct Postgres: Decodable, Sendable {
+            let database: String?
+            let scope: String?
+        }
+        let container: Container?
+        let postgres: Postgres?
+    }
+    struct Verification: Decodable, Sendable {
+        let verifiedAt: String?
+        let mode: String?
+        let scope: String?
+        let sha256: String?
+        let ok: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case mode, scope, sha256, ok
+            case verifiedAt = "verified_at"
+        }
+    }
+
+    let schemaVersion: Int?
+    let createdAt: String?
+    let scope: String?
+    let format: String?
+    let sha256: String?
+    let source: Source?
+    let verification: Verification?
+    let container: String?
+    let database: String?
+
+    enum CodingKeys: String, CodingKey {
+        case scope, format, sha256, source, verification, container, database
+        case schemaVersion = "schema_version"
+        case createdAt = "created_at"
+    }
+}
+
+extension DatabaseBackup {
+    func verifiedRecord() -> BackupRecord? {
+        guard let origin, let manifest, let data = FileManager.default.contents(atPath: manifest),
+              let descriptor = try? JSONDecoder().decode(BackupManifestV2.self, from: data)
+        else { return nil }
+        guard let containerName = descriptor.source?.container?.name ?? descriptor.container,
+              let databaseName = descriptor.source?.postgres?.database ?? descriptor.database,
+              !containerName.isEmpty,
+              !databaseName.isEmpty
+        else { return nil }
+
+        let verification = descriptor.verification
+        let currentChecksum = fileSHA256(path)
+        let checksumMatches = verification?.ok == true
+            && verification?.sha256 != nil
+            && verification?.sha256 == descriptor.sha256
+            && currentChecksum == descriptor.sha256
+        let checksumState: ChecksumState
+        if let expected = descriptor.sha256, let currentChecksum, currentChecksum != expected {
+            checksumState = .failed
+        } else if checksumMatches {
+            checksumState = .verified
+        } else if verification?.ok == false {
+            checksumState = .failed
+        } else {
+            checksumState = .unknown
+        }
+        let restoreState: RestoreTestState
+        if verification?.ok == false {
+            restoreState = .failed
+        } else if verification?.mode == "test_restore" && verification?.ok == true {
+            restoreState = .passed
+        } else {
+            restoreState = .notRun
+        }
+        let created = descriptor.createdAt.flatMap(parseISOTimestamp)
+            ?? modifiedAt.flatMap(parseISOTimestamp)
+            ?? Date.distantPast
+        let manifestContainerID = descriptor.source?.container?.id
+        let compatibilityError: String?
+        if descriptor.schemaVersion != 2 {
+            compatibilityError = "unsupported or missing manifest schema"
+        } else if manifestContainerID?.isEmpty != false {
+            compatibilityError = "immutable source container id is unavailable"
+        } else {
+            compatibilityError = nil
+        }
+        return BackupRecord(
+            identity: DatabaseIdentity(origin: origin, container: containerName, database: databaseName, containerID: manifestContainerID),
+            path: path,
+            createdAt: created,
+            checksum: checksumState,
+            restoreTest: restoreState,
+            format: descriptor.format ?? format,
+            scope: descriptor.scope,
+            compatibilityError: compatibilityError
+        )
+    }
+}
+
+func fileSHA256(_ path: String) -> String? {
+    guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    do {
+        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+    } catch {
+        return nil
+    }
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+func newestVerifiedBackup(for identity: DatabaseIdentity, in records: [BackupRecord]) -> BackupRecord? {
+    records
+        .filter { $0.identity.isSameImmutableDatabase(as: identity) && $0.isStronglyVerified }
+        .max { $0.createdAt < $1.createdAt }
+}
+
+struct BulkSelection: Codable, Hashable, Sendable {
+    private(set) var selected: [ResourceIdentity] = []
+
+    mutating func select(_ identity: ResourceIdentity) {
+        guard !selected.contains(identity) else { return }
+        selected.append(identity)
+        selected.sort()
+    }
+
+    mutating func deselect(_ identity: ResourceIdentity) {
+        selected.removeAll { $0 == identity }
+    }
+
+    mutating func clear() { selected.removeAll() }
+    func contains(_ identity: ResourceIdentity) -> Bool { selected.contains(identity) }
+}
+
+struct BulkActionResult: Codable, Hashable, Sendable {
+    let selection: BulkSelection
+    let results: [ResourceIdentity: RetainedActionResult]
+
+    var succeededCount: Int { results.values.filter { $0.phase == .succeeded }.count }
+    var failedCount: Int { results.values.filter { $0.phase == .failed || $0.phase == .timedOut }.count }
+}
+
+struct BulkStopPlanItem: Codable, Hashable, Sendable, Identifiable {
+    var id: String { identity.rawValue }
+    let identity: ResourceIdentity
+    let expectedStatus: String
+    let project: String
+    let displayName: String
+    let sourceCheckedAt: Date
+}
+
+struct BulkStopPlan: Codable, Hashable, Sendable, Identifiable {
+    let id: UUID
+    let preparedAt: Date
+    let items: [BulkStopPlanItem]
+    let fingerprint: String
+    let confirmationText: String
+
+    init(id: UUID = UUID(), preparedAt: Date, items: [BulkStopPlanItem]) {
+        self.id = id
+        self.preparedAt = preparedAt
+        self.items = items.sorted { $0.identity < $1.identity }
+        self.fingerprint = bulkStopFingerprint(items: self.items)
+        self.confirmationText = "STOP \(items.count) SELECTED"
+    }
+
+    var selection: BulkSelection {
+        var result = BulkSelection()
+        for item in items { result.select(item.identity) }
+        return result
+    }
+}
+
+func bulkStopFingerprint(items: [BulkStopPlanItem]) -> String {
+    let material = items.sorted { $0.identity < $1.identity }.map { item in
+        [
+            item.identity.rawValue,
+            item.expectedStatus,
+            item.project,
+            String(item.sourceCheckedAt.timeIntervalSince1970),
+        ].joined(separator: "\u{1f}")
+    }.joined(separator: "\u{1e}")
+    return SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
+}
+
+struct RestoreVerificationPayload: Decodable, Hashable, Sendable {
+    let testRestore: Bool?
+    let scratchCreated: Bool?
+    let restoreReturncode: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case testRestore = "test_restore"
+        case scratchCreated = "scratch_created"
+        case restoreReturncode = "restore_returncode"
+    }
+
+    var provesStrongVerification: Bool {
+        testRestore == true && scratchCreated == true && restoreReturncode == 0
+    }
+}
+
+struct RestoreSafetyBackupPayload: Decodable, Hashable, Sendable {
+    let backup: String?
+    let manifest: String?
+    let sha256: String?
+}
+
+struct ContainerIdentityPreflightPayload: Codable, Hashable, Sendable {
+    let phase: String?
+    let expectedID: String?
+    let actualID: String?
+    let match: String?
+    let executionTarget: String?
+
+    enum CodingKeys: String, CodingKey {
+        case phase, match
+        case expectedID = "expected_id"
+        case actualID = "actual_id"
+        case executionTarget = "execution_target"
+    }
+
+    func proves(expectedContainerID: String) -> Bool {
+        let expected = expectedContainerID.lowercased()
+        guard executionTarget == "immutable_full_id",
+              let actual = actualID?.lowercased(), actual.count == 64,
+              let evidenceExpected = expectedID?.lowercased()
+        else { return false }
+        if expected.count == 64 {
+            return actual == expected && evidenceExpected == expected && match == "exact_full"
+        }
+        if expected.count == 12 {
+            guard actual.hasPrefix(expected) else { return false }
+            if evidenceExpected == expected {
+                return match == "unambiguous_standard_short"
+            }
+            return evidenceExpected == actual && match == "exact_full"
+        }
+        return false
+    }
+}
+
+struct RestoreCommandPayload: Decodable, Hashable, Sendable {
+    let restored: String?
+    let container: String?
+    let database: String?
+    let transactional: Bool?
+    let incomingVerification: RestoreVerificationPayload?
+    let safetyBackup: RestoreSafetyBackupPayload?
+    let safetyVerification: RestoreVerificationPayload?
+    let restoredCatalogSignature: [String: Int]?
+    let containerIdentityPreflights: [ContainerIdentityPreflightPayload]?
+
+    enum CodingKeys: String, CodingKey {
+        case restored, container, database, transactional
+        case incomingVerification = "incoming_verification"
+        case safetyBackup = "safety_backup"
+        case safetyVerification = "safety_verification"
+        case restoredCatalogSignature = "restored_catalog_signature"
+        case containerIdentityPreflights = "container_identity_preflights"
+    }
+}
+
+struct DatabaseRestoreEvidence: Codable, Hashable, Sendable, Identifiable {
+    var id: String { target.id }
+    let target: DatabaseIdentity
+    let restoredBackupPath: String
+    let safetyBackupPath: String
+    let safetyBackupManifest: String?
+    let safetyBackupSHA256: String?
+    let incomingVerificationPassed: Bool
+    let safetyVerificationPassed: Bool
+    let transactional: Bool
+    let restoredCatalogSignature: [String: Int]
+    let containerIdentityPreflights: [ContainerIdentityPreflightPayload]
+    let actionID: UUID
+    let completedAt: Date
+}
+
+enum UptimeValue: Hashable, Sendable {
+    case measured(TimeInterval)
+    case unavailable(String)
+
+    init(startedAt: Date?, now: Date) {
+        guard let startedAt else {
+            self = .unavailable("start time unavailable")
+            return
+        }
+        self = .measured(max(0, now.timeIntervalSince(startedAt)))
+    }
+}
+
+protocol Clock: Sendable {
+    func now() -> Date
+}
+
+struct SystemClock: Clock {
+    func now() -> Date { Date() }
+}
+
+enum CommandEnvironment {
+    struct PathDirectoryFile: Hashable, Sendable {
+        let name: String
+        let contents: String
+    }
+
+    static func live(
+        inherited: [String: String] = ProcessInfo.processInfo.environment,
+        fileManager: FileManager = .default
+    ) -> [String: String] {
+        let systemPaths = try? String(contentsOfFile: "/etc/paths", encoding: .utf8)
+        let directoryNames = (try? fileManager.contentsOfDirectory(atPath: "/etc/paths.d")) ?? []
+        let directoryFiles = directoryNames.sorted().compactMap { name -> PathDirectoryFile? in
+            let path = URL(fileURLWithPath: "/etc/paths.d", isDirectory: true)
+                .appendingPathComponent(name, isDirectory: false)
+                .path
+            guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+            return PathDirectoryFile(name: name, contents: contents)
+        }
+        return resolved(
+            inherited: inherited,
+            systemPathsFileContents: systemPaths,
+            pathDirectoryFiles: directoryFiles
+        )
+    }
+
+    static func resolved(
+        inherited: [String: String],
+        systemPathsFileContents: String?,
+        pathDirectoryFiles: [PathDirectoryFile]
+    ) -> [String: String] {
+        var environment = inherited
+        let inheritedEntries = pathEntries(inherited["PATH"] ?? "")
+        let systemEntries = pathEntries(systemPathsFileContents ?? "", separators: .newlines)
+        let directoryEntries = pathDirectoryFiles
+            .sorted { $0.name < $1.name }
+            .flatMap { pathEntries($0.contents, separators: .newlines) }
+        environment["PATH"] = deduplicated(inheritedEntries + systemEntries + directoryEntries)
+            .joined(separator: ":")
+        return environment
+    }
+
+    static func merging(
+        base: [String: String],
+        overrides: [String: String]
+    ) -> [String: String] {
+        var environment = base.merging(overrides) { _, override in override }
+        let overrideEntries = pathEntries(overrides["PATH"] ?? "")
+        let baseEntries = pathEntries(base["PATH"] ?? "")
+        environment["PATH"] = deduplicated(overrideEntries + baseEntries).joined(separator: ":")
+        return environment
+    }
+
+    private static func pathEntries(
+        _ value: String,
+        separators: CharacterSet = CharacterSet(charactersIn: ":")
+    ) -> [String] {
+        value.components(separatedBy: separators).compactMap { raw in
+            let candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard candidate.hasPrefix("/") else { return nil }
+            return URL(fileURLWithPath: candidate).standardizedFileURL.path
+        }
+    }
+
+    private static func deduplicated(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { seen.insert($0).inserted }
+    }
+}
+
+struct CommandRequest: Hashable, Sendable {
+    let executable: String
+    let arguments: [String]
+    let environment: [String: String]
+    let currentDirectory: String?
+    let timeout: TimeInterval
+    let maxOutputBytes: Int
+
+    init(
+        executable: String,
+        arguments: [String],
+        environment: [String: String] = [:],
+        currentDirectory: String? = nil,
+        timeout: TimeInterval = 120,
+        maxOutputBytes: Int = 1_048_576
+    ) {
+        self.executable = executable
+        self.arguments = arguments
+        self.environment = environment
+        self.currentDirectory = currentDirectory
+        self.timeout = max(0.1, timeout)
+        self.maxOutputBytes = max(1, maxOutputBytes)
+    }
+}
+
+struct CommandExecution: Hashable, Sendable {
+    let stdout: String
+    let stderr: String
+    let exitStatus: Int32
+    let timedOut: Bool
+    let cancelled: Bool
+    let outputTruncated: Bool
+
+    init(
+        stdout: String,
+        stderr: String,
+        exitStatus: Int32,
+        timedOut: Bool = false,
+        cancelled: Bool = false,
+        outputTruncated: Bool = false
+    ) {
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exitStatus = exitStatus
+        self.timedOut = timedOut
+        self.cancelled = cancelled
+        self.outputTruncated = outputTruncated
+    }
+}
+
+protocol CommandExecuting: Sendable {
+    func execute(_ request: CommandRequest) async throws -> CommandExecution
+}
+
+protocol CoordinatorServing: Sendable {
+    func execute(origin: CoordinatorOrigin, arguments: [String]) async throws -> CommandExecution
+}
+
+protocol CoordinatorOriginDiscovering: Sendable {
+    func origins() -> [CoordinatorOrigin]
+}
+
+struct FileSystemCoordinatorOriginDiscovery: CoordinatorOriginDiscovering, Sendable {
+    let environment: [String: String]
+    let home: String
+
+    init(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        home: String = FileManager.default.homeDirectoryForCurrentUser.path
+    ) {
+        self.environment = environment
+        self.home = home
+    }
+
+    func origins() -> [CoordinatorOrigin] {
+        let fileManager = FileManager.default
+        var candidates: [(String, String)] = []
+        if let configured = environment["CODEX_AGENT_COORDINATOR_HOME"], !configured.isEmpty {
+            candidates.append(("Configured", configured))
+        }
+        candidates.append(("Codex", "\(home)/.codex/agent-coordinator"))
+        candidates.append(("Claude", "\(home)/.claude/agent-coordinator"))
+        let parallRoot = "\(home)/Library/Application Support/Parall"
+        if let entries = try? fileManager.contentsOfDirectory(atPath: parallRoot) {
+            candidates.append(contentsOf: entries.sorted().map { ("Parall \($0)", "\(parallRoot)/\($0)/.codex/agent-coordinator") })
+        }
+        var seen = Set<String>()
+        return candidates.compactMap { label, path in
+            let resolved = URL(fileURLWithPath: path).standardizedFileURL.path
+            guard seen.insert(resolved).inserted else { return nil }
+            var isDirectory: ObjCBool = false
+            let exists = fileManager.fileExists(atPath: resolved, isDirectory: &isDirectory)
+                || fileManager.fileExists(atPath: "\(resolved)/state.json")
+            return exists ? CoordinatorOrigin(label: label, home: resolved) : nil
+        }
+    }
+}
+
+protocol BackupServing: Sendable {
+    func execute(origin: CoordinatorOrigin?, arguments: [String]) async throws -> CommandExecution
+}
+
+struct DiscoveredDatabase: Codable, Hashable, Sendable, Identifiable {
+    var id: String { identity.id }
+    let identity: DatabaseIdentity
+    let sizeBytes: Int64
+}
+
+protocol DatabaseDiscovering: Sendable {
+    func discover(origin: CoordinatorOrigin, container: String, containerID: String?) async throws -> [DiscoveredDatabase]
+}
+
+struct DockerPostgresDiscoveryService: DatabaseDiscovering, Sendable {
+    let executor: any CommandExecuting
+
+    func discover(origin: CoordinatorOrigin, container: String, containerID: String?) async throws -> [DiscoveredDatabase] {
+        let environment = ["CODEX_AGENT_COORDINATOR_HOME": origin.home]
+        let identity = try await executor.execute(
+            CommandRequest(
+                executable: "/usr/bin/env",
+                arguments: [
+                    "docker", "exec", container, "sh", "-c",
+                    "printf '%s\\n%s\\n' \"${POSTGRES_USER:-postgres}\" \"${POSTGRES_DB:-postgres}\"",
+                ],
+                environment: environment
+            )
+        )
+        guard identity.exitStatus == 0 else {
+            throw RuntimeError(identity.stderr.isEmpty ? identity.stdout : identity.stderr)
+        }
+        let identityLines = identity.stdout.split(omittingEmptySubsequences: false, whereSeparator: { $0.isNewline })
+        let postgresUser = identityLines.first.map(String.init).flatMap { $0.isEmpty ? nil : $0 } ?? "postgres"
+        let connectionDatabase = identityLines.dropFirst().first.map(String.init).flatMap { $0.isEmpty ? nil : $0 } ?? "postgres"
+        let query = "SELECT datname, pg_database_size(datname) FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname"
+        let catalog = try await executor.execute(
+            CommandRequest(
+                executable: "/usr/bin/env",
+                arguments: [
+                    "docker", "exec", container,
+                    "psql", "-U", postgresUser, "-d", connectionDatabase,
+                    "-At", "-F", "\t", "-c", query,
+                ],
+                environment: environment
+            )
+        )
+        guard catalog.exitStatus == 0 else {
+            throw RuntimeError(catalog.stderr.isEmpty ? catalog.stdout : catalog.stderr)
+        }
+        return try catalog.stdout.split(whereSeparator: { $0.isNewline }).map { line in
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count == 2, let size = Int64(fields[1]) else {
+                throw RuntimeError("Unexpected PostgreSQL catalog row for \(container): \(line)")
+            }
+            let database = String(fields[0])
+            guard !database.isEmpty else { throw RuntimeError("PostgreSQL catalog returned an empty database name") }
+            return DiscoveredDatabase(
+                identity: DatabaseIdentity(origin: origin, container: container, database: database, containerID: containerID),
+                sizeBytes: size
+            )
+        }
+    }
+}
+
+struct PythonCoordinatorService: CoordinatorServing, Sendable {
+    let executor: any CommandExecuting
+    let scriptPath: String
+
+    func execute(origin: CoordinatorOrigin, arguments: [String]) async throws -> CommandExecution {
+        try await executor.execute(
+            CommandRequest(
+                executable: "/usr/bin/env",
+                arguments: ["python3", scriptPath] + arguments,
+                environment: ["CODEX_AGENT_COORDINATOR_HOME": origin.home]
+            )
+        )
+    }
+}
+
+struct PythonBackupService: BackupServing, Sendable {
+    let executor: any CommandExecuting
+    let scriptPath: String
+
+    func execute(origin: CoordinatorOrigin?, arguments: [String]) async throws -> CommandExecution {
+        let environment = origin.map { ["CODEX_AGENT_COORDINATOR_HOME": $0.home] } ?? [:]
+        return try await executor.execute(
+            CommandRequest(executable: "/usr/bin/env", arguments: ["python3", scriptPath] + arguments, environment: environment)
+        )
+    }
+}
+
+enum SkillScript: Sendable {
+    case coordinator
+    case postgresBackup
+
+    var relativePath: String {
+        switch self {
+        case .coordinator:
+            return "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
+        case .postgresBackup:
+            return "skills/postgres-docker-backup/scripts/postgres_docker_backup.py"
+        }
+    }
+}
+
+protocol SkillLocating: Sendable {
+    func scriptPath(for script: SkillScript) throws -> String
+}
+
+struct PortableSkillLocator: SkillLocating, Sendable {
+    let environment: [String: String]
+    let home: String
+    let currentDirectory: String
+    let bundleResourceRoot: String?
+
+    init(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        home: String = FileManager.default.homeDirectoryForCurrentUser.path,
+        currentDirectory: String = FileManager.default.currentDirectoryPath,
+        bundleResourceRoot: String? = Bundle.main.resourceURL?.path
+    ) {
+        self.environment = environment
+        self.home = home
+        self.currentDirectory = currentDirectory
+        self.bundleResourceRoot = bundleResourceRoot
+    }
+
+    func scriptPath(for script: SkillScript) throws -> String {
+        let fileManager = FileManager.default
+        var roots: [String] = []
+
+        // A caller-provided canonical checkout is the only override above the
+        // packaged helpers. A launchable .app must otherwise use the scripts
+        // whose hashes and signature were verified during packaging before it
+        // considers mutable runtime installations.
+        if let root = environment["DEVCOORDINATOR_ROOT"], !root.isEmpty { roots.append(root) }
+        if let bundleResourceRoot, !bundleResourceRoot.isEmpty { roots.append(bundleResourceRoot) }
+
+        // Bare SwiftPM/development launches can find the repository checkout
+        // by walking up from their current directory.
+        var cursor = URL(fileURLWithPath: currentDirectory).standardizedFileURL
+        while cursor.path != "/" {
+            roots.append(cursor.path)
+            cursor.deleteLastPathComponent()
+        }
+
+        // Installed runtime homes are compatibility fallbacks. They are
+        // intentionally below both the packaged resources and a checkout.
+        if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty { roots.append(codexHome) }
+        if let claudeHome = environment["CLAUDE_CONFIG_DIR"], !claudeHome.isEmpty { roots.append(claudeHome) }
+        roots.append(contentsOf: ["\(home)/.codex", "\(home)/.claude"])
+
+        let parallRoot = "\(home)/Library/Application Support/Parall"
+        if let entries = try? fileManager.contentsOfDirectory(atPath: parallRoot) {
+            roots.append(contentsOf: entries.sorted().map { "\(parallRoot)/\($0)/.codex" })
+        }
+
+        var tried: [String] = []
+        var seen = Set<String>()
+        for root in roots {
+            let normalizedRoot = URL(fileURLWithPath: root).standardizedFileURL.path
+            guard seen.insert(normalizedRoot).inserted else { continue }
+            let candidate = URL(fileURLWithPath: normalizedRoot).appendingPathComponent(script.relativePath).path
+            tried.append(candidate)
+            if fileManager.isExecutableFile(atPath: candidate) || fileManager.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+        throw RuntimeError("Unable to locate \(script.relativePath). Checked:\n\(tried.joined(separator: "\n"))")
+    }
 }

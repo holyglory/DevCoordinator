@@ -19,7 +19,9 @@ third-party dependencies) that:
   (grouped by repo), routes, Docker containers, port leases + permanent pins,
   and history charts, all driven by the
   [codex-dev-coordinator](../../skills/codex-dev-coordinator/SKILL.md) HTTP API
-  on loopback `127.0.0.1:29876` (spawned automatically if not running). The
+  on loopback `127.0.0.1:29876`, authenticated with a private token. Production
+  runs it as the dedicated `dev-coordinator.service`; optional local autostart
+  remains available. The
   console samples coordinator inventory (default every 10s,
   `METRICS_INTERVAL_MS`) into in-memory ring buffers; every running server and
   container row shows CPU %/memory numbers plus a sparkline, and the
@@ -43,7 +45,7 @@ Run the tests (spawns an isolated coordinator + local OIDC issuer; no network,
 no fixed ports):
 
 ```bash
-node --test test/
+node --test test/*.test.mjs
 ```
 
 ## Configuration (`.env`)
@@ -58,7 +60,9 @@ ones:
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth client (setup below). Empty = degraded mode: public routes still proxy, everything auth-gated shows a setup page. |
 | `ALLOWED_EMAILS` | Comma-separated Google accounts allowed to sign in. Everyone else gets a 403 after Google auth. |
 | `SESSION_SECRET` | 64 hex chars (`openssl rand -hex 32`). Rotating it signs everyone out. |
-| `COORDINATOR_URL` | Coordinator API, default `http://127.0.0.1:29876`. The console spawns `api serve` itself when unreachable (`COORDINATOR_AUTOSTART=0` disables). |
+| `COORDINATOR_URL` | Coordinator API, default `http://127.0.0.1:29876`. |
+| `COORDINATOR_TOKEN_FILE` | Private mode-0600 bearer token created by the coordinator and read only by the server-side Console client. |
+| `COORDINATOR_AUTOSTART` | Optional local fallback; production sets `0` and uses `dev-coordinator.service`. |
 | `METRICS_INTERVAL_MS` | CPU/memory sampling cadence for the history charts (default `10000`, floor `2000`). Each sample reads coordinator inventory, which shells out to `docker stats` when Docker is present. |
 
 ## Google OAuth client setup (one-time)
@@ -93,7 +97,7 @@ issues and renews certs while the app keeps port 80. This covers named hosts
 
 ```bash
 sudo apt-get install -y certbot
-sudo certbot certonly --webroot -w /home/holyglory/holyskills/apps/DevOpsConsole/state/acme \
+sudo certbot certonly --webroot -w "$HOME/.local/state/devops-console/acme" \
   -d console.vr.ae -d vr.ae \
   --non-interactive --agree-tos -m ja@vr.ae --cert-name vr.ae
 sudo setfacl -R -m u:holyglory:rX /etc/letsencrypt/live/vr.ae /etc/letsencrypt/archive/vr.ae
@@ -165,16 +169,21 @@ full restart; a same-path renewal only needs a reload.
 ## Deploy (systemd)
 
 ```bash
-sudo cp deploy/devops-console.service /etc/systemd/system/
+sudo install -m 0644 deploy/dev-coordinator.service deploy/devops-console.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now devops-console
-systemctl status devops-console
+sudo systemctl enable --now dev-coordinator.service devops-console.service
+systemctl status dev-coordinator.service devops-console.service
 ```
 
-The unit runs as `holyglory` with `CAP_NET_BIND_SERVICE` only (no root), and
-`ExecReload` sends SIGHUP for cert reloads. On startup the console registers
-itself with the coordinator (`server register`, port 443) so it appears in
-inventory alongside everything it manages.
+Both units run as `holyglory`. The coordinator binds only loopback and owns the
+external coordinator state and private token. The Console requires that unit,
+runs with `CAP_NET_BIND_SERVICE` only (no root), and `ExecReload` sends SIGHUP
+for cert reloads. Put private Console configuration in
+`~/.config/devops-console/console.env` (mode `0600`) and create
+`~/.local/state/devops-console` and `~/.codex/agent-coordinator` with mode
+`0700` before starting the units. On startup the Console registers itself with
+the coordinator (`server register`, port 443) so it appears in inventory
+alongside everything it manages.
 
 ## Exposing a dev server
 
@@ -202,9 +211,9 @@ inventory alongside everything it manages.
 
 ## Security model
 
-- The coordinator API on 29876 is **unauthenticated by design** and must stay
-  loopback-only; the console is the authenticated front door and only ever
-  calls a fixed set of coordinator endpoints.
+- The coordinator API on 29876 is loopback-only and bearer-authenticated. The
+  token stays in a private external file and is never returned to browser
+  JavaScript, logs, URLs, screenshots, or Git.
 - Sessions: HMAC-SHA256-signed cookie, `Domain=.vr.ae`, `HttpOnly`, `Secure`,
   `SameSite=Lax`; allowlist re-checked on every request.
 - OIDC: authorization code + PKCE, `state`/`nonce` enforced, ID-token

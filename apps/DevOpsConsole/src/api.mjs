@@ -1,7 +1,7 @@
 // Console REST API (/api/*). The router only dispatches here for the console
 // host after session validation; this module still re-checks the session and
 // enforces the Origin check on every mutation. Only the fixed endpoint set
-// below ever reaches the (unauthenticated, loopback) coordinator.
+// below reaches the authenticated, loopback-only coordinator.
 
 import { CoordError } from './coordinator.mjs';
 import { PrefsError } from './prefs.mjs';
@@ -413,10 +413,17 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
     sendJson(res, 201, { lease });
   }
 
-  async function handlePortRelease(req, res) {
+  async function handlePortRelease(req, res, session) {
     const body = await readJsonBody(req);
     const leaseId = requireString(body.lease_id, 'lease_id');
-    const lease = await coordinator.releasePort({ lease_id: leaseId });
+    const inventoryData = await coordinator.inventory({ maxAgeMs: 0 });
+    const ownedLease = (inventoryData?.leases || []).find((lease) => lease?.id === leaseId);
+    if (!ownedLease?.project) throw new ApiError(400, 'matching lease not found');
+    const lease = await coordinator.releasePort({
+      lease_id: leaseId,
+      agent: `devops-console:${session.email}`,
+      project: ownedLease.project,
+    });
     sendJson(res, 200, { lease });
   }
 
@@ -512,9 +519,15 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
     if (!DOCKER_ACTIONS.has(body.action)) {
       throw new ApiError(400, "action must be 'start', 'stop' or 'restart'");
     }
+    const inventoryData = await coordinator.inventory({ maxAgeMs: 0 });
+    const container = (inventoryData?.docker?.containers || []).find((item) => item?.name === name);
+    if (!container) throw new ApiError(404, 'container not found');
+    if (!container.project || !['docker_labels', 'coordinator_sidecar'].includes(container.metadata_source)) {
+      throw new ApiError(400, 'container has no verified project ownership; register it before mutation');
+    }
     const result = await coordinator.dockerAction(name, body.action, {
       agent: `devops-console:${session.email}`,
-      project: config.projectRoot,
+      project: container.project,
     });
     sendJson(res, 200, result);
   }
@@ -615,7 +628,7 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
         return await handlePortLease(req, res, session);
       }
       if (method === 'POST' && pathname === '/api/ports/release') {
-        return await handlePortRelease(req, res);
+        return await handlePortRelease(req, res, session);
       }
       if (method === 'POST' && pathname === '/api/ports/unassign') {
         return await handlePortUnassign(req, res, session);

@@ -252,6 +252,7 @@ export async function apiCall(stack, jar, method, apiPath, body, extraHeaders = 
 // ---------------------------------------------------------------------------
 
 async function spawnCoordinator(home, extraEnv = {}) {
+  const tokenFile = path.join(home, 'api-token');
   const proc = spawn(
     'python3',
     [COORDINATOR_SCRIPT, 'api', 'serve', '--host', '127.0.0.1', '--port', '0'],
@@ -314,9 +315,14 @@ async function spawnCoordinator(home, extraEnv = {}) {
 
   const url = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 30_000;
+  let token = '';
   for (;;) {
     try {
-      const res = await fetch(`${url}/v1/ports`, { signal: AbortSignal.timeout(1000) });
+      token = (await fsp.readFile(tokenFile, 'utf8')).trim();
+      const res = await fetch(`${url}/v1/ports`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(1000),
+      });
       await res.arrayBuffer().catch(() => {});
       if (res.status === 200) break;
     } catch {
@@ -330,9 +336,11 @@ async function spawnCoordinator(home, extraEnv = {}) {
   }
 
   async function api(method, apiPath, body, { timeoutMs = 60_000 } = {}) {
+    const headers = { authorization: `Bearer ${token}` };
+    if (body != null) headers['content-type'] = 'application/json';
     const res = await fetch(url + apiPath, {
       method,
-      headers: body != null ? { 'content-type': 'application/json' } : undefined,
+      headers,
       body: body != null ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -352,7 +360,7 @@ async function spawnCoordinator(home, extraEnv = {}) {
     return data;
   }
 
-  return { proc, port, url, home, api };
+  return { proc, port, url, home, tokenFile, api };
 }
 
 async function stopProcess(proc) {
@@ -463,6 +471,7 @@ export async function startStack({ allowedEmails = ['ja@vr.ae'], claims, routes 
         `COORDINATOR_URL=http://127.0.0.1:${coordinator.port}`,
         'COORDINATOR_AUTOSTART=0',
         `CODEX_AGENT_COORDINATOR_HOME=${coordHome}`,
+        `COORDINATOR_TOKEN_FILE=${coordinator.tokenFile}`,
         `STATE_DIR=${stateDir}`,
         'LOG_LEVEL=error',
         '',

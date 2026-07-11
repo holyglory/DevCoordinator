@@ -68,7 +68,7 @@ export function createRouter(deps) {
   // Belt-and-suspenders for security invariant #1: even though routeStore now
   // screens every resolved port against the coordinator API port, the router
   // independently refuses to proxy to it. A route must NEVER hand public
-  // traffic to the unauthenticated, loopback-only coordinator control API.
+  // traffic to the authenticated, loopback-only coordinator control API.
   let coordinatorPort = null;
   try {
     const u = new URL(config.coordinatorUrl);

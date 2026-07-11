@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "artifact_type": "test-fixture-snapshot",
+  "source": "isolated-test-fixture",
+  "fixture_id": "devops-console-canonical-v1:login:1440x900",
+  "generator": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
+  "width": 1440,
+  "height": 900,
+  "sha256": "cb63dfa072ff914ebd65f2a5450fd68cb9207d03cc77e8baa110bbe47ef5da5c",
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  },
+  "source_sha256": "eeb5bbb31965c95dedf387fc33d5429f6134e0af215016b53a7b9ef09facdc8d",
+  "source_files": [
+    {
+      "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
+      "sha256": "737abcf867757b1537795ac60a489c04752c2ec7eb4f56e4aaf670c65fd27d4a"
+    },
+    {
+      "path": "apps/DevOpsConsole/Tools/canonical-artifacts.mjs",
+      "sha256": "b39af369dfe1878b4db5e8c3f3fdd1bc17e740e6a997a035cd76b2a36989908f"
+    },
+    {
+      "path": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
+      "sha256": "e59651d1b8e7b27abe0ecfe270ba45935043daea765f3b3ee4085f94d9bcad10"
+    },
+    {
+      "path": "apps/DevOpsConsole/src/auth/pages.mjs",
+      "sha256": "4fc56ad9a5bf7e221b64a71e439dbff6edf41f31de18be5e5a740d79c2c1e503"
+    },
+    {
+      "path": "apps/DevOpsConsole/src/ui/app.css",
+      "sha256": "2591b280f799baa2d9867bc442dc3655829450cddf438b6191138905e5161be8"
+    },
+    {
+      "path": "apps/DevOpsConsole/src/ui/app.js",
+      "sha256": "bfa352429fd502142800e8b6e19280dec801a8372bd0ab484b076de201cb77ec"
+    },
+    {
+      "path": "apps/DevOpsConsole/src/ui/index.html",
+      "sha256": "b4e1452a1024dcf76413d5ffd701767099df218fc02196abd65831beaa50a5db"
+    },
+    {
+      "path": "apps/DevOpsConsole/test/helpers/stack.mjs",
+      "sha256": "0adefde2a48963b2d4d3e2631364063074eedff6f987744748ea0f413abdcecc"
+    },
+    {
+      "path": "ci/playwright/package-lock.json",
+      "sha256": "06fc624e79f3025afb049c49f0248c537544f54fb4c9bedb3a66ebdec5b7afe3"
+    },
+    {
+      "path": "ci/playwright/package.json",
+      "sha256": "40ceae65fbbe4290409f95e4726ca81d3fcb67da5da0e79ca1c1102c0effb0e7"
+    }
+  ]
+}

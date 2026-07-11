@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "DevOpsBoard", targets: ["DevOpsBoard"])
     ],
     targets: [
-        .executableTarget(name: "DevOpsBoard")
+        .executableTarget(name: "DevOpsBoard"),
+        .testTarget(name: "DevOpsBoardTests", dependencies: ["DevOpsBoard"])
     ]
 )

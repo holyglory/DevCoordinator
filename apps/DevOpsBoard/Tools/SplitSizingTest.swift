@@ -39,6 +39,7 @@ struct SplitSizingTest {
         assertNarrowLayoutDoesNotOverflow()
         assertSidebarFooterWidth()
         assertProjectGrouping()
+        assertMultiSourceProjectMembership()
         assertServerDeduplication()
         assertCurrentURLHandling()
         assertSidebarActionState()
@@ -103,7 +104,7 @@ struct SplitSizingTest {
         let staleApi = server(
             id: "old-api",
             name: "api",
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             port: 4000,
             status: "stopped",
             updatedAt: "2026-06-27T21:28:11Z"
@@ -111,7 +112,7 @@ struct SplitSizingTest {
         let newerApi = server(
             id: "new-api",
             name: "api",
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             port: 4000,
             status: "stopped",
             updatedAt: "2026-06-28T14:09:19Z"
@@ -119,7 +120,7 @@ struct SplitSizingTest {
         let web = server(
             id: "web",
             name: "web",
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             port: 3004,
             status: "stopped",
             updatedAt: "2026-06-28T14:09:18Z"
@@ -133,7 +134,7 @@ struct SplitSizingTest {
         let inventory = Inventory(
             coordinatorHome: nil,
             statePath: nil,
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             urls: [],
             servers: [staleApi, newerApi, web],
             leases: [],
@@ -143,8 +144,8 @@ struct SplitSizingTest {
             backups: [],
             projectUsage: [
                 ProjectUsage(
-                    usageKey: "path:/Users/holyglory/src/XFoilFOAM",
-                    project: "/Users/holyglory/src/XFoilFOAM",
+                    usageKey: "path:/fixtures/projects/XFoilFOAM",
+                    project: "/fixtures/projects/XFoilFOAM",
                     projectKey: "xfoilfoam",
                     name: "XFoilFOAM",
                     serverIDs: ["old-api", "new-api", "web"],
@@ -182,7 +183,9 @@ struct SplitSizingTest {
                 )
             ]
         )
-        let group = makeProjectGroups(from: inventory).first { $0.id == "path:/Users/holyglory/src/XFoilFOAM" }
+        let group = makeProjectGroups(from: inventory).first {
+            $0.id == projectGroupID(originID: nil, usageKey: "path:/fixtures/projects/XFoilFOAM")
+        }
         assert(group?.servers.count == 2, "project tree should not show duplicate api server rows")
         assert(group?.usage?.hotProcesses?.first?.pid == 18970, "project tree should retain project usage for XFoilFOAM")
     }
@@ -200,7 +203,7 @@ struct SplitSizingTest {
             image: "postgres:16-alpine",
             status: "Up 8 days",
             ports: "0.0.0.0:5544->5432/tcp",
-            project: "/Users/holyglory/src/XFoilFOAM",
+            project: "/fixtures/projects/XFoilFOAM",
             agent: "codex",
             role: "postgres",
             metadataSource: "coordinator_sidecar",
@@ -253,7 +256,7 @@ struct SplitSizingTest {
         let groupRepoWeb = server(
             id: "grouprepo-web-1",
             name: "web",
-            project: "/Users/holyglory/src/GroupRepo",
+            project: "/fixtures/projects/GroupRepo",
             port: 3000,
             status: "running",
             updatedAt: "2026-07-07T10:00:00Z"
@@ -261,7 +264,7 @@ struct SplitSizingTest {
         let sharednameRepoWeb = server(
             id: "sharedname-web-1",
             name: "web",
-            project: "/Users/holyglory/src/sharedname",
+            project: "/fixtures/projects/sharedname",
             port: 3100,
             status: "running",
             updatedAt: "2026-07-07T10:00:00Z"
@@ -285,23 +288,23 @@ struct SplitSizingTest {
             backups: [],
             projectUsage: [
                 usageRow(
-                    usageKey: "path:/Users/holyglory/src/XFoilFOAM",
-                    project: "/Users/holyglory/src/XFoilFOAM",
+                    usageKey: "path:/fixtures/projects/XFoilFOAM",
+                    project: "/fixtures/projects/XFoilFOAM",
                     projectKey: "xfoilfoam",
                     name: "XFoilFOAM",
                     containerNames: ["aerodb-pg"]
                 ),
                 usageRow(
-                    usageKey: "path:/Users/holyglory/src/GroupRepo",
-                    project: "/Users/holyglory/src/GroupRepo",
+                    usageKey: "path:/fixtures/projects/GroupRepo",
+                    project: "/fixtures/projects/GroupRepo",
                     projectKey: "grouprepo",
                     name: "GroupRepo",
                     serverIDs: ["grouprepo-web-1"],
                     containerNames: ["grouprepo-db"]
                 ),
                 usageRow(
-                    usageKey: "path:/Users/holyglory/src/sharedname",
-                    project: "/Users/holyglory/src/sharedname",
+                    usageKey: "path:/fixtures/projects/sharedname",
+                    project: "/fixtures/projects/sharedname",
                     projectKey: "sharedname",
                     name: "sharedname",
                     serverIDs: ["sharedname-web-1"]
@@ -320,7 +323,9 @@ struct SplitSizingTest {
         // Must-catch: a sidecar-attributed container whose NAME suggests a
         // different repo ("aerodb") must display under the attributed repo —
         // the exact display-vs-action divergence class fixed coordinator-side.
-        let xfoil = groups.first { $0.id == "path:/Users/holyglory/src/XFoilFOAM" }
+        let xfoil = groups.first {
+            $0.id == projectGroupID(originID: nil, usageKey: "path:/fixtures/projects/XFoilFOAM")
+        }
         assert(xfoil != nil, "attributed repo should form a usage_key-identified group")
         assert(
             xfoil?.databases.contains { $0.stableID == registeredDatabase.stableID } == true,
@@ -331,11 +336,13 @@ struct SplitSizingTest {
             "no name-derived aerodb group may exist for an attributed container"
         )
         assertString(xfoil?.name ?? "", "XFoilFOAM", "group display name should come from the membership row")
-        assertString(xfoil?.projectPath ?? "", "/Users/holyglory/src/XFoilFOAM", "group action path should come from the membership row")
+        assertString(xfoil?.projectPath ?? "", "/fixtures/projects/XFoilFOAM", "group action path should come from the membership row")
 
         // Must-catch: an unattributed grouprepo-db the coordinator claims by
         // unique name match must display under the path-keyed repo group.
-        let groupRepo = groups.first { $0.id == "path:/Users/holyglory/src/GroupRepo" }
+        let groupRepo = groups.first {
+            $0.id == projectGroupID(originID: nil, usageKey: "path:/fixtures/projects/GroupRepo")
+        }
         assert(
             groupRepo?.databases.contains { $0.stableID == claimedDatabase.stableID } == true,
             "coordinator-claimed grouprepo-db must display under the path-keyed GroupRepo group"
@@ -349,13 +356,17 @@ struct SplitSizingTest {
         // folded into a repo group whose derived name key happens to match —
         // the old name-key heuristics merged these, so the board showed the
         // container inside a group whose project stop would not touch it.
-        let sharednameRepo = groups.first { $0.id == "path:/Users/holyglory/src/sharedname" }
+        let sharednameRepo = groups.first {
+            $0.id == projectGroupID(originID: nil, usageKey: "path:/fixtures/projects/sharedname")
+        }
         assert(sharednameRepo != nil, "sharedname repo should form its own path-keyed group")
         assert(
             sharednameRepo?.containers.isEmpty == true && sharednameRepo?.databases.isEmpty == true,
             "an unclaimed same-key container must stay out of the repo group whose actions do not touch it"
         )
-        let unclaimed = groups.first { $0.id == "name:sharedname" }
+        let unclaimed = groups.first {
+            $0.id == projectGroupID(originID: nil, usageKey: "name:sharedname")
+        }
         assert(unclaimed != nil, "unclaimed containers should keep their coordinator name-keyed group")
         assert(unclaimed?.projectPath == nil, "name-keyed groups must not synthesize an action path")
         assert(
@@ -365,7 +376,7 @@ struct SplitSizingTest {
 
         // Safety net: a container missing from every membership row (older
         // coordinator payload) must stay visible in the stray fallback group.
-        let stray = groups.first { $0.id == strayProjectGroupID }
+        let stray = groups.first { $0.id == strayProjectGroupID(originID: nil) }
         assert(
             stray?.containers.contains { $0.stableID == strayContainer.stableID } == true,
             "membership-less containers must stay visible in the stray fallback group"
@@ -395,13 +406,70 @@ struct SplitSizingTest {
         // usage_key is a persisted coordinator contract; the details panel
         // fallback parses it when a selection drops out of cached groups.
         assertString(
-            projectPath(fromUsageKey: "path:/Users/holyglory/src/GroupRepo") ?? "",
-            "/Users/holyglory/src/GroupRepo",
+            projectPath(fromUsageKey: "path:/fixtures/projects/GroupRepo") ?? "",
+            "/fixtures/projects/GroupRepo",
             "path-keyed selections should recover their runtime action path"
         )
         assert(projectPath(fromUsageKey: "name:sharedname") == nil, "name-keyed selections must not invent an action path")
-        assertString(projectName(fromUsageKey: "path:/Users/holyglory/src/GroupRepo"), "GroupRepo", "path-keyed selections should display the repo name")
+        assertString(projectName(fromUsageKey: "path:/fixtures/projects/GroupRepo"), "GroupRepo", "path-keyed selections should display the repo name")
         assertString(projectName(fromUsageKey: "name:sharedname"), "sharedname", "name-keyed selections should display the derived key")
+    }
+
+    private static func assertMultiSourceProjectMembership() {
+        let left = CoordinatorOrigin(label: "Left", home: "/fixtures/coordinators/left")
+        let right = CoordinatorOrigin(label: "Right", home: "/fixtures/coordinators/right")
+        var leftServer = server(
+            id: "left-composite",
+            name: "web",
+            project: "/fixtures/projects/shared",
+            port: 3001,
+            status: "running",
+            updatedAt: "2026-07-07T10:00:00Z"
+        )
+        leftServer.coordinatorID = "web"
+        leftServer.origin = left
+        var rightServer = server(
+            id: "right-composite",
+            name: "web",
+            project: "/fixtures/projects/shared",
+            port: 3002,
+            status: "running",
+            updatedAt: "2026-07-07T10:00:00Z"
+        )
+        rightServer.coordinatorID = "web"
+        rightServer.origin = right
+        var leftUsage = usageRow(
+            usageKey: "path:/fixtures/projects/shared",
+            project: "/fixtures/projects/shared",
+            projectKey: "shared",
+            name: "shared",
+            serverIDs: ["web"]
+        )
+        leftUsage.origin = left
+        var rightUsage = leftUsage
+        rightUsage.origin = right
+        let inventory = Inventory(
+            coordinatorHome: nil,
+            statePath: nil,
+            project: nil,
+            urls: [],
+            servers: [leftServer, rightServer],
+            leases: [],
+            recentEvents: [],
+            docker: DockerSummary(available: true, error: nil, statsError: nil, containers: [], postgres: []),
+            postgres: [],
+            backups: [],
+            projectUsage: [leftUsage, rightUsage]
+        )
+        let groups = makeProjectGroups(from: inventory)
+        let leftGroup = groups.first {
+            $0.id == projectGroupID(originID: left.id, usageKey: "path:/fixtures/projects/shared")
+        }
+        let rightGroup = groups.first {
+            $0.id == projectGroupID(originID: right.id, usageKey: "path:/fixtures/projects/shared")
+        }
+        assert(leftGroup?.servers.map(\.id) == ["left-composite"], "left membership must not claim the right source's colliding native server id")
+        assert(rightGroup?.servers.map(\.id) == ["right-composite"], "right membership must not claim the left source's colliding native server id")
     }
 
     private static func usageRow(
@@ -442,7 +510,7 @@ struct SplitSizingTest {
         let stoppedForeignPID = server(
             id: "stale-pid",
             name: "web",
-            project: "/Users/holyglory/src/benzovozka",
+            project: "/fixtures/projects/sample-commerce",
             port: 3000,
             status: "stopped",
             updatedAt: "2026-07-01T08:39:42Z",
@@ -455,7 +523,7 @@ struct SplitSizingTest {
         let staleServer = server(
             id: "skydivelive-web-old",
             name: "skydivelive-web",
-            project: "/Users/holyglory/src/skydivelive",
+            project: "/fixtures/projects/sample-dashboard",
             port: 3001,
             status: "stopped",
             updatedAt: "2026-06-21T19:47:48Z",

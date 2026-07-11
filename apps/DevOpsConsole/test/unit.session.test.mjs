@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSessionManager, parseCookies } from '../src/auth/session.mjs';
 
-const SECRET = Buffer.from('ab'.repeat(32), 'hex');
+const SECRET = Buffer.from('ab'.repeat(32), 'hex'); // public-artifact-guard: allow text-secret -- deterministic test-only HMAC key bytes
 const PROFILE = {
   sub: '107691503500061507151',
   email: 'Admin@VR.AE',

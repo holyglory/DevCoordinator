@@ -218,7 +218,9 @@ struct ServiceMapView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                WindowDots()
+                Image(systemName: "terminal.fill")
+                    .foregroundStyle(Theme.blue)
+                    .accessibilityHidden(true)
                 Text("DevOps Board")
                     .font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
@@ -290,6 +292,12 @@ struct ProjectGroup: Equatable {
     var containers: [DockerContainer]
     var databases: [DockerContainer]
     var usage: ProjectUsage?
+
+    var hasObservedDockerRuntime: Bool {
+        !containers.isEmpty
+            || !databases.isEmpty
+            || (usage?.containerCount ?? 0) > 0
+    }
 }
 
 /// Groups come straight from the coordinator's `project_usage` rows, whose
@@ -299,50 +307,71 @@ struct ProjectGroup: Equatable {
 /// is exactly the group whose project actions touch it.
 func makeProjectGroups(from inventory: Inventory) -> [ProjectGroup] {
     let servers = deduplicatedManagedServers(inventory.servers)
-    let containers = inventory.docker.containers
+    let containers = inventory.docker.containers.filter { !$0.isPostgresLike }
+    let databases = inventory.postgres
     var claimedServerIDs = Set<String>()
     var claimedContainerNames = Set<String>()
 
     var groups: [ProjectGroup] = inventory.projectUsage.map { row in
+        let originID = row.origin?.id
         let memberServerIDs = Set(row.serverIDs ?? [])
         let memberContainerNames = Set(row.containerNames ?? [])
-        let rowServers = servers.filter { memberServerIDs.contains($0.id) }
+        let rowServers = servers.filter { server in
+            server.origin?.id == originID
+                && memberServerIDs.contains(server.coordinatorID ?? server.id)
+        }
         let rowContainers = containers.filter { container in
-            guard let name = container.name else { return false }
+            guard container.origin?.id == originID, let name = container.name else { return false }
             return memberContainerNames.contains(name)
         }
-        claimedServerIDs.formUnion(rowServers.map(\.id))
-        claimedContainerNames.formUnion(rowContainers.compactMap(\.name))
+        let rowDatabases = databases.filter { database in
+            guard database.origin?.id == originID, let name = database.name else { return false }
+            return memberContainerNames.contains(name)
+        }
+        claimedServerIDs.formUnion(rowServers.map { projectMembershipKey(originID: $0.origin?.id, nativeID: $0.coordinatorID ?? $0.id) })
+        claimedContainerNames.formUnion((rowContainers + rowDatabases).compactMap { container in
+            container.name.map { projectMembershipKey(originID: container.origin?.id, nativeID: $0) }
+        })
+        let usageKey = row.usageKey ?? row.project ?? row.projectKey ?? row.name ?? "local"
         return ProjectGroup(
-            // usage_key first: project_key is a display name and NOT unique
-            // (two repos named "app", or a repo plus a same-named container).
-            id: row.usageKey ?? row.project ?? row.projectKey ?? row.name ?? "local",
+            id: projectGroupID(originID: originID, usageKey: usageKey),
             name: row.name ?? row.project.map(shortProject) ?? row.projectKey ?? "local",
             projectPath: row.project,
             servers: rowServers,
-            containers: rowContainers.filter { !$0.isPostgresLike },
-            databases: rowContainers.filter(\.isPostgresLike),
+            containers: rowContainers,
+            databases: rowDatabases,
             usage: row
         )
     }
     groups.sort { ($0.name.lowercased(), $0.id) < ($1.name.lowercased(), $1.id) }
 
-    // Safety net: anything the rollup did not claim (an older coordinator
-    // payload without membership fields) still gets displayed.
-    let strayServers = servers.filter { !claimedServerIDs.contains($0.id) }
+    // Anything absent from an authoritative membership row remains visible,
+    // but never receives an inferred project path or whole-project action.
+    let strayServers = servers.filter {
+        !claimedServerIDs.contains(projectMembershipKey(originID: $0.origin?.id, nativeID: $0.coordinatorID ?? $0.id))
+    }
     let strayContainers = containers.filter { container in
         guard let name = container.name else { return true }
-        return !claimedContainerNames.contains(name)
+        return !claimedContainerNames.contains(projectMembershipKey(originID: container.origin?.id, nativeID: name))
     }
-    if !strayServers.isEmpty || !strayContainers.isEmpty {
+    let strayDatabases = databases.filter { database in
+        guard let name = database.name else { return true }
+        return !claimedContainerNames.contains(projectMembershipKey(originID: database.origin?.id, nativeID: name))
+    }
+    let originIDs = Set(
+        strayServers.map { $0.origin?.id ?? "unknown" }
+            + strayContainers.map { $0.origin?.id ?? "unknown" }
+            + strayDatabases.map { $0.origin?.id ?? "unknown" }
+    )
+    for originID in originIDs.sorted() {
         groups.append(
             ProjectGroup(
-                id: strayProjectGroupID,
+                id: strayProjectGroupID(originID: originID),
                 name: "other",
                 projectPath: nil,
-                servers: strayServers,
-                containers: strayContainers.filter { !$0.isPostgresLike },
-                databases: strayContainers.filter(\.isPostgresLike),
+                servers: strayServers.filter { ($0.origin?.id ?? "unknown") == originID },
+                containers: strayContainers.filter { ($0.origin?.id ?? "unknown") == originID },
+                databases: strayDatabases.filter { ($0.origin?.id ?? "unknown") == originID },
                 usage: nil
             )
         )
@@ -350,7 +379,17 @@ func makeProjectGroups(from inventory: Inventory) -> [ProjectGroup] {
     return groups
 }
 
-let strayProjectGroupID = "stray:other"
+func projectMembershipKey(originID: String?, nativeID: String) -> String {
+    "\(originID ?? "unknown")|\(nativeID)"
+}
+
+func projectGroupID(originID: String?, usageKey: String) -> String {
+    "\(originID ?? "unknown")|project-group|\(usageKey)"
+}
+
+func strayProjectGroupID(originID: String?) -> String {
+    projectGroupID(originID: originID, usageKey: "stray:other")
+}
 
 func usageRank(_ usage: ProjectUsage) -> (Double, Double, Int) {
     (usage.cpuPercent ?? 0, usage.memoryBytes ?? 0, usage.processCount ?? 0)
@@ -398,12 +437,18 @@ struct ProjectNode: View {
                         title: groupCanStop ? "Stop project runtime" : "Run project runtime",
                         systemImage: groupCanStop ? "stop.fill" : "play.fill",
                         tint: groupCanStop ? Theme.orange : Theme.green,
+                        enabled: projectActionAllowed(
+                            store,
+                            group: group,
+                            kind: groupCanStop ? .projectStop : .projectStart
+                        ),
                         action: { groupCanStop ? store.stopProject(group) : store.startProject(group) }
                     )
                     SidebarActionButton(
                         title: "Restart project runtime",
                         systemImage: "arrow.clockwise",
                         tint: Theme.secondary,
+                        enabled: projectActionAllowed(store, group: group, kind: .projectRestart),
                         action: { store.restartProject(group) }
                     )
                 }
@@ -424,6 +469,13 @@ struct ProjectNode: View {
                         kind: .server,
                         status: server.status,
                         isSelected: store.sidebarSelection == .server(server.id),
+                        canStop: canStopServer(server),
+                        toggleEnabled: serverActionAllowed(
+                            store,
+                            kind: canStopServer(server) ? .stopServer : .restartServer,
+                            server: server
+                        ),
+                        restartEnabled: serverActionAllowed(store, kind: .restartServer, server: server),
                         selectAction: { store.selectServer(server) },
                         toggleAction: { store.toggle(server) },
                         restartAction: { store.restart(server) }
@@ -436,6 +488,13 @@ struct ProjectNode: View {
                         kind: .docker,
                         status: container.status,
                         isSelected: store.sidebarSelection == .docker(container.stableID),
+                        canStop: container.isRunning,
+                        toggleEnabled: dockerActionAllowed(
+                            store,
+                            kind: container.isRunning ? .stopDocker : .startDocker,
+                            container: container
+                        ),
+                        restartEnabled: dockerActionAllowed(store, kind: .restartDocker, container: container),
                         selectAction: { store.selectDocker(container) },
                         toggleAction: { store.toggleDocker(container) },
                         restartAction: { store.restartDocker(container) }
@@ -448,6 +507,13 @@ struct ProjectNode: View {
                         kind: .database,
                         status: database.status,
                         isSelected: store.sidebarSelection == .database(database.stableID),
+                        canStop: database.isRunning,
+                        toggleEnabled: dockerActionAllowed(
+                            store,
+                            kind: database.isRunning ? .stopDocker : .startDocker,
+                            container: database
+                        ),
+                        restartEnabled: dockerActionAllowed(store, kind: .restartDocker, container: database),
                         selectAction: { store.selectDatabase(database) },
                         toggleAction: { store.toggleDocker(database) },
                         restartAction: { store.restartDocker(database) }
@@ -469,25 +535,36 @@ struct ProjectNode: View {
 
 struct MainBoardView: View {
     @ObservedObject var store: OpsStore
+    @State private var bulkSelectionMode = false
+    @State private var reviewingBulkPlan: BulkStopPlan?
 
     var body: some View {
         VStack(spacing: 0) {
             ToolbarView(store: store)
             Divider().overlay(Color.white.opacity(0.07))
 
-            VStack(spacing: 14) {
+            VStack(spacing: 12) {
+                InventoryStateBanner(store: store)
                 ProjectUsageStrip(store: store)
-                FilterRow(store: store)
+                if let lease = store.latestLeaseResult {
+                    LeaseResultCard(store: store, lease: lease)
+                }
+                ManagedLeasesPanel(store: store)
+                FilterRow(
+                    store: store,
+                    bulkSelectionMode: $bulkSelectionMode,
+                    reviewSelection: reviewBulkSelection
+                )
                 ResourceTabBar(store: store)
 
                 Group {
                     switch store.activeTab {
                     case .servers:
-                        DevServersSection(store: store)
+                        DevServersSection(store: store, bulkSelectionMode: bulkSelectionMode)
                     case .docker:
-                        DockerSection(store: store)
+                        DockerSection(store: store, bulkSelectionMode: bulkSelectionMode)
                     case .databases:
-                        DatabaseSection(store: store)
+                        DatabaseSection(store: store, bulkSelectionMode: bulkSelectionMode)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -495,10 +572,18 @@ struct MainBoardView: View {
             .padding(14)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
+            ActionResultDrawer(store: store)
             Divider().overlay(Color.white.opacity(0.07))
             StatusBar(store: store)
         }
         .background(Theme.background)
+        .sheet(item: $reviewingBulkPlan) { plan in
+            BulkStopReviewSheet(store: store, plan: plan)
+        }
+    }
+
+    private func reviewBulkSelection() {
+        reviewingBulkPlan = store.prepareBulkStop()
     }
 }
 
@@ -650,19 +735,20 @@ struct ToolbarView: View {
                 .frame(width: 168)
             SearchField(text: $store.searchText)
                 .frame(minWidth: 220, maxWidth: .infinity)
+            SourceHealthChip(store: store)
             ToolbarButton(title: "Refresh", systemImage: "arrow.clockwise", showsTitle: false) {
                 store.refresh()
             }
             ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus") {
+                store.prepareLeaseDraft()
                 store.showingLeaseSheet = true
             }
+            .disabled(!unscopedActionAllowed(store, kind: .leasePort))
             ToolbarButton(title: "Start", systemImage: "play.circle.fill", tint: Theme.green) {
                 store.prepareStartDraft()
                 store.showingStartSheet = true
             }
-            ToolbarButton(title: "Backup", systemImage: "externaldrive.badge.timemachine", tint: Theme.blue, showsTitle: false) {
-                store.backupDatabase(container: store.visiblePostgres.first)
-            }
+            .disabled(!unscopedActionAllowed(store, kind: .startServer))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
@@ -673,19 +759,20 @@ struct ToolbarView: View {
                 .frame(width: 132)
             SearchField(text: $store.searchText, compact: true)
                 .frame(minWidth: 120, maxWidth: .infinity)
+            SourceHealthChip(store: store, compact: true)
             ToolbarButton(title: "Refresh", systemImage: "arrow.clockwise", showsTitle: false) {
                 store.refresh()
             }
             ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus", showsTitle: false) {
+                store.prepareLeaseDraft()
                 store.showingLeaseSheet = true
             }
+            .disabled(!unscopedActionAllowed(store, kind: .leasePort))
             ToolbarButton(title: "Start", systemImage: "play.circle.fill", tint: Theme.green, showsTitle: false) {
                 store.prepareStartDraft()
                 store.showingStartSheet = true
             }
-            ToolbarButton(title: "Backup", systemImage: "externaldrive.badge.timemachine", tint: Theme.blue, showsTitle: false) {
-                store.backupDatabase(container: store.visiblePostgres.first)
-            }
+            .disabled(!unscopedActionAllowed(store, kind: .startServer))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
@@ -693,6 +780,8 @@ struct ToolbarView: View {
 
 struct FilterRow: View {
     @ObservedObject var store: OpsStore
+    @Binding var bulkSelectionMode: Bool
+    let reviewSelection: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -710,14 +799,636 @@ struct FilterRow: View {
             .frame(width: 360)
 
             Spacer()
+            if bulkSelectionMode {
+                Text("\(store.bulkSelection.selected.count) selected")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(store.bulkSelection.selected.isEmpty ? Theme.secondary : Theme.primary)
+                    .accessibilityIdentifier("bulk-selected-count")
+                Button("Review Stop…", action: reviewSelection)
+                    .buttonStyle(.borderedProminent)
+                    .tint(Theme.red)
+                    .disabled(store.bulkSelection.selected.isEmpty)
+                    .accessibilityIdentifier("bulk-review-stop")
+            }
+            Button {
+                bulkSelectionMode.toggle()
+                if !bulkSelectionMode { store.clearBulkSelection() }
+            } label: {
+                Label(bulkSelectionMode ? "Done" : "Select", systemImage: bulkSelectionMode ? "checkmark" : "checklist")
+            }
+            .buttonStyle(.bordered)
+            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .accessibilityIdentifier("bulk-selection-toggle")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
+struct SourceHealthChip: View {
+    @ObservedObject var store: OpsStore
+    var compact = false
+    @State private var showingDetails = false
+
+    var body: some View {
+        Button {
+            showingDetails.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                StatusDot(status: sourceStatus)
+                Text("Sources \(loadedCount)/\(totalCount) \(sourceStatus)")
+            }
+            .font(.system(size: compact ? 10 : 11, weight: .semibold))
+            .padding(.horizontal, compact ? 7 : 9)
+            .frame(height: 32)
+        }
+        .buttonStyle(.plain)
+        .background(Theme.control)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(statusColor(sourceStatus).opacity(0.35)))
+        .accessibilityLabel("Coordinator sources \(loadedCount) of \(totalCount), \(sourceStatus)")
+        .accessibilityIdentifier("sources-health-chip")
+        .popover(isPresented: $showingDetails, arrowEdge: .bottom) {
+            SourceDiagnosticsPopover(store: store)
+        }
+    }
+
+    private var loadedCount: Int { store.sourceStates.filter { $0.phase == .loaded }.count }
+    private var totalCount: Int { store.sourceStates.count }
+
+    private var sourceStatus: String {
+        if totalCount == 0 { return "Unavailable" }
+        if store.sourceStates.allSatisfy({ $0.phase == .loading }) { return "Loading" }
+        if loadedCount == totalCount { return "Complete" }
+        return "Partial"
+    }
+}
+
+struct SourceDiagnosticsPopover: View {
+    @ObservedObject var store: OpsStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Coordinator Sources")
+                        .font(.system(size: 14, weight: .bold))
+                    Spacer()
+                    Button("Refresh") { store.refresh() }
+                        .keyboardShortcut("r", modifiers: .command)
+                }
+                if store.sourceStates.isEmpty {
+                    Text("No coordinator sources were discovered.")
+                        .foregroundStyle(Theme.secondary)
+                } else {
+                    ForEach(store.sourceStates) { source in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                StatusDot(status: source.phase.rawValue)
+                                Text(source.origin.label)
+                                    .font(.system(size: 12, weight: .semibold))
+                                Spacer()
+                                Text(source.phase.rawValue.capitalized)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(Theme.secondary)
+                                CountBadge(count: source.resourceCount)
+                            }
+                            Text("Checked \(formatDate(source.checkedAt))")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.secondary)
+                            DisclosureGroup("Diagnostics") {
+                                DetailLine(label: "Coordinator home", value: source.origin.home)
+                                DetailLine(label: "State", value: source.origin.statePath ?? "Unavailable")
+                                if let error = source.error { DetailLine(label: "Error", value: error) }
+                            }
+                            .font(.system(size: 11, weight: .semibold))
+                        }
+                        .padding(10)
+                        .background(Theme.control)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+                if !store.capabilityStates.isEmpty {
+                    Text("CAPABILITIES")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.secondary)
+                    ForEach(store.capabilityStates) { capability in
+                        HStack(spacing: 8) {
+                            StatusDot(status: capability.phase.rawValue)
+                            Text(capability.capability.displayName)
+                            Text(capability.origin.label)
+                                .foregroundStyle(Theme.secondary)
+                            Spacer()
+                            Text(capability.phase.rawValue.capitalized)
+                                .foregroundStyle(capability.phase == .available ? Theme.green : Theme.orange)
+                        }
+                        .font(.system(size: 11))
+                        .help(capability.error ?? "")
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .frame(width: 420, height: 420)
+        .background(Theme.sidebar)
+    }
+}
+
+struct InventoryStateBanner: View {
+    @ObservedObject var store: OpsStore
+
+    var body: some View {
+        let snapshot = store.presentationSnapshot
+        let dockerUnavailable = store.capabilityStates.filter {
+            $0.capability == .docker && $0.phase == .unavailable
+        }
+        if store.isLoading || snapshot.level != .nominal || !dockerUnavailable.isEmpty {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .top, spacing: 10) {
+                    if store.isLoading {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: inventoryBannerIcon(snapshot.level))
+                            .foregroundStyle(healthLevelColor(snapshot.level))
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(store.isLoading ? "Refreshing inventory" : snapshot.statusTitle)
+                            .font(.system(size: 12, weight: .bold))
+                        Text(store.isLoading && store.sourceStates.isEmpty ? "Looking for configured coordinator sources." : snapshot.statusMessage)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    if !store.isLoading {
+                        Button("Refresh") { store.refresh() }
+                            .buttonStyle(.bordered)
+                    }
+                }
+                if !dockerUnavailable.isEmpty {
+                    Label(
+                        "Docker is unavailable for \(dockerUnavailable.map(\.origin.label).joined(separator: ", ")). Server and port lease actions remain available.",
+                        systemImage: "shippingbox.and.arrow.backward"
+                    )
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("docker-unavailable-warning")
+                }
+                if let issue = snapshot.inventoryIssue {
+                    DisclosureGroup("Inventory details") {
+                        Text(issue.details)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                }
+                if let issue = snapshot.actionIssue {
+                    DisclosureGroup("Action issue") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(issue.details)
+                                .font(.system(size: 11, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            HStack {
+                                Button("Copy details") { store.copyIssueDetails(issue) }
+                                Button("Dismiss") { store.dismissActionIssue() }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .accessibilityIdentifier("action-issue-details")
+                }
+            }
+            .padding(10)
+            .background(healthLevelColor(snapshot.level).opacity(0.1))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(healthLevelColor(snapshot.level).opacity(0.28)))
+            .accessibilityIdentifier("inventory-state-banner")
+        }
+    }
+}
+
+struct LeaseResultCard: View {
+    @ObservedObject var store: OpsStore
+    let lease: LeaseActionResult
+
+    var body: some View {
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("LEASED PORT")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Theme.secondary)
+                Text(String(lease.port))
+                    .font(.system(size: 24, weight: .bold, design: .monospaced))
+                    .textSelection(.enabled)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 7) {
+                    SourceBadge(origin: lease.identity.origin, states: store.sourceStates)
+                    StatusText(status: lease.managementStatus)
+                }
+                Text("Project \(projectDisplayLabel(lease.project)) · Expires \(formatTimestamp(lease.expiresAtISO))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+                DisclosureGroup("Lease details") {
+                    DetailLine(label: "Lease ID", value: lease.leaseID)
+                    DetailLine(label: "Project", value: lease.project ?? "Unavailable")
+                    DetailLine(label: "Agent", value: lease.agent ?? "Unavailable")
+                    if let serverID = lease.serverID { DetailLine(label: "Attached server", value: serverID) }
+                    if let operationID = lease.pendingOperationID { DetailLine(label: "Attachment operation", value: operationID) }
+                }
+                .font(.system(size: 11, weight: .semibold))
+            }
+            Spacer()
+            Button("Copy") { store.copyLeasePort(lease) }
+                .accessibilityLabel("Copy leased port \(lease.port)")
+                .accessibilityIdentifier("lease-copy-port")
+            Button("Start using lease") {
+                if store.prepareStartDraft(using: lease) { store.showingStartSheet = true }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(
+                !lease.canStartServer
+                    || !store.mutationAvailability(
+                        kind: .startServer,
+                        origin: lease.identity.origin,
+                        resource: nil,
+                        leaseID: lease.leaseID,
+                        projectPath: lease.project
+                    ).isAllowed
+            )
+            .accessibilityIdentifier("lease-start-using")
+            Button("Release", role: .destructive) { store.releaseLease(lease) }
+                .disabled(
+                    !lease.canReleaseDirectly
+                        || !store.mutationAvailability(
+                            kind: .releasePort,
+                            origin: lease.identity.origin,
+                            resource: lease.identity,
+                            leaseID: lease.leaseID,
+                            projectPath: lease.project
+                        ).isAllowed
+                )
+                .accessibilityIdentifier("lease-release")
+            Button { store.dismissLatestLeaseResult() } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss lease result")
+            .accessibilityLabel("Dismiss lease result")
+            .accessibilityIdentifier("lease-dismiss")
+        }
+        .padding(11)
+        .background(Theme.blue.opacity(0.09))
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).stroke(Theme.blue.opacity(0.28)))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("latest-lease-result")
+    }
+}
+
+struct ManagedLeasesPanel: View {
+    @ObservedObject var store: OpsStore
+    @State private var expanded = false
+
+    private var leases: [LeaseActionResult] {
+        store.manageableLeaseResults.filter { $0.identity != store.latestLeaseResult?.identity }
+    }
+
+    var body: some View {
+        if !leases.isEmpty {
+            DisclosureGroup(isExpanded: $expanded) {
+                VStack(spacing: 7) {
+                    ForEach(leases) { lease in
+                        ManagedLeaseRow(store: store, lease: lease)
+                    }
+                }
+                .padding(.top, 7)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "network.badge.shield.half.filled")
+                        .foregroundStyle(Theme.blue)
+                    Text("Managed port leases")
+                        .font(.system(size: 12, weight: .semibold))
+                    CountBadge(count: leases.count)
+                    Spacer()
+                    Text(expanded ? "Hide" : "Review")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.blue)
+                }
+            }
+            .padding(10)
+            .background(Theme.control.opacity(0.72))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
+            .accessibilityIdentifier("managed-port-leases")
+        }
+    }
+}
+
+struct ManagedLeaseRow: View {
+    @ObservedObject var store: OpsStore
+    let lease: LeaseActionResult
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(String(lease.port))
+                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(width: 56, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    SourceBadge(origin: lease.identity.origin, states: store.sourceStates)
+                    StatusText(status: lease.managementStatus)
+                }
+                Text("\(projectDisplayLabel(lease.project)) · expires \(formatTimestamp(lease.expiresAtISO))")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+                DisclosureGroup("Lease identity") {
+                    Text(lease.leaseID)
+                        .font(.system(size: 10, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+                .font(.system(size: 10, weight: .semibold))
+            }
+            Spacer()
+            Button("Copy") { store.copyLeasePort(lease) }
+            Button("Start") {
+                if store.prepareStartDraft(using: lease) { store.showingStartSheet = true }
+            }
+            .disabled(
+                !lease.canStartServer
+                    || !store.mutationAvailability(
+                        kind: .startServer,
+                        origin: lease.identity.origin,
+                        resource: nil,
+                        leaseID: lease.leaseID,
+                        projectPath: lease.project
+                    ).isAllowed
+            )
+            Button("Release", role: .destructive) { store.releaseLease(lease) }
+                .disabled(
+                    !lease.canReleaseDirectly
+                        || !store.mutationAvailability(
+                            kind: .releasePort,
+                            origin: lease.identity.origin,
+                            resource: lease.identity,
+                            leaseID: lease.leaseID,
+                            projectPath: lease.project
+                        ).isAllowed
+                )
+        }
+        .padding(8)
+        .background(Color.white.opacity(0.035))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Port \(lease.port), source \(lease.identity.origin.label), \(lease.managementStatus)")
+    }
+}
+
+struct ActionResultDrawer: View {
+    @ObservedObject var store: OpsStore
+    @State private var expanded = false
+
+    private var results: [RetainedActionResult] {
+        store.actionResults.values.sorted { $0.queuedAt > $1.queuedAt }
+    }
+
+    var body: some View {
+        if let latest = results.first {
+            DisclosureGroup(isExpanded: $expanded) {
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 7) {
+                        ForEach(results) { result in
+                            ActionResultRow(store: store, result: result)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 10)
+                }
+                .frame(maxHeight: 240)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "tray.full")
+                    Text("Activity")
+                        .fontWeight(.bold)
+                    CountBadge(count: results.count)
+                    Text(latest.request.title)
+                        .lineLimit(1)
+                    Spacer()
+                    ActionPhaseBadge(phase: latest.phase)
+                }
+                .font(.system(size: 11))
+                .padding(.horizontal, 14)
+                .frame(height: 34)
+            }
+            .background(Theme.toolbar)
+            .accessibilityIdentifier("action-result-drawer")
+        }
+    }
+}
+
+struct ActionResultRow: View {
+    @ObservedObject var store: OpsStore
+    let result: RetainedActionResult
+    @State private var showingDetails = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $showingDetails) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(store.actionResultDetails(result))
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack {
+                    if result.outputTruncated {
+                        Label("Output truncated", systemImage: "scissors")
+                            .foregroundStyle(Theme.orange)
+                    }
+                    Spacer()
+                    Button("Copy details") { store.copyActionResultDetails(result) }
+                    if isTerminalActionPhase(result.phase) {
+                        Button("Dismiss") { store.dismissActionResult(result) }
+                    }
+                }
+            }
+            .padding(.top, 7)
+        } label: {
+            HStack(spacing: 8) {
+                ActionPhaseBadge(phase: result.phase)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(result.request.title).fontWeight(.semibold).lineLimit(1)
+                    Text(result.request.origin?.label ?? "Coordinator action")
+                        .foregroundStyle(Theme.secondary)
+                }
+                Spacer()
+                Text(formatDate(result.finishedAt ?? result.queuedAt))
+                    .foregroundStyle(Theme.secondary)
+            }
+            .font(.system(size: 11))
+        }
+        .padding(9)
+        .background(Theme.control)
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+struct ActionPhaseBadge: View {
+    let phase: ActionPhase
+
+    var body: some View {
+        Text(phase.rawValue.capitalized)
+            .font(.system(size: 10, weight: .bold))
+            .foregroundStyle(actionPhaseColor(phase))
+            .padding(.horizontal, 7)
+            .frame(height: 20)
+            .background(actionPhaseColor(phase).opacity(0.12))
+            .clipShape(Capsule())
+    }
+}
+
+struct BulkSelectionCheckbox: View {
+    @ObservedObject var store: OpsStore
+    let identity: ResourceIdentity?
+    let enabled: Bool
+
+    var body: some View {
+        if let identity {
+            Toggle(
+                "Select \(identity.nativeID) to stop",
+                isOn: Binding(
+                    get: { store.bulkSelection.contains(identity) },
+                    set: { store.setBulkSelected(identity, selected: $0) }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.checkbox)
+            .disabled(!enabled || !actionAllowed(store, kind: identity.kind == .server ? .stopServer : .stopDocker, identity: identity))
+            .accessibilityIdentifier("bulk-select-\(safeAccessibilityID(identity.rawValue))")
+        } else {
+            Image(systemName: "square.dashed")
+                .foregroundStyle(Theme.secondary)
+                .accessibilityLabel("Resource cannot be selected")
+        }
+    }
+}
+
+struct BulkStopReviewSheet: View {
+    @ObservedObject var store: OpsStore
+    let plan: BulkStopPlan
+    @Environment(\.dismiss) private var dismiss
+    @State private var submitted = false
+    @State private var executionError: String?
+
+    private var completedResult: BulkActionResult? {
+        guard let result = store.latestBulkActionResult,
+              result.selection == plan.selection,
+              result.results.count == plan.items.count,
+              result.results.values.allSatisfy({ $0.queuedAt >= plan.preparedAt })
+        else { return nil }
+        return result
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(submitted ? "Stop Results" : "Review \(plan.items.count) Selected")
+                        .font(.title2.bold())
+                    Text("Only the resources listed below are in this bounded operation.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.secondary)
+                }
+                Spacer()
+                Button("Close") { dismiss() }
+            }
+
+            ScrollView {
+                LazyVStack(spacing: 7) {
+                    ForEach(plan.items) { item in
+                        HStack(spacing: 9) {
+                            Image(systemName: "checkmark.square.fill")
+                                .foregroundStyle(Theme.blue)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.displayName).fontWeight(.semibold)
+                                Text("\(shortProject(item.project)) · \(item.identity.origin.label)")
+                                    .foregroundStyle(Theme.secondary)
+                                if let failure = completedResult?.results[item.identity]?.failure, !failure.isEmpty {
+                                    Text(failure)
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(Theme.red)
+                                        .lineLimit(2)
+                                }
+                            }
+                            Spacer()
+                            if let result = completedResult?.results[item.identity] {
+                                ActionPhaseBadge(phase: result.phase)
+                            } else if submitted {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                StatusText(status: item.expectedStatus)
+                            }
+                        }
+                        .font(.system(size: 12))
+                        .padding(10)
+                        .background(Theme.control)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+            .frame(maxHeight: 330)
+
+            if let result = completedResult {
+                HStack {
+                    Label("\(result.succeededCount) stopped", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(Theme.green)
+                    if result.failedCount > 0 {
+                        Label("\(result.failedCount) failed", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Theme.red)
+                    }
+                    Spacer()
+                }
+                .font(.system(size: 12, weight: .semibold))
+                .accessibilityIdentifier("bulk-stop-result-summary")
+            } else if submitted {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Stopping selected resources…")
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let executionError {
+                        Label(executionError, systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Theme.red)
+                    }
+                    HStack {
+                        Button("Cancel") { dismiss() }
+                        Spacer()
+                        Button("Stop \(plan.items.count) Selected", role: .destructive) {
+                            submitted = store.executeBulkStop(planID: plan.id, confirmation: plan.confirmationText)
+                            executionError = submitted ? nil : (store.actionIssue?.summary ?? "The selected resources could not be stopped.")
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("bulk-stop-execute")
+                    }
+                }
+            }
+        }
+        .padding(22)
+        .frame(width: 620, height: 560)
+        .background(Theme.background)
+    }
+}
+
 struct DevServersSection: View {
     @ObservedObject var store: OpsStore
-    @State private var widths: [CGFloat] = [112, 106, 160, 86, 62, 58, 150]
+    let bulkSelectionMode: Bool
+    @State private var widths: [CGFloat] = [220, 120, 170, 86, 72, 58, 150]
 
     var body: some View {
         SectionSurface(title: "DEV SERVERS", count: store.filteredServers.count, systemImage: "terminal") {
@@ -729,19 +1440,31 @@ struct DevServersSection: View {
                         TableRow(widths: widths, isSelected: store.selectedServerID == server.id) {
                             TableCell(width: widths[0]) {
                                 HStack(spacing: 8) {
+                                    if bulkSelectionMode {
+                                        BulkSelectionCheckbox(
+                                            store: store,
+                                            identity: server.resourceIdentity,
+                                            enabled: canStopServer(server)
+                                                && serverActionAllowed(store, kind: .stopServer, server: server)
+                                        )
+                                    }
                                     StatusDot(status: server.status)
                                     Text(server.name).fontWeight(.medium).lineLimit(1)
+                                    SourceBadge(origin: server.origin, states: store.sourceStates)
                                 }
                             }
                             TableCell(width: widths[1]) {
-                                Text(shortProject(server.project)).foregroundStyle(Theme.secondary).lineLimit(1)
+                                Text(projectDisplayLabel(server.project)).foregroundStyle(Theme.secondary).lineLimit(1)
                             }
                             TableCell(width: widths[2]) {
                                 URLCell(url: server.currentURL, staleURL: server.url, open: { store.openURL(server.currentURL) }, copy: { store.copyURL(server.currentURL) })
                             }
                             TableCell(width: widths[3]) { StatusText(status: server.status) }
                             TableCell(width: widths[4]) {
-                                Text(server.health?.pidAlive == true ? "active" : "—").foregroundStyle(Theme.secondary)
+                                let uptime = server.uptime(now: Date())
+                                Text(formatUptime(uptime))
+                                    .foregroundStyle(Theme.secondary)
+                                    .help(uptimeHelp(uptime))
                             }
                             TableCell(width: widths[5]) {
                                 Text(server.port.map(String.init) ?? "—").monospacedDigit()
@@ -749,14 +1472,20 @@ struct DevServersSection: View {
                             TableCell(width: widths[6]) {
                                 HStack(spacing: 7) {
                                     IconButton("Restart", "arrow.clockwise") { store.restart(server) }
+                                        .disabled(!serverActionAllowed(store, kind: .restartServer, server: server))
                                     IconButton("Stop", "stop") { store.stop(server) }
+                                        .disabled(!canStopServer(server) || !serverActionAllowed(store, kind: .stopServer, server: server))
                                     IconButton("Open", "arrow.up.forward.square") { store.openURL(server.currentURL) }
                                         .disabled(server.currentURL == nil)
                                     IconButton("Logs", "doc.text.magnifyingglass") { store.showServerLogs(server) }
+                                        .disabled(!serverActionAllowed(store, kind: .serverLogs, server: server))
                                 }
                             }
                         }
                         .onTapGesture { store.selectServer(server) }
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityLabel("Open details for server \(server.name)")
+                        .accessibilityAction { store.selectServer(server) }
                     }
                 }
             }
@@ -766,20 +1495,40 @@ struct DevServersSection: View {
 
 struct DockerSection: View {
     @ObservedObject var store: OpsStore
-    @State private var widths: [CGFloat] = [160, 100, 88, 100, 108, 118, 118, 130, 128, 130]
+    let bulkSelectionMode: Bool
+    @State private var widths: [CGFloat] = [240, 110, 88, 100, 108, 118, 118, 130, 128, 130]
 
     var body: some View {
         SectionSurface(title: "DOCKER", count: store.visibleDockerContainers.count, systemImage: "shippingbox") {
-            ResizableTable(columns: ["Container", "Project", "Status", "CPU", "Memory", "Network", "Disk I/O", "Image", "Ports", "Actions"], widths: $widths) {
-                ForEach(store.visibleDockerContainers, id: \.stableID) { container in
+            if store.visibleDockerContainers.isEmpty {
+                ResourceEmptyState(
+                    store: store,
+                    title: dockerCapabilityUnavailable(store) ? "Docker inventory unavailable" : "No Docker containers in this scope",
+                    message: dockerCapabilityUnavailable(store)
+                        ? "Coordinator-managed servers and port leases remain available. Refresh after Docker is restored."
+                        : "No source returned a Docker container matching the current project, filter, and search.",
+                    systemImage: "shippingbox"
+                )
+            } else {
+                ResizableTable(columns: ["Container", "Project", "Status", "CPU", "Memory", "Network", "Disk I/O", "Image", "Ports", "Actions"], widths: $widths) {
+                    ForEach(store.visibleDockerContainers, id: \.stableID) { container in
                     TableRow(widths: widths, isSelected: store.selectedDockerID == container.stableID) {
                         TableCell(width: widths[0]) {
                             HStack(spacing: 8) {
+                                if bulkSelectionMode {
+                                    BulkSelectionCheckbox(
+                                        store: store,
+                                        identity: normalizedBulkIdentity(container.resourceIdentity),
+                                        enabled: container.isRunning
+                                            && dockerActionAllowed(store, kind: .stopDocker, container: container)
+                                    )
+                                }
                                 StatusDot(status: container.status)
                                 Text(container.name ?? "container")
                                     .fontWeight(.medium)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
+                                SourceBadge(origin: container.origin, states: store.sourceStates)
                             }
                         }
                         TableCell(width: widths[1]) {
@@ -831,18 +1580,23 @@ struct DockerSection: View {
                             HStack(spacing: 7) {
                                 if container.isRunning {
                                     IconButton("Restart", "arrow.clockwise") { store.restartDocker(container) }
+                                        .disabled(!dockerActionAllowed(store, kind: .restartDocker, container: container))
                                     IconButton("Stop", "stop") { store.stopDocker(container) }
+                                        .disabled(!dockerActionAllowed(store, kind: .stopDocker, container: container))
                                 } else {
                                     IconButton("Start", "play.fill") { store.startDocker(container) }
+                                        .disabled(!dockerActionAllowed(store, kind: .startDocker, container: container))
                                 }
                                 IconButton("Logs", "doc.text") { store.dockerLogs(container) }
-                                if container.isPostgresLike {
-                                    IconButton("Backup", "externaldrive.badge.timemachine") { store.backupDatabase(container: container) }
-                                }
+                                    .disabled(!dockerActionAllowed(store, kind: .dockerLogs, container: container))
                             }
                         }
                     }
                     .onTapGesture { store.selectDocker(container) }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityLabel("Open details for container \(container.name ?? "container")")
+                    .accessibilityAction { store.selectDocker(container) }
+                    }
                 }
             }
         }
@@ -851,46 +1605,60 @@ struct DockerSection: View {
 
 struct DatabaseSection: View {
     @ObservedObject var store: OpsStore
-    @State private var widths: [CGFloat] = [160, 135, 150, 105, 75, 145, 130, 120]
+    let bulkSelectionMode: Bool
+    @State private var widths: [CGFloat] = [240, 135, 150, 105, 75, 145, 130, 90]
 
     var body: some View {
         SectionSurface(title: "DATABASES", count: store.visiblePostgres.count, systemImage: "cylinder.split.1x2") {
-            ResizableTable(columns: ["Database", "Project", "Engine", "Status", "Size", "Last Backup", "Restore Safety", "Actions"], widths: $widths) {
-                ForEach(store.visiblePostgres, id: \.stableID) { db in
-                    let hasBackup = hasBackup(for: db, backups: store.inventory.backups)
+            if store.visiblePostgres.isEmpty {
+                ResourceEmptyState(
+                    store: store,
+                    title: databaseCapabilityUnavailable(store) ? "Database discovery unavailable" : "No databases in this scope",
+                    message: databaseCapabilityUnavailable(store)
+                        ? "No database target is being guessed. Restore Docker/database capability, then refresh."
+                        : "No exact discovered database matches the current project, filter, and search.",
+                    systemImage: "cylinder.split.1x2"
+                )
+            } else {
+                ResizableTable(columns: ["Database", "Project", "Engine", "Status", "Size", "Last Backup", "Restore Safety", "Actions"], widths: $widths) {
+                    ForEach(store.visiblePostgres, id: \.stableID) { db in
+                    let backup = newestBackupRecord(for: db, records: store.backupRecords)
                     TableRow(widths: widths, isSelected: store.selectedDatabaseID == db.stableID) {
                         TableCell(width: widths[0]) {
                             HStack(spacing: 8) {
                                 StatusDot(status: db.status)
-                                Text(db.name ?? "postgres")
+                                Text(db.database ?? "Unknown database")
                                     .fontWeight(.medium)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
+                                SourceBadge(origin: db.origin, states: store.sourceStates)
                             }
                         }
                         TableCell(width: widths[1]) { Text(projectLabel(for: db, in: store.projectGroups)).foregroundStyle(Theme.secondary).lineLimit(1) }
                         TableCell(width: widths[2]) { Text(db.image ?? "postgres").foregroundStyle(Theme.secondary).lineLimit(1) }
                         TableCell(width: widths[3]) { StatusText(status: db.status) }
-                        TableCell(width: widths[4]) { Text("—").foregroundStyle(Theme.secondary) }
+                        TableCell(width: widths[4]) { Text(formatDatabaseBytes(db.databaseSizeBytes)).foregroundStyle(Theme.secondary) }
                         TableCell(width: widths[5]) {
-                            Text(lastBackupText(for: db, backups: store.inventory.backups))
-                                .foregroundStyle(backupColor(for: db, backups: store.inventory.backups))
+                            Text(backup.map { formatDate($0.createdAt) } ?? "No backup")
+                                .foregroundStyle(backup == nil ? Theme.orange : Theme.primary)
                                 .lineLimit(1)
                         }
-                        TableCell(width: widths[6]) { BackupSafetyLabel(hasBackup: hasBackup) }
+                        TableCell(width: widths[6]) { BackupSafetyLabel(backup: backup) }
                         TableCell(width: widths[7]) {
                             HStack(spacing: 7) {
                                 if db.isRunning {
                                     IconButton("Backup", "externaldrive.badge.timemachine") { store.backupDatabase(container: db) }
-                                    IconButton("Stop", "stop") { store.stopDocker(db) }
-                                } else {
-                                    IconButton("Start", "play.fill") { store.startDocker(db) }
+                                        .disabled(!databaseProtectionActionAllowed(store, kind: .backupDatabase, database: db))
                                 }
-                                IconButton("Logs", "terminal") { store.dockerLogs(db) }
+                                IconButton("Details", "info.circle") { store.selectDatabase(db) }
                             }
                         }
                     }
                     .onTapGesture { store.selectDatabase(db) }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityLabel("Open details for database \(db.database ?? "unknown")")
+                    .accessibilityAction { store.selectDatabase(db) }
+                    }
                 }
             }
         }
@@ -1099,13 +1867,15 @@ struct SelectedServerPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(server.name)
-                .font(.system(size: 15, weight: .bold))
-            Text(server.project ?? "No project")
-                .font(.system(size: 12))
+            HStack(alignment: .firstTextBaseline) {
+                Text(server.name)
+                    .font(.system(size: 15, weight: .bold))
+                Spacer()
+                SourceBadge(origin: server.origin, states: store.sourceStates)
+            }
+            Text(projectDisplayLabel(server.project))
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Theme.secondary)
-                .lineLimit(3)
-                .fixedSize(horizontal: false, vertical: true)
             DetailLine(label: "Port", value: server.port.map(String.init) ?? "—")
             DetailLine(label: "Health", value: server.status ?? "unknown")
             if let duplicateCount = server.duplicateCount, duplicateCount > 1 {
@@ -1121,7 +1891,6 @@ struct SelectedServerPanel: View {
             }
             DetailLine(label: "Stopped", value: server.stoppedAt ?? "—")
             DetailLine(label: "Reason", value: server.stoppedReason ?? "—")
-            DetailLine(label: "Log", value: server.logPath ?? "—")
             Button {
                 store.showServerLogs(server)
             } label: {
@@ -1129,6 +1898,7 @@ struct SelectedServerPanel: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!serverActionAllowed(store, kind: .serverLogs, server: server))
             InspectorActionStack {
                 Button {
                     store.openURL(server.currentURL)
@@ -1145,6 +1915,13 @@ struct SelectedServerPanel: View {
                 }
                 .disabled(server.currentURL == nil)
             }
+            DisclosureGroup("Diagnostics") {
+                DetailLine(label: "Project path", value: server.project ?? "Unavailable")
+                DetailLine(label: "Working directory", value: server.cwd ?? "Unavailable")
+                DetailLine(label: "Log path", value: server.logPath ?? "Unavailable")
+                DetailLine(label: "Metadata source", value: server.metadataSource ?? "Unavailable")
+            }
+            .font(.system(size: 11, weight: .semibold))
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
@@ -1156,9 +1933,13 @@ struct SelectedDockerPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(container.name ?? "container")
-                .font(.system(size: 15, weight: .bold))
-                .lineLimit(2)
+            HStack(alignment: .firstTextBaseline) {
+                Text(container.name ?? "container")
+                    .font(.system(size: 15, weight: .bold))
+                    .lineLimit(2)
+                Spacer()
+                SourceBadge(origin: container.origin, states: store.sourceStates)
+            }
             Text(container.image ?? "No image")
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.secondary)
@@ -1170,9 +1951,12 @@ struct SelectedDockerPanel: View {
             InspectorActionStack {
                 if container.isRunning {
                     Button { store.restartDocker(container) } label: { Label("Restart", systemImage: "arrow.clockwise").frame(maxWidth: .infinity) }
+                        .disabled(!dockerActionAllowed(store, kind: .restartDocker, container: container))
                     Button { store.stopDocker(container) } label: { Label("Stop", systemImage: "stop").frame(maxWidth: .infinity) }
+                        .disabled(!dockerActionAllowed(store, kind: .stopDocker, container: container))
                 } else {
                     Button { store.startDocker(container) } label: { Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity) }
+                        .disabled(!dockerActionAllowed(store, kind: .startDocker, container: container))
                 }
             }
             Button {
@@ -1181,6 +1965,14 @@ struct SelectedDockerPanel: View {
                 Label("Fetch Logs", systemImage: "doc.text")
                     .frame(maxWidth: .infinity)
             }
+            .disabled(!dockerActionAllowed(store, kind: .dockerLogs, container: container))
+            DisclosureGroup("Diagnostics") {
+                DetailLine(label: "Project", value: container.project ?? "Unavailable")
+                DetailLine(label: "Container ID", value: container.id ?? "Unavailable")
+                DetailLine(label: "Metadata source", value: container.metadataSource ?? "Unavailable")
+                if let error = container.ownershipError { DetailLine(label: "Ownership", value: error) }
+            }
+            .font(.system(size: 11, weight: .semibold))
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
@@ -1189,31 +1981,253 @@ struct SelectedDockerPanel: View {
 struct SelectedDatabasePanel: View {
     @ObservedObject var store: OpsStore
     let database: DockerContainer
+    @State private var restorePrompt: DatabaseRestorePrompt?
+    @State private var showingEvidence = false
 
     var body: some View {
+        let identity = database.databaseIdentity
+        let backup = newestBackupRecord(for: database, records: store.backupRecords)
+        let restore = identity.flatMap { store.restoreEvidence[$0] }
         VStack(alignment: .leading, spacing: 10) {
-            Text(database.name ?? "postgres")
-                .font(.system(size: 15, weight: .bold))
-                .lineLimit(2)
-            Text(database.image ?? "Postgres")
-                .font(.system(size: 12))
+            HStack(alignment: .firstTextBaseline) {
+                Text(database.database ?? "Unknown database")
+                    .font(.system(size: 15, weight: .bold))
+                    .lineLimit(2)
+                Spacer()
+                SourceBadge(origin: database.origin, states: store.sourceStates)
+            }
+            Text(database.name ?? "Unknown container")
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Theme.secondary)
                 .lineLimit(2)
+            Text(database.image ?? "Postgres image unavailable")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.secondary)
+                .lineLimit(2)
+            DetailLine(label: "Database", value: database.database ?? "Unavailable")
+            DetailLine(label: "Container", value: database.name ?? "Unavailable")
+            DetailLine(label: "Size", value: formatDatabaseBytes(database.databaseSizeBytes))
             DetailLine(label: "Status", value: normalizedStatus(database.status))
-            DetailLine(label: "Last Backup", value: lastBackupText(for: database, backups: store.inventory.backups))
-            DetailLine(label: "Ports", value: database.ports?.isEmpty == false ? database.ports! : "none")
-            DetailLine(label: "PIDs", value: database.stats?.pids.map(String.init) ?? "—")
-            DockerTelemetryPanel(container: database)
+            if let discoveryError = database.databaseDiscoveryError {
+                Label(discoveryError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("PROTECTION EVIDENCE")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Theme.secondary)
+                EvidenceStateLine(
+                    label: "Checksum verified",
+                    state: checksumLabel(backup?.checksum),
+                    tint: checksumColor(backup?.checksum)
+                )
+                EvidenceStateLine(
+                    label: "Restore tested",
+                    state: restoreTestLabel(backup?.restoreTest),
+                    tint: restoreTestColor(backup?.restoreTest)
+                )
+                if let compatibilityError = backup?.compatibilityError {
+                    Text(compatibilityError)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.orange)
+                }
+                if let restore {
+                    EvidenceStateLine(
+                        label: "Last restore",
+                        state: restore.transactional ? "Transactional" : "Unverified",
+                        tint: restore.transactional ? Theme.green : Theme.red
+                    )
+                }
+            }
+            .padding(10)
+            .background(Theme.control)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            InspectorActionStack {
+                Button { store.backupDatabase(container: database) } label: {
+                    Label("Back up now", systemImage: "externaldrive.badge.timemachine").frame(maxWidth: .infinity)
+                }
+                .disabled(!database.isRunning || !databaseProtectionActionAllowed(store, kind: .backupDatabase, database: database))
+                .accessibilityIdentifier("database-backup-now")
+                Button {
+                    if let identity, let backup { restorePrompt = DatabaseRestorePrompt(target: identity, backup: backup) }
+                } label: {
+                    Label("Restore…", systemImage: "arrow.counterclockwise").frame(maxWidth: .infinity)
+                }
+                .disabled(
+                    identity == nil
+                        || backup?.isStronglyVerified != true
+                        || !database.isRunning
+                        || !databaseProtectionActionAllowed(store, kind: .restoreDatabase, database: database)
+                )
+                .accessibilityIdentifier("database-restore")
+                Button { showingEvidence = true } label: {
+                    Label("View evidence", systemImage: "checkmark.seal").frame(maxWidth: .infinity)
+                }
+                .disabled(identity == nil || (backup == nil && restore == nil))
+                .accessibilityIdentifier("database-view-evidence")
+            }
+
+            DisclosureGroup("Diagnostics") {
+                DetailLine(label: "Immutable container ID", value: database.id ?? "Unavailable")
+                DetailLine(label: "Ports", value: database.ports?.isEmpty == false ? database.ports! : "none")
+                DetailLine(label: "PIDs", value: database.stats?.pids.map(String.init) ?? "—")
+                DockerTelemetryPanel(container: database)
+            }
+            .font(.system(size: 11, weight: .semibold))
+
             InspectorActionStack {
                 if database.isRunning {
-                    Button { store.backupDatabase(container: database) } label: { Label("Backup", systemImage: "externaldrive.badge.timemachine").frame(maxWidth: .infinity) }
-                    Button { store.stopDocker(database) } label: { Label("Stop", systemImage: "stop").frame(maxWidth: .infinity) }
+                    Button { store.stopDocker(database) } label: {
+                        Label("Stop container", systemImage: "stop").frame(maxWidth: .infinity)
+                    }
+                    .disabled(!dockerActionAllowed(store, kind: .stopDocker, container: database))
                 } else {
-                    Button { store.startDocker(database) } label: { Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity) }
+                    Button { store.startDocker(database) } label: {
+                        Label("Start container", systemImage: "play.fill").frame(maxWidth: .infinity)
+                    }
+                    .disabled(!dockerActionAllowed(store, kind: .startDocker, container: database))
                 }
+                Button { store.dockerLogs(database) } label: {
+                    Label("Container logs", systemImage: "terminal").frame(maxWidth: .infinity)
+                }
+                .disabled(!dockerActionAllowed(store, kind: .dockerLogs, container: database))
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
+        .sheet(item: $restorePrompt) { prompt in
+            DatabaseRestoreSheet(store: store, prompt: prompt)
+        }
+        .sheet(isPresented: $showingEvidence) {
+            DatabaseEvidenceSheet(identity: identity, backup: backup, restore: restore)
+        }
+    }
+}
+
+struct EvidenceStateLine: View {
+    let label: String
+    let state: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: evidenceIcon(state))
+                .foregroundStyle(tint)
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+            Spacer()
+            Text(state)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(tint)
+        }
+    }
+}
+
+struct DatabaseRestorePrompt: Identifiable {
+    var id: String { "\(target.id)|\(backup.id)" }
+    let target: DatabaseIdentity
+    let backup: BackupRecord
+}
+
+struct DatabaseRestoreSheet: View {
+    @ObservedObject var store: OpsStore
+    let prompt: DatabaseRestorePrompt
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmation = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Restore Database")
+                .font(.title2.bold())
+            Label("This changes one exact database target.", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.orange)
+            DetailLine(label: "Database", value: prompt.target.database)
+            DetailLine(label: "Container", value: prompt.target.container)
+            DetailLine(label: "Source", value: prompt.target.origin.label)
+            DetailLine(label: "Backup created", value: formatDate(prompt.backup.createdAt))
+            HStack(spacing: 16) {
+                EvidenceStateLine(
+                    label: "Checksum",
+                    state: checksumLabel(prompt.backup.checksum),
+                    tint: checksumColor(prompt.backup.checksum)
+                )
+                EvidenceStateLine(
+                    label: "Restore test",
+                    state: restoreTestLabel(prompt.backup.restoreTest),
+                    tint: restoreTestColor(prompt.backup.restoreTest)
+                )
+            }
+            Text("Type \(store.restoreConfirmation(for: prompt.target)) to confirm")
+                .font(.system(size: 12, weight: .semibold))
+            TextField(store.restoreConfirmation(for: prompt.target), text: $confirmation)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("database-restore-confirmation")
+            HStack {
+                Button("Cancel") { dismiss() }
+                Spacer()
+                Button("Restore database", role: .destructive) {
+                    store.restoreDatabase(target: prompt.target, backup: prompt.backup, confirmation: confirmation)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(confirmation != store.restoreConfirmation(for: prompt.target))
+                .accessibilityIdentifier("database-restore-execute")
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .background(Theme.background)
+    }
+}
+
+struct DatabaseEvidenceSheet: View {
+    let identity: DatabaseIdentity?
+    let backup: BackupRecord?
+    let restore: DatabaseRestoreEvidence?
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Database Evidence").font(.title2.bold())
+                    Spacer()
+                    Button("Close") { dismiss() }
+                }
+                if let identity {
+                    DetailLine(label: "Exact target", value: "\(identity.container)/\(identity.database)")
+                    DetailLine(label: "Source", value: identity.origin.label)
+                    DetailLine(label: "Immutable container ID", value: identity.containerID ?? "Unavailable")
+                }
+                if let backup {
+                    Text("BACKUP").font(.system(size: 11, weight: .bold)).foregroundStyle(Theme.secondary)
+                    DetailLine(label: "Created", value: formatDate(backup.createdAt))
+                    DetailLine(label: "Checksum", value: checksumLabel(backup.checksum))
+                    DetailLine(label: "Restore tested", value: restoreTestLabel(backup.restoreTest))
+                    DetailLine(label: "Format / scope", value: "\(backup.format ?? "unknown") / \(backup.scope ?? "unknown")")
+                    DetailLine(label: "Artifact", value: backup.path)
+                    if let error = backup.compatibilityError { DetailLine(label: "Compatibility", value: error) }
+                } else {
+                    Text("No backup evidence is available for this exact immutable database.")
+                        .foregroundStyle(Theme.orange)
+                }
+                if let restore {
+                    Text("RESTORE").font(.system(size: 11, weight: .bold)).foregroundStyle(Theme.secondary)
+                    DetailLine(label: "Completed", value: formatDate(restore.completedAt))
+                    DetailLine(label: "Transactional", value: restore.transactional ? "Yes" : "No")
+                    DetailLine(label: "Incoming verification", value: restore.incomingVerificationPassed ? "Passed" : "Failed")
+                    DetailLine(label: "Safety verification", value: restore.safetyVerificationPassed ? "Passed" : "Failed")
+                    DetailLine(label: "Safety backup", value: restore.safetyBackupPath)
+                    DetailLine(label: "Restored catalog", value: restore.restoredCatalogSignature.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ", "))
+                }
+            }
+            .padding(22)
+        }
+        .frame(width: 680, height: 620)
+        .background(Theme.background)
     }
 }
 
@@ -1222,8 +2236,8 @@ struct SelectedProjectPanel: View {
     @ObservedObject var store: OpsStore
 
     var body: some View {
-        // Fallback parses the persisted usage_key contract so runtime actions
-        // still work for a selection that has dropped out of the cached groups.
+        // A dropped cached selection may recover only the persisted usage-key
+        // path. It never scans the filesystem or derives a project from names.
         let group = store.projectGroups.first { $0.id == name } ?? ProjectGroup(
             id: name,
             name: projectName(fromUsageKey: name),
@@ -1238,7 +2252,7 @@ struct SelectedProjectPanel: View {
             Text(group.name)
                 .font(.system(size: 15, weight: .bold))
                 .lineLimit(2)
-            DetailLine(label: "Runtime", value: group.projectPath ?? "No project path")
+            DetailLine(label: "Runtime", value: projectDisplayLabel(group.projectPath))
             DetailLine(label: "Servers", value: "\(group.servers.count)")
             DetailLine(label: "Docker", value: "\(group.containers.count)")
             DetailLine(label: "Databases", value: "\(group.databases.count)")
@@ -1249,8 +2263,11 @@ struct SelectedProjectPanel: View {
             }
             InspectorActionStack {
                 Button { store.startProject(group) } label: { Label("Run", systemImage: "play.fill").frame(maxWidth: .infinity) }
+                    .disabled(!projectActionAllowed(store, group: group, kind: .projectStart))
                 Button { store.restartProject(group) } label: { Label("Restart", systemImage: "arrow.clockwise").frame(maxWidth: .infinity) }
+                    .disabled(!projectActionAllowed(store, group: group, kind: .projectRestart))
                 Button { store.stopProject(group) } label: { Label("Stop", systemImage: "stop").frame(maxWidth: .infinity) }
+                    .disabled(!projectActionAllowed(store, group: group, kind: .projectStop))
             }
             Button {
                 store.statusProject(group)
@@ -1259,9 +2276,17 @@ struct SelectedProjectPanel: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .disabled(!projectActionAllowed(store, group: group, kind: .projectStatus))
             if let report {
                 ProjectRuntimeSummary(report: report)
             }
+            DisclosureGroup("Diagnostics") {
+                DetailLine(label: "Project path", value: group.projectPath ?? "Unavailable")
+                ForEach(Array(Set((servers.compactMap(\.origin) + docker.compactMap(\.origin) + databases.compactMap(\.origin)))), id: \.id) { origin in
+                    DetailLine(label: "Source", value: origin.label)
+                }
+            }
+            .font(.system(size: 11, weight: .semibold))
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
@@ -1274,6 +2299,11 @@ struct ProjectRuntimeSummary: View {
         VStack(alignment: .leading, spacing: 8) {
             DetailLine(label: "Ready", value: report.ok == true ? "Yes" : "No")
             DetailLine(label: "Class", value: report.classification ?? "—")
+            if report.partial == true {
+                DetailLine(label: "Outcome", value: "Partial changes applied; inventory refreshed")
+            } else if report.partial == false, report.ok == false {
+                DetailLine(label: "Outcome", value: "Preflight failed; no changes applied")
+            }
             if let url = report.urls.first?.url {
                 DetailLine(label: "URL", value: url)
             }
@@ -1334,37 +2364,123 @@ struct EmptyDetailsPanel: View {
     }
 }
 
+struct ActionSourcePicker: View {
+    let title: String
+    let origins: [CoordinatorOrigin]
+    @Binding var selection: CoordinatorOrigin?
+
+    var body: some View {
+        Picker(title, selection: $selection) {
+            Text(origins.isEmpty ? "No loaded source" : "Choose a source")
+                .tag(nil as CoordinatorOrigin?)
+            ForEach(origins) { origin in
+                Text(origin.label)
+                    .tag(origin as CoordinatorOrigin?)
+            }
+        }
+        .pickerStyle(.menu)
+        .disabled(origins.isEmpty)
+    }
+}
+
 struct StartServerSheet: View {
     @ObservedObject var store: OpsStore
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Start Managed Server")
-                .font(.title2.bold())
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Start Managed Server")
+                        .font(.title2.bold())
+                    Text("Commands are sent as structured arguments and are never evaluated by a shell.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.secondary)
+                }
+                Spacer()
+                if let origin = store.startDraft.origin {
+                    SourceBadge(origin: origin, states: store.sourceStates)
+                }
+            }
+            ActionSourcePicker(
+                title: "Coordinator source",
+                origins: store.availableActionOrigins,
+                selection: $store.startDraft.origin
+            )
+            .disabled(store.startDraft.leaseID != nil)
+            .accessibilityIdentifier("start-server-source")
             TextField("Name", text: $store.startDraft.name)
+                .accessibilityIdentifier("start-server-name")
             TextField("Project", text: $store.startDraft.project)
+                .disabled(store.startDraft.leaseID != nil)
+                .accessibilityIdentifier("start-server-project")
             TextField("Working directory", text: $store.startDraft.cwd)
-            TextField("Command using {port}", text: $store.startDraft.command, axis: .vertical)
-                .lineLimit(2...4)
+                .accessibilityIdentifier("start-server-cwd")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("COMMAND")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Theme.secondary)
+                TextField("Executable", text: $store.startDraft.executable)
+                    .accessibilityLabel("Server executable")
+                    .accessibilityIdentifier("start-server-executable")
+                ForEach($store.startDraft.argumentRows) { $argument in
+                    HStack(spacing: 8) {
+                        TextField("Argument", text: $argument.value)
+                            .accessibilityIdentifier("start-server-argument-\(argument.id.uuidString)")
+                        Button {
+                            store.startDraft.argumentRows.removeAll { $0.id == argument.id }
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Remove command argument")
+                    }
+                }
+                Button {
+                    store.startDraft.argumentRows.append(StartServerArgument(value: ""))
+                } label: {
+                    Label("Add Argument", systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+                .accessibilityIdentifier("start-server-add-argument")
+            }
+            .padding(12)
+            .background(Theme.control)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
             HStack {
                 TextField("Port range", text: $store.startDraft.range)
+                    .disabled(store.startDraft.leaseID != nil)
                 TextField("Exact port", text: $store.startDraft.preferredPort)
+                    .disabled(store.startDraft.leaseID != nil)
                 TextField("Health URL", text: $store.startDraft.healthURL)
             }
             Text("Exact port is optional. When set, the coordinator reserves only that port.")
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.secondary)
+            if store.startDraft.leaseID != nil {
+                Label(
+                    "Using reserved port \(store.startDraft.preferredPort) from \(store.startDraft.origin?.label ?? "selected source")",
+                    systemImage: "link.badge.plus"
+                )
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.blue)
+                    .accessibilityIdentifier("start-server-lease-summary")
+                    .accessibilityHint("Exact lease identity is available in the lease result details")
+                Text("The lease source, project, and exact port are fixed. A health URL must use the leased port.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.secondary)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
                 Button("Start") { store.startServer() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(store.startDraft.name.isEmpty || store.startDraft.command.isEmpty || !preferredPortIsValid)
+                    .disabled(!startIsValid)
+                    .accessibilityIdentifier("start-server-submit")
             }
         }
         .padding(24)
-        .frame(width: 620)
+        .frame(width: 640)
     }
 
     private var preferredPortIsValid: Bool {
@@ -1372,6 +2488,47 @@ struct StartServerSheet: View {
         guard !value.isEmpty else { return true }
         guard let port = Int(value) else { return false }
         return (1...65535).contains(port)
+    }
+
+    private var startIsValid: Bool {
+        !store.startDraft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !store.startDraft.executable.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !store.startDraft.arguments.contains { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            && preferredPortIsValid
+            && startDestinationIsAvailable
+            && leaseBindingIsValid
+    }
+
+    private var startDestinationIsAvailable: Bool {
+        guard let origin = store.startDraft.origin,
+              let identity = store.startDraftResourceIdentity
+        else { return false }
+        return store.mutationAvailability(
+            kind: .startServer,
+            origin: origin,
+            resource: identity,
+            leaseID: store.startDraft.leaseID,
+            projectPath: store.startDraft.project
+        ).isAllowed
+    }
+
+    private var leaseBindingIsValid: Bool {
+        guard let leaseID = store.startDraft.leaseID else { return true }
+        guard let origin = store.startDraft.origin,
+              let lease = store.leaseResults.values.first(where: {
+                  $0.leaseID == leaseID && $0.identity.origin.id == origin.id
+              }),
+              lease.canStartServer
+        else { return false }
+        let expectedProject = lease.project ?? store.actionProjectPath
+        guard store.startDraft.project == expectedProject,
+              store.startDraft.agent == lease.agent,
+              store.startDraft.range == "\(lease.port)-\(lease.port)",
+              store.startDraft.preferredPort == String(lease.port)
+        else { return false }
+        let healthURL = store.startDraft.healthURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !healthURL.isEmpty else { return true }
+        return URLComponents(string: healthURL)?.port == lease.port
     }
 }
 
@@ -1385,16 +2542,34 @@ struct LeaseSheet: View {
                 .font(.title2.bold())
             Text("The coordinator will reserve a free port for this project.")
                 .foregroundStyle(.secondary)
+            ActionSourcePicker(
+                title: "Coordinator source",
+                origins: store.availableActionOrigins,
+                selection: $store.leaseOrigin
+            )
+            .accessibilityIdentifier("lease-source")
+            DetailLine(label: "Project", value: store.actionProjectPath)
             TextField("Range", text: $store.leaseRange)
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
                 Button("Lease") { store.leasePort() }
                     .keyboardShortcut(.defaultAction)
+                    .disabled(!leaseDestinationIsAvailable)
             }
         }
         .padding(24)
         .frame(width: 420)
+    }
+
+    private var leaseDestinationIsAvailable: Bool {
+        guard let origin = store.leaseOrigin else { return false }
+        return store.mutationAvailability(
+            kind: .leasePort,
+            origin: origin,
+            resource: nil,
+            projectPath: store.actionProjectPath
+        ).isAllowed
     }
 }
 
@@ -1602,25 +2777,38 @@ struct DevServersEmptyState: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
-                Image(systemName: "terminal")
+                Group {
+                    if store.isLoading {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "terminal")
+                            .foregroundStyle(Theme.blue)
+                    }
+                }
                     .foregroundStyle(Theme.blue)
                     .frame(width: 28, height: 28)
                     .background(Theme.blue.opacity(0.12))
                     .clipShape(RoundedRectangle(cornerRadius: 7))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("No managed dev servers in this scope")
+                    Text(store.isLoading ? "Loading managed dev servers" : "No managed dev servers in this scope")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("Use the coordinator before opening default ports.")
+                    Text(store.isLoading ? "Waiting for configured coordinator sources." : "Use the coordinator before opening default ports.")
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.secondary)
                 }
                 Spacer()
-                ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus") {
-                    store.showingLeaseSheet = true
-                }
-                ToolbarButton(title: "Start", systemImage: "play.circle.fill", tint: Theme.green) {
-                    store.prepareStartDraft()
-                    store.showingStartSheet = true
+                if !store.isLoading {
+                    ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus") {
+                        store.prepareLeaseDraft()
+                        store.showingLeaseSheet = true
+                    }
+                    .disabled(!unscopedActionAllowed(store, kind: .leasePort))
+                    ToolbarButton(title: "Start", systemImage: "play.circle.fill", tint: Theme.green) {
+                        store.prepareStartDraft()
+                        store.showingStartSheet = true
+                    }
+                    .disabled(!unscopedActionAllowed(store, kind: .startServer))
                 }
             }
 
@@ -1637,6 +2825,50 @@ struct DevServersEmptyState: View {
         .background(Theme.control)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
+        .accessibilityIdentifier("dev-server-empty-state")
+    }
+}
+
+struct ResourceEmptyState: View {
+    @ObservedObject var store: OpsStore
+    let title: String
+    let message: String
+    let systemImage: String
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Group {
+                if store.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: systemImage)
+                        .foregroundStyle(Theme.blue)
+                }
+            }
+            .frame(width: 28, height: 28)
+            .background(Theme.blue.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(store.isLoading ? "Loading inventory" : title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(store.isLoading ? "Waiting for configured coordinator sources." : message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            if !store.isLoading {
+                Button("Refresh") { store.refresh() }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(14)
+        .background(Theme.control)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
+        .accessibilityIdentifier("resource-empty-state-\(safeAccessibilityID(title))")
     }
 }
 
@@ -1728,6 +2960,8 @@ struct ToolbarButton: View {
         }
         .buttonStyle(.plain)
         .help(title)
+        .accessibilityLabel(title)
+        .accessibilityIdentifier("toolbar-action-\(safeAccessibilityID(title))")
         .background(Theme.control)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
@@ -1798,7 +3032,7 @@ struct EnvironmentPicker: View {
             }
         }
         .buttonStyle(.plain)
-        .help(projectPath.isEmpty ? "All coordinator projects" : projectPath)
+        .help(projectPath.isEmpty ? "All coordinator projects" : "Scoped to \(environmentTitle(projectPath))")
         .padding(.horizontal, 9)
         .frame(height: 36)
         .background(Theme.control)
@@ -1825,12 +3059,20 @@ struct EnvironmentPicker: View {
 }
 
 struct BackupSafetyLabel: View {
-    let hasBackup: Bool
+    let backup: BackupRecord?
 
     var body: some View {
-        Label(hasBackup ? "Protected" : "Unprotected", systemImage: hasBackup ? "shield.checkered" : "exclamationmark.shield")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(hasBackup ? Theme.green : Theme.orange)
+        VStack(alignment: .leading, spacing: 2) {
+            Label(
+                checksumLabel(backup?.checksum),
+                systemImage: backup?.checksum == .verified ? "checkmark.seal.fill" : "exclamationmark.shield"
+            )
+            .foregroundStyle(checksumColor(backup?.checksum))
+            Text("Restore \(restoreTestLabel(backup?.restoreTest).lowercased())")
+                .font(.system(size: 10))
+                .foregroundStyle(restoreTestColor(backup?.restoreTest))
+        }
+            .font(.system(size: 11, weight: .semibold))
             .lineLimit(1)
             .frame(minWidth: 108, alignment: .leading)
     }
@@ -1841,15 +3083,21 @@ struct StatusBar: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            StatusDot(status: statusSeverity)
-            Text(statusText)
+            Circle()
+                .fill(healthLevelColor(store.presentationSnapshot.level))
+                .frame(width: 9, height: 9)
+                .accessibilityHidden(true)
+            Text(store.presentationSnapshot.statusMessage)
                 .font(.system(size: 12))
-                .foregroundStyle(statusSeverity == "running" ? Theme.secondary : Theme.orange)
+                .foregroundStyle(healthLevelColor(store.presentationSnapshot.level))
+                .lineLimit(1)
             Spacer()
-            Text("Lease: \(store.inventory.leases.first?.id.prefix(8) ?? "none")")
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.secondary)
-            Text("Coordinator: \(store.inventory.coordinatorHome ?? "not found")")
+            if let lease = store.latestLeaseResult {
+                Text("Lease port \(lease.port) · \(lease.managementStatus)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondary)
+            }
+            Text("Sources \(store.healthSummary.loadedSourceCount)/\(store.sourceStates.count)")
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.secondary)
         }
@@ -1857,22 +3105,6 @@ struct StatusBar: View {
         .frame(height: 38)
     }
 
-    private var overloadedProject: ProjectUsage? {
-        store.inventory.projectUsage.first(where: isHighProjectUsage)
-    }
-
-    private var statusText: String {
-        if let error = store.lastError { return error }
-        if let overloadedProject {
-            return "High load: \(overloadedProject.name ?? overloadedProject.project.map(shortProject) ?? overloadedProject.projectKey ?? "project") \(formatCPU(overloadedProject.cpuPercent)) / \(formatBytes(overloadedProject.memoryBytes))"
-        }
-        return "All systems nominal"
-    }
-
-    private var statusSeverity: String {
-        if store.lastError != nil || overloadedProject != nil { return "unhealthy" }
-        return "running"
-    }
 }
 
 struct StatusDot: View {
@@ -1882,6 +3114,27 @@ struct StatusDot: View {
         Circle()
             .fill(statusColor(status))
             .frame(width: 9, height: 9)
+            .accessibilityHidden(true)
+    }
+}
+
+struct SourceBadge: View {
+    let origin: CoordinatorOrigin?
+    let states: [CoordinatorSourceState]
+
+    var body: some View {
+        let phase = origin.flatMap { origin in states.first(where: { $0.origin.id == origin.id })?.phase }
+        Label(origin?.label ?? "Unknown source", systemImage: "point.3.connected.trianglepath.dotted")
+            .labelStyle(.titleAndIcon)
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(sourcePhaseColor(phase))
+            .padding(.horizontal, 5)
+            .frame(height: 18)
+            .background(sourcePhaseColor(phase).opacity(0.1))
+            .clipShape(Capsule())
+            .lineLimit(1)
+            .help("Source \(origin?.label ?? "unavailable") · \(phase?.rawValue ?? "unknown")")
+            .accessibilityLabel("Source \(origin?.label ?? "unknown"), \(phase?.rawValue ?? "unknown")")
     }
 }
 
@@ -1915,6 +3168,9 @@ struct MapLeaf: View {
     let kind: MapLeafKind
     let status: String?
     let isSelected: Bool
+    let canStop: Bool
+    let toggleEnabled: Bool
+    let restartEnabled: Bool
     let selectAction: () -> Void
     let toggleAction: () -> Void
     let restartAction: () -> Void
@@ -1941,12 +3197,14 @@ struct MapLeaf: View {
                     title: canStop ? "Stop" : "Run",
                     systemImage: canStop ? "stop.fill" : "play.fill",
                     tint: canStop ? Theme.orange : Theme.green,
+                    enabled: toggleEnabled,
                     action: toggleAction
                 )
                 SidebarActionButton(
                     title: "Restart",
                     systemImage: "arrow.clockwise",
                     tint: Theme.secondary,
+                    enabled: restartEnabled,
                     action: restartAction
                 )
             }
@@ -1960,9 +3218,6 @@ struct MapLeaf: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
-    private var canStop: Bool {
-        canStopStatus(status)
-    }
 }
 
 enum MapLeafKind {
@@ -1991,6 +3246,7 @@ struct SidebarActionButton: View {
     let title: String
     let systemImage: String
     let tint: Color
+    var enabled = true
     let action: () -> Void
 
     var body: some View {
@@ -2005,6 +3261,9 @@ struct SidebarActionButton: View {
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.08)))
         .help(title)
+        .accessibilityLabel(title)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
     }
 }
 
@@ -2027,69 +3286,39 @@ struct SidebarRowButtonStyle: ButtonStyle {
     }
 }
 
-struct SidebarStopAllButtonStyle: ButtonStyle {
-    @Environment(\.isEnabled) private var isEnabled
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(isEnabled ? Theme.primary : Theme.secondary.opacity(0.7))
-            .lineLimit(1)
-            .minimumScaleFactor(0.85)
-            .frame(maxWidth: .infinity, minHeight: 30)
-            .background(background(configuration: configuration))
-            .clipShape(RoundedRectangle(cornerRadius: 7))
-            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Theme.red.opacity(isEnabled ? 0.28 : 0.08)))
-    }
-
-    private func background(configuration: Configuration) -> Color {
-        if !isEnabled { return Theme.control }
-        return configuration.isPressed ? Theme.red.opacity(0.28) : Theme.red.opacity(0.14)
-    }
-}
-
 struct SidebarFooterView: View {
     @ObservedObject var store: OpsStore
+    @State private var showingSources = false
 
     var body: some View {
         GeometryReader { proxy in
             let contentWidth = sidebarFooterContentWidth(totalWidth: proxy.size.width)
-            VStack(spacing: 10) {
-                Button {
-                    store.stopAll()
-                } label: {
-                    Label("Stop all", systemImage: "stop.circle.fill")
-                        .frame(width: contentWidth)
-                }
-                .buttonStyle(SidebarStopAllButtonStyle())
-                .frame(width: contentWidth, height: 30)
-                .disabled(!store.hasStoppableResources)
-
+            VStack(spacing: 9) {
                 HStack(spacing: 8) {
-                    Circle()
-                        .fill(store.connected ? Theme.green : Theme.red)
-                        .frame(width: 9, height: 9)
-                        .fixedSize()
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                        .foregroundStyle(healthLevelColor(store.presentationSnapshot.level))
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Coordinator")
+                        Text(store.presentationSnapshot.statusTitle)
                             .font(.system(size: 12, weight: .medium))
                             .lineLimit(1)
-                        Text(store.connected ? "Connected" : "Waiting")
+                        Text("Sources \(store.healthSummary.loadedSourceCount)/\(store.sourceStates.count)")
                             .font(.system(size: 11))
                             .foregroundStyle(Theme.secondary)
                             .lineLimit(1)
                     }
                     .layoutPriority(1)
-                    Spacer(minLength: 8)
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Theme.secondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                        .help("Coordinator")
+                    Spacer(minLength: 4)
                 }
                 .frame(width: contentWidth, alignment: .leading)
                 .frame(minHeight: 28, alignment: .leading)
+                Button {
+                    showingSources = true
+                } label: {
+                    Label("Manage Sources", systemImage: "slider.horizontal.3")
+                        .frame(width: contentWidth)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("manage-coordinator-sources")
             }
             .frame(width: contentWidth, alignment: .topLeading)
             .padding(.leading, sidebarFooterInset)
@@ -2097,6 +3326,137 @@ struct SidebarFooterView: View {
         }
         .frame(height: sidebarFooterHeight)
         .clipped()
+        .sheet(isPresented: $showingSources) {
+            CoordinatorSourcesSheet(store: store)
+        }
+    }
+}
+
+struct CoordinatorSourceDraftRow: Identifiable {
+    let id: UUID
+    var label: String
+    var home: String
+    var enabled: Bool
+
+    init(id: UUID = UUID(), configuration: CoordinatorSourceConfiguration) {
+        self.id = id
+        label = configuration.label
+        home = configuration.home
+        enabled = configuration.enabled
+    }
+
+    var configuration: CoordinatorSourceConfiguration {
+        CoordinatorSourceConfiguration(label: label, home: home, enabled: enabled)
+    }
+}
+
+struct CoordinatorSourcesSheet: View {
+    @ObservedObject var store: OpsStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft = CoordinatorConfiguration()
+    @State private var sourceRows: [CoordinatorSourceDraftRow] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Coordinator Sources").font(.title2.bold())
+                    Text("Configure typed local coordinator homes and refresh behavior.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.secondary)
+                }
+                Spacer()
+                Button("Refresh now") { store.refresh() }
+            }
+
+            ScrollView {
+                VStack(spacing: 10) {
+                    ForEach($sourceRows) { $source in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                TextField("Source label", text: $source.label)
+                                Toggle("Enabled", isOn: $source.enabled)
+                                Button(role: .destructive) {
+                                    sourceRows.removeAll { $0.id == source.id }
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .accessibilityLabel("Remove source \(source.label.isEmpty ? "without a label" : source.label)")
+                            }
+                            TextField("Absolute coordinator home", text: $source.home)
+                            .font(.system(size: 12, design: .monospaced))
+                        }
+                        .padding(10)
+                        .background(Theme.control)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    Button {
+                        sourceRows.append(
+                            CoordinatorSourceDraftRow(
+                                configuration: CoordinatorSourceConfiguration(label: "", home: "", enabled: true)
+                            )
+                        )
+                    } label: {
+                        Label("Add Source", systemImage: "plus")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(minHeight: 250, maxHeight: 390)
+
+            HStack(spacing: 10) {
+                Text("Refresh")
+                    .font(.system(size: 12, weight: .semibold))
+                Picker("Refresh", selection: $draft.refreshPolicy.mode) {
+                    Text("Manual").tag(CoordinatorRefreshMode.manual)
+                    Text("Interval").tag(CoordinatorRefreshMode.interval)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 190)
+                if draft.refreshPolicy.mode == .interval {
+                    TextField(
+                        "Seconds",
+                        value: Binding(
+                            get: { draft.refreshPolicy.intervalSeconds ?? 2.5 },
+                            set: { draft.refreshPolicy.intervalSeconds = $0 }
+                        ),
+                        format: .number
+                    )
+                    .frame(width: 90)
+                }
+                Spacer()
+            }
+            .onChange(of: draft.refreshPolicy.mode) { _, mode in
+                draft.refreshPolicy.intervalSeconds = mode == .manual ? nil : (draft.refreshPolicy.intervalSeconds ?? 2.5)
+            }
+
+            if let warning = store.configurationWarning {
+                Text(warning)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button("Cancel") { dismiss() }
+                Spacer()
+                Button("Save") {
+                    draft.sources = sourceRows.map(\.configuration)
+                    if store.saveCoordinatorConfiguration(draft) {
+                        dismiss()
+                        store.refresh()
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 650, height: 590)
+        .background(Theme.background)
+        .onAppear {
+            store.reloadCoordinatorConfiguration()
+            draft = store.coordinatorConfiguration
+            sourceRows = draft.sources.map { CoordinatorSourceDraftRow(configuration: $0) }
+        }
     }
 }
 
@@ -2146,17 +3506,6 @@ struct InspectorActionStack<Content: View>: View {
     }
 }
 
-struct WindowDots: View {
-    var body: some View {
-        HStack(spacing: 7) {
-            Circle().fill(Color(red: 1, green: 0.37, blue: 0.33))
-            Circle().fill(Color(red: 1, green: 0.76, blue: 0.24))
-            Circle().fill(Color(red: 0.26, green: 0.82, blue: 0.31))
-        }
-        .frame(width: 54, height: 12)
-    }
-}
-
 struct IconButton: View {
     let title: String
     let systemImage: String
@@ -2174,6 +3523,7 @@ struct IconButton: View {
                 .frame(width: 24, height: 24)
         }
         .help(title)
+        .accessibilityLabel(title)
         .buttonStyle(IconButtonStyle())
     }
 }
@@ -2199,6 +3549,258 @@ struct URLButtonStyle: ButtonStyle {
             .clipShape(RoundedRectangle(cornerRadius: 7))
             .overlay(RoundedRectangle(cornerRadius: 7).stroke(Theme.blue.opacity(0.25)))
     }
+}
+
+@MainActor
+func actionAllowed(_ store: OpsStore, kind: ActionKind, identity: ResourceIdentity?) -> Bool {
+    guard let identity else { return false }
+    return store.mutationAvailability(kind: kind, origin: identity.origin, resource: identity).isAllowed
+}
+
+@MainActor
+func serverActionAllowed(_ store: OpsStore, kind: ActionKind, server: ManagedServer) -> Bool {
+    guard let identity = server.resourceIdentity,
+          let project = server.project?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !project.isEmpty,
+          !server.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return false }
+    return store.mutationAvailability(
+        kind: kind,
+        origin: identity.origin,
+        resource: identity,
+        projectPath: project
+    ).isAllowed
+}
+
+@MainActor
+func dockerActionAllowed(_ store: OpsStore, kind: ActionKind, container: DockerContainer) -> Bool {
+    guard let identity = container.resourceIdentity,
+          let name = container.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !name.isEmpty
+    else { return false }
+    if kind != .dockerLogs {
+        guard let project = container.project?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !project.isEmpty
+        else { return false }
+    }
+    return store.mutationAvailability(
+        kind: kind,
+        origin: identity.origin,
+        resource: identity,
+        projectPath: container.project
+    ).isAllowed
+}
+
+@MainActor
+func databaseProtectionActionAllowed(
+    _ store: OpsStore,
+    kind: ActionKind,
+    database: DockerContainer
+) -> Bool {
+    guard let identity = database.databaseIdentity,
+          identity.containerID?.isEmpty == false,
+          !identity.container.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          !identity.database.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          let resource = databaseProtectionIdentity(database)
+    else { return false }
+    if kind == .backupDatabase {
+        guard let project = database.project?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !project.isEmpty
+        else { return false }
+    }
+    return store.mutationAvailability(
+        kind: kind,
+        origin: resource.origin,
+        resource: resource,
+        projectPath: database.project
+    ).isAllowed
+}
+
+@MainActor
+func unscopedActionAllowed(_ store: OpsStore, kind: ActionKind) -> Bool {
+    store.availableActionOrigins.contains {
+        store.mutationAvailability(kind: kind, origin: $0, resource: nil).isAllowed
+    }
+}
+
+@MainActor
+func projectActionAllowed(_ store: OpsStore, group: ProjectGroup, kind: ActionKind) -> Bool {
+    store.projectMutationAvailability(kind: kind, group: group).isAllowed
+}
+
+@MainActor
+func dockerCapabilityUnavailable(_ store: OpsStore) -> Bool {
+    capabilityUnavailable(store, capability: .docker)
+}
+
+@MainActor
+func databaseCapabilityUnavailable(_ store: OpsStore) -> Bool {
+    capabilityUnavailable(store, capability: .database)
+}
+
+@MainActor
+func capabilityUnavailable(_ store: OpsStore, capability: CoordinatorCapability) -> Bool {
+    let states = store.capabilityStates.filter { $0.capability == capability }
+    guard !states.isEmpty else { return !store.isLoading }
+    return states.allSatisfy { $0.phase == .unavailable }
+}
+
+func normalizedBulkIdentity(_ identity: ResourceIdentity?) -> ResourceIdentity? {
+    guard let identity else { return nil }
+    if identity.kind == .database {
+        return ResourceIdentity(origin: identity.origin, kind: .docker, nativeID: identity.nativeID)
+    }
+    return identity
+}
+
+func databaseProtectionIdentity(_ database: DockerContainer) -> ResourceIdentity? {
+    guard let identity = database.databaseIdentity, let containerID = identity.containerID else { return nil }
+    return ResourceIdentity(
+        origin: identity.origin,
+        kind: .database,
+        nativeID: "\(containerID)/\(identity.container)/\(identity.database)"
+    )
+}
+
+func newestBackupRecord(for database: DockerContainer, records: [BackupRecord]) -> BackupRecord? {
+    guard let identity = database.databaseIdentity else { return nil }
+    return records
+        .filter { $0.identity.isSameImmutableDatabase(as: identity) }
+        .max { $0.createdAt < $1.createdAt }
+}
+
+func formatDate(_ date: Date) -> String {
+    date.formatted(date: .abbreviated, time: .shortened)
+}
+
+func formatTimestamp(_ value: String?) -> String {
+    guard let value else { return "No expiry recorded" }
+    return parseISOTimestamp(value).map(formatDate) ?? value
+}
+
+func formatDatabaseBytes(_ bytes: Int64?) -> String {
+    guard let bytes else { return "Unavailable" }
+    let formatter = ByteCountFormatter()
+    formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
+    formatter.countStyle = .file
+    return formatter.string(fromByteCount: bytes)
+}
+
+func formatUptime(_ uptime: UptimeValue) -> String {
+    switch uptime {
+    case .measured(let interval):
+        let seconds = max(0, Int(interval))
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
+    case .unavailable:
+        return "—"
+    }
+}
+
+func uptimeHelp(_ uptime: UptimeValue) -> String {
+    switch uptime {
+    case .measured(let interval): return "Measured from the recorded start time: \(Int(max(0, interval))) seconds"
+    case .unavailable(let reason): return "Uptime unavailable: \(reason)"
+    }
+}
+
+func checksumLabel(_ state: ChecksumState?) -> String {
+    switch state {
+    case .verified: return "Verified"
+    case .failed: return "Failed"
+    case .unknown: return "Not verified"
+    case nil: return "No backup"
+    }
+}
+
+func checksumColor(_ state: ChecksumState?) -> Color {
+    switch state {
+    case .verified: return Theme.green
+    case .failed: return Theme.red
+    case .unknown, nil: return Theme.orange
+    }
+}
+
+func restoreTestLabel(_ state: RestoreTestState?) -> String {
+    switch state {
+    case .passed: return "Passed"
+    case .failed: return "Failed"
+    case .notRun: return "Not run"
+    case nil: return "No backup"
+    }
+}
+
+func restoreTestColor(_ state: RestoreTestState?) -> Color {
+    switch state {
+    case .passed: return Theme.green
+    case .failed: return Theme.red
+    case .notRun, nil: return Theme.orange
+    }
+}
+
+func evidenceIcon(_ state: String) -> String {
+    let normalized = state.lowercased()
+    if normalized.contains("failed") || normalized.contains("not verified") || normalized.contains("unverified") {
+        return "xmark.circle.fill"
+    }
+    if normalized.contains("verified") || normalized.contains("passed") || normalized.contains("transactional") {
+        return "checkmark.circle.fill"
+    }
+    return "circle.dashed"
+}
+
+func healthLevelColor(_ level: HealthLevel) -> Color {
+    switch level {
+    case .nominal: return Theme.green
+    case .busy: return Theme.blue
+    case .degraded: return Theme.orange
+    case .unhealthy, .unavailable: return Theme.red
+    }
+}
+
+func inventoryBannerIcon(_ level: HealthLevel) -> String {
+    switch level {
+    case .nominal: return "checkmark.circle.fill"
+    case .busy: return "clock.arrow.circlepath"
+    case .degraded: return "exclamationmark.triangle.fill"
+    case .unhealthy: return "exclamationmark.octagon.fill"
+    case .unavailable: return "wifi.slash"
+    }
+}
+
+func sourcePhaseColor(_ phase: CoordinatorSourcePhase?) -> Color {
+    switch phase {
+    case .loaded: return Theme.green
+    case .loading: return Theme.blue
+    case .stale: return Theme.orange
+    case .failed, nil: return Theme.red
+    }
+}
+
+func actionPhaseColor(_ phase: ActionPhase) -> Color {
+    switch phase {
+    case .queued, .running: return Theme.blue
+    case .succeeded: return Theme.green
+    case .failed, .timedOut: return Theme.red
+    case .cancelled: return Theme.orange
+    }
+}
+
+func isTerminalActionPhase(_ phase: ActionPhase) -> Bool {
+    switch phase {
+    case .queued, .running: return false
+    case .succeeded, .failed, .timedOut, .cancelled: return true
+    }
+}
+
+func safeAccessibilityID(_ value: String) -> String {
+    value.unicodeScalars.map { scalar in
+        CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : "-"
+    }.joined()
 }
 
 enum Theme {
@@ -2312,8 +3914,9 @@ func ratePairValue(inbound: Double?, outbound: Double?, inboundLabel: String, ou
 
 func statusColor(_ status: String?) -> Color {
     let value = (status ?? "").lowercased()
-    if value.contains("unhealthy") || value.contains("failed") || value.contains("dead") { return Theme.red }
-    if value.contains("start") || value.contains("warning") || value.contains("degraded") { return Theme.orange }
+    if value.contains("unhealthy") || value.contains("failed") || value.contains("dead") || value.contains("unavailable") { return Theme.red }
+    if value.contains("start") || value.contains("warning") || value.contains("degraded") || value.contains("partial") || value.contains("stale") { return Theme.orange }
+    if value.contains("loading") || value.contains("running action") { return Theme.blue }
     if isStoppedStatus(status) || value.contains("stop") || value.isEmpty { return Theme.secondary }
     return Theme.green
 }
@@ -2332,20 +3935,29 @@ func shortProject(_ path: String?) -> String {
 /// `usage_key` is a persisted coordinator contract: `path:<canonical repo
 /// path>` for attributed groups, `name:<derived key>` for unclaimed ones.
 func projectPath(fromUsageKey key: String) -> String? {
-    guard key.hasPrefix("path:") else { return nil }
-    let path = String(key.dropFirst("path:".count))
+    let usageKey = key.components(separatedBy: "|project-group|").last ?? key
+    guard usageKey.hasPrefix("path:") else { return nil }
+    let path = String(usageKey.dropFirst("path:".count))
     return path.isEmpty ? nil : path
 }
 
+func projectDisplayLabel(_ path: String?) -> String {
+    guard let path else { return "Unavailable" }
+    let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return "Unavailable" }
+    return shortProject(trimmed)
+}
+
 func projectName(fromUsageKey key: String) -> String {
-    if let path = projectPath(fromUsageKey: key) {
+    let usageKey = key.components(separatedBy: "|project-group|").last ?? key
+    if let path = projectPath(fromUsageKey: usageKey) {
         return shortProject(path)
     }
-    if key.hasPrefix("name:") {
-        let name = String(key.dropFirst("name:".count))
+    if usageKey.hasPrefix("name:") {
+        let name = String(usageKey.dropFirst("name:".count))
         if !name.isEmpty { return name }
     }
-    return key
+    return usageKey == "stray:other" ? "other" : usageKey
 }
 
 func environmentTitle(_ path: String) -> String {
