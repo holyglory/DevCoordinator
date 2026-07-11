@@ -326,12 +326,21 @@ class socket:
             "80",
             "443",
             "29876",
+            "--wait-timeout-seconds",
+            "10",
+            "--poll-interval-seconds",
+            "0.02",
         ],
         environment=environment,
     )
     require_success(completed, "legacy stopped-boundary CLI")
     report = json.loads(completed.stdout)
     require(report.get("closed_ports") == [80, 443, 29876], "stopped boundary lost exact production ports")
+    require(report.get("attempts") == 1, "clean stopped boundary unexpectedly retried")
+    require(
+        isinstance(report.get("elapsed_seconds"), (int, float)),
+        "stopped boundary omitted elapsed-time evidence",
+    )
     probes = [json.loads(line) for line in probe_log.read_text(encoding="utf-8").splitlines()]
     require(
         probes == [["127.0.0.1", 80], ["127.0.0.1", 443], ["127.0.0.1", 29876]],

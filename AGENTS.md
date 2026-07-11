@@ -120,23 +120,28 @@ These rules apply to Codex and Claude Code in this repository.
   missing-as-empty normalization to security-relevant unit properties.
 - During an existing-host Console cutover, preserve checksummed per-process
   evidence for a five-second observed-clean cgroup window before the runtime
-  override and another five-second observed-clean window immediately before
-  stop. Use bounded user-space polling at 20 ms or tighter; do not describe it
-  as kernel-continuous observation. Retain every observed transition, reset the
-  candidate window on extra children or an overlong observation gap, and never
-  allowlist children or rely on fixed point samples that can land inside a
-  shorter internal gap. Read membership and stable identities twice in order,
-  and reject a captured PID whose identity changes between those passes;
-  confirming only the PID-number membership after reading identity is not a
-  safe terminal observation. Missing/reused captured processes fail immediately,
-  while persistent extras must exhaust a bounded timeout. A `running` or
-  incomplete ledger left by `SIGKILL`, power loss, or storage failure is never
-  success. Every copied mutation phase must enable fail-fast shell semantics.
+  override, then a 250-millisecond observed-clean handoff immediately before
+  the durable stop marker and in-memory rollback flag. Use bounded user-space
+  polling at 20 ms or tighter for the stable window and 10 ms for the handoff;
+  do not describe either as kernel-continuous observation. Retain every
+  observed transition, reset the candidate window on extra children or an
+  overlong observation gap, and never allowlist children or rely on fixed point
+  samples that can land inside a shorter internal gap. Read membership and
+  stable identities twice in order, and reject a captured PID whose identity
+  changes between those passes; confirming only the PID-number membership
+  after reading identity is not a safe terminal observation. Missing/reused
+  captured processes fail immediately, while persistent extras must exhaust a
+  bounded timeout. A `running` or incomplete ledger left by `SIGKILL`, power
+  loss, or storage failure is never success. Every copied mutation phase must
+  enable fail-fast shell semantics.
   Use a new timestamped backup path for every attempt and retain each backup
   after both success and failure. The verifier-return-to-stop interval remains
-  a residual race: protect it with `KillMode=process` and require the immediate
-  post-stop exact process-identity, cgroup, and listener verifier before any
-  state copy.
+  a residual race: protect it with `KillMode=process`, then wait only a bounded
+  period for the post-stop exact process-identity, cgroup, and listener boundary
+  before any state copy. Retain every cgroup member PID/start-time identity
+  observed during that wait and reject a process that leaves the cgroup without
+  exiting. Persist the successful stopped-boundary JSON in the private backup
+  and refresh and verify the manifest before the first writer-free state copy.
   Treat every repo helper invoked by a private cutover script as an executable
   interface contract. Before the script may touch a service, exercise every
   exact helper subcommand, enum/phase value, and required flag against the

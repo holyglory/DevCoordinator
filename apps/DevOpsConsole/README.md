@@ -494,24 +494,96 @@ and clean-window evidence.
 
 ```bash
 set -euo pipefail
+
+# The real transaction owns this topology-aware refresh function. It cleans
+# temporary files, atomically replaces both ledgers, verifies the exact regular
+# file set and directory/symlink topology, and syncs before returning.
+refresh_manifest() {
+  sudo bash -s -- "$CUTOVER_BACKUP" <<'SH'
+set -Eeuo pipefail
+cd "$1"
+tree_tmp="$(mktemp .TREE.json.XXXXXX)"
+sha_tmp="$(mktemp .SHA256SUMS.XXXXXX)"
+trap 'rm -f "$tree_tmp" "$sha_tmp"' EXIT
+python3 - "$PWD" "$tree_tmp" <<'PY'
+import json, os, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+output = pathlib.Path(sys.argv[2])
+records = []
+def visit(directory, prefix):
+    with os.scandir(directory) as scan:
+        entries = sorted(scan, key=lambda item: os.fsencode(item.name))
+    for entry in entries:
+        relative = entry.name if not prefix else f"{prefix}/{entry.name}"
+        mode = entry.stat(follow_symlinks=False).st_mode
+        if stat.S_ISDIR(mode):
+            records.append({"path": relative, "type": "directory"})
+            visit(entry.path, relative)
+        elif stat.S_ISLNK(mode):
+            records.append({"path": relative, "type": "symlink", "target": os.readlink(entry.path)})
+        elif not stat.S_ISREG(mode):
+            raise SystemExit(f"unsupported backup node: {entry.path}")
+visit(root, "")
+payload = (json.dumps(records, indent=2, sort_keys=True) + "\n").encode("utf-8")
+with output.open("wb") as handle:
+    handle.write(payload)
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+chmod 600 "$tree_tmp"
+mv -f "$tree_tmp" TREE.json
+find . -type f ! -name SHA256SUMS ! -name '.SHA256SUMS.*' -print0 \
+  | LC_ALL=C sort -z | xargs -0 -r sha256sum > "$sha_tmp"
+sha256sum --check "$sha_tmp" >/dev/null
+chmod 600 "$sha_tmp"
+mv -f "$sha_tmp" SHA256SUMS
+sha256sum --check SHA256SUMS >/dev/null
+python3 - "$PWD" <<'PY'
+import json, os, pathlib, stat, sys
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+expected_files = set()
+for line in (root / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+    _digest, name = line.split(None, 1)
+    expected_files.add(name.removeprefix("./"))
+actual_files = set()
+structure = []
+def visit(directory, prefix):
+    with os.scandir(directory) as scan:
+        entries = sorted(scan, key=lambda item: os.fsencode(item.name))
+    for entry in entries:
+        relative = entry.name if not prefix else f"{prefix}/{entry.name}"
+        mode = entry.stat(follow_symlinks=False).st_mode
+        if stat.S_ISDIR(mode):
+            structure.append({"path": relative, "type": "directory"})
+            visit(entry.path, relative)
+        elif stat.S_ISLNK(mode):
+            structure.append({"path": relative, "type": "symlink", "target": os.readlink(entry.path)})
+        elif stat.S_ISREG(mode):
+            if relative != "SHA256SUMS":
+                actual_files.add(relative)
+        else:
+            raise SystemExit(f"unsupported backup node: {entry.path}")
+visit(root, "")
+if actual_files != expected_files:
+    raise SystemExit(
+        f"backup regular-file set mismatch: missing={sorted(expected_files-actual_files)}, "
+        f"extra={sorted(actual_files-expected_files)}"
+    )
+expected_structure = json.loads((root / "TREE.json").read_text(encoding="utf-8"))
+if structure != expected_structure:
+    raise SystemExit("backup directory/symlink topology mismatch after refresh")
+PY
+sync -f .
+SH
+}
+
 python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_cutover_boundary.py" \
   --evidence "$CUTOVER_BACKUP/legacy-processes.json" \
   --ledger "$CUTOVER_BACKUP/cgroup-samples.stable.json" \
   --continuous-clean-seconds 5 \
   --wait-timeout-seconds 30 --poll-interval-seconds 0.02 \
   --max-observation-gap-seconds 0.1
-
-MANIFEST_TMP="$(mktemp "$CUTOVER_BACKUP/.SHA256SUMS.XXXXXX")"
-cleanup_manifest_tmp() { rm -f "$MANIFEST_TMP"; }
-trap cleanup_manifest_tmp EXIT
-(cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS \
-  ! -name '.SHA256SUMS.*' -print0 | LC_ALL=C sort -z | \
-  xargs -0 -r sha256sum > "$MANIFEST_TMP")
-(cd "$CUTOVER_BACKUP" && sha256sum --check "$MANIFEST_TMP" >/dev/null)
-chmod 600 "$MANIFEST_TMP"
-mv -f "$MANIFEST_TMP" "$CUTOVER_BACKUP/SHA256SUMS"
-trap - EXIT
-(cd "$CUTOVER_BACKUP" && sha256sum --check SHA256SUMS >/dev/null)
+refresh_manifest
 ```
 
 Before stopping the legacy unit, apply a runtime-only `KillMode=process`
@@ -519,20 +591,29 @@ override and verify it loaded. This prevents an agent-created process appearing
 after the cgroup snapshot from being silently killed. Stop terminates only the
 Console main process; the guarded cleanup sends TERM (then bounded KILL) only
 when the captured coordinator PID still has the captured start time and exact
-command. After the override reload, the verifier requires a five-second
-observed-clean window and returns at its end, binding a second
-checksummed ledger as closely as possible to the actual stop boundary. The
-verifier return and `systemctl stop` remain two distinct operations, so bounded
-polling cannot eliminate that residual interval. `KillMode=process` prevents a
-new child in that interval from being implicitly killed with the Console, and
-the immediate post-stop exact identity/cgroup/listener verifier rejects any
-unexpected survivor before state is copied. Together those checks make the
-residual race fail closed rather than pretending it does not exist.
-The following check requires both exact process instances, all three
-listeners, and the old cgroup to be empty. Any extra survivor is a hard blocker:
-move its attributed process tree to a dedicated scope or stop/restart it
-explicitly with health evidence before reusing the unit name. Then remove the
-runtime override and perform the final staged state sync.
+command. After the override reload, the verifier requires a 250-millisecond
+observed-clean handoff and returns at its end, binding a second checksummed
+ledger as closely as possible to the actual stop boundary. The earlier
+five-second window proves the stable topology; this short second window avoids
+misclassifying the coordinator's real inventory subprocesses as persistent
+foreign writers. The
+verifier return and `systemctl stop` remain distinct operations: the assembled
+transaction durably writes the service-stop phase marker and sets its in-memory
+rollback flag between them. Bounded polling cannot eliminate that residual
+interval. `KillMode=process` prevents a new child in that interval from being
+implicitly killed with the Console, and the post-stop exact
+identity/cgroup/listener verifier waits up to ten seconds for already-started
+transient descendants to drain. It retains the PID and start time of every
+cgroup member observed during that wait, so a child cannot pass merely by
+leaving the cgroup while it remains alive. It requires both captured process
+instances, every observed child instance, all three listeners, and the old
+cgroup to be gone before state is copied. A persistent survivor remains a hard
+blocker: move its attributed process tree to a dedicated scope or stop/restart
+it explicitly with health evidence before reusing the unit name. The successful
+JSON report is stored in the private backup and covered by its manifest.
+Together those checks make the residual race fail closed rather than pretending
+it does not exist. Then remove the runtime override and perform the final staged
+state sync.
 
 From the successful stop boundary until relocation completes, this is an
 operator-exclusive coordinator mutation window. Do not run another coordinator
@@ -562,15 +643,25 @@ test "$(systemctl show --property KillMode --value devops-console.service)" = pr
 python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_cutover_boundary.py" \
   --evidence "$CUTOVER_BACKUP/legacy-processes.json" \
   --ledger "$CUTOVER_BACKUP/cgroup-samples.prestop-final.json" \
-  --continuous-clean-seconds 5 \
-  --wait-timeout-seconds 30 --poll-interval-seconds 0.01 \
-  --max-observation-gap-seconds 0.1
+  --continuous-clean-seconds 0.25 \
+  --wait-timeout-seconds 5 --poll-interval-seconds 0.01 \
+  --max-observation-gap-seconds 0.05
+python3 "$DEVCOORDINATOR_ROOT/scripts/write_cutover_phase_marker.py" \
+  --marker "$CUTOVER_BACKUP/service-stop.attempted" \
+  --phase service-stop-attempted
+STOP_ATTEMPTED_THIS_RUN=1
 sudo systemctl stop devops-console.service
 python3 "$DEVCOORDINATOR_ROOT/scripts/terminate_captured_legacy_process.py" \
   --evidence "$CUTOVER_BACKUP/legacy-processes.json" --role coordinator \
   --timeout-seconds 5
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_legacy_cutover_stopped.py" \
-  --evidence "$CUTOVER_BACKUP/legacy-processes.json" --ports 80 443 29876
+  --evidence "$CUTOVER_BACKUP/legacy-processes.json" --ports 80 443 29876 \
+  --wait-timeout-seconds 10 --poll-interval-seconds 0.02 \
+  > "$CUTOVER_BACKUP/evidence/legacy-stopped-boundary.json"
+chmod 600 "$CUTOVER_BACKUP/evidence/legacy-stopped-boundary.json"
+
+# Bind the successful stopped boundary before the first writer-free state copy.
+refresh_manifest
 
 install -d -m 700 "$CUTOVER_BACKUP/user-runtime.writer-free"
 for name in routes.json ui-prefs.json; do
@@ -732,18 +823,7 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(result, indent=2, sort_keys=True
 PY
 chmod 600 "$CUTOVER_BACKUP"/post-cutover-*.txt
 
-MANIFEST_TMP="$(mktemp "$CUTOVER_BACKUP/.SHA256SUMS.XXXXXX")"
-cleanup_manifest_tmp() { rm -f "$MANIFEST_TMP"; }
-trap cleanup_manifest_tmp EXIT
-(cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS \
-  ! -name '.SHA256SUMS.*' -print0 | LC_ALL=C sort -z | \
-  xargs -0 -r sha256sum > "$MANIFEST_TMP")
-(cd "$CUTOVER_BACKUP" && sha256sum --check "$MANIFEST_TMP" >/dev/null)
-chmod 600 "$MANIFEST_TMP"
-mv -f "$MANIFEST_TMP" "$CUTOVER_BACKUP/SHA256SUMS"
-trap - EXIT
-(cd "$CUTOVER_BACKUP" && sha256sum --check SHA256SUMS >/dev/null)
-sync -f "$CUTOVER_BACKUP"
+refresh_manifest
 ```
 
 The verifier requires the exact assignment, reused server ID, running and
@@ -781,7 +861,8 @@ if [ -f "$CUTOVER_BACKUP/legacy-processes.json" ]; then
     --timeout-seconds 5
 fi
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_legacy_cutover_stopped.py" \
-  --evidence "$CUTOVER_BACKUP/legacy-processes.json" --ports 80 443 29876
+  --evidence "$CUTOVER_BACKUP/legacy-processes.json" --ports 80 443 29876 \
+  --wait-timeout-seconds 10 --poll-interval-seconds 0.02
 if grep -qx absent "$CUTOVER_BACKUP/dev-coordinator.service.preexisting" && \
    systemctl cat dev-coordinator.service >/dev/null 2>&1; then
   sudo systemctl disable dev-coordinator.service

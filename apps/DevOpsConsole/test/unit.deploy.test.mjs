@@ -195,11 +195,22 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'terminate_captured_legacy_process.py',
     'check_legacy_cutover_stopped.py',
     '--continuous-clean-seconds 5',
+    '--continuous-clean-seconds 0.25',
     '--wait-timeout-seconds 30 --poll-interval-seconds 0.02',
-    '--wait-timeout-seconds 30 --poll-interval-seconds 0.01',
+    '--wait-timeout-seconds 5 --poll-interval-seconds 0.01',
+    '--wait-timeout-seconds 10 --poll-interval-seconds 0.02',
     '--max-observation-gap-seconds 0.1',
+    '--max-observation-gap-seconds 0.05',
     'cgroup-samples.stable.json',
     'cgroup-samples.prestop-final.json',
+    'STOP_ATTEMPTED_THIS_RUN=1',
+    'legacy-stopped-boundary.json',
+    '.TREE.json.XXXXXX',
+    '.SHA256SUMS.XXXXXX',
+    'trap \'rm -f "$tree_tmp" "$sha_tmp"\' EXIT',
+    'backup directory/symlink topology mismatch after refresh',
+    'sync -f .',
+    'every observed child instance',
     'find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +',
     '90-cutover-killmode.conf',
     'KillMode --value devops-console.service',
@@ -271,17 +282,39 @@ test('existing-host runbook models the legacy Console child-coordinator topology
   assert.equal((cutover.match(/\.rfind\("\)"\)/g) ?? []).length, 1);
   assert.equal(
     (cutover.match(/--continuous-clean-seconds 5/g) ?? []).length,
-    2,
-    'both pre-override and final pre-stop gates require five observed-clean seconds',
+    1,
+    'the stable-topology gate requires one five-second observed-clean window',
   );
   assert.equal(
     (cutover.match(/--max-observation-gap-seconds 0\.1/g) ?? []).length,
-    2,
-    'both observed-clean gates enforce the same explicit maximum observation gap',
+    1,
+    'the stable-topology gate enforces its explicit maximum observation gap',
   );
   assert.match(
     cutover,
-    /--continuous-clean-seconds 5 \\\n  --wait-timeout-seconds 30 --poll-interval-seconds 0\.01 \\\n  --max-observation-gap-seconds 0\.1\nsudo systemctl stop devops-console\.service/,
+    /--continuous-clean-seconds 0\.25 \\\n  --wait-timeout-seconds 5 --poll-interval-seconds 0\.01 \\\n  --max-observation-gap-seconds 0\.05\npython3 "\$DEVCOORDINATOR_ROOT\/scripts\/write_cutover_phase_marker\.py" \\\n  --marker "\$CUTOVER_BACKUP\/service-stop\.attempted" \\\n  --phase service-stop-attempted\nSTOP_ATTEMPTED_THIS_RUN=1\nsudo systemctl stop devops-console\.service/,
+    'the short final handoff must flow only through the durable marker and rollback flag into the service stop',
+  );
+  const stoppedEvidenceIndex = cutover.indexOf(
+    'chmod 600 "$CUTOVER_BACKUP/evidence/legacy-stopped-boundary.json"',
+  );
+  const stoppedManifestIndex = cutover.indexOf(
+    'refresh_manifest\n',
+    stoppedEvidenceIndex,
+  );
+  const writerFreeCopyIndex = cutover.indexOf(
+    'install -d -m 700 "$CUTOVER_BACKUP/user-runtime.writer-free"',
+  );
+  assert.ok(
+    stoppedEvidenceIndex >= 0
+      && stoppedManifestIndex > stoppedEvidenceIndex
+      && writerFreeCopyIndex > stoppedManifestIndex,
+    'the stopped-boundary JSON must be manifest-bound before any writer-free state copy',
+  );
+  assert.match(
+    cutover,
+    /refresh_manifest\(\) \{[\s\S]*?trap 'rm -f "\$tree_tmp" "\$sha_tmp"' EXIT[\s\S]*?mv -f "\$tree_tmp" TREE\.json[\s\S]*?mv -f "\$sha_tmp" SHA256SUMS[\s\S]*?backup directory\/symlink topology mismatch after refresh[\s\S]*?sync -f \.[\s\S]*?\nSH\n\}/,
+    'manifest refresh must clean temporary files, atomically bind topology and hashes, verify, and sync',
   );
   assert.equal(
     (cutover.match(/sudo rm -f \/run\/systemd\/system\/devops-console\.service\.d\/90-cutover-killmode\.conf/g) ?? []).length,
