@@ -230,6 +230,7 @@ find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type d -exec chmod 700 {} +
 find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +
 
 cp -a "$CONSOLE_ENV" "$CUTOVER_BACKUP/console.env"
+sha256sum "$CONSOLE_ENV" > "$CUTOVER_BACKUP/console.env.sha256"
 cp -a "$CONSOLE_STATE" "$CUTOVER_BACKUP/devops-console-state"
 cp -a "$COORDINATOR_HOME" "$CUTOVER_BACKUP/agent-coordinator"
 if [ -d "$LEGACY_STATE" ]; then
@@ -244,8 +245,17 @@ for unit in dev-coordinator.service devops-console.service; do
   fi
   systemctl is-enabled "$unit" > "$CUTOVER_BACKUP/$unit.enabled" 2>&1 || true
 done
-(cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS -print0 \
-  | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS)
+MANIFEST_TMP="$(mktemp "$CUTOVER_BACKUP/.SHA256SUMS.XXXXXX")"
+cleanup_manifest_tmp() { rm -f "$MANIFEST_TMP"; }
+trap cleanup_manifest_tmp EXIT
+(cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS \
+  ! -name '.SHA256SUMS.*' -print0 | LC_ALL=C sort -z | \
+  xargs -0 -r sha256sum > "$MANIFEST_TMP")
+(cd "$CUTOVER_BACKUP" && sha256sum --check "$MANIFEST_TMP" >/dev/null)
+chmod 600 "$MANIFEST_TMP"
+mv -f "$MANIFEST_TMP" "$CUTOVER_BACKUP/SHA256SUMS"
+trap - EXIT
+(cd "$CUTOVER_BACKUP" && sha256sum --check SHA256SUMS >/dev/null)
 chmod -R go-rwx "$CUTOVER_BACKUP"
 ```
 
@@ -306,6 +316,21 @@ autostarts the coordinator as a detached child in the same systemd cgroup.
 There is no old `dev-coordinator.service` to restart. Before stopping anything,
 capture the Console main PID, cgroup, exact child coordinator PID/start time/
 command, listener evidence, exact lease ID, and exact Console server ID.
+
+For every real attempt, create a new timestamped private backup path and
+assemble these phases into one `0600` script inside that fresh backup. Never
+reuse or amend a prior attempt's path. Run `bash -n` on those exact bytes, hash
+the script into the verified backup manifest, and execute that same hash.
+Retain the backup, script, ledgers, and manifest after success or failure; a
+retry starts with another fresh path. The transaction handler
+must cover `ERR`, `INT`, `TERM`, `HUP`, and incomplete `EXIT`: before the stop
+marker it removes the runtime override, reloads systemd, proves the old unit and
+public TLS are healthy, and after the marker it runs phase-aware rollback. Run
+rollback itself with strict fail-fast semantics, require all captured writers
+and listeners to be gone before restoring state, and verify the restored exact
+Node/old-coordinator cgroup and listener topology. Remove any success marker on
+failure; create it only after a complete manifest verification, then bind that
+marker with one final verified manifest refresh.
 
 ```bash
 set -euo pipefail
@@ -396,29 +421,46 @@ sudo ss -ltnp '( sport = :80 or sport = :443 or sport = :29876 )' \
 chmod 600 "$CUTOVER_BACKUP/pre-cutover-listeners.txt"
 ```
 
-Immediately before applying the runtime override, require five consecutive
-one-second clean legacy cgroup samples. The sampler writes a private,
-independently checksummed JSON
-ledger after every sample, including the start time and exact argv of every
-accessible member. A mismatch therefore preserves attribution evidence before
-failing. Retry only with a new backup after the extra process is attributed and
-has exited or been moved/stopped through its own lifecycle. Refresh the backup
-manifest after adding the later process, listener, identity, and sample
-evidence.
+Immediately before applying the runtime override, require one five-second
+observed-clean legacy cgroup window. The verifier uses bounded user-space
+polling every 20 ms; this is not a kernel-continuous monitor and cannot prove
+the absence of a process that starts and exits entirely between observations.
+It writes a private independently checksummed JSON ledger for every observed
+membership/identity transition and one-second checkpoint, and resets the
+candidate window whenever an extra child appears or an observation is delayed
+beyond its bound. Extra children are attributed evidence, never allowlisted. A
+membership pass is followed by stable identity reads, a confirming membership
+pass, and confirmed identity rereads, so PID reuse between those reads fails
+unsafe. A missing/reused captured process fails immediately; a workload that never
+supplies the full clean window fails at the bounded timeout. This distinguishes
+a true inter-cycle quiet window from shorter observed gaps inside the Console's
+normal inventory burst without relying on lucky point samples.
+Only a terminal successful ledger counts as proof. `SIGKILL`, host power loss,
+or storage loss can leave the ledger `running` or otherwise incomplete; such a
+ledger must never be accepted as success.
+Refresh the backup manifest after adding the later process, listener, identity,
+and clean-window evidence.
 
 ```bash
 set -euo pipefail
 python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_cutover_boundary.py" \
   --evidence "$CUTOVER_BACKUP/legacy-processes.json" \
   --ledger "$CUTOVER_BACKUP/cgroup-samples.stable.json" \
-  --samples 5 --interval-seconds 1
+  --continuous-clean-seconds 5 \
+  --wait-timeout-seconds 30 --poll-interval-seconds 0.02 \
+  --max-observation-gap-seconds 0.1
 
 MANIFEST_TMP="$(mktemp "$CUTOVER_BACKUP/.SHA256SUMS.XXXXXX")"
+cleanup_manifest_tmp() { rm -f "$MANIFEST_TMP"; }
+trap cleanup_manifest_tmp EXIT
 (cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS \
   ! -name '.SHA256SUMS.*' -print0 | LC_ALL=C sort -z | \
-  xargs -0 sha256sum > "$MANIFEST_TMP")
+  xargs -0 -r sha256sum > "$MANIFEST_TMP")
+(cd "$CUTOVER_BACKUP" && sha256sum --check "$MANIFEST_TMP" >/dev/null)
+chmod 600 "$MANIFEST_TMP"
 mv -f "$MANIFEST_TMP" "$CUTOVER_BACKUP/SHA256SUMS"
-chmod 600 "$CUTOVER_BACKUP/SHA256SUMS"
+trap - EXIT
+(cd "$CUTOVER_BACKUP" && sha256sum --check SHA256SUMS >/dev/null)
 ```
 
 Before stopping the legacy unit, apply a runtime-only `KillMode=process`
@@ -426,8 +468,15 @@ override and verify it loaded. This prevents an agent-created process appearing
 after the cgroup snapshot from being silently killed. Stop terminates only the
 Console main process; the guarded cleanup sends TERM (then bounded KILL) only
 when the captured coordinator PID still has the captured start time and exact
-command. The sampler runs once more after the override reload and directly
-before stop, binding a second checksummed ledger to the actual stop boundary.
+command. After the override reload, the verifier requires a five-second
+observed-clean window and returns at its end, binding a second
+checksummed ledger as closely as possible to the actual stop boundary. The
+verifier return and `systemctl stop` remain two distinct operations, so bounded
+polling cannot eliminate that residual interval. `KillMode=process` prevents a
+new child in that interval from being implicitly killed with the Console, and
+the immediate post-stop exact identity/cgroup/listener verifier rejects any
+unexpected survivor before state is copied. Together those checks make the
+residual race fail closed rather than pretending it does not exist.
 The following check requires both exact process instances, all three
 listeners, and the old cgroup to be empty. Any extra survivor is a hard blocker:
 move its attributed process tree to a dedicated scope or stop/restart it
@@ -462,13 +511,25 @@ test "$(systemctl show --property KillMode --value devops-console.service)" = pr
 python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_cutover_boundary.py" \
   --evidence "$CUTOVER_BACKUP/legacy-processes.json" \
   --ledger "$CUTOVER_BACKUP/cgroup-samples.prestop-final.json" \
-  --samples 1 --interval-seconds 0
+  --continuous-clean-seconds 5 \
+  --wait-timeout-seconds 30 --poll-interval-seconds 0.01 \
+  --max-observation-gap-seconds 0.1
 sudo systemctl stop devops-console.service
 python3 "$DEVCOORDINATOR_ROOT/scripts/terminate_captured_legacy_process.py" \
   --evidence "$CUTOVER_BACKUP/legacy-processes.json" --role coordinator \
   --timeout-seconds 5
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_legacy_cutover_stopped.py" \
   --evidence "$CUTOVER_BACKUP/legacy-processes.json" --ports 80 443 29876
+
+install -d -m 700 "$CUTOVER_BACKUP/user-runtime.writer-free"
+for name in routes.json ui-prefs.json; do
+  test -f "$LEGACY_STATE/$name"
+  install -m 600 "$LEGACY_STATE/$name" \
+    "$CUTOVER_BACKUP/user-runtime.writer-free/$name"
+done
+sha256sum "$CUTOVER_BACKUP/user-runtime.writer-free/routes.json" \
+  "$CUTOVER_BACKUP/user-runtime.writer-free/ui-prefs.json" \
+  > "$CUTOVER_BACKUP/user-runtime.writer-free.sha256"
 
 # This is the first lossless state checkpoint: every captured legacy writer
 # and listener has been proved stopped, so the state cannot change underneath
@@ -503,6 +564,10 @@ python3 "$DEVCOORDINATOR_ROOT/scripts/migrate_legacy_console_runtime.py" \
   --coordinator-home "$COORDINATOR_HOME" \
   --devcoordinator-root "$DEVCOORDINATOR_ROOT" \
   --backup-dir "$CUTOVER_BACKUP/legacy-migration-final" --sync-state-only
+cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/routes.json" \
+  "$CONSOLE_STATE/routes.json"
+cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/ui-prefs.json" \
+  "$CONSOLE_STATE/ui-prefs.json"
 
 install -m 600 "$COORDINATOR_HOME/state.json" \
   "$CUTOVER_BACKUP/coordinator-state.pre-relocate.json"
@@ -569,15 +634,38 @@ curl --fail --silent --show-error --output /dev/null \
   https://console.vr.ae/healthz > "$CUTOVER_BACKUP/post-cutover-public-health.txt"
 grep -Eq '^status=200 remote=[^[:space:]]+ tls=0$' \
   "$CUTOVER_BACKUP/post-cutover-public-health.txt"
+sha256sum --check "$CUTOVER_BACKUP/console.env.sha256"
+cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/routes.json" \
+  "$CONSOLE_STATE/routes.json"
+cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/ui-prefs.json" \
+  "$CONSOLE_STATE/ui-prefs.json"
+python3 - "$CONSOLE_STATE" "$CUTOVER_BACKUP/user-runtime-counts.json" <<'PY'
+import json, pathlib, sys
+state = pathlib.Path(sys.argv[1])
+routes = json.loads((state / "routes.json").read_text(encoding="utf-8"))["routes"]
+hidden = json.loads((state / "ui-prefs.json").read_text(encoding="utf-8"))["hidden"]
+if not isinstance(routes, dict) or not isinstance(hidden, dict):
+    raise SystemExit("invalid route or UI-preference schema after cutover")
+result = {
+    "routes": len(routes),
+    "hidden_preference_owners": len(hidden),
+    "hidden_preferences": sum(len(value) for value in hidden.values() if isinstance(value, list)),
+}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+PY
 chmod 600 "$CUTOVER_BACKUP"/post-cutover-*.txt
 
 MANIFEST_TMP="$(mktemp "$CUTOVER_BACKUP/.SHA256SUMS.XXXXXX")"
+cleanup_manifest_tmp() { rm -f "$MANIFEST_TMP"; }
+trap cleanup_manifest_tmp EXIT
 (cd "$CUTOVER_BACKUP" && find . -type f ! -name SHA256SUMS \
   ! -name '.SHA256SUMS.*' -print0 | LC_ALL=C sort -z | \
-  xargs -0 sha256sum > "$MANIFEST_TMP")
+  xargs -0 -r sha256sum > "$MANIFEST_TMP")
+(cd "$CUTOVER_BACKUP" && sha256sum --check "$MANIFEST_TMP" >/dev/null)
+chmod 600 "$MANIFEST_TMP"
 mv -f "$MANIFEST_TMP" "$CUTOVER_BACKUP/SHA256SUMS"
-chmod 600 "$CUTOVER_BACKUP/SHA256SUMS"
-(cd "$CUTOVER_BACKUP" && sha256sum --check SHA256SUMS)
+trap - EXIT
+(cd "$CUTOVER_BACKUP" && sha256sum --check SHA256SUMS >/dev/null)
 sync -f "$CUTOVER_BACKUP"
 ```
 
@@ -675,8 +763,9 @@ sudo systemctl start devops-console.service
 Verify the restored Console cgroup again contains its exact Node main process
 and one child coordinator on 29876, while the split coordinator unit is absent
 or restored to its recorded prior state. Re-run TLS health and login before
-ending rollback. Do not delete the old checkout or private backup after a
-successful cutover.
+ending rollback. Retain the old checkout and the immutable private backup after
+every attempted cutover, whether it succeeds or fails. Never reuse a failed
+attempt's backup path for a retry.
 
 Both units run as `holyglory`. The coordinator binds only loopback and owns the
 external coordinator state and private token. The Console requires that unit,

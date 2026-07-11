@@ -148,8 +148,10 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'verify_legacy_cutover_boundary.py',
     'terminate_captured_legacy_process.py',
     'check_legacy_cutover_stopped.py',
-    '--samples 5 --interval-seconds 1',
-    '--samples 1 --interval-seconds 0',
+    '--continuous-clean-seconds 5',
+    '--wait-timeout-seconds 30 --poll-interval-seconds 0.02',
+    '--wait-timeout-seconds 30 --poll-interval-seconds 0.01',
+    '--max-observation-gap-seconds 0.1',
     'cgroup-samples.stable.json',
     'cgroup-samples.prestop-final.json',
     'find "$CONSOLE_STATE" "$COORDINATOR_HOME" -type f -exec chmod 600 {} +',
@@ -158,6 +160,9 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'pre-cutover-identities.json',
     '"server_id": servers[0]["id"]',
     '--sync-state-only',
+    'user-runtime.writer-free/routes.json',
+    'user-runtime.writer-free/ui-prefs.json',
+    'sha256sum --check "$CUTOVER_BACKUP/console.env.sha256"',
     'coordinator-state.poststop.json',
     'coordinator-state.pre-relocate.json',
     'state-migration.attempted',
@@ -181,14 +186,32 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'check_loaded_systemd_paths.py',
     'resolved-unit-paths.json',
     'sha256sum --check SHA256SUMS',
+    'For every real attempt, create a new timestamped private backup path',
+    'Retain the backup, script, ledgers, and manifest after success or failure',
+    'not a kernel-continuous monitor',
+    'can leave the ledger `running` or otherwise incomplete',
   ]) assert.ok(cutover.includes(marker), marker);
 
   assert.doesNotMatch(cutover, /systemctl restart dev-coordinator\.service/);
   assert.doesNotMatch(cutover, /MainPID --value dev-coordinator\.service/);
   assert.doesNotMatch(cutover, /\[ -s [^\n]*cgroup\.procs/);
   assert.doesNotMatch(cutover, /assert status\(/);
+  assert.doesNotMatch(cutover, /--samples(?:\s|=)/, 'cutover must not use point-sample mode');
   assert.equal((cutover.match(/\.rfind\("\)"\)/g) ?? []).length, 1);
-  assert.match(cutover, /--samples 1 --interval-seconds 0\nsudo systemctl stop devops-console\.service/);
+  assert.equal(
+    (cutover.match(/--continuous-clean-seconds 5/g) ?? []).length,
+    2,
+    'both pre-override and final pre-stop gates require five observed-clean seconds',
+  );
+  assert.equal(
+    (cutover.match(/--max-observation-gap-seconds 0\.1/g) ?? []).length,
+    2,
+    'both observed-clean gates enforce the same explicit maximum observation gap',
+  );
+  assert.match(
+    cutover,
+    /--continuous-clean-seconds 5 \\\n  --wait-timeout-seconds 30 --poll-interval-seconds 0\.01 \\\n  --max-observation-gap-seconds 0\.1\nsudo systemctl stop devops-console\.service/,
+  );
   assert.equal(
     (cutover.match(/sudo rm -f \/run\/systemd\/system\/devops-console\.service\.d\/90-cutover-killmode\.conf/g) ?? []).length,
     3,
@@ -237,7 +260,7 @@ test('existing-host runbook models the legacy Console child-coordinator topology
   const stableSamples = cutover.indexOf('cgroup-samples.stable.json');
   const finalSamples = cutover.indexOf('cgroup-samples.prestop-final.json');
   const poststopCheckpoint = cutover.indexOf('coordinator-state.poststop.json');
-  const trapCleared = cutover.indexOf('trap - EXIT');
+  const trapCleared = cutover.indexOf('trap - EXIT', poststopCheckpoint);
   const stoppedBoundaryChecks = [...cutover.matchAll(/scripts\/check_legacy_cutover_stopped\.py/g)]
     .map((match) => match.index);
   const relocate = cutover.indexOf('port relocate --agent');

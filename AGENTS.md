@@ -119,8 +119,24 @@ These rules apply to Codex and Claude Code in this repository.
   output and must-reject non-empty override fixtures; never apply a global
   missing-as-empty normalization to security-relevant unit properties.
 - During an existing-host Console cutover, preserve checksummed per-process
-  evidence for repeated clean cgroup samples and recheck immediately before
-  stop. Every copied mutation phase must enable fail-fast shell semantics.
+  evidence for a five-second observed-clean cgroup window before the runtime
+  override and another five-second observed-clean window immediately before
+  stop. Use bounded user-space polling at 20 ms or tighter; do not describe it
+  as kernel-continuous observation. Retain every observed transition, reset the
+  candidate window on extra children or an overlong observation gap, and never
+  allowlist children or rely on fixed point samples that can land inside a
+  shorter internal gap. Read membership and stable identities twice in order,
+  and reject a captured PID whose identity changes between those passes;
+  confirming only the PID-number membership after reading identity is not a
+  safe terminal observation. Missing/reused captured processes fail immediately,
+  while persistent extras must exhaust a bounded timeout. A `running` or
+  incomplete ledger left by `SIGKILL`, power loss, or storage failure is never
+  success. Every copied mutation phase must enable fail-fast shell semantics.
+  Use a new timestamped backup path for every attempt and retain each backup
+  after both success and failure. The verifier-return-to-stop interval remains
+  a residual race: protect it with `KillMode=process` and require the immediate
+  post-stop exact process-identity, cgroup, and listener verifier before any
+  state copy.
   Never treat state copied while a writer is active as lossless; checkpoint
   only after verified shutdown and immediately before relocation, and bind
   rollback to durable phase markers. Parse Linux `/proc/PID/stat` around its

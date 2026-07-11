@@ -1,5 +1,44 @@
 # Decision History
 
+## 2026-07-11 - Cutover readiness is a bounded observed-clean window, not lucky point samples
+
+Decision: Existing-host cutover now waits for one five-second observed-clean
+legacy cgroup window before the runtime override and another five-second
+observed-clean window immediately before stop. The verifier uses bounded
+user-space polling at 20 ms or tighter; it is not a kernel-continuous monitor.
+It durably records every observed membership/identity transition and one-second
+checkpoint, resets on every extra child or overlong observation gap, fails
+immediately when a captured PID disappears/reuses/changes identity, and fails
+on timeout when no full window exists. Each observation reads cgroup membership,
+reads stable identities, confirms membership again, and then rereads every
+confirmed identity; a PID reused between those passes is therefore unsafe, not
+clean. No child command is allowlisted. Only a
+terminal successful ledger is evidence: `SIGKILL`, host power loss, or storage
+loss may leave `running` or incomplete evidence, which never counts as success.
+Every attempt receives a new timestamped backup path, and every backup is
+retained after success or failure.
+
+Why: Production retry evidence showed the legacy coordinator legitimately
+spawns Git root discovery and Docker `ps`, `stats`, and `inspect` children while
+the Console samples inventory. A 30-second 5 ms trace captured 182 membership
+changes. Internal exact gaps reached about 3.3 seconds, while true inter-cycle
+gaps were about 6.4 seconds. The old five point samples could fail randomly on
+an attributed child or, conversely, miss activity between samples. Operator
+attempts that tuned a point-in-time precheck merely moved the race; every one
+failed before the stop marker and left the legacy TLS service healthy.
+
+Result: The realistic self-test includes a 3.2-second internal clean gap that
+must be rejected, a later five-second inter-cycle window that must pass, a
+periodic-child workload that must time out, and captured-PID reuse that must
+fail immediately rather than being waited through, including reuse on the
+would-be terminal success observation between the first identity pass and the
+confirmed membership/identity pass. The durable ledger retains
+the attributed transient command/start evidence and its own verified checksum.
+There remains a bounded interval between verifier return and `systemctl stop`;
+the runtime `KillMode=process` override prevents a newly appearing child from
+being hidden by the Console stop, and the immediate post-stop exact
+identity/cgroup/listener verifier rejects survivors before any state copy.
+
 ## 2026-07-11 - Split-service listener discovery must capability-match without capability propagation
 
 Decision: The production coordinator process will receive only
@@ -202,6 +241,10 @@ units and every external env, token, coordinator, Console state, and ACME path
 before a second cutover attempt.
 
 ## 2026-07-11 - Cutover preconditions are sampled and revalidated after legacy stop
+
+Status: Superseded by the five-second bounded observed-clean gates recorded
+above. The point-sample contract below is retained only as incident history and
+is not an executable cutover requirement.
 
 Decision: An existing-host Console cutover requires five consecutive one-second
 cgroup samples containing only the exact captured Node and coordinator process
