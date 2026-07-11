@@ -351,6 +351,10 @@ than replacing it with a different token.
 Useful endpoints:
 
 - `GET /v1/inventory`
+- `GET /v1/inventory/no-docker` — the same observed coordinator graph with
+  Docker discovery intentionally omitted (`available: null`, empty container
+  and PostgreSQL rows); use only for authenticated service readiness where
+  Docker availability must not control the unit start transaction.
 - `GET /v1/state`
 - `GET /v1/ports`
 - `GET /v1/ports/assignments`

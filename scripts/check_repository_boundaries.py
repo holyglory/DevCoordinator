@@ -240,6 +240,8 @@ def scan_tip(repo: Path) -> list[Finding]:
         "legacy runtime migration": repo / "scripts/migrate_legacy_console_runtime.py",
         "loaded unit preflight": repo / "scripts/check_loaded_systemd_paths.py",
         "post-cutover registration": repo / "scripts/verify_post_cutover_registration.py",
+        "Console registration readiness": repo / "scripts/check_console_registration_ready.py",
+        "coordinator HTTP contract": repo / "apps/DevOpsConsole/docs/coordinator-http-api.json",
         "legacy rollback readiness": repo / "scripts/verify_legacy_console_rollback_ready.py",
         "skill link manager": repo / "scripts/manage_skill_links.py",
     }
@@ -253,6 +255,7 @@ def scan_tip(repo: Path) -> list[Finding]:
     contract_needles = {
         "coordinator": {
             "anonymous health": 'if path == "/healthz":',
+            "authenticated no-Docker inventory": 'elif path == "/v1/inventory/no-docker":',
             "protected API path classifier": 'protected = path == "/v1" or path.startswith("/v1/")',
             "protected API authorization": "if not self._require_authorization()",
             "authenticated unsupported method": '_method_not_allowed(("GET",))',
@@ -316,6 +319,9 @@ def scan_tip(repo: Path) -> list[Finding]:
             "pinned ACME state": "ACME_WEBROOT=/home/holyglory/.local/state/devops-console/acme",
             "read-only checkout home": "ProtectHome=read-only",
             "fail-closed production preflight": "ExecStartPre=/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py",
+            "MainPID registration readiness": "ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py --unit devops-console.service --main-pid $MAINPID",
+            "bounded registration deadline": "--wait-seconds 80 --poll-interval-seconds 0.1",
+            "bounded Console startup": "TimeoutStartSec=90",
         },
         "capability integration": {
             "real capability fixture": "--ambient-caps=+",
@@ -333,6 +339,22 @@ def scan_tip(repo: Path) -> list[Finding]:
             "exact listener inode": "no exact LISTEN socket inode evidence",
             "replacement lease": "active Console lease reused the retired pre-cutover lease id",
             "bidirectional lease linkage": '"lease_id", lease_id',
+        },
+        "Console registration readiness": {
+            "authenticated no-Docker endpoint": '"/v1/inventory/no-docker"',
+            "shared exact current graph": "verify_current_registration_graph(",
+            "systemd MainPID stability": "Console systemd MainPID changed",
+            "runtime argv contract": "Console MainPID argv does not match the production contract",
+            "clean absence retry": '"pending-clean-absence"',
+            "stopped baseline retry": '"pending-stopped-baseline"',
+            "active lease conflict": "an active lease still claims the Console port",
+            "raw listener MainPID binding": "raw port listener is not the systemd MainPID",
+            "terminal deadline recheck": "observation crossed the readiness deadline",
+        },
+        "coordinator HTTP contract": {
+            "documented no-Docker route": '"/v1/inventory/no-docker"',
+            "documented readiness semantics": '"no_docker"',
+            "documented Docker omission": "docker.available=null with empty containers/postgres",
         },
         "legacy rollback readiness": {
             "fixed systemd identity": "_require_fixed_unit",

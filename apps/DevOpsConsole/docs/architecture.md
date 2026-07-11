@@ -293,7 +293,10 @@ export class CoordError extends Error {} // .status (http), .body
 ```
 - Requests may run concurrently; the coordinator serializes only short state
   reservation/commit phases and rejects conflicting lifecycle targets. Per-path timeouts:
-  `/v1/projects/*` 300s, `/v1/inventory` 60s, docker 60s, rest 15s.
+  `/v1/projects/*` 300s, `/v1/inventory` 60s, docker 60s, rest 15s. The
+  systemd-only readiness gate uses authenticated `GET /v1/inventory/no-docker`
+  so exact server/assignment/lease observation is not coupled to Docker CLI or
+  daemon availability.
 - Error bodies are `{"error": "..."}`; KeyError messages keep quotes
   (`"'agent'"`) — surface `.message` trimmed of surrounding quotes.
 - Every `/v1/*` request reads the private `COORDINATOR_TOKEN_FILE` server-side

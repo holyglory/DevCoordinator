@@ -23,7 +23,8 @@ MANAGER_BOUNDING = (
     | MODULE.CAPABILITY_BITS["cap_sys_admin"]
 )
 
-COORDINATOR = """FragmentPath=/etc/systemd/system/dev-coordinator.service
+COORDINATOR = """Type=simple
+FragmentPath=/etc/systemd/system/dev-coordinator.service
 DropInPaths=
 User=holyglory
 Group=holyglory
@@ -36,7 +37,8 @@ ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordin
 TimeoutStartUSec=20s
 ReadWritePaths=
 """
-CONSOLE = """FragmentPath=/etc/systemd/system/devops-console.service
+CONSOLE = """Type=simple
+FragmentPath=/etc/systemd/system/devops-console.service
 DropInPaths=
 User=holyglory
 Group=holyglory
@@ -47,6 +49,8 @@ AmbientCapabilities=cap_net_bind_service
 CapabilityBoundingSet=cap_net_bind_service
 ExecStartPre={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py --repo-root /home/DevCoordinator --home /home/holyglory --env-file /home/holyglory/.config/devops-console/console.env --state-dir /home/holyglory/.local/state/devops-console --acme-webroot /home/holyglory/.local/state/devops-console/acme --coordinator-home /home/holyglory/.codex/agent-coordinator --token-file /home/holyglory/.codex/agent-coordinator/api-token --require-token --wait-token-seconds 10 ; ignore_errors=no ; start_time=[n/a] ; }
 ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator COORDINATOR_AUTOSTART=0 COORDINATOR_REGISTRATION_REQUIRED=1 COORDINATOR_URL=http://127.0.0.1:29876 COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py COORDINATOR_TOKEN_FILE=/home/holyglory/.codex/agent-coordinator/api-token CODEX_AGENT_COORDINATOR_HOME=/home/holyglory/.codex/agent-coordinator STATE_DIR=/home/holyglory/.local/state/devops-console ACME_WEBROOT=/home/holyglory/.local/state/devops-console/acme /usr/bin/node bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env ; ignore_errors=no ; start_time=[n/a] ; }
+ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py --unit devops-console.service --main-pid $MAINPID --token-file /home/holyglory/.codex/agent-coordinator/api-token --project /home/DevCoordinator --name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 --expected-executable /usr/bin/node --expected-script bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole --wait-seconds 80 --poll-interval-seconds 0.1 ; ignore_errors=no ; start_time=[n/a] ; }
+TimeoutStartUSec=1min 30s
 ReadWritePaths=/home/holyglory/.local/state/devops-console
 """
 
@@ -72,6 +76,8 @@ def main() -> int:
     home = MODULE.SERVICE_HOME
 
     must_fail(COORDINATOR.replace("User=holyglory", "User=root", 1), CONSOLE, "wrong service user")
+    must_fail(COORDINATOR.replace("Type=simple", "Type=notify", 1), CONSOLE, "wrong coordinator service type")
+    must_fail(COORDINATOR, CONSOLE.replace("Type=simple", "Type=notify", 1), "wrong Console service type")
     must_fail(COORDINATOR.replace(f"{home}/.codex", "/root/.codex"), CONSOLE, "resolved manager home")
     must_fail(COORDINATOR.replace(f"{home}/.codex", "%h/.codex"), CONSOLE, "unresolved manager home")
     must_fail(COORDINATOR.replace("/etc/systemd/system", "/run/systemd/transient"), CONSOLE, "wrong coordinator fragment")
@@ -103,6 +109,12 @@ def main() -> int:
     must_fail(COORDINATOR, CONSOLE.replace("COORDINATOR_REGISTRATION_REQUIRED=1", "COORDINATOR_REGISTRATION_REQUIRED=0"), "optional production registration")
     must_fail(COORDINATOR, CONSOLE.replace("path=/usr/bin/env", "path=/tmp/env"), "Console executable path")
     must_fail(COORDINATOR, CONSOLE.replace("ExecStart=", "MissingExecStart=", 1), "missing Console command")
+    must_fail(COORDINATOR, CONSOLE.replace("ExecStartPost=", "MissingExecStartPost=", 1), "missing Console registration readiness gate")
+    must_fail(COORDINATOR, CONSOLE.replace("--main-pid $MAINPID", "--main-pid 4242", 1), "Console readiness is not tied to systemd MainPID")
+    must_fail(COORDINATOR, CONSOLE.replace("--wait-seconds 80", "--wait-seconds 60", 1), "Console readiness deadline drift")
+    must_fail(COORDINATOR, CONSOLE.replace("/usr/bin/node --expected-script", "/tmp/node --expected-script", 1), "wrong Console runtime executable")
+    must_fail(COORDINATOR, CONSOLE.replace("TimeoutStartUSec=1min 30s", "TimeoutStartUSec=infinity", 1), "unbounded Console startup")
+    must_fail(COORDINATOR, CONSOLE + "ExecStartPost=" + CONSOLE.split("ExecStartPost=", 1)[1].split("\n", 1)[0] + "\n", "duplicate Console post-start command")
     must_fail(COORDINATOR, CONSOLE.replace("FragmentPath=/etc/systemd/system", "FragmentPath=/tmp"), "wrong Console fragment")
 
     with tempfile.TemporaryDirectory(prefix="loaded-systemd-capabilities-") as temp:

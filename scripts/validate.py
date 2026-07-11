@@ -571,6 +571,8 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_coordinator_auth_boundary.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_post_cutover_registration.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_post_cutover_registration.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_console_registration_ready.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_console_registration_ready.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_write_cutover_phase_marker.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_check_legacy_cutover_stopped.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_legacy_console_rollback_ready.py")])

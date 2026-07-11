@@ -8096,6 +8096,7 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
 API_GET_ROUTES = frozenset(
     {
         "/v1/inventory",
+        "/v1/inventory/no-docker",
         "/v1/state",
         "/v1/ports",
         "/v1/ports/assignments",
@@ -8215,6 +8216,11 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         try:
             if path == "/v1/inventory":
                 result: Any = coordinated_build_inventory()
+            elif path == "/v1/inventory/no-docker":
+                # Startup/readiness checks must observe the complete
+                # coordinator registration graph without making Docker CLI or
+                # daemon availability part of the service-start boundary.
+                result = coordinated_build_inventory(include_docker=False)
             elif path in {"/v1/state", "/v1/ports", "/v1/ports/assignments", "/v1/servers"}:
                 snapshot = snapshot_coordinator_state()
                 if path == "/v1/state":

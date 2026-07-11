@@ -14,6 +14,7 @@ from secure_cutover_io import SecureIOError, open_private_parent
 
 
 PROPERTIES = (
+    "Type",
     "FragmentPath",
     "DropInPaths",
     "User",
@@ -57,6 +58,15 @@ CONSOLE_ARGV = (
     f"COORDINATOR_TOKEN_FILE={COORDINATOR_HOME}/api-token "
     f"CODEX_AGENT_COORDINATOR_HOME={COORDINATOR_HOME} STATE_DIR={CONSOLE_STATE} "
     f"ACME_WEBROOT={CONSOLE_STATE}/acme /usr/bin/node bin/devops-console.mjs --env-file {CONSOLE_ENV}"
+)
+CONSOLE_POSTSTART_ARGV = (
+    "/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py "
+    "--unit devops-console.service --main-pid $MAINPID "
+    f"--token-file {COORDINATOR_HOME}/api-token --project /home/DevCoordinator "
+    "--name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 "
+    f"--expected-executable /usr/bin/node --expected-script bin/devops-console.mjs "
+    f"--env-file {CONSOLE_ENV} --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole "
+    "--wait-seconds 80 --poll-interval-seconds 0.1"
 )
 
 LINUX_CAPABILITIES = (
@@ -114,6 +124,8 @@ def parse_properties(raw: str) -> dict[str, str]:
     for line in raw.splitlines():
         key, separator, value = line.partition("=")
         if separator and key:
+            if key in parsed:
+                raise LoadedUnitPathError(f"loaded unit output repeated {key}")
             parsed[key] = value
     return parsed
 
@@ -216,6 +228,7 @@ def validate_loaded_unit_outputs(
 
     coordinator = units["dev-coordinator.service"]
     for key, expected in {
+        "Type": "simple",
         "FragmentPath": "/etc/systemd/system/dev-coordinator.service",
         "DropInPaths": "",
         "User": "holyglory",
@@ -260,6 +273,7 @@ def validate_loaded_unit_outputs(
 
     console = units["devops-console.service"]
     for key, expected in {
+        "Type": "simple",
         "FragmentPath": "/etc/systemd/system/devops-console.service",
         "DropInPaths": "",
         "User": "holyglory",
@@ -267,6 +281,7 @@ def validate_loaded_unit_outputs(
         "WorkingDirectory": "/home/DevCoordinator/apps/DevOpsConsole",
         "Environment": "",
         "EnvironmentFiles": f"{CONSOLE_ENV} (ignore_errors=no)",
+        "TimeoutStartUSec": "1min 30s",
         "ReadWritePaths": CONSOLE_STATE,
         "AmbientCapabilities": "cap_net_bind_service",
         "CapabilityBoundingSet": "cap_net_bind_service",
@@ -274,6 +289,13 @@ def validate_loaded_unit_outputs(
         require_exact(violations, "devops-console.service", console, key, expected)
     require_command(violations, "devops-console.service", console, "ExecStartPre", CONSOLE_PREFLIGHT_ARGV)
     require_command(violations, "devops-console.service", console, "ExecStart", CONSOLE_ARGV)
+    require_command(
+        violations,
+        "devops-console.service",
+        console,
+        "ExecStartPost",
+        CONSOLE_POSTSTART_ARGV,
+    )
 
     if violations:
         raise LoadedUnitPathError("; ".join(violations))

@@ -4491,6 +4491,27 @@ else:
         check(api_exact_stopped["status"] == "stopped", "API exact-lease fixture should stop cleanly")
         api_inventory = get_json(api_port, "/v1/inventory", token=api_token)
         check("urls" in api_inventory and "docker" in api_inventory, "API inventory should expose URLs and Docker summary")
+        anonymous_no_docker = request_json(
+            api_port,
+            "GET",
+            "/v1/inventory/no-docker",
+            expected_status=401,
+        )
+        check(
+            anonymous_no_docker.get("error") == "unauthorized",
+            "no-Docker inventory must remain inside the authenticated /v1 boundary",
+        )
+        api_no_docker_inventory = get_json(
+            api_port,
+            "/v1/inventory/no-docker",
+            token=api_token,
+        )
+        check(
+            api_no_docker_inventory.get("docker")
+            == {"available": None, "containers": [], "postgres": []}
+            and api_no_docker_inventory.get("postgres") == [],
+            "authenticated no-Docker inventory must observe the graph without Docker evidence",
+        )
         api_runtime = post_json(api_port, "/v1/projects/status", {"project": str(tmp)}, token=api_token)
         check("services" in api_runtime and "ok" in api_runtime, "API project status should expose runtime report")
         api_stats = post_json(api_port, "/v1/docker/stats", {"dry_run": True}, token=api_token)

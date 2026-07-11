@@ -315,6 +315,15 @@ requires the complete anonymous/authenticated `200/401/200` contract within the
 unit's bounded start timeout. The explicit probe above records the same
 contract at the deployment boundary.
 
+`devops-console.service` likewise remains in its start transaction until its
+single pinned `ExecStartPost` observes the exact systemd `$MAINPID`, Node argv,
+working directory, and authenticated current registration graph through
+`/v1/inventory/no-docker`. The 80-second observer retries only explicit
+loopback transport startup, clean graph absence, or the exact stopped baseline
+left by relocation/a prior restart; the unit's 90-second timeout bounds the
+whole start. A foreign listener, active lease, wrong PID, malformed response,
+or graph conflict fails immediately.
+
 ### Existing-host checkout cutover
 
 The deployed legacy topology has one `devops-console.service`; its Node process
@@ -630,7 +639,9 @@ python3 "$DEVCOORDINATOR_ROOT/scripts/check_production_layout.py" \
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
   --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876
 sudo systemctl start devops-console.service
-sleep 2
+# A successful start already includes the bounded MainPID registration gate;
+# no timing sleep is part of the correctness boundary.
+systemctl is-active --quiet devops-console.service
 python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
   --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876 \
   --inventory-output "$CUTOVER_BACKUP/post-cutover-inventory.json"

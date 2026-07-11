@@ -20,6 +20,7 @@
     "GET": [
       "/healthz",
       "/v1/inventory",
+      "/v1/inventory/no-docker",
       "/v1/state",
       "/v1/ports",
       "/v1/ports/assignments",
@@ -74,6 +75,7 @@
     "operations": "short reservation/commit lock phases with same-target exclusion and bounded journal evidence"
   },
   "inventory_contract": {
+    "no_docker": "GET /v1/inventory/no-docker performs the same authenticated server/lease/assignment observation and optimistic commit while intentionally returning docker.available=null with empty containers/postgres; it is the production service-readiness surface and does not test Docker capability",
     "project_usage": "rows include stable usage_key plus authoritative server_ids and container_names",
     "docker_ownership": "Compose labels and verified coordinator sidecars are mutation authority; name similarity is read-only evidence",
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"

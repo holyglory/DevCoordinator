@@ -14,6 +14,7 @@ test('production units split coordinator ownership and keep runtime data outside
   const consoleUnit = await fsp.readFile(path.join(APP_ROOT, 'deploy', 'devops-console.service'), 'utf8');
 
   assert.match(coordinator, /api serve --host 127\.0\.0\.1 --port 29876/);
+  assert.deepEqual(coordinator.split('\n').filter((line) => line.startsWith('Type=')), ['Type=simple']);
   assert.match(coordinator, /^User=holyglory$/m);
   assert.match(coordinator, /^Group=holyglory$/m);
   assert.match(coordinator, /WorkingDirectory=\/home\/DevCoordinator/);
@@ -44,6 +45,7 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.doesNotMatch(coordinator, /0\.0\.0\.0|holyskills/i);
 
   assert.match(consoleUnit, /Requires=dev-coordinator\.service/);
+  assert.deepEqual(consoleUnit.split('\n').filter((line) => line.startsWith('Type=')), ['Type=simple']);
   assert.match(consoleUnit, /After=.*dev-coordinator\.service/);
   assert.match(consoleUnit, /^User=holyglory$/m);
   assert.match(consoleUnit, /^Group=holyglory$/m);
@@ -71,6 +73,18 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(consoleUnit, /ExecStart=.*STATE_DIR=\/home\/holyglory\/\.local\/state\/devops-console/);
   assert.match(consoleUnit, /ExecStart=.*ACME_WEBROOT=\/home\/holyglory\/\.local\/state\/devops-console\/acme/);
   assert.match(consoleUnit, /--env-file \/home\/holyglory\/\.config\/devops-console\/console\.env/);
+  assert.deepEqual(
+    consoleUnit.split('\n').filter((line) => line.startsWith('ExecStartPost=')),
+    [
+      'ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py --unit devops-console.service --main-pid $MAINPID --token-file /home/holyglory/.codex/agent-coordinator/api-token --project /home/DevCoordinator --name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 --expected-executable /usr/bin/node --expected-script bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole --wait-seconds 80 --poll-interval-seconds 0.1',
+    ],
+    'Console startup must have one exact MainPID-bound registration readiness gate',
+  );
+  assert.deepEqual(
+    consoleUnit.split('\n').filter((line) => line.startsWith('TimeoutStartSec=')),
+    ['TimeoutStartSec=90'],
+    'Console startup must bound its 80-second registration observation',
+  );
   assert.doesNotMatch(consoleUnit, /^Environment=(?:DEVCOORDINATOR_ROOT|COORDINATOR_|CODEX_AGENT_COORDINATOR_HOME|STATE_DIR)/m);
   assert.match(consoleUnit, /ReadWritePaths=\/home\/holyglory\/\.local\/state\/devops-console/);
   assert.match(consoleUnit, /UMask=0077/);
@@ -137,6 +151,8 @@ test('cutover process identity and signaling are Linux-format and PID-reuse safe
   const sampler = await fsp.readFile(path.join(scripts, 'verify_legacy_cutover_boundary.py'), 'utf8');
   const terminator = await fsp.readFile(path.join(scripts, 'terminate_captured_legacy_process.py'), 'utf8');
   const authBoundary = await fsp.readFile(path.join(scripts, 'check_coordinator_auth_boundary.py'), 'utf8');
+  const registrationReadyPath = path.join(scripts, 'check_console_registration_ready.py');
+  const registrationReady = await fsp.readFile(registrationReadyPath, 'utf8');
   assert.match(parser, /stat_text\.rfind\("\)"\)/);
   assert.match(parser, /after_comm\[19\]/);
   assert.doesNotMatch(`${parser}\n${sampler}\n${terminator}`, /split\(\)\[21\]/);
@@ -145,6 +161,8 @@ test('cutover process identity and signaling are Linux-format and PID-reuse safe
   assert.doesNotMatch(terminator, /os\.kill\(/);
   assert.match(authBoundary, /if observed != expected:/);
   assert.doesNotMatch(authBoundary, /\bassert\b/);
+  assert.doesNotMatch(registrationReady, /\bassert\b/);
+  assert.equal((await fsp.stat(registrationReadyPath)).mode & 0o777, 0o755);
 });
 
 test('existing-host runbook models the legacy Console child-coordinator topology', async () => {
@@ -212,6 +230,7 @@ test('existing-host runbook models the legacy Console child-coordinator topology
   ]) assert.ok(cutover.includes(marker), marker);
 
   assert.doesNotMatch(cutover, /systemctl restart dev-coordinator\.service/);
+  assert.doesNotMatch(cutover, /sleep 2/, 'registration correctness must not depend on a timing sleep');
   assert.doesNotMatch(cutover, /MainPID --value dev-coordinator\.service/);
   assert.doesNotMatch(cutover, /\[ -s [^\n]*cgroup\.procs/);
   assert.doesNotMatch(cutover, /assert status\(/);
