@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { loadConfig } from '../src/config.mjs';
@@ -70,6 +71,98 @@ function redactedConfig(config) {
     },
     allowedEmails: [...config.allowedEmails],
   };
+}
+
+export function productionRegistrationPlan({ config, env = process.env }) {
+  const required = env.COORDINATOR_REGISTRATION_REQUIRED === '1';
+  const productionEdge = config.httpsPort === 443 && !config.devInsecureHttp;
+  if (required && !productionEdge) {
+    throw new Error('required coordinator registration needs the production TLS edge on port 443');
+  }
+  return {
+    required,
+    shouldRegister: productionEdge && (required || !env.PORT),
+  };
+}
+
+export async function registerProductionEdge({
+  coordinator,
+  config,
+  pid = process.pid,
+  cwd = process.cwd(),
+  platform = process.platform,
+  attempts = 5,
+  delayMs = 200,
+}) {
+  const identityMatches = (identity) => {
+    const proofMatches = platform === 'linux'
+      ? (
+        identity?.source === 'proc_pid_fd'
+        && Array.isArray(identity?.listener_inodes)
+        && identity.listener_inodes.length > 0
+        && identity.listener_inodes.every((value) => /^\d+$/.test(value))
+      )
+      : (
+        identity?.source === 'platform_listener_probe'
+        && Array.isArray(identity?.listener_inodes)
+      );
+    return identity?.ok === true
+    && identity.pid === pid
+    && identity.project === config.projectRoot
+    && identity.host === '127.0.0.1'
+    && identity.port === 443
+    && (identity.cwd === config.projectRoot || identity.cwd?.startsWith(`${config.projectRoot}/`))
+    && proofMatches;
+  };
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const registered = await coordinator.serverRegister({
+        agent: 'devops-console',
+        project: config.projectRoot,
+        name: 'devops-console',
+        cwd,
+        pid,
+        port: 443,
+        url: 'https://127.0.0.1:443',
+        health_url: 'https://127.0.0.1:443/healthz',
+      });
+      if (
+        registered?.pid !== pid
+        || registered?.status !== 'running'
+        || registered?.health?.ok !== true
+        || registered?.health?.classification !== 'healthy'
+        || registered?.health?.check?.status !== 200
+        || !registered?.lease_id
+        || !identityMatches(registered?.registration_identity)
+        || !identityMatches(registered?.health?.identity)
+      ) {
+        throw new Error('coordinator returned an incomplete or mismatched registration graph');
+      }
+      return registered;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) await delay(delayMs);
+    }
+  }
+  throw new Error(
+    `coordinator self-registration failed after ${attempts} attempts: ${lastError?.message || String(lastError)}`,
+    { cause: lastError },
+  );
+}
+
+export async function completeProductionRegistration({ coordinator, config, log, required = false, attempts, delayMs }) {
+  try {
+    const result = await registerProductionEdge({ coordinator, config, attempts, delayMs });
+    log.info('registered with coordinator', { name: 'devops-console', port: 443 });
+    return result;
+  } catch (error) {
+    if (required) throw error;
+    log.warn('coordinator self-registration failed (continuing)', {
+      error: error?.message || String(error),
+    });
+    return null;
+  }
 }
 
 // The proxy's error page renderer is shared by main() and start().
@@ -382,22 +475,17 @@ async function main() {
     log.error('unhandled rejection', { error: reason?.stack || String(reason) });
   });
 
-  // Self-registration with the coordinator: only for the real prod edge.
-  // Coordinator-spawned dev instances (PORT set) and DEV_HTTP runs skip it.
-  if (!process.env.PORT && config.httpsPort === 443 && !config.devInsecureHttp) {
-    try {
-      await coordinator.serverRegister({
-        agent: 'devops-console',
-        project: config.projectRoot,
-        name: 'devops-console',
-        port: 443,
-        url: 'https://127.0.0.1:443',
-        health_url: 'https://127.0.0.1:443/healthz',
-      });
-      log.info('registered with coordinator', { name: 'devops-console', port: 443 });
-    } catch (err) {
-      log.warn('coordinator self-registration failed (continuing)', { error: err?.message || String(err) });
-    }
+  // Required production registration cannot be bypassed by a preserved PORT
+  // value in the external environment file. Optional coordinator-spawned dev
+  // instances retain the PORT-based skip.
+  const registrationPlan = productionRegistrationPlan({ config });
+  if (registrationPlan.shouldRegister) {
+    await completeProductionRegistration({
+      coordinator,
+      config,
+      log,
+      required: registrationPlan.required,
+    });
   }
 }
 

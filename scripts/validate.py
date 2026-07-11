@@ -54,6 +54,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     core_tests = (ops_console / "Tests" / "DevOpsBoardTests" / "CoreTests.swift").read_text(encoding="utf-8")
     coordinator = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "dev_coordinator.py").read_text(encoding="utf-8")
     coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
+    coordinator_capability_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "capability_integration_test.py").read_text(encoding="utf-8")
     coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
 
     required = {
@@ -278,6 +279,17 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "adopted server pid fallback": "os.kill(pid, signal.SIGTERM)",
         "server listener identity": "def server_listener_identity(",
         "listener ownership guard": "listener_belongs_to_project(",
+        "strict registration PID ownership": "def registration_pid_identity(",
+        "endpoint-specific registration ownership": "def _listening_inodes_for_endpoint(",
+        "API capability inheritance clear": "def clear_exec_capability_inheritance(",
+        "registration PID false-positive guard": "registration accepted invalid PID",
+        "changed owner replacement lease": "changed listener owner must receive a replacement lease",
+        "unobservable listener preservation": "unobservable inventory upgraded an unhealthy baseline",
+        "unobservable lifecycle fail closed": "signalled, launched, or changed the registration graph",
+        "unobservable project atomicity": "partially mutated before identity proof",
+        "manager bounding ceiling preserved": "capability API narrowed the host's preexisting bounding ceiling",
+        "child bounding ceiling inherited": "managed child capability ceiling did not inherit the API's default ceiling",
+        "relocation replacement lease linkage": "replacement lease must link server, PID, purpose, and assignment",
         "stale foreign pid stop guard": "linked server process belongs to a different project",
         "current url marker": "url_is_current",
         "port reuse owner marker": "port_reused_by",
@@ -339,6 +351,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
             core_tests,
             coordinator,
             coordinator_self_test,
+            coordinator_capability_test,
             coordinator_skill,
         ]
     )
@@ -412,6 +425,7 @@ def check_devops_console() -> None:
     # otherwise outside the needle haystack; read it explicitly so both its
     # deletion and its generation contract are gated.
     dev_cert_helper = (console / "test" / "helpers" / "dev-cert.mjs").read_text(encoding="utf-8")
+    server_bind_test = (console / "test" / "unit.server-bind.test.mjs").read_text(encoding="utf-8")
     package_json = json.loads((console / "package.json").read_text(encoding="utf-8"))
 
     required = {
@@ -476,8 +490,10 @@ def check_devops_console() -> None:
         "host sampled before coordinator inventory": "await sampleHost();",
         "host snapshot in metrics history": "host: hostNow,",
         "performance page machine panel": "function hostPanel(",
+        "explicit production IPv4 listener": "config.bindHost ?? '0.0.0.0'",
+        "production listener behavior test": "production TLS binds the explicit IPv4 wildcard",
     }
-    haystack = "\n".join([source_text, app_js, app_css, index_html, dev_cert_helper])
+    haystack = "\n".join([source_text, app_js, app_css, index_html, dev_cert_helper, server_bind_test])
     missing = [label for label, needle in required.items() if needle not in haystack]
     if missing:
         raise SystemExit("DevOpsConsole guardrail failed: " + ", ".join(missing))
@@ -546,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, str(ROOT / "scripts" / "self_test_terminate_captured_legacy_process.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_coordinator_auth_boundary.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_coordinator_auth_boundary.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_post_cutover_registration.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_post_cutover_registration.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_write_cutover_phase_marker.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_check_legacy_cutover_stopped.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_loaded_systemd_paths.py")])

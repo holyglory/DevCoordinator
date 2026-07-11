@@ -28,6 +28,11 @@ third-party dependencies) that:
   Performance page renders full history charts (history resets when the
   console restarts).
 
+Production binds ports 80/443 on the explicit IPv4 wildcard `0.0.0.0` and
+uses `127.0.0.1` for coordinator registration and health. This deployment has
+IPv4 DNS records; the explicit bind avoids Node's platform-dependent omitted-
+host IPv6 dual-stack behavior and keeps listener ownership verifiable.
+
 Architecture and module contracts: [docs/architecture.md](docs/architecture.md).
 Coordinator HTTP API map: [docs/coordinator-http-api.json](docs/coordinator-http-api.json).
 User journeys: [docs/journeys.md](docs/journeys.md).
@@ -67,6 +72,7 @@ ones:
 | `COORDINATOR_URL` | Coordinator API origin, default `http://127.0.0.1:29876`; only loopback `http(s)` origins without credentials, paths, queries, or fragments are accepted. |
 | `COORDINATOR_TOKEN_FILE` | Private mode-0600 bearer token created by the coordinator and read only by the server-side Console client. |
 | `COORDINATOR_AUTOSTART` | Optional local fallback; production sets `0` and uses `dev-coordinator.service`. |
+| `COORDINATOR_REGISTRATION_REQUIRED` | Production-only fail-closed gate. The unit pins `1`; direct/local runs omit it and log a bounded registration failure without exiting. |
 | `METRICS_INTERVAL_MS` | CPU/memory sampling cadence for the history charts (default `10000`, floor `2000`). Each sample reads coordinator inventory, which shells out to `docker stats` when Docker is present. |
 
 ## Google OAuth client setup (one-time)
@@ -270,6 +276,7 @@ Console:
 
 ```bash
 set -euo pipefail
+umask 077
 sudo install -m 0644 \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/dev-coordinator.service" \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service" \
@@ -522,6 +529,7 @@ from the fresh-host section before starting the new Console.
 
 ```bash
 set -euo pipefail
+umask 077
 sudo install -m 0644 \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/dev-coordinator.service" \
   "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole/deploy/devops-console.service" \
@@ -541,30 +549,17 @@ python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
   --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876
 sudo systemctl start devops-console.service
 sleep 2
-python3 "$DEVCOORDINATOR_ROOT/skills/codex-dev-coordinator/scripts/dev_coordinator.py" \
-  inventory --no-docker \
-  > "$CUTOVER_BACKUP/post-cutover-inventory.json"
-python3 - "$CUTOVER_BACKUP/pre-cutover-identities.json" \
-  "$CUTOVER_BACKUP/post-cutover-inventory.json" "$OLD_PROJECT" "$DEVCOORDINATOR_ROOT" <<'PY'
-import json, sys
-
-before = json.load(open(sys.argv[1], encoding="utf-8"))
-after = json.load(open(sys.argv[2], encoding="utf-8"))
-old_project, new_project = sys.argv[3], sys.argv[4]
-assignments = [item for item in after.get("port_assignments", []) if int(item.get("port") or 0) == 443]
-servers = [item for item in after.get("servers", []) if item.get("name") == "devops-console" and int(item.get("port") or 0) == 443]
-leases = [item for item in after.get("leases", []) if item.get("status") == "active" and int(item.get("port") or 0) == 443]
-if len(assignments) != 1 or assignments[0].get("project") != new_project:
-    raise SystemExit("post-cutover port 443 assignment is not uniquely owned by DevCoordinator")
-if len(servers) != 1 or servers[0].get("project") != new_project or servers[0].get("id") != before["server_id"]:
-    raise SystemExit("post-cutover Console server did not reuse the exact relocated identity")
-if len(leases) != 1 or leases[0].get("project") != new_project:
-    raise SystemExit("post-cutover port 443 lease is not uniquely owned by DevCoordinator")
-for collection in (after.get("port_assignments", []), after.get("servers", []), after.get("leases", [])):
-    if any(item.get("project") == old_project and int(item.get("port") or 0) == 443 for item in collection):
-        raise SystemExit("current coordinator state still points port 443 at the retired checkout")
-print("post-cutover assignment/server/lease identity ok")
-PY
+python3 "$DEVCOORDINATOR_ROOT/scripts/check_coordinator_auth_boundary.py" \
+  --token-file "$COORDINATOR_HOME/api-token" --host 127.0.0.1 --port 29876 \
+  --inventory-output "$CUTOVER_BACKUP/post-cutover-inventory.json"
+CONSOLE_MAIN_PID="$(systemctl show --property MainPID --value devops-console.service)"
+test "$CONSOLE_MAIN_PID" -gt 1
+python3 "$DEVCOORDINATOR_ROOT/scripts/verify_post_cutover_registration.py" \
+  --inventory "$CUTOVER_BACKUP/post-cutover-inventory.json" \
+  --expected-identities "$CUTOVER_BACKUP/pre-cutover-identities.json" \
+  --project "$DEVCOORDINATOR_ROOT" --old-project "$OLD_PROJECT" \
+  --name devops-console --port 443 --main-pid "$CONSOLE_MAIN_PID" \
+  > "$CUTOVER_BACKUP/post-cutover-registration-graph.json"
 systemctl --no-pager --full status dev-coordinator.service devops-console.service \
   | tee "$CUTOVER_BACKUP/post-cutover-systemd-status.txt"
 journalctl --no-pager -u dev-coordinator.service -u devops-console.service --since '-5 minutes' \
@@ -572,6 +567,8 @@ journalctl --no-pager -u dev-coordinator.service -u devops-console.service --sin
 curl --fail --silent --show-error --output /dev/null \
   --write-out 'status=%{http_code} remote=%{remote_ip} tls=%{ssl_verify_result}\n' \
   https://console.vr.ae/healthz > "$CUTOVER_BACKUP/post-cutover-public-health.txt"
+grep -Eq '^status=200 remote=[^[:space:]]+ tls=0$' \
+  "$CUTOVER_BACKUP/post-cutover-public-health.txt"
 chmod 600 "$CUTOVER_BACKUP"/post-cutover-*.txt
 
 MANIFEST_TMP="$(mktemp "$CUTOVER_BACKUP/.SHA256SUMS.XXXXXX")"
@@ -584,11 +581,13 @@ chmod 600 "$CUTOVER_BACKUP/SHA256SUMS"
 sync -f "$CUTOVER_BACKUP"
 ```
 
-The verifier requires assignment, current server, and active lease for port 443
-to name `/home/DevCoordinator`, and the server ID to match the captured old
-record. Separately confirm no current process, unit, helper, or environment
-value references the retired checkout. Historical events may retain the old
-path as evidence.
+The verifier requires the exact assignment, reused server ID, running and
+healthy systemd MainPID, and one new active lease for port 443 to form a
+bidirectionally linked graph under `/home/DevCoordinator`. It also rejects any
+current assignment, server, or active lease owned by the retired checkout.
+Separately confirm no current process, unit, helper, or environment value
+references that checkout. Historical events may retain the old path as
+evidence.
 
 On any failure, stop every possible writer and choose state restoration by the
 durable phase marker. If relocation was attempted, restore `pre-relocate`; if

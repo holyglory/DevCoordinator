@@ -7,6 +7,7 @@ import argparse
 import atexit
 import copy
 import contextlib
+import ctypes
 import errno
 import fcntl
 import glob
@@ -82,6 +83,10 @@ PROJECT_RUNTIME_FILES = (
     ".codex/codex-dev-runtime.json",
     "codex-dev-runtime.json",
 )
+
+
+class ListenerIdentityUnobservable(RuntimeError):
+    """The caller lacks evidence access; this is not proof of wrong ownership."""
 
 SERVICE_ROLE_TOKENS = {
     "api",
@@ -622,14 +627,17 @@ def port_open(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def _listening_inodes_for_port(port: int) -> set[str]:
-    """Socket inodes of TCP sockets in LISTEN state on `port`, read from /proc.
+def _decode_proc_tcp_address(raw: str, *, ipv6: bool) -> str:
+    payload = bytes.fromhex(raw)
+    if ipv6:
+        payload = b"".join(payload[offset : offset + 4][::-1] for offset in range(0, 16, 4))
+        return socket.inet_ntop(socket.AF_INET6, payload)
+    return socket.inet_ntop(socket.AF_INET, payload[::-1])
 
-    Pure-stdlib, Linux-native, and privilege-free — the parsed files are the
-    calling user's view of the network tables. Covers IPv4 and IPv6.
-    """
-    inodes: set[str] = set()
-    for proc_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+
+def _proc_listening_sockets(port: int) -> list[dict[str, str]]:
+    listeners: list[dict[str, str]] = []
+    for proc_file, ipv6 in (("/proc/net/tcp", False), ("/proc/net/tcp6", True)):
         with contextlib.suppress(Exception):
             with open(proc_file, encoding="utf-8") as handle:
                 next(handle, None)  # header
@@ -640,8 +648,50 @@ def _listening_inodes_for_port(port: int) -> set[str]:
                     local_port = int(fields[1].rsplit(":", 1)[1], 16)
                     state = fields[3]
                     if local_port == port and state == "0A":  # 0A = TCP_LISTEN
-                        inodes.add(fields[9])
-    return inodes
+                        raw_address = fields[1].rsplit(":", 1)[0]
+                        listeners.append(
+                            {
+                                "address": _decode_proc_tcp_address(raw_address, ipv6=ipv6),
+                                "inode": fields[9],
+                            }
+                        )
+    return listeners
+
+
+def _host_addresses(host: str) -> set[str]:
+    candidate = str(host or "127.0.0.1").strip().strip("[]")
+    if candidate.lower() == "localhost":
+        return {"127.0.0.1", "::1"}
+    with contextlib.suppress(ValueError):
+        return {str(ipaddress.ip_address(candidate))}
+    addresses: set[str] = set()
+    with contextlib.suppress(OSError):
+        for result in socket.getaddrinfo(candidate, None, type=socket.SOCK_STREAM):
+            addresses.add(str(ipaddress.ip_address(result[4][0])))
+    return addresses
+
+
+def _listener_address_matches(host: str, listener_address: str) -> bool:
+    requested = _host_addresses(host)
+    if not requested:
+        return False
+    listener = ipaddress.ip_address(listener_address)
+    if listener.is_unspecified:
+        return any(ipaddress.ip_address(address).version == listener.version for address in requested)
+    return str(listener) in requested
+
+
+def _listening_inodes_for_port(port: int) -> set[str]:
+    """Socket inodes of all TCP LISTEN sockets on ``port`` from Linux procfs."""
+    return {item["inode"] for item in _proc_listening_sockets(int(port))}
+
+
+def _listening_inodes_for_endpoint(host: str, port: int) -> set[str]:
+    return {
+        item["inode"]
+        for item in _proc_listening_sockets(int(port))
+        if _listener_address_matches(host, item["address"])
+    }
 
 
 def _pid_owning_socket_inodes(inodes: set[str]) -> int | None:
@@ -679,6 +729,170 @@ def listening_pid_for_port(port: int) -> int | None:
     return None
 
 
+def _lsof_listener_observation(
+    host: str, port: int, *, expected_pid: int | None = None
+) -> tuple[bool, int | None]:
+    command = ["lsof", "-nP", "-a"]
+    if expected_pid is not None:
+        command.extend(["-p", str(expected_pid)])
+    command.extend([f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fpn"])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+        )
+        if completed.returncode not in {0, 1}:
+            return False, None
+        current_pid: int | None = None
+        for line in completed.stdout.splitlines():
+            if line.startswith("p"):
+                current_pid = int(line[1:])
+                continue
+            if not line.startswith("n") or current_pid is None:
+                continue
+            endpoint = line[1:].split("->", 1)[0].split(" (LISTEN)", 1)[0]
+            endpoint_host, separator, endpoint_port = endpoint.rpartition(":")
+            if not separator or endpoint_port != str(int(port)):
+                continue
+            endpoint_host = endpoint_host.strip("[]")
+            if endpoint_host == "*" or _listener_address_matches(host, endpoint_host):
+                return True, current_pid
+        return True, None
+    except (OSError, subprocess.SubprocessError):
+        return False, None
+
+
+def _lsof_listener_pid_for_endpoint(host: str, port: int, *, expected_pid: int | None = None) -> int | None:
+    _observable, pid = _lsof_listener_observation(host, port, expected_pid=expected_pid)
+    return pid
+
+
+def listening_pid_for_endpoint(host: str, port: int) -> int | None:
+    if Path("/proc/net/tcp").exists():
+        with contextlib.suppress(Exception):
+            return _pid_owning_socket_inodes(_listening_inodes_for_endpoint(host, port))
+    return _lsof_listener_pid_for_endpoint(host, port)
+
+
+def registration_pid_identity(*, pid: int, host: str, port: int, project: str) -> dict[str, Any]:
+    """Prove that an explicit registration PID owns this project's listener.
+
+    A live PID is not sufficient evidence.  On Linux, bind the claim to the
+    exact LISTEN socket inode in ``/proc/net/tcp{,6}`` and require that inode to
+    appear in the PID's own fd table.  This deliberately fails closed when the
+    caller cannot inspect a capability-bearing target; the production
+    coordinator unit is capability-matched for that observation boundary.
+    """
+
+    pid = int(pid)
+    port = int(port)
+    resolved_project = canonical_project(project)
+    if pid <= 1 or not pid_alive(pid):
+        raise RuntimeError(f"registration PID {pid} is not alive")
+    cwd = process_cwd(pid)
+    if not cwd:
+        if sys.platform.startswith("linux"):
+            try:
+                os.readlink(Path("/proc") / str(pid) / "cwd")
+            except PermissionError as exc:
+                raise ListenerIdentityUnobservable(
+                    f"registration PID {pid} working directory is not observable by this process"
+                ) from exc
+            except OSError:
+                pass
+        raise RuntimeError(f"registration PID {pid} working directory could not be identified")
+    owner_project = canonical_project(cwd)
+    if owner_project != resolved_project and not path_inside(cwd, resolved_project):
+        raise RuntimeError(
+            f"registration PID {pid} cwd {cwd} is outside registered project {resolved_project}"
+        )
+
+    proc_fd = Path("/proc") / str(pid) / "fd"
+    proc_tcp_available = Path("/proc/net/tcp").exists()
+    if proc_tcp_available:
+        listener_inodes = _listening_inodes_for_endpoint(host, port)
+        if not listener_inodes:
+            raise RuntimeError(f"endpoint {host}:{port} has no TCP LISTEN socket")
+        try:
+            entries = list(os.scandir(proc_fd))
+        except PermissionError as exc:
+            raise ListenerIdentityUnobservable(
+                f"registration PID {pid} fd table is not observable by this process"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"registration PID {pid} fd table could not be inspected: {exc.strerror or exc}"
+            ) from exc
+        owned_inodes: set[str] = set()
+        denied = 0
+        for entry in entries:
+            try:
+                target = os.readlink(entry.path)
+            except PermissionError:
+                denied += 1
+                continue
+            except OSError:
+                continue
+            match = re.fullmatch(r"socket:\[(\d+)\]", target)
+            if match:
+                owned_inodes.add(match.group(1))
+        matching = sorted(listener_inodes & owned_inodes)
+        if not matching:
+            if denied:
+                raise ListenerIdentityUnobservable(
+                    f"registration PID {pid} listener ownership is not observable for {host}:{port}"
+                )
+            raise RuntimeError(f"registration PID {pid} does not own a LISTEN socket on port {port}")
+        return {
+            "ok": True,
+            "pid": pid,
+            "cwd": cwd,
+            "project": owner_project,
+            "port": port,
+            "host": host,
+            "listener_inodes": matching,
+            "source": "proc_pid_fd",
+        }
+
+    observable, discovered = _lsof_listener_observation(host, port, expected_pid=pid)
+    if discovered != pid:
+        if not observable and port_open(host, port):
+            raise ListenerIdentityUnobservable(
+                f"registration PID {pid} listener ownership is not observable for {host}:{port}"
+            )
+        raise RuntimeError(
+            f"registration PID {pid} does not own the listener on port {port}"
+        )
+    return {
+        "ok": True,
+        "pid": pid,
+        "cwd": cwd,
+        "project": owner_project,
+        "port": port,
+        "host": host,
+        "listener_inodes": [],
+        "source": "platform_listener_probe",
+    }
+
+
+def resolve_registration_pid(options: dict[str, Any], *, host: str, port: int, project: str) -> tuple[int | None, dict[str, Any] | None]:
+    explicit = options.get("pid")
+    if explicit is not None:
+        identity = registration_pid_identity(pid=int(explicit), host=host, port=port, project=project)
+        return int(explicit), identity
+    discovered = listening_pid_for_endpoint(host, port)
+    if discovered is not None:
+        identity = registration_pid_identity(pid=int(discovered), host=host, port=port, project=project)
+        return int(discovered), identity
+    probe_host = "127.0.0.1" if host == "0.0.0.0" else host
+    if port_open(probe_host, int(port)):
+        raise RuntimeError(f"endpoint {host}:{port} is open but no listener PID could be identified")
+    return None, None
+
+
 def process_cwd(pid: int | None) -> str | None:
     if not pid:
         return None
@@ -710,29 +924,33 @@ def path_inside(child: str | None, parent: str | None) -> bool:
     return child_path == parent_path or parent_path in child_path.parents
 
 
-def listener_owner_for_port(port: int) -> dict[str, Any]:
-    pid = listening_pid_for_port(port)
+def listener_owner_for_port(port: int, *, host: str | None = None) -> dict[str, Any]:
+    pid = listening_pid_for_endpoint(host, port) if host else listening_pid_for_port(port)
     cwd = process_cwd(pid)
     owner_project = canonical_project(cwd) if cwd else None
     return {"pid": pid, "cwd": cwd, "project": owner_project}
 
 
-def listener_belongs_to_project(port: int, project: str) -> tuple[bool, dict[str, Any]]:
-    owner = listener_owner_for_port(port)
+def listener_belongs_to_project(port: int, project: str, *, host: str | None = None) -> tuple[bool, dict[str, Any]]:
+    owner = listener_owner_for_port(port, host=host)
     resolved_project = canonical_project(project)
     owner_project = owner.get("project")
     if not owner.get("pid"):
+        owner["observable"] = False
         owner["reason"] = f"port {port} is open but no listener PID could be identified"
         return False, owner
     if not owner.get("cwd") or not owner_project:
+        owner["observable"] = False
         owner["reason"] = f"port {port} is owned by PID {owner['pid']}, but its working directory could not be identified"
         return False, owner
     if owner_project != resolved_project and not path_inside(str(owner.get("cwd")), resolved_project):
+        owner["observable"] = True
         owner["reason"] = (
             f"port {port} is owned by PID {owner['pid']} in {owner.get('cwd')}, "
             f"outside project {resolved_project}"
         )
         return False, owner
+    owner["observable"] = True
     return True, owner
 
 
@@ -884,6 +1102,31 @@ def server_listener_identity(server: dict[str, Any]) -> dict[str, Any]:
         return identity
     pid = int(server.get("pid") or 0)
     if pid and pid_alive(pid):
+        if server.get("registration_identity"):
+            try:
+                return registration_pid_identity(
+                    pid=pid,
+                    host=str(server.get("host") or "127.0.0.1"),
+                    port=int(server.get("port") or 0),
+                    project=str(server.get("project") or ""),
+                )
+            except ListenerIdentityUnobservable as exc:
+                return {
+                    "ok": None,
+                    "observable": False,
+                    "pid": pid,
+                    "cwd": identity.get("cwd"),
+                    "project": identity.get("project"),
+                    "reason": str(exc),
+                }
+            except (OSError, RuntimeError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "pid": pid,
+                    "cwd": identity.get("cwd"),
+                    "project": identity.get("project"),
+                    "reason": str(exc),
+                }
         return identity
     project = server.get("project")
     port = server.get("port")
@@ -892,7 +1135,7 @@ def server_listener_identity(server: dict[str, Any]) -> dict[str, Any]:
     host = str(server.get("host") or "127.0.0.1")
     if not port_open(host, int(port)):
         return identity
-    belongs, owner = listener_belongs_to_project(int(port), str(project))
+    belongs, owner = listener_belongs_to_project(int(port), str(project), host=host)
     return {"ok": belongs, **owner}
 
 
@@ -1508,10 +1751,24 @@ def lease_existing_server_port(
         owner_project=project,
         reason=f"port {port} lease pointed at stale or foreign server metadata",
     )
-    for lease in state["leases"].values():
+    for lease_id, lease in list(state["leases"].items()):
         if lease.get("status") != "active" or int(lease.get("port") or 0) != int(port):
             continue
         if lease.get("server_id") == server_id and canonical_project(str(lease.get("project") or "")) == project:
+            same_owner = int(lease.get("owner_pid") or 0) == int(owner_pid or 0)
+            same_purpose = str(lease.get("purpose") or "") == str(purpose)
+            if not same_owner or not same_purpose:
+                mark_lease_stale_released(
+                    state,
+                    lease_id,
+                    lease,
+                    f"server registration owner or purpose changed on port {port}",
+                )
+                break
+            if assignment_key:
+                lease["assignment_key"] = assignment_key
+            lease["expires_at"] = now() + ttl if ttl > 0 else None
+            lease["expires_at_iso"] = iso_timestamp(lease["expires_at"]) if lease["expires_at"] else None
             return lease
         raise RuntimeError(
             f"port {port} already has an active lease for {lease.get('project') or 'unknown project'}"
@@ -1533,6 +1790,7 @@ def lease_existing_server_port(
         "range": f"{port}-{port}",
         "occupied_existing": True,
         "owner_pid": owner_pid,
+        "assignment_key": assignment_key,
     }
     state["leases"][lease_id] = lease
     record_event(state, "port.leased", lease)
@@ -2841,14 +3099,19 @@ def server_health(
             break
         if attempt + 1 < attempts:
             time.sleep(max(0.0, backoff))
-    ok = alive is not False and bool(check.get("ok")) and identity.get("ok") is not False
-    if ok:
+    identity_unobservable = identity.get("observable") is False
+    if alive is not False and identity_unobservable:
+        ok: bool | None = None
+        classification = "unverified-listener"
+    else:
+        ok = alive is not False and bool(check.get("ok")) and identity.get("ok") is not False
+    if ok is True:
         classification = "healthy"
     elif identity.get("ok") is False:
         classification = "wrong-listener"
-    elif within_startup_grace(server):
+    elif ok is not None and within_startup_grace(server):
         classification = "starting"
-    else:
+    elif ok is not None:
         classification = "unhealthy"
     return {
         "ok": ok,
@@ -2858,6 +3121,94 @@ def server_health(
         "attempts": attempts,
         "classification": classification,
     }
+
+
+def listener_identity_unobservable(health: dict[str, Any] | None) -> bool:
+    """Return whether a health result cannot prove the current listener owner.
+
+    ``False`` means the observer positively disproved identity. ``None`` means
+    the observer lacks the capability to decide. Lifecycle code must never
+    collapse that third state into "down" and replace or signal the process.
+    """
+
+    evidence = health or {}
+    identity = evidence.get("identity") or {}
+    return bool(
+        evidence.get("classification") == "unverified-listener"
+        or ("ok" in evidence and evidence.get("ok") is None)
+        or identity.get("observable") is False
+        or ("ok" in identity and identity.get("ok") is None)
+    )
+
+
+def require_listener_identity_observable(
+    health: dict[str, Any], *, action: str, server: dict[str, Any] | None = None
+) -> None:
+    """Fail a mutation before it can act on an unverified process identity."""
+
+    if not listener_identity_unobservable(health):
+        return
+    identity = health.get("identity") or {}
+    name = str((server or {}).get("name") or "server")
+    reason = str(identity.get("reason") or "listener ownership cannot be observed")
+    raise ListenerIdentityUnobservable(
+        f"refusing to {action} {name}: listener identity is unobservable; {reason}"
+    )
+
+
+def require_project_server_identities_observable(
+    state: dict[str, Any], spec: dict[str, Any], *, action: str
+) -> dict[str, tuple[Any, ...]]:
+    """Preflight every registered project server before any project mutation."""
+
+    project = str(spec["project"])
+    fingerprints: dict[str, tuple[Any, ...]] = {}
+    registered_by_key: dict[str, dict[str, Any]] = {}
+    for server_id, server in state.get("servers", {}).items():
+        if str(server.get("project") or "") != project:
+            continue
+        health = server_health(copy.deepcopy(server))
+        require_listener_identity_observable(
+            health,
+            action=f"{action} project server",
+            server=server,
+        )
+        fingerprints[str(server_id)] = server_lifecycle_fingerprint(server)
+        registered_by_key[server_key(project, str(server.get("name") or ""))] = server
+
+    for server_def in spec.get("servers", []):
+        server = registered_by_key.get(
+            server_key(str(server_def["project"]), str(server_def["name"]))
+        )
+        health = server_health(copy.deepcopy(server)) if server else {"ok": False}
+        if action not in {"start", "restart"} or health.get("ok") is True:
+            continue
+        _assignment_key, assignment = find_port_assignment(
+            state,
+            project=str(server_def["project"]),
+            name=str(server_def["name"]),
+        )
+        fixed_port = server_def.get("port") or (assignment or {}).get("port") or (server or {}).get("port")
+        if fixed_port is None:
+            continue
+        host = str(server_def.get("host") or (server or {}).get("host") or "127.0.0.1")
+        if not port_open(host, int(fixed_port)):
+            continue
+        belongs, owner = listener_belongs_to_project(
+            int(fixed_port), str(server_def["project"]), host=host
+        )
+        if belongs:
+            continue
+        reason = str(owner.get("reason") or "listener does not belong to project")
+        if owner.get("observable") is False:
+            raise ListenerIdentityUnobservable(
+                f"refusing to {action} project server {server_def['name']}: "
+                f"listener identity is unobservable; {reason}"
+            )
+        # A positively identified foreign listener follows the established
+        # per-server adoption error/report path. This preflight is specifically
+        # the no-capability boundary where continuing could create duplicates.
+    return fingerprints
 
 
 def docker_available_command(args: list[str], *, cwd: str | None = None) -> dict[str, Any]:
@@ -3680,7 +4031,9 @@ def server_status_for_runtime(state: dict[str, Any], server_def: dict[str, Any])
         }
     status_server(state, {"server_id": server_id, "project": server["project"], "name": server["name"]})
     classification = None
-    if server.get("status") == "stopped":
+    if listener_identity_unobservable(server.get("health")):
+        classification = "unverified-listener"
+    elif server.get("status") == "stopped":
         classification = "crashed_process" if server.get("stopped_reason") else "unhealthy_process"
     elif server.get("status") == "unhealthy":
         classification = "unhealthy_process"
@@ -3706,6 +4059,7 @@ def server_status_for_runtime(state: dict[str, Any], server_def: dict[str, Any])
         "metadata_source": server.get("metadata_source"),
         "agent": server.get("agent"),
         "agent_metadata": server.get("agent_metadata"),
+        "health": copy.deepcopy(server.get("health")),
         "previous_exit_reason": server.get("stopped_reason"),
         "stopped_at": server.get("stopped_at"),
         "recent_logs": logs,
@@ -3848,6 +4202,12 @@ def start_runtime_server(state: dict[str, Any], server_def: dict[str, Any], opti
         raise RuntimeError(f"project server {server_def['name']} has no fixed port; add .codex/dev-runtime.json")
     if fixed_port is not None:
         existing_health = server_health(existing) if existing else {"ok": False}
+        if existing:
+            require_listener_identity_observable(
+                existing_health,
+                action="start",
+                server=existing,
+            )
         if not existing_health.get("ok"):
             adopted = adopt_runtime_server_if_running(state, {**server_def, "port": fixed_port}, options)
             if adopted:
@@ -3922,8 +4282,10 @@ def ensure_runtime_docker_metadata(state: dict[str, Any], spec: dict[str, Any], 
 def project_runtime_start(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
     agent, _project = require_identity(options, "project start")
     spec = build_project_runtime_spec(state, project=options["project"], runtime_file=options.get("runtime_file"))
-    before = project_runtime_report(state, spec, action="pre-start")
     dry_run = bool(options.get("dry_run"))
+    if not dry_run:
+        require_project_server_identities_observable(state, spec, action="start")
+    before = project_runtime_report(state, spec, action="pre-start")
     actions: list[dict[str, Any]] = []
     action_errors: list[dict[str, Any]] = []
     compose = spec.get("compose")
@@ -3986,8 +4348,10 @@ def project_runtime_restart(state: dict[str, Any], options: dict[str, Any]) -> d
     options = dict(options)
     options["force_restart"] = True
     spec = build_project_runtime_spec(state, project=options["project"], runtime_file=options.get("runtime_file"))
-    before = project_runtime_report(state, spec, action="pre-restart")
     dry_run = bool(options.get("dry_run"))
+    if not dry_run:
+        require_project_server_identities_observable(state, spec, action="restart")
+    before = project_runtime_report(state, spec, action="pre-restart")
     actions: list[dict[str, Any]] = []
     for server_def in reversed(spec.get("servers", [])):
         server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
@@ -4017,8 +4381,10 @@ def project_runtime_restart(state: dict[str, Any], options: dict[str, Any]) -> d
 def project_runtime_stop(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
     agent, _project = require_identity(options, "project stop")
     spec = build_project_runtime_spec(state, project=options["project"], runtime_file=options.get("runtime_file"))
-    before = project_runtime_report(state, spec, action="pre-stop")
     dry_run = bool(options.get("dry_run"))
+    if not dry_run:
+        require_project_server_identities_observable(state, spec, action="stop")
+    before = project_runtime_report(state, spec, action="pre-stop")
     actions: list[dict[str, Any]] = []
     # Like start/restart, stop records sidecar attribution for the containers
     # it acts on, so display grouping converges to explicit membership after
@@ -4060,6 +4426,11 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
             continue
         health = server_health(server)
         if server.get("status") == "stopped":
+            server["health"] = health
+        elif listener_identity_unobservable(health):
+            # An incapable observer must not upgrade, downgrade, or detach the
+            # recorded lifecycle. Preserve it until the capability-matched API
+            # can perform strict current listener proof.
             server["health"] = health
         elif health.get("ok"):
             server["health"] = health
@@ -4145,7 +4516,7 @@ def wait_for_health(server: dict[str, Any], timeout: float) -> dict[str, Any]:
     deadline = now() + timeout
     last = server_health(server)
     while now() < deadline:
-        if last.get("ok"):
+        if last.get("ok") is True or listener_identity_unobservable(last):
             return last
         time.sleep(0.25)
         last = server_health(server)
@@ -4177,12 +4548,7 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
     command = shlex.join(argv) if argv else None
     health_url_template = options.get("health_url") or url
     health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
-    pid = options.get("pid")
-    if pid is None:
-        pid = listening_pid_for_port(port)
-    identity = server_listener_identity({"pid": int(pid) if pid else None, "project": project, "port": port, "host": host})
-    if identity.get("ok") is False:
-        raise RuntimeError(str(identity.get("reason") or f"PID {pid or 'unknown'} is outside project {project}"))
+    pid, registration_identity = resolve_registration_pid(options, host=host, port=port, project=project)
     server_id, existing = find_server(state, project=project, name=name)
     server_id = server_id or str(uuid.uuid4())
     previous = existing or {}
@@ -4193,13 +4559,6 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
             f"port {port} is durably assigned to {assignment_owner_text(foreign[int(port)])}; "
             "register on another port or unassign it first"
         )
-    reclaim_stale_leases_for_port(
-        state,
-        project=project,
-        port=port,
-        reason=f"server register reclaimed stale lease for {name}",
-        allow_occupied_unattached=True,
-    )
     server = {
         "id": server_id,
         "key": server_key(project, name),
@@ -4218,6 +4577,7 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
         "health_url_template": health_url_template,
         "lease_id": previous.get("lease_id"),
         "pid": int(pid) if pid else None,
+        "registration_identity": registration_identity,
         "log_path": previous.get("log_path"),
         "adopted": True,
         "missing_command": not bool(argv_template or previous.get("argv_template") or previous.get("cmd_template")),
@@ -4227,8 +4587,20 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
         "updated_at": iso_timestamp(),
     }
     health = wait_for_health(server, float(options.get("health_timeout") or 3))
+    require_listener_identity_observable(health, action="register", server=server)
     server["health"] = health
     server["status"] = "running" if health.get("ok") else "unhealthy"
+    if server.get("pid"):
+        server["registration_identity"] = registration_pid_identity(
+            pid=int(server["pid"]), host=host, port=port, project=project
+        )
+    reclaim_stale_leases_for_port(
+        state,
+        project=project,
+        port=port,
+        reason=f"server register reclaimed stale lease for {name}",
+        allow_occupied_unattached=True,
+    )
     if server["status"] == "running" and server.get("pid"):
         lease = lease_existing_server_port(
             state,
@@ -4258,9 +4630,10 @@ def adopt_runtime_server_if_running(state: dict[str, Any], server_def: dict[str,
     host = server_def.get("host") or "127.0.0.1"
     if not port_open(host, port):
         return None
-    belongs, owner = listener_belongs_to_project(port, server_def["project"])
+    belongs, owner = listener_belongs_to_project(port, server_def["project"], host=str(host))
     if not belongs:
-        raise RuntimeError(
+        error_type = ListenerIdentityUnobservable if owner.get("observable") is False else RuntimeError
+        raise error_type(
             f"refusing to adopt {server_def['name']} on port {port}: "
             f"{owner.get('reason') or 'listener does not belong to project'}"
         )
@@ -4327,9 +4700,12 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
     argv_template = command_argv(options)
     name = options["name"]
     existing_id, existing = find_server(state, project=project, name=name)
-    if existing and server_health(existing).get("ok"):
+    existing_health = server_health(existing) if existing else None
+    if existing and existing_health is not None:
+        require_listener_identity_observable(existing_health, action="start", server=existing)
+    if existing and existing_health and existing_health.get("ok"):
         existing["status"] = "running"
-        existing["health"] = server_health(existing)
+        existing["health"] = existing_health
         if existing.get("port"):
             # Self-heal a MISSING pin only: an idempotent re-start must never
             # move an existing pin (an explicit re-pin would silently revert)
@@ -4463,6 +4839,7 @@ def stop_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any
     if canonical_project(str(server.get("project") or "")) != project:
         raise ValueError("server stop project does not match the registered server project")
     health = server_health(server)
+    require_listener_identity_observable(health, action="stop", server=server)
     server["health"] = health
     if (health.get("identity") or {}).get("ok") is False:
         mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
@@ -4492,6 +4869,11 @@ def restart_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, 
         raise KeyError("matching server not found")
     if not server.get("argv_template") and not server.get("cmd_template"):
         raise RuntimeError(f"server {server.get('name')} is registered without a command; missing_command=true")
+    require_listener_identity_observable(
+        server_health(server),
+        action="restart",
+        server=server,
+    )
     _, assignment = find_port_assignment(state, project=project, name=str(options["name"]))
     fixed_port = int(assignment["port"]) if assignment else int(server["port"])
     restart_options = {
@@ -4948,6 +5330,11 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
         existing_snapshot = copy.deepcopy(existing) if existing else None
     if existing_snapshot:
         existing_health = server_health(existing_snapshot)
+        require_listener_identity_observable(
+            existing_health,
+            action="start",
+            server=existing_snapshot,
+        )
         if existing_health.get("ok"):
             with locked_state() as state:
                 current = state["servers"].get(existing_id)
@@ -5159,8 +5546,25 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
         project = project_hint
         if str(server.get("project") or "") != project:
             raise ValueError("server stop project does not match the registered server project")
-        target = f"server:{server_key(project, str(server.get('name') or ''))}"
-        generation = int(server.get("generation") or 0) + 1
+        observed_snapshot = copy.deepcopy(server)
+
+    health = server_health(observed_snapshot)
+    require_listener_identity_observable(
+        health,
+        action="stop",
+        server=observed_snapshot,
+    )
+
+    # Reserve only after identity observation. An incapable observer therefore
+    # cannot create an operation, change status/generation, signal, or release.
+    with locked_state() as state:
+        current = state["servers"].get(server_id)
+        if not current or server_lifecycle_fingerprint(current) != server_lifecycle_fingerprint(
+            observed_snapshot
+        ):
+            raise RuntimeError("server changed while listener identity was checked; retry stop")
+        target = f"server:{server_key(project, str(current.get('name') or ''))}"
+        generation = int(current.get("generation") or 0) + 1
         operation = begin_operation(
             state,
             action="server.stop",
@@ -5168,16 +5572,15 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
             agent=agent,
             project=project,
             generation=generation,
-            lease_id=server.get("lease_id"),
+            lease_id=current.get("lease_id"),
             server_id=server_id,
         )
-        server["generation"] = generation
-        server["operation_id"] = operation["id"]
-        server["status"] = "stopping"
-        server["updated_at"] = iso_timestamp()
-        snapshot = copy.deepcopy(server)
+        current["generation"] = generation
+        current["operation_id"] = operation["id"]
+        current["status"] = "stopping"
+        current["updated_at"] = iso_timestamp()
+        snapshot = copy.deepcopy(current)
 
-    health = server_health(snapshot)
     identity_wrong = (health.get("identity") or {}).get("ok") is False
     if not identity_wrong:
         stop_pid(int(snapshot.get("pid") or 0))
@@ -5216,13 +5619,23 @@ def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(f"server {server.get('name')} is registered without a command; missing_command=true")
         snapshot = copy.deepcopy(server)
         _assignment_key, assignment = find_port_assignment(state, project=project, name=options["name"])
+    health = server_health(snapshot)
+    require_listener_identity_observable(
+        health,
+        action="restart",
+        server=snapshot,
+    )
+    with locked_state() as state:
+        current = state["servers"].get(server_id)
+        if not current or server_lifecycle_fingerprint(current) != server_lifecycle_fingerprint(snapshot):
+            raise RuntimeError("server changed while listener identity was checked; retry restart")
         operation = begin_operation(
             state,
             action="server.restart",
-            target=f"server:{server_key(project, str(server.get('name') or ''))}",
+            target=f"server:{server_key(project, str(current.get('name') or ''))}",
             agent=agent,
             project=project,
-            generation=int(server.get("generation") or 0) + 1,
+            generation=int(current.get("generation") or 0) + 1,
             server_id=server_id,
         )
     fixed_port = int((assignment or {}).get("port") or snapshot["port"])
@@ -5414,14 +5827,7 @@ def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
     command = shlex.join(argv) if argv else None
     health_url_template = prepared.get("health_url") or url
     health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
-    pid = prepared.get("pid")
-    if pid is None:
-        pid = listening_pid_for_port(port)
-    identity = server_listener_identity(
-        {"pid": int(pid) if pid else None, "project": project, "port": port, "host": host}
-    )
-    if identity.get("ok") is False:
-        raise RuntimeError(str(identity.get("reason") or f"PID {pid or 'unknown'} is outside project {project}"))
+    pid, registration_identity = resolve_registration_pid(prepared, host=host, port=port, project=project)
 
     target = f"server:{server_key(project, name)}"
     with locked_state() as state:
@@ -5463,6 +5869,7 @@ def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
         "health_url_template": health_url_template,
         "lease_id": previous.get("lease_id"),
         "pid": int(pid) if pid else None,
+        "registration_identity": registration_identity,
         "log_path": previous.get("log_path"),
         "adopted": True,
         "missing_command": not bool(
@@ -5482,8 +5889,17 @@ def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
     }
     try:
         health = wait_for_health(candidate, float(prepared.get("health_timeout") or 3))
+        require_listener_identity_observable(
+            health,
+            action="register",
+            server=candidate,
+        )
         candidate["health"] = health
         candidate["status"] = "running" if health.get("ok") else "unhealthy"
+        if candidate.get("pid"):
+            candidate["registration_identity"] = registration_pid_identity(
+                pid=int(candidate["pid"]), host=host, port=port, project=project
+            )
     except Exception as exc:
         with locked_state() as state:
             finish_operation(state, operation["id"], status="failed", phase="observe", error=str(exc))
@@ -5634,7 +6050,31 @@ def observe_project_runtime(
 def begin_project_operation(options: dict[str, Any], action: str) -> tuple[dict[str, Any], dict[str, Any]]:
     prepared = dict(options)
     agent, project = require_identity(prepared, f"project {action}")
+    if not prepared.get("dry_run"):
+        preflight_state = snapshot_coordinator_state()
+        preflight_spec = build_project_runtime_spec(
+            preflight_state,
+            project=project,
+            runtime_file=prepared.get("runtime_file"),
+        )
+        preflight_fingerprints = require_project_server_identities_observable(
+            preflight_state,
+            preflight_spec,
+            action=action,
+        )
+    else:
+        preflight_fingerprints = {}
     with locked_state() as state:
+        if not prepared.get("dry_run"):
+            current_fingerprints = {
+                str(server_id): server_lifecycle_fingerprint(server)
+                for server_id, server in state.get("servers", {}).items()
+                if str(server.get("project") or "") == project
+            }
+            if current_fingerprints != preflight_fingerprints:
+                raise RuntimeError(
+                    f"project {action} server lifecycle changed during listener identity preflight; retry"
+                )
         operation = begin_operation(
             state,
             action=f"project.{action}",
@@ -5783,15 +6223,23 @@ def coordinated_start_runtime_server(server_def: dict[str, Any], options: dict[s
     fixed_port = start_options.get("preferred")
     if existing:
         existing_health = server_health(existing)
+        require_listener_identity_observable(
+            existing_health,
+            action="start project server",
+            server=existing,
+        )
         if existing_health.get("ok"):
             return coordinated_status_server(
                 {"server_id": server_id, "project": server_def["project"], "name": server_def["name"]}
             )
 
     if fixed_port is not None and port_open(str(start_options["host"]), int(fixed_port)):
-        belongs, owner = listener_belongs_to_project(int(fixed_port), server_def["project"])
+        belongs, owner = listener_belongs_to_project(
+            int(fixed_port), server_def["project"], host=str(server_def.get("host") or "127.0.0.1")
+        )
         if not belongs:
-            raise RuntimeError(
+            error_type = ListenerIdentityUnobservable if owner.get("observable") is False else RuntimeError
+            raise error_type(
                 f"refusing to adopt {server_def['name']} on port {fixed_port}: "
                 f"{owner.get('reason') or 'listener does not belong to project'}"
             )
@@ -6590,6 +7038,10 @@ def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, A
     server["health"] = health
     if server.get("status") == "stopped":
         pass
+    elif listener_identity_unobservable(health):
+        # Read-only observers report the capability gap but preserve the last
+        # lifecycle decision and its linked lease exactly.
+        pass
     elif health.get("ok"):
         server["status"] = "running"
         server["updated_at"] = iso_timestamp()
@@ -7331,6 +7783,87 @@ def validate_api_bind_host(host: str) -> str:
     return candidate
 
 
+def linux_process_capability_sets(pid: int | str = "self") -> dict[str, int]:
+    if not sys.platform.startswith("linux"):
+        return {}
+    values: dict[str, int] = {}
+    labels = {
+        "CapInh": "inheritable",
+        "CapPrm": "permitted",
+        "CapEff": "effective",
+        "CapBnd": "bounding",
+        "CapAmb": "ambient",
+    }
+    try:
+        with open(Path("/proc") / str(pid) / "status", encoding="utf-8") as handle:
+            for line in handle:
+                key, separator, raw = line.partition(":")
+                if separator and key in labels:
+                    values[labels[key]] = int(raw.strip(), 16)
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect Linux capability sets for PID {pid}: {exc}") from exc
+    missing = sorted(set(labels.values()) - set(values))
+    if missing:
+        raise RuntimeError(f"Linux capability status omitted: {', '.join(missing)}")
+    return values
+
+
+def clear_exec_capability_inheritance() -> dict[str, Any]:
+    """Keep observer capabilities local to this process, never to exec children.
+
+    The production API needs the same permitted capability as the Console to
+    inspect that capability-bearing process's fd/cwd links.  Ambient and
+    inheritable sets would otherwise flow through ``exec`` into every managed
+    server.  Clear exactly those sets while retaining this process's effective
+    and permitted observer capability.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return {"supported": False, "cleared": True}
+    before = linux_process_capability_sets()
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    class CapabilityHeader(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+    class CapabilityData(ctypes.Structure):
+        _fields_ = [
+            ("effective", ctypes.c_uint32),
+            ("permitted", ctypes.c_uint32),
+            ("inheritable", ctypes.c_uint32),
+        ]
+
+    if before["inheritable"]:
+        header = CapabilityHeader(0x20080522, 0)
+        data = (CapabilityData * 2)()
+        if libc.capget(ctypes.byref(header), ctypes.byref(data)) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), "capget")
+        for word in data:
+            word.inheritable = 0
+        if libc.capset(ctypes.byref(header), ctypes.byref(data)) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), "capset")
+
+    if before["ambient"]:
+        # prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+        if libc.prctl(47, 4, 0, 0, 0) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), "prctl(PR_CAP_AMBIENT_CLEAR_ALL)")
+
+    after = linux_process_capability_sets()
+    if after["inheritable"] or after["ambient"]:
+        raise RuntimeError("coordinator failed to clear inheritable/ambient capabilities")
+    if after["permitted"] != before["permitted"] or after["effective"] != before["effective"]:
+        raise RuntimeError("coordinator capability boundary unexpectedly changed observer capabilities")
+    return {
+        "supported": True,
+        "cleared": True,
+        "had_inheritable": bool(before["inheritable"]),
+        "had_ambient": bool(before["ambient"]),
+    }
+
+
 def request_hostname(raw: str) -> str | None:
     try:
         return urlparse(f"//{raw}").hostname
@@ -7742,6 +8275,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
 
 
 def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
+    clear_exec_capability_inheritance()
     host = validate_api_bind_host(host)
     token_path = Path(token_file).expanduser().absolute() if token_file else api_token_path()
     token = load_or_create_api_token(token_path)

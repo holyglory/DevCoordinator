@@ -24,6 +24,8 @@ PROPERTIES = (
     "ExecStartPre",
     "ExecStart",
     "ReadWritePaths",
+    "AmbientCapabilities",
+    "CapabilityBoundingSet",
 )
 SERVICE_HOME = "/home/holyglory"
 COORDINATOR_HOME = f"{SERVICE_HOME}/.codex/agent-coordinator"
@@ -42,12 +44,58 @@ CONSOLE_PREFLIGHT_ARGV = (
 )
 CONSOLE_ARGV = (
     "/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator COORDINATOR_AUTOSTART=0 "
+    "COORDINATOR_REGISTRATION_REQUIRED=1 "
     "COORDINATOR_URL=http://127.0.0.1:29876 "
     "COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py "
     f"COORDINATOR_TOKEN_FILE={COORDINATOR_HOME}/api-token "
     f"CODEX_AGENT_COORDINATOR_HOME={COORDINATOR_HOME} STATE_DIR={CONSOLE_STATE} "
     f"ACME_WEBROOT={CONSOLE_STATE}/acme /usr/bin/node bin/devops-console.mjs --env-file {CONSOLE_ENV}"
 )
+
+LINUX_CAPABILITIES = (
+    "cap_chown",
+    "cap_dac_override",
+    "cap_dac_read_search",
+    "cap_fowner",
+    "cap_fsetid",
+    "cap_kill",
+    "cap_setgid",
+    "cap_setuid",
+    "cap_setpcap",
+    "cap_linux_immutable",
+    "cap_net_bind_service",
+    "cap_net_broadcast",
+    "cap_net_admin",
+    "cap_net_raw",
+    "cap_ipc_lock",
+    "cap_ipc_owner",
+    "cap_sys_module",
+    "cap_sys_rawio",
+    "cap_sys_chroot",
+    "cap_sys_ptrace",
+    "cap_sys_pacct",
+    "cap_sys_admin",
+    "cap_sys_boot",
+    "cap_sys_nice",
+    "cap_sys_resource",
+    "cap_sys_time",
+    "cap_sys_tty_config",
+    "cap_mknod",
+    "cap_lease",
+    "cap_audit_write",
+    "cap_audit_control",
+    "cap_setfcap",
+    "cap_mac_override",
+    "cap_mac_admin",
+    "cap_syslog",
+    "cap_wake_alarm",
+    "cap_block_suspend",
+    "cap_audit_read",
+    "cap_perfmon",
+    "cap_bpf",
+    "cap_checkpoint_restore",
+)
+CAPABILITY_BITS = {name: 1 << index for index, name in enumerate(LINUX_CAPABILITIES)}
 
 
 class LoadedUnitPathError(RuntimeError):
@@ -110,7 +158,43 @@ def require_command(
         violations.append(f"{unit} {key} does not contain exactly the pinned production command")
 
 
-def validate_loaded_unit_outputs(coordinator_raw: str, console_raw: str) -> dict[str, dict[str, str]]:
+def capability_property_mask(value: str) -> int:
+    names = value.split()
+    if len(names) != len(set(names)):
+        raise LoadedUnitPathError("loaded capability set contains duplicate names")
+    unknown = sorted(set(names) - set(CAPABILITY_BITS))
+    if unknown:
+        raise LoadedUnitPathError(
+            "loaded capability set contains unsupported names: " + ", ".join(unknown)
+        )
+    return sum(CAPABILITY_BITS[name] for name in names)
+
+
+def manager_capability_bounding_mask(path: Path = Path("/proc/1/status")) -> int:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise LoadedUnitPathError(f"cannot read system manager capability ceiling: {error}") from error
+    for line in lines:
+        key, separator, value = line.partition(":")
+        if separator and key == "CapBnd":
+            try:
+                mask = int(value.strip(), 16)
+            except ValueError as error:
+                raise LoadedUnitPathError("system manager CapBnd is not hexadecimal") from error
+            known_mask = (1 << len(LINUX_CAPABILITIES)) - 1
+            if mask & ~known_mask:
+                raise LoadedUnitPathError("system manager exposes capability bits unknown to this verifier")
+            return mask
+    raise LoadedUnitPathError("system manager status omitted CapBnd")
+
+
+def validate_loaded_unit_outputs(
+    coordinator_raw: str,
+    console_raw: str,
+    *,
+    manager_bounding_mask: int,
+) -> dict[str, dict[str, str]]:
     units = {
         "dev-coordinator.service": parse_properties(coordinator_raw),
         "devops-console.service": parse_properties(console_raw),
@@ -134,6 +218,7 @@ def validate_loaded_unit_outputs(coordinator_raw: str, console_raw: str) -> dict
         "EnvironmentFiles": "",
         "ExecStartPre": "",
         "ReadWritePaths": "",
+        "AmbientCapabilities": "cap_net_bind_service",
     }.items():
         require_exact(
             violations,
@@ -144,6 +229,19 @@ def validate_loaded_unit_outputs(coordinator_raw: str, console_raw: str) -> dict
             allow_omitted_empty=key in {"EnvironmentFiles", "ExecStartPre"},
         )
     require_command(violations, "dev-coordinator.service", coordinator, "ExecStart", COORDINATOR_ARGV)
+    coordinator_bounding = coordinator.get("CapabilityBoundingSet")
+    if coordinator_bounding is None:
+        violations.append("dev-coordinator.service did not expose CapabilityBoundingSet")
+    else:
+        try:
+            loaded_mask = capability_property_mask(coordinator_bounding)
+        except LoadedUnitPathError as error:
+            violations.append(f"dev-coordinator.service {error}")
+        else:
+            if loaded_mask != manager_bounding_mask:
+                violations.append(
+                    "dev-coordinator.service narrows or changes the system manager capability ceiling"
+                )
 
     console = units["devops-console.service"]
     for key, expected in {
@@ -155,6 +253,8 @@ def validate_loaded_unit_outputs(coordinator_raw: str, console_raw: str) -> dict
         "Environment": "",
         "EnvironmentFiles": f"{CONSOLE_ENV} (ignore_errors=no)",
         "ReadWritePaths": CONSOLE_STATE,
+        "AmbientCapabilities": "cap_net_bind_service",
+        "CapabilityBoundingSet": "cap_net_bind_service",
     }.items():
         require_exact(violations, "devops-console.service", console, key, expected)
     require_command(violations, "devops-console.service", console, "ExecStartPre", CONSOLE_PREFLIGHT_ARGV)
@@ -208,7 +308,11 @@ def main() -> int:
     try:
         coordinator_raw = systemctl_show(args.systemctl, "dev-coordinator.service")
         console_raw = systemctl_show(args.systemctl, "devops-console.service")
-        units = validate_loaded_unit_outputs(coordinator_raw, console_raw)
+        units = validate_loaded_unit_outputs(
+            coordinator_raw,
+            console_raw,
+            manager_bounding_mask=manager_capability_bounding_mask(),
+        )
         if args.evidence:
             write_evidence(args.evidence, units)
     except (LoadedUnitPathError, OSError, SecureIOError) as error:

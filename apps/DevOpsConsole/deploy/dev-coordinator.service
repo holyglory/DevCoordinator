@@ -13,6 +13,12 @@ Environment=CODEX_AGENT_COORDINATOR_HOME=/home/holyglory/.codex/agent-coordinato
 ExecStart=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876 --token-file /home/holyglory/.codex/agent-coordinator/api-token
 Restart=on-failure
 RestartSec=3
+# Linux gates /proc/<pid>/fd and cwd access by capability parity even for
+# same-UID processes. The Console carries this one capability to bind 80/443.
+# API startup clears ambient/inheritable sets before any managed child execs.
+# Do not narrow CapabilityBoundingSet: this generic process manager must retain
+# the manager's default ceiling for executables with legitimate file caps.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 # Managed dev servers are independently attributed lifecycles. Although they
 # start new sessions, systemd still places descendants in this service cgroup;
 # control-group shutdown would kill them when only the API is restarted.

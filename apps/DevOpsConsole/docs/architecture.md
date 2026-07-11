@@ -492,10 +492,20 @@ devInsecureHttp) → sessions → oidc → guard → pages → coordinator
 routeStore (`load()`) → consoleApi → static →
 proxy → router → `startServers`. SIGHUP → cert reload; SIGTERM/SIGINT →
 graceful close (also `metrics.stop()` and `coordinator.close()`). On listen success, log every
-public URL. If `process.env.PORT` is set (coordinator-spawned dev instance),
-skip self-registration; otherwise when `httpsPort === 443` best-effort
+public URL. Production listeners bind the explicit IPv4 wildcard `0.0.0.0`;
+development listeners bind IPv4 loopback. If `process.env.PORT` is set for an optional coordinator-spawned
+dev instance, skip self-registration; required production registration ignores
+that inherited value. When `httpsPort === 443`, retry the exact
 `serverRegister({ agent: 'devops-console', project: config.projectRoot,
-name: 'devops-console', port: 443 })`, swallow+log failure.
+name: 'devops-console', pid: process.pid, port: 443 })` call with a short bound
+and reject a response without the same PID, an exact HTTP 200 health response,
+healthy status, and active lease. Linux requires exact procfs socket-inode
+evidence; non-Linux direct runs accept the coordinator's platform listener
+proof without weakening that Linux gate. Local direct
+deployments retain an explicitly optional best-effort mode. The production
+unit pins `COORDINATOR_REGISTRATION_REQUIRED=1`, so exhausted registration
+fails startup instead of serving with a stopped coordinator record and no
+active lease.
 
 ## Test fixtures (test agents; `test/helpers/`)
 

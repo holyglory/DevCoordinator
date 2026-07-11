@@ -20,6 +20,8 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(coordinator, /\/home\/DevCoordinator\/skills\/codex-dev-coordinator\/scripts\/dev_coordinator\.py/);
   assert.match(coordinator, /--token-file \/home\/holyglory\/\.codex\/agent-coordinator\/api-token/);
   assert.match(coordinator, /CODEX_AGENT_COORDINATOR_HOME=\/home\/holyglory\/\.codex\/agent-coordinator/);
+  assert.match(coordinator, /^AmbientCapabilities=CAP_NET_BIND_SERVICE$/m);
+  assert.doesNotMatch(coordinator, /^CapabilityBoundingSet=/m);
   assert.match(coordinator, /^KillMode=process$/m);
   assert.doesNotMatch(coordinator, /^KillMode=(?:control-group|mixed)$/m);
   assert.doesNotMatch(
@@ -49,6 +51,7 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(consoleUnit, /ExecStartPre=.*--require-token --wait-token-seconds 10/);
   assert.match(consoleUnit, /ExecStart=\/usr\/bin\/env DEVCOORDINATOR_ROOT=\/home\/DevCoordinator/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_AUTOSTART=0/);
+  assert.match(consoleUnit, /ExecStart=.*COORDINATOR_REGISTRATION_REQUIRED=1/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_URL=http:\/\/127\.0\.0\.1:29876/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_SCRIPT=\/home\/DevCoordinator\/skills\/codex-dev-coordinator\/scripts\/dev_coordinator\.py/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_TOKEN_FILE=\/home\/holyglory\/\.codex\/agent-coordinator\/api-token/);
@@ -64,6 +67,7 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(consoleUnit, /^ProtectSystem=full$/m);
   assert.match(consoleUnit, /^ProtectHome=read-only$/m);
   assert.match(consoleUnit, /^NoNewPrivileges=true$/m);
+  assert.match(consoleUnit, /^CapabilityBoundingSet=CAP_NET_BIND_SERVICE$/m);
   assert.doesNotMatch(`${coordinator}\n${consoleUnit}`, /\/home\/holyglory\/holyskills|apps\/DevOpsConsole\/\.env/i);
   assert.doesNotMatch(`${coordinator}\n${consoleUnit}`, /%h|\/root\//, 'system units must not resolve runtime paths from the manager home');
   assert.doesNotMatch(consoleUnit, /holyskills|spawn python3/i);
@@ -87,6 +91,7 @@ test('ExecStart assignments override malicious EnvironmentFile values', async ()
   );
   for (const [key, value] of Object.entries(expected)) assert.equal(actual[key], value, key);
   assert.equal(actual.COORDINATOR_AUTOSTART, '0');
+  assert.equal(actual.COORDINATOR_REGISTRATION_REQUIRED, '1');
   assert.equal(actual.COORDINATOR_URL, 'http://127.0.0.1:29876');
   assert.equal(actual.STATE_DIR, '/home/holyglory/.local/state/devops-console');
 });
@@ -161,12 +166,18 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'trap cleanup_cutover_override EXIT',
     'trap - EXIT',
     'restore_enablement devops-console.service',
-    'post-cutover Console server did not reuse the exact relocated identity',
+    'verify_post_cutover_registration.py',
+    'post-cutover-registration-graph.json',
+    '--expected-identities "$CUTOVER_BACKUP/pre-cutover-identities.json"',
+    'systemctl show --property MainPID --value devops-console.service',
+    '--main-pid "$CONSOLE_MAIN_PID"',
     'systemctl disable dev-coordinator.service',
     'dev-coordinator.service.preexisting',
     'sudo rm -f /etc/systemd/system/dev-coordinator.service',
     'systemctl reset-failed dev-coordinator.service devops-console.service',
     'check_coordinator_auth_boundary.py',
+    '--inventory-output "$CUTOVER_BACKUP/post-cutover-inventory.json"',
+    "grep -Eq '^status=200 remote=[^[:space:]]+ tls=0$'",
     'check_loaded_systemd_paths.py',
     'resolved-unit-paths.json',
     'sha256sum --check SHA256SUMS',

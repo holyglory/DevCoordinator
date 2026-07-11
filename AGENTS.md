@@ -132,3 +132,31 @@ These rules apply to Codex and Claude Code in this repository.
   an operator-exclusive coordinator mutation window. Do not run another API or
   coordinator CLI against that home until relocation is committed or rollback
   is complete.
+- When one Linux service discovers another service's listener through
+  `/proc/<pid>/fd`, model the target's effective capability set in both the
+  service design and its tests. Same UID is not sufficient: a process carrying
+  a permitted capability can make its fd/cwd links unreadable to an otherwise
+  unprivileged peer. A capability-matched observer must clear ambient and
+  inheritable capabilities before it can exec managed children, and tests must
+  prove those children receive empty inheritable, permitted, effective, and
+  ambient sets. The coordinator must not narrow the system manager's bounding
+  ceiling merely to constrain its own observer capability: a bounding ceiling
+  is not an active capability, and narrowing it would mask legitimate file
+  capabilities on managed executables.
+- A production Console cutover is not healthy merely because ports 80/443 and
+  `/healthz` answer. Its coordinator registration is required and must prove
+  the exact relocated server identity is running, healthy, bound to the
+  systemd MainPID, and linked in both directions to one active replacement
+  lease and the exact durable assignment. Exercise the capability-asymmetric
+  split-unit topology; an ordinary same-process listener fixture is not enough.
+- Never trust a caller-supplied registration PID only because it is alive.
+  Registration must prove readable project ownership and that the exact PID
+  owns a LISTEN socket for the declared port. Keep must-reject controls for a
+  same-project non-listener, foreign listener, dead PID, wrong port, and
+  unreadable process identity.
+- Treat listener identity as tri-state. If ownership is unobservable, every
+  server or project lifecycle mutation must fail before it writes an operation,
+  changes lifecycle or lease state, sends a signal, launches a process, acts on
+  Docker, or records sidecar metadata. Status and inventory may return the
+  unknown observation but must preserve the last strictly proved lifecycle and
+  lease. Never coerce unknown ownership to false through truthiness.

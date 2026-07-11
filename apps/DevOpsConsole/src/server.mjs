@@ -168,9 +168,10 @@ export async function startServers({ config, log, certManager, router, listenPor
     new Promise((resolve, reject) => {
       const onError = (err) => reject(err);
       server.once('error', onError);
-      // Dev mode is loopback-only by design; prod binds all interfaces unless
-      // config.bindHost narrows it (used by the in-process test harness).
-      server.listen(port, config.devInsecureHttp ? '127.0.0.1' : config.bindHost ?? undefined, () => {
+      // Dev mode is loopback-only. Production pins the IPv4 wildcard instead
+      // of relying on Node's omitted-host IPv6 dual-stack default, so listener
+      // ownership and the public network contract are deterministic.
+      server.listen(port, config.devInsecureHttp ? '127.0.0.1' : config.bindHost ?? '0.0.0.0', () => {
         server.removeListener('error', onError);
         log.info('listener started', { name, port: server.address().port });
         resolve();
@@ -227,6 +228,9 @@ export async function startServers({ config, log, certManager, router, listenPor
   return {
     close,
     // Actual bound ports (meaningful when listenPorts requested port 0).
-    addresses: entries.map(({ name, server }) => ({ name, port: server.address().port })),
+    addresses: entries.map(({ name, server }) => {
+      const address = server.address();
+      return { name, port: address.port, host: address.address, family: address.family };
+    }),
   };
 }

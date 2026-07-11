@@ -384,6 +384,156 @@ def check_listener_and_health_helpers() -> None:
             thread.join(timeout=5)
     finally:
         rmtree(cert_dir, ignore_errors=True)
+
+
+def check_registration_pid_guards() -> None:
+    """Prove explicit registration binds the exact process, project and port."""
+
+    module = _load_module()
+    root = Path(tempfile.mkdtemp(prefix="coordinator-register-pid-")).resolve(strict=True)
+    project = root / "project"
+    foreign_project = root / "foreign"
+    project.mkdir()
+    foreign_project.mkdir()
+    processes: list[subprocess.Popen[str]] = []
+
+    def spawn_listener(cwd: Path, *, nondumpable: bool = False) -> tuple[subprocess.Popen[str], int]:
+        port = free_port()
+        code = HTTP_FIXTURE_CODE
+        if nondumpable:
+            code = (
+                "import ctypes\n"
+                "libc=ctypes.CDLL(None,use_errno=True)\n"
+                "assert libc.prctl(4,0,0,0,0)==0\n"
+                + HTTP_FIXTURE_CODE
+            )
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, str(port)],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        processes.append(process)
+        wait_for_http(port)
+        return process, port
+
+    def must_reject(pid: int, port: int, expected: str | None, *, host: str = "127.0.0.1") -> None:
+        try:
+            module.registration_pid_identity(pid=pid, host=host, port=port, project=str(project))
+        except RuntimeError as exc:
+            if expected is not None:
+                check(expected in str(exc), f"registration PID rejection should mention {expected!r}: {exc}")
+            return
+        raise AssertionError(f"registration accepted invalid PID {pid} for port {port}: {expected}")
+
+    try:
+        listener, port = spawn_listener(project)
+        identity = module.registration_pid_identity(
+            pid=listener.pid, host="127.0.0.1", port=port, project=str(project)
+        )
+        check(
+            identity["pid"] == listener.pid and identity["port"] == port and identity["cwd"] == str(project),
+            f"exact owning PID should validate: {identity}",
+        )
+        resolved_pid, resolved_identity = module.resolve_registration_pid(
+            {}, host="127.0.0.1", port=port, project=str(project)
+        )
+        check(
+            resolved_pid == listener.pid and (resolved_identity or {}).get("pid") == listener.pid,
+            "normal omitted-PID adoption should retain verified listener discovery",
+        )
+
+        assignment_key = module.server_key(str(project), "lease-owner-change")
+        owner_state = module.default_state()
+        owner_state["port_assignments"][assignment_key] = {
+            "key": assignment_key,
+            "project": str(project),
+            "name": "lease-owner-change",
+            "port": port,
+        }
+        owner_state["servers"]["owner-change-server"] = {
+            "id": "owner-change-server",
+            "key": assignment_key,
+            "project": str(project),
+            "name": "lease-owner-change",
+            "port": port,
+            "pid": os.getpid(),
+            "status": "running",
+        }
+        owner_state["leases"]["old-owner-lease"] = {
+            "id": "old-owner-lease",
+            "project": str(project),
+            "port": port,
+            "purpose": "server:lease-owner-change",
+            "server_id": "owner-change-server",
+            "owner_pid": os.getpid(),
+            "status": "active",
+        }
+        replacement = module.lease_existing_server_port(
+            owner_state,
+            agent="registration-test",
+            project=str(project),
+            port=port,
+            purpose="server:lease-owner-change",
+            server_id="owner-change-server",
+            owner_pid=listener.pid,
+            assignment_key=assignment_key,
+        )
+        check(
+            replacement["id"] != "old-owner-lease"
+            and replacement["owner_pid"] == listener.pid
+            and replacement["assignment_key"] == assignment_key
+            and "old-owner-lease" not in owner_state["leases"],
+            f"changed listener owner must receive a replacement lease: {replacement}",
+        )
+
+        idle = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=project,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        processes.append(idle)
+        must_reject(idle.pid, port, "does not own")
+        must_reject(listener.pid, port, None, host="127.0.0.2")
+
+        foreign, foreign_port = spawn_listener(foreign_project)
+        must_reject(foreign.pid, foreign_port, "outside registered project")
+        must_reject(
+            listener.pid,
+            free_port(),
+            "no TCP LISTEN socket" if sys.platform.startswith("linux") else "does not own",
+        )
+
+        dead = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            cwd=project,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        dead.wait(timeout=5)
+        must_reject(dead.pid, port, "is not alive")
+
+        empty_pid, empty_identity = module.resolve_registration_pid(
+            {}, host="127.0.0.1", port=free_port(), project=str(project)
+        )
+        check(empty_pid is None and empty_identity is None, "an intentionally stopped endpoint may remain unleased")
+
+        if sys.platform.startswith("linux"):
+            opaque, opaque_port = spawn_listener(project, nondumpable=True)
+            must_reject(opaque.pid, opaque_port, "working directory is not observable")
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        rmtree(root, ignore_errors=True)
     check(True, "loopback HTTPS health checks should pass against self-signed certs")
 
 
@@ -548,6 +698,31 @@ def check_port_relocation_guards(module: object, tmp: Path, base_env: dict[str, 
             f"new listener registration should reuse the relocated server id: {registered}",
         )
         registered_state = json.loads(happy_file.read_text(encoding="utf-8"))
+        current_server = registered_state["servers"][server_id]
+        active_leases = [
+            lease
+            for lease in registered_state["leases"].values()
+            if lease.get("status") == "active"
+            and lease.get("project") == str(new_project.resolve())
+            and int(lease.get("port") or 0) == happy_port
+        ]
+        check(
+            current_server.get("status") == "running"
+            and (current_server.get("health") or {}).get("ok") is True
+            and current_server.get("pid") == relocated_listener.pid,
+            f"relocated server must become the exact healthy listener: {current_server}",
+        )
+        check(len(active_leases) == 1, f"registration must create one replacement lease: {active_leases}")
+        replacement_lease = active_leases[0]
+        check(
+            replacement_lease.get("id") != lease_id
+            and current_server.get("lease_id") == replacement_lease.get("id")
+            and replacement_lease.get("server_id") == server_id
+            and replacement_lease.get("owner_pid") == relocated_listener.pid
+            and replacement_lease.get("purpose") == f"server:{name}"
+            and replacement_lease.get("assignment_key") == new_key,
+            f"replacement lease must link server, PID, purpose, and assignment in both directions: {replacement_lease}",
+        )
         check(
             not any(
                 assignment.get("project") == str(old_project.resolve())
@@ -735,9 +910,416 @@ class _HealthzHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
 
+def check_unobservable_listener_lifecycle_guards(module: object, tmp: Path) -> None:
+    """Prove unknown listener identity is never treated as stopped or replaceable."""
+
+    project = tmp / "unobservable-listener-lifecycle"
+    (project / ".codex").mkdir(parents=True)
+    port = free_port()
+    server_id = "unobservable-server"
+    lease_id = "unobservable-lease"
+    key = f"{project.resolve()}::web"
+    (project / ".codex" / "dev-runtime.json").write_text(
+        json.dumps(
+            {
+                "name": "unobservable-runtime",
+                "servers": [
+                    {
+                        "name": "web",
+                        "role": "web",
+                        "port": port,
+                        "cwd": ".",
+                        "argv": [sys.executable, "-c", "pass"],
+                    }
+                ],
+                "dependencies": [
+                    {"type": "docker", "name": "database", "container": "unobservable-db"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    server = {
+        "id": server_id,
+        "key": key,
+        "name": "web",
+        "project": str(project.resolve()),
+        "cwd": str(project.resolve()),
+        "port": port,
+        "host": "127.0.0.1",
+        "pid": os.getpid(),
+        "lease_id": lease_id,
+        "status": "running",
+        "argv_template": [sys.executable, "-c", "pass"],
+        "cmd_template": None,
+        "env": {},
+        "health_url": None,
+        "created_at": "fixture-created",
+        "generation": 7,
+        "registration_identity": {"pid": os.getpid()},
+    }
+    lease = {
+        "id": lease_id,
+        "port": port,
+        "agent": "fixture-agent",
+        "project": str(project.resolve()),
+        "purpose": "server:web",
+        "server_id": server_id,
+        "status": "active",
+        "owner_pid": os.getpid(),
+        "assignment_key": key,
+        "expires_at": None,
+    }
+    assignment = {
+        "key": key,
+        "project": str(project.resolve()),
+        "name": "web",
+        "port": port,
+        "agent": "fixture-agent",
+        "source": "fixture",
+        "created_at": "fixture-created",
+        "updated_at": "fixture-created",
+    }
+    unknown = {
+        "ok": None,
+        "pid_alive": True,
+        "check": {"ok": True},
+        "identity": {
+            "ok": None,
+            "observable": False,
+            "reason": "listener fd table is outside this observer's capability",
+        },
+        "classification": "unverified-listener",
+    }
+
+    def fixture_state() -> dict:
+        state = module.default_state()
+        state["servers"] = {server_id: copy.deepcopy(server)}
+        state["leases"] = {lease_id: copy.deepcopy(lease)}
+        state["port_assignments"] = {key: copy.deepcopy(assignment)}
+        return state
+
+    def lifecycle(state: dict) -> dict:
+        row = state["servers"][server_id]
+        return {
+            "status": row.get("status"),
+            "pid": row.get("pid"),
+            "lease_id": row.get("lease_id"),
+            "generation": row.get("generation"),
+            "operation_id": row.get("operation_id"),
+            "lease": copy.deepcopy(state["leases"].get(lease_id)),
+        }
+
+    def expect_unknown(call, label: str) -> None:
+        try:
+            call()
+        except module.ListenerIdentityUnobservable as exc:
+            check("unobservable" in str(exc), f"{label} should explain listener identity: {exc}")
+            return
+        raise AssertionError(f"{label} accepted an unobservable listener identity")
+
+    original_health = module.server_health
+    original_stop = module.stop_pid
+    original_start = module.start_process
+    original_docker_inventory = module.docker_ps_inventory
+    original_run_docker = module.run_docker
+    original_register_docker = module.register_docker_metadata
+    original_coordinated_docker = module.coordinated_run_docker
+    original_coordinated_register = module.coordinated_register_docker_metadata
+    original_project_identity_guard = module.require_project_server_identities_observable
+    original_home = os.environ.get("CODEX_AGENT_COORDINATOR_HOME")
+    signals: list[int] = []
+    launches: list[dict] = []
+    docker_mutations: list[list[str]] = []
+    docker_registrations: list[str] = []
+    try:
+        module.server_health = lambda *_args, **_kwargs: copy.deepcopy(unknown)
+        module.stop_pid = lambda pid: signals.append(int(pid))
+        module.start_process = lambda **kwargs: (
+            launches.append(dict(kwargs)) or (987_654_321, str(project / "unexpected.log"))
+        )
+        module.docker_ps_inventory = lambda **_kwargs: {
+            "available": True,
+            "containers": [
+                {
+                    "id": "unobservable-db-id",
+                    "name": "unobservable-db",
+                    "status": "Exited (0)",
+                    "ports": "",
+                    "metadata_source": "none",
+                }
+            ],
+            "postgres": [],
+        }
+        module.run_docker = lambda _state, command, **_kwargs: (
+            docker_mutations.append(list(command)) or {"command": list(command)}
+        )
+        module.register_docker_metadata = lambda _state, options: (
+            docker_registrations.append(str(options["container"])) or dict(options)
+        )
+        module.coordinated_run_docker = lambda command, **_kwargs: (
+            docker_mutations.append(list(command)) or {"command": list(command)}
+        )
+        module.coordinated_register_docker_metadata = lambda options: (
+            docker_registrations.append(str(options["container"])) or dict(options)
+        )
+
+        status_state = fixture_state()
+        before = lifecycle(status_state)
+        status = module.status_server(
+            status_state,
+            {"server_id": server_id, "project": str(project.resolve()), "name": "web"},
+        )
+        check(
+            status.get("status") == "running"
+            and (status.get("health") or {}).get("ok") is None
+            and lifecycle(status_state) == before,
+            f"read-only status must preserve the recorded lifecycle: {status}",
+        )
+        inventory_state = fixture_state()
+        before = lifecycle(inventory_state)
+        inventory = module.build_inventory(
+            inventory_state,
+            project=str(project.resolve()),
+            include_docker=False,
+        )
+        inventory_server = next(item for item in inventory["servers"] if item["id"] == server_id)
+        check(
+            inventory_server.get("status") == "running"
+            and (inventory_server.get("health") or {}).get("classification") == "unverified-listener"
+            and lifecycle(inventory_state) == before,
+            "read-only inventory must preserve lifecycle and lease state",
+        )
+
+        sync_actions = {
+            "stop": lambda state: module.stop_server(
+                state,
+                {"agent": "guard-test", "project": str(project.resolve()), "name": "web"},
+            ),
+            "start": lambda state: module.start_server(
+                state,
+                {
+                    "agent": "guard-test",
+                    "project": str(project.resolve()),
+                    "name": "web",
+                    "cwd": str(project.resolve()),
+                    "argv": [sys.executable, "-c", "pass"],
+                    "range": f"{port}-{port}",
+                    "preferred": port,
+                },
+            ),
+            "restart": lambda state: module.restart_server(
+                state,
+                {"agent": "guard-test", "project": str(project.resolve()), "name": "web"},
+            ),
+        }
+        for action, call in sync_actions.items():
+            state = fixture_state()
+            before = lifecycle(state)
+            expect_unknown(lambda call=call, state=state: call(state), f"synchronous {action}")
+            check(lifecycle(state) == before, f"synchronous {action} changed lifecycle or lease")
+        for action in ("start", "restart", "stop"):
+            state = fixture_state()
+            before = lifecycle(state)
+            docker_mutations.clear()
+            docker_registrations.clear()
+            expect_unknown(
+                lambda action=action, state=state: getattr(module, f"project_runtime_{action}")(
+                    state,
+                    {"agent": "guard-test", "project": str(project.resolve())},
+                ),
+                f"synchronous project {action}",
+            )
+            check(
+                lifecycle(state) == before and not docker_mutations and not docker_registrations,
+                f"synchronous project {action} partially mutated before identity proof",
+            )
+
+        # The project preflight covers every registered row owned by the
+        # project, including a server omitted from the runtime declaration.
+        undeclared_state = fixture_state()
+        undeclared = copy.deepcopy(server)
+        undeclared.update(
+            {
+                "id": "undeclared-unobservable-server",
+                "key": f"{project.resolve()}::undeclared-worker",
+                "name": "undeclared-worker",
+                "lease_id": None,
+            }
+        )
+        undeclared_state["servers"][undeclared["id"]] = undeclared
+        healthy = {
+            "ok": True,
+            "pid_alive": True,
+            "check": {"ok": True},
+            "identity": {"ok": True, "observable": True},
+            "classification": "healthy",
+        }
+        module.server_health = lambda candidate, **_kwargs: copy.deepcopy(
+            unknown if candidate.get("name") == "undeclared-worker" else healthy
+        )
+        undeclared_spec = module.build_project_runtime_spec(
+            undeclared_state,
+            project=str(project.resolve()),
+        )
+        expect_unknown(
+            lambda: module.require_project_server_identities_observable(
+                undeclared_state,
+                undeclared_spec,
+                action="stop",
+            ),
+            "undeclared registered project server preflight",
+        )
+        module.server_health = lambda *_args, **_kwargs: copy.deepcopy(unknown)
+
+        coordinated_home = tmp / "unobservable-coordinated-state"
+        os.environ["CODEX_AGENT_COORDINATOR_HOME"] = str(coordinated_home)
+
+        def reset_coordinated() -> None:
+            with module.locked_state() as state:
+                fresh = fixture_state()
+                state.clear()
+                state.update(fresh)
+
+        reset_coordinated()
+        before = lifecycle(module.snapshot_coordinator_state())
+        coordinated_status = module.coordinated_status_server(
+            {"project": str(project.resolve()), "name": "web"}
+        )
+        after = lifecycle(module.snapshot_coordinator_state())
+        check(
+            coordinated_status.get("status") == "running"
+            and (coordinated_status.get("health") or {}).get("ok") is None
+            and after == before,
+            "coordinated status must preserve lifecycle and lease state",
+        )
+        for action in ("stop", "start", "restart"):
+            reset_coordinated()
+            before_state = module.snapshot_coordinator_state()
+            before = lifecycle(before_state)
+            signals.clear()
+            launches.clear()
+            options = {"agent": "guard-test", "project": str(project.resolve()), "name": "web"}
+            if action == "start":
+                options.update(
+                    {
+                        "cwd": str(project.resolve()),
+                        "argv": [sys.executable, "-c", "pass"],
+                        "range": f"{port}-{port}",
+                        "preferred": port,
+                    }
+                )
+            expect_unknown(
+                lambda action=action, options=options: getattr(
+                    module, f"coordinated_{action}_server"
+                )(options),
+                f"coordinated {action}",
+            )
+            after_state = module.snapshot_coordinator_state()
+            check(
+                lifecycle(after_state) == before
+                and len(after_state.get("operations", {})) == len(before_state.get("operations", {}))
+                and not signals
+                and not launches,
+                f"coordinated {action} signalled, launched, or changed lifecycle state",
+            )
+        for action in ("start", "restart", "stop"):
+            reset_coordinated()
+            before_state = module.snapshot_coordinator_state()
+            before = lifecycle(before_state)
+            docker_mutations.clear()
+            docker_registrations.clear()
+            expect_unknown(
+                lambda action=action: getattr(module, f"coordinated_project_runtime_{action}")(
+                    {"agent": "guard-test", "project": str(project.resolve())}
+                ),
+                f"coordinated project {action}",
+            )
+            after_state = module.snapshot_coordinator_state()
+            check(
+                lifecycle(after_state) == before
+                and len(after_state.get("operations", {})) == len(before_state.get("operations", {}))
+                and not docker_mutations
+                and not docker_registrations,
+                f"coordinated project {action} partially mutated before identity proof",
+            )
+
+        # Revalidate all relevant lifecycle fingerprints under the same lock
+        # that creates the project operation. This fixture changes generation
+        # after observation and must fail before an operation record exists.
+        reset_coordinated()
+        module.server_health = lambda *_args, **_kwargs: copy.deepcopy(healthy)
+        before_operation_ids = set(module.snapshot_coordinator_state().get("operations", {}))
+
+        def race_project_preflight(state: dict, spec: dict, *, action: str) -> dict:
+            fingerprints = original_project_identity_guard(state, spec, action=action)
+            with module.locked_state() as current:
+                current["servers"][server_id]["generation"] += 1
+            return fingerprints
+
+        module.require_project_server_identities_observable = race_project_preflight
+        try:
+            module.begin_project_operation(
+                {"agent": "guard-test", "project": str(project.resolve())},
+                "stop",
+            )
+        except RuntimeError as exc:
+            check(
+                "changed during listener identity preflight" in str(exc),
+                f"project TOCTOU should have an exact retry failure: {exc}",
+            )
+        else:
+            raise AssertionError("project operation ignored a post-observation lifecycle change")
+        finally:
+            module.require_project_server_identities_observable = original_project_identity_guard
+        after_operation_ids = set(module.snapshot_coordinator_state().get("operations", {}))
+        check(
+            after_operation_ids == before_operation_ids,
+            "project TOCTOU rejection must happen before operation-state mutation",
+        )
+
+        # False-positive guard: positive identity proof retains the authorized
+        # lifecycle path instead of turning every registered listener immutable.
+        module.server_health = lambda *_args, **_kwargs: {
+            "ok": True,
+            "pid_alive": True,
+            "check": {"ok": True},
+            "identity": {"ok": True, "observable": True},
+            "classification": "healthy",
+        }
+        capable_state = fixture_state()
+        signals.clear()
+        stopped = module.stop_server(
+            capable_state,
+            {"agent": "guard-test", "project": str(project.resolve()), "name": "web"},
+        )
+        check(
+            signals == [os.getpid()]
+            and stopped.get("status") == "stopped"
+            and lease_id not in capable_state["leases"],
+            "positive listener identity proof must retain authorized stop behavior",
+        )
+    finally:
+        module.server_health = original_health
+        module.stop_pid = original_stop
+        module.start_process = original_start
+        module.docker_ps_inventory = original_docker_inventory
+        module.run_docker = original_run_docker
+        module.register_docker_metadata = original_register_docker
+        module.coordinated_run_docker = original_coordinated_docker
+        module.coordinated_register_docker_metadata = original_coordinated_register
+        module.require_project_server_identities_observable = original_project_identity_guard
+        if original_home is None:
+            os.environ.pop("CODEX_AGENT_COORDINATOR_HOME", None)
+        else:
+            os.environ["CODEX_AGENT_COORDINATOR_HOME"] = original_home
+
+
 def main() -> int:
     check_http_fixture_policy()
     check_listener_and_health_helpers()
+    check_registration_pid_guards()
     tmp = Path(tempfile.mkdtemp(prefix="codex-dev-coordinator-self-test-")).resolve(strict=True)
     env = os.environ.copy()
     env["CODEX_AGENT_COORDINATOR_HOME"] = str(tmp / "state")
@@ -775,6 +1357,7 @@ def main() -> int:
 
         check_atomic_write_cleanup_preserves_primary(dc, tmp)
         check_port_relocation_guards(dc, tmp, env)
+        check_unobservable_listener_lifecycle_guards(dc, tmp)
 
         # A GUI-launched process commonly receives launchd's minimal PATH.  A
         # Linux validation host may legitimately install Docker in /usr/bin,

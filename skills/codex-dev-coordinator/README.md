@@ -57,6 +57,18 @@ history. It detects listeners from positive socket/PID/connect evidence rather
 than a bind probe, so lack of permission to bind a free privileged port cannot
 be mistaken for a live listener.
 
+Registration never treats an arbitrary live `--pid` as listener ownership.
+The exact PID must own a LISTEN socket for the declared port and have a
+readable cwd within the canonical project. On Linux, inspecting a
+capability-bearing listener can require the observer to hold the same narrow
+capability even under the same UID. The production API clears its ambient and
+inheritable sets at startup so that observer capability remains in the
+coordinator process and does not become an inheritable, permitted, effective,
+or ambient capability of ordinary managed executables. The coordinator leaves
+the system manager's bounding ceiling unchanged: that ceiling is not active
+capability state, and legitimate privileges attached to a child's own
+executable remain available.
+
 Status and inventory collect evidence from a consistent snapshot. Their health
 and telemetry observations reserve monotonic per-server tickets and commit only
 if both the newest ticket and lifecycle fingerprint are still current. A newer
@@ -69,6 +81,17 @@ between observation and commit.
 Repository identity is resolved from local `.git` markers and HEAD metadata.
 State-critical paths do not invoke the Git executable or credential helpers
 while the coordinator lock is held.
+
+An unprivileged CLI may be unable to re-open procfs evidence for a listener
+whose capability was strictly proved by the production API. That observation
+is returned as `unverified-listener` (`health.ok=null`,
+`identity.observable=false`) and does not upgrade/downgrade the stored
+lifecycle or release its lease. Authenticated inventory through the
+capability-matched API is the strict current-ownership surface.
+Server and whole-project start, stop, and restart also fail before any
+operation record, signal, process launch, lease change, Docker action, or
+sidecar metadata write when a target listener is unobservable. Unknown
+ownership is never treated as evidence that the listener is stopped.
 
 ## What It Does Not Provide
 

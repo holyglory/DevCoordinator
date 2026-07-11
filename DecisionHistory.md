@@ -1,5 +1,89 @@
 # Decision History
 
+## 2026-07-11 - Split-service listener discovery must capability-match without capability propagation
+
+Decision: The production coordinator process will receive only
+`CAP_NET_BIND_SERVICE`, matching the Console capability that makes Linux allow
+the coordinator to inspect the Console's `/proc/<pid>/fd` and `cwd` evidence.
+At API startup the coordinator must immediately clear its ambient and
+inheritable capability sets while retaining the effective capability needed by
+the long-lived observer. Every subsequently exec'd managed child must therefore
+start with empty inheritable, permitted, effective, and ambient sets. Production
+Console self-registration is required rather than best-effort. Explicit
+registration PIDs must independently prove exact LISTEN-socket ownership and a
+readable cwd inside the canonical project. The production registration and
+post-cutover gates require `/healthz` to return exactly HTTP 200; a redirect is
+not accepted as service health. The public TLS evidence also requires status
+200 and curl's certificate verification result zero; `--fail` alone is not
+sufficient because curl accepts 3xx responses. The post-cutover gate must validate
+the full assignment/server/lease graph and the systemd MainPID, not merely the
+presence of rows on port 443.
+
+Linux Console registration requires procfs socket-inode evidence. Optional
+non-Linux direct Console runs accept the coordinator's platform-specific
+listener proof, because they do not expose Linux procfs inodes; that fallback
+is rejected when `process.platform` is Linux and is never accepted by the
+production post-cutover verifier.
+
+The production unit continues to omit `NoNewPrivileges`: this is a generic
+process coordinator whose managed children may have legitimate executable
+privilege semantics. It also leaves the system manager's capability bounding
+ceiling unchanged. A bounding ceiling is inherited but is not an active
+capability; narrowing it would silently mask legitimate file capabilities on
+managed executables. The non-propagation claim and test are therefore
+explicitly limited to inheritable, permitted, effective, and ambient sets on
+ordinary managed executables, while separately proving that the child's
+bounding ceiling matches the coordinator's inherited manager ceiling.
+
+The Console production listener is explicitly bound to IPv4 wildcard
+`0.0.0.0`, while registration and health use `127.0.0.1`. This replaces Node's
+platform-dependent omitted-host IPv6 dual-stack default, matches the deployed
+IPv4-only DNS records, and makes address-specific listener ownership
+deterministic. The server test verifies the real TLS listener reports an IPv4
+wildcard address and answers through IPv4 loopback.
+
+An ordinary CLI process does not receive the observer capability. If it reads
+the shared state after API registration, procfs ownership is explicitly
+`unverified-listener`; the observation preserves the prior lifecycle and
+active lease instead of treating permission denial as foreign ownership or
+healthy proof. Cutover evidence is captured through authenticated API
+inventory so the capable process supplies fresh PID/address/inode evidence.
+Every lifecycle mutation, including whole-project actions, fails before any
+operation record, signal, launch, lease change, Docker action, or metadata
+write when a relevant listener has that unknown identity. This is a tri-state
+contract; truthiness must not collapse unknown into stopped or unhealthy.
+
+Why: The third split-unit cutover relocated the durable assignment and retained
+the exact server ID correctly, intentionally stale-releasing the old lease.
+The new Console then opened ports 80/443 and served valid public TLS, but its
+`POST /v1/servers/register` failed with `port 443 is open but no listener PID
+could be identified`. The Console Node process carried
+`CAP_NET_BIND_SERVICE`; the separately launched unprivileged coordinator could
+read the global TCP listener inode but received `EACCES` for that process's fd
+and cwd links. The legacy topology worked only because its Console-spawned
+coordinator inherited the same capability. Existing tests used an ordinary
+same-process listener with no capability asymmetry, while the Console e2e
+harness deliberately skipped production self-registration. The CLI's optional
+`--pid` was not a safe workaround: any live PID bypassed listener ownership and
+an unreadable cwd was accepted.
+
+The adjacent lifecycle sweep reproduced a more dangerous consequence in the
+pre-fix implementation: `server stop` treated only explicit wrong ownership as
+unsafe, so unobservable ownership fell into the signal path, marked the server
+stopped, and released its lease. Start/restart paths similarly treated unknown
+as down and could attempt a duplicate launch. Project mutations could perform
+metadata or Docker work before reaching the affected server. These behaviors
+were not covered by the initial inventory-only preservation test.
+
+Result: The failed cutover was rolled back from the checksummed pre-relocation
+checkpoint to the untouched legacy unit; public `https://console.vr.ae/healthz`
+returned HTTP 200 with valid TLS, and the legacy Console again registered on
+443. The durable prevention boundary now requires a real Linux
+capability-asymmetric fixture, capability non-propagation evidence for launched
+children, explicit-PID false-positive guards, required production registration,
+and an executable graph verifier before another cutover can be accepted. Each
+cutover attempt retains its own immutable backup and incident evidence.
+
 ## 2026-07-11 - Loaded-unit checks model omitted undefined properties narrowly
 
 Decision: The loaded-systemd checker accepts an omitted property as empty only

@@ -255,6 +255,23 @@ python3 scripts/dev_coordinator.py server register \
   --url 'http://127.0.0.1:3000'
 ```
 
+An explicit `--pid` is proof input, not an ownership override. Registration
+requires that PID to be alive, have a readable cwd inside the canonical
+project, and own an exact TCP LISTEN socket inode for the declared port. A
+same-project idle PID, foreign listener, dead PID, wrong port, or unreadable
+process identity is rejected.
+
+On Linux, same UID alone does not guarantee `/proc/<pid>/fd` or cwd visibility
+when the target carries capabilities. A long-lived system service that adopts
+such listeners must have the narrow matching observer capability. Before it
+can exec managed children it must clear ambient and inheritable capabilities;
+the children must receive empty inheritable, permitted, effective, and ambient
+sets. The DevCoordinator production unit and capability integration test model
+this boundary for the Console's `CAP_NET_BIND_SERVICE` listener. The
+coordinator leaves the system manager's bounding ceiling unchanged; it is not
+an active capability, and legitimate privileges attached to a child's own
+executable remain available.
+
 Check, restart, and stop:
 
 ```bash
@@ -570,7 +587,19 @@ reporting success.
   grace window is reported as `starting`, not `unhealthy`, so a slow boot does
   not trigger needless restart churn. After the grace window it becomes
   `unhealthy`. `server_health` also returns a `classification` of `healthy`,
-  `starting`, `unhealthy`, `wrong-listener`, or `stopped`.
+  `starting`, `unhealthy`, `wrong-listener`, `unverified-listener`, or
+  `stopped`.
+- A CLI process that lacks permission to inspect a previously proven
+  capability-bearing listener reports `unverified-listener` with
+  `health.ok=null` and `identity.observable=false`. It preserves the recorded
+  running/unhealthy lifecycle and active lease; inability to observe is not
+  evidence that another process owns the port. Use the capability-matched,
+  authenticated production API inventory for a fresh strict ownership proof.
+- Server and project start, stop, and restart fail closed on that unknown
+  identity before recording an operation, signaling or launching a process,
+  changing a lease, acting on Docker, or writing sidecar metadata. Run the
+  mutation through a capability-matched coordinator surface; do not retry it
+  from an incapable CLI or infer that the port is safe to replace.
 - Stopped-server records are retained for evidence but pruned once they pass the
   retention window or exceed the per-home cap, so the shared state file does not
   grow without bound across months of start/stop cycles.

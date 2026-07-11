@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends lsof procps
+          sudo apt-get install --yes --no-install-recommends lsof procps util-linux
 
       - name: Capture coordinator inventory before test listeners
         run: >-
@@ -62,6 +62,13 @@ jobs:
 
       - name: Run complete safe validation
         run: python3 scripts/validate.py --skip-macos-app
+
+      - name: Prove split-service capability registration and non-propagation
+        if: runner.os == 'Linux'
+        env:
+          COORDINATOR_CAPABILITY_INTEGRATION_INVENTORY_CHECKED: "1"
+          COORDINATOR_CAPABILITY_INTEGRATION_REQUIRED: "1"
+        run: python3 skills/codex-dev-coordinator/scripts/capability_integration_test.py
 
   postgres-docker-integration:
     name: Disposable PostgreSQL Docker integration
