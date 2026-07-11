@@ -7,7 +7,9 @@ import argparse
 import http.client
 import json
 import os
+import socket
 import sys
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -19,6 +21,27 @@ class AuthBoundaryError(RuntimeError):
 
 
 INVENTORY_MAX_BYTES = 16 * 1024 * 1024
+TRANSIENT_TRANSPORT_ERRORS = (
+    ConnectionRefusedError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+    socket.timeout,
+    http.client.RemoteDisconnected,
+)
+
+
+def caused_by_missing_file(error: BaseException) -> bool:
+    """Return true only when a wrapped secure read failed with ENOENT."""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, FileNotFoundError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def read_token(token_file: Path) -> str:
@@ -49,29 +72,89 @@ def check_boundary(
     host: str = "127.0.0.1",
     port: int = 29876,
     timeout: float = 60.0,
+    wait_seconds: float = 10.0,
+    poll_interval_seconds: float = 0.1,
     status_fn: Callable[[str, int, float, str, str | None], int] = http_status,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict[str, int]:
     if host not in {"127.0.0.1", "::1"}:
         raise AuthBoundaryError("coordinator auth preflight is restricted to loopback")
-    if port < 1 or port > 65535 or timeout <= 0 or timeout > 120:
-        raise AuthBoundaryError("invalid coordinator port or timeout")
-    token = read_token(token_file)
-
-    observed = {
-        "anonymous_health": status_fn(host, port, timeout, "/healthz", None),
-        "anonymous_inventory": status_fn(host, port, timeout, "/v1/inventory", None),
-        "authenticated_inventory": status_fn(host, port, timeout, "/v1/inventory", token),
-    }
+    if (
+        port < 1
+        or port > 65535
+        or timeout <= 0
+        or timeout > 120
+        or wait_seconds <= 0
+        or wait_seconds > 120
+        or poll_interval_seconds <= 0
+        or poll_interval_seconds > 10
+    ):
+        raise AuthBoundaryError("invalid coordinator port, timeout, or readiness wait")
     expected = {
         "anonymous_health": 200,
         "anonymous_inventory": 401,
         "authenticated_inventory": 200,
     }
-    if observed != expected:
-        raise AuthBoundaryError(
-            f"coordinator health/auth boundary mismatch: expected {expected}, got {observed}"
-        )
-    return observed
+    deadline = monotonic_fn() + wait_seconds
+    attempts = 0
+    token: str | None = None
+    while True:
+        attempts += 1
+        def probe(path: str, bearer: str | None) -> int:
+            remaining = deadline - monotonic_fn()
+            if remaining <= 0:
+                raise TimeoutError("coordinator readiness deadline expired between requests")
+            return status_fn(host, port, min(timeout, remaining), path, bearer)
+
+        try:
+            if token is None:
+                token = read_token(token_file)
+            observed = {
+                "anonymous_health": probe("/healthz", None),
+                "anonymous_inventory": probe("/v1/inventory", None),
+                "authenticated_inventory": probe("/v1/inventory", token),
+            }
+        except AuthBoundaryError as error:
+            # The coordinator creates a missing token atomically before it
+            # binds. Only ENOENT is a startup condition; a symlink, FIFO,
+            # unsafe mode/owner, malformed value, or oversized token remains
+            # an immediate credential failure.
+            if not caused_by_missing_file(error):
+                raise
+            remaining = deadline - monotonic_fn()
+            if remaining <= 0:
+                raise AuthBoundaryError(
+                    "coordinator token did not appear before the readiness deadline "
+                    f"after {attempts} attempt(s)"
+                ) from error
+            sleep_fn(min(poll_interval_seconds, remaining))
+            continue
+        except (OSError, http.client.HTTPException) as error:
+            if not isinstance(error, TRANSIENT_TRANSPORT_ERRORS):
+                raise AuthBoundaryError(
+                    f"coordinator returned a non-transient probe error: {type(error).__name__}"
+                ) from error
+            remaining = deadline - monotonic_fn()
+            if remaining <= 0:
+                raise AuthBoundaryError(
+                    "coordinator did not become reachable before the readiness deadline "
+                    f"after {attempts} attempt(s); last error class={type(error).__name__}"
+                ) from error
+            sleep_fn(min(poll_interval_seconds, remaining))
+            continue
+        if observed != expected:
+            # A reachable endpoint with a wrong authorization contract is a
+            # configuration/security failure, not a startup race. Fail closed
+            # immediately instead of waiting for it to become acceptable.
+            raise AuthBoundaryError(
+                f"coordinator health/auth boundary mismatch: expected {expected}, got {observed}"
+            )
+        if monotonic_fn() > deadline:
+            raise AuthBoundaryError(
+                "coordinator boundary responses completed after the readiness deadline"
+            )
+        return observed
 
 
 def http_inventory(host: str, port: int, timeout: float, bearer: str) -> tuple[int, bytes]:
@@ -134,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=29876)
     parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument("--wait-seconds", type=float, default=10.0)
+    parser.add_argument("--poll-interval-seconds", type=float, default=0.1)
     parser.add_argument("--inventory-output")
     args = parser.parse_args(argv)
     try:
@@ -142,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             port=args.port,
             timeout=args.timeout,
+            wait_seconds=args.wait_seconds,
+            poll_interval_seconds=args.poll_interval_seconds,
         )
         if args.inventory_output:
             inventory = fetch_authenticated_inventory(

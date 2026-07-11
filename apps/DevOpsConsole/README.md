@@ -309,6 +309,12 @@ sudo systemctl start devops-console.service
 systemctl status dev-coordinator.service devops-console.service
 ```
 
+`dev-coordinator.service` does not finish starting merely because its Python
+process exists. Its pinned `ExecStartPost` probe waits for the loopback API and
+requires the complete anonymous/authenticated `200/401/200` contract within the
+unit's bounded start timeout. The explicit probe above records the same
+contract at the deployment boundary.
+
 ### Existing-host checkout cutover
 
 The deployed legacy topology has one `devops-console.service`; its Node process
@@ -320,7 +326,9 @@ command, listener evidence, exact lease ID, and exact Console server ID.
 For every real attempt, create a new timestamped private backup path and
 assemble these phases into one `0600` script inside that fresh backup. Never
 reuse or amend a prior attempt's path. Run `bash -n` on those exact bytes, hash
-the script into the verified backup manifest, and execute that same hash.
+the script into the verified backup manifest, and execute that same hash via
+`/bin/bash "$CUTOVER_BACKUP/cutover.sh" "$CUTOVER_BACKUP"`; the private
+artifact is intentionally readable only by its owner, not executable.
 Retain the backup, script, ledgers, and manifest after success or failure; a
 retry starts with another fresh path. The transaction handler
 must cover `ERR`, `INT`, `TERM`, `HUP`, and incomplete `EXIT`: before the stop
@@ -767,14 +775,40 @@ if grep -qx present "$CUTOVER_BACKUP/dev-coordinator.service.preexisting"; then
 fi
 sudo systemctl reset-failed dev-coordinator.service devops-console.service || true
 sudo systemctl start devops-console.service
+ROLLBACK_MAIN_PID="$(systemctl show --property MainPID --value devops-console.service)"
+ROLLBACK_CGROUP="$(systemctl show --property ControlGroup --value devops-console.service)"
+test "$ROLLBACK_MAIN_PID" -gt 1
+test -n "$ROLLBACK_CGROUP"
+python3 "$DEVCOORDINATOR_ROOT/scripts/verify_legacy_console_rollback_ready.py" \
+  --unit devops-console.service \
+  --main-pid "$ROLLBACK_MAIN_PID" --cgroup "$ROLLBACK_CGROUP" \
+  --old-coordinator-script "$OLD_COORDINATOR" \
+  --health-url https://console.vr.ae/healthz \
+  --evidence "$CUTOVER_BACKUP/rollback-readiness.json" \
+  --timeout-seconds 30 --poll-interval-seconds 0.1
 ```
 
-Verify the restored Console cgroup again contains its exact Node main process
-and one child coordinator on 29876, while the split coordinator unit is absent
-or restored to its recorded prior state. Re-run TLS health and login before
-ending rollback. Retain the old checkout and the immutable private backup after
-every attempted cutover, whether it succeeds or fails. Never reuse a failed
-attempt's backup path for a retry.
+The rollback readiness verifier fixes the systemd MainPID and cgroup at start,
+then revalidates both process start/argv identities on every observation. A
+temporarily missing child coordinator, transient attributed child, missing
+listener, or pre-bind TLS transport is retried only within the bounded timeout.
+Wrong, ambiguous, or unobservable listener ownership and any fixed identity
+change fail immediately. Success requires ports 80 and 443 to belong only to
+the restored Node MainPID, port 29876 to belong only to its exact old-checkout
+coordinator child, and the locally owned TLS listener to answer the public
+hostname with exactly HTTP 200 and successful certificate verification. The
+probe bypasses proxies and DNS routing, preserves SNI with the public hostname,
+and records an exact `127.0.0.1` remote address; externally routed public
+reachability remains a separate post-rollback check. The complete observation
+ledger and terminal result remain private and checksummed beside the rollback
+evidence. `SIGINT`, `SIGTERM`, and `SIGHUP` produce terminal `interrupted`
+evidence. `SIGKILL`, power loss, or storage failure can still leave `running`
+or incomplete evidence, which must never be accepted as rollback readiness.
+
+Also verify the split coordinator unit is absent or restored to its recorded
+prior state. Re-run login before ending rollback. Retain the old checkout and
+the immutable private backup after every attempted cutover, whether it succeeds
+or fails. Never reuse a failed attempt's backup path for a retry.
 
 Both units run as `holyglory`. The coordinator binds only loopback and owns the
 external coordinator state and private token. The Console requires that unit,

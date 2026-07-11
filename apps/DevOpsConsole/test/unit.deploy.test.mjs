@@ -19,6 +19,18 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(coordinator, /WorkingDirectory=\/home\/DevCoordinator/);
   assert.match(coordinator, /\/home\/DevCoordinator\/skills\/codex-dev-coordinator\/scripts\/dev_coordinator\.py/);
   assert.match(coordinator, /--token-file \/home\/holyglory\/\.codex\/agent-coordinator\/api-token/);
+  assert.deepEqual(
+    coordinator.split('\n').filter((line) => line.startsWith('ExecStartPost=')),
+    [
+      'ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py --token-file /home/holyglory/.codex/agent-coordinator/api-token --host 127.0.0.1 --port 29876 --wait-seconds 10 --poll-interval-seconds 0.1',
+    ],
+    'coordinator readiness must use exactly one pinned authenticated loopback probe',
+  );
+  assert.deepEqual(
+    coordinator.split('\n').filter((line) => line.startsWith('TimeoutStartSec=')),
+    ['TimeoutStartSec=20'],
+    'coordinator startup must have one exact bounded deadline',
+  );
   assert.match(coordinator, /CODEX_AGENT_COORDINATOR_HOME=\/home\/holyglory\/\.codex\/agent-coordinator/);
   assert.match(coordinator, /^AmbientCapabilities=CAP_NET_BIND_SERVICE$/m);
   assert.doesNotMatch(coordinator, /^CapabilityBoundingSet=/m);
@@ -171,6 +183,10 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     'trap cleanup_cutover_override EXIT',
     'trap - EXIT',
     'restore_enablement devops-console.service',
+    'verify_legacy_console_rollback_ready.py',
+    'rollback-readiness.json',
+    '--main-pid "$ROLLBACK_MAIN_PID" --cgroup "$ROLLBACK_CGROUP"',
+    '--timeout-seconds 30 --poll-interval-seconds 0.1',
     'verify_post_cutover_registration.py',
     'post-cutover-registration-graph.json',
     '--expected-identities "$CUTOVER_BACKUP/pre-cutover-identities.json"',
@@ -278,6 +294,22 @@ test('existing-host runbook models the legacy Console child-coordinator topology
   const resolvedUnitPaths = cutover.indexOf('check_loaded_systemd_paths.py', installUnits);
   const startConsole = cutover.indexOf('systemctl start devops-console.service', startCoordinator);
   const rollbackStateDecision = cutover.indexOf('ROLLBACK_STATE=');
+  const rollbackStart = cutover.indexOf(
+    'sudo systemctl start devops-console.service',
+    rollbackStateDecision,
+  );
+  const rollbackMainIdentity = cutover.indexOf(
+    'ROLLBACK_MAIN_PID="$(systemctl show --property MainPID --value devops-console.service)"',
+    rollbackStart,
+  );
+  const rollbackCgroupIdentity = cutover.indexOf(
+    'ROLLBACK_CGROUP="$(systemctl show --property ControlGroup --value devops-console.service)"',
+    rollbackStart,
+  );
+  const rollbackReady = cutover.indexOf(
+    'verify_legacy_console_rollback_ready.py',
+    rollbackStart,
+  );
   assert.ok(
     stableSamples >= 0 && stableSamples < safeKillOverride && safeKillOverride < finalSamples
       && finalSamples < stopLegacy
@@ -295,5 +327,18 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     stopLegacy < stoppedBoundaryChecks[0] && stoppedBoundaryChecks[0] < poststopCheckpoint
       && stoppedBoundaryChecks[1] < rollbackStateDecision,
     'rollback must recheck the old cgroup before any state restoration decision',
+  );
+  assert.ok(
+    rollbackStateDecision < rollbackStart
+      && rollbackStart < rollbackMainIdentity
+      && rollbackStart < rollbackCgroupIdentity
+      && rollbackMainIdentity < rollbackReady
+      && rollbackCgroupIdentity < rollbackReady,
+    'rollback must bind its restored systemd identity before the bounded readiness verifier',
+  );
+  assert.doesNotMatch(
+    cutover.slice(rollbackStart, rollbackReady),
+    /\bsleep\s+\d/,
+    'rollback readiness must not depend on a fixed post-start sleep',
   );
 });

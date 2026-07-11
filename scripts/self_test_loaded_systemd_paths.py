@@ -32,6 +32,8 @@ Environment=CODEX_AGENT_COORDINATOR_HOME=/home/holyglory/.codex/agent-coordinato
 AmbientCapabilities=cap_net_bind_service
 CapabilityBoundingSet=cap_chown cap_net_bind_service cap_sys_admin
 ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876 --token-file /home/holyglory/.codex/agent-coordinator/api-token ; ignore_errors=no ; start_time=[n/a] ; }
+ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py --token-file /home/holyglory/.codex/agent-coordinator/api-token --host 127.0.0.1 --port 29876 --wait-seconds 10 --poll-interval-seconds 0.1 ; ignore_errors=no ; start_time=[n/a] ; }
+TimeoutStartUSec=20s
 ReadWritePaths=
 """
 CONSOLE = """FragmentPath=/etc/systemd/system/devops-console.service
@@ -83,6 +85,9 @@ def main() -> int:
     must_fail(COORDINATOR.replace("/home/DevCoordinator/skills", f"{home}/holyskills/skills"), CONSOLE, "stale coordinator executable")
     must_fail(COORDINATOR.replace("path=/usr/bin/python3", "path=/tmp/python3"), CONSOLE, "coordinator executable path")
     must_fail(COORDINATOR.replace("ExecStart=", "MissingExecStart=", 1), CONSOLE, "missing coordinator command")
+    must_fail(COORDINATOR.replace("ExecStartPost=", "MissingExecStartPost=", 1), CONSOLE, "missing coordinator readiness gate")
+    must_fail(COORDINATOR.replace("--wait-seconds 10", "--wait-seconds 0", 1), CONSOLE, "disabled coordinator readiness wait")
+    must_fail(COORDINATOR.replace("TimeoutStartUSec=20s", "TimeoutStartUSec=infinity", 1), CONSOLE, "unbounded coordinator startup")
     must_fail(COORDINATOR, CONSOLE.replace(f"{home}/.config", "/root/.config"), "environment file")
     must_fail(COORDINATOR, CONSOLE.replace(f"--home {home}", "--home /root"), "preflight home")
     must_fail(COORDINATOR, CONSOLE.replace(f"--state-dir {home}/.local", "--state-dir /root/.local"), "preflight state")

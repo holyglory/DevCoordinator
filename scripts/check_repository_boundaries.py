@@ -240,6 +240,7 @@ def scan_tip(repo: Path) -> list[Finding]:
         "legacy runtime migration": repo / "scripts/migrate_legacy_console_runtime.py",
         "loaded unit preflight": repo / "scripts/check_loaded_systemd_paths.py",
         "post-cutover registration": repo / "scripts/verify_post_cutover_registration.py",
+        "legacy rollback readiness": repo / "scripts/verify_legacy_console_rollback_ready.py",
         "skill link manager": repo / "scripts/manage_skill_links.py",
     }
     texts: dict[str, str] = {}
@@ -295,6 +296,8 @@ def scan_tip(repo: Path) -> list[Finding]:
             "service group": "Group=holyglory",
             "external state": "CODEX_AGENT_COORDINATOR_HOME=/home/holyglory/.codex/agent-coordinator",
             "external token": "--token-file /home/holyglory/.codex/agent-coordinator/api-token",
+            "bounded authenticated readiness": "ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py",
+            "bounded startup deadline": "TimeoutStartSec=20",
             "managed-server-preserving stop": "KillMode=process",
             "matching listener capability": "AmbientCapabilities=CAP_NET_BIND_SERVICE",
             "unmodified manager capability ceiling": "Do not narrow CapabilityBoundingSet",
@@ -330,6 +333,13 @@ def scan_tip(repo: Path) -> list[Finding]:
             "exact listener inode": "no exact LISTEN socket inode evidence",
             "replacement lease": "active Console lease reused the retired pre-cutover lease id",
             "bidirectional lease linkage": '"lease_id", lease_id',
+        },
+        "legacy rollback readiness": {
+            "fixed systemd identity": "_require_fixed_unit",
+            "exact listener ownership": "_parse_listener_owners",
+            "bounded convergence": "RollbackReadinessTimeout",
+            "verified public TLS": 'health.get("tls_verify_result") != 0',
+            "terminal topology recheck": 'observation["post_listener_topology"]',
         },
         "packager": {
             "coordinator helper": "skills/codex-dev-coordinator/scripts/dev_coordinator.py",

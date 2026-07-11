@@ -23,6 +23,8 @@ PROPERTIES = (
     "EnvironmentFiles",
     "ExecStartPre",
     "ExecStart",
+    "ExecStartPost",
+    "TimeoutStartUSec",
     "ReadWritePaths",
     "AmbientCapabilities",
     "CapabilityBoundingSet",
@@ -34,6 +36,11 @@ CONSOLE_ENV = f"{SERVICE_HOME}/.config/devops-console/console.env"
 COORDINATOR_ARGV = (
     "/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py "
     f"api serve --host 127.0.0.1 --port 29876 --token-file {COORDINATOR_HOME}/api-token"
+)
+COORDINATOR_POSTSTART_ARGV = (
+    "/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py "
+    f"--token-file {COORDINATOR_HOME}/api-token --host 127.0.0.1 --port 29876 "
+    "--wait-seconds 10 --poll-interval-seconds 0.1"
 )
 CONSOLE_PREFLIGHT_ARGV = (
     "/usr/bin/python3 /home/DevCoordinator/scripts/check_production_layout.py "
@@ -217,6 +224,7 @@ def validate_loaded_unit_outputs(
         "Environment": f"CODEX_AGENT_COORDINATOR_HOME={COORDINATOR_HOME}",
         "EnvironmentFiles": "",
         "ExecStartPre": "",
+        "TimeoutStartUSec": "20s",
         "ReadWritePaths": "",
         "AmbientCapabilities": "cap_net_bind_service",
     }.items():
@@ -229,6 +237,13 @@ def validate_loaded_unit_outputs(
             allow_omitted_empty=key in {"EnvironmentFiles", "ExecStartPre"},
         )
     require_command(violations, "dev-coordinator.service", coordinator, "ExecStart", COORDINATOR_ARGV)
+    require_command(
+        violations,
+        "dev-coordinator.service",
+        coordinator,
+        "ExecStartPost",
+        COORDINATOR_POSTSTART_ARGV,
+    )
     coordinator_bounding = coordinator.get("CapabilityBoundingSet")
     if coordinator_bounding is None:
         violations.append("dev-coordinator.service did not expose CapabilityBoundingSet")
