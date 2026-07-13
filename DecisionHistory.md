@@ -2136,3 +2136,34 @@ Result: The frozen source passed 124 SwiftPM tests with zero failures and one
 expected regeneration skip. The explicitly enabled renderer test passed, the
 public-artifact guard found zero issues across 168 publishable files, and the
 unflagged snapshot verifier accepted all four current-source artifacts.
+
+## 2026-07-13 - Global attention must identify current evidence and a safe route
+
+Decision: DevOps Board treats stopped and starting managed servers as lifecycle
+state rather than failures merely because their readiness probe is false. A
+global non-nominal presentation must retain a concrete current action,
+resource, inventory issue, or in-progress action and at least one contextual
+route. Resource alerts name the server, container, or project conflict and use
+Review; action failures use View Activity; inventory failures use Refresh.
+Retained Activity history is evidence, not an unresolved global alert after its
+current issue is dismissed. Stale resource observations remain visible for
+diagnostics but cannot assert a new present-tense failure.
+
+Why: The Board collapsed resource health into a count and rendered the generic
+title and subtitle “Action or resource requires attention” with Refresh. In the
+reported state, 19 intentionally stopped or historical managed-server records
+had false readiness values, so no actual current issue could be named and
+Refresh was not a remedy. The same generic state was present in a canonical
+fixture but previous visual and launch gates checked geometry/cardinality only.
+
+Result: Typed attention items now preserve current loaded evidence, reason,
+recommended next step, and stable review target through the main window and
+menu. The signed launch gate rejects generic, unidentified, unactionable, and
+phantom attention. Native recall/control coverage distinguishes running probe
+failure from stopped/starting state and proves retained failed Activity does
+not keep health red. During final visual verification, a fragmented RGBA
+preview exposed that the center-body detector could be satisfied by the banner
+and Activity alone; the detector now excludes both and must catch erased
+primary content while allowing inner scrolling and intentionally empty rows.
+The clean signed build retained nominal attention semantics across three real
+three-source refreshes and returned to idle between them.
