@@ -62,6 +62,27 @@ def write_png(
     path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(rows))) + chunk(b"IEND", b""))
 
 
+def write_control_band_png(path: Path, *, control_y: int) -> None:
+    """Render two text/control rows without coupling the fixture to verifier code."""
+
+    width, height = 120, 80
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            in_first_row = control_y <= y < control_y + 6
+            in_second_row = control_y + 12 <= y < control_y + 18
+            is_control_pixel = (in_first_row or in_second_row) and (x % 16) < 12
+            rows.extend((180, 190, 200) if is_control_pixel else (15, 17, 18))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", zlib.compress(bytes(rows)))
+        + chunk(b"IEND", b"")
+    )
+
+
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -109,6 +130,34 @@ def main() -> int:
         )
         check("snapshot-sparse" not in fragmented_rules, "fragmented dark UI fixture should retain normal background coverage")
         check("snapshot-empty-region" not in fragmented_rules, "fixture must prove the old broad-region checks would pass")
+
+        # Removing a false alert legitimately moves the filter and resource-tab
+        # rows upward. The recalibrated semantic anchor must accept those intact
+        # rows, while still catching controls displaced below their expected
+        # first-viewport area.
+        control_anchor_spec = VERIFIER.ArtifactSpec(
+            120,
+            80,
+            0.85,
+            (),
+            (VERIFIER.AnchorSpec("filters-and-resource-tabs", 0, 10, 120, 40, 500, 12, 3),),
+        )
+        upward_controls = temporary / "intact-upward-controls.png"
+        write_control_band_png(upward_controls, control_y=14)
+        check(
+            not VERIFIER.verify_image(upward_controls, control_anchor_spec),
+            "intact controls shifted upward after false-alert removal should pass",
+        )
+
+        misplaced_controls = temporary / "misplaced-lower-controls.png"
+        write_control_band_png(misplaced_controls, control_y=54)
+        misplaced_rules = {
+            finding.rule for finding in VERIFIER.verify_image(misplaced_controls, control_anchor_spec)
+        }
+        check(
+            "snapshot-missing-semantic-anchor" in misplaced_rules,
+            "controls displaced below the expected filter/tab area must be caught",
+        )
 
         sparse = temporary / "sparse.png"
         write_png(sparse, rgba=False, sparse=True)

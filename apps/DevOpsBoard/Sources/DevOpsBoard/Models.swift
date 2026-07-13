@@ -659,6 +659,26 @@ func isStoppedStatus(_ status: String?) -> Bool {
     return value.contains("exited") || value.contains("created") || value.contains("dead") || value.contains("stopped")
 }
 
+/// A stopped or starting server commonly has `health.ok == false` because no
+/// readiness endpoint is expected to answer yet. That is lifecycle state, not
+/// evidence that the user must repair the resource. A failed health probe is
+/// actionable only while the server is currently running; explicit failure
+/// lifecycle states remain actionable regardless of the optional probe value.
+func serverRequiresAttention(_ server: ManagedServer) -> Bool {
+    let status = (server.status ?? "unknown")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    if ["unhealthy", "degraded", "orphaned"].contains(status) {
+        return true
+    }
+    return isRunningStatus(status) && server.health?.ok == false
+}
+
+func dockerRequiresAttention(_ container: DockerContainer) -> Bool {
+    let status = (container.status ?? "unknown").lowercased()
+    return status.contains("unhealthy") || status.contains("dead") || status.contains("restart")
+}
+
 func canStopStatus(_ status: String?) -> Bool {
     let value = (status ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     return !value.isEmpty && !isStoppedStatus(value)
@@ -1420,6 +1440,49 @@ struct ResourceHealthSignal: Codable, Hashable, Sendable, Identifiable {
     let reason: String
 }
 
+enum ResourceAttentionKind: String, Codable, Hashable, Sendable {
+    case server
+    case docker
+    case projectConflict
+}
+
+enum AttentionReviewTargetKind: String, Codable, Hashable, Sendable {
+    case server
+    case docker
+    case project
+}
+
+/// A stable route from global health presentation to the resource or project
+/// that owns the diagnostic evidence. The selection id uses the same logical
+/// identity as the Board, so changing the representative coordinator source
+/// does not invalidate the review action.
+struct AttentionReviewTarget: Codable, Hashable, Sendable {
+    let kind: AttentionReviewTargetKind
+    let selectionID: String
+
+    var stableID: String { "\(kind.rawValue):\(selectionID)" }
+
+    var actionLabel: String {
+        switch kind {
+        case .server: return "Review server"
+        case .docker: return "Review container"
+        case .project: return "Review project"
+        }
+    }
+}
+
+/// Concrete evidence behind a global resource-attention state. This remains
+/// separate from inventory and action issues because it has a different
+/// lifecycle: it is recomputed from the latest loaded resource observations.
+struct ResourceAttentionItem: Codable, Hashable, Sendable, Identifiable {
+    let id: String
+    let kind: ResourceAttentionKind
+    let title: String
+    let reason: String
+    let recommendedNextStep: String
+    let reviewTarget: AttentionReviewTarget
+}
+
 struct HealthSummary: Codable, Hashable, Sendable {
     let level: HealthLevel
     let isComplete: Bool
@@ -1450,7 +1513,7 @@ struct HealthSummary: Codable, Hashable, Sendable {
         let level: HealthLevel
         if sources.isEmpty || usableSources == 0 {
             level = .unavailable
-        } else if unhealthyResources > 0 || failedActions > 0 {
+        } else if unhealthyResources > 0 {
             level = .unhealthy
         } else if failed > 0 || stale > 0 || !complete {
             level = .degraded
@@ -1514,16 +1577,40 @@ struct OpsPresentationSnapshot: Codable, Hashable, Sendable {
     let statusMessage: String
     let inventoryIssue: OpsIssue?
     let actionIssue: OpsIssue?
+    let resourceAttentionItems: [ResourceAttentionItem]
     let sources: [CoordinatorSourceState]
     let capabilities: [CoordinatorCapabilityState]
     let unavailableCapabilityCount: Int
+
+    var attentionItemCount: Int {
+        resourceAttentionItems.count
+            + (actionIssue == nil ? 0 : 1)
+            + (inventoryIssue == nil ? 0 : 1)
+            + unavailableCapabilityCount
+            + (health.runningActionCount > 0 && actionIssue == nil ? 1 : 0)
+    }
+
+    var resolutionTargetIDs: [String] {
+        var targets = Set(resourceAttentionItems.map(\.reviewTarget.stableID))
+        if actionIssue != nil {
+            targets.insert("action-issue")
+        }
+        if health.runningActionCount > 0 {
+            targets.insert("activity")
+        }
+        if inventoryIssue != nil || unavailableCapabilityCount > 0 {
+            targets.insert("sources")
+        }
+        return targets.sorted()
+    }
 
     static func reduce(
         health: HealthSummary,
         sources: [CoordinatorSourceState],
         inventoryIssue: OpsIssue?,
         actionIssue: OpsIssue?,
-        capabilities: [CoordinatorCapabilityState] = []
+        capabilities: [CoordinatorCapabilityState] = [],
+        resourceAttentionItems: [ResourceAttentionItem] = []
     ) -> OpsPresentationSnapshot {
         var level = health.level
         let unavailableCapabilityCount = capabilities.filter { $0.phase == .unavailable }.count
@@ -1536,18 +1623,91 @@ struct OpsPresentationSnapshot: Codable, Hashable, Sendable {
         if actionIssue != nil {
             level = max(level, .unhealthy)
         }
-        let statusTitle: String
-        switch level {
-        case .nominal: statusTitle = "All systems nominal"
-        case .busy: statusTitle = "Action in progress"
-        case .degraded:
-            statusTitle = unavailableCapabilityCount > 0 ? "Capabilities degraded" : "Inventory incomplete"
-        case .unhealthy: statusTitle = "Action or resource requires attention"
-        case .unavailable: statusTitle = "Inventory unavailable"
+        if !resourceAttentionItems.isEmpty {
+            level = max(level, .unhealthy)
         }
-        let statusMessage = inventoryIssue?.summary
-            ?? actionIssue?.summary
-            ?? statusTitle
+        let sortedAttentionItems = resourceAttentionItems.sorted {
+            if $0.kind != $1.kind { return $0.kind.rawValue < $1.kind.rawValue }
+            let titleOrder = $0.title.localizedCaseInsensitiveCompare($1.title)
+            if titleOrder != .orderedSame { return titleOrder == .orderedAscending }
+            return $0.id < $1.id
+        }
+
+        func clean(_ value: String?) -> String? {
+            guard let value else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        func distinctMessage(
+            title: String,
+            candidates: [String?],
+            fallback: String
+        ) -> String {
+            let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            for candidate in candidates.compactMap(clean)
+                where candidate.localizedCaseInsensitiveCompare(normalizedTitle) != .orderedSame
+            {
+                return candidate
+            }
+            return fallback.localizedCaseInsensitiveCompare(normalizedTitle) == .orderedSame
+                ? "Open details to review the concrete evidence."
+                : fallback
+        }
+
+        let statusTitle: String
+        let statusMessage: String
+        if let actionIssue {
+            statusTitle = clean(actionIssue.title) ?? "Action failed"
+            statusMessage = distinctMessage(
+                title: statusTitle,
+                candidates: [actionIssue.summary, actionIssue.details],
+                fallback: "Review the failed action in Activity."
+            )
+        } else if let firstAttention = sortedAttentionItems.first {
+            if sortedAttentionItems.count == 1 {
+                statusTitle = firstAttention.title
+                statusMessage = distinctMessage(
+                    title: statusTitle,
+                    candidates: [firstAttention.reason, firstAttention.recommendedNextStep],
+                    fallback: firstAttention.recommendedNextStep
+                )
+            } else {
+                statusTitle = "\(sortedAttentionItems.count) resources need attention"
+                statusMessage = distinctMessage(
+                    title: statusTitle,
+                    candidates: ["\(firstAttention.title): \(firstAttention.reason)"],
+                    fallback: "Review the affected resources before taking lifecycle actions."
+                )
+            }
+        } else if let inventoryIssue {
+            statusTitle = clean(inventoryIssue.title) ?? "Inventory incomplete"
+            statusMessage = distinctMessage(
+                title: statusTitle,
+                candidates: [inventoryIssue.summary, inventoryIssue.details],
+                fallback: "Review coordinator source details, then refresh the inventory."
+            )
+        } else {
+            switch level {
+            case .nominal:
+                statusTitle = "All systems nominal"
+                statusMessage = "All loaded coordinator sources and observed resources are healthy."
+            case .busy:
+                statusTitle = "Action in progress"
+                statusMessage = "\(health.runningActionCount) coordinator action\(health.runningActionCount == 1 ? " is" : "s are") still running."
+            case .degraded:
+                statusTitle = unavailableCapabilityCount > 0 ? "Capabilities degraded" : "Inventory incomplete"
+                statusMessage = unavailableCapabilityCount > 0
+                    ? "\(unavailableCapabilityCount) coordinator capabilit\(unavailableCapabilityCount == 1 ? "y is" : "ies are") unavailable."
+                    : "\(health.loadedSourceCount) of \(sources.count) coordinator sources supplied current inventory."
+            case .unhealthy:
+                statusTitle = "\(health.unhealthyResourceCount) resource\(health.unhealthyResourceCount == 1 ? " needs" : "s need") attention"
+                statusMessage = "Open the affected resource details to review the current failure evidence."
+            case .unavailable:
+                statusTitle = "Inventory unavailable"
+                statusMessage = "No coordinator source supplied usable inventory."
+            }
+        }
         return OpsPresentationSnapshot(
             health: health,
             level: level,
@@ -1555,6 +1715,7 @@ struct OpsPresentationSnapshot: Codable, Hashable, Sendable {
             statusMessage: statusMessage,
             inventoryIssue: inventoryIssue,
             actionIssue: actionIssue,
+            resourceAttentionItems: sortedAttentionItems,
             sources: sources.sorted { $0.origin.id < $1.origin.id },
             capabilities: capabilities.sorted { $0.id < $1.id },
             unavailableCapabilityCount: unavailableCapabilityCount

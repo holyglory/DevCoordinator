@@ -17,6 +17,7 @@ from typing import Callable
 
 SCRIPT = Path(__file__).with_name("verify_launch_readiness.py")
 BUILD_SCRIPT = SCRIPT.parents[3] / "script" / "build_and_run.sh"
+OPS_STORE = SCRIPT.parents[1] / "Sources" / "DevOpsBoard" / "OpsStore.swift"
 
 
 def load_verifier() -> ModuleType:
@@ -69,11 +70,24 @@ def unified_line(
     repositories: int = 0,
     repository_groups: int | None = None,
     unassigned_groups: int = 0,
+    health: str | None = None,
+    attention_items: int | None = None,
+    resolution_targets: int | None = None,
+    generic_attention: bool = False,
 ) -> str:
     if sources is None:
         sources = tuple(fixture_source_fingerprint(f"source-{index}") for index in range(loaded))
     visible = managed if visible is None else visible
     repository_groups = repositories if repository_groups is None else repository_groups
+    if health is None:
+        if outcome == "completed" and loaded > 0:
+            health = "nominal" if loaded == total else "degraded"
+        else:
+            health = "unavailable"
+    if attention_items is None:
+        attention_items = 0 if health == "nominal" else 1
+    if resolution_targets is None:
+        resolution_targets = 0 if health == "nominal" else 1
     if server_counts is None:
         server_counts = tuple(
             (fingerprint, managed if len(sources) == 1 else 0)
@@ -90,7 +104,10 @@ def unified_line(
         f"Inventory refresh {outcome} pid={pid} loaded={loaded} total={total} "
         f"sources={source_evidence} disabled={disabled_evidence} server_counts={server_count_evidence} "
         f"managed={managed} visible={visible} repositories={repositories} "
-        f"repository_groups={repository_groups} unassigned_groups={unassigned_groups}\n"
+        f"repository_groups={repository_groups} unassigned_groups={unassigned_groups} "
+        f"health={health} attention_items={attention_items} "
+        f"resolution_targets={resolution_targets} "
+        f"generic_attention={'true' if generic_attention else 'false'}\n"
     )
 
 
@@ -183,6 +200,33 @@ def check_build_script_wiring() -> None:
         check=False,
     )
     check(syntax.returncode == 0, f"build script is not valid Bash: {syntax.stderr}")
+
+
+def check_production_telemetry_wiring() -> None:
+    source = OPS_STORE.read_text(encoding="utf-8")
+    required = {
+        "presentation snapshot": "let snapshot = presentationSnapshot",
+        "concrete item count": "let attentionItems = snapshot.attentionItemCount",
+        "working target count": "let resolutionTargets = snapshot.resolutionTargetIDs.count",
+        "generic-copy comparison": ".localizedCaseInsensitiveCompare(",
+    }
+    missing = [label for label, token in required.items() if token not in source]
+    check(
+        not missing,
+        "production inventory telemetry is missing attention-readiness bindings: "
+        + ", ".join(missing),
+    )
+    emitted_fields = (
+        " health=\\(health, privacy: .public)",
+        " attention_items=\\(attentionItems, privacy: .public)",
+        " resolution_targets=\\(resolutionTargets, privacy: .public)",
+        " generic_attention=\\(genericAttention, privacy: .public)",
+    )
+    for field in emitted_fields:
+        check(
+            source.count(field) == 2,
+            f"completed and failed inventory telemetry do not both emit {field.strip()}",
+        )
 
 
 def write_executable(path: Path, source: str) -> None:
@@ -343,6 +387,7 @@ def check_shell_behavior_harness(temp: Path) -> None:
 
 def main() -> int:
     check_build_script_wiring()
+    check_production_telemetry_wiring()
     check(verifier.process_state_is_alive("Ss+"), "ordinary sleeping process state was rejected")
     check(not verifier.process_state_is_alive("Z+"), "zombie process state was treated as alive")
     check(not verifier.process_state_is_alive("  "), "empty process state was treated as alive")
@@ -521,6 +566,167 @@ def main() -> int:
         check(
             empty_ready.managed_servers == 0 and empty_ready.visible_servers == 0,
             "legitimate empty automatic source did not pass readiness",
+        )
+        check(
+            empty_ready.health == "nominal"
+            and empty_ready.attention_items == 0
+            and empty_ready.resolution_targets == 0
+            and not empty_ready.generic_attention,
+            "nominal inventory did not retain an empty attention contract",
+        )
+
+        # False-positive control: a genuinely unhealthy live service is ready
+        # when the Board exposes one concrete issue and a working review route.
+        actionable_unhealthy = temp / "actionable-unhealthy-service.log"
+        actionable_unhealthy.write_text(
+            unified_line(
+                4161,
+                "completed",
+                1,
+                1,
+                managed=2,
+                visible=2,
+                repositories=1,
+                health="unhealthy",
+                attention_items=1,
+                resolution_targets=1,
+            ),
+            encoding="utf-8",
+        )
+        actionable_ready = run_wait(actionable_unhealthy, expected_pid=4161)
+        check(
+            actionable_ready.health == "unhealthy"
+            and actionable_ready.attention_items == 1
+            and actionable_ready.resolution_targets == 1
+            and not actionable_ready.generic_attention,
+            "a concrete unhealthy service with a review target was rejected",
+        )
+
+        # Must-catch the user-visible incident: the red banner repeated
+        # "Action or resource requires attention" as both title and summary,
+        # but named no item and offered no contextual resolution.
+        generic_unhealthy = temp / "generic-unhealthy-attention.log"
+        generic_unhealthy.write_text(
+            unified_line(
+                4162,
+                "completed",
+                1,
+                1,
+                managed=2,
+                visible=2,
+                repositories=1,
+                health="unhealthy",
+                attention_items=0,
+                resolution_targets=0,
+                generic_attention=True,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(generic_unhealthy, expected_pid=4162),
+            "generic duplicated attention",
+            "the production-shaped generic attention banner passed readiness",
+        )
+
+        unexplained_unhealthy = temp / "unexplained-unhealthy-state.log"
+        unexplained_unhealthy.write_text(
+            unified_line(
+                4163,
+                "completed",
+                1,
+                1,
+                health="unhealthy",
+                attention_items=0,
+                resolution_targets=1,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(unexplained_unhealthy, expected_pid=4163),
+            "without a concrete attention item",
+            "unhealthy state with no identified issue passed readiness",
+        )
+
+        unactionable_unhealthy = temp / "unactionable-unhealthy-state.log"
+        unactionable_unhealthy.write_text(
+            unified_line(
+                4164,
+                "completed",
+                1,
+                1,
+                health="unhealthy",
+                attention_items=1,
+                resolution_targets=0,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(unactionable_unhealthy, expected_pid=4164),
+            "without a resolution target",
+            "identified unhealthy state with no contextual route passed readiness",
+        )
+
+        # Multiple issues may intentionally share one Review Issues route; the
+        # detector must not require one button per item.
+        shared_review_target = temp / "shared-attention-review-target.log"
+        shared_review_target.write_text(
+            unified_line(
+                4165,
+                "completed",
+                1,
+                1,
+                health="unhealthy",
+                attention_items=3,
+                resolution_targets=1,
+            ),
+            encoding="utf-8",
+        )
+        shared_ready = run_wait(shared_review_target, expected_pid=4165)
+        check(
+            shared_ready.attention_items == 3 and shared_ready.resolution_targets == 1,
+            "one real review route shared by multiple issues was rejected",
+        )
+
+        # A running action is intentionally non-nominal and routes to Activity;
+        # it must not be rejected merely because it is not an error.
+        actionable_busy = temp / "actionable-busy-state.log"
+        actionable_busy.write_text(
+            unified_line(
+                4167,
+                "completed",
+                1,
+                1,
+                health="busy",
+                attention_items=1,
+                resolution_targets=1,
+            ),
+            encoding="utf-8",
+        )
+        busy_ready = run_wait(actionable_busy, expected_pid=4167)
+        check(
+            busy_ready.health == "busy"
+            and busy_ready.attention_items == 1
+            and busy_ready.resolution_targets == 1,
+            "an in-progress action with an Activity target was rejected",
+        )
+
+        nominal_with_phantom_attention = temp / "nominal-phantom-attention.log"
+        nominal_with_phantom_attention.write_text(
+            unified_line(
+                4166,
+                "completed",
+                1,
+                1,
+                health="nominal",
+                attention_items=1,
+                resolution_targets=1,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(nominal_with_phantom_attention, expected_pid=4166),
+            "nominal health with attention_items=1 resolution_targets=1",
+            "nominal state with phantom attention passed readiness",
         )
 
         # Must-catch: correct source identity is not enough when the direct
@@ -1024,7 +1230,11 @@ def main() -> int:
             expected_source_fingerprint=canonical_fingerprint,
         )
         check(
-            partial_ready.loaded == 1 and partial_ready.total == 2,
+            partial_ready.loaded == 1
+            and partial_ready.total == 2
+            and partial_ready.health == "degraded"
+            and partial_ready.attention_items == 1
+            and partial_ready.resolution_targets == 1,
             "one loaded source out of two was incorrectly rejected",
         )
 

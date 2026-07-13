@@ -91,7 +91,21 @@ struct MenuBarRuntimeView: View {
             Divider().overlay(Color.white.opacity(0.08))
 
             if let issue = store.presentationSnapshot.actionIssue {
-                MenuBarActionIssuePanel(store: store, issue: issue)
+                MenuBarActionIssuePanel(
+                    store: store,
+                    issue: issue,
+                    viewActivity: {
+                        ActivityReviewCoordinator.shared.requestReview()
+                        openConsole()
+                    }
+                )
+                Divider().overlay(Color.white.opacity(0.08))
+            } else if !store.presentationSnapshot.resourceAttentionItems.isEmpty {
+                MenuBarResourceAttentionPanel(
+                    store: store,
+                    items: store.presentationSnapshot.resourceAttentionItems,
+                    openConsole: openConsole
+                )
                 Divider().overlay(Color.white.opacity(0.08))
             } else if let latestResult {
                 MenuBarActionResultPanel(store: store, result: latestResult)
@@ -137,6 +151,7 @@ struct MenuBarRuntimeView: View {
 struct MenuBarActionIssuePanel: View {
     @ObservedObject var store: OpsStore
     let issue: OpsIssue
+    let viewActivity: () -> Void
     @State private var showingDetails = false
 
     var body: some View {
@@ -148,20 +163,36 @@ struct MenuBarActionIssuePanel: View {
                     .foregroundStyle(Theme.red)
                     .lineLimit(1)
                 Spacer()
-                Button("Copy") { store.copyIssueDetails(issue) }
+                if hasActivityResult {
+                    Button("View Activity", action: viewActivity)
+                        .buttonStyle(MenuBarTextButtonStyle(tint: Theme.blue))
+                        .accessibilityIdentifier("menu-attention-view-activity")
+                } else {
+                    Button(showingDetails ? "Hide" : "View details") {
+                        showingDetails.toggle()
+                    }
                     .buttonStyle(MenuBarTextButtonStyle(tint: Theme.blue))
-                Button("Dismiss") { store.dismissActionIssue() }
-                    .buttonStyle(MenuBarTextButtonStyle(tint: Theme.secondary))
+                    .accessibilityIdentifier("menu-attention-view-details")
+                }
             }
             Text(issue.summary)
                 .font(.system(size: 11))
                 .fixedSize(horizontal: false, vertical: true)
             DisclosureGroup("Diagnostics", isExpanded: $showingDetails) {
-                Text(issue.details)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(Theme.secondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(issue.details)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Theme.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack {
+                        Spacer()
+                        Button("Copy") { store.copyIssueDetails(issue) }
+                            .buttonStyle(MenuBarTextButtonStyle(tint: Theme.blue))
+                        Button("Dismiss") { store.dismissActionIssue() }
+                            .buttonStyle(MenuBarTextButtonStyle(tint: Theme.secondary))
+                    }
+                }
             }
             .font(.system(size: 10, weight: .semibold))
         }
@@ -169,6 +200,126 @@ struct MenuBarActionIssuePanel: View {
         .padding(.vertical, 10)
         .background(Theme.red.opacity(0.08))
         .accessibilityIdentifier("menu-action-issue")
+    }
+
+    private var hasActivityResult: Bool {
+        guard let actionID = issue.relatedActionID else { return false }
+        return store.actionResults[actionID] != nil
+    }
+}
+
+struct MenuBarResourceAttentionPanel: View {
+    @ObservedObject var store: OpsStore
+    let items: [ResourceAttentionItem]
+    let openConsole: () -> Void
+    @State private var expanded = false
+
+    private var firstItem: ResourceAttentionItem? { items.first }
+
+    var body: some View {
+        if let firstItem {
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 7) {
+                    Image(systemName: items.count == 1 ? resourceAttentionIcon(firstItem.kind) : "exclamationmark.triangle.fill")
+                        .foregroundStyle(Theme.red)
+                        .frame(width: 12)
+                        .accessibilityHidden(true)
+                    Text(items.count == 1 ? firstItem.title : "\(items.count) resources need attention")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.red)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    if items.count == 1 {
+                        Button(firstItem.reviewTarget.actionLabel) {
+                            review(firstItem)
+                        }
+                        .buttonStyle(MenuBarTextButtonStyle(tint: Theme.blue))
+                        .accessibilityIdentifier("menu-attention-review-resource")
+                    } else {
+                        Button(expanded ? "Hide" : "Review \(items.count)") {
+                            expanded.toggle()
+                        }
+                        .buttonStyle(MenuBarTextButtonStyle(tint: Theme.blue))
+                        .accessibilityIdentifier("menu-attention-review-resources")
+                    }
+                }
+
+                if items.count == 1 {
+                    Text(firstItem.reason)
+                        .font(.system(size: 11))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(firstItem.recommendedNextStep)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("\(firstItem.title): \(firstItem.reason)")
+                        .font(.system(size: 11))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if expanded && items.count > 1 {
+                    ScrollView(.vertical, showsIndicators: true) {
+                        LazyVStack(spacing: 6) {
+                            ForEach(items) { item in
+                                MenuBarResourceAttentionRow(item: item) {
+                                    review(item)
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 148)
+                    .accessibilityIdentifier("menu-resource-attention-list")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(Theme.red.opacity(0.08))
+            .accessibilityIdentifier("menu-resource-attention")
+        }
+    }
+
+    private func review(_ item: ResourceAttentionItem) {
+        guard store.reviewAttentionItem(item) else { return }
+        openConsole()
+    }
+}
+
+struct MenuBarResourceAttentionRow: View {
+    let item: ResourceAttentionItem
+    let review: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: resourceAttentionIcon(item.kind))
+                .foregroundStyle(Theme.red)
+                .frame(width: 12)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.system(size: 10, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(item.reason)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(2)
+                Text(item.recommendedNextStep)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 6)
+            Button(item.reviewTarget.actionLabel, action: review)
+                .buttonStyle(MenuBarTextButtonStyle(tint: Theme.blue))
+        }
+        .padding(7)
+        .background(Theme.control.opacity(0.72))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("menu-resource-attention-\(safeAccessibilityID(item.id))")
     }
 }
 
@@ -232,9 +383,16 @@ struct MenuBarSourceSummary: View {
                         .fixedSize(horizontal: false, vertical: true)
                     }
                     if let issue = store.presentationSnapshot.inventoryIssue {
-                        Text(issue.summary)
-                            .foregroundStyle(Theme.orange)
-                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(alignment: .top, spacing: 7) {
+                            Text(issue.summary)
+                                .foregroundStyle(Theme.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 6)
+                            Button("Refresh") { store.refresh() }
+                                .buttonStyle(MenuBarTextButtonStyle(tint: Theme.blue))
+                                .disabled(store.isLoading)
+                                .accessibilityIdentifier("menu-attention-refresh-inventory")
+                        }
                     }
                 }
                 .font(.system(size: 10))

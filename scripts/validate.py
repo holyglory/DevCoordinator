@@ -238,7 +238,7 @@ def check_devops_board_center_pane_geometry(
     scroll_start = main_board.find("ScrollView(.vertical)")
     scroll_body_end = main_board.find('.accessibilityIdentifier("main-board-scroll-body")')
     toolbar_index = main_board.find("ToolbarView(store: store)")
-    activity_index = main_board.find("ActionResultDrawer(store: store)")
+    activity_index = main_board.find("ActionResultDrawer(")
     status_index = main_board.find("StatusBar(store: store)")
     fixed_chrome_order = [toolbar_index, scroll_start, scroll_body_end, activity_index, status_index]
     if any(index < 0 for index in fixed_chrome_order) or fixed_chrome_order != sorted(fixed_chrome_order):
@@ -249,7 +249,7 @@ def check_devops_board_center_pane_geometry(
 
     variable_body = main_board[scroll_start:scroll_body_end]
     variable_body_contract = {
-        "inventory attention banner": "InventoryStateBanner(store: store)",
+        "inventory attention banner": "InventoryStateBanner(",
         "project-load rows": "ProjectUsageStrip(store: store)",
         "managed leases": "ManagedLeasesPanel(store: store)",
         "filters": "FilterRow(",
@@ -300,6 +300,15 @@ def check_devops_board_center_pane_geometry(
         ),
         "inner-scroll false-positive control": "scrollingOnlyVariableBody(upBy: 72)",
         "empty-body false-positive control": "clearingOnlyVariableBody()",
+        "banner-and-Activity-only content-loss must-catch": (
+            "testDetectorRejectsBannerAndActivityWithoutPrimaryDecisionContent"
+        ),
+        "realistic erased primary viewport": "clearingPrimaryContent(yRange: 151..<678)",
+        "former detector miss proof": "legacyBodyObservation.meetsVariableBodyMinimum",
+        "empty resource rows false-positive control": "clearingResourceRows(yRange: 505..<678)",
+        "inner-scroll primary-content control": (
+            "MainBoardEdgeDetector.assess(internallyScrolled).bodyHasVisibleContent"
+        ),
     }
     missing_vertical_xctest = [
         label
@@ -340,6 +349,12 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     ).read_text(encoding="utf-8")
     snapshot_main = (ops_console / "Tools" / "SnapshotMain.swift").read_text(encoding="utf-8")
     menu_snapshot = (ops_console / "Tools" / "MenuBarSnapshotMain.swift").read_text(encoding="utf-8")
+    launch_readiness = (ops_console / "Tools" / "verify_launch_readiness.py").read_text(
+        encoding="utf-8"
+    )
+    launch_readiness_tests = (
+        ops_console / "Tools" / "self_test_verify_launch_readiness.py"
+    ).read_text(encoding="utf-8")
     snapshot_provenance = (ops_console / "Tools" / "SnapshotProvenance.swift").read_text(encoding="utf-8")
     split_sizing = (ops_console / "Tools" / "SplitSizingTest.swift").read_text(encoding="utf-8")
     core_tests = (ops_console / "Tests" / "DevOpsBoardTests" / "CoreTests.swift").read_text(encoding="utf-8")
@@ -662,6 +677,15 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "cross-project server conflict regression": "testSameActivePhysicalServerClaimedByTwoRepositoriesBlocksBothProjects",
         "usage-only unassigned regression": "testUsageOnlyNameEvidenceStillProducesOneUnassignedPresentation",
         "catalog conflict health regression": "testCatalogOwnershipConflictMakesPublishedHealthNonNominalEvenWithoutResourceIdentity",
+        "privacy-safe attention readiness telemetry": "attention_items=\\(attentionItems, privacy: .public)",
+        "generic attention readiness rejection": "reports generic duplicated attention",
+        "missing attention item readiness rejection": "without a concrete attention item",
+        "missing resolution target readiness rejection": "without a resolution target",
+        "production-shaped generic attention fixture": "generic-unhealthy-attention.log",
+        "actionable unhealthy readiness control": "actionable-unhealthy-service.log",
+        "shared review target readiness control": "shared-attention-review-target.log",
+        "action-in-progress readiness control": "actionable-busy-state.log",
+        "nominal attention readiness control": "nominal-phantom-attention.log",
         "coordinator env per inventory": "CODEX_AGENT_COORDINATOR_HOME",
         "process usage self-test": "inventory should expose project usage rollups",
         "hanging health self-test": "hanging HTTP health checks should be bounded",
@@ -676,6 +700,8 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
             repository_catalog,
             snapshot_main,
             menu_snapshot,
+            launch_readiness,
+            launch_readiness_tests,
             snapshot_provenance,
             split_sizing,
             core_tests,

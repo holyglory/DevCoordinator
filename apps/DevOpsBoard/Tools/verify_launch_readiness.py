@@ -29,7 +29,11 @@ MARKER_PATTERN = re.compile(
     r"managed=(?P<managed>[0-9]+) visible=(?P<visible>[0-9]+) "
     r"repositories=(?P<repositories>[0-9]+) "
     r"repository_groups=(?P<repository_groups>[0-9]+) "
-    r"unassigned_groups=(?P<unassigned_groups>[0-9]+)\s*$"
+    r"unassigned_groups=(?P<unassigned_groups>[0-9]+) "
+    r"health=(?P<health>nominal|busy|degraded|unhealthy|unavailable) "
+    r"attention_items=(?P<attention_items>[0-9]+) "
+    r"resolution_targets=(?P<resolution_targets>[0-9]+) "
+    r"generic_attention=(?P<generic_attention>true|false)\s*$"
 )
 SOURCE_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_SOURCE_INVENTORY_PATTERN = re.compile(r"^[0-9a-f]{64}:(?:[0-9]+|\?)$")
@@ -54,6 +58,10 @@ class InventoryMarker:
     repositories: int
     repository_groups: int
     unassigned_groups: int
+    health: str
+    attention_items: int
+    resolution_targets: int
+    generic_attention: bool
 
 
 @dataclass(frozen=True)
@@ -69,6 +77,10 @@ class ReadinessResult:
     repositories: int
     repository_groups: int
     unassigned_groups: int
+    health: str
+    attention_items: int
+    resolution_targets: int
+    generic_attention: bool
 
 
 @dataclass(frozen=True)
@@ -305,6 +317,10 @@ def parse_inventory_marker(line: str) -> InventoryMarker | None:
         repositories=int(match.group("repositories")),
         repository_groups=int(match.group("repository_groups")),
         unassigned_groups=int(match.group("unassigned_groups")),
+        health=match.group("health"),
+        attention_items=int(match.group("attention_items")),
+        resolution_targets=int(match.group("resolution_targets")),
+        generic_attention=match.group("generic_attention") == "true",
     )
 
 
@@ -379,6 +395,28 @@ def evaluate_inventory_marker(
         raise LaunchReadinessError(
             f"inventory refresh completed for PID {expected_pid} without a loaded source"
         )
+    if marker.generic_attention:
+        raise LaunchReadinessError(
+            f"inventory readiness marker for PID {expected_pid} reports generic duplicated attention"
+        )
+    if marker.health == "nominal":
+        if marker.attention_items != 0 or marker.resolution_targets != 0:
+            raise LaunchReadinessError(
+                f"inventory readiness marker for PID {expected_pid} reports nominal health "
+                f"with attention_items={marker.attention_items} "
+                f"resolution_targets={marker.resolution_targets}"
+            )
+    else:
+        if marker.attention_items < 1:
+            raise LaunchReadinessError(
+                f"inventory readiness marker for PID {expected_pid} reports {marker.health} health "
+                "without a concrete attention item"
+            )
+        if marker.resolution_targets < 1:
+            raise LaunchReadinessError(
+                f"inventory readiness marker for PID {expected_pid} reports {marker.health} health "
+                "without a resolution target"
+            )
     if (
         expected_source_fingerprint is not None
         and expected_source_fingerprint not in marker.source_fingerprints
@@ -424,6 +462,10 @@ def evaluate_inventory_marker(
         repositories=marker.repositories,
         repository_groups=marker.repository_groups,
         unassigned_groups=marker.unassigned_groups,
+        health=marker.health,
+        attention_items=marker.attention_items,
+        resolution_targets=marker.resolution_targets,
+        generic_attention=marker.generic_attention,
     )
 
 
@@ -799,7 +841,10 @@ def main(argv: list[str] | None = None) -> int:
         f"DevOps Board ready: pid={result.pid} loaded={result.loaded} total={result.total} "
         f"managed={result.managed_servers} visible={result.visible_servers} "
         f"repositories={result.repositories} repository_groups={result.repository_groups} "
-        f"unassigned_groups={result.unassigned_groups}"
+        f"unassigned_groups={result.unassigned_groups} health={result.health} "
+        f"attention_items={result.attention_items} "
+        f"resolution_targets={result.resolution_targets} "
+        f"generic_attention={'true' if result.generic_attention else 'false'}"
     )
     return 0
 

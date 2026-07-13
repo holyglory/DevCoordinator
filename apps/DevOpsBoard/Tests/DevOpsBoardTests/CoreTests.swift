@@ -427,9 +427,22 @@ final class CoreTests: XCTestCase {
 
         XCTAssertNil(store.inventory.docker.containers.first?.resourceIdentity)
         XCTAssertEqual(store.repositoryCatalog.repositories.flatMap(\.dockerMembershipConflicts).count, 2)
+        let attention = store.resourceAttentionItems
+        XCTAssertEqual(attention.count, 1, "one physical conflict must produce one attention item")
+        let conflictAttention = try XCTUnwrap(attention.first)
+        XCTAssertEqual(conflictAttention.kind, .projectConflict)
+        XCTAssertEqual(conflictAttention.title, "shared-worker has conflicting project ownership")
+        XCTAssertTrue(conflictAttention.reason.contains("left-owner"))
+        XCTAssertTrue(conflictAttention.reason.contains("right-owner"))
+        XCTAssertEqual(conflictAttention.reviewTarget.kind, .docker)
+        XCTAssertEqual(conflictAttention.reviewTarget.selectionID, "container:shared-conflicting-container")
         XCTAssertEqual(store.healthSummary.level, .unhealthy)
         XCTAssertEqual(store.healthSummary.unhealthyResourceCount, 1)
-        XCTAssertNotEqual(store.presentationSnapshot.statusTitle, "All systems nominal")
+        XCTAssertEqual(store.presentationSnapshot.level, .unhealthy)
+        XCTAssertEqual(store.presentationSnapshot.attentionItemCount, 1)
+        XCTAssertNotEqual(store.presentationSnapshot.statusTitle, store.presentationSnapshot.statusMessage)
+        XCTAssertTrue(store.reviewAttentionItem(conflictAttention))
+        XCTAssertEqual(store.selectedDockerID, conflictAttention.reviewTarget.selectionID)
 
         let conflicted = try XCTUnwrap(store.projectGroups.first(where: \.isRepository))
         let callsBefore = await service.capturedCalls().count
@@ -442,6 +455,93 @@ final class CoreTests: XCTestCase {
             callsBefore,
             "a repository membership conflict must fail before any coordinator command"
         )
+    }
+
+    @MainActor
+    func testMembershipConflictWithOneStaleParticipantDoesNotAssertCurrentResourceAttention() async throws {
+        let fixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("core-stale-docker-conflict-\(UUID().uuidString)", isDirectory: true)
+        let leftProject = fixtureRoot.appendingPathComponent("left-owner", isDirectory: true)
+        let rightProject = fixtureRoot.appendingPathComponent("right-owner", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: leftProject.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: rightProject.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+        let leftInventory = dockerProjectConflictInventoryExecution(home: codex.home, project: leftProject.path)
+        let rightInventory = dockerProjectConflictInventoryExecution(home: parall.home, project: rightProject.path)
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [.success(leftInventory), .success(leftInventory), .success(leftInventory), .success(leftInventory)],
+            parall.id: [.success(rightInventory), .success(rightInventory), .failure(MockFailure.offline)],
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex, parall]),
+            configurationStore: StaticConfigurationStore()
+        )
+
+        await store.loadInventory(force: true)
+        XCTAssertEqual(store.resourceAttentionItems.count, 1)
+
+        await store.loadInventory(force: true)
+        XCTAssertEqual(store.sourceStates.first(where: { $0.origin.id == parall.id })?.phase, .stale)
+        XCTAssertEqual(
+            store.repositoryCatalog.repositories.flatMap(\.dockerMembershipConflicts).count,
+            2,
+            "retained inventory remains visible for diagnostics"
+        )
+        XCTAssertTrue(
+            store.resourceAttentionItems.isEmpty,
+            "a contradiction whose second participant is stale is not a current resource assertion"
+        )
+        XCTAssertEqual(store.healthSummary.unhealthyResourceCount, 0)
+        XCTAssertEqual(store.healthSummary.level, .degraded)
+    }
+
+    @MainActor
+    func testPhysicalServerMembershipConflictProducesOneRoutableAttentionItem() async throws {
+        let fixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("core-server-conflict-\(UUID().uuidString)", isDirectory: true)
+        let leftProject = fixtureRoot.appendingPathComponent("left-owner", isDirectory: true)
+        let rightProject = fixtureRoot.appendingPathComponent("right-owner", isDirectory: true)
+        for project in [leftProject, rightProject] {
+            try FileManager.default.createDirectory(
+                at: project.appendingPathComponent(".git", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+        }
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+        let leftInventory = serverProjectConflictInventoryExecution(home: codex.home, project: leftProject.path)
+        let rightInventory = serverProjectConflictInventoryExecution(home: parall.home, project: rightProject.path)
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [.success(leftInventory), .success(leftInventory)],
+            parall.id: [.success(rightInventory), .success(rightInventory)],
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex, parall]),
+            configurationStore: StaticConfigurationStore()
+        )
+
+        await store.loadInventory(force: true)
+
+        XCTAssertEqual(store.repositoryCatalog.repositories.flatMap(\.serverMembershipConflicts).count, 2)
+        let attention = try XCTUnwrap(store.resourceAttentionItems.first)
+        XCTAssertEqual(store.resourceAttentionItems.count, 1)
+        XCTAssertEqual(attention.title, "web has conflicting project ownership")
+        XCTAssertEqual(attention.reviewTarget.kind, .server)
+        XCTAssertEqual(store.healthSummary.unhealthyResourceCount, 1)
+        XCTAssertEqual(store.presentationSnapshot.level, .unhealthy)
+        XCTAssertTrue(store.reviewAttentionItem(attention))
+        XCTAssertEqual(store.selectedServerID, attention.reviewTarget.selectionID)
     }
 
     @MainActor
@@ -562,6 +662,225 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(summary.level, .unhealthy)
         XCTAssertEqual(summary.failedActionCount, 1)
         XCTAssertEqual(summary.unhealthyResourceCount, 1)
+    }
+
+    @MainActor
+    func testStoppedAndStartingServersWithFailedProbeAreNotAttentionOrUnhealthyFilterMatches() throws {
+        let store = OpsStore(
+            coordinatorService: OriginSequencedCoordinatorService(results: [:]),
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: []),
+            configurationStore: StaticConfigurationStore()
+        )
+        var stopped = try JSONDecoder().decode(
+            ManagedServer.self,
+            from: Data(#"{"id":"stopped","name":"stopped-web","status":"stopped","health":{"ok":false,"pid_alive":false},"stopped_reason":"Stopped by project runtime"}"#.utf8)
+        )
+        var starting = try JSONDecoder().decode(
+            ManagedServer.self,
+            from: Data(#"{"id":"starting","name":"warming-web","status":"starting","health":{"ok":false,"pid_alive":true}}"#.utf8)
+        )
+        for index in [stopped, starting].indices {
+            if index == 0 {
+                stopped.origin = codex
+                stopped.coordinatorID = "stopped"
+                stopped.id = ResourceIdentity(origin: codex, kind: .server, nativeID: "stopped").rawValue
+            } else {
+                starting.origin = codex
+                starting.coordinatorID = "starting"
+                starting.id = ResourceIdentity(origin: codex, kind: .server, nativeID: "starting").rawValue
+            }
+        }
+        store.inventory.servers = [stopped, starting]
+        store.sourceStates = [.init(origin: codex, phase: .loaded, checkedAt: Date(), resourceCount: 2)]
+        store.filter = .unhealthy
+
+        XCTAssertFalse(serverRequiresAttention(stopped))
+        XCTAssertFalse(serverRequiresAttention(starting))
+        XCTAssertTrue(store.resourceAttentionItems.isEmpty)
+        XCTAssertTrue(store.filteredServers.isEmpty)
+        XCTAssertEqual(store.healthSummary.level, .nominal)
+        XCTAssertEqual(store.presentationSnapshot.level, .nominal)
+    }
+
+    @MainActor
+    func testRunningProbeFailureAndExplicitFailureStatesProduceActionableStableAttention() throws {
+        let store = OpsStore(
+            coordinatorService: OriginSequencedCoordinatorService(results: [:]),
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: []),
+            configurationStore: StaticConfigurationStore()
+        )
+        let documents = [
+            #"{"id":"running","name":"web","status":"running","health":{"ok":false,"pid_alive":true}}"#,
+            #"{"id":"unhealthy","name":"api","status":"unhealthy","health":{"ok":false,"pid_alive":true}}"#,
+            #"{"id":"degraded","name":"worker","status":"degraded","health":{"ok":true,"pid_alive":true}}"#,
+            #"{"id":"orphaned","name":"orphan","status":"orphaned","health":{"ok":null,"pid_alive":true}}"#,
+        ]
+        store.inventory.servers = try documents.map { document in
+            var server = try JSONDecoder().decode(ManagedServer.self, from: Data(document.utf8))
+            server.origin = codex
+            server.coordinatorID = server.id
+            server.id = ResourceIdentity(origin: codex, kind: .server, nativeID: server.id).rawValue
+            return server
+        }
+        store.sourceStates = [.init(origin: codex, phase: .loaded, checkedAt: Date(), resourceCount: 4)]
+        store.filter = .unhealthy
+
+        let attention = store.resourceAttentionItems
+        XCTAssertEqual(attention.count, 4)
+        XCTAssertEqual(store.filteredServers.count, 4)
+        XCTAssertEqual(store.healthSummary.unhealthyResourceCount, 4)
+        XCTAssertEqual(store.presentationSnapshot.level, .unhealthy)
+        XCTAssertTrue(attention.allSatisfy { !$0.title.isEmpty && !$0.reason.isEmpty })
+        XCTAssertTrue(attention.allSatisfy { !$0.recommendedNextStep.isEmpty })
+        XCTAssertEqual(Set(attention.map(\.reviewTarget.stableID)).count, 4)
+
+        let webAttention = try XCTUnwrap(attention.first { $0.title == "web health check failed" })
+        XCTAssertTrue(store.reviewAttentionItem(webAttention))
+        XCTAssertEqual(store.selectedServerID, webAttention.reviewTarget.selectionID)
+    }
+
+    @MainActor
+    func testStaleOnlyResourceFailureDoesNotAssertCurrentAttention() throws {
+        let store = OpsStore(
+            coordinatorService: OriginSequencedCoordinatorService(results: [:]),
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: []),
+            configurationStore: StaticConfigurationStore()
+        )
+        var server = try JSONDecoder().decode(
+            ManagedServer.self,
+            from: Data(#"{"id":"web","name":"web","status":"running","health":{"ok":false,"pid_alive":true}}"#.utf8)
+        )
+        server.origin = codex
+        server.coordinatorID = "web"
+        server.id = ResourceIdentity(origin: codex, kind: .server, nativeID: "web").rawValue
+        var container = try JSONDecoder().decode(
+            DockerContainer.self,
+            from: Data(#"{"id":"worker-id","name":"worker","status":"Restarting (1) 2 seconds ago"}"#.utf8)
+        )
+        container.origin = codex
+        store.inventory.servers = [server]
+        store.inventory.docker.containers = [container]
+        store.sourceStates = [
+            .init(origin: codex, phase: .stale, checkedAt: Date(), resourceCount: 2, error: "refresh failed")
+        ]
+        store.filter = .unhealthy
+
+        XCTAssertTrue(serverRequiresAttention(server), "the retained row still carries failure-shaped evidence")
+        XCTAssertTrue(store.resourceAttentionItems.isEmpty, "stale-only evidence must not assert a current failure")
+        XCTAssertTrue(store.filteredServers.isEmpty)
+        XCTAssertTrue(store.visibleDockerContainers.isEmpty)
+        XCTAssertEqual(store.healthSummary.level, .degraded)
+    }
+
+    @MainActor
+    func testDismissedActionIssueLeavesFailedActivityWithoutKeepingGlobalHealthRed() {
+        let store = OpsStore(
+            coordinatorService: OriginSequencedCoordinatorService(results: [:]),
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: []),
+            configurationStore: StaticConfigurationStore()
+        )
+        store.sourceStates = [.init(origin: codex, phase: .loaded, checkedAt: Date(), resourceCount: 0)]
+        let request = ActionRequest(kind: .restartServer, title: "Restart web")
+        store.actionResults[request.id] = RetainedActionResult(
+            request: request,
+            phase: .failed,
+            queuedAt: Date(),
+            finishedAt: Date(),
+            exitStatus: 1,
+            stdout: "",
+            stderr: "connection refused",
+            failure: "connection refused"
+        )
+        store.actionIssue = OpsIssue(
+            kind: .action,
+            title: "Restart web failed",
+            summary: "Connection refused",
+            details: "The coordinator could not restart web.",
+            createdAt: Date(),
+            relatedActionID: request.id
+        )
+
+        XCTAssertEqual(store.presentationSnapshot.level, .unhealthy)
+        store.dismissActionIssue()
+
+        XCTAssertEqual(store.actionResults.count, 1, "dismissal must retain Activity evidence")
+        XCTAssertEqual(store.healthSummary.failedActionCount, 1)
+        XCTAssertEqual(store.healthSummary.level, .nominal)
+        XCTAssertEqual(store.presentationSnapshot.level, .nominal)
+    }
+
+    func testPresentationPrioritizesConcreteActionThenResourceThenInventoryWithoutDuplicateCopy() {
+        let now = Date()
+        let nominal = HealthSummary.reduce(
+            sources: [.init(origin: codex, phase: .loaded, checkedAt: now, resourceCount: 1)],
+            resourceSignals: [],
+            actions: [],
+            now: now
+        )
+        let resource = ResourceAttentionItem(
+            id: "server-health:web",
+            kind: .server,
+            title: "web health check failed",
+            reason: "The running server returned an unhealthy response.",
+            recommendedNextStep: "Review logs.",
+            reviewTarget: AttentionReviewTarget(kind: .server, selectionID: "web")
+        )
+        let inventoryIssue = OpsIssue(
+            kind: .inventory,
+            title: "One source could not refresh",
+            summary: "Codex TT is offline.",
+            details: "connection refused",
+            createdAt: now
+        )
+        let actionIssue = OpsIssue(
+            kind: .action,
+            title: "Restart web failed",
+            summary: "RESTART WEB FAILED",
+            details: "The coordinator returned exit status 1.",
+            createdAt: now
+        )
+
+        let actionFirst = OpsPresentationSnapshot.reduce(
+            health: nominal,
+            sources: [.init(origin: codex, phase: .loaded, checkedAt: now, resourceCount: 1)],
+            inventoryIssue: inventoryIssue,
+            actionIssue: actionIssue,
+            resourceAttentionItems: [resource]
+        )
+        XCTAssertEqual(actionFirst.statusTitle, actionIssue.title)
+        XCTAssertEqual(actionFirst.statusMessage, actionIssue.details)
+        XCTAssertNotEqual(actionFirst.statusTitle, actionFirst.statusMessage)
+
+        let resourceNext = OpsPresentationSnapshot.reduce(
+            health: nominal,
+            sources: actionFirst.sources,
+            inventoryIssue: inventoryIssue,
+            actionIssue: nil,
+            resourceAttentionItems: [resource]
+        )
+        XCTAssertEqual(resourceNext.statusTitle, resource.title)
+        XCTAssertEqual(resourceNext.statusMessage, resource.reason)
+        XCTAssertEqual(resourceNext.level, .unhealthy)
+        XCTAssertEqual(resourceNext.attentionItemCount, 2)
+        XCTAssertEqual(resourceNext.resolutionTargetIDs, ["server:web", "sources"])
+
+        let inventoryLast = OpsPresentationSnapshot.reduce(
+            health: nominal,
+            sources: actionFirst.sources,
+            inventoryIssue: inventoryIssue,
+            actionIssue: nil
+        )
+        XCTAssertEqual(inventoryLast.statusTitle, inventoryIssue.title)
+        XCTAssertEqual(inventoryLast.statusMessage, inventoryIssue.summary)
+        XCTAssertNotEqual(inventoryLast.statusTitle, inventoryLast.statusMessage)
     }
 
     func testActionResultRetainsRealOutputAndLeaseValue() throws {
@@ -3331,6 +3650,13 @@ private func dockerInventoryExecution(home: String, metadataSource: String, proj
 private func dockerProjectConflictInventoryExecution(home: String, project: String) -> CommandExecution {
     let json = """
     {"coordinator_home":"\(home)","state_path":"\(home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"available":true,"containers":[{"id":"shared-conflicting-container","name":"shared-worker","status":"Up","project":"\(project)","metadata_source":"coordinator_sidecar"}],"postgres":[]},"postgres":[],"backups":[],"project_usage":[{"usage_key":"path:\(project)","project":"\(project)","project_key":"\(URL(fileURLWithPath: project).lastPathComponent)","name":"\(URL(fileURLWithPath: project).lastPathComponent)","server_ids":[],"container_names":["shared-worker"],"server_count":0,"container_count":1,"process_count":0,"cpu_percent":0,"memory_bytes":0}]}
+    """
+    return CommandExecution(stdout: json, stderr: "", exitStatus: 0)
+}
+
+private func serverProjectConflictInventoryExecution(home: String, project: String) -> CommandExecution {
+    let json = """
+    {"coordinator_home":"\(home)","state_path":"\(home)/state.json","urls":[],"servers":[{"id":"shared-web","name":"web","status":"running","project":"\(project)","host":"127.0.0.1","port":4317,"health":{"ok":true,"pid_alive":true}}],"leases":[],"recent_events":[],"docker":{"available":true,"containers":[],"postgres":[]},"postgres":[],"backups":[],"project_usage":[{"usage_key":"path:\(project)","project":"\(project)","project_key":"\(URL(fileURLWithPath: project).lastPathComponent)","name":"\(URL(fileURLWithPath: project).lastPathComponent)","server_ids":["shared-web"],"container_names":[],"server_count":1,"container_count":0,"process_count":1,"cpu_percent":0,"memory_bytes":0}]}
     """
     return CommandExecution(stdout: json, stderr: "", exitStatus: 0)
 }

@@ -82,7 +82,7 @@ BOARD_SPEC = ArtifactSpec(
         AnchorSpec("service-map-heading", 0, 60, 325, 45, 120, 5, 1),
         AnchorSpec("project-tree", 0, 95, 325, 200, 900, 10, 6),
         AnchorSpec("project-load-summary", 327, 60, 785, 80, 900, 20, 3),
-        AnchorSpec("filters-and-resource-tabs", 327, 190, 785, 80, 5_000, 30, 6),
+        AnchorSpec("filters-and-resource-tabs", 327, 125, 785, 90, 5_000, 30, 6),
         AnchorSpec("details-heading", 1125, 0, 315, 80, 300, 6, 2),
         AnchorSpec("sidebar-footer", 0, 920, 325, 104, 400, 10, 4),
         AnchorSpec("center-status-footer", 327, 970, 785, 54, 500, 20, 2),
@@ -100,7 +100,7 @@ DEV_SERVERS_SPEC = ArtifactSpec(
         for region in BOARD_SPEC.regions
     ),
     anchors=tuple(
-        AnchorSpec("filters-and-resource-tabs", 327, 285, 785, 80, 5_000, 30, 6)
+        AnchorSpec("filters-and-resource-tabs", 327, 220, 785, 90, 5_000, 30, 6)
         if anchor.name == "filters-and-resource-tabs"
         else anchor
         for anchor in BOARD_SPEC.anchors

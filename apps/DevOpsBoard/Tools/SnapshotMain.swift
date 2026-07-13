@@ -48,6 +48,11 @@ struct SnapshotMain {
                 checkedAt: Date(timeIntervalSince1970: 1_767_225_600)
             )
         }
+        guard store.resourceAttentionItems.isEmpty,
+              store.presentationSnapshot.level == .nominal
+        else {
+            throw SnapshotError.invalidAttentionFixture
+        }
         if let identity = store.inventory.postgres.first?.databaseIdentity {
             store.backupRecords = [
                 BackupRecord(
@@ -536,6 +541,7 @@ private func pngRemovingSensitiveMetadata(_ data: Data) throws -> Data {
 }
 
 enum SnapshotError: Error {
+    case invalidAttentionFixture
     case invalidPNG
     case invalidRepositoryFixture
     case renderFailed

@@ -48,6 +48,12 @@ struct MenuBarSnapshotMain {
             )
         }
         if mode == "error" {
+            var unhealthyServer = store.inventory.servers[0]
+            unhealthyServer.status = "unhealthy"
+            unhealthyServer.health = Health(ok: false, pidAlive: true)
+            unhealthyServer.stoppedReason = nil
+            store.inventory.servers[0] = unhealthyServer
+
             let desktop = CoordinatorOrigin(label: "Desktop", home: "/fixtures/desktop-coordinator")
             store.sourceStates.append(
                 CoordinatorSourceState(
@@ -82,7 +88,15 @@ struct MenuBarSnapshotMain {
                 stderr: "Fixture health check rejected the restart.",
                 failure: "Health check failed"
             )
+            guard store.resourceAttentionItems.count == 1,
+                  store.resourceAttentionItems.first?.title == "web is unhealthy",
+                  store.resourceAttentionItems.first?.reviewTarget.actionLabel == "Review server"
+            else {
+                throw MenuBarSnapshotError.invalidAttentionFixture
+            }
             try validateFixtureCopy(store)
+        } else if !store.resourceAttentionItems.isEmpty {
+            throw MenuBarSnapshotError.invalidAttentionFixture
         }
 
         let view = MenuBarRuntimeView(
@@ -388,6 +402,7 @@ private func menuPNGRemovingSensitiveMetadata(_ data: Data) throws -> Data {
 
 enum MenuBarSnapshotError: Error {
     case fixtureCopyDoesNotFit
+    case invalidAttentionFixture
     case invalidPNG
     case invalidRepositoryFixture
     case renderFailed

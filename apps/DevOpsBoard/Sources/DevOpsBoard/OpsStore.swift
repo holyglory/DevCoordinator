@@ -260,7 +260,10 @@ final class OpsStore: ObservableObject {
             case .running:
                 matchesFilter = status == "running"
             case .unhealthy:
-                matchesFilter = status == "unhealthy" || status == "degraded" || server.health?.ok == false
+                matchesFilter = serverRequiresAttention(server) && hasLoadedEvidence(
+                    primary: server.origin,
+                    observations: server.observationOrigins
+                )
             case .stopped:
                 matchesFilter = status == "stopped"
             }
@@ -352,6 +355,143 @@ final class OpsStore: ObservableObject {
         }
     }
 
+    /// Resource attention is recomputed only from currently loaded source
+    /// evidence. Retained stale inventory remains visible, but it cannot make
+    /// a new assertion that a resource presently requires intervention.
+    var resourceAttentionItems: [ResourceAttentionItem] {
+        var items: [ResourceAttentionItem] = []
+
+        for row in presentedServerRows {
+            let server = row.server
+            guard server.resourceIdentity != nil,
+                  serverRequiresAttention(server),
+                  hasLoadedEvidence(primary: server.origin, observations: server.observationOrigins)
+            else { continue }
+            let status = (server.status ?? "unknown")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let isExplicitFailure = ["unhealthy", "degraded", "orphaned"].contains(status)
+            let title = isExplicitFailure
+                ? "\(server.name) is \(status)"
+                : "\(server.name) health check failed"
+            let reason: String
+            if isExplicitFailure {
+                let stoppedReason = server.stoppedReason?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                reason = stoppedReason.isEmpty
+                    ? "The coordinator reports the server state as \(status)."
+                    : stoppedReason
+            } else {
+                reason = "The server is running, but its current health check reports failure."
+            }
+            items.append(
+                ResourceAttentionItem(
+                    id: "server-health:\(row.id)",
+                    kind: .server,
+                    title: title,
+                    reason: reason,
+                    recommendedNextStep: "Review the server logs and diagnostics, then restart it only if the failure persists.",
+                    reviewTarget: AttentionReviewTarget(kind: .server, selectionID: row.id)
+                )
+            )
+        }
+
+        var seenDocker = Set<String>()
+        for container in inventory.docker.containers {
+            let selectionID = container.containerSelectionID
+            guard seenDocker.insert(selectionID).inserted,
+                  container.resourceIdentity != nil,
+                  dockerRequiresAttention(container),
+                  hasLoadedEvidence(primary: container.origin, observations: container.observationOrigins)
+            else { continue }
+            let status = (container.status ?? "unknown").trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = container.name ?? "Docker container"
+            items.append(
+                ResourceAttentionItem(
+                    id: "docker-health:\(selectionID)",
+                    kind: .docker,
+                    title: "\(name) needs attention",
+                    reason: "Docker reports \(status).",
+                    recommendedNextStep: "Review the container diagnostics and logs before restarting it.",
+                    reviewTarget: AttentionReviewTarget(kind: .docker, selectionID: selectionID)
+                )
+            )
+        }
+
+        var seenConflicts = Set<String>()
+        for repository in repositoryCatalog.repositories {
+            let projectGroupID = "path:\(repository.identity.canonicalRoot)"
+            let projectTarget = AttentionReviewTarget(kind: .project, selectionID: projectGroupID)
+            for conflict in repository.serverConflicts
+                where seenConflicts.insert("server-endpoint:\(conflict.id)").inserted
+                    && hasFullyLoadedEvidence(origins: conflict.activeSourceIdentities.map { $0.origin })
+            {
+                items.append(
+                    ResourceAttentionItem(
+                        id: "project-conflict:server-endpoint:\(conflict.id)",
+                        kind: .projectConflict,
+                        title: "\(repository.displayName) has conflicting active servers",
+                        reason: conflict.message,
+                        recommendedNextStep: "Review project diagnostics and resolve the competing server records before running project actions.",
+                        reviewTarget: projectTarget
+                    )
+                )
+            }
+            for conflict in repository.serverMembershipConflicts
+                where seenConflicts.insert("server-membership:\(conflict.id)").inserted
+                    && hasFullyLoadedEvidence(origins: conflict.activeSourceIdentities.map { $0.origin })
+            {
+                let conflictedIdentities = Set(conflict.activeSourceIdentities.map(\.rawValue))
+                let row = presentedServerRows.first { candidate in
+                    conflictedIdentities.contains(candidate.server.id)
+                        || !Set(candidate.server.observationOrigins.map(\.id)).isDisjoint(
+                            with: Set(conflict.activeSourceIdentities.map { $0.origin.id })
+                        ) && candidate.server.ownershipError == conflict.message
+                }
+                guard let row else { continue }
+                let target = AttentionReviewTarget(kind: .server, selectionID: row.id)
+                let repositories = conflict.repositories.map(\.displayName).joined(separator: ", ")
+                let resourceName = row.server.name
+                items.append(
+                    ResourceAttentionItem(
+                        id: "project-conflict:server-membership:\(conflict.id)",
+                        kind: .projectConflict,
+                        title: "\(resourceName) has conflicting project ownership",
+                        reason: "\(conflict.message) Candidate repositories: \(repositories).",
+                        recommendedNextStep: "Review the server diagnostics and correct its repository attribution before acting.",
+                        reviewTarget: target
+                    )
+                )
+            }
+            for conflict in repository.dockerMembershipConflicts
+                where seenConflicts.insert("docker-membership:\(conflict.id)").inserted
+                    && hasFullyLoadedEvidence(origins: conflict.sourceIdentities.map { $0.origin })
+            {
+                guard let physical = repositoryCatalog.unassigned.docker.first(where: {
+                    $0.identity == conflict.resource
+                }) else { continue }
+                let selectionID = physical.representative.containerSelectionID
+                let resourceName = physical.representative.name ?? "Docker container"
+                let repositories = conflict.repositories.map(\.displayName).joined(separator: ", ")
+                items.append(
+                    ResourceAttentionItem(
+                        id: "project-conflict:docker-membership:\(conflict.id)",
+                        kind: .projectConflict,
+                        title: "\(resourceName) has conflicting project ownership",
+                        reason: "\(conflict.message) Candidate repositories: \(repositories).",
+                        recommendedNextStep: "Review the container diagnostics and correct its repository attribution before acting.",
+                        reviewTarget: AttentionReviewTarget(kind: .docker, selectionID: selectionID)
+                    )
+                )
+            }
+        }
+
+        return items.sorted {
+            if $0.kind != $1.kind { return $0.kind.rawValue < $1.kind.rawValue }
+            return $0.id < $1.id
+        }
+    }
+
     var healthSummary: HealthSummary {
         HealthSummary.reduce(
             sources: sourceStates,
@@ -367,7 +507,8 @@ final class OpsStore: ObservableObject {
             sources: sourceStates,
             inventoryIssue: inventoryIssue,
             actionIssue: actionIssue,
-            capabilities: capabilityStates
+            capabilities: capabilityStates,
+            resourceAttentionItems: resourceAttentionItems
         )
     }
 
@@ -747,21 +888,54 @@ final class OpsStore: ObservableObject {
         return true
     }
 
+    private var loadedSourceIDs: Set<String> {
+        Set(sourceStates.filter { $0.phase == .loaded }.map { $0.origin.id })
+    }
+
+    private func hasLoadedEvidence(
+        primary: CoordinatorOrigin?,
+        observations: [CoordinatorOrigin]
+    ) -> Bool {
+        hasLoadedEvidence(origins: [primary].compactMap { $0 } + observations)
+    }
+
+    private func hasLoadedEvidence(origins: [CoordinatorOrigin]) -> Bool {
+        !Set(origins.map(\.id)).isDisjoint(with: loadedSourceIDs)
+    }
+
+    private func hasFullyLoadedEvidence(origins: [CoordinatorOrigin]) -> Bool {
+        let originIDs = Set(origins.map(\.id))
+        return !originIDs.isEmpty && originIDs.isSubset(of: loadedSourceIDs)
+    }
+
     private var resourceHealthSignals: [ResourceHealthSignal] {
-        var signals: [ResourceHealthSignal] = presentedServers.compactMap { server in
-            guard let identity = server.resourceIdentity else { return nil }
-            let status = (server.status ?? "unknown").lowercased()
-            guard server.health?.ok == false || ["unhealthy", "degraded", "orphaned"].contains(status) else { return nil }
-            return ResourceHealthSignal(identity: identity, level: .unhealthy, reason: server.stoppedReason ?? status)
+        resourceAttentionItems.compactMap { item in
+            let observedIdentity: ResourceIdentity?
+            switch item.reviewTarget.kind {
+            case .server:
+                observedIdentity = presentedServerRows
+                    .first { $0.id == item.reviewTarget.selectionID }?
+                    .server.resourceIdentity
+            case .docker:
+                observedIdentity = inventory.docker.containers
+                    .first { $0.containerSelectionID == item.reviewTarget.selectionID }?
+                    .resourceIdentity
+            case .project:
+                guard let group = projectGroups.first(where: { $0.id == item.reviewTarget.selectionID }),
+                      let origin = group.observedOrigins.first(where: { loadedSourceIDs.contains($0.id) })
+                else { return nil }
+                observedIdentity = ResourceIdentity(origin: origin, kind: .project, nativeID: item.id)
+            }
+            let signalKind: ResourceKind = item.reviewTarget.kind == .docker ? .docker
+                : (item.reviewTarget.kind == .server ? .server : .project)
+            let identity = observedIdentity ?? sourceStates
+                .filter { $0.phase == .loaded }
+                .map(\.origin)
+                .sorted { $0.id < $1.id }
+                .first
+                .map { ResourceIdentity(origin: $0, kind: signalKind, nativeID: item.id) }
+            return identity.map { ResourceHealthSignal(identity: $0, level: .unhealthy, reason: item.reason) }
         }
-        signals.append(contentsOf: inventory.docker.containers.compactMap { container in
-            guard let identity = container.resourceIdentity else { return nil }
-            let status = (container.status ?? "unknown").lowercased()
-            guard status.contains("unhealthy") || status.contains("dead") || status.contains("restart") else { return nil }
-            return ResourceHealthSignal(identity: identity, level: .unhealthy, reason: status)
-        })
-        signals.append(contentsOf: repositoryCatalogConflictHealthSignals(repositoryCatalog))
-        return signals
     }
 
     @discardableResult
@@ -1104,13 +1278,29 @@ final class OpsStore: ObservableObject {
         let canonicalRepositories = repositoryCatalog.repositories.count
         let repositoryGroups = projectGroups.filter(\.isRepository).count
         let unassignedGroups = projectGroups.filter { !$0.isRepository }.count
+        let snapshot = presentationSnapshot
+        let health: String
+        switch snapshot.level {
+        case .nominal: health = "nominal"
+        case .busy: health = "busy"
+        case .degraded: health = "degraded"
+        case .unhealthy: health = "unhealthy"
+        case .unavailable: health = "unavailable"
+        }
+        let attentionItems = snapshot.attentionItemCount
+        let resolutionTargets = snapshot.resolutionTargetIDs.count
+        let genericAttention = snapshot.statusTitle
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .localizedCaseInsensitiveCompare(
+                snapshot.statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+            ) == .orderedSame ? "true" : "false"
         if loaded > 0 {
             inventoryLogger.info(
-                "Inventory refresh completed pid=\(pid, privacy: .public) loaded=\(loaded, privacy: .public) total=\(total, privacy: .public) sources=\(sourceEvidence, privacy: .public) disabled=\(disabledEvidence, privacy: .public) server_counts=\(serverCounts, privacy: .public) managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public) repositories=\(canonicalRepositories, privacy: .public) repository_groups=\(repositoryGroups, privacy: .public) unassigned_groups=\(unassignedGroups, privacy: .public)"
+                "Inventory refresh completed pid=\(pid, privacy: .public) loaded=\(loaded, privacy: .public) total=\(total, privacy: .public) sources=\(sourceEvidence, privacy: .public) disabled=\(disabledEvidence, privacy: .public) server_counts=\(serverCounts, privacy: .public) managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public) repositories=\(canonicalRepositories, privacy: .public) repository_groups=\(repositoryGroups, privacy: .public) unassigned_groups=\(unassignedGroups, privacy: .public) health=\(health, privacy: .public) attention_items=\(attentionItems, privacy: .public) resolution_targets=\(resolutionTargets, privacy: .public) generic_attention=\(genericAttention, privacy: .public)"
             )
         } else {
             inventoryLogger.error(
-                "Inventory refresh failed pid=\(pid, privacy: .public) loaded=0 total=\(total, privacy: .public) sources=none disabled=\(disabledEvidence, privacy: .public) server_counts=none managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public) repositories=\(canonicalRepositories, privacy: .public) repository_groups=\(repositoryGroups, privacy: .public) unassigned_groups=\(unassignedGroups, privacy: .public)"
+                "Inventory refresh failed pid=\(pid, privacy: .public) loaded=0 total=\(total, privacy: .public) sources=none disabled=\(disabledEvidence, privacy: .public) server_counts=none managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public) repositories=\(canonicalRepositories, privacy: .public) repository_groups=\(repositoryGroups, privacy: .public) unassigned_groups=\(unassignedGroups, privacy: .public) health=\(health, privacy: .public) attention_items=\(attentionItems, privacy: .public) resolution_targets=\(resolutionTargets, privacy: .public) generic_attention=\(genericAttention, privacy: .public)"
             )
         }
     }
@@ -1531,6 +1721,45 @@ final class OpsStore: ObservableObject {
     func selectProject(_ name: String) {
         selectedProjectName = name
         sidebarSelection = .project(name)
+    }
+
+    @discardableResult
+    func reviewAttentionItem(_ item: ResourceAttentionItem) -> Bool {
+        reviewAttentionTarget(item.reviewTarget)
+    }
+
+    @discardableResult
+    func reviewAttentionTarget(_ target: AttentionReviewTarget) -> Bool {
+        switch target.kind {
+        case .server:
+            guard let row = presentedServerRows.first(where: { $0.id == target.selectionID }) else {
+                return reportUnavailableAttentionTarget(target)
+            }
+            selectServer(row.server)
+        case .docker:
+            guard let container = inventory.docker.containers.first(where: {
+                $0.containerSelectionID == target.selectionID
+            }) else {
+                return reportUnavailableAttentionTarget(target)
+            }
+            selectDocker(container)
+        case .project:
+            guard projectGroups.contains(where: { $0.id == target.selectionID }) else {
+                return reportUnavailableAttentionTarget(target)
+            }
+            selectProject(target.selectionID)
+        }
+        return true
+    }
+
+    private func reportUnavailableAttentionTarget(_ target: AttentionReviewTarget) -> Bool {
+        setLastError(
+            title: "Resource is no longer in the current inventory",
+            summary: "Refresh inventory to review its latest state.",
+            details: "The attention target \(target.stableID) changed or disappeared before it could be opened.",
+            source: "action"
+        )
+        return false
     }
 
     func statusProject(_ group: ProjectGroup) {
@@ -2488,8 +2717,11 @@ final class OpsStore: ObservableObject {
             case .running:
                 matchesFilter = isRunningStatus(container.status)
             case .unhealthy:
-                let status = (container.status ?? "").lowercased()
-                matchesFilter = status.contains("restart") || status.contains("unhealthy") || status.contains("dead")
+                matchesFilter = dockerRequiresAttention(container)
+                    && hasLoadedEvidence(
+                        primary: container.origin,
+                        observations: container.observationOrigins
+                    )
             case .stopped:
                 matchesFilter = isStoppedStatus(container.status)
             }

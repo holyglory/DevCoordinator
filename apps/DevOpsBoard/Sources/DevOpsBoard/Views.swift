@@ -486,10 +486,30 @@ struct ProjectNode: View {
     }
 }
 
+@MainActor
+final class ActivityReviewCoordinator: ObservableObject {
+    static let shared = ActivityReviewCoordinator()
+
+    @Published private(set) var pendingRequestID: UUID?
+
+    private init() {}
+
+    func requestReview() {
+        pendingRequestID = UUID()
+    }
+
+    func consume(_ requestID: UUID) {
+        guard pendingRequestID == requestID else { return }
+        pendingRequestID = nil
+    }
+}
+
 struct MainBoardView: View {
     @ObservedObject var store: OpsStore
+    @ObservedObject private var activityReviewCoordinator = ActivityReviewCoordinator.shared
     @State private var bulkSelectionMode = false
     @State private var reviewingBulkPlan: BulkStopPlan?
+    @State private var activityExpanded = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -498,7 +518,10 @@ struct MainBoardView: View {
 
             ScrollView(.vertical) {
                 VStack(spacing: 12) {
-                    InventoryStateBanner(store: store)
+                    InventoryStateBanner(
+                        store: store,
+                        viewActivity: { activityExpanded = true }
+                    )
                     ProjectUsageStrip(store: store)
                     if let lease = store.latestLeaseResult {
                         LeaseResultCard(store: store, lease: lease)
@@ -529,7 +552,7 @@ struct MainBoardView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .accessibilityIdentifier("main-board-scroll-body")
 
-            ActionResultDrawer(store: store)
+            ActionResultDrawer(store: store, expanded: $activityExpanded)
             Divider().overlay(Color.white.opacity(0.07))
             StatusBar(store: store)
         }
@@ -537,10 +560,20 @@ struct MainBoardView: View {
         .sheet(item: $reviewingBulkPlan) { plan in
             BulkStopReviewSheet(store: store, plan: plan)
         }
+        .onAppear(perform: consumePendingActivityReview)
+        .onChange(of: activityReviewCoordinator.pendingRequestID) {
+            consumePendingActivityReview()
+        }
     }
 
     private func reviewBulkSelection() {
         reviewingBulkPlan = store.prepareBulkStop()
+    }
+
+    private func consumePendingActivityReview() {
+        guard let requestID = activityReviewCoordinator.pendingRequestID else { return }
+        activityExpanded = true
+        activityReviewCoordinator.consume(requestID)
     }
 }
 
@@ -973,6 +1006,10 @@ struct SourceDiagnosticsPopover: View {
 
 struct InventoryStateBanner: View {
     @ObservedObject var store: OpsStore
+    let viewActivity: () -> Void
+    @State private var resourceIssuesExpanded = false
+    @State private var inventoryDetailsExpanded = false
+    @State private var actionDetailsExpanded = false
 
     var body: some View {
         let snapshot = store.presentationSnapshot
@@ -994,12 +1031,20 @@ struct InventoryStateBanner: View {
                             .font(.system(size: 11))
                             .foregroundStyle(Theme.secondary)
                             .fixedSize(horizontal: false, vertical: true)
+                        if !isInitialLoading,
+                           snapshot.actionIssue == nil,
+                           snapshot.resourceAttentionItems.count == 1,
+                           let attention = snapshot.resourceAttentionItems.first
+                        {
+                            Text(attention.recommendedNextStep)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(Theme.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityIdentifier("resource-attention-next-step")
+                        }
                     }
                     Spacer()
-                    if !store.isLoading {
-                        Button("Refresh") { store.refresh() }
-                            .buttonStyle(.bordered)
-                    }
+                    contextualAction(snapshot: snapshot, isInitialLoading: isInitialLoading)
                 }
                 if !dockerUnavailable.isEmpty {
                     Label(
@@ -1011,8 +1056,23 @@ struct InventoryStateBanner: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("docker-unavailable-warning")
                 }
+                if shouldShowResourceList(snapshot) {
+                    DisclosureGroup(
+                        resourceDisclosureTitle(snapshot.resourceAttentionItems.count),
+                        isExpanded: $resourceIssuesExpanded
+                    ) {
+                        LazyVStack(spacing: 7) {
+                            ForEach(snapshot.resourceAttentionItems) { item in
+                                ResourceAttentionRow(store: store, item: item)
+                            }
+                        }
+                        .padding(.top, 5)
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .accessibilityIdentifier("resource-attention-list")
+                }
                 if let issue = snapshot.inventoryIssue {
-                    DisclosureGroup("Inventory details") {
+                    DisclosureGroup("Inventory details", isExpanded: $inventoryDetailsExpanded) {
                         Text(issue.details)
                             .font(.system(size: 11, design: .monospaced))
                             .textSelection(.enabled)
@@ -1021,7 +1081,7 @@ struct InventoryStateBanner: View {
                     .font(.system(size: 11, weight: .semibold))
                 }
                 if let issue = snapshot.actionIssue {
-                    DisclosureGroup("Action issue") {
+                    DisclosureGroup("Action issue", isExpanded: $actionDetailsExpanded) {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(issue.details)
                                 .font(.system(size: 11, design: .monospaced))
@@ -1044,6 +1104,115 @@ struct InventoryStateBanner: View {
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(healthLevelColor(snapshot.level).opacity(0.28)))
             .accessibilityIdentifier("inventory-state-banner")
         }
+    }
+
+    @ViewBuilder
+    private func contextualAction(
+        snapshot: OpsPresentationSnapshot,
+        isInitialLoading: Bool
+    ) -> some View {
+        if !isInitialLoading {
+            if let issue = snapshot.actionIssue {
+                if hasActivityResult(for: issue) {
+                    Button("View Activity", action: viewActivity)
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("attention-view-activity")
+                } else {
+                    Button(actionDetailsExpanded ? "Hide details" : "View details") {
+                        actionDetailsExpanded.toggle()
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("attention-view-action-details")
+                }
+            } else if snapshot.resourceAttentionItems.count == 1,
+                      let item = snapshot.resourceAttentionItems.first
+            {
+                Button(item.reviewTarget.actionLabel) {
+                    _ = store.reviewAttentionItem(item)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("attention-review-resource")
+            } else if snapshot.resourceAttentionItems.count > 1 {
+                Button(resourceIssuesExpanded ? "Hide issues" : "Review \(snapshot.resourceAttentionItems.count)") {
+                    resourceIssuesExpanded.toggle()
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("attention-review-resources")
+            } else if snapshot.health.runningActionCount > 0 {
+                Button("View Activity", action: viewActivity)
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("attention-view-running-activity")
+            } else if snapshot.inventoryIssue != nil
+                        || snapshot.level == .degraded
+                        || snapshot.level == .unavailable
+                        || snapshot.unavailableCapabilityCount > 0
+            {
+                Button("Refresh") { store.refresh() }
+                    .buttonStyle(.bordered)
+                    .disabled(store.isLoading)
+                    .accessibilityIdentifier("attention-refresh-inventory")
+            }
+        }
+    }
+
+    private func hasActivityResult(for issue: OpsIssue) -> Bool {
+        guard let actionID = issue.relatedActionID else { return false }
+        return store.actionResults[actionID] != nil
+    }
+
+    private func shouldShowResourceList(_ snapshot: OpsPresentationSnapshot) -> Bool {
+        snapshot.resourceAttentionItems.count > 1
+            || (snapshot.actionIssue != nil && !snapshot.resourceAttentionItems.isEmpty)
+    }
+
+    private func resourceDisclosureTitle(_ count: Int) -> String {
+        count == 1 ? "Affected resource" : "Affected resources (\(count))"
+    }
+}
+
+struct ResourceAttentionRow: View {
+    @ObservedObject var store: OpsStore
+    let item: ResourceAttentionItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: resourceAttentionIcon(item.kind))
+                .foregroundStyle(Theme.red)
+                .frame(width: 15)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(item.reason)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(item.recommendedNextStep)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Theme.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button(item.reviewTarget.actionLabel) {
+                _ = store.reviewAttentionItem(item)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .padding(8)
+        .background(Theme.control.opacity(0.72))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("resource-attention-\(safeAccessibilityID(item.id))")
+    }
+}
+
+func resourceAttentionIcon(_ kind: ResourceAttentionKind) -> String {
+    switch kind {
+    case .server: return "terminal"
+    case .docker: return "shippingbox"
+    case .projectConflict: return "point.3.connected.trianglepath.dotted"
     }
 }
 
@@ -1229,7 +1398,7 @@ struct ManagedLeaseRow: View {
 
 struct ActionResultDrawer: View {
     @ObservedObject var store: OpsStore
-    @State private var expanded = false
+    @Binding var expanded: Bool
 
     private var results: [RetainedActionResult] {
         store.actionResults.values.sorted { $0.queuedAt > $1.queuedAt }

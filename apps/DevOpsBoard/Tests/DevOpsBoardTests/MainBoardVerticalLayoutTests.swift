@@ -21,6 +21,17 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         XCTAssertEqual(fixture.store.filteredServers.count, 19)
         XCTAssertNotNil(fixture.store.actionIssue)
         XCTAssertEqual(fixture.store.actionResults.count, 1)
+        XCTAssertTrue(
+            fixture.store.resourceAttentionItems.isEmpty,
+            "intentionally stopped servers must remain ordinary lifecycle state"
+        )
+        XCTAssertEqual(fixture.store.presentationSnapshot.statusTitle, "Restart service-1 failed")
+        XCTAssertEqual(fixture.store.presentationSnapshot.statusMessage, "The health check did not become ready.")
+        XCTAssertNotEqual(
+            fixture.store.presentationSnapshot.statusTitle,
+            fixture.store.presentationSnapshot.statusMessage,
+            "the banner must not repeat generic attention copy"
+        )
 
         let raster = try renderMainBoard(
             store: fixture.store,
@@ -104,11 +115,124 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
             MainBoardEdgeDetector.assess(internallyScrolled).hasBothFixedEdges,
             "ordinary inner-table scrolling must not be classified as pane-edge cropping"
         )
+        XCTAssertTrue(
+            MainBoardEdgeDetector.assess(internallyScrolled).bodyHasVisibleContent,
+            "ordinary inner-table scrolling must retain the surrounding primary controls"
+        )
+
+        let emptyResourceRows = intact.clearingResourceRows(yRange: 505..<678)
+        let emptyResourceAssessment = MainBoardEdgeDetector.assess(emptyResourceRows)
+        XCTAssertTrue(
+            emptyResourceAssessment.hasBothFixedEdges && emptyResourceAssessment.bodyHasVisibleContent,
+            "an intentionally empty resource table must retain its Project Load, filters, tabs, and heading"
+        )
 
         let emptyBody = intact.clearingOnlyVariableBody()
         XCTAssertTrue(
             MainBoardEdgeDetector.assess(emptyBody).hasBothFixedEdges,
             "an intentionally empty resource body must retain valid fixed pane edges"
+        )
+    }
+
+    func testDetectorRejectsBannerAndActivityWithoutPrimaryDecisionContent() throws {
+        let fixture = try makeDenseMinimumWindowFixture()
+        let intact = try renderMainBoard(
+            store: fixture.store,
+            width: mainPaneWidth,
+            height: minimumWindowHeight
+        )
+
+        // Production-shaped loss: keep the actionable banner, toolbar,
+        // Activity, and status exactly where they render, but erase Project
+        // Load, filters, tabs, section heading, and resource rows.
+        let bannerAndActivityOnly = intact.clearingPrimaryContent(yRange: 151..<678)
+        let legacyBodyObservation = bannerAndActivityOnly.brightPixelObservation(yRange: 55..<721)
+        XCTAssertTrue(
+            legacyBodyObservation.meetsVariableBodyMinimum,
+            "the fixture must prove banner and Activity alone satisfy the former whole-body detector"
+        )
+
+        let assessment = MainBoardEdgeDetector.assess(bannerAndActivityOnly)
+        XCTAssertTrue(
+            assessment.hasBothFixedEdges,
+            "the fixture must retain toolbar and status so this is primary-content loss, not edge cropping"
+        )
+        XCTAssertFalse(
+            assessment.bodyHasVisibleContent,
+            "the detector accepted a banner and Activity while the primary decision content was erased"
+        )
+    }
+
+    func testConcreteResourceAttentionKeepsActionableBannerAndFixedEdgesVisible() throws {
+        let fixture = try makeDenseMinimumWindowFixture()
+        fixture.store.actionIssue = nil
+        fixture.store.actionResults.removeAll()
+
+        var unhealthy = fixture.store.inventory.servers[0]
+        unhealthy.status = "unhealthy"
+        unhealthy.health = Health(ok: false, pidAlive: true)
+        unhealthy.stoppedReason = nil
+        fixture.store.inventory.servers[0] = unhealthy
+
+        let attention = try XCTUnwrap(fixture.store.resourceAttentionItems.first)
+        XCTAssertEqual(fixture.store.resourceAttentionItems.count, 1)
+        XCTAssertEqual(attention.title, "service-1 is unhealthy")
+        XCTAssertTrue(attention.reason.localizedCaseInsensitiveContains("unhealthy"))
+        XCTAssertEqual(attention.reviewTarget.actionLabel, "Review server")
+        XCTAssertEqual(fixture.store.presentationSnapshot.statusTitle, attention.title)
+        XCTAssertNotEqual(
+            fixture.store.presentationSnapshot.statusTitle,
+            fixture.store.presentationSnapshot.statusMessage
+        )
+
+        let raster = try renderMainBoard(
+            store: fixture.store,
+            width: mainPaneWidth,
+            height: minimumWindowHeight
+        )
+        try captureRasterIfRequested(
+            raster,
+            name: "main-board-resource-attention-524x760"
+        )
+        let assessment = MainBoardEdgeDetector.assess(raster)
+        XCTAssertTrue(assessment.hasBothFixedEdges)
+        XCTAssertTrue(assessment.bodyHasVisibleContent)
+    }
+
+    func testActivityReviewRequestIsRetainedUntilTheMainBoardConsumesIt() throws {
+        let coordinator = ActivityReviewCoordinator.shared
+        if let existing = coordinator.pendingRequestID {
+            coordinator.consume(existing)
+        }
+
+        coordinator.requestReview()
+        let requestID = try XCTUnwrap(coordinator.pendingRequestID)
+
+        coordinator.consume(UUID())
+        XCTAssertEqual(coordinator.pendingRequestID, requestID)
+
+        coordinator.consume(requestID)
+        XCTAssertNil(coordinator.pendingRequestID)
+    }
+
+    func testMainBoardConsumesBufferedActivityReviewWhenItAppears() throws {
+        let fixture = try makeDenseMinimumWindowFixture()
+        let coordinator = ActivityReviewCoordinator.shared
+        if let existing = coordinator.pendingRequestID {
+            coordinator.consume(existing)
+        }
+        coordinator.requestReview()
+        XCTAssertNotNil(coordinator.pendingRequestID)
+
+        _ = try renderMainBoard(
+            store: fixture.store,
+            width: mainPaneWidth,
+            height: minimumWindowHeight
+        )
+
+        XCTAssertNil(
+            coordinator.pendingRequestID,
+            "the main board must consume a menu-bar Activity request after it appears"
         )
     }
 }
@@ -242,28 +366,31 @@ private func makeDenseMinimumWindowFixture() throws -> DenseMinimumWindowFixture
     let actionID = UUID(uuidString: "00000000-0000-0000-0000-000000000760")!
     let request = ActionRequest(
         id: actionID,
-        kind: .projectRestart,
-        title: "Project restart Nevod",
+        kind: .restartServer,
+        title: "Restart service-1",
         origin: origin,
+        resource: inventory.servers[0].resourceIdentity,
         projectPath: projects[0]
     )
     store.actionResults[actionID] = RetainedActionResult(
         request: request,
-        phase: .succeeded,
+        phase: .failed,
         queuedAt: now.addingTimeInterval(-2),
         startedAt: now.addingTimeInterval(-1),
         finishedAt: now,
-        exitStatus: 0,
-        stdout: "fixture action completed"
+        exitStatus: 1,
+        stdout: "",
+        stderr: "Fixture health check timed out.",
+        failure: "The health check did not become ready."
     )
     store.actionIssue = OpsIssue(
         id: UUID(uuidString: "00000000-0000-0000-0000-000000000761")!,
         kind: .action,
-        title: "Fixture action needs attention",
-        summary: "Action or resource requires attention",
-        details: "Dense minimum-window fixture retains an unresolved action warning.",
+        title: "Restart service-1 failed",
+        summary: "The health check did not become ready.",
+        details: "Fixture health check timed out while restarting service-1.",
         createdAt: now,
-        relatedActionID: nil
+        relatedActionID: actionID
     )
 
     keepFixture = true
@@ -377,9 +504,15 @@ private enum MainBoardEdgeDetector {
         let statusHeight = min(38, raster.height)
         let bodyStart = min(toolbarHeight + 1, raster.height)
         let bodyEnd = max(bodyStart, raster.height - statusHeight - 1)
+        // The banner and Activity are useful contextual chrome, but neither is
+        // the primary inventory decision surface. Exclude their maximum
+        // collapsed footprints so they cannot hide a blank project/resource
+        // viewport behind a passing aggregate brightness score.
+        let primaryStart = min(bodyStart + 96, bodyEnd)
+        let primaryEnd = max(primaryStart, bodyEnd - 43)
         return MainBoardEdgeAssessment(
             toolbar: raster.brightPixelObservation(yRange: 0..<toolbarHeight),
-            body: raster.brightPixelObservation(yRange: bodyStart..<bodyEnd),
+            body: raster.brightPixelObservation(yRange: primaryStart..<primaryEnd),
             status: raster.brightPixelObservation(yRange: (raster.height - statusHeight)..<raster.height)
         )
     }
@@ -483,6 +616,18 @@ private struct BoardRaster {
             output.fillRow(y, color: backgroundColor)
         }
         return output
+    }
+
+    func clearingPrimaryContent(yRange: Range<Int>) -> BoardRaster {
+        var output = self
+        for y in yRange where y >= 0 && y < height {
+            output.fillRow(y, color: backgroundColor)
+        }
+        return output
+    }
+
+    func clearingResourceRows(yRange: Range<Int>) -> BoardRaster {
+        clearingPrimaryContent(yRange: yRange)
     }
 
     private var backgroundColor: [UInt8] { [16, 19, 20, 255] }
