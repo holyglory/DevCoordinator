@@ -739,6 +739,7 @@ struct ToolbarView: View {
             ToolbarButton(title: "Refresh", systemImage: "arrow.clockwise", showsTitle: false) {
                 store.refresh()
             }
+            .disabled(store.isLoading)
             ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus") {
                 store.prepareLeaseDraft()
                 store.showingLeaseSheet = true
@@ -763,6 +764,7 @@ struct ToolbarView: View {
             ToolbarButton(title: "Refresh", systemImage: "arrow.clockwise", showsTitle: false) {
                 store.refresh()
             }
+            .disabled(store.isLoading)
             ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus", showsTitle: false) {
                 store.prepareLeaseDraft()
                 store.showingLeaseSheet = true
@@ -941,19 +943,20 @@ struct InventoryStateBanner: View {
         let dockerUnavailable = store.capabilityStates.filter {
             $0.capability == .docker && $0.phase == .unavailable
         }
-        if store.isLoading || snapshot.level != .nominal || !dockerUnavailable.isEmpty {
+        let isInitialLoading = store.isInitialInventoryLoading
+        if isInitialLoading || snapshot.level != .nominal || !dockerUnavailable.isEmpty {
             VStack(alignment: .leading, spacing: 7) {
                 HStack(alignment: .top, spacing: 10) {
-                    if store.isLoading {
+                    if isInitialLoading {
                         ProgressView().controlSize(.small)
                     } else {
                         Image(systemName: inventoryBannerIcon(snapshot.level))
                             .foregroundStyle(healthLevelColor(snapshot.level))
                     }
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(store.isLoading ? "Refreshing inventory" : snapshot.statusTitle)
+                        Text(isInitialLoading ? "Refreshing inventory" : snapshot.statusTitle)
                             .font(.system(size: 12, weight: .bold))
-                        Text(store.isLoading && store.sourceStates.isEmpty ? "Looking for configured coordinator sources." : snapshot.statusMessage)
+                        Text(isInitialLoading && store.sourceStates.isEmpty ? "Looking for configured coordinator sources." : snapshot.statusMessage)
                             .font(.system(size: 11))
                             .foregroundStyle(Theme.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -2784,7 +2787,7 @@ struct DevServersEmptyState: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 12) {
                 Group {
-                    if store.isLoading {
+                    if store.isInitialInventoryLoading {
                         ProgressView()
                             .controlSize(.small)
                     } else {
@@ -2797,14 +2800,14 @@ struct DevServersEmptyState: View {
                     .background(Theme.blue.opacity(0.12))
                     .clipShape(RoundedRectangle(cornerRadius: 7))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(store.isLoading ? "Loading managed dev servers" : "No managed dev servers in this scope")
+                    Text(store.isInitialInventoryLoading ? "Loading managed dev servers" : "No managed dev servers in this scope")
                         .font(.system(size: 13, weight: .semibold))
-                    Text(store.isLoading ? "Waiting for configured coordinator sources." : "Use the coordinator before opening default ports.")
+                    Text(store.isInitialInventoryLoading ? "Waiting for configured coordinator sources." : "Use the coordinator before opening default ports.")
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.secondary)
                 }
                 Spacer()
-                if !store.isLoading {
+                if !store.isInitialInventoryLoading {
                     ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus") {
                         store.prepareLeaseDraft()
                         store.showingLeaseSheet = true
@@ -2844,7 +2847,7 @@ struct ResourceEmptyState: View {
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             Group {
-                if store.isLoading {
+                if store.isInitialInventoryLoading {
                     ProgressView()
                         .controlSize(.small)
                 } else {
@@ -2857,15 +2860,15 @@ struct ResourceEmptyState: View {
             .clipShape(RoundedRectangle(cornerRadius: 7))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(store.isLoading ? "Loading inventory" : title)
+                Text(store.isInitialInventoryLoading ? "Loading inventory" : title)
                     .font(.system(size: 13, weight: .semibold))
-                Text(store.isLoading ? "Waiting for configured coordinator sources." : message)
+                Text(store.isInitialInventoryLoading ? "Waiting for configured coordinator sources." : message)
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
-            if !store.isLoading {
+            if !store.isInitialInventoryLoading {
                 Button("Refresh") { store.refresh() }
                     .buttonStyle(.bordered)
             }

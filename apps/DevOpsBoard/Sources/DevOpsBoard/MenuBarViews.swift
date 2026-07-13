@@ -32,7 +32,8 @@ struct MenuBarRuntimeView: View {
                     title: "Refresh",
                     systemImage: "arrow.clockwise",
                     tint: Theme.secondary,
-                    action: store.refresh
+                    action: store.refresh,
+                    disabled: store.isLoading
                 )
                 MenuBarActionButton(
                     title: "Open console",
@@ -51,7 +52,7 @@ struct MenuBarRuntimeView: View {
 
             Divider().overlay(Color.white.opacity(0.08))
 
-            if store.isLoading && groups.isEmpty {
+            if store.isInitialInventoryLoading && groups.isEmpty {
                 VStack(spacing: 9) {
                     ProgressView().controlSize(.small)
                     Text("Refreshing coordinator sources…")
@@ -183,46 +184,63 @@ struct MenuBarSourceSummary: View {
     }
 
     var body: some View {
-        DisclosureGroup(isExpanded: $expanded) {
-            VStack(alignment: .leading, spacing: 7) {
-                ForEach(store.sourceStates) { source in
-                    HStack(spacing: 7) {
-                        StatusDot(status: source.phase.rawValue)
-                        Text(source.origin.label)
-                            .fontWeight(.semibold)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(source.phase.rawValue.capitalized)
-                            .foregroundStyle(Theme.secondary)
-                        CountBadge(count: source.resourceCount)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(Theme.secondary)
+                        .frame(width: 10)
+                    Image(systemName: menuHealthIcon(store.presentationSnapshot.level))
+                        .foregroundStyle(menuHealthColor(store.presentationSnapshot.level))
+                    Text(title)
+                        .font(.system(size: 11, weight: .semibold))
+                    Spacer()
+                    Text(expanded ? "Hide" : "View details")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.blue)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("menu-source-summary-toggle")
+            .accessibilityLabel(expanded ? "Hide source details" : "View source details")
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(store.sourceStates) { source in
+                        HStack(spacing: 7) {
+                            StatusDot(status: source.phase.rawValue)
+                            Text(source.origin.label)
+                                .fontWeight(.semibold)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(source.phase.rawValue.capitalized)
+                                .foregroundStyle(Theme.secondary)
+                            CountBadge(count: source.resourceCount)
+                        }
                     }
-                }
-                ForEach(store.capabilityStates.filter { $0.phase == .unavailable }) { capability in
-                    Label(
-                        "\(capability.capability.displayName) unavailable on \(capability.origin.label)",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                    .foregroundStyle(Theme.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                }
-                if let issue = store.presentationSnapshot.inventoryIssue {
-                    Text(issue.summary)
+                    ForEach(store.capabilityStates.filter { $0.phase == .unavailable }) { capability in
+                        Label(
+                            "\(capability.capability.displayName) unavailable on \(capability.origin.label)",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
                         .foregroundStyle(Theme.orange)
                         .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let issue = store.presentationSnapshot.inventoryIssue {
+                        Text(issue.summary)
+                            .foregroundStyle(Theme.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
-            }
-            .font(.system(size: 10))
-            .padding(.top, 7)
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: menuHealthIcon(store.presentationSnapshot.level))
-                    .foregroundStyle(menuHealthColor(store.presentationSnapshot.level))
-                Text(title)
-                    .font(.system(size: 11, weight: .semibold))
-                Spacer()
-                Text(expanded ? "Hide" : "View details")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.blue)
+                .font(.system(size: 10))
+                .padding(.top, 7)
+                .padding(.leading, 17)
+                .accessibilityIdentifier("menu-source-details")
             }
         }
         .padding(.horizontal, 12)

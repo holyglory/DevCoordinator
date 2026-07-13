@@ -1947,3 +1947,40 @@ Restore stays disabled until that exact artifact has passed current checksum
 verification. Automated recall uses a realistic sparse 8 GiB backup and proves
 ordinary inventory completes without reading it; a separate test proves
 selection performs the real verification and enables strong evidence.
+
+## 2026-07-13 - Background inventory refresh stays cached and edge-triggered
+
+Decision: DevOps Board keeps the 30-second external-truth reconciliation poll,
+but treats it as background work once a source snapshot exists. Surface
+visibility is now gated on the aggregate hidden/visible edge, so duplicate
+window callbacks and menu-to-window handoffs do not restart polling. Opening
+the menu no longer forces an additional refresh; the explicit Refresh control
+remains available. While a scheduled refresh is running, the last proven
+source/capability/resource snapshot stays visible until the replacement is
+complete. The menu source summary is a full-row native Button rather than
+link-styled inert text.
+
+Why: Reproduction showed that every popover open forced an inventory command,
+`setSurfaceVisible` re-requested work for unchanged/per-surface callbacks, and
+every poll replaced healthy source state with `loading`. That made the menu to
+console journey reliably show `Refreshing inventory` even when cached data was
+usable. Unscoped inventory also performed a second Docker-backed pass solely
+to add project backup directories, repeating the expensive
+`docker stats --no-stream` observation.
+
+Result: The backup-enrichment pass now uses `--no-docker` and merges only its
+backup evidence into the first authoritative runtime snapshot. Deterministic
+tests prove initial loading remains truthful, a blocked background refresh
+retains nominal cached presentation, duplicate/overlapping visibility events
+do not issue commands, a real hidden-to-visible edge still refreshes, and the
+no-Docker enrichment retains the first pass's Docker telemetry even when
+backup discovery fails, and combined Docker/backup failures retain both
+operator-relevant reasons. A failed first load followed by a blocked retry also
+proves that failed-without-cache state returns to truthful loading rather than
+showing a completed empty inventory. The existing
+source-presentation regression exposed a contradiction with the earlier
+publish-on-change decision: `CoordinatorOrigin` identity equality intentionally
+ignores label/state-path presentation changes, so an otherwise equal inventory
+could retain an old source label. Inventory publication now also checks the
+current source presentation, preserving low-churn publishing without hiding
+real configuration changes.

@@ -151,8 +151,8 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             rootView: MenuBarRuntimeView(
                 store: store,
                 openConsole: { [weak self] in
-                    self?.closePopover()
                     AppWindowController.shared.showWindow()
+                    self?.closePopover()
                 },
                 quit: {
                     NSApp.terminate(nil)
@@ -160,7 +160,6 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             )
         )
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        store.refresh()
     }
 
     private func closePopover() {

@@ -4,7 +4,7 @@ import Foundation
 import SwiftUI
 
 private enum OriginInventoryExecutionResult: Sendable {
-    case success(CommandExecution, databaseWarning: String?)
+    case success(CommandExecution, enrichedBackups: [DatabaseBackup]?, databaseWarning: String?)
     case failure(String)
 }
 
@@ -27,7 +27,7 @@ private func loadOriginInventory(
             throw RuntimeError(initial.stderr.isEmpty ? initial.stdout : initial.stderr)
         }
         let decoded = try JSONDecoder().decode(Inventory.self, from: Data(initial.stdout.utf8))
-        var selected = initial
+        var enrichedBackups: [DatabaseBackup]?
         var databaseWarning: String?
         if shouldEnrichBackups {
             let backupDirectories = Set(
@@ -36,6 +36,11 @@ private func loadOriginInventory(
             ).sorted()
             if !backupDirectories.isEmpty {
                 var enrichedArguments = arguments
+                // The first inventory already contains the authoritative
+                // Docker/process snapshot. This second pass exists only to
+                // include project-local backup directories, so repeating
+                // Docker's expensive `stats --no-stream` sample is wasteful.
+                enrichedArguments.append("--no-docker")
                 for directory in backupDirectories {
                     enrichedArguments.append(contentsOf: ["--backup-dir", directory])
                 }
@@ -44,8 +49,8 @@ private func loadOriginInventory(
                     guard enriched.exitStatus == 0 else {
                         throw RuntimeError(enriched.stderr.isEmpty ? enriched.stdout : enriched.stderr)
                     }
-                    _ = try JSONDecoder().decode(Inventory.self, from: Data(enriched.stdout.utf8))
-                    selected = enriched
+                    let enrichedInventory = try JSONDecoder().decode(Inventory.self, from: Data(enriched.stdout.utf8))
+                    enrichedBackups = enrichedInventory.backups
                 } catch {
                     databaseWarning = "Backup inventory incomplete: \(error.localizedDescription)"
                 }
@@ -54,7 +59,7 @@ private func loadOriginInventory(
         return OriginInventoryLoadOutcome(
             index: index,
             origin: origin,
-            result: .success(selected, databaseWarning: databaseWarning)
+            result: .success(initial, enrichedBackups: enrichedBackups, databaseWarning: databaseWarning)
         )
     } catch {
         return OriginInventoryLoadOutcome(
@@ -248,6 +253,13 @@ final class OpsStore: ObservableObject {
             : nil
     }
 
+    /// Blocking loading presentation is reserved for the first snapshot. A
+    /// background refresh keeps the last proven source/resource state visible
+    /// until replacement evidence arrives.
+    var isInitialInventoryLoading: Bool {
+        isLoading && (sourceStates.isEmpty || sourceStates.allSatisfy { $0.phase == .loading })
+    }
+
     var scopedProjectPath: String? {
         let trimmed = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
@@ -302,12 +314,15 @@ final class OpsStore: ObservableObject {
     /// Auto-refresh honors the configured policy and runs only while a surface
     /// is visible. A hidden app spawns no coordinator commands.
     func setSurfaceVisible(_ surface: RefreshSurface, _ visible: Bool) {
+        let wasVisible = !visibleSurfaces.isEmpty
         if visible {
             visibleSurfaces.insert(surface)
         } else {
             visibleSurfaces.remove(surface)
         }
-        if visibleSurfaces.isEmpty {
+        let isVisible = !visibleSurfaces.isEmpty
+        guard wasVisible != isVisible else { return }
+        if !isVisible {
             autoRefreshTask?.cancel()
             autoRefreshTask = nil
         } else {
@@ -711,18 +726,35 @@ final class OpsStore: ObservableObject {
             )
             return
         }
-        sourceStates = origins.map { CoordinatorSourceState(origin: $0, phase: .loading, checkedAt: clock.now()) }
-        capabilityStates = origins.flatMap { origin in
-            CoordinatorCapability.allCases.map {
-                CoordinatorCapabilityState(
+        let checkedAt = clock.now()
+        let retainedSources = Dictionary(uniqueKeysWithValues: sourceStates.map { ($0.origin.id, $0) })
+        let refreshingSources = origins.map { origin in
+            if let retained = retainedSources[origin.id], retained.phase == .loaded || retained.phase == .stale {
+                return retained
+            }
+            return CoordinatorSourceState(origin: origin, phase: .loading, checkedAt: checkedAt)
+        }
+        if refreshingSources != sourceStates { sourceStates = refreshingSources }
+        let retainedOriginIDs = Set(
+            refreshingSources.filter { $0.phase == .loaded || $0.phase == .stale }.map { $0.origin.id }
+        )
+        let retainedCapabilities = Dictionary(uniqueKeysWithValues: capabilityStates.map { ($0.id, $0) })
+        let refreshingCapabilities = origins.flatMap { origin in
+            CoordinatorCapability.allCases.map { capability in
+                if retainedOriginIDs.contains(origin.id),
+                   let retained = retainedCapabilities["\(origin.id)|\(capability.rawValue)"] {
+                    return retained
+                }
+                return CoordinatorCapabilityState(
                     origin: origin,
-                    capability: $0,
+                    capability: capability,
                     phase: .loading,
-                    checkedAt: clock.now(),
+                    checkedAt: checkedAt,
                     error: nil
                 )
             }
         }
+        if refreshingCapabilities != capabilityStates { capabilityStates = refreshingCapabilities }
         let projectScope = scopedProjectPath
         let arguments = projectScope.map { ["inventory", "--project", $0] } ?? ["inventory"]
         let service = coordinatorService
@@ -757,9 +789,12 @@ final class OpsStore: ObservableObject {
             var databaseWarning: String?
             var sourceFailure: String?
             switch outcome.result {
-            case .success(let result, let warning):
+            case .success(let result, let enrichedBackups, let warning):
                 do {
                     decoded = try JSONDecoder().decode(Inventory.self, from: Data(result.stdout.utf8))
+                    if let enrichedBackups {
+                        decoded?.backups = enrichedBackups
+                    }
                     databaseWarning = warning
                 } catch {
                     sourceFailure = error.localizedDescription
@@ -775,7 +810,10 @@ final class OpsStore: ObservableObject {
                     ? "Docker inventory unavailable: \(dockerFailureReason)"
                     : nil
                 if let dockerWarning {
-                    databaseWarning = "Database capability unavailable because \(dockerWarning.lowercased())"
+                    let dependencyWarning = "Database capability unavailable because \(dockerWarning.lowercased())"
+                    databaseWarning = [databaseWarning, dependencyWarning]
+                        .compactMap { $0 }
+                        .joined(separator: "; ")
                 }
                 decoded = attach(origin: sourcedOrigin, to: decoded)
                 inventoryByOrigin[origin.id] = decoded
@@ -854,6 +892,9 @@ final class OpsStore: ObservableObject {
         decoded.servers = deduplicatedManagedServers(decoded.servers)
         decoded = await discoverDatabases(in: decoded)
         if decoded != inventory { inventory = decoded }
+        else if !inventoryUsesCurrentSourcePresentation(inventory) {
+            inventory = decoded
+        }
         rebuildBackupRecords(from: decoded.backups)
         reconcileLeaseResults(now: clock.now())
         keepSelectionValid()
@@ -963,6 +1004,27 @@ final class OpsStore: ObservableObject {
             return usage
         }
         return result
+    }
+
+    private func inventoryUsesCurrentSourcePresentation(_ inventory: Inventory) -> Bool {
+        let currentOrigins = Dictionary(uniqueKeysWithValues: sourceStates.map { ($0.origin.id, $0.origin) })
+        let representedOrigins = [inventory.origin]
+            + inventory.urls.map(\.origin)
+            + inventory.servers.map(\.origin)
+            + inventory.leases.map(\.origin)
+            + inventory.recentEvents.map(\.origin)
+            + inventory.docker.containers.map(\.origin)
+            + inventory.docker.postgres.map(\.origin)
+            + inventory.postgres.map(\.origin)
+            + inventory.backups.map(\.origin)
+            + inventory.projectUsage.map(\.origin)
+            + inventory.projectUsage.flatMap { $0.processes ?? [] }.map(\.origin)
+        return representedOrigins.compactMap { $0 }.allSatisfy { represented in
+            guard let current = currentOrigins[represented.id] else { return false }
+            return represented.label == current.label
+                && represented.home == current.home
+                && represented.statePath == current.statePath
+        }
     }
 
     private func discoverDatabases(in inventory: Inventory) async -> Inventory {

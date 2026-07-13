@@ -892,6 +892,244 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
+    func testVisibilitySchedulingOnlyRefreshesOnAggregateHiddenToVisibleEdges() async throws {
+        let clock = MutableTestClock(Date(timeIntervalSince1970: 1_000))
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [
+                .success(inventoryExecution(home: codex.home, serverName: "first")),
+                .success(inventoryExecution(home: codex.home, serverName: "second")),
+            ]
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .interval(seconds: 3_600))
+            ),
+            clock: clock
+        )
+
+        store.setSurfaceVisible(.popover, true)
+        try await waitUntilAsync {
+            let count = await service.capturedCalls().count
+            return count == 1 && !store.isLoading
+        }
+        clock.advance(by: 3_601)
+
+        store.setSurfaceVisible(.popover, true)
+        store.setSurfaceVisible(.window, true)
+        store.setSurfaceVisible(.popover, false)
+        try await Task.sleep(for: .milliseconds(50))
+        let callsAfterHandoff = await service.capturedCalls()
+        XCTAssertEqual(
+            callsAfterHandoff.count,
+            1,
+            "duplicate callbacks and visible-surface handoff must not restart inventory"
+        )
+
+        store.setSurfaceVisible(.window, false)
+        store.setSurfaceVisible(.popover, true)
+        try await waitUntilAsync {
+            let count = await service.capturedCalls().count
+            return count == 2 && !store.isLoading
+        }
+        XCTAssertEqual(store.inventory.servers.first?.name, "second")
+        store.setSurfaceVisible(.popover, false)
+    }
+
+    @MainActor
+    func testBackgroundRefreshRetainsLoadedPresentationUntilReplacementArrives() async throws {
+        let clock = MutableTestClock(Date(timeIntervalSince1970: 2_000))
+        let service = GatedSequencedCoordinatorService(results: [
+            inventoryExecution(home: codex.home, serverName: "first"),
+            inventoryExecution(home: codex.home, serverName: "second"),
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .interval(seconds: 30))
+            ),
+            clock: clock
+        )
+
+        let initialLoad = Task { await store.loadInventory() }
+        try await waitUntilAsync { await service.startedCallCount() == 1 }
+        XCTAssertTrue(store.isLoading)
+        XCTAssertTrue(store.isInitialInventoryLoading)
+        XCTAssertEqual(store.sourceStates.first?.phase, .loading)
+        XCTAssertTrue(store.capabilityStates.allSatisfy { $0.phase == .loading })
+        await service.release(call: 1)
+        await initialLoad.value
+        XCTAssertEqual(store.sourceStates.first?.phase, .loaded)
+        XCTAssertEqual(store.presentationSnapshot.level, .nominal)
+
+        clock.advance(by: 31)
+        let backgroundLoad = Task { await store.loadInventory() }
+        try await waitUntilAsync { await service.startedCallCount() == 2 }
+        XCTAssertTrue(store.isLoading)
+        XCTAssertFalse(store.isInitialInventoryLoading)
+        XCTAssertEqual(store.sourceStates.first?.phase, .loaded)
+        XCTAssertTrue(store.capabilityStates.allSatisfy { $0.phase == .available })
+        XCTAssertEqual(store.inventory.servers.first?.name, "first")
+        XCTAssertEqual(store.presentationSnapshot.level, .nominal)
+        await service.release(call: 2)
+        await backgroundLoad.value
+
+        XCTAssertFalse(store.isLoading)
+        XCTAssertEqual(store.inventory.servers.first?.name, "second")
+        XCTAssertEqual(store.sourceStates.first?.phase, .loaded)
+    }
+
+    @MainActor
+    func testRetryAfterInitialFailureShowsLoadingUntilFirstSnapshotArrives() async throws {
+        let service = GatedSequencedCoordinatorService(outcomes: [
+            .failure(.offline),
+            .success(inventoryExecution(home: codex.home, serverName: "recovered")),
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .manual())
+            )
+        )
+
+        let failedLoad = Task { await store.loadInventory(force: true) }
+        try await waitUntilAsync { await service.startedCallCount() == 1 }
+        await service.release(call: 1)
+        await failedLoad.value
+        XCTAssertEqual(store.sourceStates.first?.phase, .failed)
+        XCTAssertTrue(store.inventory.servers.isEmpty)
+
+        let retry = Task { await store.loadInventory(force: true) }
+        try await waitUntilAsync { await service.startedCallCount() == 2 }
+        XCTAssertTrue(store.isLoading)
+        XCTAssertTrue(store.isInitialInventoryLoading)
+        XCTAssertEqual(store.sourceStates.first?.phase, .loading)
+        XCTAssertTrue(store.capabilityStates.allSatisfy { $0.phase == .loading })
+        await service.release(call: 2)
+        await retry.value
+
+        XCTAssertFalse(store.isLoading)
+        XCTAssertEqual(store.sourceStates.first?.phase, .loaded)
+        XCTAssertEqual(store.inventory.servers.first?.name, "recovered")
+    }
+
+    @MainActor
+    func testBackupEnrichmentSkipsDuplicateDockerObservationAndMergesOnlyBackups() async throws {
+        let initialJSON = """
+        {"coordinator_home":"\(codex.home)","state_path":"\(codex.home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"containers":[{"id":"cid","name":"db","project":"/repo","status":"Up","stats":{"cpu_percent":17.5}}],"postgres":[]},"postgres":[],"backups":[],"project_usage":[]}
+        """
+        let enrichmentJSON = """
+        {"coordinator_home":"\(codex.home)","state_path":"\(codex.home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"available":null,"containers":[],"postgres":[]},"postgres":[],"backups":[{"path":"/repo/.codex-db-backups/app.dump","size":42}],"project_usage":[]}
+        """
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [
+                .success(.init(stdout: initialJSON, stderr: "", exitStatus: 0)),
+                .success(.init(stdout: enrichmentJSON, stderr: "", exitStatus: 0)),
+            ]
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .manual())
+            )
+        )
+
+        await store.loadInventory()
+
+        let calls = await service.capturedCalls()
+        XCTAssertEqual(calls.map(\.1), [
+            ["inventory"],
+            ["inventory", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"],
+        ])
+        XCTAssertEqual(store.inventory.docker.containers.first?.name, "db")
+        XCTAssertEqual(store.inventory.docker.containers.first?.stats?.cpuPercent, 17.5)
+        XCTAssertEqual(store.inventory.backups.first?.path, "/repo/.codex-db-backups/app.dump")
+    }
+
+    @MainActor
+    func testFailedBackupEnrichmentRetainsRuntimeSnapshotAndDegradesOnlyDatabaseCapability() async throws {
+        let initialJSON = """
+        {"coordinator_home":"\(codex.home)","state_path":"\(codex.home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"containers":[{"id":"cid","name":"db","project":"/repo","status":"Up","stats":{"cpu_percent":8.25}}],"postgres":[]},"postgres":[],"backups":[],"project_usage":[]}
+        """
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [
+                .success(.init(stdout: initialJSON, stderr: "", exitStatus: 0)),
+                .failure(.offline),
+            ]
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .manual())
+            )
+        )
+
+        await store.loadInventory()
+
+        XCTAssertEqual(store.sourceStates.first?.phase, .loaded)
+        XCTAssertEqual(store.inventory.docker.containers.first?.name, "db")
+        XCTAssertEqual(store.inventory.docker.containers.first?.stats?.cpuPercent, 8.25)
+        XCTAssertEqual(
+            store.capabilityStates.first { $0.capability == .docker }?.phase,
+            .available
+        )
+        XCTAssertEqual(
+            store.capabilityStates.first { $0.capability == .database }?.phase,
+            .unavailable
+        )
+        XCTAssertTrue(store.inventoryIssue?.details.localizedCaseInsensitiveContains("backup inventory incomplete") == true)
+    }
+
+    @MainActor
+    func testDockerAndBackupEnrichmentFailuresAreBothRetainedInDiagnostics() async throws {
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [
+                .success(inventoryWithDockerUnavailableExecution(home: codex.home)),
+                .failure(.offline),
+            ]
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .manual())
+            )
+        )
+
+        await store.loadInventory()
+
+        XCTAssertEqual(store.sourceStates.first?.phase, .loaded)
+        XCTAssertEqual(
+            store.capabilityStates.first { $0.capability == .docker }?.phase,
+            .unavailable
+        )
+        XCTAssertEqual(
+            store.capabilityStates.first { $0.capability == .database }?.phase,
+            .unavailable
+        )
+        let details = store.inventoryIssue?.details ?? ""
+        XCTAssertTrue(details.localizedCaseInsensitiveContains("backup inventory incomplete"))
+        XCTAssertTrue(details.localizedCaseInsensitiveContains("docker daemon unavailable"))
+    }
+
+    @MainActor
     func testInventoryRefreshDoesNotHashMultiGigabyteBackupArtifactsEagerly() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1140,7 +1378,7 @@ final class CoreTests: XCTestCase {
         )
         let refreshed = inventoryExecution(home: codex.home, serverName: "after-refresh", project: "/repo")
         let service = OriginSequencedCoordinatorService(results: [
-            codex.id: [.success(partialReport), .success(refreshed)]
+            codex.id: [.success(partialReport), .success(refreshed), .success(refreshed)]
         ])
         let store = OpsStore(
             coordinatorService: service,
@@ -1180,15 +1418,16 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(store.actionIssue?.summary.contains("partial changes applied") == true)
         XCTAssertTrue(store.actionIssue?.details.contains("Partial changes were applied") == true)
         let calls = await service.capturedCalls()
-        XCTAssertEqual(calls.count, 2, "the failed project command must be followed by an inventory refresh")
-        XCTAssertEqual(calls.last?.1 ?? [], ["inventory"])
+        XCTAssertEqual(calls.count, 3, "the failed project command must be followed by an inventory refresh")
+        XCTAssertEqual(calls[1].1, ["inventory"])
+        XCTAssertEqual(calls[2].1, ["inventory", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"])
     }
 
     @MainActor
     func testThrownProjectActionFailureStillRefreshesInventory() async throws {
         let refreshed = inventoryExecution(home: codex.home, serverName: "refreshed-after-throw", project: "/repo")
         let service = OriginSequencedCoordinatorService(results: [
-            codex.id: [.failure(.offline), .success(refreshed)]
+            codex.id: [.failure(.offline), .success(refreshed), .success(refreshed)]
         ])
         let store = OpsStore(
             coordinatorService: service,
@@ -1221,8 +1460,9 @@ final class CoreTests: XCTestCase {
         }
 
         let calls = await service.capturedCalls()
-        XCTAssertEqual(calls.count, 2)
-        XCTAssertEqual(calls.last?.1 ?? [], ["inventory"])
+        XCTAssertEqual(calls.count, 3)
+        XCTAssertEqual(calls[1].1, ["inventory"])
+        XCTAssertEqual(calls[2].1, ["inventory", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"])
     }
 
     @MainActor
@@ -1770,6 +2010,8 @@ final class CoreTests: XCTestCase {
         await store.loadInventory(force: true)
         XCTAssertEqual(store.manageableLeaseResults.first?.identity.origin.label, "Old label")
         await store.loadInventory(force: true)
+        XCTAssertEqual(store.sourceStates.first?.origin.label, "Current label")
+        XCTAssertEqual(store.inventory.leases.first?.origin?.label, "Current label")
         XCTAssertEqual(store.manageableLeaseResults.first?.identity.origin.label, "Current label")
         XCTAssertEqual(store.manageableLeaseResults.count, 1)
     }
@@ -1961,6 +2203,18 @@ private func waitUntil(
     throw RuntimeError("Timed out waiting for asynchronous store state")
 }
 
+@MainActor
+private func waitUntilAsync(
+    attempts: Int = 100,
+    condition: @escaping @MainActor () async -> Bool
+) async throws {
+    for _ in 0..<attempts {
+        if await condition() { return }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    throw RuntimeError("Timed out waiting for asynchronous state")
+}
+
 private func inventoryExecution(home: String, serverName: String, project: String? = nil) -> CommandExecution {
     let projectJSON = project.map { ",\"project\":\"\($0)\"" } ?? ""
     let json = """
@@ -2104,6 +2358,53 @@ private actor DelayedCountingCoordinatorService: CoordinatorServing {
     }
 
     func callCount() -> Int { calls }
+}
+
+private actor GatedSequencedCoordinatorService: CoordinatorServing {
+    private var outcomes: [Result<CommandExecution, MockFailure>]
+    private var startedCalls = 0
+    private var continuations: [Int: CheckedContinuation<Void, Never>] = [:]
+
+    init(results: [CommandExecution]) {
+        outcomes = results.map(Result.success)
+    }
+
+    init(outcomes: [Result<CommandExecution, MockFailure>]) {
+        self.outcomes = outcomes
+    }
+
+    func execute(origin: CoordinatorOrigin, arguments: [String]) async throws -> CommandExecution {
+        guard arguments.first == "inventory", !outcomes.isEmpty else { throw MockFailure.offline }
+        startedCalls += 1
+        let call = startedCalls
+        await withCheckedContinuation { continuation in
+            continuations[call] = continuation
+        }
+        return try outcomes.removeFirst().get()
+    }
+
+    func startedCallCount() -> Int { startedCalls }
+
+    func release(call: Int) {
+        continuations.removeValue(forKey: call)?.resume()
+    }
+}
+
+private final class MutableTestClock: Clock, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
+
+    func now() -> Date {
+        lock.withLock { value }
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.withLock { value = value.addingTimeInterval(interval) }
+    }
 }
 
 private actor RecordingBackupService: BackupServing {
