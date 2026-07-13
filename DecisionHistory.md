@@ -30,9 +30,10 @@ user's zero-server screen contradicted that claim.
 Result: The prior launch evidence is reclassified as insufficient. The product
 repair, legacy configuration migration, interprocess configuration transaction,
 canonical source identity, same-UID coordinator convergence, per-source launch
-evidence, and narrow-pane layout guard are implemented. Deterministic and
-native suites pass; the incident remains open only for the final clean,
-committed signed-app launch and sustained-refresh check.
+evidence, and narrow-pane layout guard are implemented. The clean signed app
+loaded all three discovered sources with server counts 0, 16, and 3 and rendered
+all 19 managed servers. Four refresh cycles retained those counts, with the app
+returning to idle and zero child processes between bounded inventory bursts.
 
 ## 2026-07-11 - The final legacy-cgroup gate is a handoff, not a second quiescence window
 
