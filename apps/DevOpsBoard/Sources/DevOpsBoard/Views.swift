@@ -2248,6 +2248,11 @@ struct SelectedProjectPanel: View {
             usage: nil
         )
         let report = store.projectRuntimeReports[name]
+        let origins = Set(
+            group.servers.compactMap(\.origin)
+                + group.containers.compactMap(\.origin)
+                + group.databases.compactMap(\.origin)
+        )
         VStack(alignment: .leading, spacing: 10) {
             Text(group.name)
                 .font(.system(size: 15, weight: .bold))
@@ -2282,7 +2287,7 @@ struct SelectedProjectPanel: View {
             }
             DisclosureGroup("Diagnostics") {
                 DetailLine(label: "Project path", value: group.projectPath ?? "Unavailable")
-                ForEach(Array(Set((servers.compactMap(\.origin) + docker.compactMap(\.origin) + databases.compactMap(\.origin)))), id: \.id) { origin in
+                ForEach(origins.sorted { $0.id < $1.id }, id: \.id) { origin in
                     DetailLine(label: "Source", value: origin.label)
                 }
             }

@@ -1881,3 +1881,22 @@ Decision: Reworked `formal-web-ui-verification` detection so it measures how rea
 Why: User reported the skill "doesn't report problems now in most of the cases". Reproduction confirmed it: 10 of 11 realistic defect fixtures (div text cut by a parent card, absolutely positioned button cut by an overflow-hidden panel, negative-margin top cut, 60% badge/label overlap, collapsed broken image, invisible text in a `roadmap-section` and in a plain div, half-off-canvas button, fixed toolbar cut below the viewport, nowrap div text spilling into a clipping parent) produced zero findings, while only the synthetic self-overflow case was caught. Root cause: detection rules and self-test fixtures both mirrored the implementation (self-overflow on a fixed tag list, all-sample-points occlusion, substring artifact exclusion), so the self-test proved precision only and gave false confidence — a recall gap, not a regression from one bad edit.
 
 Result: All 11 realistic defect fixtures now produce criticals; the prior contract fixtures still pass; the extended self-test fails against the pre-fix verifier at the first new fixture (fail-before/pass-after proven). Noise checks stay clean: a composite modern page (sticky header, ellipsis card titles inside overflow-hidden cards, line-clamp, scrollable table, FAB, sr-only link) yields zero findings at mobile and desktop — this page also caught and now guards a false positive where an element's own ellipsis was re-tested against its parent's clip — and real pages (example.com, news.ycombinator.com) yield zero criticals with plausible warnings only. `scripts/validate.py` passes. Guardrails updated: repo `AGENTS.md` skill-development recall rule, and the generalized detector-recall rule in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and the curated mirror `reference/codex-app-wide/AGENTS.md`.
+
+## 2026-07-13 - DevOps Board uses the Build macOS Apps run contract
+
+Decision: DevOps Board now has the repository-level
+`script/build_and_run.sh` entrypoint and Codex `Run` action required by the
+Build macOS Apps plugin. The entrypoint builds and provenance-packages the
+native app before launching it. The user explicitly authorized committing and
+pushing this operational workflow and its compile repair directly to `main`.
+
+Why: The first launch attempt reproduced a compiler failure in the selected
+project diagnostics view, where stale local names were used instead of the
+`ProjectGroup` collections. After that repair compiled, the existing package
+gate correctly required the exact source to be committed before it could
+produce a launchable provenance-bound bundle.
+
+Result: Diagnostics now derives a stable, deduplicated origin list from the
+selected group's servers, containers, and databases. The same plugin entrypoint
+is the repeatable build, package, launch, log, telemetry, debug, and process
+verification surface.
