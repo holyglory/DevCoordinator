@@ -858,6 +858,35 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
+    func testAutomaticRefreshWaitsForAFullIdleIntervalAfterSlowInventoryCompletes() async throws {
+        XCTAssertEqual(CoordinatorRefreshPolicy.default.intervalSeconds, 30)
+        let service = DelayedCountingCoordinatorService(
+            result: inventoryExecution(home: codex.home, serverName: "web"),
+            delay: .milliseconds(900)
+        )
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .interval(seconds: 1))
+            )
+        )
+
+        store.setSurfaceVisible(.window, true)
+        defer { store.setSurfaceVisible(.window, false) }
+        try await Task.sleep(for: .milliseconds(2_250))
+
+        let callCount = await service.callCount()
+        XCTAssertEqual(
+            callCount,
+            2,
+            "a slow automatic refresh must finish before the next full idle interval begins"
+        )
+    }
+
+    @MainActor
     func testDockerCapabilityFailureDoesNotMakeCoordinatorSourceStaleOrBlockServerAndLease() async throws {
         let unavailable = inventoryWithDockerUnavailableExecution(home: codex.home)
         let service = OriginSequencedCoordinatorService(results: [
@@ -1951,6 +1980,26 @@ private actor ConcurrentOriginCoordinatorService: CoordinatorServing {
     func concurrencyEvidence() -> (maximumInFlight: Int, completionOrder: [String]) {
         (maximumInFlight, completionOrder)
     }
+}
+
+private actor DelayedCountingCoordinatorService: CoordinatorServing {
+    private let result: CommandExecution
+    private let delay: Duration
+    private var calls = 0
+
+    init(result: CommandExecution, delay: Duration) {
+        self.result = result
+        self.delay = delay
+    }
+
+    func execute(origin: CoordinatorOrigin, arguments: [String]) async throws -> CommandExecution {
+        guard arguments.first == "inventory" else { throw MockFailure.offline }
+        calls += 1
+        try await Task.sleep(for: delay)
+        return result
+    }
+
+    func callCount() -> Int { calls }
 }
 
 private actor RecordingBackupService: BackupServing {

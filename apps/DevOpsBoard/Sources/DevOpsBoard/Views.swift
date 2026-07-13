@@ -3422,7 +3422,10 @@ struct CoordinatorSourcesSheet: View {
                     TextField(
                         "Seconds",
                         value: Binding(
-                            get: { draft.refreshPolicy.intervalSeconds ?? 2.5 },
+                            get: {
+                                draft.refreshPolicy.intervalSeconds
+                                    ?? CoordinatorRefreshPolicy.defaultIntervalSeconds
+                            },
                             set: { draft.refreshPolicy.intervalSeconds = $0 }
                         ),
                         format: .number
@@ -3432,7 +3435,9 @@ struct CoordinatorSourcesSheet: View {
                 Spacer()
             }
             .onChange(of: draft.refreshPolicy.mode) { _, mode in
-                draft.refreshPolicy.intervalSeconds = mode == .manual ? nil : (draft.refreshPolicy.intervalSeconds ?? 2.5)
+                draft.refreshPolicy.intervalSeconds = mode == .manual
+                    ? nil
+                    : (draft.refreshPolicy.intervalSeconds ?? CoordinatorRefreshPolicy.defaultIntervalSeconds)
             }
 
             if let warning = store.configurationWarning {

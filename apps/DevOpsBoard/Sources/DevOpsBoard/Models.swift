@@ -737,10 +737,15 @@ enum CoordinatorRefreshMode: String, Codable, Hashable, Sendable {
 }
 
 struct CoordinatorRefreshPolicy: Codable, Hashable, Sendable {
+    static let defaultIntervalSeconds = 30.0
+
     var mode: CoordinatorRefreshMode
     var intervalSeconds: Double?
 
-    static let `default` = CoordinatorRefreshPolicy(mode: .interval, intervalSeconds: 2.5)
+    static let `default` = CoordinatorRefreshPolicy(
+        mode: .interval,
+        intervalSeconds: defaultIntervalSeconds
+    )
 
     static func manual() -> CoordinatorRefreshPolicy {
         CoordinatorRefreshPolicy(mode: .manual, intervalSeconds: nil)

@@ -1911,3 +1911,23 @@ post-sign integrity boundary, and reports the final executable hash separately.
 The deterministic packager test now mutates executable bytes during its fake
 signing step and requires signed packaging to preserve both facts; unsigned
 packages retain exact whole-file hash verification and tamper rejection.
+
+## 2026-07-13 - Automatic inventory refresh waits after completion
+
+Decision: DevOps Board's default automatic inventory interval is 30 seconds,
+and each interval begins only after the preceding inventory load has completed.
+Explicit refresh remains immediate, and operators can still configure a custom
+validated interval or manual refresh.
+
+Why: A real unscoped coordinator inventory on the user's active source took
+2.39 seconds because it includes Docker's `stats --no-stream` observation. The
+previous 2.5-second start-to-start schedule left about 0.1 seconds between
+loads, keeping the Board's loading badges effectively permanent and repeatedly
+spawning expensive inventory work. The UI symptom and high load were therefore
+one scheduling defect rather than slow progress that needed more status copy.
+
+Result: A focused native regression models a 900ms inventory load with a
+one-second configured interval and proves only two loads begin in 2.25 seconds;
+the next poll cannot start until a full idle interval follows completion. The
+default cadence now leaves substantial idle time while preserving truthful
+live data and manual refresh.

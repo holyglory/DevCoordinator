@@ -328,7 +328,12 @@ final class OpsStore: ObservableObject {
                     return
                 }
                 guard !Task.isCancelled else { return }
-                self?.requestRefresh(force: false)
+                // Wait for the requested load to finish before starting the
+                // next idle interval. Inventory includes Docker's no-stream
+                // stats sample, which can take seconds; fixed start-to-start
+                // polling otherwise makes the loading UI nearly permanent and
+                // continuously respawns expensive observation commands.
+                await self?.loadInventory(force: false)
             }
         }
     }
