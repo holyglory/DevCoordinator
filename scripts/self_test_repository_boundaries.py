@@ -73,6 +73,25 @@ def provenance(image: bytes, source_path: str, source: bytes) -> str:
     return json.dumps(value, indent=2, sort_keys=True) + "\n"
 
 
+def relative_provenance(image: bytes, source_path: str, source: bytes) -> str:
+    fingerprint = hashlib.sha256()
+    fingerprint.update(source_path.encode("utf-8"))
+    fingerprint.update(b"\0")
+    fingerprint.update(source)
+    fingerprint.update(b"\0")
+    value = {
+        "schema_version": 1,
+        "artifact_type": "test-fixture-snapshot",
+        "source": "isolated-test-fixture",
+        "fixture_id": "boundary-safe-relative-v1",
+        "generator": source_path,
+        "sha256": hashlib.sha256(image).hexdigest(),
+        "source_files": [source_path],
+        "source_sha256": fingerprint.hexdigest(),
+    }
+    return json.dumps(value, indent=2, sort_keys=True) + "\n"
+
+
 def main() -> int:
     temp = Path(tempfile.mkdtemp(prefix="devcoordinator-boundary-self-test-")).resolve(strict=True)
     try:
@@ -96,6 +115,14 @@ def main() -> int:
         safe_image_path = repo / "apps/DevOpsConsole/Artifacts/Canonical/safe.png"
         write(safe_image_path, safe_image)
         write(Path(f"{safe_image_path}.provenance.json"), provenance(safe_image, safe_source_path, safe_source))
+        safe_board_source_path = "Sources/DevOpsBoard/App.swift"
+        safe_board_source = (repo / "apps/DevOpsBoard" / safe_board_source_path).read_bytes()
+        safe_board_image_path = repo / "apps/DevOpsBoard/Artifacts/Canonical/safe-relative.png"
+        write(safe_board_image_path, safe_image)
+        write(
+            Path(f"{safe_board_image_path}.provenance.json"),
+            relative_provenance(safe_image, safe_board_source_path, safe_board_source),
+        )
         write(
             repo / "docs/history/holyskills-to-devcoordinator.commit-map",
             "old                                      new\n" + "1" * 40 + " " + "2" * 40 + "\n" + "3" * 40 + " " + "4" * 40 + "\n",
@@ -227,6 +254,20 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         write(repo / "runtime-backups/state.json", "{}\n")
         missing_sidecar = repo / "apps/DevOpsConsole/Artifacts/Canonical/missing-sidecar.png"
         write(missing_sidecar, b"canonical name without provenance")
+        missing_relative_source = repo / "apps/DevOpsBoard/Artifacts/Canonical/missing-relative-source.png"
+        missing_relative_image = b"canonical image with missing app-relative source"
+        write(missing_relative_source, missing_relative_image)
+        write(
+            Path(f"{missing_relative_source}.provenance.json"),
+            relative_provenance(missing_relative_image, "Tools/Missing.swift", b"missing source bytes"),
+        )
+        escaped_relative_source = repo / "apps/DevOpsBoard/Artifacts/Canonical/escaped-relative-source.png"
+        escaped_relative_image = b"canonical image with an app-root escape"
+        write(escaped_relative_source, escaped_relative_image)
+        write(
+            Path(f"{escaped_relative_source}.provenance.json"),
+            relative_provenance(escaped_relative_image, "../DevOpsConsole/src/app.mjs", safe_source),
+        )
         openai_secret = "sk-" + "A" * 32
         openai_project_secret = "sk-proj-" + "B" * 32
         google_api_secret = "AIza" + "C" * 35
@@ -253,6 +294,10 @@ Environment=ROOT_STATE=%h/.local/state/root-app
             repo / "ops/private.key",
             repo / "runtime-backups/state.json",
             missing_sidecar,
+            missing_relative_source,
+            Path(f"{missing_relative_source}.provenance.json"),
+            escaped_relative_source,
+            Path(f"{escaped_relative_source}.provenance.json"),
             repo / "docs/accidental-secrets.txt",
         ):
             path.unlink()
@@ -275,6 +320,28 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         write(repo / safe_source_path, safe_source)
         commit(repo, "remove tampered pair and restore source")
 
+        # Source-only drift must be caught for the Board's app-relative
+        # provenance schema. Keep image and sidecar bytes unchanged so an image
+        # digest failure cannot mask the source-fingerprint assertion.
+        relative_renderer_path = "Tools/RelativeRenderer.swift"
+        relative_renderer = repo / "apps/DevOpsBoard" / relative_renderer_path
+        relative_renderer_source = b"let snapshotVersion = 1\n"
+        relative_drift_image_path = repo / "apps/DevOpsBoard/Artifacts/Canonical/relative-source-drift.png"
+        relative_drift_image = b"stable image bytes during source-only drift"
+        write(relative_renderer, relative_renderer_source)
+        write(relative_drift_image_path, relative_drift_image)
+        write(
+            Path(f"{relative_drift_image_path}.provenance.json"),
+            relative_provenance(relative_drift_image, relative_renderer_path, relative_renderer_source),
+        )
+        commit(repo, "add valid app-relative canonical provenance")
+        write(relative_renderer, b"let snapshotVersion = 2\n")
+        commit(repo, "drift app-relative source without refreshing provenance")
+        relative_renderer.unlink()
+        relative_drift_image_path.unlink()
+        Path(f"{relative_drift_image_path}.provenance.json").unlink()
+        commit(repo, "remove app-relative drift fixture")
+
         history_findings = module.scan_history(repo)
         rules = {item.rule for item in history_findings}
         details = "\n".join(f"{item.path}: {item.detail}" for item in history_findings)
@@ -285,6 +352,23 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         for expected in ("design-qa-live-production.png", ".env", "private.key", "runtime-backups/state.json"):
             check(expected in details, f"must-catch historical class missing: {expected}")
         check("missing-sidecar.png" in details, "missing canonical sidecar path was not reported")
+        check("missing-relative-source.png" in details, "missing app-relative provenance source was not reported")
+        check(
+            any(
+                "escaped-relative-source.png" in item.path
+                and item.detail == "relative source_files contains a non-canonical path"
+                for item in history_findings
+            ),
+            "existing-target app-root escape was not rejected as non-canonical",
+        )
+        check(
+            any(
+                "relative-source-drift.png" in item.path
+                and item.detail == "aggregate source hash mismatch"
+                for item in history_findings
+            ),
+            "source-only drift did not exercise the app-relative fingerprint check",
+        )
         check("tampered.png" in details, "tampered canonical pair was not reported")
         for secret in (openai_secret, openai_project_secret, google_api_secret, google_oauth_secret, session_secret):
             check(secret not in details, "secret value leaked into detector output")

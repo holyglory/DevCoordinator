@@ -39,7 +39,11 @@ bucket. The larger normalized SQLite/WAL store, same-UID legacy import,
 single-observer Docker/process pipeline, pure read-only inventory, and optional
 cross-user broker are recorded as a proposed architecture, not implemented
 behavior. Different effective UIDs remain isolated and require disjoint port
-ranges or an authorized broker for host-wide uniqueness.
+ranges or an authorized broker for host-wide uniqueness. The signed app from
+commit `5f208ae` retained raw source server counts `0`, `16`, and `3` across
+four refreshes while presenting 19 logical servers, nine canonical repository
+groups, and one Unassigned group. A 75-second process-tree sample covered two
+automatic refreshes and returned to 0% app CPU with zero children after each.
 
 ## 2026-07-13 - DevOps Board source ownership is anchored to the login account
 

@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 EXPECTED_SKILLS = {"codex-dev-coordinator", "postgres-docker-backup"}
@@ -571,21 +571,51 @@ def scan_history(repo: Path) -> list[Finding]:
                 if records is not None:
                     if not isinstance(records, list) or not records:
                         raise ValueError("source_files must be a non-empty list when present")
-                    current: list[dict[str, str]] = []
-                    for record in records:
-                        source_path = record.get("path") if isinstance(record, dict) else None
-                        recorded_hash = record.get("sha256") if isinstance(record, dict) else None
-                        if not isinstance(source_path, str) or source_path not in paths:
-                            raise ValueError("source_files names a missing same-tree path")
-                        source = git(repo, "show", f"{commit}:{source_path}", text=False)
-                        assert isinstance(source, bytes)
-                        digest = hashlib.sha256(source).hexdigest()
-                        if digest != recorded_hash:
-                            raise ValueError(f"source hash mismatch: {source_path}")
-                        current.append({"path": source_path, "sha256": digest})
-                    aggregate = "".join(f"{item['path']}\0{item['sha256']}\n" for item in current)
-                    if provenance.get("source_sha256") != hashlib.sha256(aggregate.encode("utf-8")).hexdigest():
-                        raise ValueError("aggregate source hash mismatch")
+                    if all(isinstance(record, str) for record in records):
+                        # DevOps Board snapshots bind to source paths relative to
+                        # the app's package root. Preserve that generator contract
+                        # while resolving every path inside the historical tree.
+                        source_root, marker, _ = image_path.partition("/Artifacts/Canonical/")
+                        if not marker or len(set(records)) != len(records):
+                            raise ValueError("relative source_files must be unique canonical paths")
+                        fingerprint = hashlib.sha256()
+                        for source_path in sorted(records):
+                            relative = PurePosixPath(source_path)
+                            if (
+                                relative.is_absolute()
+                                or relative.as_posix() != source_path
+                                or any(part in {"", ".", ".."} for part in relative.parts)
+                            ):
+                                raise ValueError("relative source_files contains a non-canonical path")
+                            tree_path = f"{source_root}/{source_path}"
+                            if tree_path not in paths:
+                                raise ValueError("source_files names a missing same-tree path")
+                            source = git(repo, "show", f"{commit}:{tree_path}", text=False)
+                            assert isinstance(source, bytes)
+                            fingerprint.update(source_path.encode("utf-8"))
+                            fingerprint.update(b"\0")
+                            fingerprint.update(source)
+                            fingerprint.update(b"\0")
+                        if provenance.get("source_sha256") != fingerprint.hexdigest():
+                            raise ValueError("aggregate source hash mismatch")
+                    elif all(isinstance(record, dict) for record in records):
+                        current: list[dict[str, str]] = []
+                        for record in records:
+                            source_path = record.get("path")
+                            recorded_hash = record.get("sha256")
+                            if not isinstance(source_path, str) or source_path not in paths:
+                                raise ValueError("source_files names a missing same-tree path")
+                            source = git(repo, "show", f"{commit}:{source_path}", text=False)
+                            assert isinstance(source, bytes)
+                            digest = hashlib.sha256(source).hexdigest()
+                            if digest != recorded_hash:
+                                raise ValueError(f"source hash mismatch: {source_path}")
+                            current.append({"path": source_path, "sha256": digest})
+                        aggregate = "".join(f"{item['path']}\0{item['sha256']}\n" for item in current)
+                        if provenance.get("source_sha256") != hashlib.sha256(aggregate.encode("utf-8")).hexdigest():
+                            raise ValueError("aggregate source hash mismatch")
+                    else:
+                        raise ValueError("source_files must use one supported provenance schema")
             except (AssertionError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 findings.append(Finding("historical-image-provenance", location, str(error)))
 
