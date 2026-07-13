@@ -940,9 +940,7 @@ struct InventoryStateBanner: View {
 
     var body: some View {
         let snapshot = store.presentationSnapshot
-        let dockerUnavailable = store.capabilityStates.filter {
-            $0.capability == .docker && $0.phase == .unavailable
-        }
+        let dockerUnavailable = store.explicitlyUnavailableDockerCapabilities
         let isInitialLoading = store.isInitialInventoryLoading
         if isInitialLoading || snapshot.level != .nominal || !dockerUnavailable.isEmpty {
             VStack(alignment: .leading, spacing: 7) {

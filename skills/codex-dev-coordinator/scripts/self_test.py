@@ -1562,6 +1562,227 @@ def check_unobservable_listener_lifecycle_guards(module: object, tmp: Path) -> N
             os.environ["CODEX_AGENT_COORDINATOR_HOME"] = original_home
 
 
+def check_inventory_transport_controls(
+    module: object,
+    tmp: Path,
+    base_env: dict[str, str],
+) -> None:
+    fixture_root = tmp / "inventory-transport-controls"
+    state_home = fixture_root / "state"
+    fake_bin = fixture_root / "bin"
+    state_home.mkdir(parents=True)
+    fake_bin.mkdir(parents=True)
+
+    container_id = "abc123def456"
+    full_container_id = f"{container_id}{'0' * 52}"
+    history = [
+        {
+            "id": container_id,
+            "container_id": full_container_id,
+            "name": "transport-postgres",
+            "timestamp": module.iso_timestamp(float(index + 1)),
+            "timestamp_ts": float(index),
+            "live": True,
+            "cpu_percent": float(index) / 10,
+            "memory_percent": 1.5,
+            "memory_usage_bytes": 10_000_000 + index,
+            "memory_limit_bytes": 1_000_000_000,
+            "network_rx_bytes": 20_000 + index,
+            "network_tx_bytes": 30_000 + index,
+            "block_read_bytes": 40_000 + index,
+            "block_write_bytes": 50_000 + index,
+            "pids": 5,
+        }
+        for index in range(module.DOCKER_STATS_HISTORY_LIMIT)
+    ]
+    state = module.default_state()
+    state["docker"]["stats_history"] = {container_id: history}
+    state_path = state_home / "state.json"
+    state_path.write_text(
+        json.dumps(state, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+if args[:1] == ["ps"]:
+    print(json.dumps({{
+        "ID": "{container_id}",
+        "Names": "transport-postgres",
+        "Image": "postgres:17-alpine",
+        "Status": "Up 1 hour",
+        "Ports": "127.0.0.1:55432->5432/tcp",
+    }}))
+elif args[:1] == ["stats"]:
+    print(json.dumps({{
+        "ID": "{container_id}",
+        "Container": "{full_container_id}",
+        "Name": "transport-postgres",
+        "CPUPerc": "7.50%",
+        "MemPerc": "6.25%",
+        "MemUsage": "64MiB / 1GiB",
+        "NetIO": "120kB / 130kB",
+        "BlockIO": "140kB / 150kB",
+        "PIDs": "5",
+    }}))
+elif args[:3] == ["inspect", "--format", "{{{{json .}}}}"]:
+    for _container in args[3:]:
+        print(json.dumps({{
+            "Id": "{full_container_id}",
+            "Name": "/transport-postgres",
+            "Config": {{"Labels": {{}}}},
+        }}))
+else:
+    sys.exit(1)
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+
+    env = base_env.copy()
+    env["CODEX_AGENT_COORDINATOR_HOME"] = str(state_home)
+    env.pop("CODEX_DOCKER_CLI", None)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+
+    def execute(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *arguments],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=20,
+        )
+        check(
+            result.returncode == 0,
+            f"inventory transport command failed: {arguments}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        return result
+
+    default_result = execute(["inventory"])
+    check(
+        default_result.stdout.startswith("{\n"),
+        "default inventory JSON should remain pretty-printed",
+    )
+    default_payload = json.loads(default_result.stdout)
+    default_container = default_payload["docker"]["containers"][0]
+    check(
+        len(default_container.get("stats_history") or []) == module.DOCKER_STATS_HISTORY_LIMIT,
+        "default inventory should retain the full bounded Docker stats history",
+    )
+
+    compact_result = execute(["inventory", "--compact-json"])
+    check(
+        "\n" not in compact_result.stdout.rstrip("\n"),
+        "--compact-json should emit one machine-readable JSON line",
+    )
+    check(
+        len(compact_result.stdout.encode("utf-8")) < len(default_result.stdout.encode("utf-8")),
+        "--compact-json should reduce inventory transport bytes",
+    )
+    compact_payload = json.loads(compact_result.stdout)
+    check(
+        compact_payload["docker"]["containers"][0]["name"] == "transport-postgres",
+        "compact inventory JSON should parse without changing primary Docker rows",
+    )
+
+    limited_payload = json.loads(execute(["inventory", "--stats-history-limit", "30"]).stdout)
+    limited_container = limited_payload["docker"]["containers"][0]
+    limited_history = limited_container.get("stats_history") or []
+    check(len(limited_history) == 30, "explicit history limit should return exactly 30 samples")
+    persisted_after_limit = json.loads(state_path.read_text(encoding="utf-8"))
+    expected_limited_history = sorted(
+        persisted_after_limit["docker"]["stats_history"][container_id],
+        key=module.docker_stats_sample_sort_key,
+    )[-30:]
+    check(
+        [item["timestamp_ts"] for item in limited_history]
+        == [item["timestamp_ts"] for item in expected_limited_history],
+        "explicit history limit should retain the newest samples in chronological order",
+    )
+    check(
+        "stats_history" in limited_container,
+        "history shaping must retain stats_history on primary Docker containers",
+    )
+
+    empty_payload = json.loads(execute(["inventory", "--stats-history-limit", "0"]).stdout)
+    empty_container = empty_payload["docker"]["containers"][0]
+    check(
+        empty_container.get("stats_history") == [],
+        "zero history limit should return no historical samples",
+    )
+    current_stats = empty_container.get("stats") or {}
+    check(
+        current_stats.get("live") is True
+        and current_stats.get("id") == container_id
+        and current_stats.get("container_id") == full_container_id
+        and current_stats.get("cpu_percent") == 7.5
+        and current_stats.get("memory_usage_bytes") == 64 * 1024 * 1024,
+        f"zero history limit must preserve the current live Docker stats sample: {current_stats}",
+    )
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted_history = persisted["docker"]["stats_history"][container_id]
+    check(
+        len(persisted_history) == module.DOCKER_STATS_HISTORY_LIMIT,
+        "response history limits must not truncate the persisted rolling history",
+    )
+    check(
+        any(
+            item.get("timestamp_ts") == current_stats.get("timestamp_ts")
+            and item.get("id") == current_stats.get("id")
+            for item in persisted_history
+        ),
+        "the current sample omitted from response history must remain in persisted telemetry",
+    )
+
+    run_fail(
+        ["inventory", "--stats-history-limit", str(module.DOCKER_STATS_HISTORY_LIMIT + 1)],
+        env=env,
+        expected=f"between 0 and {module.DOCKER_STATS_HISTORY_LIMIT}",
+    )
+    run_fail(
+        ["inventory", "--stats-history-limit", "-1"],
+        env=env,
+        expected=f"between 0 and {module.DOCKER_STATS_HISTORY_LIMIT}",
+    )
+    run_fail(
+        ["inventory", "--stats-history-limit", "not-an-integer"],
+        env=env,
+        expected="stats history limit must be an integer",
+    )
+
+    # Two inventories can finish out of order. The late commit from the older
+    # observation must not become the apparent newest sample returned by a
+    # bounded history request or the baseline for the next rate calculation.
+    concurrent_state = module.default_state()
+    concurrent_state["docker"]["stats_history"] = {
+        container_id: [history[100], history[102]],
+    }
+    older_observation = module.default_state()
+    older_observation["docker"]["stats_history"] = {
+        container_id: [history[100], history[101]],
+    }
+    module.merge_docker_stats_history(concurrent_state, older_observation)
+    merged_timestamps = [
+        item["timestamp_ts"]
+        for item in concurrent_state["docker"]["stats_history"][container_id]
+    ]
+    check(
+        merged_timestamps == [100.0, 101.0, 102.0],
+        f"out-of-order Docker observations must merge chronologically: {merged_timestamps}",
+    )
+    check(
+        concurrent_state["docker"]["stats_history"][container_id][-1]["timestamp_ts"] == 102.0,
+        "bounded history must retain the newest observation after an older commit arrives late",
+    )
+
+
 def main() -> int:
     check_http_fixture_policy()
     check_listener_and_health_helpers()
@@ -1591,6 +1812,8 @@ def main() -> int:
             "Do not start dev/test servers",
             "try the default port",
             "--argv",
+            "--compact-json",
+            "--stats-history-limit",
             "Authorization: Bearer",
             "non-loopback",
             "outside the cross-agent lock",
@@ -1601,6 +1824,7 @@ def main() -> int:
             sys.path.insert(0, str(ROOT / "scripts"))
         import dev_coordinator as dc
 
+        check_inventory_transport_controls(dc, tmp, env)
         check_zombie_pid_detection(dc)
         check_atomic_write_cleanup_preserves_primary(dc, tmp)
         check_port_relocation_guards(dc, tmp, env)

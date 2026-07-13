@@ -1,10 +1,22 @@
 import AppKit
 import Darwin
 import Foundation
+import OSLog
 import SwiftUI
 
+private let inventoryLogger = Logger(
+    subsystem: "local.holyskills.codex-ops-console",
+    category: "Inventory"
+)
+
+private let boardInventoryArguments = [
+    "inventory",
+    "--compact-json",
+    "--stats-history-limit", "30",
+]
+
 private enum OriginInventoryExecutionResult: Sendable {
-    case success(CommandExecution, enrichedBackups: [DatabaseBackup]?, databaseWarning: String?)
+    case success(Inventory, enrichedBackups: [DatabaseBackup]?, databaseWarning: String?)
     case failure(String)
 }
 
@@ -12,6 +24,24 @@ private struct OriginInventoryLoadOutcome: Sendable {
     let index: Int
     let origin: CoordinatorOrigin
     let result: OriginInventoryExecutionResult
+}
+
+private func validateInventoryExecution(_ execution: CommandExecution) throws -> CommandExecution {
+    if execution.outputTruncated {
+        throw RuntimeError(
+            "Coordinator inventory exceeded the app's \(CommandRequest.inventoryMaxOutputBytes / 1_048_576) MiB output limit"
+        )
+    }
+    if execution.timedOut {
+        throw RuntimeError("Coordinator inventory timed out")
+    }
+    if execution.cancelled {
+        throw RuntimeError("Coordinator inventory was cancelled")
+    }
+    guard execution.exitStatus == 0 else {
+        throw RuntimeError(execution.stderr.isEmpty ? execution.stdout : execution.stderr)
+    }
+    return execution
 }
 
 private func loadOriginInventory(
@@ -22,10 +52,9 @@ private func loadOriginInventory(
     coordinatorService: any CoordinatorServing
 ) async -> OriginInventoryLoadOutcome {
     do {
-        let initial = try await coordinatorService.execute(origin: origin, arguments: arguments)
-        guard initial.exitStatus == 0 else {
-            throw RuntimeError(initial.stderr.isEmpty ? initial.stdout : initial.stderr)
-        }
+        let initial = try validateInventoryExecution(
+            await coordinatorService.execute(origin: origin, arguments: arguments)
+        )
         let decoded = try JSONDecoder().decode(Inventory.self, from: Data(initial.stdout.utf8))
         var enrichedBackups: [DatabaseBackup]?
         var databaseWarning: String?
@@ -45,10 +74,9 @@ private func loadOriginInventory(
                     enrichedArguments.append(contentsOf: ["--backup-dir", directory])
                 }
                 do {
-                    let enriched = try await coordinatorService.execute(origin: origin, arguments: enrichedArguments)
-                    guard enriched.exitStatus == 0 else {
-                        throw RuntimeError(enriched.stderr.isEmpty ? enriched.stdout : enriched.stderr)
-                    }
+                    let enriched = try validateInventoryExecution(
+                        await coordinatorService.execute(origin: origin, arguments: enrichedArguments)
+                    )
                     let enrichedInventory = try JSONDecoder().decode(Inventory.self, from: Data(enriched.stdout.utf8))
                     enrichedBackups = enrichedInventory.backups
                 } catch {
@@ -59,7 +87,7 @@ private func loadOriginInventory(
         return OriginInventoryLoadOutcome(
             index: index,
             origin: origin,
-            result: .success(initial, enrichedBackups: enrichedBackups, databaseWarning: databaseWarning)
+            result: .success(decoded, enrichedBackups: enrichedBackups, databaseWarning: databaseWarning)
         )
     } catch {
         return OriginInventoryLoadOutcome(
@@ -226,6 +254,18 @@ final class OpsStore: ObservableObject {
 
     var connected: Bool {
         sourceStates.contains { $0.phase == .loaded }
+    }
+
+    /// A Docker-specific warning is evidence-backed only when its coordinator
+    /// source loaded successfully. A transport/source failure makes Docker
+    /// unknown, not unavailable.
+    var explicitlyUnavailableDockerCapabilities: [CoordinatorCapabilityState] {
+        let loadedOriginIDs = Set(sourceStates.filter { $0.phase == .loaded }.map { $0.origin.id })
+        return capabilityStates.filter {
+            $0.capability == .docker
+                && $0.phase == .unavailable
+                && loadedOriginIDs.contains($0.origin.id)
+        }
     }
 
     var healthSummary: HealthSummary {
@@ -724,6 +764,7 @@ final class OpsStore: ObservableObject {
                 details: "Set CODEX_AGENT_COORDINATOR_HOME or initialize a coordinator state home before refreshing.",
                 source: "inventory"
             )
+            logInventoryRefresh(states: sourceStates)
             return
         }
         let checkedAt = clock.now()
@@ -756,7 +797,7 @@ final class OpsStore: ObservableObject {
         }
         if refreshingCapabilities != capabilityStates { capabilityStates = refreshingCapabilities }
         let projectScope = scopedProjectPath
-        let arguments = projectScope.map { ["inventory", "--project", $0] } ?? ["inventory"]
+        let arguments = boardInventoryArguments + (projectScope.map { ["--project", $0] } ?? [])
         let service = coordinatorService
         let outcomes = await withTaskGroup(
             of: OriginInventoryLoadOutcome.self,
@@ -789,16 +830,12 @@ final class OpsStore: ObservableObject {
             var databaseWarning: String?
             var sourceFailure: String?
             switch outcome.result {
-            case .success(let result, let enrichedBackups, let warning):
-                do {
-                    decoded = try JSONDecoder().decode(Inventory.self, from: Data(result.stdout.utf8))
-                    if let enrichedBackups {
-                        decoded?.backups = enrichedBackups
-                    }
-                    databaseWarning = warning
-                } catch {
-                    sourceFailure = error.localizedDescription
+            case .success(let inventory, let enrichedBackups, let warning):
+                decoded = inventory
+                if let enrichedBackups {
+                    decoded?.backups = enrichedBackups
                 }
+                databaseWarning = warning
             case .failure(let failure):
                 sourceFailure = failure
             }
@@ -939,6 +976,22 @@ final class OpsStore: ObservableObject {
                 summary: "\(capabilityFailures.count) coordinator capabilit\(capabilityFailures.count == 1 ? "y is" : "ies are") unavailable",
                 details: details,
                 source: "inventory"
+            )
+        }
+        logInventoryRefresh(states: states)
+    }
+
+    private func logInventoryRefresh(states: [CoordinatorSourceState]) {
+        let loaded = states.filter { $0.phase == .loaded }.count
+        let total = states.count
+        let pid = Int(Darwin.getpid())
+        if loaded > 0 {
+            inventoryLogger.info(
+                "Inventory refresh completed pid=\(pid, privacy: .public) loaded=\(loaded, privacy: .public) total=\(total, privacy: .public)"
+            )
+        } else {
+            inventoryLogger.error(
+                "Inventory refresh failed pid=\(pid, privacy: .public) loaded=0 total=\(total, privacy: .public)"
             )
         }
     }

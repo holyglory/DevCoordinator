@@ -160,7 +160,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "exact preferred port model": "preferredPort",
         "server preferred port flag": "\"--preferred\"",
         "structured server argv": "\"--argv\", encodedArgv",
-        "docker all inventory": "docker_ps_inventory(*, all_containers: bool = True, state:",
+        "docker all inventory": "def docker_ps_inventory(\n    *,\n    all_containers: bool = True,",
         "docker ps all command": "args.append(\"--all\")",
         "docker stats command": "\"docker\", \"stats\", \"--no-stream\"",
         "docker stats history": "stats_history",
@@ -181,6 +181,12 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "pre-launch subprocess completion handler": "process.terminationHandler = { finished in",
         "bounded subprocess watchdog": "processExit.wait(timeout:",
         "event-driven output limit": "SpoolBudget(limit: request.maxOutputBytes) {",
+        "realistic large inventory transport regression": "testRealisticLargeInventoryTraversesProductionExecutorAndLoadsStore",
+        "ordinary coordinator output limit control": "testOrdinaryCoordinatorOutputOverOneMiBRemainsTruncated",
+        "inventory-specific bounded output budget": "inventoryMaxOutputBytes",
+        "compact bounded inventory request": "--stats-history-limit",
+        "background-decoded inventory handoff": "case success(Inventory, enrichedBackups:",
+        "sendable inventory value graph": "struct Inventory: Decodable, Equatable, Sendable",
         "bounded command default timeout": "timeout: TimeInterval = 120",
         "concurrent source refresh": "let outcomes = await withTaskGroup(",
         "deterministic source refresh order": "ordered[outcome.index] = outcome",
@@ -365,6 +371,15 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     missing = [label for label, needle in required.items() if needle not in haystacks]
     if missing:
         raise SystemExit("DevOpsBoard interaction guardrail failed: " + ", ".join(missing))
+
+    merge_start = store.find("for outcome in outcomes {")
+    merge_end = store.find("sourceStates = states", merge_start)
+    if merge_start < 0 or merge_end <= merge_start:
+        raise SystemExit("DevOpsBoard interaction guardrail could not locate the inventory merge boundary")
+    if "JSONDecoder().decode(Inventory.self" in store[merge_start:merge_end]:
+        raise SystemExit(
+            "DevOpsBoard interaction guardrail failed: inventory was decoded again on the main-actor merge path"
+        )
 
     prohibited = {
         "sidebar category rows": "MapCategory",
@@ -622,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
         # the safe validation path so stale Swift binaries cannot evade the
         # guardrail merely because the required native plugin is unavailable.
         run([sys.executable, "Tools/self_test_package_app.py"], cwd=ops_console)
+        run([sys.executable, "Tools/self_test_verify_launch_readiness.py"], cwd=ops_console)
     print("validation ok (native DevOps Board gate remains Build macOS Apps-owned)")
     return 0
 

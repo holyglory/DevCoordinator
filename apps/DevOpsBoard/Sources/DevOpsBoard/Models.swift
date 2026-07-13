@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import Darwin
 
-struct Inventory: Decodable, Equatable {
+struct Inventory: Decodable, Equatable, Sendable {
     var origin: CoordinatorOrigin? = nil
     var coordinatorHome: String?
     var statePath: String?
@@ -45,7 +45,7 @@ struct Inventory: Decodable, Equatable {
     )
 }
 
-struct ManagedURL: Decodable, Identifiable, Hashable {
+struct ManagedURL: Decodable, Identifiable, Hashable, Sendable {
     var id: String { "\(origin?.id ?? "unknown"):\(project ?? ""):\(name ?? ""):\(url ?? "")" }
     var origin: CoordinatorOrigin? = nil
     var name: String?
@@ -60,7 +60,7 @@ struct ManagedURL: Decodable, Identifiable, Hashable {
     }
 }
 
-struct ManagedServer: Decodable, Identifiable, Hashable {
+struct ManagedServer: Decodable, Identifiable, Hashable, Sendable {
     var id: String
     var coordinatorID: String? = nil
     var origin: CoordinatorOrigin? = nil
@@ -118,7 +118,7 @@ struct ManagedServer: Decodable, Identifiable, Hashable {
     }
 }
 
-struct ProcessUsage: Decodable, Hashable, Identifiable {
+struct ProcessUsage: Decodable, Hashable, Identifiable, Sendable {
     var id: String {
         if let pid { return "pid-\(pid)" }
         if let rootPIDs, !rootPIDs.isEmpty {
@@ -158,7 +158,7 @@ struct ProcessUsage: Decodable, Hashable, Identifiable {
     }
 }
 
-struct ProjectUsage: Decodable, Hashable, Identifiable {
+struct ProjectUsage: Decodable, Hashable, Identifiable, Sendable {
     var id: String { "\(origin?.id ?? "unknown"):\(usageKey ?? project ?? projectKey ?? name ?? "project")" }
     var origin: CoordinatorOrigin? = nil
     var usageKey: String? = nil
@@ -200,7 +200,7 @@ struct ProjectUsage: Decodable, Hashable, Identifiable {
     }
 }
 
-struct PortReuseOwner: Decodable, Hashable {
+struct PortReuseOwner: Decodable, Hashable, Sendable {
     var type: String?
     var id: String?
     var name: String?
@@ -210,7 +210,7 @@ struct PortReuseOwner: Decodable, Hashable {
     var url: String?
 }
 
-struct Health: Decodable, Hashable {
+struct Health: Decodable, Hashable, Sendable {
     var ok: Bool?
     var pidAlive: Bool?
 
@@ -220,7 +220,7 @@ struct Health: Decodable, Hashable {
     }
 }
 
-struct PortLease: Decodable, Identifiable, Hashable {
+struct PortLease: Decodable, Identifiable, Hashable, Sendable {
     var id: String
     var coordinatorID: String? = nil
     var origin: CoordinatorOrigin? = nil
@@ -241,7 +241,7 @@ struct PortLease: Decodable, Identifiable, Hashable {
     }
 }
 
-struct DockerSummary: Decodable, Hashable {
+struct DockerSummary: Decodable, Hashable, Sendable {
     var available: Bool?
     var error: String?
     var statsError: String?
@@ -254,7 +254,7 @@ struct DockerSummary: Decodable, Hashable {
     }
 }
 
-struct DockerContainer: Decodable, Identifiable, Hashable {
+struct DockerContainer: Decodable, Identifiable, Hashable, Sendable {
     var origin: CoordinatorOrigin? = nil
     var id: String?
     var name: String?
@@ -282,7 +282,7 @@ struct DockerContainer: Decodable, Identifiable, Hashable {
     }
 }
 
-struct DockerStats: Decodable, Identifiable, Hashable {
+struct DockerStats: Decodable, Identifiable, Hashable, Sendable {
     var id: String { "\(containerID ?? name ?? "container"):\(timestampTs ?? 0)" }
     var containerShortID: String?
     var containerID: String?
@@ -353,7 +353,7 @@ struct DatabaseBackup: Decodable, Identifiable, Hashable, Sendable {
     }
 }
 
-struct RecentEvent: Decodable, Identifiable, Hashable {
+struct RecentEvent: Decodable, Identifiable, Hashable, Sendable {
     var id: String { "\(origin?.id ?? "unknown")-\(at)-\(type)" }
     var origin: CoordinatorOrigin? = nil
     var at: String
@@ -2021,6 +2021,9 @@ enum CommandEnvironment {
 }
 
 struct CommandRequest: Hashable, Sendable {
+    static let defaultMaxOutputBytes = 1_048_576
+    static let inventoryMaxOutputBytes = 16 * 1_048_576
+
     let executable: String
     let arguments: [String]
     let environment: [String: String]
@@ -2034,7 +2037,7 @@ struct CommandRequest: Hashable, Sendable {
         environment: [String: String] = [:],
         currentDirectory: String? = nil,
         timeout: TimeInterval = 120,
-        maxOutputBytes: Int = 1_048_576
+        maxOutputBytes: Int = CommandRequest.defaultMaxOutputBytes
     ) {
         self.executable = executable
         self.arguments = arguments
@@ -2188,11 +2191,15 @@ struct PythonCoordinatorService: CoordinatorServing, Sendable {
     let scriptPath: String
 
     func execute(origin: CoordinatorOrigin, arguments: [String]) async throws -> CommandExecution {
-        try await executor.execute(
+        let maxOutputBytes = arguments.first == "inventory"
+            ? CommandRequest.inventoryMaxOutputBytes
+            : CommandRequest.defaultMaxOutputBytes
+        return try await executor.execute(
             CommandRequest(
                 executable: "/usr/bin/env",
                 arguments: ["python3", scriptPath] + arguments,
-                environment: ["CODEX_AGENT_COORDINATOR_HOME": origin.home]
+                environment: ["CODEX_AGENT_COORDINATOR_HOME": origin.home],
+                maxOutputBytes: maxOutputBytes
             )
         )
     }

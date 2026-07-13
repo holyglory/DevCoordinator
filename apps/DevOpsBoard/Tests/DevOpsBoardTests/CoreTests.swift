@@ -25,6 +25,28 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(request.arguments, ["python3", "/repo/coordinator.py", "server", "status"])
     }
 
+    func testCoordinatorInventoryUsesDedicatedOutputBudgetWithoutRelaxingOrdinaryCommands() async throws {
+        let executor = RecordingCommandExecutor(result: .init(stdout: "{}", stderr: "", exitStatus: 0))
+        let service = PythonCoordinatorService(executor: executor, scriptPath: "/repo/coordinator.py")
+
+        _ = try await service.execute(origin: codex, arguments: ["inventory", "--compact-json"])
+        _ = try await service.execute(origin: codex, arguments: ["server", "status"])
+
+        let requests = await executor.capturedRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].maxOutputBytes, 16 * 1_024 * 1_024)
+        XCTAssertEqual(requests[1].maxOutputBytes, 1_048_576)
+    }
+
+    func testInventoryValueGraphCanCrossTheBackgroundDecodeBoundary() async {
+        let inventory = Inventory.empty
+        let handedOff = await Task.detached(priority: .userInitiated) {
+            inventory
+        }.value
+
+        XCTAssertEqual(handedOff, inventory)
+    }
+
     func testPartialSourceHealthNeverReportsNominal() {
         let now = Date(timeIntervalSince1970: 100)
         let sources = [
@@ -574,6 +596,25 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(cancelled.cancelled)
     }
 
+    func testOrdinaryCoordinatorOutputOverOneMiBRemainsTruncated() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("large-output.py")
+        try Data("import sys\nsys.stdout.write('x' * 1_100_000)\n".utf8).write(to: script)
+        let executor = SystemCommandExecutor(
+            temporaryRoot: root.appendingPathComponent("spools"),
+            baseEnvironment: ["PATH": "/usr/bin:/bin"]
+        )
+        let service = PythonCoordinatorService(executor: executor, scriptPath: script.path)
+
+        let result = try await service.execute(origin: codex, arguments: ["server", "status"])
+
+        XCTAssertTrue(result.outputTruncated)
+        XCTAssertNotEqual(result.exitStatus, 0)
+        XCTAssertLessThanOrEqual(result.stdout.utf8.count + result.stderr.utf8.count, 1_048_576)
+    }
+
     func testSystemExecutorSpoolsOnlyToPrivateBoundedFiles() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1023,6 +1064,114 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
+    func testRealisticLargeInventoryTraversesProductionExecutorAndLoadsStore() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let origin = CoordinatorOrigin(label: "Large fixture", home: root.appendingPathComponent("coordinator-home").path)
+        let payload = try realisticAccumulatedInventoryPayload(home: origin.home)
+        let decodedFixture = try JSONDecoder().decode(Inventory.self, from: payload)
+        let historySamples = decodedFixture.docker.containers.reduce(0) { partial, container in
+            partial + (container.statsHistory?.count ?? 0)
+        }
+        XCTAssertGreaterThan(payload.count, 1_048_576, "the recall fixture must cross the former production limit")
+        XCTAssertEqual(decodedFixture.docker.containers.count, 15)
+        XCTAssertEqual(decodedFixture.postgres.count, 9)
+        XCTAssertEqual(historySamples, 548)
+        try payload.write(to: root.appendingPathComponent("inventory.json"))
+        let enrichment = try JSONSerialization.data(
+            withJSONObject: inventoryJSONObject(home: origin.home, containers: [], postgres: []),
+            options: [.sortedKeys]
+        )
+        try enrichment.write(to: root.appendingPathComponent("enrichment.json"))
+        let script = root.appendingPathComponent("coordinator.py")
+        let scriptText = #"""
+        from pathlib import Path
+        import sys
+
+        args = sys.argv[1:]
+        try:
+            history_index = args.index("--stats-history-limit")
+            has_history_limit = args[history_index + 1] == "30"
+        except (ValueError, IndexError):
+            has_history_limit = False
+        if not args or args[0] != "inventory" or "--compact-json" not in args or not has_history_limit:
+            print("inventory transport flags are missing", file=sys.stderr)
+            raise SystemExit(64)
+        fixture = "enrichment.json" if "--no-docker" in args else "inventory.json"
+        sys.stdout.buffer.write(Path(__file__).with_name(fixture).read_bytes())
+        """#
+        try Data(scriptText.utf8).write(to: script)
+
+        let executor = SystemCommandExecutor(
+            temporaryRoot: root.appendingPathComponent("spools"),
+            baseEnvironment: ["PATH": "/usr/bin:/bin"]
+        )
+        let service = PythonCoordinatorService(executor: executor, scriptPath: script.path)
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [origin]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .manual())
+            )
+        )
+
+        await store.loadInventory(force: true)
+
+        XCTAssertFalse(store.isLoading)
+        XCTAssertEqual(store.sourceStates.first?.phase, .loaded)
+        XCTAssertEqual(store.inventory.docker.containers.count, 15)
+        XCTAssertEqual(
+            store.inventory.docker.containers.reduce(0) { $0 + ($1.statsHistory?.count ?? 0) },
+            548
+        )
+        XCTAssertEqual(
+            store.capabilityStates.first { $0.capability == .docker }?.phase,
+            .available
+        )
+        XCTAssertNil(store.inventoryIssue)
+        XCTAssertEqual(store.presentationSnapshot.level, .nominal)
+    }
+
+    @MainActor
+    func testTruncatedInventoryReportsConciseLimitFailureWithoutClaimingDockerIsUnavailable() async throws {
+        let partialMarker = "partial-inventory-json-must-not-reach-the-ui"
+        let truncated = CommandExecution(
+            stdout: String(repeating: partialMarker, count: 30_000),
+            stderr: "",
+            exitStatus: -1,
+            outputTruncated: true
+        )
+        let service = OriginSequencedCoordinatorService(results: [codex.id: [.success(truncated)]])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .manual())
+            )
+        )
+
+        await store.loadInventory(force: true)
+
+        let sourceError = try XCTUnwrap(store.sourceStates.first?.error)
+        let issueDetails = try XCTUnwrap(store.inventoryIssue?.details)
+        XCTAssertEqual(store.sourceStates.first?.phase, .failed)
+        XCTAssertTrue(sourceError.localizedCaseInsensitiveContains("output limit"))
+        XCTAssertLessThan(sourceError.utf8.count, 512)
+        XCTAssertLessThan(issueDetails.utf8.count, 2_048)
+        XCTAssertFalse(sourceError.contains(partialMarker))
+        XCTAssertFalse(issueDetails.contains(partialMarker))
+        XCTAssertTrue(
+            store.explicitlyUnavailableDockerCapabilities.isEmpty,
+            "a failed coordinator makes Docker unknown; it is not evidence that Docker itself is unavailable"
+        )
+    }
+
+    @MainActor
     func testBackupEnrichmentSkipsDuplicateDockerObservationAndMergesOnlyBackups() async throws {
         let initialJSON = """
         {"coordinator_home":"\(codex.home)","state_path":"\(codex.home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"containers":[{"id":"cid","name":"db","project":"/repo","status":"Up","stats":{"cpu_percent":17.5}}],"postgres":[]},"postgres":[],"backups":[],"project_usage":[]}
@@ -1050,8 +1199,8 @@ final class CoreTests: XCTestCase {
 
         let calls = await service.capturedCalls()
         XCTAssertEqual(calls.map(\.1), [
-            ["inventory"],
-            ["inventory", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"],
+            ["inventory", "--compact-json", "--stats-history-limit", "30"],
+            ["inventory", "--compact-json", "--stats-history-limit", "30", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"],
         ])
         XCTAssertEqual(store.inventory.docker.containers.first?.name, "db")
         XCTAssertEqual(store.inventory.docker.containers.first?.stats?.cpuPercent, 17.5)
@@ -1240,6 +1389,11 @@ final class CoreTests: XCTestCase {
             store.capabilityStates.first { $0.capability == .database }?.phase,
             .unavailable
         )
+        XCTAssertEqual(
+            store.explicitlyUnavailableDockerCapabilities.map(\.origin.id),
+            [codex.id],
+            "an explicitly loaded Docker-unavailable result must retain its warning"
+        )
         XCTAssertEqual(store.presentationSnapshot.level, .degraded)
         let server = try XCTUnwrap(store.inventory.servers.first)
         XCTAssertTrue(
@@ -1419,8 +1573,8 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(store.actionIssue?.details.contains("Partial changes were applied") == true)
         let calls = await service.capturedCalls()
         XCTAssertEqual(calls.count, 3, "the failed project command must be followed by an inventory refresh")
-        XCTAssertEqual(calls[1].1, ["inventory"])
-        XCTAssertEqual(calls[2].1, ["inventory", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"])
+        XCTAssertEqual(calls[1].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+        XCTAssertEqual(calls[2].1, ["inventory", "--compact-json", "--stats-history-limit", "30", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"])
     }
 
     @MainActor
@@ -1461,8 +1615,8 @@ final class CoreTests: XCTestCase {
 
         let calls = await service.capturedCalls()
         XCTAssertEqual(calls.count, 3)
-        XCTAssertEqual(calls[1].1, ["inventory"])
-        XCTAssertEqual(calls[2].1, ["inventory", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"])
+        XCTAssertEqual(calls[1].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+        XCTAssertEqual(calls[2].1, ["inventory", "--compact-json", "--stats-history-limit", "30", "--no-docker", "--backup-dir", "/repo/.codex-db-backups"])
     }
 
     @MainActor
@@ -2213,6 +2367,110 @@ private func waitUntilAsync(
         try await Task.sleep(for: .milliseconds(10))
     }
     throw RuntimeError("Timed out waiting for asynchronous state")
+}
+
+private func realisticAccumulatedInventoryPayload(home: String) throws -> Data {
+    // This mirrors the production failure shape: 15 observed containers, nine
+    // PostgreSQL projections, and 548 accumulated telemetry samples with the
+    // per-container history cap still respected. PostgreSQL projections repeat
+    // container telemetry in the coordinator schema, so this naturally crosses
+    // 1 MiB without padding or an implementation-shaped synthetic blob.
+    let historyCounts = [120, 120, 120, 120, 68] + Array(repeating: 0, count: 10)
+    let containers: [[String: Any]] = historyCounts.enumerated().map { index, historyCount in
+        let shortID = String(format: "%012llx", Int64(index + 1))
+        let fullID = shortID + String(repeating: "0", count: 52)
+        let name = "project-\(index)-postgres"
+        let history: [[String: Any]] = (0..<historyCount).map { sampleIndex in
+            dockerStatsJSONObject(
+                shortID: shortID,
+                fullID: fullID,
+                name: name,
+                sampleIndex: sampleIndex
+            )
+        }
+        let current = history.last ?? dockerStatsJSONObject(
+            shortID: shortID,
+            fullID: fullID,
+            name: name,
+            sampleIndex: 0
+        )
+        return [
+            "id": fullID,
+            "name": name,
+            "image": "postgres:17",
+            "status": "Up 2 hours (healthy)",
+            "ports": "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp",
+            "project": "/Users/example/src/project-\(index)",
+            "agent": "codex",
+            "role": "database",
+            "metadata_source": "docker_labels",
+            "adopted": false,
+            "stats": current,
+            "stats_history": history,
+        ]
+    }
+    var data = try JSONSerialization.data(
+        withJSONObject: inventoryJSONObject(
+            home: home,
+            containers: containers,
+            postgres: Array(containers.prefix(9))
+        ),
+        options: [.prettyPrinted, .sortedKeys]
+    )
+    data.append(0x0A)
+    return data
+}
+
+private func inventoryJSONObject(
+    home: String,
+    containers: [[String: Any]],
+    postgres: [[String: Any]]
+) -> [String: Any] {
+    [
+        "coordinator_home": home,
+        "state_path": "\(home)/state.json",
+        "urls": [],
+        "servers": [],
+        "leases": [],
+        "recent_events": [],
+        "docker": [
+            "available": true,
+            "containers": containers,
+            "postgres": postgres,
+        ],
+        "postgres": postgres,
+        "backups": [],
+        "project_usage": [],
+    ]
+}
+
+private func dockerStatsJSONObject(
+    shortID: String,
+    fullID: String,
+    name: String,
+    sampleIndex: Int
+) -> [String: Any] {
+    [
+        "id": shortID,
+        "container_id": fullID,
+        "name": name,
+        "timestamp": String(format: "2026-07-13T12:%02d:00Z", sampleIndex % 60),
+        "timestamp_ts": 1_783_944_000.0 + Double(sampleIndex),
+        "live": true,
+        "cpu_percent": 17.25,
+        "memory_percent": 3.75,
+        "memory_usage_bytes": 123_456_789.0,
+        "memory_limit_bytes": 34_359_738_368.0,
+        "network_rx_bytes": 1_234_567.0,
+        "network_tx_bytes": 7_654_321.0,
+        "block_read_bytes": 1_048_576.0,
+        "block_write_bytes": 2_097_152.0,
+        "network_rx_rate_bytes_per_second": 1_024.5,
+        "network_tx_rate_bytes_per_second": 2_048.5,
+        "block_read_rate_bytes_per_second": 512.25,
+        "block_write_rate_bytes_per_second": 256.25,
+        "pids": 12,
+    ]
 }
 
 private func inventoryExecution(home: String, serverName: String, project: String? = nil) -> CommandExecution {

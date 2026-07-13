@@ -3611,6 +3611,16 @@ def attach_docker_rates(sample: dict[str, Any], previous: dict[str, Any] | None)
     return sample
 
 
+def docker_stats_sample_sort_key(sample: Any) -> tuple[float, str, str]:
+    if not isinstance(sample, dict):
+        return float("-inf"), "", ""
+    try:
+        timestamp = float(sample.get("timestamp_ts"))
+    except (TypeError, ValueError):
+        timestamp = float("-inf")
+    return timestamp, str(sample.get("id") or ""), str(sample.get("name") or "")
+
+
 def sample_docker_stats(state: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
     command = ["docker", "stats", "--no-stream", "--format", "{{json .}}"]
     if dry_run:
@@ -3635,6 +3645,7 @@ def sample_docker_stats(state: dict[str, Any], *, dry_run: bool = False) -> dict
         if not key:
             continue
         history = history_by_id.setdefault(key, [])
+        history.sort(key=docker_stats_sample_sort_key)
         previous = history[-1] if history else None
         sample = attach_docker_rates(sample, previous)
         history.append(sample)
@@ -3644,7 +3655,18 @@ def sample_docker_stats(state: dict[str, Any], *, dry_run: bool = False) -> dict
     return {"available": True, "stats": samples}
 
 
-def docker_ps_inventory(*, all_containers: bool = True, state: dict[str, Any] | None = None) -> dict[str, Any]:
+def docker_ps_inventory(
+    *,
+    all_containers: bool = True,
+    state: dict[str, Any] | None = None,
+    stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
+) -> dict[str, Any]:
+    if not isinstance(stats_history_limit, int) or isinstance(stats_history_limit, bool):
+        raise ValueError("Docker stats history limit must be an integer")
+    if not 0 <= stats_history_limit <= DOCKER_STATS_HISTORY_LIMIT:
+        raise ValueError(
+            f"Docker stats history limit must be between 0 and {DOCKER_STATS_HISTORY_LIMIT}"
+        )
     args = ["ps"]
     if all_containers:
         args.append("--all")
@@ -3684,7 +3706,11 @@ def docker_ps_inventory(*, all_containers: bool = True, state: dict[str, Any] | 
         if container_id:
             if container_id in stats_by_id:
                 container["stats"] = stats_by_id[container_id]
-            container["stats_history"] = history_by_id.get(container_id, [])[-DOCKER_STATS_HISTORY_LIMIT:]
+            history = sorted(
+                history_by_id.get(container_id, []),
+                key=docker_stats_sample_sort_key,
+            )
+            container["stats_history"] = history[-stats_history_limit:] if stats_history_limit else []
         containers.append(container)
     inspect_by_id: dict[str, dict[str, Any]] = {}
     inspect_ids = [str(container.get("id")) for container in containers if container.get("id")]
@@ -4582,7 +4608,14 @@ def project_runtime_stop(state: dict[str, Any], options: dict[str, Any]) -> dict
     return after
 
 
-def build_inventory(state: dict[str, Any], *, project: str | None = None, include_docker: bool = True, backup_dirs: list[str] | None = None) -> dict[str, Any]:
+def build_inventory(
+    state: dict[str, Any],
+    *,
+    project: str | None = None,
+    include_docker: bool = True,
+    backup_dirs: list[str] | None = None,
+    stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
+) -> dict[str, Any]:
     resolved_project = canonical_project(project) if project else None
     servers = []
     for server in state["servers"].values():
@@ -4659,7 +4692,11 @@ def build_inventory(state: dict[str, Any], *, project: str | None = None, includ
         if resolved_project and payload.get("project") != resolved_project:
             continue
         recent_events.append(event)
-    docker = docker_ps_inventory(state=state) if include_docker else {"available": None, "containers": [], "postgres": []}
+    docker = (
+        docker_ps_inventory(state=state, stats_history_limit=stats_history_limit)
+        if include_docker
+        else {"available": None, "containers": [], "postgres": []}
+    )
     project_usage = build_project_usage(servers, docker, process_table, state)
     return {
         "coordinator_home": str(coordinator_home()),
@@ -5917,6 +5954,7 @@ def merge_docker_stats_history(state: dict[str, Any], observed: dict[str, Any]) 
                 continue
             current.append(copy.deepcopy(sample))
             known.add(identity)
+        current.sort(key=docker_stats_sample_sort_key)
         del current[:-DOCKER_STATS_HISTORY_LIMIT]
 
 
@@ -6180,7 +6218,11 @@ def coordinated_sample_docker_stats(*, dry_run: bool = False) -> dict[str, Any]:
 
 
 def coordinated_build_inventory(
-    *, project: str | None = None, include_docker: bool = True, backup_dirs: list[str] | None = None
+    *,
+    project: str | None = None,
+    include_docker: bool = True,
+    backup_dirs: list[str] | None = None,
+    stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
 ) -> dict[str, Any]:
     prepared_project = canonical_project(project) if project else None
     baseline = snapshot_runtime_observation(project=prepared_project)
@@ -6190,6 +6232,7 @@ def coordinated_build_inventory(
         project=prepared_project,
         include_docker=include_docker,
         backup_dirs=backup_dirs,
+        stats_history_limit=stats_history_limit,
     )
     commit_runtime_observations(baseline, observed)
     return result
@@ -7586,9 +7629,12 @@ def coordinated_run_docker(
     return result
 
 
-def print_result(value: Any, *, as_json: bool = True) -> None:
+def print_result(value: Any, *, as_json: bool = True, compact_json: bool = False) -> None:
     if as_json:
-        print(json.dumps(value, indent=2, sort_keys=True))
+        if compact_json:
+            print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+        else:
+            print(json.dumps(value, indent=2, sort_keys=True))
     else:
         print(value)
 
@@ -7607,6 +7653,18 @@ def parse_argv_json(raw: str) -> list[str]:
     return value
 
 
+def parse_stats_history_limit(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("stats history limit must be an integer") from exc
+    if not 0 <= value <= DOCKER_STATS_HISTORY_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"stats history limit must be between 0 and {DOCKER_STATS_HISTORY_LIMIT}"
+        )
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Coordinate Codex dev ports, servers, and Docker.")
     sub = parser.add_subparsers(dest="group", required=True)
@@ -7615,6 +7673,18 @@ def build_parser() -> argparse.ArgumentParser:
     inventory.add_argument("--project")
     inventory.add_argument("--backup-dir", action="append")
     inventory.add_argument("--no-docker", action="store_true")
+    inventory.add_argument(
+        "--compact-json",
+        action="store_true",
+        help="emit inventory as one compact JSON line",
+    )
+    inventory.add_argument(
+        "--stats-history-limit",
+        type=parse_stats_history_limit,
+        default=DOCKER_STATS_HISTORY_LIMIT,
+        metavar="N",
+        help=f"return the newest N Docker stats samples per container (0-{DOCKER_STATS_HISTORY_LIMIT})",
+    )
 
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="action", required=True)
@@ -7838,6 +7908,7 @@ def handle_cli(args: argparse.Namespace) -> Any:
             project=args.project,
             include_docker=not args.no_docker,
             backup_dirs=args.backup_dir,
+            stats_history_limit=args.stats_history_limit,
         )
     if args.group == "docker" and args.action == "ps":
         command = ["docker", "ps"]
@@ -8486,7 +8557,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)
             return 1
     try:
-        print_result(handle_cli(args))
+        print_result(handle_cli(args), compact_json=bool(getattr(args, "compact_json", False)))
         return 0
     except Exception as exc:
         print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)

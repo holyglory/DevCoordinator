@@ -479,6 +479,21 @@ rolling `stats_history` per container, and exposes current CPU, memory, network
 I/O, and block I/O values plus per-second network/block rates. Stopped
 containers remain visible but do not receive live stats.
 
+Machine consumers can reduce inventory transport cost without changing the
+persisted telemetry window. `--compact-json` emits the same inventory as one
+compact JSON line, while `--stats-history-limit` selects how many of the newest
+stored samples are returned for each primary Docker container:
+
+```bash
+python3 scripts/dev_coordinator.py inventory --compact-json --stats-history-limit 30
+```
+
+Both controls are opt-in. Ordinary CLI and HTTP inventory responses retain the
+full bounded 120-sample history, and ordinary CLI JSON stays pretty-printed.
+Use a limit of `0` when only the current `stats` sample is needed; this shapes
+the response only and never deletes the coordinator's persisted rolling
+history. Values outside `0..120` are rejected.
+
 ## Project Runtime Declarations
 
 Project runtime declarations live at `.codex/dev-runtime.json` by default. Use
