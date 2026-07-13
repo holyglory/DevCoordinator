@@ -719,6 +719,33 @@ private func managedServerRank(_ server: ManagedServer) -> (Int, String, String)
 
 // MARK: - Source-aware, testable operations core
 
+/// Match the coordinator readiness verifier's non-strict `realpath` identity.
+/// Resolve the deepest existing ancestor, then append any not-yet-created
+/// suffix so configuring a future coordinator home remains supported.
+private func canonicalCoordinatorHomePath(_ home: String) -> String {
+    let standardized = URL(fileURLWithPath: home).standardizedFileURL.path
+    var probe = standardized
+    var unresolvedSuffix: [String] = []
+
+    while true {
+        if let resolvedAncestor = probe.withCString({ pointer -> String? in
+            guard let resolved = realpath(pointer, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }) {
+            return unresolvedSuffix.reversed().reduce(
+                URL(fileURLWithPath: resolvedAncestor, isDirectory: true)
+            ) { partial, component in
+                partial.appendingPathComponent(component)
+            }.standardizedFileURL.path
+        }
+        guard probe != "/" else { return standardized }
+        let probeURL = URL(fileURLWithPath: probe)
+        unresolvedSuffix.append(probeURL.lastPathComponent)
+        probe = probeURL.deletingLastPathComponent().path
+    }
+}
+
 struct CoordinatorOrigin: Codable, Hashable, Sendable, Identifiable {
     let id: String
     let label: String
@@ -726,7 +753,7 @@ struct CoordinatorOrigin: Codable, Hashable, Sendable, Identifiable {
     var statePath: String?
 
     init(label: String, home: String, statePath: String? = nil) {
-        let normalizedHome = URL(fileURLWithPath: home).standardizedFileURL.path
+        let normalizedHome = canonicalCoordinatorHomePath(home)
         self.id = normalizedHome
         self.label = label
         self.home = normalizedHome
@@ -795,7 +822,7 @@ struct CoordinatorSourceConfiguration: Codable, Hashable, Sendable, Identifiable
     }
 
     var normalizedHome: String {
-        URL(fileURLWithPath: home).standardizedFileURL.path
+        canonicalCoordinatorHomePath(home)
     }
 
     func validated() throws -> CoordinatorSourceConfiguration {
@@ -803,7 +830,11 @@ struct CoordinatorSourceConfiguration: Codable, Hashable, Sendable, Identifiable
         let cleanHome = home.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanLabel.isEmpty else { throw CoordinatorConfigurationError.invalidSource("source label is empty") }
         guard cleanHome.hasPrefix("/") else { throw CoordinatorConfigurationError.invalidSource("source home must be an absolute path") }
-        return CoordinatorSourceConfiguration(label: cleanLabel, home: normalizedHome, enabled: enabled)
+        return CoordinatorSourceConfiguration(
+            label: cleanLabel,
+            home: canonicalCoordinatorHomePath(cleanHome),
+            enabled: enabled
+        )
     }
 
     var origin: CoordinatorOrigin {
@@ -880,29 +911,176 @@ protocol CoordinatorConfigurationPersisting: Sendable {
     func save(_ configuration: CoordinatorConfiguration) throws
 }
 
+/// LaunchServices can remap HOME/CFFIXED_USER_HOME for an app process. The
+/// effective account's passwd record remains the authoritative user root.
+struct POSIXAccountHomeResolver: Sendable {
+    private let resolveAccountHome: @Sendable () -> String?
+
+    init(
+        resolveAccountHome: @escaping @Sendable () -> String? = POSIXAccountHomeResolver.effectiveAccountHome
+    ) {
+        self.resolveAccountHome = resolveAccountHome
+    }
+
+    func resolve() -> String? {
+        guard let rawValue = resolveAccountHome() else { return nil }
+        let candidate = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard candidate.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: candidate).standardizedFileURL.path
+    }
+
+    private static func effectiveAccountHome() -> String? {
+        let effectiveUserID = geteuid()
+        var bufferSize = 16 * 1_024
+        while bufferSize <= 1_024 * 1_024 {
+            var account = passwd()
+            var accountPointer: UnsafeMutablePointer<passwd>?
+            var buffer = [CChar](repeating: 0, count: bufferSize)
+            let lookup = buffer.withUnsafeMutableBufferPointer { bytes -> (status: Int32, path: String?) in
+                guard let baseAddress = bytes.baseAddress else { return (EINVAL, nil) }
+                let status = getpwuid_r(
+                    effectiveUserID,
+                    &account,
+                    baseAddress,
+                    bytes.count,
+                    &accountPointer
+                )
+                guard status == 0,
+                      accountPointer != nil,
+                      let directory = account.pw_dir
+                else { return (status, nil) }
+                return (status, String(cString: directory))
+            }
+            if lookup.status == ERANGE {
+                bufferSize *= 2
+                continue
+            }
+            guard lookup.status == 0,
+                  let path = lookup.path,
+                  !path.isEmpty
+            else { return nil }
+            return path
+        }
+        return nil
+    }
+}
+
 struct PrivateCoordinatorConfigurationStore: CoordinatorConfigurationPersisting, Sendable {
+    enum TransactionEvent: Sendable {
+        case waitingForExclusiveLock
+        case acquiredExclusiveLock
+        case replacedLastKnownGood
+        case replacedPrimary
+    }
+
     let configurationURL: URL
     let lastKnownGoodURL: URL
+    private let storageUnavailableReason: String?
+    private let legacyConfigurationURL: URL?
+    private let legacyLastKnownGoodURL: URL?
+    private let transactionObserver: @Sendable (TransactionEvent) throws -> Void
 
-    init(configurationURL: URL? = nil) {
-        // Deliberately retain the pre-rename storage identity so existing
-        // coordinator-source settings survive the DevOps Board rename.
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("CodexOpsConsole", isDirectory: true)
+    init(
+        configurationURL: URL? = nil,
+        accountHomeResolver: POSIXAccountHomeResolver = POSIXAccountHomeResolver(),
+        legacyConfigurationURL: URL = (
+            FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("CodexOpsConsole", isDirectory: true)
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/CodexOpsConsole", isDirectory: true)
-        let selected = configurationURL ?? root.appendingPathComponent("coordinator-configuration.json")
+        ).appendingPathComponent("coordinator-configuration.json"),
+        transactionObserver: @escaping @Sendable (TransactionEvent) throws -> Void = { _ in }
+    ) {
+        // Deliberately retain the pre-rename storage identity so existing
+        // coordinator-source settings survive the DevOps Board rename.
+        let selected: URL
+        let legacySelected: URL?
+        if let configurationURL {
+            selected = configurationURL
+            storageUnavailableReason = nil
+            legacySelected = nil
+        } else if let accountHome = accountHomeResolver.resolve() {
+            selected = URL(fileURLWithPath: accountHome, isDirectory: true)
+                .appendingPathComponent("Library/Application Support/CodexOpsConsole", isDirectory: true)
+                .appendingPathComponent("coordinator-configuration.json")
+            storageUnavailableReason = nil
+            let standardizedLegacy = legacyConfigurationURL.standardizedFileURL
+            legacySelected = standardizedLegacy == selected.standardizedFileURL ? nil : standardizedLegacy
+        } else {
+            // This URL is never read or written while the resolution error is
+            // present; it keeps the public evidence properties non-optional.
+            selected = URL(fileURLWithPath: "/var/empty", isDirectory: true)
+                .appendingPathComponent("Library/Application Support/CodexOpsConsole", isDirectory: true)
+                .appendingPathComponent("coordinator-configuration.json")
+            storageUnavailableReason = "the effective POSIX account home could not be resolved"
+            legacySelected = nil
+        }
         self.configurationURL = selected
         self.lastKnownGoodURL = selected.deletingPathExtension().appendingPathExtension("last-known-good.json")
+        self.legacyConfigurationURL = legacySelected
+        self.legacyLastKnownGoodURL = legacySelected?.deletingPathExtension().appendingPathExtension("last-known-good.json")
+        self.transactionObserver = transactionObserver
     }
 
     func load() -> CoordinatorConfigurationLoadResult {
-        let primary = decode(configurationURL)
+        if let storageUnavailableReason {
+            return CoordinatorConfigurationLoadResult(
+                configuration: nil,
+                warning: "Coordinator configuration is unavailable: \(storageUnavailableReason).",
+                usedLastKnownGood: false
+            )
+        }
+        do {
+            return try withExclusiveTransaction {
+                let primary = decode(configurationURL)
+                let backup = decode(lastKnownGoodURL)
+                if !primary.isMissing || !backup.isMissing {
+                    return loadResult(primary: primary, backup: backup)
+                }
+
+                guard let legacyConfigurationURL, let legacyLastKnownGoodURL else {
+                    return CoordinatorConfigurationLoadResult(
+                        configuration: nil,
+                        warning: nil,
+                        usedLastKnownGood: false
+                    )
+                }
+                let legacyResult = loadResult(
+                    primary: decode(legacyConfigurationURL),
+                    backup: decode(legacyLastKnownGoodURL)
+                )
+                guard let configuration = legacyResult.configuration else { return legacyResult }
+
+                do {
+                    try persistPairUnderLock(configuration)
+                    return legacyResult
+                } catch {
+                    let migrationWarning = "Could not migrate the legacy coordinator configuration to the POSIX account path: \(error.localizedDescription)"
+                    let warning = [legacyResult.warning, migrationWarning]
+                        .compactMap { $0 }
+                        .joined(separator: " ")
+                    return CoordinatorConfigurationLoadResult(
+                        configuration: configuration,
+                        warning: warning,
+                        usedLastKnownGood: legacyResult.usedLastKnownGood
+                    )
+                }
+            }
+        } catch {
+            return CoordinatorConfigurationLoadResult(
+                configuration: nil,
+                warning: "Coordinator configuration is unavailable: \(error.localizedDescription)",
+                usedLastKnownGood: false
+            )
+        }
+    }
+
+    private func loadResult(primary: DecodeResult, backup: DecodeResult) -> CoordinatorConfigurationLoadResult {
         switch primary {
         case .success(let configuration):
             return CoordinatorConfigurationLoadResult(configuration: configuration, warning: nil, usedLastKnownGood: false)
         case .missing:
-            switch decode(lastKnownGoodURL) {
+            switch backup {
             case .success(let configuration):
                 return CoordinatorConfigurationLoadResult(
                     configuration: configuration,
@@ -919,7 +1097,7 @@ struct PrivateCoordinatorConfigurationStore: CoordinatorConfigurationPersisting,
                 )
             }
         case .failure(let primaryError):
-            switch decode(lastKnownGoodURL) {
+            switch backup {
             case .success(let configuration):
                 return CoordinatorConfigurationLoadResult(
                     configuration: configuration,
@@ -943,19 +1121,59 @@ struct PrivateCoordinatorConfigurationStore: CoordinatorConfigurationPersisting,
     }
 
     func save(_ configuration: CoordinatorConfiguration) throws {
+        if let storageUnavailableReason {
+            throw CoordinatorConfigurationError.writeFailed(storageUnavailableReason)
+        }
+        try withExclusiveTransaction {
+            try persistPairUnderLock(configuration)
+        }
+    }
+
+    private func persistPairUnderLock(_ configuration: CoordinatorConfiguration) throws {
         let validated = try configuration.validated()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(validated)
-        try preparePrivateDirectory(configurationURL.deletingLastPathComponent())
-        try atomicPrivateWrite(data, to: lastKnownGoodURL)
-        try atomicPrivateWrite(data, to: configurationURL)
+        let originalPrimary = try snapshot(configurationURL)
+        let originalLastKnownGood = try snapshot(lastKnownGoodURL)
+        do {
+            try atomicPrivateWrite(data, to: lastKnownGoodURL)
+            try transactionObserver(.replacedLastKnownGood)
+            try atomicPrivateWrite(data, to: configurationURL)
+            try transactionObserver(.replacedPrimary)
+        } catch {
+            var rollbackFailures: [String] = []
+            for (snapshot, url) in [
+                (originalLastKnownGood, lastKnownGoodURL),
+                (originalPrimary, configurationURL),
+            ] {
+                do {
+                    try restore(snapshot, to: url)
+                } catch {
+                    rollbackFailures.append("\(url.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+            let rollbackDetail = rollbackFailures.isEmpty
+                ? "the previous primary and last-known-good pair was restored"
+                : "rollback also failed for \(rollbackFailures.joined(separator: "; "))"
+            throw CoordinatorConfigurationError.writeFailed("\(error.localizedDescription); \(rollbackDetail)")
+        }
     }
 
     private enum DecodeResult {
         case success(CoordinatorConfiguration)
         case missing
         case failure(String)
+
+        var isMissing: Bool {
+            if case .missing = self { return true }
+            return false
+        }
+    }
+
+    private enum StoredFileSnapshot {
+        case missing
+        case data(Data)
     }
 
     private func decode(_ url: URL) -> DecodeResult {
@@ -971,6 +1189,66 @@ struct PrivateCoordinatorConfigurationStore: CoordinatorConfigurationPersisting,
         } catch {
             return .failure(error.localizedDescription)
         }
+    }
+
+    private func snapshot(_ url: URL) throws -> StoredFileSnapshot {
+        guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+        do {
+            let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+            guard values.isSymbolicLink != true, values.isRegularFile == true else {
+                throw CoordinatorConfigurationError.writeFailed("\(url.lastPathComponent) is not a regular file")
+            }
+            return .data(try Data(contentsOf: url, options: [.mappedIfSafe]))
+        } catch let error as CoordinatorConfigurationError {
+            throw error
+        } catch {
+            throw CoordinatorConfigurationError.writeFailed(error.localizedDescription)
+        }
+    }
+
+    private func restore(_ snapshot: StoredFileSnapshot, to url: URL) throws {
+        switch snapshot {
+        case .missing:
+            if FileManager.default.fileExists(atPath: url.path) {
+                do {
+                    try FileManager.default.removeItem(at: url)
+                } catch {
+                    throw CoordinatorConfigurationError.writeFailed(error.localizedDescription)
+                }
+            }
+        case .data(let data):
+            try atomicPrivateWrite(data, to: url)
+        }
+    }
+
+    /// Every reader and writer uses the same advisory lock. Writers therefore
+    /// commit the primary/LKG pair in lock-acquisition order; the last lock
+    /// holder is the deterministic last writer and readers never observe the
+    /// intermediate replacement of only one member of the pair.
+    private func withExclusiveTransaction<T>(_ operation: () throws -> T) throws -> T {
+        let directory = configurationURL.deletingLastPathComponent()
+        try preparePrivateDirectory(directory)
+        try transactionObserver(.waitingForExclusiveLock)
+        let lockURL = configurationURL.deletingPathExtension().appendingPathExtension("lock")
+        let descriptor = open(
+            lockURL.path,
+            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            mode_t(S_IRUSR | S_IWUSR)
+        )
+        guard descriptor >= 0 else {
+            throw CoordinatorConfigurationError.writeFailed("could not open the configuration transaction lock: \(String(cString: strerror(errno)))")
+        }
+        defer { close(descriptor) }
+        guard fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+            throw CoordinatorConfigurationError.writeFailed("could not protect the configuration transaction lock: \(String(cString: strerror(errno)))")
+        }
+        while flock(descriptor, LOCK_EX) != 0 {
+            if errno == EINTR { continue }
+            throw CoordinatorConfigurationError.writeFailed("could not acquire the configuration transaction lock: \(String(cString: strerror(errno)))")
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        try transactionObserver(.acquiredExclusiveLock)
+        return try operation()
     }
 
     private func preparePrivateDirectory(_ directory: URL) throws {
@@ -2087,14 +2365,14 @@ protocol CoordinatorOriginDiscovering: Sendable {
 
 struct FileSystemCoordinatorOriginDiscovery: CoordinatorOriginDiscovering, Sendable {
     let environment: [String: String]
-    let home: String
+    let accountHome: String?
 
     init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        home: String = FileManager.default.homeDirectoryForCurrentUser.path
+        accountHomeResolver: POSIXAccountHomeResolver = POSIXAccountHomeResolver()
     ) {
         self.environment = environment
-        self.home = home
+        self.accountHome = accountHomeResolver.resolve()
     }
 
     func origins() -> [CoordinatorOrigin] {
@@ -2103,15 +2381,17 @@ struct FileSystemCoordinatorOriginDiscovery: CoordinatorOriginDiscovering, Senda
         if let configured = environment["CODEX_AGENT_COORDINATOR_HOME"], !configured.isEmpty {
             candidates.append(("Configured", configured))
         }
-        candidates.append(("Codex", "\(home)/.codex/agent-coordinator"))
-        candidates.append(("Claude", "\(home)/.claude/agent-coordinator"))
-        let parallRoot = "\(home)/Library/Application Support/Parall"
-        if let entries = try? fileManager.contentsOfDirectory(atPath: parallRoot) {
-            candidates.append(contentsOf: entries.sorted().map { ("Parall \($0)", "\(parallRoot)/\($0)/.codex/agent-coordinator") })
+        if let accountHome {
+            candidates.append(("Codex", "\(accountHome)/.codex/agent-coordinator"))
+            candidates.append(("Claude", "\(accountHome)/.claude/agent-coordinator"))
+            let parallRoot = "\(accountHome)/Library/Application Support/Parall"
+            if let entries = try? fileManager.contentsOfDirectory(atPath: parallRoot) {
+                candidates.append(contentsOf: entries.sorted().map { ("Parall \($0)", "\(parallRoot)/\($0)/.codex/agent-coordinator") })
+            }
         }
         var seen = Set<String>()
         return candidates.compactMap { label, path in
-            let resolved = URL(fileURLWithPath: path).standardizedFileURL.path
+            let resolved = canonicalCoordinatorHomePath(path)
             guard seen.insert(resolved).inserted else { return nil }
             var isDirectory: ObjCBool = false
             let exists = fileManager.fileExists(atPath: resolved, isDirectory: &isDirectory)
@@ -2237,18 +2517,18 @@ protocol SkillLocating: Sendable {
 
 struct PortableSkillLocator: SkillLocating, Sendable {
     let environment: [String: String]
-    let home: String
+    let accountHome: String?
     let currentDirectory: String
     let bundleResourceRoot: String?
 
     init(
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        home: String = FileManager.default.homeDirectoryForCurrentUser.path,
         currentDirectory: String = FileManager.default.currentDirectoryPath,
-        bundleResourceRoot: String? = Bundle.main.resourceURL?.path
+        bundleResourceRoot: String? = Bundle.main.resourceURL?.path,
+        accountHomeResolver: POSIXAccountHomeResolver = POSIXAccountHomeResolver()
     ) {
         self.environment = environment
-        self.home = home
+        self.accountHome = accountHomeResolver.resolve()
         self.currentDirectory = currentDirectory
         self.bundleResourceRoot = bundleResourceRoot
     }
@@ -2276,11 +2556,12 @@ struct PortableSkillLocator: SkillLocating, Sendable {
         // intentionally below both the packaged resources and a checkout.
         if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty { roots.append(codexHome) }
         if let claudeHome = environment["CLAUDE_CONFIG_DIR"], !claudeHome.isEmpty { roots.append(claudeHome) }
-        roots.append(contentsOf: ["\(home)/.codex", "\(home)/.claude"])
-
-        let parallRoot = "\(home)/Library/Application Support/Parall"
-        if let entries = try? fileManager.contentsOfDirectory(atPath: parallRoot) {
-            roots.append(contentsOf: entries.sorted().map { "\(parallRoot)/\($0)/.codex" })
+        if let accountHome {
+            roots.append(contentsOf: ["\(accountHome)/.codex", "\(accountHome)/.claude"])
+            let parallRoot = "\(accountHome)/Library/Application Support/Parall"
+            if let entries = try? fileManager.contentsOfDirectory(atPath: parallRoot) {
+                roots.append(contentsOf: entries.sorted().map { "\(parallRoot)/\($0)/.codex" })
+            }
         }
 
         var tried: [String] = []

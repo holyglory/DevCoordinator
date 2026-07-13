@@ -29,13 +29,15 @@ launch_app() {
 verify_launch() (
   set -euo pipefail
 
-  local capture_dir log_file capture_pid capture_ready pids app_pid app_start expected_executable
+  local capture_dir log_file capture_pid capture_ready pids app_pid app_start expected_executable expected_source_inventory coordinator_script
   capture_dir=""
   log_file=""
   capture_pid=""
   app_pid=""
   app_start=""
   expected_executable="$(cd "$(dirname "$APP_BINARY")" && pwd -P)/$(basename "$APP_BINARY")"
+  coordinator_script="$APP_BUNDLE/Contents/Resources/skills/codex-dev-coordinator/scripts/dev_coordinator.py"
+  expected_source_inventory="$("$PYTHON_COMMAND" "$VERIFIER" expected-inventory --coordinator-script "$coordinator_script")"
 
   pid_is_running() {
     local process_state
@@ -163,6 +165,8 @@ verify_launch() (
     --pid "$app_pid" \
     --expected-executable "$expected_executable" \
     --expected-start "$app_start" \
+    --expected-source-inventory "$expected_source_inventory" \
+    --expect-unfiltered-servers \
     --capture-pid "$capture_pid" \
     --timeout 30 \
     --stabilization 1.5

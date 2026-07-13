@@ -25,6 +25,126 @@ def run(args: list[str], *, cwd: Path = ROOT) -> None:
     subprocess.run(args, cwd=cwd, check=True)
 
 
+def source_region(source: str, start: str, end: str) -> str:
+    start_index = source.find(start)
+    end_index = source.find(end, start_index + len(start))
+    if start_index < 0 or end_index <= start_index:
+        raise SystemExit(f"DevOpsBoard geometry guard could not locate {start!r} through {end!r}")
+    return source[start_index:end_index]
+
+
+def check_devops_board_center_pane_geometry(views: str, split_sizing: str) -> None:
+    """Keep intrinsic children from widening and center-cropping the main pane.
+
+    The reported window was 1180 points wide with a user-resized 380-point
+    sidebar and the 320-point inspector. That leaves a 464-point main pane,
+    rather than the 524 points produced by the default-sidebar fixture. The
+    executable sizing check carries both that must-catch geometry and a wider
+    control where the same preferred maxima legitimately fit.
+    """
+
+    split_width = 8
+    narrow_main_width = 1180 - 380 - split_width - 320 - split_width
+    narrow_body_width = narrow_main_width - 28
+    narrow_toolbar_width = narrow_main_width - 24
+    wide_main_width = 1440 - 380 - split_width - 320 - split_width
+    wide_body_width = wide_main_width - 28
+    wide_toolbar_width = wide_main_width - 24
+    legacy_compact_toolbar = 132 + 120 + 88 + (3 * 32) + (5 * 6)
+    adaptive_narrow_toolbar = 108 + 72 + 44 + (3 * 32) + (5 * 6)
+    normal_filter = 32 + 220 + 78 + (3 * 12)
+    bulk_filter = normal_filter + 64 + 108 + (2 * 12)
+    legacy_empty_state = 28 + 250 + 148 + (3 * 12)
+    geometry_recall = {
+        "fixed 520-point tabs overflow the real narrow fixture": 520 > narrow_body_width,
+        "legacy compact toolbar overflows the real narrow fixture": (
+            legacy_compact_toolbar > narrow_toolbar_width
+        ),
+        "adaptive narrow toolbar fits the real narrow fixture": (
+            adaptive_narrow_toolbar <= narrow_toolbar_width
+        ),
+        "ordinary filters fit the real narrow fixture": normal_filter <= narrow_body_width,
+        "bulk filters require an adaptive row": bulk_filter > narrow_body_width,
+        "legacy empty-state actions require an adaptive row": legacy_empty_state > narrow_body_width,
+        "520-point tab maximum is valid at wider width": 520 <= wide_body_width,
+        "legacy compact-toolbar footprint is valid at wider width": (
+            legacy_compact_toolbar <= wide_toolbar_width
+        ),
+    }
+    broken_geometry_checks = [label for label, condition in geometry_recall.items() if not condition]
+    if broken_geometry_checks:
+        raise SystemExit(
+            "DevOpsBoard center-pane geometry recall/control fixture is invalid: "
+            + ", ".join(broken_geometry_checks)
+        )
+
+    sizing_contract = {
+        "real 1180-point center-pane fixture": (
+            "consoleLayout(totalWidth: 1180, sidebarPreference: 380, inspectorPreference: 320)"
+        ),
+        "fixed-tab overflow must-catch": (
+            "guard must catch the legacy fixed resource tabs that widened and cropped the 1180-point main pane"
+        ),
+        "compact-toolbar overflow must-catch": (
+            "guard must catch the compact toolbar action cluster clipped in the reported 1180-point window"
+        ),
+        "bulk-filter overflow must-catch": (
+            "guard must keep the bulk-selection filter row on an adaptive layout path"
+        ),
+        "wider-layout false-positive control": (
+            "consoleLayout(totalWidth: 1440, sidebarPreference: 380, inspectorPreference: 320)"
+        ),
+    }
+    missing_sizing = [label for label, needle in sizing_contract.items() if needle not in split_sizing]
+    if missing_sizing:
+        raise SystemExit(
+            "DevOpsBoard center-pane geometry guard is missing realistic coverage: "
+            + ", ".join(missing_sizing)
+        )
+
+    resource_tabs = source_region(views, "struct ResourceTabBar: View", "struct ToolbarView: View")
+    toolbar = source_region(views, "struct ToolbarView: View", "struct FilterRow: View")
+    filters = source_region(views, "struct FilterRow: View", "struct SourceHealthChip: View")
+    empty_state = source_region(views, "struct DevServersEmptyState: View", "struct ResourceEmptyState: View")
+
+    if ".frame(width: 520" in resource_tabs:
+        raise SystemExit(
+            "DevOpsBoard center-pane geometry guard caught the 520-point fixed ResourceTabBar regression"
+        )
+    if ".frame(minWidth: 280, maxWidth: 520" not in resource_tabs:
+        raise SystemExit("DevOpsBoard ResourceTabBar must retain its bounded flexible width")
+
+    if ".frame(width: 360" in filters:
+        raise SystemExit("DevOpsBoard center-pane geometry guard caught the fixed-width FilterRow regression")
+    if ".frame(minWidth: 220, maxWidth: 360" not in filters:
+        raise SystemExit("DevOpsBoard FilterRow picker must retain its bounded flexible width")
+    if "ViewThatFits(in: .horizontal)" not in filters:
+        raise SystemExit(
+            "DevOpsBoard FilterRow must retain an adaptive bulk-selection layout at the 1180-point fixture"
+        )
+
+    adaptive_toolbar_contract = [
+        "if proxy.size.width < 520",
+        "narrowToolbar",
+        ".frame(width: 108)",
+        ".frame(minWidth: 72, maxWidth: .infinity)",
+        "SourceHealthChip(store: store, compact: true, minimal: true)",
+    ]
+    has_adaptive_toolbar = (
+        "ViewThatFits(in: .horizontal)" in toolbar
+        or all(needle in toolbar for needle in adaptive_toolbar_contract)
+    )
+    if not has_adaptive_toolbar:
+        raise SystemExit(
+            "DevOpsBoard compact toolbar must retain an adaptive fallback for the reported 1180-point fixture"
+        )
+
+    if "ViewThatFits(in: .horizontal)" not in empty_state:
+        raise SystemExit(
+            "DevOpsBoard dev-server empty state must retain its adaptive action layout at narrow pane widths"
+        )
+
+
 def check_standalone_skill(skill: Path) -> None:
     tmp = Path(tempfile.mkdtemp(prefix=f"{skill.name}-standalone-")).resolve(strict=True)
     try:
@@ -56,6 +176,8 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
     coordinator_capability_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "capability_integration_test.py").read_text(encoding="utf-8")
     coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
+
+    check_devops_board_center_pane_geometry(views, split_sizing)
 
     required = {
         "left pane splitter": "SplitHandle(width: $sidebarWidth",

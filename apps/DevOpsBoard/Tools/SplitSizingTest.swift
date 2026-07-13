@@ -37,6 +37,7 @@ struct SplitSizingTest {
         )
         assertMonotonicColumn()
         assertNarrowLayoutDoesNotOverflow()
+        assertCenterPaneIntrinsicWidthBudget()
         assertSidebarFooterWidth()
         assertProjectGrouping()
         assertMultiSourceProjectMembership()
@@ -80,6 +81,75 @@ struct SplitSizingTest {
         let compact = consoleLayout(totalWidth: 440, sidebarPreference: 320, inspectorPreference: 320)
         assert(!compact.showsMain, "very narrow layout should prioritize an uncropped sidebar over unusable content panes")
         assertEqual(compact.sidebarWidth, 320, "very narrow layout should keep the preferred sidebar width when it fits")
+    }
+
+    // This fixture mirrors the reported 1180-point three-pane window: the
+    // sidebar had been widened to about 380 points and the inspector retained
+    // its readable minimum. The split frames themselves fit, but a 520-point
+    // segmented control was wider than the main pane's padded content and made
+    // SwiftUI center-crop the entire content stack. Keep the wider control so
+    // the guard distinguishes a real narrow overflow from an intentional fixed
+    // maximum that fits at ordinary desktop widths.
+    private static func assertCenterPaneIntrinsicWidthBudget() {
+        let narrow = consoleLayout(totalWidth: 1180, sidebarPreference: 380, inspectorPreference: 320)
+        assert(narrow.showsMain && narrow.showsInspector, "1180-point regression fixture must retain all three panes")
+        assertEqual(narrow.mainWidth, 464, "1180-point regression fixture should reproduce the reported main-pane width")
+
+        let narrowBodyWidth = max(0, narrow.mainWidth - 28)
+        assert(
+            childOverflows(availableWidth: narrowBodyWidth, intrinsicWidth: 520),
+            "guard must catch the legacy fixed resource tabs that widened and cropped the 1180-point main pane"
+        )
+        assert(
+            !childOverflows(
+                availableWidth: narrowBodyWidth,
+                intrinsicWidth: responsiveWidth(availableWidth: narrowBodyWidth, minimum: 280, maximum: 520)
+            ),
+            "responsive resource tabs must stay within the padded 1180-point main pane"
+        )
+
+        let narrowToolbarWidth = max(0, narrow.mainWidth - 24)
+        let legacyCompactToolbarMinimum: CGFloat = 132 + 120 + 88 + (3 * 32) + (5 * 6)
+        assert(
+            childOverflows(availableWidth: narrowToolbarWidth, intrinsicWidth: legacyCompactToolbarMinimum),
+            "guard must catch the compact toolbar action cluster clipped in the reported 1180-point window"
+        )
+        let adaptiveNarrowToolbarMinimum: CGFloat = 108 + 72 + 44 + (3 * 32) + (5 * 6)
+        assert(
+            !childOverflows(availableWidth: narrowToolbarWidth, intrinsicWidth: adaptiveNarrowToolbarMinimum),
+            "the narrow toolbar fallback must fit the reported 1180-point main pane"
+        )
+
+        let normalFilterMinimum: CGFloat = 32 + 220 + 78 + (3 * 12)
+        let bulkFilterMinimum: CGFloat = normalFilterMinimum + 64 + 108 + (2 * 12)
+        assert(
+            !childOverflows(availableWidth: narrowBodyWidth, intrinsicWidth: normalFilterMinimum),
+            "ordinary filter controls should fit the reported main-pane width"
+        )
+        assert(
+            childOverflows(availableWidth: narrowBodyWidth, intrinsicWidth: bulkFilterMinimum),
+            "guard must keep the bulk-selection filter row on an adaptive layout path"
+        )
+
+        let wide = consoleLayout(totalWidth: 1440, sidebarPreference: 380, inspectorPreference: 320)
+        let wideBodyWidth = max(0, wide.mainWidth - 28)
+        let wideToolbarWidth = max(0, wide.mainWidth - 24)
+        assert(
+            !childOverflows(availableWidth: wideBodyWidth, intrinsicWidth: 520),
+            "a 520-point resource-tab maximum is intentional and must not be rejected when it fits"
+        )
+        assert(
+            !childOverflows(availableWidth: wideToolbarWidth, intrinsicWidth: legacyCompactToolbarMinimum),
+            "the overflow detector must not flag the same toolbar footprint at a wider desktop layout"
+        )
+    }
+
+    private static func responsiveWidth(availableWidth: CGFloat, minimum: CGFloat, maximum: CGFloat) -> CGFloat {
+        min(maximum, max(minimum, availableWidth))
+    }
+
+    private static func childOverflows(availableWidth: CGFloat, intrinsicWidth: CGFloat) -> Bool {
+        intrinsicWidth > availableWidth
     }
 
     private static func assertSidebarFooterWidth() {

@@ -51,11 +51,41 @@ class FakeTimeline:
             self.on_sleep(self.now)
 
 
-def unified_line(pid: int, outcome: str, loaded: int, total: int) -> str:
+def fixture_source_fingerprint(label: str) -> str:
+    return verifier.source_fingerprint(f"/fixture/coordinator/{label}")
+
+
+def unified_line(
+    pid: int,
+    outcome: str,
+    loaded: int,
+    total: int,
+    *,
+    sources: tuple[str, ...] | None = None,
+    disabled: tuple[str, ...] = (),
+    server_counts: tuple[tuple[str, int], ...] | None = None,
+    managed: int = 0,
+    visible: int | None = None,
+) -> str:
+    if sources is None:
+        sources = tuple(fixture_source_fingerprint(f"source-{index}") for index in range(loaded))
+    visible = managed if visible is None else visible
+    if server_counts is None:
+        server_counts = tuple(
+            (fingerprint, managed if len(sources) == 1 else 0)
+            for fingerprint in sources
+        )
+    source_evidence = ",".join(sources) or "none"
+    disabled_evidence = ",".join(disabled) or "none"
+    server_count_evidence = ",".join(
+        f"{fingerprint}:{count}" for fingerprint, count in server_counts
+    ) or "none"
     return (
         "2026-07-13 17:10:00.000 I  DevOpsBoard"
         f"[{pid}:abc123] [local.holyskills.codex-ops-console:inventory] "
-        f"Inventory refresh {outcome} pid={pid} loaded={loaded} total={total}\n"
+        f"Inventory refresh {outcome} pid={pid} loaded={loaded} total={total} "
+        f"sources={source_evidence} disabled={disabled_evidence} server_counts={server_count_evidence} "
+        f"managed={managed} visible={visible}\n"
     )
 
 
@@ -68,6 +98,9 @@ def run_wait(
     identity_reader: Callable[[int], object | None] | None = None,
     capture_pid: int | None = None,
     is_alive: Callable[[int], bool] = lambda _pid: True,
+    expected_source_fingerprint: str | None = None,
+    expected_source_inventory: str | None = None,
+    require_unfiltered_servers: bool = False,
 ) -> object:
     timeline = timeline or FakeTimeline()
     expected = verifier.ProcessIdentity(
@@ -83,6 +116,9 @@ def run_wait(
         poll_interval=0.05,
         stabilization=0.1,
         capture_pid=capture_pid,
+        expected_source_fingerprint=expected_source_fingerprint,
+        expected_source_inventory=expected_source_inventory,
+        require_unfiltered_servers=require_unfiltered_servers,
         identity_reader=identity_reader,
         is_alive=is_alive,
         monotonic=timeline.monotonic,
@@ -109,6 +145,9 @@ def check_build_script_wiring() -> None:
     launch = gate.find("launch_app")
     pid = gate.find('app_pid="$1"')
     verifier_call = gate.find('"$VERIFIER" inspect')
+    source_expectation = gate.find('"$VERIFIER" expected-inventory')
+    check(source_expectation >= 0, "launch gate does not derive the OS-account source expectation")
+    check(source_expectation < launch, "source expectation is derived after app launch")
     check(capture >= 0, "launch-readiness gate does not start a unified-log capture")
     check(launch > capture, "app launches before the fresh unified-log capture starts")
     check(pid > launch, "launch-readiness gate does not bind the fresh app PID")
@@ -116,6 +155,11 @@ def check_build_script_wiring() -> None:
     check("--capture-pid \"$capture_pid\"" in gate, "launch gate does not monitor its log capture")
     check("--expected-executable \"$expected_executable\"" in gate, "launch gate does not bind the exact executable")
     check("--expected-start \"$app_start\"" in gate, "launch gate does not bind process start identity")
+    check(
+        '--expected-source-inventory "$expected_source_inventory"' in gate,
+        "launch gate does not require source-bound packaged-helper inventory evidence",
+    )
+    check("--expect-unfiltered-servers" in gate, "launch gate does not verify clean-launch server visibility")
     check("--stabilization 1.5" in gate, "launch gate lacks the sustained-health window")
     check(" terminate \\\n" in gate, "failed launch does not invoke identity-bound cleanup")
     check(
@@ -193,12 +237,21 @@ def check_shell_behavior_harness(temp: Path) -> None:
 
         command = sys.argv[2]
         state = Path(os.environ["HARNESS_STATE"])
+        if command == "expected-inventory":
+            if "--coordinator-script" not in sys.argv:
+                raise SystemExit(2)
+            print("a" * 64 + ":16")
+            raise SystemExit(0)
         if command == "inspect":
             if not state.exists():
                 raise SystemExit(1)
             print("Mon Jul 13 17:00:00 2026")
             raise SystemExit(0)
         if command == "wait":
+            expected_index = sys.argv.index("--expected-source-inventory")
+            if sys.argv[expected_index + 1] != "a" * 64 + ":16" or "--expect-unfiltered-servers" not in sys.argv:
+                print("source readiness arguments missing", file=sys.stderr)
+                raise SystemExit(2)
             if os.environ["HARNESS_WAIT_RESULT"] == "success":
                 print("fixture ready")
                 raise SystemExit(0)
@@ -223,6 +276,7 @@ def check_shell_behavior_harness(temp: Path) -> None:
                 "set -euo pipefail",
                 'APP_NAME="DevOpsBoard"',
                 'BUNDLE_ID="fixture.devops-board"',
+                f'APP_BUNDLE="{app_binary.parent}"',
                 f'APP_BINARY="{app_binary}"',
                 f'PYTHON_COMMAND="{fake_python}"',
                 'PS_COMMAND="/bin/ps"',
@@ -290,6 +344,358 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="devops-board-launch-readiness-") as raw_temp:
         temp = Path(raw_temp)
 
+        account_home = temp / "account-home"
+        canonical_source = account_home / ".codex/agent-coordinator"
+        canonical_source.mkdir(parents=True)
+        (canonical_source / "state.json").write_text(
+            '{"servers":{},"leases":{},"history":[],"port_assignments":{}}\n',
+            encoding="utf-8",
+        )
+        canonical_fingerprint = verifier.expected_automatic_source_fingerprint(
+            account_home=account_home,
+            environment={},
+        )
+        check(
+            canonical_fingerprint == verifier.source_fingerprint(canonical_source),
+            "automatic OS-account source fingerprint did not use the canonical account home",
+        )
+        check(
+            canonical_fingerprint is not None and len(canonical_fingerprint) == 64,
+            "automatic source fingerprint is not exact 64-hex evidence",
+        )
+        absent_home = temp / "account-without-coordinator"
+        absent_home.mkdir()
+        check(
+            verifier.expected_automatic_source_fingerprint(account_home=absent_home, environment={}) is None,
+            "absent automatic source incorrectly became a launch requirement",
+        )
+        try:
+            verifier.expected_automatic_source_fingerprint(
+                account_home=account_home,
+                environment={},
+                entry_exists=lambda _path: (_ for _ in ()).throw(PermissionError("fixture denied")),
+            )
+        except PermissionError:
+            # An injected observer is already outside the production
+            # sanitizer; separately exercise that sanitizer below.
+            pass
+        else:
+            raise AssertionError("unobservable automatic source was collapsed to absent")
+        original_stat = verifier.os.stat
+
+        def denied_stat(_path: object) -> object:
+            raise PermissionError(13, "fixture denied", str(canonical_source))
+
+        verifier.os.stat = denied_stat
+        try:
+            try:
+                verifier.observable_entry_exists(canonical_source)
+            except verifier.LaunchReadinessError as error:
+                check(
+                    str(canonical_source) not in str(error),
+                    "observer failure leaked the private automatic-source path",
+                )
+            else:
+                raise AssertionError("permission-denied source observation was treated as absent")
+        finally:
+            verifier.os.stat = original_stat
+
+        # Must-catch: all auto-discovery channels used by the product are
+        # required, including two Parall-hosted Codex instances. Lexical aliases
+        # of one physical source are deduplicated by canonical path.
+        multi_home = temp / "multi-instance-account"
+        multi_sources = (
+            multi_home / ".codex/agent-coordinator",
+            multi_home / ".claude/agent-coordinator",
+            multi_home / "Library/Application Support/Parall/Codex A/.codex/agent-coordinator",
+            multi_home / "Library/Application Support/Parall/Codex B/.codex/agent-coordinator",
+        )
+        source_counts = (16, 3, 0, 2)
+        for source, count in zip(multi_sources, source_counts):
+            source.mkdir(parents=True)
+            (source / "state.json").write_text(
+                '{"fixture_server_count":' + str(count) + '}\n',
+                encoding="utf-8",
+            )
+        alias = temp / "codex-source-alias"
+        alias.symlink_to(multi_sources[0], target_is_directory=True)
+        discovered = verifier.automatic_source_paths(
+            account_home=multi_home,
+            environment={"CODEX_AGENT_COORDINATOR_HOME": str(alias)},
+        )
+        check(
+            discovered == multi_sources,
+            f"multi-instance automatic discovery was incomplete or not canonical: {discovered!r}",
+        )
+        multi_fingerprints = tuple(sorted(verifier.source_fingerprint(path) for path in multi_sources))
+        check(
+            verifier.expected_automatic_source_fingerprints(
+                account_home=multi_home,
+                environment={"CODEX_AGENT_COORDINATOR_HOME": str(alias)},
+            )
+            == multi_fingerprints,
+            "automatic source evidence did not cover both Codex instances and both account channels",
+        )
+
+        fake_coordinator = temp / "fixture-coordinator.py"
+        write_executable(
+            fake_coordinator,
+            """
+            #!/usr/bin/env python3
+            import json
+            import os
+            from pathlib import Path
+
+            home = Path(os.environ["CODEX_AGENT_COORDINATOR_HOME"])
+            count = json.loads((home / "state.json").read_text())["fixture_server_count"]
+            print(json.dumps({"coordinator_home": str(home), "servers": [{}] * count}))
+            """,
+        )
+        measured_inventory = verifier.collect_expected_source_inventory(
+            coordinator_script=fake_coordinator,
+            source_paths=multi_sources,
+        )
+        expected_count_by_fingerprint = {
+            verifier.source_fingerprint(path): count
+            for path, count in zip(multi_sources, source_counts)
+        }
+        check(
+            dict(measured_inventory) == expected_count_by_fingerprint,
+            "packaged-helper preflight did not bind each source to its real server count",
+        )
+        measured_inventory_argument = verifier.format_expected_source_inventory(measured_inventory)
+
+        # Must-catch: the app successfully loads a valid-but-empty coordinator
+        # under an inherited pseudo-home instead of the existing OS-account
+        # source. A source-count-only gate previously accepted this incident.
+        wrong_empty_fingerprint = fixture_source_fingerprint("wrong-valid-empty-home")
+        wrong_empty = temp / "wrong-valid-empty-home.log"
+        wrong_empty_line = unified_line(
+            4090,
+            "completed",
+            1,
+            1,
+            sources=(wrong_empty_fingerprint,),
+            managed=0,
+            visible=0,
+        )
+        wrong_empty.write_text(wrong_empty_line, encoding="utf-8")
+        check(str(account_home) not in wrong_empty_line, "telemetry leaked a private source path")
+        expect_failure(
+            lambda: run_wait(
+                wrong_empty,
+                expected_pid=4090,
+                expected_source_fingerprint=canonical_fingerprint,
+                require_unfiltered_servers=True,
+            ),
+            "neither loaded nor explicitly disabled",
+            "wrong valid empty coordinator home passed source-bound readiness",
+        )
+
+        # False-positive control: an existing but genuinely empty automatic
+        # source is ready when its identity was loaded and zero rows are shown.
+        legitimate_empty = temp / "legitimate-empty-home.log"
+        legitimate_empty.write_text(
+            unified_line(
+                4091,
+                "completed",
+                1,
+                1,
+                sources=(canonical_fingerprint,),
+                managed=0,
+                visible=0,
+            ),
+            encoding="utf-8",
+        )
+        empty_ready = run_wait(
+            legitimate_empty,
+            expected_pid=4091,
+            expected_source_fingerprint=canonical_fingerprint,
+            require_unfiltered_servers=True,
+        )
+        check(
+            empty_ready.managed_servers == 0 and empty_ready.visible_servers == 0,
+            "legitimate empty automatic source did not pass readiness",
+        )
+
+        # Must-catch: correct source identity is not enough when the direct
+        # helper measured real rows and the Board decoded/merged zero of them.
+        dropped_real_rows = temp / "dropped-real-rows.log"
+        dropped_real_rows.write_text(
+            unified_line(
+                4094,
+                "completed",
+                1,
+                1,
+                sources=(canonical_fingerprint,),
+                managed=0,
+                visible=0,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(
+                dropped_real_rows,
+                expected_pid=4094,
+                expected_source_inventory=f"{canonical_fingerprint}:16",
+                require_unfiltered_servers=True,
+            ),
+            "did not match packaged-helper preflight",
+            "populated source decoded as zero servers passed readiness",
+        )
+
+        multi_loaded_counts = tuple(
+            sorted(
+                (verifier.source_fingerprint(path), count)
+                for path, count in zip(multi_sources, source_counts)
+            )
+        )
+        all_instances = temp / "all-codex-instances.log"
+        all_instances.write_text(
+            unified_line(
+                4095,
+                "completed",
+                4,
+                4,
+                sources=tuple(fingerprint for fingerprint, _count in multi_loaded_counts),
+                server_counts=multi_loaded_counts,
+                managed=sum(source_counts),
+                visible=sum(source_counts),
+            ),
+            encoding="utf-8",
+        )
+        check(
+            run_wait(
+                all_instances,
+                expected_pid=4095,
+                expected_source_inventory=measured_inventory_argument,
+                require_unfiltered_servers=True,
+            ).loaded
+            == 4,
+            "two-instance source set did not pass source-bound readiness",
+        )
+
+        missing_instance = temp / "missing-codex-instance.log"
+        present_counts = multi_loaded_counts[:-1]
+        missing_instance.write_text(
+            unified_line(
+                4096,
+                "completed",
+                3,
+                3,
+                sources=tuple(fingerprint for fingerprint, _count in present_counts),
+                server_counts=present_counts,
+                managed=sum(count for _fingerprint, count in present_counts),
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(
+                missing_instance,
+                expected_pid=4096,
+                expected_source_inventory=measured_inventory_argument,
+            ),
+            "1 automatic OS-account coordinator source(s)",
+            "one missing Codex-instance source passed multi-source readiness",
+        )
+
+        disabled_fingerprint, _disabled_count = multi_loaded_counts[-1]
+        intentionally_disabled_instance = temp / "disabled-codex-instance.log"
+        intentionally_disabled_instance.write_text(
+            unified_line(
+                4097,
+                "completed",
+                3,
+                3,
+                sources=tuple(fingerprint for fingerprint, _count in present_counts),
+                disabled=(disabled_fingerprint,),
+                server_counts=present_counts,
+                managed=sum(count for _fingerprint, count in present_counts),
+            ),
+            encoding="utf-8",
+        )
+        check(
+            run_wait(
+                intentionally_disabled_instance,
+                expected_pid=4097,
+                expected_source_inventory=measured_inventory_argument,
+            ).loaded
+            == 3,
+            "explicitly disabled second-instance source caused a false readiness failure",
+        )
+
+        # Explicitly disabling the automatic source is intentional. Another
+        # loaded source keeps the Board usable and the gate must not override
+        # that persisted user choice.
+        explicitly_disabled = temp / "explicitly-disabled.log"
+        explicitly_disabled.write_text(
+            unified_line(
+                4092,
+                "completed",
+                1,
+                1,
+                sources=(fixture_source_fingerprint("enabled-alternate"),),
+                disabled=(canonical_fingerprint,),
+            ),
+            encoding="utf-8",
+        )
+        disabled_ready = run_wait(
+            explicitly_disabled,
+            expected_pid=4092,
+            expected_source_fingerprint=canonical_fingerprint,
+        )
+        check(disabled_ready.loaded == 1, "explicitly disabled automatic source caused a false failure")
+
+        # Must-catch: an unmeasured helper preflight cannot silently bless a
+        # loaded source. The same unknown evidence is intentional when that
+        # source is explicitly disabled and therefore not read by the Board.
+        unmeasured_loaded = temp / "unmeasured-loaded-source.log"
+        unmeasured_loaded.write_text(
+            unified_line(
+                4098,
+                "completed",
+                1,
+                1,
+                sources=(canonical_fingerprint,),
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(
+                unmeasured_loaded,
+                expected_pid=4098,
+                expected_source_inventory=f"{canonical_fingerprint}:?",
+            ),
+            "could not measure a loaded automatic source",
+            "unmeasured loaded source passed packaged-helper readiness",
+        )
+        unknown_but_disabled = run_wait(
+            explicitly_disabled,
+            expected_pid=4092,
+            expected_source_inventory=f"{canonical_fingerprint}:?",
+        )
+        check(
+            unknown_but_disabled.loaded == 1,
+            "an intentionally disabled unmeasured source caused a false readiness failure",
+        )
+
+        # No account source means there is no identity requirement. This is a
+        # separate control from a present-but-empty account source.
+        no_account_requirement = temp / "no-account-source.log"
+        no_account_requirement.write_text(
+            unified_line(4093, "completed", 1, 1, sources=(wrong_empty_fingerprint,)),
+            encoding="utf-8",
+        )
+        check(
+            run_wait(
+                no_account_requirement,
+                expected_pid=4093,
+                expected_source_fingerprint=None,
+            ).loaded
+            == 1,
+            "absent account source incorrectly constrained another loaded source",
+        )
+
         # Common intentional state: one coordinator source loaded while Docker
         # is degraded. Readiness is source-level, so the capability warning must
         # not be mistaken for a launch failure.
@@ -353,6 +759,121 @@ def main() -> int:
             "completed marker with no loaded source passed readiness",
         )
 
+        missing_source_evidence = temp / "missing-source-evidence.log"
+        missing_source_evidence.write_text(
+            unified_line(4150, "completed", 1, 1, sources=()),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(missing_source_evidence, expected_pid=4150),
+            "0 source fingerprints for 1 loaded sources",
+            "loaded source without identity evidence passed readiness",
+        )
+
+        duplicate_fingerprint = fixture_source_fingerprint("duplicate")
+        duplicate_sources = temp / "duplicate-sources.log"
+        duplicate_sources.write_text(
+            unified_line(
+                4151,
+                "completed",
+                2,
+                2,
+                sources=(duplicate_fingerprint, duplicate_fingerprint),
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(duplicate_sources, expected_pid=4151),
+            "repeats a source fingerprint",
+            "duplicate loaded-source evidence passed readiness",
+        )
+
+        overlap = temp / "loaded-disabled-overlap.log"
+        overlap.write_text(
+            unified_line(
+                4152,
+                "completed",
+                1,
+                1,
+                sources=(duplicate_fingerprint,),
+                disabled=(duplicate_fingerprint,),
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(overlap, expected_pid=4152),
+            "loaded and disabled",
+            "overlapping loaded/disabled source evidence passed readiness",
+        )
+
+        duplicate_disabled = temp / "duplicate-disabled-sources.log"
+        duplicate_disabled.write_text(
+            unified_line(
+                4156,
+                "completed",
+                1,
+                1,
+                disabled=(duplicate_fingerprint, duplicate_fingerprint),
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(duplicate_disabled, expected_pid=4156),
+            "repeats a disabled source fingerprint",
+            "duplicate disabled-source evidence passed readiness",
+        )
+
+        malformed = temp / "malformed-source-evidence.log"
+        malformed.write_text(
+            unified_line(4153, "completed", 1, 1).replace(
+                fixture_source_fingerprint("source-0"),
+                "A" * 64,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(malformed, expected_pid=4153),
+            "timed out",
+            "malformed source fingerprint satisfied the exact marker",
+        )
+
+        try:
+            verifier.normalize_expected_source_fingerprint("a" * 63)
+        except ValueError as error:
+            check("64 lowercase hex" in str(error), "invalid expected-source diagnostic was unclear")
+        else:
+            raise AssertionError("short expected source fingerprint was accepted")
+
+        hidden_managed_servers = temp / "hidden-managed-servers.log"
+        hidden_managed_servers.write_text(
+            unified_line(4154, "completed", 1, 1, managed=3, visible=0),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(
+                hidden_managed_servers,
+                expected_pid=4154,
+                require_unfiltered_servers=True,
+            ),
+            "rendered 0 of 3 managed servers",
+            "clean launch hid managed servers but passed readiness",
+        )
+        check(
+            run_wait(hidden_managed_servers, expected_pid=4154).visible_servers == 0,
+            "intentional runtime filtering was rejected outside the clean-launch gate",
+        )
+
+        impossible_server_counts = temp / "impossible-server-counts.log"
+        impossible_server_counts.write_text(
+            unified_line(4155, "completed", 1, 1, managed=0, visible=1),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(impossible_server_counts, expected_pid=4155),
+            "more visible than managed",
+            "impossible managed/visible server counts passed readiness",
+        )
+
         near_match = temp / "near-match.log"
         near_match.write_text(
             unified_line(4107, "completed", 1, 1).rstrip("\n") + " debug-copy\n",
@@ -367,8 +888,21 @@ def main() -> int:
         # Intentional partial-source state: one usable coordinator is enough for
         # the Board to operate even while another source is unavailable.
         partial_sources = temp / "partial-sources.log"
-        partial_sources.write_text(unified_line(4108, "completed", 1, 2), encoding="utf-8")
-        partial_ready = run_wait(partial_sources, expected_pid=4108)
+        partial_sources.write_text(
+            unified_line(
+                4108,
+                "completed",
+                1,
+                2,
+                sources=(canonical_fingerprint,),
+            ),
+            encoding="utf-8",
+        )
+        partial_ready = run_wait(
+            partial_sources,
+            expected_pid=4108,
+            expected_source_fingerprint=canonical_fingerprint,
+        )
         check(
             partial_ready.loaded == 1 and partial_ready.total == 2,
             "one loaded source out of two was incorrectly rejected",
@@ -378,10 +912,12 @@ def main() -> int:
         # line and a current marker split across separate writes.
         incremental = temp / "incremental.log"
         incremental.write_text("", encoding="utf-8")
+        current_incremental_line = unified_line(4109, "completed", 1, 2)
+        split_at = current_incremental_line.index("disabled=") + len("disabled=") + 7
         chunks = [
             unified_line(3999, "completed", 1, 1)
-            + unified_line(4109, "completed", 1, 2).rsplit("total=", 1)[0],
-            "total=2\n",
+            + current_incremental_line[:split_at],
+            current_incremental_line[split_at:],
         ]
 
         def append_incremental(_now: float) -> None:

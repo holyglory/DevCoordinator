@@ -43,24 +43,36 @@ The bundled script stores leases and server metadata under:
 ~/.codex/agent-coordinator/
 ```
 
-The default is relative to the current process's resolved home. It is shared
-only by runtimes executing as the same OS user with the same home. A sandboxed
-desktop runtime, VM, or different account can resolve another directory. Run
-`inventory` in each runtime and compare its `coordinator_home` field before
-assuming that leases and operations are mutually visible.
+By default the coordinator resolves the effective POSIX account through
+`getpwuid(geteuid())` and stores state below that account home. It deliberately
+does not derive this default from `HOME`, `CFFIXED_USER_HOME`, or a desktop
+host's remapped user-domain root. Two Codex or Parall instances with one
+effective UID therefore converge on one coordinator home and one lock even
+when their runtime-home environment values differ. Run `inventory` in every
+runtime and compare its `coordinator_home` field when verifying the boundary.
 
-For multiple runtimes owned by one OS user, set the same absolute private path
-in every runtime when shared coordination is required:
+An explicit absolute override remains authoritative. Set the same override in
+every same-UID runtime only when an alternate coordination domain is required:
 
 ```bash
 export CODEX_AGENT_COORDINATOR_HOME=/path/to/shared/codex-agent-coordinator
 ```
 
-Do not use one coordinator home across different OS users or VM security
-boundaries. The directory is deliberately `0700` and the coordinator has no
-multi-user ACL, authentication, or ownership protocol. Keep separate homes and
-aggregate their read-only inventories through an explicitly source-aware tool
-when cross-boundary visibility is needed.
+Separate coordinator homes do not share a reservation lock. Two deliberately
+different overrides, different effective UIDs, or separate VMs can each lease
+the same currently free host port, so neither lease is evidence of host-wide
+uniqueness. Listener checks prevent many later collisions, but they cannot
+close a simultaneous pre-launch race between independent homes.
+
+Do not use one coordinator home across different effective OS users or VM
+security boundaries. The coordinator validates that every private directory is
+owned by its effective UID and has mode `0700`; it has no multi-user ACL,
+authentication, or ownership protocol. Different Linux users therefore keep
+separate homes and do not receive cross-user port uniqueness from the state
+lock. Use deliberately disjoint port ranges or an authorized system-level
+broker when accounts must run services on one host. Aggregate separate homes'
+read-only inventories through an explicitly source-aware tool when
+cross-boundary visibility is needed; keep mutations bound to their source.
 
 The script uses a lock file in that directory so concurrent agents cannot lease
 the same port. The lock protects short state snapshot, reservation, and commit

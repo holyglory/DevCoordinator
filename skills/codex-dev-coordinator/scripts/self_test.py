@@ -23,6 +23,7 @@ from shutil import rmtree, which as _which
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "dev_coordinator.py"
+MULTI_RUNTIME_TEST = ROOT / "scripts" / "self_test_multi_runtime.py"
 SKILL = ROOT / "SKILL.md"
 
 # macOS CI runners black-hole reverse DNS lookups, which hangs
@@ -96,6 +97,25 @@ def run_fail(args: list[str], *, env: dict[str, str], expected: str) -> None:
     haystack = f"{result.stdout}\n{result.stderr}"
     if expected not in haystack:
         raise AssertionError(f"failure did not mention {expected!r}: {' '.join(args)}\n{haystack}")
+
+
+def check_multi_runtime_boundaries() -> None:
+    result = subprocess.run(
+        [sys.executable, str(MULTI_RUNTIME_TEST)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            "multi-runtime boundary self-test failed\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    check(
+        result.stdout.strip() == "multi-runtime self-test ok",
+        f"multi-runtime boundary self-test returned unexpected output: {result.stdout!r}",
+    )
 
 
 def request_http(
@@ -1787,6 +1807,7 @@ def main() -> int:
     check_http_fixture_policy()
     check_listener_and_health_helpers()
     check_registration_pid_guards()
+    check_multi_runtime_boundaries()
     tmp = Path(tempfile.mkdtemp(prefix="codex-dev-coordinator-self-test-")).resolve(strict=True)
     env = os.environ.copy()
     env["CODEX_AGENT_COORDINATOR_HOME"] = str(tmp / "state")
@@ -1817,6 +1838,9 @@ def main() -> int:
             "Authorization: Bearer",
             "non-loopback",
             "outside the cross-agent lock",
+            "getpwuid(geteuid())",
+            "Separate coordinator homes do not share a reservation lock",
+            "owned by its effective UID",
         ):
             check(needle in skill_text, f"SKILL.md should retain policy text: {needle}")
 

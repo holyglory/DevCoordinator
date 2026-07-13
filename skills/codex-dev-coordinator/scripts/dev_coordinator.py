@@ -16,6 +16,7 @@ import http.server
 import ipaddress
 import json
 import os
+import pwd
 import re
 import secrets
 import shlex
@@ -327,11 +328,35 @@ def iso_timestamp(value: float | None = None) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value or now()))
 
 
+def posix_account_home(
+    *,
+    effective_uid: int | None = None,
+    account_lookup: Any | None = None,
+) -> Path:
+    """Resolve the stable POSIX account home for one effective user."""
+
+    uid = os.geteuid() if effective_uid is None else int(effective_uid)
+    lookup = pwd.getpwuid if account_lookup is None else account_lookup
+    try:
+        record = lookup(uid)
+    except (KeyError, OSError) as error:
+        raise RuntimeError(
+            f"could not resolve POSIX account home for effective uid {uid}: {error}"
+        ) from error
+    raw_home = str(getattr(record, "pw_dir", "") or "")
+    home = Path(raw_home)
+    if not raw_home or not home.is_absolute():
+        raise RuntimeError(
+            f"POSIX account home for effective uid {uid} is not an absolute path"
+        )
+    return home.resolve()
+
+
 def coordinator_home() -> Path:
     configured = os.environ.get("CODEX_AGENT_COORDINATOR_HOME")
     if configured:
         return Path(configured).expanduser().resolve()
-    return Path.home() / ".codex" / "agent-coordinator"
+    return posix_account_home() / ".codex" / "agent-coordinator"
 
 
 def state_path() -> Path:
@@ -353,10 +378,38 @@ def api_token_path() -> Path:
     return coordinator_home() / "api-token"
 
 
+def validate_private_directory(
+    path: Path,
+    *,
+    effective_uid: int | None = None,
+) -> None:
+    """Require one effective OS user to own a private coordinator directory."""
+
+    metadata = path.stat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PermissionError(f"private coordinator path is not a directory: {path}")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode != 0o700:
+        raise PermissionError(
+            f"private coordinator directory must be mode 0700, got {mode:04o}: {path}"
+        )
+    expected_uid = os.geteuid() if effective_uid is None else int(effective_uid)
+    if metadata.st_uid != expected_uid:
+        raise PermissionError(
+            f"private coordinator directory is owned by uid {metadata.st_uid}, "
+            f"not effective uid {expected_uid}: {path}"
+        )
+
+
 def ensure_private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with contextlib.suppress(OSError):
+    try:
         path.chmod(0o700)
+    except OSError as error:
+        raise PermissionError(
+            f"could not make coordinator directory private: {path}: {error}"
+        ) from error
+    validate_private_directory(path)
 
 
 def atomic_write_private(path: Path, content: str) -> None:

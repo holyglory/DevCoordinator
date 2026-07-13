@@ -700,7 +700,11 @@ struct ResourceTabBar: View {
         }
         .pickerStyle(.segmented)
         .labelsHidden()
-        .frame(width: 520, alignment: .leading)
+        // Keep the segmented control inside the main pane at the minimum
+        // supported three-column window width. A fixed 520-point child plus
+        // the board's horizontal padding widened the whole content stack and
+        // caused SwiftUI to center-crop every sibling in the pane.
+        .frame(minWidth: 280, maxWidth: 520, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -718,7 +722,9 @@ struct ToolbarView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            if proxy.size.width < 760 {
+            if proxy.size.width < 520 {
+                narrowToolbar
+            } else if proxy.size.width < 760 {
                 compactToolbar
             } else {
                 fullToolbar
@@ -778,6 +784,31 @@ struct ToolbarView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
+
+    private var narrowToolbar: some View {
+        HStack(spacing: 6) {
+            EnvironmentPicker(projectPath: $store.projectPath)
+                .frame(width: 108)
+            SearchField(text: $store.searchText, compact: true)
+                .frame(minWidth: 72, maxWidth: .infinity)
+            SourceHealthChip(store: store, compact: true, minimal: true)
+            ToolbarButton(title: "Refresh", systemImage: "arrow.clockwise", showsTitle: false) {
+                store.refresh()
+            }
+            .disabled(store.isLoading)
+            ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus", showsTitle: false) {
+                store.prepareLeaseDraft()
+                store.showingLeaseSheet = true
+            }
+            .disabled(!unscopedActionAllowed(store, kind: .leasePort))
+            ToolbarButton(title: "Start", systemImage: "play.circle.fill", tint: Theme.green, showsTitle: false) {
+                store.prepareStartDraft()
+                store.showingStartSheet = true
+            }
+            .disabled(!unscopedActionAllowed(store, kind: .startServer))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
 }
 
 struct FilterRow: View {
@@ -786,49 +817,93 @@ struct FilterRow: View {
     let reviewSelection: () -> Void
 
     var body: some View {
+        ViewThatFits(in: .horizontal) {
+            regularRow
+            compactRow
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var regularRow: some View {
         HStack(spacing: 12) {
             Text("Filter")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Theme.secondary)
-            Picker("Filter", selection: $store.filter) {
-                ForEach(ServiceFilter.allCases) { filter in
-                    Label(filter.rawValue, systemImage: filterIcon(filter))
-                        .tag(filter)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 360)
+            filterPicker
 
             Spacer()
-            if bulkSelectionMode {
-                Text("\(store.bulkSelection.selected.count) selected")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(store.bulkSelection.selected.isEmpty ? Theme.secondary : Theme.primary)
-                    .accessibilityIdentifier("bulk-selected-count")
-                Button("Review Stop…", action: reviewSelection)
-                    .buttonStyle(.borderedProminent)
-                    .tint(Theme.red)
-                    .disabled(store.bulkSelection.selected.isEmpty)
-                    .accessibilityIdentifier("bulk-review-stop")
+            HStack(spacing: 12) {
+                if bulkSelectionMode {
+                    selectionCount
+                    reviewButton
+                }
+                selectionModeButton
             }
-            Button {
-                bulkSelectionMode.toggle()
-                if !bulkSelectionMode { store.clearBulkSelection() }
-            } label: {
-                Label(bulkSelectionMode ? "Done" : "Select", systemImage: bulkSelectionMode ? "checkmark" : "checklist")
-            }
-            .buttonStyle(.bordered)
-            .keyboardShortcut("s", modifiers: [.command, .shift])
-            .accessibilityIdentifier("bulk-selection-toggle")
+            .fixedSize()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var compactRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                filterPicker
+                selectionModeButton
+                    .fixedSize()
+            }
+            if bulkSelectionMode {
+                HStack(spacing: 8) {
+                    selectionCount
+                    Spacer(minLength: 0)
+                    reviewButton
+                }
+            }
+        }
+    }
+
+    private var filterPicker: some View {
+        Picker("Filter", selection: $store.filter) {
+            ForEach(ServiceFilter.allCases) { filter in
+                Label(filter.rawValue, systemImage: filterIcon(filter))
+                    .tag(filter)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(minWidth: 220, maxWidth: 360)
+    }
+
+    private var selectionCount: some View {
+        Text("\(store.bulkSelection.selected.count) selected")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(store.bulkSelection.selected.isEmpty ? Theme.secondary : Theme.primary)
+            .accessibilityIdentifier("bulk-selected-count")
+    }
+
+    private var reviewButton: some View {
+        Button("Review Stop…", action: reviewSelection)
+            .buttonStyle(.borderedProminent)
+            .tint(Theme.red)
+            .disabled(store.bulkSelection.selected.isEmpty)
+            .accessibilityIdentifier("bulk-review-stop")
+    }
+
+    private var selectionModeButton: some View {
+        Button {
+            bulkSelectionMode.toggle()
+            if !bulkSelectionMode { store.clearBulkSelection() }
+        } label: {
+            Label(bulkSelectionMode ? "Done" : "Select", systemImage: bulkSelectionMode ? "checkmark" : "checklist")
+        }
+        .buttonStyle(.bordered)
+        .keyboardShortcut("s", modifiers: [.command, .shift])
+        .accessibilityIdentifier("bulk-selection-toggle")
     }
 }
 
 struct SourceHealthChip: View {
     @ObservedObject var store: OpsStore
     var compact = false
+    var minimal = false
     @State private var showingDetails = false
 
     var body: some View {
@@ -837,7 +912,7 @@ struct SourceHealthChip: View {
         } label: {
             HStack(spacing: 6) {
                 StatusDot(status: sourceStatus)
-                Text("Sources \(loadedCount)/\(totalCount) \(sourceStatus)")
+                Text(minimal ? "\(loadedCount)/\(totalCount)" : "Sources \(loadedCount)/\(totalCount) \(sourceStatus)")
             }
             .font(.system(size: compact ? 10 : 11, weight: .semibold))
             .padding(.horizontal, compact ? 7 : 9)
@@ -847,6 +922,7 @@ struct SourceHealthChip: View {
         .background(Theme.control)
         .clipShape(Capsule())
         .overlay(Capsule().stroke(statusColor(sourceStatus).opacity(0.35)))
+        .help("Coordinator sources \(loadedCount) of \(totalCount), \(sourceStatus)")
         .accessibilityLabel("Coordinator sources \(loadedCount) of \(totalCount), \(sourceStatus)")
         .accessibilityIdentifier("sources-health-chip")
         .popover(isPresented: $showingDetails, arrowEdge: .bottom) {
@@ -2783,39 +2859,27 @@ struct DevServersEmptyState: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center, spacing: 12) {
-                Group {
-                    if store.isInitialInventoryLoading {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Image(systemName: "terminal")
-                            .foregroundStyle(Theme.blue)
-                    }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: 12) {
+                    stateIcon
+                    stateCopy
+                        .fixedSize(horizontal: true, vertical: false)
+                    Spacer(minLength: 8)
+                    actions
                 }
-                    .foregroundStyle(Theme.blue)
-                    .frame(width: 28, height: 28)
-                    .background(Theme.blue.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 7))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(store.isInitialInventoryLoading ? "Loading managed dev servers" : "No managed dev servers in this scope")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(store.isInitialInventoryLoading ? "Waiting for configured coordinator sources." : "Use the coordinator before opening default ports.")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Theme.secondary)
-                }
-                Spacer()
-                if !store.isInitialInventoryLoading {
-                    ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus") {
-                        store.prepareLeaseDraft()
-                        store.showingLeaseSheet = true
+
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .top, spacing: 12) {
+                        stateIcon
+                        stateCopy
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .disabled(!unscopedActionAllowed(store, kind: .leasePort))
-                    ToolbarButton(title: "Start", systemImage: "play.circle.fill", tint: Theme.green) {
-                        store.prepareStartDraft()
-                        store.showingStartSheet = true
+                    if !store.isInitialInventoryLoading {
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 0)
+                            actions
+                        }
                     }
-                    .disabled(!unscopedActionAllowed(store, kind: .startServer))
                 }
             }
 
@@ -2833,6 +2897,49 @@ struct DevServersEmptyState: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
         .accessibilityIdentifier("dev-server-empty-state")
+    }
+
+    private var stateIcon: some View {
+        Group {
+            if store.isInitialInventoryLoading {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: "terminal")
+                    .foregroundStyle(Theme.blue)
+            }
+        }
+        .foregroundStyle(Theme.blue)
+        .frame(width: 28, height: 28)
+        .background(Theme.blue.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
+    }
+
+    private var stateCopy: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(store.isInitialInventoryLoading ? "Loading managed dev servers" : "No managed dev servers in this scope")
+                .font(.system(size: 13, weight: .semibold))
+            Text(store.isInitialInventoryLoading ? "Waiting for configured coordinator sources." : "Use the coordinator before opening default ports.")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var actions: some View {
+        if !store.isInitialInventoryLoading {
+            ToolbarButton(title: "Lease", systemImage: "calendar.badge.plus") {
+                store.prepareLeaseDraft()
+                store.showingLeaseSheet = true
+            }
+            .disabled(!unscopedActionAllowed(store, kind: .leasePort))
+            ToolbarButton(title: "Start", systemImage: "play.circle.fill", tint: Theme.green) {
+                store.prepareStartDraft()
+                store.showingStartSheet = true
+            }
+            .disabled(!unscopedActionAllowed(store, kind: .startServer))
+        }
     }
 }
 

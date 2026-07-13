@@ -521,8 +521,200 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.createFile(atPath: script.path, contents: Data()))
         defer { try? FileManager.default.removeItem(at: root) }
 
-        let locator = PortableSkillLocator(environment: ["DEVCOORDINATOR_ROOT": root.path], home: "/unused", currentDirectory: "/unused")
+        let locator = PortableSkillLocator(
+            environment: ["DEVCOORDINATOR_ROOT": root.path],
+            currentDirectory: "/unused",
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { nil })
+        )
         XCTAssertEqual(try locator.scriptPath(for: .coordinator), script.path)
+    }
+
+    func testAutomaticPathsUseAccountHomeWhenFoundationHomesAreRemapped() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let accountHome = root.appendingPathComponent("account-home", isDirectory: true)
+        let remappedHome = root.appendingPathComponent("remapped-foundation-home", isDirectory: true)
+        let accountCoordinator = accountHome.appendingPathComponent(".codex/agent-coordinator", isDirectory: true)
+        let remappedCoordinator = remappedHome.appendingPathComponent(".codex/agent-coordinator", isDirectory: true)
+        let accountHelper = accountHome.appendingPathComponent(".codex/skills/codex-dev-coordinator/scripts/dev_coordinator.py")
+        let remappedHelper = remappedHome.appendingPathComponent(".codex/skills/codex-dev-coordinator/scripts/dev_coordinator.py")
+        for coordinator in [accountCoordinator, remappedCoordinator] {
+            try FileManager.default.createDirectory(at: coordinator, withIntermediateDirectories: true)
+            try Data(#"{"version":2}"#.utf8).write(to: coordinator.appendingPathComponent("state.json"))
+        }
+        for helper in [accountHelper, remappedHelper] {
+            try FileManager.default.createDirectory(at: helper.deletingLastPathComponent(), withIntermediateDirectories: true)
+            XCTAssertTrue(FileManager.default.createFile(atPath: helper.path, contents: Data("#!/usr/bin/env python3\n".utf8)))
+        }
+
+        let remappedEnvironment = [
+            "HOME": remappedHome.path,
+            "CFFIXED_USER_HOME": remappedHome.path,
+        ]
+        let resolver = POSIXAccountHomeResolver(resolveAccountHome: { accountHome.path })
+        let origins = FileSystemCoordinatorOriginDiscovery(
+            environment: remappedEnvironment,
+            accountHomeResolver: resolver
+        ).origins()
+        XCTAssertEqual(origins.map(\.home), [accountCoordinator.path])
+        XCTAssertFalse(origins.contains { $0.home == remappedCoordinator.path })
+
+        let locator = PortableSkillLocator(
+            environment: remappedEnvironment,
+            currentDirectory: root.appendingPathComponent("unrelated-checkout").path,
+            bundleResourceRoot: nil,
+            accountHomeResolver: resolver
+        )
+        XCTAssertEqual(try locator.scriptPath(for: .coordinator), accountHelper.path)
+        XCTAssertNotEqual(try locator.scriptPath(for: .coordinator), remappedHelper.path)
+
+        let configurationStore = PrivateCoordinatorConfigurationStore(accountHomeResolver: resolver)
+        XCTAssertEqual(
+            configurationStore.configurationURL.path,
+            accountHome.appendingPathComponent("Library/Application Support/CodexOpsConsole/coordinator-configuration.json").path
+        )
+    }
+
+    func testAutomaticDiscoveryAggregatesTwoParallInstancesForOneAccount() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let accountHome = root.appendingPathComponent("account-home", isDirectory: true)
+        let accountCoordinator = accountHome.appendingPathComponent(".codex/agent-coordinator", isDirectory: true)
+        let firstInstance = accountHome.appendingPathComponent(
+            "Library/Application Support/Parall/ChatGPT Alpha/.codex/agent-coordinator",
+            isDirectory: true
+        )
+        let secondInstance = accountHome.appendingPathComponent(
+            "Library/Application Support/Parall/Codex Beta/.codex/agent-coordinator",
+            isDirectory: true
+        )
+        for coordinator in [accountCoordinator, firstInstance, secondInstance] {
+            try FileManager.default.createDirectory(at: coordinator, withIntermediateDirectories: true)
+            try Data(#"{"version":2}"#.utf8).write(to: coordinator.appendingPathComponent("state.json"))
+        }
+
+        let origins = FileSystemCoordinatorOriginDiscovery(
+            environment: [
+                "HOME": firstInstance.deletingLastPathComponent().deletingLastPathComponent().path,
+                "CFFIXED_USER_HOME": firstInstance.deletingLastPathComponent().deletingLastPathComponent().path,
+            ],
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { accountHome.path })
+        ).origins()
+
+        XCTAssertEqual(
+            origins.map(\.home),
+            [accountCoordinator.path, firstInstance.path, secondInstance.path],
+            "one Board must aggregate the login-account coordinator and both discoverable Parall instance homes"
+        )
+        XCTAssertEqual(Set(origins.map(\.id)).count, 3)
+    }
+
+    func testAutomaticDiscoveryDeduplicatesExplicitAliasAndAutomaticRealSource() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let accountHome = root.appendingPathComponent("account-home", isDirectory: true)
+        let coordinator = accountHome.appendingPathComponent(".codex/agent-coordinator", isDirectory: true)
+        let alias = root.appendingPathComponent("configured-coordinator-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: coordinator, withIntermediateDirectories: true)
+        try Data(#"{"version":2}"#.utf8).write(to: coordinator.appendingPathComponent("state.json"))
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: coordinator)
+
+        let origins = FileSystemCoordinatorOriginDiscovery(
+            environment: ["CODEX_AGENT_COORDINATOR_HOME": alias.path],
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { accountHome.path })
+        ).origins()
+
+        XCTAssertEqual(origins.count, 1)
+        XCTAssertEqual(origins.first?.label, "Configured", "the explicit candidate keeps precedence after physical deduplication")
+        XCTAssertEqual(origins.first?.home, coordinator.resolvingSymlinksInPath().path)
+        XCTAssertEqual(origins.first?.id, coordinator.resolvingSymlinksInPath().path)
+    }
+
+    func testExplicitCoordinatorHomeAndConfigurationURLKeepPrecedence() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let pseudoRuntimeHome = root.appendingPathComponent("pseudo-runtime-home", isDirectory: true)
+        let configuredCoordinator = pseudoRuntimeHome.appendingPathComponent(".codex/agent-coordinator", isDirectory: true)
+        try FileManager.default.createDirectory(at: configuredCoordinator, withIntermediateDirectories: true)
+        let invalidResolver = POSIXAccountHomeResolver(resolveAccountHome: { "relative-account-home" })
+
+        let origins = FileSystemCoordinatorOriginDiscovery(
+            environment: [
+                "HOME": pseudoRuntimeHome.path,
+                "CFFIXED_USER_HOME": pseudoRuntimeHome.path,
+                "CODEX_AGENT_COORDINATOR_HOME": configuredCoordinator.path,
+            ],
+            accountHomeResolver: invalidResolver
+        ).origins()
+        XCTAssertEqual(origins.first?.label, "Configured")
+        XCTAssertEqual(origins.first?.home, configuredCoordinator.path)
+        XCTAssertEqual(origins.count, 1)
+
+        let explicitConfiguration = root.appendingPathComponent("explicit/configuration.json")
+        let configurationStore = PrivateCoordinatorConfigurationStore(
+            configurationURL: explicitConfiguration,
+            accountHomeResolver: invalidResolver
+        )
+        XCTAssertEqual(configurationStore.configurationURL, explicitConfiguration)
+        XCTAssertEqual(
+            configurationStore.lastKnownGoodURL,
+            explicitConfiguration.deletingPathExtension().appendingPathExtension("last-known-good.json")
+        )
+    }
+
+    func testInvalidAccountHomeFailsClosedWithoutUsingHostileRuntimeHome() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let hostileHome = root.appendingPathComponent("hostile-runtime-home", isDirectory: true)
+        let hostileCoordinator = hostileHome.appendingPathComponent(".codex/agent-coordinator", isDirectory: true)
+        let hostileHelper = hostileHome.appendingPathComponent(".codex/skills/codex-dev-coordinator/scripts/dev_coordinator.py")
+        try FileManager.default.createDirectory(at: hostileCoordinator, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: hostileHelper.deletingLastPathComponent(), withIntermediateDirectories: true)
+        XCTAssertTrue(FileManager.default.createFile(atPath: hostileHelper.path, contents: Data()))
+        let hostileEnvironment = [
+            "HOME": hostileHome.path,
+            "CFFIXED_USER_HOME": hostileHome.path,
+        ]
+
+        for resolver in [
+            POSIXAccountHomeResolver(resolveAccountHome: { nil }),
+            POSIXAccountHomeResolver(resolveAccountHome: { "relative-account-home" }),
+        ] {
+            XCTAssertTrue(
+                FileSystemCoordinatorOriginDiscovery(
+                    environment: hostileEnvironment,
+                    accountHomeResolver: resolver
+                ).origins().isEmpty
+            )
+            XCTAssertThrowsError(
+                try PortableSkillLocator(
+                    environment: hostileEnvironment,
+                    currentDirectory: root.appendingPathComponent("unrelated").path,
+                    bundleResourceRoot: nil,
+                    accountHomeResolver: resolver
+                ).scriptPath(for: .coordinator)
+            )
+
+            let configurationStore = PrivateCoordinatorConfigurationStore(accountHomeResolver: resolver)
+            XCTAssertNotEqual(
+                configurationStore.configurationURL.path,
+                hostileHome.appendingPathComponent("Library/Application Support/CodexOpsConsole/coordinator-configuration.json").path
+            )
+            let load = configurationStore.load()
+            XCTAssertNil(load.configuration)
+            XCTAssertTrue(load.warning?.contains("effective POSIX account home could not be resolved") == true)
+            XCTAssertThrowsError(try configurationStore.save(CoordinatorConfiguration()))
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: hostileHome.appendingPathComponent("Library/Application Support/CodexOpsConsole/coordinator-configuration.json").path
+            )
+        )
     }
 
     func testPackagedSkillLocatorPrefersBundledHelperAndKeepsExplicitOverride() throws {
@@ -544,17 +736,17 @@ final class CoreTests: XCTestCase {
 
         let packaged = PortableSkillLocator(
             environment: [:],
-            home: home.path,
             currentDirectory: checkout.path,
-            bundleResourceRoot: bundleRoot.path
+            bundleResourceRoot: bundleRoot.path,
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { home.path })
         )
         XCTAssertEqual(try packaged.scriptPath(for: .coordinator), bundled.path)
 
         let explicitlyOverridden = PortableSkillLocator(
             environment: ["DEVCOORDINATOR_ROOT": override.path],
-            home: home.path,
             currentDirectory: checkout.path,
-            bundleResourceRoot: bundleRoot.path
+            bundleResourceRoot: bundleRoot.path,
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { home.path })
         )
         XCTAssertEqual(try explicitlyOverridden.scriptPath(for: .coordinator), overridden.path)
     }
@@ -811,6 +1003,265 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(failed.warning?.contains("last-known-good copy are invalid") == true)
     }
 
+    func testDefaultConfigurationMigratesRemappedLegacySettingsWithoutLosingDisabledSourcesOrRefreshPolicy() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let accountHome = root.appendingPathComponent("account-home", isDirectory: true)
+        let legacyConfigurationURL = root
+            .appendingPathComponent("remapped-foundation-app-support/CodexOpsConsole", isDirectory: true)
+            .appendingPathComponent("coordinator-configuration.json")
+        let legacyStore = PrivateCoordinatorConfigurationStore(configurationURL: legacyConfigurationURL)
+        let legacyConfiguration = CoordinatorConfiguration(
+            sources: [
+                .init(label: "Enabled", home: "/tmp/enabled-coordinator", enabled: true),
+                .init(label: "Intentionally disabled", home: "/tmp/disabled-coordinator", enabled: false),
+            ],
+            refreshPolicy: .interval(seconds: 75)
+        )
+        try legacyStore.save(legacyConfiguration)
+        let legacyPrimaryBeforeMigration = try Data(contentsOf: legacyConfigurationURL)
+        let legacyBackupBeforeMigration = try Data(contentsOf: legacyStore.lastKnownGoodURL)
+
+        let migratedStore = PrivateCoordinatorConfigurationStore(
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { accountHome.path }),
+            legacyConfigurationURL: legacyConfigurationURL
+        )
+        let result = migratedStore.load()
+
+        XCTAssertEqual(result.configuration, try legacyConfiguration.validated())
+        XCTAssertFalse(result.usedLastKnownGood)
+        XCTAssertEqual(result.configuration?.sources.first(where: { $0.label == "Intentionally disabled" })?.enabled, false)
+        XCTAssertEqual(result.configuration?.refreshPolicy, .interval(seconds: 75))
+        XCTAssertEqual(
+            migratedStore.configurationURL.path,
+            accountHome.appendingPathComponent("Library/Application Support/CodexOpsConsole/coordinator-configuration.json").path
+        )
+        XCTAssertEqual(PrivateCoordinatorConfigurationStore(configurationURL: migratedStore.configurationURL).load().configuration, try legacyConfiguration.validated())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: migratedStore.lastKnownGoodURL.path))
+        XCTAssertEqual(try Data(contentsOf: legacyConfigurationURL), legacyPrimaryBeforeMigration)
+        XCTAssertEqual(try Data(contentsOf: legacyStore.lastKnownGoodURL), legacyBackupBeforeMigration)
+    }
+
+    func testDefaultConfigurationMigratesLegacyLastKnownGoodWhenLegacyPrimaryIsCorrupt() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let accountHome = root.appendingPathComponent("account-home", isDirectory: true)
+        let legacyConfigurationURL = root
+            .appendingPathComponent("remapped-foundation-app-support/CodexOpsConsole", isDirectory: true)
+            .appendingPathComponent("coordinator-configuration.json")
+        let legacyStore = PrivateCoordinatorConfigurationStore(configurationURL: legacyConfigurationURL)
+        let recoverableConfiguration = CoordinatorConfiguration(
+            sources: [.init(label: "Disabled lab", home: "/tmp/disabled-lab", enabled: false)],
+            refreshPolicy: .manual()
+        )
+        try legacyStore.save(recoverableConfiguration)
+        try Data("corrupt legacy primary".utf8).write(to: legacyConfigurationURL)
+        let legacyBackupBeforeMigration = try Data(contentsOf: legacyStore.lastKnownGoodURL)
+
+        let migratedStore = PrivateCoordinatorConfigurationStore(
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { accountHome.path }),
+            legacyConfigurationURL: legacyConfigurationURL
+        )
+        let result = migratedStore.load()
+
+        XCTAssertEqual(result.configuration, try recoverableConfiguration.validated())
+        XCTAssertTrue(result.usedLastKnownGood)
+        XCTAssertNotNil(result.warning)
+        XCTAssertEqual(PrivateCoordinatorConfigurationStore(configurationURL: migratedStore.configurationURL).load().configuration, try recoverableConfiguration.validated())
+        XCTAssertEqual(try Data(contentsOf: legacyConfigurationURL), Data("corrupt legacy primary".utf8))
+        XCTAssertEqual(try Data(contentsOf: legacyStore.lastKnownGoodURL), legacyBackupBeforeMigration)
+    }
+
+    func testDefaultConfigurationAlreadyAtAccountPathWinsOverRemappedLegacySettings() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let accountHome = root.appendingPathComponent("account-home", isDirectory: true)
+        let accountConfigurationURL = accountHome
+            .appendingPathComponent("Library/Application Support/CodexOpsConsole", isDirectory: true)
+            .appendingPathComponent("coordinator-configuration.json")
+        let legacyConfigurationURL = root
+            .appendingPathComponent("remapped-foundation-app-support/CodexOpsConsole", isDirectory: true)
+            .appendingPathComponent("coordinator-configuration.json")
+        let accountConfiguration = CoordinatorConfiguration(
+            sources: [.init(label: "Account source", home: "/tmp/account-source", enabled: true)],
+            refreshPolicy: .interval(seconds: 15)
+        )
+        let staleLegacyConfiguration = CoordinatorConfiguration(
+            sources: [.init(label: "Stale disabled source", home: "/tmp/stale-source", enabled: false)],
+            refreshPolicy: .manual()
+        )
+        try PrivateCoordinatorConfigurationStore(configurationURL: accountConfigurationURL).save(accountConfiguration)
+        try PrivateCoordinatorConfigurationStore(configurationURL: legacyConfigurationURL).save(staleLegacyConfiguration)
+
+        let store = PrivateCoordinatorConfigurationStore(
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { accountHome.path }),
+            legacyConfigurationURL: legacyConfigurationURL
+        )
+
+        XCTAssertEqual(store.load().configuration, try accountConfiguration.validated())
+        XCTAssertNotEqual(store.load().configuration, try staleLegacyConfiguration.validated())
+    }
+
+    func testExplicitConfigurationURLDoesNotConsultOrMigrateRemappedLegacySettings() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let explicitConfigurationURL = root.appendingPathComponent("explicit/configuration.json")
+        let legacyConfigurationURL = root
+            .appendingPathComponent("remapped-foundation-app-support/CodexOpsConsole", isDirectory: true)
+            .appendingPathComponent("coordinator-configuration.json")
+        let legacyConfiguration = CoordinatorConfiguration(
+            sources: [.init(label: "Legacy", home: "/tmp/legacy-source", enabled: false)],
+            refreshPolicy: .manual()
+        )
+        try PrivateCoordinatorConfigurationStore(configurationURL: legacyConfigurationURL).save(legacyConfiguration)
+
+        let explicitStore = PrivateCoordinatorConfigurationStore(
+            configurationURL: explicitConfigurationURL,
+            accountHomeResolver: POSIXAccountHomeResolver(resolveAccountHome: { nil }),
+            legacyConfigurationURL: legacyConfigurationURL
+        )
+
+        XCTAssertNil(explicitStore.load().configuration)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: explicitConfigurationURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: explicitStore.lastKnownGoodURL.path))
+    }
+
+    func testConfigurationSaveRollsBackTheWholePairWhenAReplacementDoesNotComplete() throws {
+        enum InjectedFailure: Error { case afterLastKnownGood }
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configurationURL = root.appendingPathComponent("configuration.json")
+        let original = CoordinatorConfiguration(
+            sources: [.init(label: "Original", home: "/tmp/original")],
+            refreshPolicy: .interval(seconds: 10)
+        )
+        let replacement = CoordinatorConfiguration(
+            sources: [.init(label: "Replacement", home: "/tmp/replacement")],
+            refreshPolicy: .interval(seconds: 20)
+        )
+        let originalStore = PrivateCoordinatorConfigurationStore(configurationURL: configurationURL)
+        try originalStore.save(original)
+        let originalPrimary = try Data(contentsOf: originalStore.configurationURL)
+        let originalLastKnownGood = try Data(contentsOf: originalStore.lastKnownGoodURL)
+
+        let interruptedStore = PrivateCoordinatorConfigurationStore(
+            configurationURL: configurationURL,
+            transactionObserver: { event in
+                if case .replacedLastKnownGood = event {
+                    throw InjectedFailure.afterLastKnownGood
+                }
+            }
+        )
+        XCTAssertThrowsError(try interruptedStore.save(replacement))
+
+        XCTAssertEqual(try Data(contentsOf: originalStore.configurationURL), originalPrimary)
+        XCTAssertEqual(try Data(contentsOf: originalStore.lastKnownGoodURL), originalLastKnownGood)
+        XCTAssertEqual(originalStore.load().configuration, try original.validated())
+    }
+
+    func testTwoConfigurationWriterProcessesSerializeThePairWithLockOrderLastWriterWins() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configurationURL = root.appendingPathComponent("configuration.json")
+        let first = CoordinatorConfiguration(
+            sources: [.init(label: "First", home: "/tmp/first")],
+            refreshPolicy: .interval(seconds: 11)
+        )
+        let second = CoordinatorConfiguration(
+            sources: [.init(label: "Second", home: "/tmp/second", enabled: false)],
+            refreshPolicy: .manual()
+        )
+
+        let firstEvents = root.appendingPathComponent("first-events", isDirectory: true)
+        let secondEvents = root.appendingPathComponent("second-events", isDirectory: true)
+        try FileManager.default.createDirectory(at: firstEvents, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondEvents, withIntermediateDirectories: true)
+
+        let firstProcess = try launchConfigurationWriterFixture(
+            configurationURL: configurationURL,
+            configuration: first,
+            eventDirectory: firstEvents
+        )
+        defer { if firstProcess.process.isRunning { firstProcess.process.terminate() } }
+        try waitForFile(firstEvents.appendingPathComponent("waiting"))
+        try waitForFile(firstEvents.appendingPathComponent("acquired"))
+
+        let secondProcess = try launchConfigurationWriterFixture(
+            configurationURL: configurationURL,
+            configuration: second,
+            eventDirectory: secondEvents
+        )
+        defer { if secondProcess.process.isRunning { secondProcess.process.terminate() } }
+        try waitForFile(secondEvents.appendingPathComponent("waiting"))
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: secondEvents.appendingPathComponent("acquired").path),
+            "the second process must remain outside the save transaction while the first process owns the lock"
+        )
+
+        XCTAssertTrue(FileManager.default.createFile(atPath: firstEvents.appendingPathComponent("release").path, contents: Data()))
+        try waitForConfigurationWriter(firstProcess)
+        try waitForFile(secondEvents.appendingPathComponent("acquired"))
+        XCTAssertTrue(FileManager.default.createFile(atPath: secondEvents.appendingPathComponent("release").path, contents: Data()))
+        try waitForConfigurationWriter(secondProcess)
+
+        let primary = try JSONDecoder().decode(CoordinatorConfiguration.self, from: Data(contentsOf: configurationURL))
+        let lastKnownGoodURL = configurationURL.deletingPathExtension().appendingPathExtension("last-known-good.json")
+        let lastKnownGood = try JSONDecoder().decode(CoordinatorConfiguration.self, from: Data(contentsOf: lastKnownGoodURL))
+        XCTAssertEqual(primary, try second.validated())
+        XCTAssertEqual(lastKnownGood, try second.validated())
+        XCTAssertEqual(primary, lastKnownGood, "a completed process save must never leave files from different writers")
+    }
+
+    func testConfigurationWriterProcessFixture() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["DEVOPS_BOARD_CONFIGURATION_WRITER_FIXTURE"] == "1" else { return }
+        guard let configurationPath = environment["DEVOPS_BOARD_CONFIGURATION_WRITER_PATH"],
+              let sourceLabel = environment["DEVOPS_BOARD_CONFIGURATION_WRITER_LABEL"],
+              let sourceHome = environment["DEVOPS_BOARD_CONFIGURATION_WRITER_HOME"],
+              let enabledValue = environment["DEVOPS_BOARD_CONFIGURATION_WRITER_ENABLED"],
+              let refreshMode = environment["DEVOPS_BOARD_CONFIGURATION_WRITER_REFRESH_MODE"],
+              let eventDirectoryPath = environment["DEVOPS_BOARD_CONFIGURATION_WRITER_EVENTS"]
+        else { throw ConfigurationWriterFixtureFailure(description: "configuration writer fixture environment is incomplete") }
+
+        let refreshPolicy: CoordinatorRefreshPolicy
+        if refreshMode == CoordinatorRefreshMode.manual.rawValue {
+            refreshPolicy = .manual()
+        } else {
+            guard let intervalValue = environment["DEVOPS_BOARD_CONFIGURATION_WRITER_REFRESH_INTERVAL"],
+                  let interval = Double(intervalValue)
+            else { throw ConfigurationWriterFixtureFailure(description: "configuration writer fixture interval is invalid") }
+            refreshPolicy = .interval(seconds: interval)
+        }
+        let eventDirectory = URL(fileURLWithPath: eventDirectoryPath, isDirectory: true)
+        let releaseURL = eventDirectory.appendingPathComponent("release")
+        let store = PrivateCoordinatorConfigurationStore(
+            configurationURL: URL(fileURLWithPath: configurationPath),
+            transactionObserver: { event in
+                switch event {
+                case .waitingForExclusiveLock:
+                    try createFixtureMarker(eventDirectory.appendingPathComponent("waiting"))
+                case .acquiredExclusiveLock:
+                    try createFixtureMarker(eventDirectory.appendingPathComponent("acquired"))
+                    try waitForFile(releaseURL, timeout: 10)
+                case .replacedLastKnownGood, .replacedPrimary:
+                    break
+                }
+            }
+        )
+        try store.save(
+            CoordinatorConfiguration(
+                sources: [.init(label: sourceLabel, home: sourceHome, enabled: enabledValue == "1")],
+                refreshPolicy: refreshPolicy
+            )
+        )
+    }
+
     func testCoordinatorConfigurationValidationRejectsInvalidShapesAndAcceptsManualPolicy() throws {
         let duplicate = CoordinatorConfiguration(
             sources: [
@@ -822,6 +1273,41 @@ final class CoreTests: XCTestCase {
         XCTAssertThrowsError(try CoordinatorConfiguration(refreshPolicy: .interval(seconds: 0.5)).validated())
         XCTAssertThrowsError(try CoordinatorConfiguration(sources: [.init(label: "Relative", home: "relative/path")]).validated())
         XCTAssertNoThrow(try CoordinatorConfiguration(refreshPolicy: .manual()).validated())
+    }
+
+    func testCoordinatorConfigurationRejectsTwoAliasesOfOnePhysicalSource() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let coordinator = root.appendingPathComponent("physical-coordinator", isDirectory: true)
+        let alias = root.appendingPathComponent("coordinator-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: coordinator, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: coordinator)
+
+        let duplicate = CoordinatorConfiguration(sources: [
+            .init(label: "Physical", home: coordinator.path),
+            .init(label: "Alias", home: alias.path),
+        ])
+
+        XCTAssertThrowsError(try duplicate.validated()) { error in
+            XCTAssertEqual(
+                error as? CoordinatorConfigurationError,
+                .duplicateSource(coordinator.resolvingSymlinksInPath().path)
+            )
+        }
+
+        let futurePhysicalParent = root.appendingPathComponent("future-physical-parent", isDirectory: true)
+        let futureAliasParent = root.appendingPathComponent("future-alias-parent", isDirectory: true)
+        try FileManager.default.createDirectory(at: futurePhysicalParent, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: futureAliasParent, withDestinationURL: futurePhysicalParent)
+        let nonexistentAlias = futureAliasParent.appendingPathComponent("not-created/agent-coordinator")
+        let resolvedPhysicalParent = try XCTUnwrap(futurePhysicalParent.path.withCString { realpath($0, nil) })
+        defer { free(resolvedPhysicalParent) }
+        let nonexistentPhysical = URL(fileURLWithPath: String(cString: resolvedPhysicalParent), isDirectory: true)
+            .appendingPathComponent("not-created/agent-coordinator")
+        let validated = try CoordinatorSourceConfiguration(label: "Future", home: nonexistentAlias.path).validated()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: nonexistentAlias.path))
+        XCTAssertEqual(validated.home, nonexistentPhysical.standardizedFileURL.path)
     }
 
     @MainActor
@@ -872,6 +1358,39 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(calls.count, 0)
         XCTAssertTrue(store.sourceStates.isEmpty)
         XCTAssertEqual(store.presentationSnapshot.level, .unavailable)
+    }
+
+    @MainActor
+    func testDisabledConfiguredAliasSuppressesTheSamePhysicalAutomaticSource() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let coordinator = root.appendingPathComponent("physical-coordinator", isDirectory: true)
+        let alias = root.appendingPathComponent("disabled-coordinator-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: coordinator, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: coordinator)
+
+        let automatic = CoordinatorOrigin(label: "Automatic", home: coordinator.path)
+        let configuration = CoordinatorConfiguration(
+            sources: [.init(label: "Disabled alias", home: alias.path, enabled: false)],
+            refreshPolicy: .manual()
+        )
+        let service = OriginSequencedCoordinatorService(results: [
+            automatic.id: [.success(inventoryExecution(home: automatic.home, serverName: "must-not-load"))],
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [automatic]),
+            configurationStore: StaticConfigurationStore(configuration: configuration)
+        )
+
+        await store.loadInventory()
+
+        let calls = await service.capturedCalls()
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertTrue(store.sourceStates.isEmpty)
     }
 
     @MainActor
@@ -2736,6 +3255,101 @@ private struct StaticConfigurationStore: CoordinatorConfigurationPersisting {
     }
 
     func save(_ configuration: CoordinatorConfiguration) throws {}
+}
+
+private struct ConfigurationWriterFixtureFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+private struct ConfigurationWriterFixtureProcess {
+    let process: Process
+    let standardOutput: Pipe
+    let standardError: Pipe
+}
+
+private func launchConfigurationWriterFixture(
+    configurationURL: URL,
+    configuration: CoordinatorConfiguration,
+    eventDirectory: URL
+) throws -> ConfigurationWriterFixtureProcess {
+    guard configuration.sources.count == 1, let source = configuration.sources.first else {
+        throw ConfigurationWriterFixtureFailure(description: "writer fixture requires exactly one source")
+    }
+    var environment = ProcessInfo.processInfo.environment
+    environment["DEVOPS_BOARD_CONFIGURATION_WRITER_FIXTURE"] = "1"
+    environment["DEVOPS_BOARD_CONFIGURATION_WRITER_PATH"] = configurationURL.path
+    environment["DEVOPS_BOARD_CONFIGURATION_WRITER_LABEL"] = source.label
+    environment["DEVOPS_BOARD_CONFIGURATION_WRITER_HOME"] = source.home
+    environment["DEVOPS_BOARD_CONFIGURATION_WRITER_ENABLED"] = source.enabled ? "1" : "0"
+    environment["DEVOPS_BOARD_CONFIGURATION_WRITER_REFRESH_MODE"] = configuration.refreshPolicy.mode.rawValue
+    if let interval = configuration.refreshPolicy.intervalSeconds {
+        environment["DEVOPS_BOARD_CONFIGURATION_WRITER_REFRESH_INTERVAL"] = String(interval)
+    }
+    environment["DEVOPS_BOARD_CONFIGURATION_WRITER_EVENTS"] = eventDirectory.path
+
+    let process = Process()
+    let standardOutput = Pipe()
+    let standardError = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    process.arguments = [
+        "xctest",
+        "-XCTest",
+        "DevOpsBoardTests.CoreTests/testConfigurationWriterProcessFixture",
+        Bundle(for: CoreTests.self).bundleURL.path,
+    ]
+    process.environment = environment
+    process.standardOutput = standardOutput
+    process.standardError = standardError
+    do {
+        try process.run()
+    } catch {
+        throw ConfigurationWriterFixtureFailure(description: "could not launch writer fixture: \(error.localizedDescription)")
+    }
+    return ConfigurationWriterFixtureProcess(
+        process: process,
+        standardOutput: standardOutput,
+        standardError: standardError
+    )
+}
+
+private func createFixtureMarker(_ url: URL) throws {
+    if FileManager.default.createFile(atPath: url.path, contents: Data()) { return }
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        throw ConfigurationWriterFixtureFailure(description: "could not create fixture marker at \(url.path)")
+    }
+}
+
+private func waitForFile(_ url: URL, timeout: TimeInterval = 5) throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !FileManager.default.fileExists(atPath: url.path) {
+        guard Date() < deadline else {
+            throw ConfigurationWriterFixtureFailure(description: "timed out waiting for \(url.lastPathComponent)")
+        }
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+}
+
+private func waitForConfigurationWriter(
+    _ fixture: ConfigurationWriterFixtureProcess,
+    timeout: TimeInterval = 10
+) throws {
+    let deadline = Date().addingTimeInterval(timeout)
+    while fixture.process.isRunning, Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+    guard !fixture.process.isRunning else {
+        fixture.process.terminate()
+        throw ConfigurationWriterFixtureFailure(description: "writer fixture did not exit after release")
+    }
+    let outputData = fixture.standardOutput.fileHandleForReading.readDataToEndOfFile()
+    let errorData = fixture.standardError.fileHandleForReading.readDataToEndOfFile()
+    guard fixture.process.terminationStatus == 0 else {
+        let output = String(data: outputData, encoding: .utf8) ?? ""
+        let error = String(data: errorData, encoding: .utf8) ?? ""
+        throw ConfigurationWriterFixtureFailure(
+            description: "writer fixture exited \(fixture.process.terminationStatus). stdout: \(output) stderr: \(error)"
+        )
+    }
 }
 
 private extension Array where Element: Equatable {

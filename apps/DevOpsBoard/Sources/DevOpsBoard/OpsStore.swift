@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Darwin
 import Foundation
 import OSLog
@@ -982,18 +983,47 @@ final class OpsStore: ObservableObject {
     }
 
     private func logInventoryRefresh(states: [CoordinatorSourceState]) {
-        let loaded = states.filter { $0.phase == .loaded }.count
+        let loadedStates = states.filter { $0.phase == .loaded }
+        let loaded = loadedStates.count
         let total = states.count
         let pid = Int(Darwin.getpid())
+        let sourceFingerprints = loadedStates
+            .map { coordinatorSourceFingerprint($0.origin.id) }
+            .sorted()
+            .joined(separator: ",")
+        let sourceEvidence = sourceFingerprints.isEmpty ? "none" : sourceFingerprints
+        let disabledFingerprints = coordinatorConfiguration.sources
+            .filter { !$0.enabled }
+            .map { coordinatorSourceFingerprint($0.normalizedHome) }
+            .sorted()
+            .joined(separator: ",")
+        let disabledEvidence = disabledFingerprints.isEmpty ? "none" : disabledFingerprints
+        let serverCountEvidence = loadedStates
+            .map { state in
+                let fingerprint = coordinatorSourceFingerprint(state.origin.id)
+                let count = inventoryByOrigin[state.origin.id]?.servers.count ?? 0
+                return "\(fingerprint):\(count)"
+            }
+            .sorted()
+            .joined(separator: ",")
+        let serverCounts = serverCountEvidence.isEmpty ? "none" : serverCountEvidence
+        let managedServers = inventory.servers.count
+        let visibleServers = filteredServers.count
         if loaded > 0 {
             inventoryLogger.info(
-                "Inventory refresh completed pid=\(pid, privacy: .public) loaded=\(loaded, privacy: .public) total=\(total, privacy: .public)"
+                "Inventory refresh completed pid=\(pid, privacy: .public) loaded=\(loaded, privacy: .public) total=\(total, privacy: .public) sources=\(sourceEvidence, privacy: .public) disabled=\(disabledEvidence, privacy: .public) server_counts=\(serverCounts, privacy: .public) managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public)"
             )
         } else {
             inventoryLogger.error(
-                "Inventory refresh failed pid=\(pid, privacy: .public) loaded=0 total=\(total, privacy: .public)"
+                "Inventory refresh failed pid=\(pid, privacy: .public) loaded=0 total=\(total, privacy: .public) sources=none disabled=\(disabledEvidence, privacy: .public) server_counts=none managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public)"
             )
         }
+    }
+
+    private func coordinatorSourceFingerprint(_ normalizedHome: String) -> String {
+        SHA256.hash(data: Data(normalizedHome.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private func attach(origin: CoordinatorOrigin, to inventory: Inventory) -> Inventory {

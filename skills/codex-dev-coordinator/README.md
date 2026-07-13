@@ -155,14 +155,23 @@ than advertising the port as safely reusable.
 
 ## State And Privacy
 
-The default state is under the current process's
-`~/.codex/agent-coordinator/`. It is shared only by runtimes that resolve the
-same OS-user home. Compare the `coordinator_home` field from each runtime's
-`inventory` output before assuming shared leases. Same-user runtimes can set
-one absolute `CODEX_AGENT_COORDINATOR_HOME`; different OS users, VMs, and
-security boundaries must retain separate homes because the coordinator has no
-multi-user access protocol. The directory is `0700`; state, token, lock, and
-log files are private.
+The default state is under the effective POSIX account's
+`~/.codex/agent-coordinator/`. The coordinator resolves that home through
+`getpwuid(geteuid())`; it does not trust runtime `HOME`, `CFFIXED_USER_HOME`, or
+a desktop host's remapped user-domain root for the default. Two Codex or Parall
+instances running as one effective UID therefore share one lock automatically.
+Compare the `coordinator_home` field from each runtime's `inventory` output when
+verifying that boundary.
+
+One absolute `CODEX_AGENT_COORDINATOR_HOME` remains an authoritative same-UID
+override. Deliberately different overrides are independent: they do not share a
+lock and can both lease the same currently free host port. Never use one
+override across effective OS users. The implementation verifies the effective
+UID and exact private directory mode, while separate Linux users must use
+disjoint port ranges or an authorized system broker when host-wide port
+coordination is required. A source-aware UI may aggregate separate inventories
+read-only, but mutations must stay bound to the originating home. Coordinator
+directories are mode `0700`; state, token, lock, and log files are private.
 
 Inventory and logs can contain local project paths, process commands, and
 service names. Treat generated state and screenshots as private runtime
@@ -178,9 +187,12 @@ python3 scripts/self_test.py
 
 The test uses isolated temporary coordinator homes, deliberately slow fake Git
 and Docker executables, hanging loopback health endpoints, and short-lived
-fixture processes. It covers state recovery, unique concurrent leases,
-same-target lifecycle exclusion, unrelated-operation progress during slow
-project/health/Docker work, durable operation evidence, exact manual-lease
+fixture processes. It covers remapped same-user runtime convergence and
+shared-lock serialization, the duplicate-port risk across deliberately
+separate overrides, distinct effective-UID home resolution, foreign-UID home
+rejection, state recovery, unique concurrent
+leases, same-target lifecycle exclusion, unrelated-operation progress during
+slow project/health/Docker work, durable operation evidence, exact manual-lease
 attachment and rollback/interleaving behavior, structured launch, project
 runtime classification, exact/atomic port relocation and listener false-
 positive guards, Docker metadata/telemetry command paths, and API
