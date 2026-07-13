@@ -115,6 +115,7 @@ final class OpsStore: ObservableObject {
     @Published var latestBulkActionResult: BulkActionResult?
     @Published var pendingBulkStopPlan: BulkStopPlan?
     @Published var backupRecords: [BackupRecord] = []
+    @Published private(set) var backupVerificationInProgress: Set<String> = []
     @Published var restoreEvidence: [DatabaseIdentity: DatabaseRestoreEvidence] = [:]
     @Published var coordinatorConfiguration = CoordinatorConfiguration()
     @Published var configurationWarning: String?
@@ -135,6 +136,8 @@ final class OpsStore: ObservableObject {
     private var autoRefreshTask: Task<Void, Never>?
     private var activeLoad: Task<Void, Never>?
     private var followUpRequested = false
+    private var verifiedBackupsByKey: [String: BackupRecord] = [:]
+    private var backupVerificationTasks: [String: Task<Void, Never>] = [:]
 
     init(
         coordinatorService: (any CoordinatorServing)? = nil,
@@ -851,9 +854,12 @@ final class OpsStore: ObservableObject {
         decoded.servers = deduplicatedManagedServers(decoded.servers)
         decoded = await discoverDatabases(in: decoded)
         if decoded != inventory { inventory = decoded }
-        backupRecords = decoded.backups.compactMap { $0.verifiedRecord() }
+        rebuildBackupRecords(from: decoded.backups)
         reconcileLeaseResults(now: clock.now())
         keepSelectionValid()
+        if let selectedDatabase {
+            requestBackupVerification(for: selectedDatabase)
+        }
         if sourceFailures.isEmpty && capabilityFailures.isEmpty {
             if let configurationWarning {
                 inventoryIssue = OpsIssue(
@@ -1319,6 +1325,48 @@ final class OpsStore: ObservableObject {
         activeTab = .databases
         selectedDatabaseID = container.stableID
         sidebarSelection = .database(container.stableID)
+        requestBackupVerification(for: container)
+    }
+
+    func isBackupVerificationInProgress(for container: DockerContainer) -> Bool {
+        guard let identity = container.databaseIdentity else { return false }
+        return backupVerificationInProgress.contains(identity.id)
+    }
+
+    private func rebuildBackupRecords(from backups: [DatabaseBackup]) {
+        let activeKeys = Set(backups.map(\.verificationCacheKey))
+        verifiedBackupsByKey = verifiedBackupsByKey.filter { activeKeys.contains($0.key) }
+        backupRecords = backups.compactMap { backup in
+            verifiedBackupsByKey[backup.verificationCacheKey] ?? backup.manifestRecord()
+        }
+    }
+
+    private func requestBackupVerification(for container: DockerContainer) {
+        guard let identity = container.databaseIdentity else { return }
+        let candidates: [(backup: DatabaseBackup, record: BackupRecord)] = inventory.backups.compactMap { backup in
+            guard let record = backup.manifestRecord(),
+                  record.identity.isSameImmutableDatabase(as: identity)
+            else { return nil }
+            return (backup, record)
+        }
+        guard let candidate = candidates.max(by: { $0.record.createdAt < $1.record.createdAt }) else { return }
+        let key = candidate.backup.verificationCacheKey
+        if verifiedBackupsByKey[key] != nil || backupVerificationTasks[key] != nil { return }
+
+        backupVerificationInProgress.insert(identity.id)
+        backupVerificationTasks[key] = Task { [weak self] in
+            let verified = await Task.detached(priority: .utility) {
+                candidate.backup.verifiedRecord()
+            }.value
+            guard let self else { return }
+            self.backupVerificationTasks[key] = nil
+            self.backupVerificationInProgress.remove(identity.id)
+            guard self.inventory.backups.contains(where: { $0.verificationCacheKey == key }) else { return }
+            if let verified {
+                self.verifiedBackupsByKey[key] = verified
+            }
+            self.rebuildBackupRecords(from: self.inventory.backups)
+        }
     }
 
     func restart(_ server: ManagedServer) {

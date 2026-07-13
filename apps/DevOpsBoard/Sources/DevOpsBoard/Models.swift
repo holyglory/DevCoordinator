@@ -324,7 +324,7 @@ struct DockerStats: Decodable, Identifiable, Hashable {
     }
 }
 
-struct DatabaseBackup: Decodable, Identifiable, Hashable {
+struct DatabaseBackup: Decodable, Identifiable, Hashable, Sendable {
     var id: String { "\(origin?.id ?? "unknown"):\(path)" }
     var origin: CoordinatorOrigin? = nil
     var path: String
@@ -339,6 +339,17 @@ struct DatabaseBackup: Decodable, Identifiable, Hashable {
     enum CodingKeys: String, CodingKey {
         case path, size, manifest, database, container, format, sha256
         case modifiedAt = "modified_at"
+    }
+
+    var verificationCacheKey: String {
+        [
+            origin?.id ?? "unknown",
+            path,
+            size.map(String.init) ?? "unknown-size",
+            modifiedAt ?? "unknown-modified-at",
+            manifest ?? "no-manifest",
+            sha256 ?? "no-checksum",
+        ].joined(separator: "\u{1f}")
     }
 }
 
@@ -1662,6 +1673,14 @@ struct BackupManifestV2: Decodable, Sendable {
 
 extension DatabaseBackup {
     func verifiedRecord() -> BackupRecord? {
+        record(verifyArtifactChecksum: true)
+    }
+
+    func manifestRecord() -> BackupRecord? {
+        record(verifyArtifactChecksum: false)
+    }
+
+    private func record(verifyArtifactChecksum: Bool) -> BackupRecord? {
         guard let origin, let manifest, let data = FileManager.default.contents(atPath: manifest),
               let descriptor = try? JSONDecoder().decode(BackupManifestV2.self, from: data)
         else { return nil }
@@ -1672,13 +1691,15 @@ extension DatabaseBackup {
         else { return nil }
 
         let verification = descriptor.verification
-        let currentChecksum = fileSHA256(path)
+        let currentChecksum = verifyArtifactChecksum ? fileSHA256(path) : nil
         let checksumMatches = verification?.ok == true
             && verification?.sha256 != nil
             && verification?.sha256 == descriptor.sha256
             && currentChecksum == descriptor.sha256
         let checksumState: ChecksumState
-        if let expected = descriptor.sha256, let currentChecksum, currentChecksum != expected {
+        if !verifyArtifactChecksum {
+            checksumState = .unknown
+        } else if let expected = descriptor.sha256, let currentChecksum, currentChecksum != expected {
             checksumState = .failed
         } else if checksumMatches {
             checksumState = .verified
@@ -1725,8 +1746,15 @@ func fileSHA256(_ path: String) -> String? {
     defer { try? handle.close() }
     var hasher = SHA256()
     do {
-        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+        while try autoreleasepool(invoking: {
+            guard let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty else {
+                return false
+            }
             hasher.update(data: chunk)
+            return true
+        }) {
+            // The autorelease pool bounds Foundation Data retained by long
+            // multi-gigabyte verification reads.
         }
     } catch {
         return nil

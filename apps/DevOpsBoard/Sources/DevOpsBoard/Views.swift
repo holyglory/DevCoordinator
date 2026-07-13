@@ -1988,6 +1988,7 @@ struct SelectedDatabasePanel: View {
         let identity = database.databaseIdentity
         let backup = newestBackupRecord(for: database, records: store.backupRecords)
         let restore = identity.flatMap { store.restoreEvidence[$0] }
+        let isVerifyingBackup = store.isBackupVerificationInProgress(for: database)
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 Text(database.database ?? "Unknown database")
@@ -2021,8 +2022,8 @@ struct SelectedDatabasePanel: View {
                     .foregroundStyle(Theme.secondary)
                 EvidenceStateLine(
                     label: "Checksum verified",
-                    state: checksumLabel(backup?.checksum),
-                    tint: checksumColor(backup?.checksum)
+                    state: isVerifyingBackup ? "Checking…" : checksumLabel(backup?.checksum),
+                    tint: isVerifyingBackup ? Theme.blue : checksumColor(backup?.checksum)
                 )
                 EvidenceStateLine(
                     label: "Restore tested",

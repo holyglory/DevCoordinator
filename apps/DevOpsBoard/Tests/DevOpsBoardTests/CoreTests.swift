@@ -423,6 +423,11 @@ final class CoreTests: XCTestCase {
         var backup = DatabaseBackup(path: artifact.path, size: 4, modifiedAt: nil, manifest: manifest.path, database: nil, container: nil, format: nil, sha256: nil)
         backup.origin = codex
 
+        let preview = try XCTUnwrap(backup.manifestRecord())
+        XCTAssertEqual(preview.checksum, .unknown, "inventory preview must not claim an unread artifact is current")
+        XCTAssertEqual(preview.restoreTest, .passed, "manifest restore-test evidence should remain visible")
+        XCTAssertFalse(preview.isStronglyVerified, "manifest parsing alone must not enable restore")
+
         let record = try XCTUnwrap(backup.verifiedRecord())
         XCTAssertEqual(record.identity, DatabaseIdentity(origin: codex, container: "pg", database: "app", containerID: "cid"))
         XCTAssertTrue(record.isStronglyVerified)
@@ -884,6 +889,86 @@ final class CoreTests: XCTestCase {
             2,
             "a slow automatic refresh must finish before the next full idle interval begins"
         )
+    }
+
+    @MainActor
+    func testInventoryRefreshDoesNotHashMultiGigabyteBackupArtifactsEagerly() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let artifact = directory.appendingPathComponent("large.dump")
+        let manifest = URL(fileURLWithPath: artifact.path + ".manifest.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: artifact.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: artifact)
+        try handle.truncate(atOffset: 8 * 1_024 * 1_024 * 1_024)
+        try handle.close()
+        let manifestJSON = """
+        {"schema_version":2,"created_at":"2026-07-13T12:00:00Z","scope":"database","format":"custom","sha256":"recorded-sha","source":{"container":{"name":"pg","id":"cid","image":"postgres:17"},"postgres":{"database":"app","scope":"database"}},"verification":{"verified_at":"2026-07-13T12:01:00Z","mode":"test_restore","scope":"database","sha256":"recorded-sha","ok":true}}
+        """
+        try Data(manifestJSON.utf8).write(to: manifest)
+        let inventoryJSON = """
+        {"coordinator_home":"\(codex.home)","state_path":"\(codex.home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"containers":[],"postgres":[]},"postgres":[],"backups":[{"path":"\(artifact.path)","size":8589934592,"manifest":"\(manifest.path)"}],"project_usage":[]}
+        """
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [.success(.init(stdout: inventoryJSON, stderr: "", exitStatus: 0))]
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .manual())
+            )
+        )
+
+        let startedAt = Date()
+        await store.loadInventory()
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        XCTAssertLessThan(elapsed, 0.5, "inventory refresh must not read an 8 GiB backup artifact")
+        XCTAssertEqual(store.backupRecords.first?.checksum, .unknown)
+        XCTAssertEqual(store.backupRecords.first?.restoreTest, .passed)
+    }
+
+    @MainActor
+    func testSelectingDatabaseVerifiesOnlyItsNewestBackupOnDemand() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let artifact = directory.appendingPathComponent("app.dump")
+        let manifest = URL(fileURLWithPath: artifact.path + ".manifest.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: artifact.path, contents: Data("dump".utf8)))
+        let checksum = try XCTUnwrap(fileSHA256(artifact.path))
+        let manifestJSON = """
+        {"schema_version":2,"created_at":"2026-07-13T12:00:00Z","scope":"database","format":"custom","sha256":"\(checksum)","source":{"container":{"name":"pg","id":"cid","image":"postgres:17"},"postgres":{"database":"app","scope":"database"}},"verification":{"verified_at":"2026-07-13T12:01:00Z","mode":"test_restore","scope":"database","sha256":"\(checksum)","ok":true}}
+        """
+        try Data(manifestJSON.utf8).write(to: manifest)
+        let inventoryJSON = """
+        {"coordinator_home":"\(codex.home)","state_path":"\(codex.home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"containers":[],"postgres":[]},"postgres":[{"id":"cid","name":"pg","image":"postgres:17","status":"Up","project":"/repo","metadata_source":"coordinator_sidecar"}],"backups":[{"path":"\(artifact.path)","size":4,"manifest":"\(manifest.path)"}],"project_usage":[]}
+        """
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [.success(.init(stdout: inventoryJSON, stderr: "", exitStatus: 0))]
+        ])
+        let discovery = StaticDatabaseDiscovery(database: "app", sizeBytes: 4)
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: discovery,
+            originDiscovery: StaticOriginDiscovery(values: [codex]),
+            configurationStore: StaticConfigurationStore(
+                configuration: CoordinatorConfiguration(refreshPolicy: .manual())
+            )
+        )
+
+        await store.loadInventory()
+        XCTAssertEqual(store.backupRecords.first?.checksum, .unknown)
+        let database = try XCTUnwrap(store.inventory.postgres.first)
+        store.selectDatabase(database)
+        try await waitUntil { store.backupRecords.first?.checksum == .verified }
+
+        XCTAssertFalse(store.isBackupVerificationInProgress(for: database))
+        XCTAssertTrue(store.backupRecords.first?.isStronglyVerified == true)
     }
 
     @MainActor
@@ -1930,6 +2015,25 @@ private final class SequencedOriginDiscovery: CoordinatorOriginDiscovering, @unc
 
 private struct EmptyDatabaseDiscovery: DatabaseDiscovering {
     func discover(origin: CoordinatorOrigin, container: String, containerID: String?) async throws -> [DiscoveredDatabase] { [] }
+}
+
+private struct StaticDatabaseDiscovery: DatabaseDiscovering {
+    let database: String
+    let sizeBytes: Int64
+
+    func discover(origin: CoordinatorOrigin, container: String, containerID: String?) async throws -> [DiscoveredDatabase] {
+        [
+            DiscoveredDatabase(
+                identity: DatabaseIdentity(
+                    origin: origin,
+                    container: container,
+                    database: database,
+                    containerID: containerID
+                ),
+                sizeBytes: sizeBytes
+            )
+        ]
+    }
 }
 
 private enum MockFailure: Error { case offline }

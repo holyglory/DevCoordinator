@@ -1931,3 +1931,19 @@ one-second configured interval and proves only two loads begin in 2.25 seconds;
 the next poll cannot start until a full idle interval follows completion. The
 default cadence now leaves substantial idle time while preserving truthful
 live data and manual refresh.
+
+Follow-up: Live post-fix sampling found a second independent cost after each
+coordinator command: `performLoadInventory` synchronously rehashed every
+discovered database dump on the main actor. The active backup set includes one
+7.4 GB artifact and many roughly 500 MB artifacts; a three-second process sample
+showed nearly all main-thread time in `DatabaseBackup.verifiedRecord()` and
+`fileSHA256`, with a 4.1 GB physical footprint and a 19.9 GB recorded peak.
+Inventory now parses manifest evidence without claiming a current checksum,
+and verifies only the newest backup for a database when the user selects that
+database. Verification runs at utility priority off the main actor, is cached
+by source/path/size/mtime/manifest/checksum fingerprint for subsequent
+refreshes, and bounds Foundation read allocations with an autorelease pool.
+Restore stays disabled until that exact artifact has passed current checksum
+verification. Automated recall uses a realistic sparse 8 GiB backup and proves
+ordinary inventory completes without reading it; a separate test proves
+selection performs the real verification and enables strong evidence.
