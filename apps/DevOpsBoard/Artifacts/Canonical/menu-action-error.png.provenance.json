@@ -1,10 +1,22 @@
 {
   "artifact_type" : "test-fixture-snapshot",
-  "fixture_id" : "codex-ops-menu-neutral-v1",
-  "generator" : "apps\/CodexOpsConsole\/Tools\/MenuBarSnapshotMain.swift",
+  "fixture_id" : "devops-board-menu-neutral-v1",
+  "generator" : "apps\/DevOpsBoard\/Tools\/MenuBarSnapshotMain.swift",
   "height" : 600,
   "schema_version" : 1,
-  "sha256" : "83fde7a3413fd7918d9116878821f65a51cfd02bdb12101cac31fe2f27a4ee0f",
+  "sha256" : "464e1733e9d376e6bbfe58c63c8d2ae8ded1ff6720f406e5822b0dd1fc5c041b",
   "source" : "isolated-test-fixture",
+  "source_files" : [
+    "Package.swift",
+    "Sources\/DevOpsBoard\/MenuBarViews.swift",
+    "Sources\/DevOpsBoard\/Models.swift",
+    "Sources\/DevOpsBoard\/OpsStore.swift",
+    "Sources\/DevOpsBoard\/RepositoryCatalog.swift",
+    "Sources\/DevOpsBoard\/Views.swift",
+    "Tools\/CanonicalSnapshotGenerationTests.swift",
+    "Tools\/MenuBarSnapshotMain.swift",
+    "Tools\/SnapshotProvenance.swift"
+  ],
+  "source_sha256" : "dd66e22dbfdf248e25abeceaae95cb837e2720f5b8ef3bb8ddf91ec5ea0f68b6",
   "width" : 430
 }

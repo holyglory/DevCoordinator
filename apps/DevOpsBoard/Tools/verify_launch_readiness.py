@@ -26,7 +26,10 @@ MARKER_PATTERN = re.compile(
     r"sources=(?P<sources>none|[0-9a-f]{64}(?:,[0-9a-f]{64})*) "
     r"disabled=(?P<disabled>none|[0-9a-f]{64}(?:,[0-9a-f]{64})*) "
     r"server_counts=(?P<server_counts>none|[0-9a-f]{64}:[0-9]+(?:,[0-9a-f]{64}:[0-9]+)*) "
-    r"managed=(?P<managed>[0-9]+) visible=(?P<visible>[0-9]+)\s*$"
+    r"managed=(?P<managed>[0-9]+) visible=(?P<visible>[0-9]+) "
+    r"repositories=(?P<repositories>[0-9]+) "
+    r"repository_groups=(?P<repository_groups>[0-9]+) "
+    r"unassigned_groups=(?P<unassigned_groups>[0-9]+)\s*$"
 )
 SOURCE_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_SOURCE_INVENTORY_PATTERN = re.compile(r"^[0-9a-f]{64}:(?:[0-9]+|\?)$")
@@ -48,6 +51,9 @@ class InventoryMarker:
     server_counts: tuple[tuple[str, int], ...]
     managed_servers: int
     visible_servers: int
+    repositories: int
+    repository_groups: int
+    unassigned_groups: int
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,9 @@ class ReadinessResult:
     server_counts: tuple[tuple[str, int], ...]
     managed_servers: int
     visible_servers: int
+    repositories: int
+    repository_groups: int
+    unassigned_groups: int
 
 
 @dataclass(frozen=True)
@@ -293,6 +302,9 @@ def parse_inventory_marker(line: str) -> InventoryMarker | None:
         server_counts=server_counts,
         managed_servers=int(match.group("managed")),
         visible_servers=int(match.group("visible")),
+        repositories=int(match.group("repositories")),
+        repository_groups=int(match.group("repository_groups")),
+        unassigned_groups=int(match.group("unassigned_groups")),
     )
 
 
@@ -344,6 +356,16 @@ def evaluate_inventory_marker(
     if marker.visible_servers > marker.managed_servers:
         raise LaunchReadinessError(
             f"inventory readiness marker for PID {expected_pid} reports more visible than managed servers"
+        )
+    if marker.repository_groups != marker.repositories:
+        raise LaunchReadinessError(
+            f"inventory readiness marker for PID {expected_pid} renders "
+            f"{marker.repository_groups} repository groups for {marker.repositories} canonical repositories"
+        )
+    if marker.unassigned_groups > 1:
+        raise LaunchReadinessError(
+            f"inventory readiness marker for PID {expected_pid} renders "
+            f"{marker.unassigned_groups} unassigned resource groups; expected at most one"
         )
     if marker.outcome == "failed":
         if marker.loaded != 0:
@@ -399,6 +421,9 @@ def evaluate_inventory_marker(
         server_counts=marker.server_counts,
         managed_servers=marker.managed_servers,
         visible_servers=marker.visible_servers,
+        repositories=marker.repositories,
+        repository_groups=marker.repository_groups,
+        unassigned_groups=marker.unassigned_groups,
     )
 
 
@@ -772,7 +797,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(
         f"DevOps Board ready: pid={result.pid} loaded={result.loaded} total={result.total} "
-        f"managed={result.managed_servers} visible={result.visible_servers}"
+        f"managed={result.managed_servers} visible={result.visible_servers} "
+        f"repositories={result.repositories} repository_groups={result.repository_groups} "
+        f"unassigned_groups={result.unassigned_groups}"
     )
     return 0
 

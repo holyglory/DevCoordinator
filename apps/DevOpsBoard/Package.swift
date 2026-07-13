@@ -10,6 +10,24 @@ let package = Package(
     ],
     targets: [
         .executableTarget(name: "DevOpsBoard"),
-        .testTarget(name: "DevOpsBoardTests", dependencies: ["DevOpsBoard"])
+        .testTarget(name: "DevOpsBoardTests", dependencies: ["DevOpsBoard"]),
+        .testTarget(
+            name: "DevOpsBoardSnapshotTests",
+            dependencies: ["DevOpsBoard"],
+            path: "Tools",
+            exclude: [
+                "SplitSizingTest.swift",
+                "package_app.py",
+                "self_test_package_app.py",
+                "self_test_verify_launch_readiness.py",
+                "verify_launch_readiness.py",
+            ],
+            sources: [
+                "CanonicalSnapshotGenerationTests.swift",
+                "MenuBarSnapshotMain.swift",
+                "SnapshotMain.swift",
+                "SnapshotProvenance.swift",
+            ]
+        )
     ]
 )

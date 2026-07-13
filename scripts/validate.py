@@ -33,14 +33,21 @@ def source_region(source: str, start: str, end: str) -> str:
     return source[start_index:end_index]
 
 
-def check_devops_board_center_pane_geometry(views: str, split_sizing: str) -> None:
-    """Keep intrinsic children from widening and center-cropping the main pane.
+def check_devops_board_center_pane_geometry(
+    views: str,
+    split_sizing: str,
+    vertical_layout_tests: str,
+) -> None:
+    """Keep intrinsic children from widening or vertically center-cropping the main pane.
 
     The reported window was 1180 points wide with a user-resized 380-point
     sidebar and the 320-point inspector. That leaves a 464-point main pane,
     rather than the 524 points produced by the default-sidebar fixture. The
     executable sizing check carries both that must-catch geometry and a wider
-    control where the same preferred maxima legitimately fit.
+    control where the same preferred maxima legitimately fit. The vertical
+    fixture models the dense six-project, 19-server, attention, and Activity
+    state that used to exceed the minimum window height and become centered
+    inside the exact-height pane before clipping.
     """
 
     split_width = 8
@@ -76,6 +83,72 @@ def check_devops_board_center_pane_geometry(views: str, split_sizing: str) -> No
         raise SystemExit(
             "DevOpsBoard center-pane geometry recall/control fixture is invalid: "
             + ", ".join(broken_geometry_checks)
+        )
+
+    minimum_window_height = 760
+    fixed_toolbar_height = 54
+    toolbar_divider_height = 1
+    activity_height = 34
+    status_divider_height = 1
+    status_height = 38
+    variable_body_viewport = minimum_window_height - (
+        fixed_toolbar_height
+        + toolbar_divider_height
+        + activity_height
+        + status_divider_height
+        + status_height
+    )
+    dense_variable_body_minimum = (
+        28  # body padding
+        + 62  # attention banner
+        + 19
+        + (6 * 34)  # project-load heading and six rows
+        + 32  # filters
+        + 28  # resource tabs
+        + 30
+        + 340  # resource heading and table minimum
+        + (4 * 12)  # inter-section spacing
+    )
+    sparse_variable_body_control = (
+        28
+        + 19
+        + 34  # one project-load row, without an attention banner
+        + 32
+        + 28
+        + 30
+        + 340
+        + (3 * 12)
+    )
+    legacy_dense_intrinsic_height = (
+        fixed_toolbar_height
+        + toolbar_divider_height
+        + dense_variable_body_minimum
+        + activity_height
+        + status_divider_height
+        + status_height
+    )
+    vertical_geometry_recall = {
+        "dense variable body exceeds its minimum-window viewport": (
+            dense_variable_body_minimum > variable_body_viewport
+        ),
+        "legacy dense intrinsic pane exceeds the minimum window": (
+            legacy_dense_intrinsic_height > minimum_window_height
+        ),
+        "centered legacy pane crops a fixed edge by more than the realistic shift": (
+            (legacy_dense_intrinsic_height - minimum_window_height) / 2 > 48
+        ),
+        "sparse body remains a false-positive control": (
+            sparse_variable_body_control <= variable_body_viewport
+        ),
+        "fixed chrome leaves a usable resource viewport": variable_body_viewport >= 340,
+    }
+    broken_vertical_checks = [
+        label for label, condition in vertical_geometry_recall.items() if not condition
+    ]
+    if broken_vertical_checks:
+        raise SystemExit(
+            "DevOpsBoard vertical center-crop recall/control fixture is invalid: "
+            + ", ".join(broken_vertical_checks)
         )
 
     sizing_contract = {
@@ -144,6 +217,101 @@ def check_devops_board_center_pane_geometry(views: str, split_sizing: str) -> No
             "DevOpsBoard dev-server empty state must retain its adaptive action layout at narrow pane widths"
         )
 
+    ops_console = source_region(views, "struct OpsConsoleView: View", "struct SplitHandle: View")
+    main_board = source_region(views, "struct MainBoardView: View", "struct ProjectUsageStrip: View")
+
+    exact_pane_frame = re.search(
+        r"MainBoardView\(store: store\)\s*"
+        r"\.frame\(\s*"
+        r"width: layout\.mainWidth,\s*"
+        r"height: proxy\.size\.height,\s*"
+        r"alignment: \.topLeading\s*"
+        r"\)",
+        ops_console,
+    )
+    if exact_pane_frame is None:
+        raise SystemExit(
+            "DevOpsBoard MainBoardView must retain its exact width/height frame with "
+            "top-leading alignment to prevent vertical center-cropping"
+        )
+
+    scroll_start = main_board.find("ScrollView(.vertical)")
+    scroll_body_end = main_board.find('.accessibilityIdentifier("main-board-scroll-body")')
+    toolbar_index = main_board.find("ToolbarView(store: store)")
+    activity_index = main_board.find("ActionResultDrawer(store: store)")
+    status_index = main_board.find("StatusBar(store: store)")
+    fixed_chrome_order = [toolbar_index, scroll_start, scroll_body_end, activity_index, status_index]
+    if any(index < 0 for index in fixed_chrome_order) or fixed_chrome_order != sorted(fixed_chrome_order):
+        raise SystemExit(
+            "DevOpsBoard MainBoardView must keep the toolbar before, and Activity/status after, "
+            "the variable-body vertical ScrollView"
+        )
+
+    variable_body = main_board[scroll_start:scroll_body_end]
+    variable_body_contract = {
+        "inventory attention banner": "InventoryStateBanner(store: store)",
+        "project-load rows": "ProjectUsageStrip(store: store)",
+        "managed leases": "ManagedLeasesPanel(store: store)",
+        "filters": "FilterRow(",
+        "resource tabs": "ResourceTabBar(store: store)",
+        "active resource section": "switch store.activeTab",
+    }
+    missing_variable_body = [
+        label for label, needle in variable_body_contract.items() if needle not in variable_body
+    ]
+    if missing_variable_body:
+        raise SystemExit(
+            "DevOpsBoard variable-body ScrollView is missing vertically scrollable content: "
+            + ", ".join(missing_variable_body)
+        )
+
+    fixed_chrome_contract = {
+        "toolbar anchor": '.accessibilityIdentifier("main-board-toolbar")',
+        "scroll-body anchor": '.accessibilityIdentifier("main-board-scroll-body")',
+        "status anchor": '.accessibilityIdentifier("main-board-status")',
+    }
+    missing_fixed_chrome = [
+        label for label, needle in fixed_chrome_contract.items() if needle not in views
+    ]
+    if missing_fixed_chrome:
+        raise SystemExit(
+            "DevOpsBoard vertical crop detector is missing stable production anchors: "
+            + ", ".join(missing_fixed_chrome)
+        )
+
+    vertical_xctest_contract = {
+        "native SwiftUI/AppKit raster test": "NSHostingView(rootView: view)",
+        "minimum 760-point window": "private let minimumWindowHeight = 760",
+        "dense six-repository assertion": (
+            "XCTAssertEqual(fixture.store.projectGroups.filter(\\.isRepository).count, 6)"
+        ),
+        "dense unassigned false-positive guard": (
+            "XCTAssertFalse(fixture.store.projectGroups.contains { !$0.isRepository })"
+        ),
+        "dense 19-server assertion": "XCTAssertEqual(fixture.store.filteredServers.count, 19)",
+        "attention-state assertion": "XCTAssertNotNil(fixture.store.actionIssue)",
+        "Activity-state assertion": "XCTAssertEqual(fixture.store.actionResults.count, 1)",
+        "fixed-edge production assertion": "assessment.statusIsVisible",
+        "center-only upward-crop must-catch": "testDetectorCatchesRealisticCenterOnlyUpwardCrop",
+        "realistic 48-point shift": "intact.shiftedUp(by: 48)",
+        "must-catch failure assertion": "XCTAssertFalse(\n            assessment.hasBothFixedEdges",
+        "inner-scroll and empty-body controls": (
+            "testDetectorAllowsIntentionalInnerTableScrollingAndEmptyBody"
+        ),
+        "inner-scroll false-positive control": "scrollingOnlyVariableBody(upBy: 72)",
+        "empty-body false-positive control": "clearingOnlyVariableBody()",
+    }
+    missing_vertical_xctest = [
+        label
+        for label, needle in vertical_xctest_contract.items()
+        if needle not in vertical_layout_tests
+    ]
+    if missing_vertical_xctest:
+        raise SystemExit(
+            "DevOpsBoard vertical center-crop guard is missing realistic XCTest recall/control coverage: "
+            + ", ".join(missing_vertical_xctest)
+        )
+
 
 def check_standalone_skill(skill: Path) -> None:
     tmp = Path(tempfile.mkdtemp(prefix=f"{skill.name}-standalone-")).resolve(strict=True)
@@ -167,24 +335,41 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     views = (ops_console / "Sources" / "DevOpsBoard" / "Views.swift").read_text(encoding="utf-8")
     store = (ops_console / "Sources" / "DevOpsBoard" / "OpsStore.swift").read_text(encoding="utf-8")
     models = (ops_console / "Sources" / "DevOpsBoard" / "Models.swift").read_text(encoding="utf-8")
+    repository_catalog = (
+        ops_console / "Sources" / "DevOpsBoard" / "RepositoryCatalog.swift"
+    ).read_text(encoding="utf-8")
     snapshot_main = (ops_console / "Tools" / "SnapshotMain.swift").read_text(encoding="utf-8")
     menu_snapshot = (ops_console / "Tools" / "MenuBarSnapshotMain.swift").read_text(encoding="utf-8")
     snapshot_provenance = (ops_console / "Tools" / "SnapshotProvenance.swift").read_text(encoding="utf-8")
     split_sizing = (ops_console / "Tools" / "SplitSizingTest.swift").read_text(encoding="utf-8")
     core_tests = (ops_console / "Tests" / "DevOpsBoardTests" / "CoreTests.swift").read_text(encoding="utf-8")
+    repository_catalog_tests = (
+        ops_console / "Tests" / "DevOpsBoardTests" / "RepositoryCatalogTests.swift"
+    ).read_text(encoding="utf-8")
+    project_group_presentation_tests = (
+        ops_console / "Tests" / "DevOpsBoardTests" / "ProjectGroupPresentationTests.swift"
+    ).read_text(encoding="utf-8")
+    vertical_layout_tests_path = (
+        ops_console / "Tests" / "DevOpsBoardTests" / "MainBoardVerticalLayoutTests.swift"
+    )
+    if not vertical_layout_tests_path.is_file():
+        raise SystemExit(
+            "DevOpsBoard vertical center-crop guard requires MainBoardVerticalLayoutTests.swift"
+        )
+    vertical_layout_tests = vertical_layout_tests_path.read_text(encoding="utf-8")
     coordinator = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "dev_coordinator.py").read_text(encoding="utf-8")
     coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
     coordinator_capability_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "capability_integration_test.py").read_text(encoding="utf-8")
     coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
 
-    check_devops_board_center_pane_geometry(views, split_sizing)
+    check_devops_board_center_pane_geometry(views, split_sizing, vertical_layout_tests)
 
     required = {
         "left pane splitter": "SplitHandle(width: $sidebarWidth",
         "right pane splitter": "SplitHandle(width: $inspectorWidth",
         "thin splitter width": "let splitHandleWidth: CGFloat = 8",
         "absolute pane layout": "ZStack(alignment: .topLeading)",
-        "exact main pane frame": ".frame(width: layout.mainWidth, height:",
+        "exact main pane height": "height: proxy.size.height,",
         "positioned main pane": ".position(x: mainX +",
         "global splitter drag": "DragGesture(minimumDistance: 0, coordinateSpace: .global)",
         "stable splitter math": "resizedPaneWidth(",
@@ -200,7 +385,11 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "usage key membership decoding": "case usageKey = \"usage_key\"",
         "server membership decoding": "case serverIDs = \"server_ids\"",
         "container membership decoding": "case containerNames = \"container_names\"",
-        "group identity prefers usage key": "row.usageKey ?? row.project ?? row.projectKey",
+        "canonical repository identity": "struct RepositoryIdentity",
+        "source-independent project group identity": "guard usageKey.hasPrefix(\"path:\") else { return unassignedProjectGroupID }",
+        "global physical Docker reconciliation": "let physicalDocker = Dictionary(grouping: pendingDocker)",
+        "whole-runtime control intersection": "candidates.formIntersection(constraint)",
+        "unassigned resource aggregate": "name: \"Unassigned Resources\"",
         "stray items fallback group": "strayProjectGroupID",
         "membership union across coordinator homes": "seenServerIDs.insert(serverID).inserted",
         "board name-claim divergence must-catch": "grouprepo-db must display under the path-keyed GroupRepo group",
@@ -297,7 +486,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "window occlusion tracking": "windowDidChangeOcclusionState",
         "popover visibility tracking": "popoverDidClose",
         "coalesced inventory refresh": "followUpRequested",
-        "publish inventory only on change": "if decoded != inventory { inventory = decoded }",
+        "publish inventory and repository catalog atomically": "publishInventory(decoded, catalog: catalog)",
         "cached project groups": "@Published private(set) var projectGroups",
         "main-actor-safe detached command execution": "let worker = Task.detached(priority: .userInitiated)",
         "pre-launch subprocess completion handler": "process.terminationHandler = { finished in",
@@ -350,7 +539,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "undeclared compose skill policy": "`project start` must not run `docker\ncompose up` from that discovery",
         "docker identity enforcement": "requires --agent so the coordinator can attribute the action",
         "project runtime model": "struct ProjectRuntimeReport",
-        "project action path from membership row": "projectPath: row.project",
+        "project action path from canonical group": "nativeID: projectPath",
         "project start UI action": "func startProject(_ group",
         "project restart UI action": "func restartProject(_ group",
         "project stop UI action": "func stopProject(_ group",
@@ -468,6 +657,11 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "project load strip": "ProjectUsageStrip",
         "project load hot process": "hotProcessLabel(",
         "multi coordinator origin discovery": "FileSystemCoordinatorOriginDiscovery",
+        "three-source repository UI regression": "testThreeSourceRepositoryPublishesOneNevodProjectAndRoutesOneProjectAction",
+        "cross-project Docker conflict regression": "testDockerMembershipConflictBlocksBothOtherwiseControlledProjectActionsAndHealthIsNotNominal",
+        "cross-project server conflict regression": "testSameActivePhysicalServerClaimedByTwoRepositoriesBlocksBothProjects",
+        "usage-only unassigned regression": "testUsageOnlyNameEvidenceStillProducesOneUnassignedPresentation",
+        "catalog conflict health regression": "testCatalogOwnershipConflictMakesPublishedHealthNonNominalEvenWithoutResourceIdentity",
         "coordinator env per inventory": "CODEX_AGENT_COORDINATOR_HOME",
         "process usage self-test": "inventory should expose project usage rollups",
         "hanging health self-test": "hanging HTTP health checks should be bounded",
@@ -479,11 +673,14 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
             views,
             store,
             models,
+            repository_catalog,
             snapshot_main,
             menu_snapshot,
             snapshot_provenance,
             split_sizing,
             core_tests,
+            repository_catalog_tests,
+            project_group_presentation_tests,
             coordinator,
             coordinator_self_test,
             coordinator_capability_test,

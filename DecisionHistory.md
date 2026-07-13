@@ -1,5 +1,46 @@
 # Decision History
 
+## 2026-07-13 - DevOps Board project identity is one canonical worktree, never one coordinator source
+
+Decision: The user's invariant is authoritative: one canonical local Git
+worktree root is one Board project. Coordinator home, application instance,
+display name, `project_key`, and native server/container ID are observation or
+control provenance, not project identity. The Board builds a repository catalog
+from the original per-source inventories, preserves source-qualified resource
+identities inside each repository, reconciles physical Docker/process evidence
+before aggregation, and projects exactly one repository row per canonical
+root. Name-only, non-repository, missing, or unresolved evidence belongs in one
+non-actionable Unassigned Resources group. A repository or resource mutation
+is enabled only when one source proves the complete control binding; conflicting
+active endpoints or cross-repository claims remain visible and fail closed.
+The center pane keeps its toolbar and status footer fixed while variable content
+scrolls vertically, and its exact-height embedding is top-aligned.
+
+Why: The account source and two legacy Parall homes each observed the same
+host-global Docker engine. They returned 29 `project_usage` rows for 13 distinct
+keys and repeated the same Nevod worktree and two physical containers three
+times. The Board incorrectly included source origin in `ProjectGroup` identity,
+rendered name-only rows as projects, and summed repeated physical metrics. Its
+multi-source fixture protected source-scoped projects to avoid resource-ID
+collisions, contradicting the 2026-07-07 decision that project grouping consumes
+coordinator membership and unions multi-home observations. Separately, the
+center view's oversized intrinsic height was centered inside an exact-height
+clipped frame, which removed its top content. The previous horizontal sizing
+fixture and launch gate checked server counts but not vertical edges or canonical
+repository cardinality, so both failures escaped delivery.
+
+Result: The bounded Board repair introduces a repository catalog, explicit
+unassigned presentation, physical metrics deduplication, conflict health, and
+source-safe action routing. Native layout tests include the real center-only
+upward crop plus intentional inner-scroll controls. Launch telemetry now reports
+canonical repositories, repository groups, and unassigned groups; readiness
+rejects one repository rendered several times or more than one unassigned
+bucket. The larger normalized SQLite/WAL store, same-UID legacy import,
+single-observer Docker/process pipeline, pure read-only inventory, and optional
+cross-user broker are recorded as a proposed architecture, not implemented
+behavior. Different effective UIDs remain isolated and require disjoint port
+ranges or an authorized broker for host-wide uniqueness.
+
 ## 2026-07-13 - DevOps Board source ownership is anchored to the login account
 
 Decision: The Board and coordinator CLI use the effective POSIX account home,
@@ -2065,3 +2106,29 @@ chronological concurrent history, and hostile executable overrides; the launch
 detector has must-catch and false-positive controls for source failure, stale or
 reused process identity, split log writes, capture/app death, partial success,
 stabilization, and TERM-to-KILL cleanup.
+
+## 2026-07-13 - Canonical Board snapshots use an isolated SwiftPM gate
+
+Decision: The production app remains free of snapshot fixtures. The checked-in
+Board and menu renderers instead compile in an explicitly gated
+`DevOpsBoardSnapshotTests` target. `script/build_and_run.sh --test` is the
+non-launching full native regression entrypoint, while `--snapshots` renders
+the four canonical fixture states and runs both the public-artifact guard and
+the unflagged current-source verifier. Snapshot provenance binds the manifest,
+the regeneration driver, the renderer, and every production source that can
+affect the rendered state.
+
+Why: The renderers existed outside the SwiftPM package, so agents could not
+regenerate their evidence through the required native workflow without an
+ad-hoc compiler command. Their old sidecars were not bound to current source,
+and the new repository catalog made nonexistent fixture paths truthfully
+unassigned. The canonical fixture now creates a neutral project-local ignored
+Git-worktree marker so snapshots exercise the same repository-identity boundary
+as production. Artifact-specific anchors account for the lease-expanded server
+layout and the current menu error-row position without weakening the shared
+dark-UI fragmentation checks.
+
+Result: The frozen source passed 124 SwiftPM tests with zero failures and one
+expected regeneration skip. The explicitly enabled renderer test passed, the
+public-artifact guard found zero issues across 168 publishable files, and the
+unflagged snapshot verifier accepted all four current-source artifacts.

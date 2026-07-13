@@ -82,10 +82,28 @@ BOARD_SPEC = ArtifactSpec(
         AnchorSpec("service-map-heading", 0, 60, 325, 45, 120, 5, 1),
         AnchorSpec("project-tree", 0, 95, 325, 200, 900, 10, 6),
         AnchorSpec("project-load-summary", 327, 60, 785, 80, 900, 20, 3),
-        AnchorSpec("filters-and-complete-tabs", 327, 130, 785, 90, 2_500, 20, 4),
+        AnchorSpec("filters-and-resource-tabs", 327, 190, 785, 80, 5_000, 30, 6),
         AnchorSpec("details-heading", 1125, 0, 315, 80, 300, 6, 2),
         AnchorSpec("sidebar-footer", 0, 920, 325, 104, 400, 10, 4),
         AnchorSpec("center-status-footer", 327, 970, 785, 54, 500, 20, 2),
+    ),
+)
+
+DEV_SERVERS_SPEC = ArtifactSpec(
+    width=BOARD_SPEC.width,
+    height=BOARD_SPEC.height,
+    minimum_nonblack_ratio=BOARD_SPEC.minimum_nonblack_ratio,
+    regions=tuple(
+        RegionSpec("resource-table", 327, 380, 785, 220, 700)
+        if region.name == "resource-table"
+        else region
+        for region in BOARD_SPEC.regions
+    ),
+    anchors=tuple(
+        AnchorSpec("filters-and-resource-tabs", 327, 285, 785, 80, 5_000, 30, 6)
+        if anchor.name == "filters-and-resource-tabs"
+        else anchor
+        for anchor in BOARD_SPEC.anchors
     ),
 )
 
@@ -104,31 +122,37 @@ MENU_SPEC = ArtifactSpec(
         AnchorSpec("menu-actions", 330, 0, 100, 55, 40, 2, 2),
         AnchorSpec("project-row", 0, 55, 430, 50, 250, 8, 2),
         AnchorSpec("task-rows", 0, 100, 430, 125, 800, 12, 5),
-        AnchorSpec("error-heading", 0, 360, 430, 72, 500, 12, 2),
-        AnchorSpec("error-details", 0, 430, 430, 125, 650, 12, 4),
+        AnchorSpec("error-heading", 0, 495, 430, 30, 350, 12, 2),
+        AnchorSpec("error-summary", 0, 520, 430, 35, 400, 12, 2),
         AnchorSpec("menu-footer", 0, 555, 430, 45, 250, 12, 1),
     ),
 )
 
 CANONICAL_SPECS = {
-    "dev-servers.png": BOARD_SPEC,
+    "dev-servers.png": DEV_SERVERS_SPEC,
     "docker-board.png": BOARD_SPEC,
     "databases.png": BOARD_SPEC,
     "menu-action-error.png": MENU_SPEC,
 }
 
 BOARD_SOURCE_FILES = (
+    "Package.swift",
     "Sources/DevOpsBoard/Models.swift",
     "Sources/DevOpsBoard/OpsStore.swift",
+    "Sources/DevOpsBoard/RepositoryCatalog.swift",
     "Sources/DevOpsBoard/Views.swift",
+    "Tools/CanonicalSnapshotGenerationTests.swift",
     "Tools/SnapshotMain.swift",
     "Tools/SnapshotProvenance.swift",
 )
 MENU_SOURCE_FILES = (
+    "Package.swift",
     "Sources/DevOpsBoard/Models.swift",
     "Sources/DevOpsBoard/OpsStore.swift",
+    "Sources/DevOpsBoard/RepositoryCatalog.swift",
     "Sources/DevOpsBoard/Views.swift",
     "Sources/DevOpsBoard/MenuBarViews.swift",
+    "Tools/CanonicalSnapshotGenerationTests.swift",
     "Tools/MenuBarSnapshotMain.swift",
     "Tools/SnapshotProvenance.swift",
 )

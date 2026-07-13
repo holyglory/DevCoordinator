@@ -1,10 +1,21 @@
 {
   "artifact_type" : "test-fixture-snapshot",
-  "fixture_id" : "codex-ops-console-neutral-v1",
-  "generator" : "apps\/CodexOpsConsole\/Tools\/SnapshotMain.swift",
+  "fixture_id" : "devops-board-neutral-v1",
+  "generator" : "apps\/DevOpsBoard\/Tools\/SnapshotMain.swift",
   "height" : 1024,
   "schema_version" : 1,
-  "sha256" : "0aaf96197e9121a831530f1f39ed352ffa0491aac574f249ebb59666343eadb3",
+  "sha256" : "7f7c8f16c181132d38e0841d6a0c9dcf0671e5f571e207605acb38240286075f",
   "source" : "isolated-test-fixture",
+  "source_files" : [
+    "Package.swift",
+    "Sources\/DevOpsBoard\/Models.swift",
+    "Sources\/DevOpsBoard\/OpsStore.swift",
+    "Sources\/DevOpsBoard\/RepositoryCatalog.swift",
+    "Sources\/DevOpsBoard\/Views.swift",
+    "Tools\/CanonicalSnapshotGenerationTests.swift",
+    "Tools\/SnapshotMain.swift",
+    "Tools\/SnapshotProvenance.swift"
+  ],
+  "source_sha256" : "7437cc68cff180fc9cdcf3f8cdbf30a10f4023a17e218c348b62927345445420",
   "width" : 1440
 }

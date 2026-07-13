@@ -30,13 +30,22 @@ The guard cannot OCR arbitrary pixels. The stronger prevention boundary is there
 ## Regenerate
 
 Agents regenerate the native fixtures only through the Build macOS Apps plugin.
-The plugin workflow must compile the checked-in snapshot tools, render the
-`servers`, `docker`, `databases`, and menu `error` fixture states into the four
-canonical paths above, and inspect the results without taking over the user's
-desktop. Direct `swift`, `swiftc`, `xcodebuild`, `open`, XCUI, mouse, or keyboard
-substitutes are not an accepted agent workflow. If the plugin is unavailable,
-regeneration remains pending rather than being approximated through another
-surface.
+Its authoritative SwiftPM entrypoint is:
+
+```sh
+./script/build_and_run.sh --test
+./script/build_and_run.sh --snapshots
+```
+
+The `--test` mode runs the complete SwiftPM regression suite. The `--snapshots`
+mode compiles the checked-in snapshot tools in the isolated
+`DevOpsBoardSnapshotTests` target, renders the `servers`, `docker`, `databases`,
+and menu `error` fixture states into the four canonical paths above, and runs
+the public-artifact and current-source snapshot gates. Neither mode terminates
+or launches DevOps Board or takes over the user's desktop. Direct `swift`,
+`swiftc`, `xcodebuild`, `open`, XCUI, mouse, or keyboard substitutes are not an
+accepted agent workflow. If the plugin is unavailable, regeneration remains
+pending rather than being approximated through another surface.
 
 Generated working images belong under `.build/qa/` unless they replace one of the four reviewed canonical artifacts. Do not commit screenshots made from a developer's live coordinator state, local project names, home directory, logs, secrets, or databases.
 

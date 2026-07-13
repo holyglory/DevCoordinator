@@ -127,7 +127,11 @@ struct OpsConsoleView: View {
                         .position(x: layout.sidebarWidth + (splitHandleWidth / 2), y: proxy.size.height / 2)
                         .zIndex(5)
                     MainBoardView(store: store)
-                        .frame(width: layout.mainWidth, height: proxy.size.height)
+                        .frame(
+                            width: layout.mainWidth,
+                            height: proxy.size.height,
+                            alignment: .topLeading
+                        )
                         .clipped()
                         .position(x: mainX + (layout.mainWidth / 2), y: proxy.size.height / 2)
                         .zIndex(0)
@@ -284,123 +288,60 @@ struct ServiceMapView: View {
     }
 }
 
-struct ProjectGroup: Equatable {
-    var id: String
-    var name: String
-    var projectPath: String?
-    var servers: [ManagedServer]
-    var containers: [DockerContainer]
-    var databases: [DockerContainer]
-    var usage: ProjectUsage?
-
-    var hasObservedDockerRuntime: Bool {
-        !containers.isEmpty
-            || !databases.isEmpty
-            || (usage?.containerCount ?? 0) > 0
-    }
-}
-
-/// Groups come straight from the coordinator's `project_usage` rows, whose
-/// `server_ids`/`container_names` carry the same membership that
-/// whole-project start/stop/restart acts on. The app never re-derives repo
-/// identity from resource names, so the group a container is displayed under
-/// is exactly the group whose project actions touch it.
-func makeProjectGroups(from inventory: Inventory) -> [ProjectGroup] {
-    let servers = deduplicatedManagedServers(inventory.servers)
-    let containers = inventory.docker.containers.filter { !$0.isPostgresLike }
-    let databases = inventory.postgres
-    var claimedServerIDs = Set<String>()
-    var claimedContainerNames = Set<String>()
-
-    var groups: [ProjectGroup] = inventory.projectUsage.map { row in
-        let originID = row.origin?.id
-        let memberServerIDs = Set(row.serverIDs ?? [])
-        let memberContainerNames = Set(row.containerNames ?? [])
-        let rowServers = servers.filter { server in
-            server.origin?.id == originID
-                && memberServerIDs.contains(server.coordinatorID ?? server.id)
-        }
-        let rowContainers = containers.filter { container in
-            guard container.origin?.id == originID, let name = container.name else { return false }
-            return memberContainerNames.contains(name)
-        }
-        let rowDatabases = databases.filter { database in
-            guard database.origin?.id == originID, let name = database.name else { return false }
-            return memberContainerNames.contains(name)
-        }
-        claimedServerIDs.formUnion(rowServers.map { projectMembershipKey(originID: $0.origin?.id, nativeID: $0.coordinatorID ?? $0.id) })
-        claimedContainerNames.formUnion((rowContainers + rowDatabases).compactMap { container in
-            container.name.map { projectMembershipKey(originID: container.origin?.id, nativeID: $0) }
-        })
-        let usageKey = row.usageKey ?? row.project ?? row.projectKey ?? row.name ?? "local"
-        return ProjectGroup(
-            id: projectGroupID(originID: originID, usageKey: usageKey),
-            name: row.name ?? row.project.map(shortProject) ?? row.projectKey ?? "local",
-            projectPath: row.project,
-            servers: rowServers,
-            containers: rowContainers,
-            databases: rowDatabases,
-            usage: row
-        )
-    }
-    groups.sort { ($0.name.lowercased(), $0.id) < ($1.name.lowercased(), $1.id) }
-
-    // Anything absent from an authoritative membership row remains visible,
-    // but never receives an inferred project path or whole-project action.
-    let strayServers = servers.filter {
-        !claimedServerIDs.contains(projectMembershipKey(originID: $0.origin?.id, nativeID: $0.coordinatorID ?? $0.id))
-    }
-    let strayContainers = containers.filter { container in
-        guard let name = container.name else { return true }
-        return !claimedContainerNames.contains(projectMembershipKey(originID: container.origin?.id, nativeID: name))
-    }
-    let strayDatabases = databases.filter { database in
-        guard let name = database.name else { return true }
-        return !claimedContainerNames.contains(projectMembershipKey(originID: database.origin?.id, nativeID: name))
-    }
-    let originIDs = Set(
-        strayServers.map { $0.origin?.id ?? "unknown" }
-            + strayContainers.map { $0.origin?.id ?? "unknown" }
-            + strayDatabases.map { $0.origin?.id ?? "unknown" }
-    )
-    for originID in originIDs.sorted() {
-        groups.append(
-            ProjectGroup(
-                id: strayProjectGroupID(originID: originID),
-                name: "other",
-                projectPath: nil,
-                servers: strayServers.filter { ($0.origin?.id ?? "unknown") == originID },
-                containers: strayContainers.filter { ($0.origin?.id ?? "unknown") == originID },
-                databases: strayDatabases.filter { ($0.origin?.id ?? "unknown") == originID },
-                usage: nil
-            )
-        )
-    }
-    return groups
-}
-
-func projectMembershipKey(originID: String?, nativeID: String) -> String {
-    "\(originID ?? "unknown")|\(nativeID)"
-}
-
-func projectGroupID(originID: String?, usageKey: String) -> String {
-    "\(originID ?? "unknown")|project-group|\(usageKey)"
-}
-
-func strayProjectGroupID(originID: String?) -> String {
-    projectGroupID(originID: originID, usageKey: "stray:other")
-}
-
 func usageRank(_ usage: ProjectUsage) -> (Double, Double, Int) {
     (usage.cpuPercent ?? 0, usage.memoryBytes ?? 0, usage.processCount ?? 0)
 }
 
 func projectGroupStatus(_ group: ProjectGroup) -> String {
+    if !group.serverConflicts.isEmpty
+        || !group.serverMembershipConflicts.isEmpty
+        || !group.dockerMembershipConflicts.isEmpty {
+        return "unhealthy"
+    }
     if group.servers.contains(where: { ($0.status ?? "").lowercased() == "unhealthy" }) { return "unhealthy" }
     if group.servers.contains(where: { ($0.status ?? "").lowercased() == "running" }) { return "running" }
     if group.containers.contains(where: { isRunningStatus($0.status) }) { return "running" }
     if group.databases.contains(where: { isRunningStatus($0.status) }) { return "running" }
     return "stopped"
+}
+
+func projectGroupShowsProjectActions(_ group: ProjectGroup) -> Bool {
+    group.isRepository
+}
+
+func resourceObservationOrigins(
+    primary: CoordinatorOrigin?,
+    candidates: [CoordinatorOrigin]
+) -> [CoordinatorOrigin] {
+    Array(Set(candidates + [primary].compactMap { $0 })).sorted { $0.id < $1.id }
+}
+
+func projectGroupObservedOrigins(_ group: ProjectGroup) -> [CoordinatorOrigin] {
+    let origins = group.observedOrigins
+        + group.servers.flatMap {
+            resourceObservationOrigins(primary: $0.origin, candidates: $0.observationOrigins)
+        }
+        + group.containers.flatMap {
+            resourceObservationOrigins(primary: $0.origin, candidates: $0.observationOrigins)
+        }
+        + group.databases.flatMap {
+            resourceObservationOrigins(primary: $0.origin, candidates: $0.observationOrigins)
+        }
+        + [group.usage?.origin].compactMap { $0 }
+    return Array(Set(origins)).sorted { $0.id < $1.id }
+}
+
+func projectConflictOrigins(_ conflict: RepositoryServerConflict) -> [CoordinatorOrigin] {
+    Array(Set(conflict.activeSourceIdentities.map(\.origin))).sorted { $0.id < $1.id }
+}
+
+func projectGroupConflictSummary(_ group: ProjectGroup) -> String? {
+    let messages = group.serverConflicts.map(\.message)
+        + group.serverMembershipConflicts.map(\.message)
+        + group.dockerMembershipConflicts.map(\.message)
+    guard let first = messages.first else { return nil }
+    guard messages.count > 1 else { return first }
+    return "\(messages.count) ownership conflicts block project actions until repository and resource evidence agree."
 }
 
 func projectGroupCanStop(_ group: ProjectGroup) -> Bool {
@@ -430,30 +371,39 @@ struct ProjectNode: View {
                     .font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .frame(minWidth: 54, maxWidth: 96, alignment: .leading)
+                    .frame(minWidth: 54, maxWidth: group.isRepository ? 96 : 180, alignment: .leading)
                 CountBadge(count: group.servers.count + group.containers.count + group.databases.count)
-                HStack(spacing: 4) {
-                    SidebarActionButton(
-                        title: groupCanStop ? "Stop project runtime" : "Run project runtime",
-                        systemImage: groupCanStop ? "stop.fill" : "play.fill",
-                        tint: groupCanStop ? Theme.orange : Theme.green,
-                        enabled: projectActionAllowed(
-                            store,
-                            group: group,
-                            kind: groupCanStop ? .projectStop : .projectStart
-                        ),
-                        action: { groupCanStop ? store.stopProject(group) : store.startProject(group) }
-                    )
-                    SidebarActionButton(
-                        title: "Restart project runtime",
-                        systemImage: "arrow.clockwise",
-                        tint: Theme.secondary,
-                        enabled: projectActionAllowed(store, group: group, kind: .projectRestart),
-                        action: { store.restartProject(group) }
-                    )
+                if let conflictSummary = projectGroupConflictSummary(group) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.orange)
+                        .help(conflictSummary)
+                        .accessibilityLabel("Project conflict: \(conflictSummary)")
                 }
-                .fixedSize()
-                .layoutPriority(1)
+                if projectGroupShowsProjectActions(group) {
+                    HStack(spacing: 4) {
+                        SidebarActionButton(
+                            title: groupCanStop ? "Stop project runtime" : "Run project runtime",
+                            systemImage: groupCanStop ? "stop.fill" : "play.fill",
+                            tint: groupCanStop ? Theme.orange : Theme.green,
+                            enabled: projectActionAllowed(
+                                store,
+                                group: group,
+                                kind: groupCanStop ? .projectStop : .projectStart
+                            ),
+                            action: { groupCanStop ? store.stopProject(group) : store.startProject(group) }
+                        )
+                        SidebarActionButton(
+                            title: "Restart project runtime",
+                            systemImage: "arrow.clockwise",
+                            tint: Theme.secondary,
+                            enabled: projectActionAllowed(store, group: group, kind: .projectRestart),
+                            action: { store.restartProject(group) }
+                        )
+                    }
+                    .fixedSize()
+                    .layoutPriority(1)
+                }
             }
             .padding(.horizontal, 6)
             .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
@@ -463,12 +413,15 @@ struct ProjectNode: View {
             .onTapGesture(perform: toggle)
 
             if isExpanded {
-                ForEach(group.servers) { server in
+                ForEach(group.servers.map {
+                    PresentedServerRow(id: store.serverSelectionID(for: $0), server: $0)
+                }) { row in
+                    let server = row.server
                     MapLeaf(
                         title: resourceDisplayName(server.name, inProject: group.name),
                         kind: .server,
                         status: server.status,
-                        isSelected: store.sidebarSelection == .server(server.id),
+                        isSelected: store.sidebarSelection == .server(row.id),
                         canStop: canStopServer(server),
                         toggleEnabled: serverActionAllowed(
                             store,
@@ -482,12 +435,12 @@ struct ProjectNode: View {
                     )
                 }
 
-                ForEach(group.containers, id: \.stableID) { container in
+                ForEach(group.containers, id: \.containerSelectionID) { container in
                     MapLeaf(
                         title: resourceDisplayName(container.name, inProject: group.name),
                         kind: .docker,
                         status: container.status,
-                        isSelected: store.sidebarSelection == .docker(container.stableID),
+                        isSelected: store.sidebarSelection == .docker(container.containerSelectionID),
                         canStop: container.isRunning,
                         toggleEnabled: dockerActionAllowed(
                             store,
@@ -501,12 +454,12 @@ struct ProjectNode: View {
                     )
                 }
 
-                ForEach(group.databases, id: \.stableID) { database in
+                ForEach(group.databases, id: \.databaseSelectionID) { database in
                     MapLeaf(
                         title: resourceDisplayName(database.name, inProject: group.name),
                         kind: .database,
                         status: database.status,
-                        isSelected: store.sidebarSelection == .database(database.stableID),
+                        isSelected: store.sidebarSelection == .database(database.databaseSelectionID),
                         canStop: database.isRunning,
                         toggleEnabled: dockerActionAllowed(
                             store,
@@ -543,34 +496,38 @@ struct MainBoardView: View {
             ToolbarView(store: store)
             Divider().overlay(Color.white.opacity(0.07))
 
-            VStack(spacing: 12) {
-                InventoryStateBanner(store: store)
-                ProjectUsageStrip(store: store)
-                if let lease = store.latestLeaseResult {
-                    LeaseResultCard(store: store, lease: lease)
-                }
-                ManagedLeasesPanel(store: store)
-                FilterRow(
-                    store: store,
-                    bulkSelectionMode: $bulkSelectionMode,
-                    reviewSelection: reviewBulkSelection
-                )
-                ResourceTabBar(store: store)
-
-                Group {
-                    switch store.activeTab {
-                    case .servers:
-                        DevServersSection(store: store, bulkSelectionMode: bulkSelectionMode)
-                    case .docker:
-                        DockerSection(store: store, bulkSelectionMode: bulkSelectionMode)
-                    case .databases:
-                        DatabaseSection(store: store, bulkSelectionMode: bulkSelectionMode)
+            ScrollView(.vertical) {
+                VStack(spacing: 12) {
+                    InventoryStateBanner(store: store)
+                    ProjectUsageStrip(store: store)
+                    if let lease = store.latestLeaseResult {
+                        LeaseResultCard(store: store, lease: lease)
                     }
+                    ManagedLeasesPanel(store: store)
+                    FilterRow(
+                        store: store,
+                        bulkSelectionMode: $bulkSelectionMode,
+                        reviewSelection: reviewBulkSelection
+                    )
+                    ResourceTabBar(store: store)
+
+                    Group {
+                        switch store.activeTab {
+                        case .servers:
+                            DevServersSection(store: store, bulkSelectionMode: bulkSelectionMode)
+                        case .docker:
+                            DockerSection(store: store, bulkSelectionMode: bulkSelectionMode)
+                        case .databases:
+                            DatabaseSection(store: store, bulkSelectionMode: bulkSelectionMode)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .padding(14)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .accessibilityIdentifier("main-board-scroll-body")
 
             ActionResultDrawer(store: store)
             Divider().overlay(Color.white.opacity(0.07))
@@ -591,7 +548,9 @@ struct ProjectUsageStrip: View {
     @ObservedObject var store: OpsStore
 
     private var rows: [ProjectUsage] {
-        store.inventory.projectUsage
+        store.projectGroups
+            .filter(\.isRepository)
+            .compactMap(\.usage)
             .filter { ($0.serverCount ?? 0) > 0 || ($0.containerCount ?? 0) > 0 || ($0.cpuPercent ?? 0) > 0 || ($0.memoryBytes ?? 0) > 0 }
             .sorted { usageRank($0) > usageRank($1) }
             .prefix(6)
@@ -733,6 +692,7 @@ struct ToolbarView: View {
         .padding(.horizontal, 12)
         .frame(height: 54)
         .background(Theme.toolbar)
+        .accessibilityIdentifier("main-board-toolbar")
     }
 
     private var fullToolbar: some View {
@@ -1513,8 +1473,9 @@ struct DevServersSection: View {
                 DevServersEmptyState(store: store)
             } else {
                 ResizableTable(columns: ["Service", "Project", "URL", "Status", "Uptime", "Port", "Actions"], widths: $widths) {
-                    ForEach(store.filteredServers) { server in
-                        TableRow(widths: widths, isSelected: store.selectedServerID == server.id) {
+                    ForEach(store.filteredServerRows) { row in
+                        let server = row.server
+                        TableRow(widths: widths, isSelected: store.selectedServerID == row.id) {
                             TableCell(width: widths[0]) {
                                 HStack(spacing: 8) {
                                     if bulkSelectionMode {
@@ -1527,7 +1488,11 @@ struct DevServersSection: View {
                                     }
                                     StatusDot(status: server.status)
                                     Text(server.name).fontWeight(.medium).lineLimit(1)
-                                    SourceBadge(origin: server.origin, states: store.sourceStates)
+                                    ResourceSourceBadge(
+                                        primary: server.origin,
+                                        candidates: server.observationOrigins,
+                                        states: store.sourceStates
+                                    )
                                 }
                             }
                             TableCell(width: widths[1]) {
@@ -1588,8 +1553,8 @@ struct DockerSection: View {
                 )
             } else {
                 ResizableTable(columns: ["Container", "Project", "Status", "CPU", "Memory", "Network", "Disk I/O", "Image", "Ports", "Actions"], widths: $widths) {
-                    ForEach(store.visibleDockerContainers, id: \.stableID) { container in
-                    TableRow(widths: widths, isSelected: store.selectedDockerID == container.stableID) {
+                    ForEach(store.visibleDockerContainers, id: \.containerSelectionID) { container in
+                    TableRow(widths: widths, isSelected: store.selectedDockerID == container.containerSelectionID) {
                         TableCell(width: widths[0]) {
                             HStack(spacing: 8) {
                                 if bulkSelectionMode {
@@ -1605,7 +1570,11 @@ struct DockerSection: View {
                                     .fontWeight(.medium)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
-                                SourceBadge(origin: container.origin, states: store.sourceStates)
+                                ResourceSourceBadge(
+                                    primary: container.origin,
+                                    candidates: container.observationOrigins,
+                                    states: store.sourceStates
+                                )
                             }
                         }
                         TableCell(width: widths[1]) {
@@ -1698,9 +1667,9 @@ struct DatabaseSection: View {
                 )
             } else {
                 ResizableTable(columns: ["Database", "Project", "Engine", "Status", "Size", "Last Backup", "Restore Safety", "Actions"], widths: $widths) {
-                    ForEach(store.visiblePostgres, id: \.stableID) { db in
+                    ForEach(store.visiblePostgres, id: \.databaseSelectionID) { db in
                     let backup = newestBackupRecord(for: db, records: store.backupRecords)
-                    TableRow(widths: widths, isSelected: store.selectedDatabaseID == db.stableID) {
+                    TableRow(widths: widths, isSelected: store.selectedDatabaseID == db.databaseSelectionID) {
                         TableCell(width: widths[0]) {
                             HStack(spacing: 8) {
                                 StatusDot(status: db.status)
@@ -1708,7 +1677,11 @@ struct DatabaseSection: View {
                                     .fontWeight(.medium)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
-                                SourceBadge(origin: db.origin, states: store.sourceStates)
+                                ResourceSourceBadge(
+                                    primary: db.origin,
+                                    candidates: db.observationOrigins,
+                                    states: store.sourceStates
+                                )
                             }
                         }
                         TableCell(width: widths[1]) { Text(projectLabel(for: db, in: store.projectGroups)).foregroundStyle(Theme.secondary).lineLimit(1) }
@@ -1948,7 +1921,11 @@ struct SelectedServerPanel: View {
                 Text(server.name)
                     .font(.system(size: 15, weight: .bold))
                 Spacer()
-                SourceBadge(origin: server.origin, states: store.sourceStates)
+                ResourceSourceBadge(
+                    primary: server.origin,
+                    candidates: server.observationOrigins,
+                    states: store.sourceStates
+                )
             }
             Text(projectDisplayLabel(server.project))
                 .font(.system(size: 12, weight: .semibold))
@@ -1968,6 +1945,13 @@ struct SelectedServerPanel: View {
             }
             DetailLine(label: "Stopped", value: server.stoppedAt ?? "—")
             DetailLine(label: "Reason", value: server.stoppedReason ?? "—")
+            if let ownershipError = server.ownershipError {
+                Label(ownershipError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("server-ownership-conflict")
+            }
             Button {
                 store.showServerLogs(server)
             } label: {
@@ -1997,6 +1981,15 @@ struct SelectedServerPanel: View {
                 DetailLine(label: "Working directory", value: server.cwd ?? "Unavailable")
                 DetailLine(label: "Log path", value: server.logPath ?? "Unavailable")
                 DetailLine(label: "Metadata source", value: server.metadataSource ?? "Unavailable")
+                ForEach(
+                    resourceObservationOrigins(
+                        primary: server.origin,
+                        candidates: server.observationOrigins
+                    ),
+                    id: \.id
+                ) { origin in
+                    DetailLine(label: "Observed by", value: origin.label)
+                }
             }
             .font(.system(size: 11, weight: .semibold))
         }
@@ -2015,7 +2008,11 @@ struct SelectedDockerPanel: View {
                     .font(.system(size: 15, weight: .bold))
                     .lineLimit(2)
                 Spacer()
-                SourceBadge(origin: container.origin, states: store.sourceStates)
+                ResourceSourceBadge(
+                    primary: container.origin,
+                    candidates: container.observationOrigins,
+                    states: store.sourceStates
+                )
             }
             Text(container.image ?? "No image")
                 .font(.system(size: 12))
@@ -2048,6 +2045,15 @@ struct SelectedDockerPanel: View {
                 DetailLine(label: "Container ID", value: container.id ?? "Unavailable")
                 DetailLine(label: "Metadata source", value: container.metadataSource ?? "Unavailable")
                 if let error = container.ownershipError { DetailLine(label: "Ownership", value: error) }
+                ForEach(
+                    resourceObservationOrigins(
+                        primary: container.origin,
+                        candidates: container.observationOrigins
+                    ),
+                    id: \.id
+                ) { origin in
+                    DetailLine(label: "Observed by", value: origin.label)
+                }
             }
             .font(.system(size: 11, weight: .semibold))
         }
@@ -2072,7 +2078,11 @@ struct SelectedDatabasePanel: View {
                     .font(.system(size: 15, weight: .bold))
                     .lineLimit(2)
                 Spacer()
-                SourceBadge(origin: database.origin, states: store.sourceStates)
+                ResourceSourceBadge(
+                    primary: database.origin,
+                    candidates: database.observationOrigins,
+                    states: store.sourceStates
+                )
             }
             Text(database.name ?? "Unknown container")
                 .font(.system(size: 12, weight: .semibold))
@@ -2153,6 +2163,16 @@ struct SelectedDatabasePanel: View {
                 DetailLine(label: "Immutable container ID", value: database.id ?? "Unavailable")
                 DetailLine(label: "Ports", value: database.ports?.isEmpty == false ? database.ports! : "none")
                 DetailLine(label: "PIDs", value: database.stats?.pids.map(String.init) ?? "—")
+                if let error = database.ownershipError { DetailLine(label: "Ownership", value: error) }
+                ForEach(
+                    resourceObservationOrigins(
+                        primary: database.origin,
+                        candidates: database.observationOrigins
+                    ),
+                    id: \.id
+                ) { origin in
+                    DetailLine(label: "Observed by", value: origin.label)
+                }
                 DockerTelemetryPanel(container: database)
             }
             .font(.system(size: 11, weight: .semibold))
@@ -2316,57 +2336,95 @@ struct SelectedProjectPanel: View {
     var body: some View {
         // A dropped cached selection may recover only the persisted usage-key
         // path. It never scans the filesystem or derives a project from names.
+        let cachedRepository = RepositoryIdentity(projectPath: projectPath(fromUsageKey: name))
         let group = store.projectGroups.first { $0.id == name } ?? ProjectGroup(
             id: name,
             name: projectName(fromUsageKey: name),
-            projectPath: projectPath(fromUsageKey: name),
+            projectPath: cachedRepository?.canonicalRoot,
             servers: [],
             containers: [],
             databases: [],
-            usage: nil
+            usage: nil,
+            kind: cachedRepository == nil ? .unassigned : .repository
         )
         let report = store.projectRuntimeReports[name]
-        let origins = Set(
-            group.servers.compactMap(\.origin)
-                + group.containers.compactMap(\.origin)
-                + group.databases.compactMap(\.origin)
-        )
+        let origins = projectGroupObservedOrigins(group)
         VStack(alignment: .leading, spacing: 10) {
             Text(group.name)
                 .font(.system(size: 15, weight: .bold))
                 .lineLimit(2)
-            DetailLine(label: "Runtime", value: projectDisplayLabel(group.projectPath))
+            DetailLine(
+                label: "Runtime",
+                value: group.isRepository ? projectDisplayLabel(group.projectPath) : "Not linked to a repository"
+            )
             DetailLine(label: "Servers", value: "\(group.servers.count)")
             DetailLine(label: "Docker", value: "\(group.containers.count)")
             DetailLine(label: "Databases", value: "\(group.databases.count)")
+            if !group.isRepository, group.unassignedEvidenceCount > 0 {
+                DetailLine(label: "Attribution hints", value: "\(group.unassignedEvidenceCount)")
+            }
             if let usage = group.usage {
                 DetailLine(label: "CPU", value: formatCPU(usage.cpuPercent))
                 DetailLine(label: "Memory", value: formatBytes(usage.memoryBytes))
                 DetailLine(label: "Hot Process", value: hotProcessLabel(usage.hotProcesses?.first))
             }
-            InspectorActionStack {
-                Button { store.startProject(group) } label: { Label("Run", systemImage: "play.fill").frame(maxWidth: .infinity) }
-                    .disabled(!projectActionAllowed(store, group: group, kind: .projectStart))
-                Button { store.restartProject(group) } label: { Label("Restart", systemImage: "arrow.clockwise").frame(maxWidth: .infinity) }
-                    .disabled(!projectActionAllowed(store, group: group, kind: .projectRestart))
-                Button { store.stopProject(group) } label: { Label("Stop", systemImage: "stop").frame(maxWidth: .infinity) }
-                    .disabled(!projectActionAllowed(store, group: group, kind: .projectStop))
+            if let conflictSummary = projectGroupConflictSummary(group) {
+                Label(conflictSummary, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("project-server-conflict")
             }
-            Button {
-                store.statusProject(group)
-            } label: {
-                Label("Check Runtime", systemImage: "checkmark.seal")
-                    .frame(maxWidth: .infinity)
+            if projectGroupShowsProjectActions(group) {
+                InspectorActionStack {
+                    Button { store.startProject(group) } label: { Label("Run", systemImage: "play.fill").frame(maxWidth: .infinity) }
+                        .disabled(!projectActionAllowed(store, group: group, kind: .projectStart))
+                    Button { store.restartProject(group) } label: { Label("Restart", systemImage: "arrow.clockwise").frame(maxWidth: .infinity) }
+                        .disabled(!projectActionAllowed(store, group: group, kind: .projectRestart))
+                    Button { store.stopProject(group) } label: { Label("Stop", systemImage: "stop").frame(maxWidth: .infinity) }
+                        .disabled(!projectActionAllowed(store, group: group, kind: .projectStop))
+                }
+                Button {
+                    store.statusProject(group)
+                } label: {
+                    Label("Check Runtime", systemImage: "checkmark.seal")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!projectActionAllowed(store, group: group, kind: .projectStatus))
+            } else {
+                Text("These resources have no validated repository path. Use each resource row to inspect the controls available for its exact source.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.secondary)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!projectActionAllowed(store, group: group, kind: .projectStatus))
             if let report {
                 ProjectRuntimeSummary(report: report)
             }
             DisclosureGroup("Diagnostics") {
-                DetailLine(label: "Project path", value: group.projectPath ?? "Unavailable")
-                ForEach(origins.sorted { $0.id < $1.id }, id: \.id) { origin in
+                DetailLine(label: "Project path", value: group.projectPath ?? "Unassigned")
+                ForEach(origins, id: \.id) { origin in
                     DetailLine(label: "Source", value: origin.label)
+                }
+                ForEach(group.serverConflicts) { conflict in
+                    DetailLine(label: "Server conflict", value: conflict.message)
+                    DetailLine(
+                        label: "Active sources",
+                        value: projectConflictOrigins(conflict).map(\.label).joined(separator: ", ")
+                    )
+                }
+                ForEach(group.serverMembershipConflicts) { conflict in
+                    DetailLine(label: "Server ownership", value: conflict.message)
+                    DetailLine(
+                        label: "Candidate repositories",
+                        value: conflict.repositories.map(\.displayName).joined(separator: ", ")
+                    )
+                }
+                ForEach(group.dockerMembershipConflicts) { conflict in
+                    DetailLine(label: "Docker ownership", value: conflict.message)
+                    DetailLine(
+                        label: "Candidate repositories",
+                        value: conflict.repositories.map(\.displayName).joined(separator: ", ")
+                    )
                 }
             }
             .font(.system(size: 11, weight: .semibold))
@@ -3217,6 +3275,7 @@ struct StatusBar: View {
         }
         .padding(.horizontal, 18)
         .frame(height: 38)
+        .accessibilityIdentifier("main-board-status")
     }
 
 }
@@ -3249,6 +3308,34 @@ struct SourceBadge: View {
             .lineLimit(1)
             .help("Source \(origin?.label ?? "unavailable") · \(phase?.rawValue ?? "unknown")")
             .accessibilityLabel("Source \(origin?.label ?? "unknown"), \(phase?.rawValue ?? "unknown")")
+    }
+}
+
+struct ResourceSourceBadge: View {
+    let primary: CoordinatorOrigin?
+    let candidates: [CoordinatorOrigin]
+    let states: [CoordinatorSourceState]
+
+    private var origins: [CoordinatorOrigin] {
+        resourceObservationOrigins(primary: primary, candidates: candidates)
+    }
+
+    var body: some View {
+        if origins.count <= 1 {
+            SourceBadge(origin: origins.first, states: states)
+        } else {
+            Label("\(origins.count) sources", systemImage: "point.3.connected.trianglepath.dotted")
+                .labelStyle(.titleAndIcon)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(Theme.blue)
+                .padding(.horizontal, 5)
+                .frame(height: 18)
+                .background(Theme.blue.opacity(0.1))
+                .clipShape(Capsule())
+                .lineLimit(1)
+                .help("Observed by \(origins.map(\.label).joined(separator: ", "))")
+                .accessibilityLabel("Observed by sources \(origins.map(\.label).joined(separator: ", "))")
+        }
     }
 }
 
@@ -4094,8 +4181,8 @@ func environmentSubtitle(_ path: String) -> String {
 /// under; the fallbacks only cover containers absent from every membership row.
 func projectLabel(for container: DockerContainer, in groups: [ProjectGroup]) -> String {
     let member = groups.first { group in
-        group.containers.contains { $0.stableID == container.stableID }
-            || group.databases.contains { $0.stableID == container.stableID }
+        group.containers.contains { $0.containerSelectionID == container.containerSelectionID }
+            || group.databases.contains { $0.containerSelectionID == container.containerSelectionID }
     }
     if let member {
         return member.name

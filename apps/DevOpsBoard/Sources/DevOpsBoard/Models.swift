@@ -93,6 +93,12 @@ struct ManagedServer: Decodable, Identifiable, Hashable, Sendable {
     var portReused: Bool?
     var portReusedBy: PortReuseOwner?
     var processUsage: ProcessUsage?
+    // Populated by the Board's repository catalog after source inventories
+    // are reconciled. These are presentation/control facts, not coordinator
+    // payload fields, so they deliberately have no CodingKeys.
+    var ownershipError: String? = nil
+    var ownershipCandidates: [CoordinatorOrigin] = []
+    var observationOrigins: [CoordinatorOrigin] = []
 
     enum CodingKeys: String, CodingKey {
         case id, name, agent, project, cwd, port, host, url, pid, status, health
@@ -274,6 +280,7 @@ struct DockerContainer: Decodable, Identifiable, Hashable, Sendable {
     var startedAt: String? = nil
     var ownershipError: String? = nil
     var ownershipCandidates: [CoordinatorOrigin] = []
+    var observationOrigins: [CoordinatorOrigin] = []
 
     enum CodingKeys: String, CodingKey {
         case id, name, image, status, ports, project, agent, role, adopted, stats
@@ -583,6 +590,27 @@ extension DockerContainer {
         "\(origin?.id ?? "unknown"):\(id ?? name ?? "\(image ?? "container"):\(ports ?? ""):\(status ?? "")"):\(database ?? "container")"
     }
 
+    /// User-facing selection follows the physical container, not whichever
+    /// coordinator observation currently supplies the actionable row. Only an
+    /// immutable Docker ID may cross that source boundary; weaker evidence
+    /// remains source-qualified so unrelated containers cannot collapse.
+    var containerSelectionID: String {
+        if let immutableID = id?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !immutableID.isEmpty
+        {
+            return "container:\(immutableID)"
+        }
+        return "container-observation:\(stableID)"
+    }
+
+    /// One physical PostgreSQL container can expose several databases, so the
+    /// database name remains part of the logical row identity.
+    var databaseSelectionID: String {
+        let databaseName = database?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(containerSelectionID)|database|\(databaseName?.isEmpty == false ? databaseName! : "unknown")"
+    }
+
     var isRunning: Bool {
         isRunningStatus(status)
     }
@@ -659,7 +687,8 @@ extension ManagedServer {
     }
 
     var resourceIdentity: ResourceIdentity? {
-        origin.map { ResourceIdentity(origin: $0, kind: .server, nativeID: coordinatorID ?? id) }
+        guard ownershipError == nil else { return nil }
+        return origin.map { ResourceIdentity(origin: $0, kind: .server, nativeID: coordinatorID ?? id) }
     }
 
     func uptime(now: Date) -> UptimeValue {

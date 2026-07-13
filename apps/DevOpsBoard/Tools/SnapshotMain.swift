@@ -3,17 +3,35 @@ import CryptoKit
 import Foundation
 import SwiftUI
 
+#if SWIFT_PACKAGE
+@testable import DevOpsBoard
+#endif
+
+#if !SWIFT_PACKAGE
 @main
+#endif
 struct SnapshotMain {
     @MainActor
     static func main() async throws {
-        let output = CommandLine.arguments.dropFirst().first ?? ".build/qa/snapshots/dev-servers.png"
-        let tab = CommandLine.arguments.dropFirst().dropFirst().first
-        let width = CGFloat(Double(CommandLine.arguments.dropFirst(3).first ?? "1440") ?? 1440)
-        let height = CGFloat(Double(CommandLine.arguments.dropFirst(4).first ?? "1024") ?? 1024)
+        try render(arguments: Array(CommandLine.arguments.dropFirst()))
+    }
+
+    @MainActor
+    static func render(arguments: [String]) throws {
+        let output = arguments.first ?? ".build/qa/snapshots/dev-servers.png"
+        let tab = arguments.dropFirst().first
+        let width = CGFloat(Double(arguments.dropFirst(2).first ?? "1440") ?? 1440)
+        let height = CGFloat(Double(arguments.dropFirst(3).first ?? "1024") ?? 1024)
         let store = OpsStore()
         let fixture = try fixtureInventory()
         store.inventory = fixture.inventory
+        guard store.repositoryCatalog.repositories.count == 1,
+              store.projectGroups.count == 1,
+              store.projectGroups.first?.isRepository == true,
+              store.projectGroups.first?.projectPath == fixture.repositoryPath
+        else {
+            throw SnapshotError.invalidRepositoryFixture
+        }
         store.sourceStates = [
             CoordinatorSourceState(
                 origin: fixture.origin,
@@ -62,7 +80,7 @@ struct SnapshotMain {
                     id: "fixture-lease-4310",
                     port: 4310,
                     agent: "fixture-agent",
-                    project: "/fixtures/projects/sample-console",
+                    project: fixture.repositoryPath,
                     purpose: "manual",
                     status: "active",
                     expiresAtISO: "2099-01-01T01:00:00Z",
@@ -91,7 +109,7 @@ struct SnapshotMain {
                     .position(x: layout.sidebarWidth + (splitHandleWidth / 2), y: height / 2)
                     .zIndex(5)
                 MainBoardView(store: store)
-                    .frame(width: layout.mainWidth, height: height)
+                    .frame(width: layout.mainWidth, height: height, alignment: .topLeading)
                     .clipped()
                     .position(x: mainX + (layout.mainWidth / 2), y: height / 2)
                     .zIndex(0)
@@ -177,6 +195,7 @@ private func opaquePNGRepresentation(from bitmap: NSBitmapImageRep, size: NSSize
 private struct FixtureInventory {
     var inventory: Inventory
     var origin: CoordinatorOrigin
+    var repositoryPath: String
 
     var resourceCount: Int {
         inventory.servers.count + inventory.leases.count + inventory.docker.containers.count + inventory.postgres.count
@@ -184,7 +203,12 @@ private struct FixtureInventory {
 }
 
 private func fixtureInventory() throws -> FixtureInventory {
-    let data = Data(fixtureInventoryJSON.utf8)
+    let repositoryPath = try SnapshotSourceProvenance.fixtureRepository(named: "sample-console").path
+    let fixtureJSON = fixtureInventoryJSON.replacingOccurrences(
+        of: "/fixtures/projects/sample-console",
+        with: repositoryPath
+    )
+    let data = Data(fixtureJSON.utf8)
     var inventory = try JSONDecoder().decode(Inventory.self, from: data)
     let origin = CoordinatorOrigin(
         label: "Fixture",
@@ -238,7 +262,11 @@ private func fixtureInventory() throws -> FixtureInventory {
         value.origin = origin
         return value
     }
-    return FixtureInventory(inventory: inventory, origin: origin)
+    return FixtureInventory(
+        inventory: inventory,
+        origin: origin,
+        repositoryPath: repositoryPath
+    )
 }
 
 private let fixtureInventoryJSON = #"""
@@ -509,6 +537,7 @@ private func pngRemovingSensitiveMetadata(_ data: Data) throws -> Data {
 
 enum SnapshotError: Error {
     case invalidPNG
+    case invalidRepositoryFixture
     case renderFailed
 }
 

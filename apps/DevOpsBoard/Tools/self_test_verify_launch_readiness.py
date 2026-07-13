@@ -66,10 +66,14 @@ def unified_line(
     server_counts: tuple[tuple[str, int], ...] | None = None,
     managed: int = 0,
     visible: int | None = None,
+    repositories: int = 0,
+    repository_groups: int | None = None,
+    unassigned_groups: int = 0,
 ) -> str:
     if sources is None:
         sources = tuple(fixture_source_fingerprint(f"source-{index}") for index in range(loaded))
     visible = managed if visible is None else visible
+    repository_groups = repositories if repository_groups is None else repository_groups
     if server_counts is None:
         server_counts = tuple(
             (fingerprint, managed if len(sources) == 1 else 0)
@@ -85,7 +89,8 @@ def unified_line(
         f"[{pid}:abc123] [local.holyskills.codex-ops-console:inventory] "
         f"Inventory refresh {outcome} pid={pid} loaded={loaded} total={total} "
         f"sources={source_evidence} disabled={disabled_evidence} server_counts={server_count_evidence} "
-        f"managed={managed} visible={visible}\n"
+        f"managed={managed} visible={visible} repositories={repositories} "
+        f"repository_groups={repository_groups} unassigned_groups={unassigned_groups}\n"
     )
 
 
@@ -863,6 +868,47 @@ def main() -> int:
             "intentional runtime filtering was rejected outside the clean-launch gate",
         )
 
+        # False-positive control: per-source preflight evidence counts raw
+        # observations, while managed/visible counts describe logical Board
+        # rows. Two coordinators observing the same repository service must not
+        # be rejected merely because their two raw rows collapse to one.
+        duplicate_observation_fingerprints = (
+            fixture_source_fingerprint("duplicate-observer-a"),
+            fixture_source_fingerprint("duplicate-observer-b"),
+        )
+        duplicate_observation_counts = tuple(
+            (fingerprint, 1) for fingerprint in duplicate_observation_fingerprints
+        )
+        collapsed_logical_server = temp / "collapsed-logical-server.log"
+        collapsed_logical_server.write_text(
+            unified_line(
+                4160,
+                "completed",
+                2,
+                2,
+                sources=duplicate_observation_fingerprints,
+                server_counts=duplicate_observation_counts,
+                managed=1,
+                visible=1,
+                repositories=1,
+            ),
+            encoding="utf-8",
+        )
+        collapsed_ready = run_wait(
+            collapsed_logical_server,
+            expected_pid=4160,
+            expected_source_inventory=verifier.format_expected_source_inventory(
+                duplicate_observation_counts
+            ),
+            require_unfiltered_servers=True,
+        )
+        check(
+            collapsed_ready.server_counts == duplicate_observation_counts
+            and collapsed_ready.managed_servers == 1
+            and collapsed_ready.visible_servers == 1,
+            "logical source deduplication caused a false launch-readiness failure",
+        )
+
         impossible_server_counts = temp / "impossible-server-counts.log"
         impossible_server_counts.write_text(
             unified_line(4155, "completed", 1, 1, managed=0, visible=1),
@@ -872,6 +918,80 @@ def main() -> int:
             lambda: run_wait(impossible_server_counts, expected_pid=4155),
             "more visible than managed",
             "impossible managed/visible server counts passed readiness",
+        )
+
+        # Must-catch the production-shaped regression: three coordinator
+        # observations of one Nevod worktree rendered as three project rows.
+        duplicated_repository_rows = temp / "duplicated-repository-rows.log"
+        duplicated_repository_rows.write_text(
+            unified_line(
+                4157,
+                "completed",
+                3,
+                3,
+                server_counts=tuple(
+                    (fixture_source_fingerprint(f"source-{index}"), count)
+                    for index, count in enumerate((0, 16, 3))
+                ),
+                managed=19,
+                visible=19,
+                repositories=1,
+                repository_groups=3,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(duplicated_repository_rows, expected_pid=4157),
+            "3 repository groups for 1 canonical repositories",
+            "one canonical repository rendered three times but passed readiness",
+        )
+
+        # False-positive control: one explicit unassigned bucket may coexist
+        # with repository groups without becoming another project.
+        one_unassigned_group = temp / "one-unassigned-group.log"
+        one_unassigned_group.write_text(
+            unified_line(
+                4158,
+                "completed",
+                2,
+                2,
+                server_counts=tuple(
+                    (fixture_source_fingerprint(f"source-{index}"), 2)
+                    for index in range(2)
+                ),
+                managed=4,
+                visible=4,
+                repositories=2,
+                repository_groups=2,
+                unassigned_groups=1,
+            ),
+            encoding="utf-8",
+        )
+        one_unassigned_ready = run_wait(one_unassigned_group, expected_pid=4158)
+        check(
+            one_unassigned_ready.repositories == 2
+            and one_unassigned_ready.repository_groups == 2
+            and one_unassigned_ready.unassigned_groups == 1,
+            "one intentional unassigned-resources bucket caused a false readiness failure",
+        )
+
+        duplicate_unassigned_groups = temp / "duplicate-unassigned-groups.log"
+        duplicate_unassigned_groups.write_text(
+            unified_line(
+                4159,
+                "completed",
+                2,
+                2,
+                repositories=1,
+                repository_groups=1,
+                unassigned_groups=2,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(duplicate_unassigned_groups, expected_pid=4159),
+            "2 unassigned resource groups; expected at most one",
+            "multiple unassigned pseudo-project groups passed readiness",
         )
 
         near_match = temp / "near-match.log"

@@ -40,7 +40,7 @@ struct SplitSizingTest {
         assertCenterPaneIntrinsicWidthBudget()
         assertSidebarFooterWidth()
         assertProjectGrouping()
-        assertMultiSourceProjectMembership()
+        assertRepositoryCatalogMultiSourceIdentity()
         assertServerDeduplication()
         assertCurrentURLHandling()
         assertSidebarActionState()
@@ -485,13 +485,17 @@ struct SplitSizingTest {
         assertString(projectName(fromUsageKey: "name:sharedname"), "sharedname", "name-keyed selections should display the derived key")
     }
 
-    private static func assertMultiSourceProjectMembership() {
+    // One canonical worktree is one repository even when several coordinator
+    // homes observe it. Source qualification belongs to resource provenance,
+    // while incompatible live endpoints become one blocked service conflict.
+    private static func assertRepositoryCatalogMultiSourceIdentity() {
         let left = CoordinatorOrigin(label: "Left", home: "/fixtures/coordinators/left")
         let right = CoordinatorOrigin(label: "Right", home: "/fixtures/coordinators/right")
+        let project = "/fixtures/projects/shared"
         var leftServer = server(
             id: "left-composite",
             name: "web",
-            project: "/fixtures/projects/shared",
+            project: project,
             port: 3001,
             status: "running",
             updatedAt: "2026-07-07T10:00:00Z"
@@ -501,45 +505,131 @@ struct SplitSizingTest {
         var rightServer = server(
             id: "right-composite",
             name: "web",
-            project: "/fixtures/projects/shared",
+            project: project,
             port: 3002,
             status: "running",
             updatedAt: "2026-07-07T10:00:00Z"
         )
         rightServer.coordinatorID = "web"
         rightServer.origin = right
-        var leftUsage = usageRow(
-            usageKey: "path:/fixtures/projects/shared",
-            project: "/fixtures/projects/shared",
+        let leftUsage = usageRow(
+            usageKey: "path:\(project)",
+            project: project,
             projectKey: "shared",
             name: "shared",
             serverIDs: ["web"]
         )
-        leftUsage.origin = left
-        var rightUsage = leftUsage
-        rightUsage.origin = right
-        let inventory = Inventory(
+        let rightUsage = usageRow(
+            usageKey: "path:\(project)",
+            project: project,
+            projectKey: "shared",
+            name: "shared",
+            serverIDs: ["web"]
+        )
+        let leftInventory = Inventory(
             coordinatorHome: nil,
             statePath: nil,
             project: nil,
             urls: [],
-            servers: [leftServer, rightServer],
+            servers: [leftServer],
             leases: [],
             recentEvents: [],
             docker: DockerSummary(available: true, error: nil, statsError: nil, containers: [], postgres: []),
             postgres: [],
             backups: [],
-            projectUsage: [leftUsage, rightUsage]
+            projectUsage: [leftUsage]
         )
-        let groups = makeProjectGroups(from: inventory)
-        let leftGroup = groups.first {
-            $0.id == projectGroupID(originID: left.id, usageKey: "path:/fixtures/projects/shared")
+        let rightInventory = Inventory(
+            coordinatorHome: nil,
+            statePath: nil,
+            project: nil,
+            urls: [],
+            servers: [rightServer],
+            leases: [],
+            recentEvents: [],
+            docker: DockerSummary(available: true, error: nil, statsError: nil, containers: [], postgres: []),
+            postgres: [],
+            backups: [],
+            projectUsage: [rightUsage]
+        )
+        let catalog = RepositoryCatalog.build(from: [
+            RepositoryInventorySource(origin: left, inventory: leftInventory),
+            RepositoryInventorySource(origin: right, inventory: rightInventory)
+        ])
+
+        assert(catalog.repositories.count == 1, "the same canonical project path across sources must produce exactly one repository")
+        guard let repository = catalog.repositories.first else {
+            fail("the shared repository aggregate should exist")
         }
-        let rightGroup = groups.first {
-            $0.id == projectGroupID(originID: right.id, usageKey: "path:/fixtures/projects/shared")
+        assertString(repository.identity.canonicalRoot, project, "repository identity must be its canonical path")
+        assert(repository.sourceObservations.count == 2, "the repository must preserve both source observations")
+        assert(repository.servers.count == 1, "colliding web observations must produce one logical service")
+        guard let web = repository.servers.first else {
+            fail("the logical web service should exist")
         }
-        assert(leftGroup?.servers.map(\.id) == ["left-composite"], "left membership must not claim the right source's colliding native server id")
-        assert(rightGroup?.servers.map(\.id) == ["right-composite"], "right membership must not claim the left source's colliding native server id")
+        let expectedIdentities = Set([
+            ResourceIdentity(origin: left, kind: .server, nativeID: "web"),
+            ResourceIdentity(origin: right, kind: .server, nativeID: "web")
+        ])
+        assert(Set(web.sourceIdentities) == expectedIdentities, "colliding native IDs must remain source-qualified for routing provenance")
+        assert(web.isActionBlocked, "distinct simultaneously active endpoints must block the logical service")
+        assert(web.conflict?.activeSourceIdentities.count == 2, "the blocked service must retain both conflicting active endpoints")
+        assert(repository.serverConflicts.count == 1, "distinct live endpoints must become one conflict, not duplicate repositories")
+        assert(repository.projectActionsBlocked, "a repository with a live service conflict must block project actions")
+
+        let unassignedContainer = DockerContainer(
+            id: "container-unassigned",
+            name: "sharedname-worker",
+            image: "node:20",
+            status: "Up 1 hour",
+            ports: "",
+            project: nil,
+            agent: nil,
+            role: nil,
+            metadataSource: "none",
+            adopted: nil,
+            stats: nil,
+            statsHistory: nil
+        )
+        let nameOnlyInventory = Inventory(
+            coordinatorHome: nil,
+            statePath: nil,
+            project: nil,
+            urls: [],
+            servers: [],
+            leases: [],
+            recentEvents: [],
+            docker: DockerSummary(
+                available: true,
+                error: nil,
+                statsError: nil,
+                containers: [unassignedContainer],
+                postgres: []
+            ),
+            postgres: [],
+            backups: [],
+            projectUsage: [
+                usageRow(
+                    usageKey: "name:sharedname",
+                    project: nil,
+                    projectKey: "sharedname",
+                    name: "sharedname",
+                    containerNames: ["sharedname-worker"]
+                )
+            ]
+        )
+        let nameOnlyCatalog = RepositoryCatalog.build(from: [
+            RepositoryInventorySource(origin: left, inventory: nameOnlyInventory)
+        ])
+        assert(nameOnlyCatalog.repositories.isEmpty, "a name-only usage row must never synthesize a repository")
+        assert(nameOnlyCatalog.unassigned.docker.count == 1, "a project-null Docker observation must remain unassigned")
+        assert(nameOnlyCatalog.unassigned.usageObservations.count == 1, "the name-only membership row must remain visible as unassigned provenance")
+        assert(
+            nameOnlyCatalog.unassigned.docker.first?.sourceIdentities == [
+                ResourceIdentity(origin: left, kind: .docker, nativeID: "container-unassigned")
+            ],
+            "an unassigned Docker resource must retain its source-qualified immutable identity"
+        )
     }
 
     private static func usageRow(

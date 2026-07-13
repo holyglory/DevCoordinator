@@ -137,6 +137,210 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
+    func testLogicalServerSelectionSurvivesRepresentativeSourceSwitchAcrossRefreshes() async throws {
+        let fixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("server-selection-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: fixtureRoot.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [.success(inventoryExecution(home: codex.home, serverName: "web", project: fixtureRoot.path))],
+            parall.id: [.success(inventoryExecution(home: parall.home, serverName: "web", project: fixtureRoot.path))],
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: SequencedOriginDiscovery(values: [[codex], [parall]]),
+            configurationStore: StaticConfigurationStore()
+        )
+        let repository = try XCTUnwrap(RepositoryIdentity(projectPath: fixtureRoot.path))
+        let logicalSelectionID = RepositoryLogicalServerIdentity(
+            repository: repository,
+            serviceName: "web"
+        ).id
+
+        await store.loadInventory(force: true)
+        let firstRepresentative = try XCTUnwrap(store.filteredServers.first)
+        XCTAssertEqual(firstRepresentative.origin, codex)
+        store.selectServer(firstRepresentative)
+        XCTAssertEqual(store.selectedServerID, logicalSelectionID)
+
+        await store.loadInventory(force: true)
+
+        XCTAssertEqual(store.selectedServerID, logicalSelectionID)
+        XCTAssertEqual(store.sidebarSelection, .server(logicalSelectionID))
+        let selected = try XCTUnwrap(store.selectedServer)
+        XCTAssertEqual(selected.origin, parall)
+        XCTAssertEqual(selected.resourceIdentity?.origin, parall)
+    }
+
+    @MainActor
+    func testDockerSelectionSurvivesRepresentativeSourceSwitchAcrossRefreshes() async throws {
+        let fixtureRoot = try selectionRepository(named: "docker-selection")
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [.success(selectionContainerInventoryExecution(
+                home: codex.home,
+                project: fixtureRoot.path,
+                postgres: false
+            ))],
+            parall.id: [.success(selectionContainerInventoryExecution(
+                home: parall.home,
+                project: fixtureRoot.path,
+                postgres: false
+            ))],
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: SequencedOriginDiscovery(values: [[codex], [parall]]),
+            configurationStore: StaticConfigurationStore()
+        )
+
+        await store.loadInventory(force: true)
+        let firstRepresentative = try XCTUnwrap(store.inventory.docker.containers.first)
+        XCTAssertEqual(firstRepresentative.origin, codex)
+        store.selectDocker(firstRepresentative)
+        XCTAssertEqual(store.selectedDockerID, "container:immutable-selection-container")
+
+        await store.loadInventory(force: true)
+
+        XCTAssertEqual(store.selectedDockerID, "container:immutable-selection-container")
+        XCTAssertEqual(store.sidebarSelection, .docker("container:immutable-selection-container"))
+        let selected = try XCTUnwrap(store.selectedDocker)
+        XCTAssertEqual(selected.origin, parall)
+        XCTAssertEqual(selected.resourceIdentity?.origin, parall)
+    }
+
+    @MainActor
+    func testDatabaseSelectionSurvivesRepresentativeSourceSwitchAcrossRefreshes() async throws {
+        let fixtureRoot = try selectionRepository(named: "database-selection")
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [.success(selectionContainerInventoryExecution(
+                home: codex.home,
+                project: fixtureRoot.path,
+                postgres: true
+            ))],
+            parall.id: [.success(selectionContainerInventoryExecution(
+                home: parall.home,
+                project: fixtureRoot.path,
+                postgres: true
+            ))],
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            backupService: RecordingBackupService(results: []),
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: StaticDatabaseDiscovery(database: "app", sizeBytes: 1_024),
+            originDiscovery: SequencedOriginDiscovery(values: [[codex], [parall]]),
+            configurationStore: StaticConfigurationStore()
+        )
+
+        await store.loadInventory(force: true)
+        let firstRepresentative = try XCTUnwrap(store.inventory.postgres.first)
+        XCTAssertEqual(firstRepresentative.origin, codex)
+        store.selectDatabase(firstRepresentative)
+        let logicalSelectionID = "container:immutable-selection-container|database|app"
+        XCTAssertEqual(store.selectedDatabaseID, logicalSelectionID)
+
+        await store.loadInventory(force: true)
+
+        XCTAssertEqual(store.selectedDatabaseID, logicalSelectionID)
+        XCTAssertEqual(store.sidebarSelection, .database(logicalSelectionID))
+        let selected = try XCTUnwrap(store.selectedDatabase)
+        XCTAssertEqual(selected.origin, parall)
+        XCTAssertEqual(selected.databaseIdentity?.origin, parall)
+    }
+
+    @MainActor
+    func testThreeSourceRepositoryPublishesOneNevodProjectAndRoutesOneProjectAction() async throws {
+        let account = CoordinatorOrigin(label: "Account Codex", home: "/fixtures/multi-source/account")
+        let chatGPT = CoordinatorOrigin(label: "Parall ChatGPT", home: "/fixtures/multi-source/chatgpt")
+        let codexTT = CoordinatorOrigin(label: "Parall Codex", home: "/fixtures/multi-source/codex")
+        let fixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("core-three-source-\(UUID().uuidString)", isDirectory: true)
+        let projectURL = fixtureRoot.appendingPathComponent("Nevod", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: projectURL.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+        let project = projectURL.path
+        let accountInventory = threeSourceRepositoryInventoryExecution(
+            home: account.home,
+            project: project,
+            includeServers: false,
+            sample: 1
+        )
+        let chatInventory = threeSourceRepositoryInventoryExecution(
+            home: chatGPT.home,
+            project: project,
+            includeServers: false,
+            sample: 2
+        )
+        let codexInventory = threeSourceRepositoryInventoryExecution(
+            home: codexTT.home,
+            project: project,
+            includeServers: true,
+            sample: 3
+        )
+        let successfulStart = CommandExecution(
+            stdout: #"{"action":"start","project":"\#(project)","ok":true,"partial":false,"urls":[],"ports":[],"services":[],"health_checks":[],"previous_exit_reasons":[],"logs":[],"action_errors":[]}"#,
+            stderr: "",
+            exitStatus: 0
+        )
+        let service = OriginSequencedCoordinatorService(results: [
+            account.id: [.success(accountInventory), .success(accountInventory), .success(accountInventory), .success(accountInventory)],
+            chatGPT.id: [.success(chatInventory), .success(chatInventory), .success(chatInventory), .success(chatInventory)],
+            codexTT.id: [.success(codexInventory), .success(codexInventory), .success(successfulStart), .success(codexInventory), .success(codexInventory)],
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [account, chatGPT, codexTT]),
+            configurationStore: StaticConfigurationStore()
+        )
+
+        await store.loadInventory(force: true)
+
+        let group = try XCTUnwrap(store.projectGroups.first)
+        XCTAssertEqual(store.repositoryCatalog.repositories.count, 1)
+        XCTAssertEqual(store.projectGroups.count, 1)
+        XCTAssertEqual(group.name, "Nevod")
+        XCTAssertEqual(group.servers.count, 2)
+        XCTAssertEqual(group.usage?.containerCount, 2)
+        XCTAssertEqual(group.usage?.memoryBytes, 3_700_000_000)
+        XCTAssertEqual(Set(group.observedOrigins), Set([account, chatGPT, codexTT]))
+        XCTAssertEqual(group.actionOrigin, codexTT)
+        XCTAssertTrue(store.projectMutationAvailability(kind: .projectStart, group: group).isAllowed)
+
+        store.startProject(group)
+        try await waitUntil {
+            store.actionResults.values.first?.phase == .succeeded
+        }
+        try await waitUntilAsync {
+            await service.capturedCalls().count == 13
+        }
+
+        let calls = await service.capturedCalls()
+        let projectCalls = calls.filter { $0.1.prefix(2) == ["project", "start"] }
+        XCTAssertEqual(projectCalls.count, 1, "one repository action must never fan out once per observing source")
+        XCTAssertEqual(projectCalls.first?.0, codexTT)
+        XCTAssertEqual(
+            projectCalls.first?.1,
+            ["project", "start", "--project", project, "--agent", NSUserName()]
+        )
+        XCTAssertEqual(store.projectGroups.count, 1, "the post-action refresh must preserve canonical repository identity")
+    }
+
+    @MainActor
     func testDockerActionsRouteToTheOnlySidecarOwningHome() async throws {
         let unowned = dockerInventoryExecution(home: codex.home, metadataSource: "none", project: nil)
         let owned = dockerInventoryExecution(home: parall.home, metadataSource: "coordinator_sidecar", project: "/repo")
@@ -182,6 +386,62 @@ final class CoreTests: XCTestCase {
         XCTAssertNil(container.resourceIdentity)
         XCTAssertEqual(container.ownershipCandidates.count, 2)
         XCTAssertEqual(container.ownershipError, "conflicting coordinator-sidecar ownership")
+    }
+
+    @MainActor
+    func testCatalogOwnershipConflictMakesPublishedHealthNonNominalEvenWithoutResourceIdentity() async throws {
+        let fixtureRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("core-docker-conflict-\(UUID().uuidString)", isDirectory: true)
+        let leftProject = fixtureRoot.appendingPathComponent("left-owner", isDirectory: true)
+        let rightProject = fixtureRoot.appendingPathComponent("right-owner", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: leftProject.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: rightProject.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+        let leftInventory = dockerProjectConflictInventoryExecution(
+            home: codex.home,
+            project: leftProject.path
+        )
+        let rightInventory = dockerProjectConflictInventoryExecution(
+            home: parall.home,
+            project: rightProject.path
+        )
+        let service = OriginSequencedCoordinatorService(results: [
+            codex.id: [.success(leftInventory), .success(leftInventory)],
+            parall.id: [.success(rightInventory), .success(rightInventory)],
+        ])
+        let store = OpsStore(
+            coordinatorService: service,
+            commandExecutor: RecordingCommandExecutor(result: .init(stdout: "", stderr: "", exitStatus: 0)),
+            databaseDiscovery: EmptyDatabaseDiscovery(),
+            originDiscovery: StaticOriginDiscovery(values: [codex, parall]),
+            configurationStore: StaticConfigurationStore()
+        )
+
+        await store.loadInventory(force: true)
+
+        XCTAssertNil(store.inventory.docker.containers.first?.resourceIdentity)
+        XCTAssertEqual(store.repositoryCatalog.repositories.flatMap(\.dockerMembershipConflicts).count, 2)
+        XCTAssertEqual(store.healthSummary.level, .unhealthy)
+        XCTAssertEqual(store.healthSummary.unhealthyResourceCount, 1)
+        XCTAssertNotEqual(store.presentationSnapshot.statusTitle, "All systems nominal")
+
+        let conflicted = try XCTUnwrap(store.projectGroups.first(where: \.isRepository))
+        let callsBefore = await service.capturedCalls().count
+        store.startProject(conflicted)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(store.actionResults.isEmpty)
+        let callsAfter = await service.capturedCalls().count
+        XCTAssertEqual(
+            callsAfter,
+            callsBefore,
+            "a repository membership conflict must fail before any coordinator command"
+        )
     }
 
     @MainActor
@@ -3000,6 +3260,52 @@ private func inventoryExecution(home: String, serverName: String, project: Strin
     return CommandExecution(stdout: json, stderr: "", exitStatus: 0)
 }
 
+private func selectionRepository(named name: String) throws -> URL {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: root.appendingPathComponent(".git", isDirectory: true),
+        withIntermediateDirectories: true
+    )
+    return root
+}
+
+private func selectionContainerInventoryExecution(
+    home: String,
+    project: String,
+    postgres: Bool
+) -> CommandExecution {
+    let name = postgres ? "selection-postgres" : "selection-worker"
+    let image = postgres ? "postgres:17" : "worker:latest"
+    let container = """
+    {"id":"immutable-selection-container","name":"\(name)","image":"\(image)","status":"Up","project":"\(project)","metadata_source":"coordinator_sidecar"}
+    """
+    let postgresRows = postgres ? "[\(container)]" : "[]"
+    let json = """
+    {"coordinator_home":"\(home)","state_path":"\(home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"available":true,"containers":[\(container)],"postgres":\(postgresRows)},"postgres":\(postgresRows),"backups":[],"project_usage":[]}
+    """
+    return CommandExecution(stdout: json, stderr: "", exitStatus: 0)
+}
+
+private func threeSourceRepositoryInventoryExecution(
+    home: String,
+    project: String,
+    includeServers: Bool,
+    sample: Int
+) -> CommandExecution {
+    let servers = includeServers
+        ? """
+          [{"id":"nevod-web","name":"web","project":"\(project)","port":3000,"status":"stopped"},{"id":"nevod-worker","name":"worker","project":"\(project)","port":3001,"status":"stopped"}]
+          """
+        : "[]"
+    let serverIDs = includeServers ? #"["nevod-web","nevod-worker"]"# : "[]"
+    let timestamp = 1_783_944_000 + sample
+    let json = """
+    {"coordinator_home":"\(home)","state_path":"\(home)/state.json","urls":[],"servers":\(servers),"leases":[],"recent_events":[],"docker":{"available":true,"containers":[{"id":"nevod-worker-container","name":"nevod-telegram-worker","project":"\(project)","status":"Up","metadata_source":"docker_labels","stats":{"container_id":"nevod-worker-container","timestamp_ts":\(timestamp),"live":true,"cpu_percent":0.6,"memory_usage_bytes":100000000}},{"id":"nevod-postgres-container","name":"nevod-postgres","project":"\(project)","status":"Up","metadata_source":"docker_labels","stats":{"container_id":"nevod-postgres-container","timestamp_ts":\(timestamp),"live":true,"cpu_percent":2.0,"memory_usage_bytes":3600000000}}],"postgres":[]},"postgres":[],"backups":[],"project_usage":[{"usage_key":"path:\(project)","project":"\(project)","project_key":"nevod","name":"Nevod","server_ids":\(serverIDs),"container_names":["nevod-telegram-worker","nevod-postgres"],"server_count":\(includeServers ? 2 : 0),"container_count":2,"process_count":0,"cpu_percent":2.6,"memory_bytes":3700000000,"hot_processes":[]}]}
+    """
+    return CommandExecution(stdout: json, stderr: "", exitStatus: 0)
+}
+
 private func inventoryWithLeaseExecution(home: String) -> CommandExecution {
     let json = """
     {"coordinator_home":"\(home)","state_path":"\(home)/state.json","urls":[],"servers":[],"leases":[{"id":"existing-lease","port":4317,"agent":"tester","project":"/repo","purpose":"manual","status":"active","expires_at_iso":"2099-01-01T00:00:00Z"}],"recent_events":[],"docker":{"containers":[],"postgres":[]},"postgres":[],"backups":[],"project_usage":[]}
@@ -3018,6 +3324,13 @@ private func dockerInventoryExecution(home: String, metadataSource: String, proj
     let projectJSON = project.map { "\"\($0)\"" } ?? "null"
     let json = """
     {"coordinator_home":"\(home)","state_path":"\(home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"containers":[{"id":"immutable-cid","name":"db","status":"Up","project":\(projectJSON),"metadata_source":"\(metadataSource)"}],"postgres":[]},"postgres":[],"backups":[],"project_usage":[]}
+    """
+    return CommandExecution(stdout: json, stderr: "", exitStatus: 0)
+}
+
+private func dockerProjectConflictInventoryExecution(home: String, project: String) -> CommandExecution {
+    let json = """
+    {"coordinator_home":"\(home)","state_path":"\(home)/state.json","urls":[],"servers":[],"leases":[],"recent_events":[],"docker":{"available":true,"containers":[{"id":"shared-conflicting-container","name":"shared-worker","status":"Up","project":"\(project)","metadata_source":"coordinator_sidecar"}],"postgres":[]},"postgres":[],"backups":[],"project_usage":[{"usage_key":"path:\(project)","project":"\(project)","project_key":"\(URL(fileURLWithPath: project).lastPathComponent)","name":"\(URL(fileURLWithPath: project).lastPathComponent)","server_ids":[],"container_names":["shared-worker"],"server_count":0,"container_count":1,"process_count":0,"cpu_percent":0,"memory_bytes":0}]}
     """
     return CommandExecution(stdout: json, stderr: "", exitStatus: 0)
 }

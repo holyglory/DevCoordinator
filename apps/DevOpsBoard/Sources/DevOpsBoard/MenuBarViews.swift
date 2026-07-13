@@ -382,7 +382,8 @@ struct MenuProjectRow: View {
                         } else if sourceCount > 1 {
                             Text("\(sourceCount) sources")
                                 .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(Theme.orange)
+                                .foregroundStyle(Theme.blue)
+                                .help("Observed by \(groupOrigins.map(\.label).joined(separator: ", "))")
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -391,37 +392,56 @@ struct MenuProjectRow: View {
                 .buttonStyle(.plain)
                 .layoutPriority(1)
 
-                HStack(spacing: 5) {
-                    MenuBarActionButton(
-                        title: canStop ? "Stop project runtime" : "Run project runtime",
-                        systemImage: canStop ? "stop.fill" : "play.fill",
-                        tint: canStop ? Theme.orange : Theme.green,
-                        action: { canStop ? store.stopProject(group) : store.startProject(group) },
-                        disabled: !projectActionAllowed(canStop ? .projectStop : .projectStart)
-                    )
-                    MenuBarActionButton(
-                        title: "Restart project runtime",
-                        systemImage: "arrow.clockwise",
-                        tint: Theme.secondary,
-                        action: { store.restartProject(group) },
-                        disabled: !projectActionAllowed(.projectRestart)
-                    )
+                if projectGroupShowsProjectActions(group) {
+                    HStack(spacing: 5) {
+                        MenuBarActionButton(
+                            title: canStop ? "Stop project runtime" : "Run project runtime",
+                            systemImage: canStop ? "stop.fill" : "play.fill",
+                            tint: canStop ? Theme.orange : Theme.green,
+                            action: { canStop ? store.stopProject(group) : store.startProject(group) },
+                            disabled: !projectActionAllowed(canStop ? .projectStop : .projectStart)
+                        )
+                        MenuBarActionButton(
+                            title: "Restart project runtime",
+                            systemImage: "arrow.clockwise",
+                            tint: Theme.secondary,
+                            action: { store.restartProject(group) },
+                            disabled: !projectActionAllowed(.projectRestart)
+                        )
+                    }
+                    .fixedSize()
+                    .zIndex(10)
                 }
-                .fixedSize()
-                .zIndex(10)
             }
             .padding(.horizontal, 10)
             .frame(height: 34)
             .background(Theme.control.opacity(0.78))
             .clipShape(RoundedRectangle(cornerRadius: 7))
 
+            if let conflictSummary = projectGroupConflictSummary(group) {
+                Label(conflictSummary, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Theme.orange)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .accessibilityIdentifier("menu-project-server-conflict")
+            }
+
             VStack(spacing: 3) {
-                ForEach(group.servers) { server in
+                ForEach(group.servers.map {
+                    PresentedServerRow(id: store.serverSelectionID(for: $0), server: $0)
+                }) { row in
+                    let server = row.server
                     MenuTaskRow(
                         kind: .server,
                         title: resourceDisplayName(server.name, inProject: group.name),
                         subtitle: menuServerSubtitle(server),
-                        origin: server.origin,
+                        origins: resourceObservationOrigins(
+                            primary: server.origin,
+                            candidates: server.observationOrigins
+                        ),
                         status: server.status,
                         canStop: canStopServer(server),
                         toggleAllowed: serverActionAllowed(
@@ -437,12 +457,15 @@ struct MenuProjectRow: View {
                     )
                 }
 
-                ForEach(group.containers, id: \.stableID) { container in
+                ForEach(group.containers, id: \.containerSelectionID) { container in
                     MenuTaskRow(
                         kind: .docker,
                         title: resourceDisplayName(container.name, inProject: group.name),
                         subtitle: menuDockerSubtitle(container),
-                        origin: container.origin,
+                        origins: resourceObservationOrigins(
+                            primary: container.origin,
+                            candidates: container.observationOrigins
+                        ),
                         status: container.status,
                         canStop: container.isRunning,
                         toggleAllowed: dockerActionAllowed(
@@ -458,12 +481,15 @@ struct MenuProjectRow: View {
                     )
                 }
 
-                ForEach(group.databases, id: \.stableID) { database in
+                ForEach(group.databases, id: \.databaseSelectionID) { database in
                     MenuTaskRow(
                         kind: .database,
                         title: database.database ?? resourceDisplayName(database.name, inProject: group.name),
                         subtitle: menuDockerSubtitle(database),
-                        origin: database.origin,
+                        origins: resourceObservationOrigins(
+                            primary: database.origin,
+                            candidates: database.observationOrigins
+                        ),
                         status: database.status,
                         canStop: database.isRunning,
                         toggleAllowed: dockerActionAllowed(
@@ -487,17 +513,12 @@ struct MenuProjectRow: View {
         projectGroupCanStop(group)
     }
 
-    private var groupOrigins: Set<CoordinatorOrigin> {
-        Set(
-            group.servers.compactMap(\.origin)
-                + group.containers.compactMap(\.origin)
-                + group.databases.compactMap(\.origin)
-                + [group.usage?.origin].compactMap { $0 }
-        )
+    private var groupOrigins: [CoordinatorOrigin] {
+        projectGroupObservedOrigins(group)
     }
 
     private var sourceCount: Int { groupOrigins.count }
-    private var groupOrigin: CoordinatorOrigin? { groupOrigins.count == 1 ? groupOrigins.first : nil }
+    private var groupOrigin: CoordinatorOrigin? { groupOrigins.count == 1 ? groupOrigins[0] : nil }
 
     private func projectActionAllowed(_ kind: ActionKind) -> Bool {
         store.projectMutationAvailability(kind: kind, group: group).isAllowed
@@ -508,7 +529,7 @@ struct MenuTaskRow: View {
     let kind: MapLeafKind
     let title: String
     let subtitle: String
-    let origin: CoordinatorOrigin?
+    let origins: [CoordinatorOrigin]
     let status: String?
     let canStop: Bool
     let toggleAllowed: Bool
@@ -533,7 +554,15 @@ struct MenuTaskRow: View {
                                 .font(.system(size: 12, weight: .medium))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            if let origin { MenuSourceBadge(origin: origin) }
+                            if origins.count == 1 {
+                                MenuSourceBadge(origin: origins[0])
+                            } else if origins.count > 1 {
+                                Text("\(origins.count) sources")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(Theme.blue)
+                                    .lineLimit(1)
+                                    .help("Observed by \(origins.map(\.label).joined(separator: ", "))")
+                            }
                         }
                         Text(subtitle)
                             .font(.system(size: 10))
@@ -580,9 +609,9 @@ struct MenuTaskRow: View {
         .background(Color.white.opacity(0.035))
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(kindLabel), \(title), \(normalizedStatus(status)), source \(origin?.label ?? "unavailable")")
+        .accessibilityLabel("\(kindLabel), \(title), \(normalizedStatus(status)), \(originAccessibilityLabel)")
         .accessibilityIdentifier(
-            "menu-resource-\(safeAccessibilityID(kindLabel))-\(safeAccessibilityID(title))-\(safeAccessibilityID(origin?.label ?? "unknown-source"))"
+            "menu-resource-\(safeAccessibilityID(kindLabel))-\(safeAccessibilityID(title))-\(originAccessibilityID)"
         )
     }
 
@@ -592,6 +621,16 @@ struct MenuTaskRow: View {
         case .docker: "Docker container"
         case .database: "Database"
         }
+    }
+
+    private var originAccessibilityLabel: String {
+        guard !origins.isEmpty else { return "source unavailable" }
+        return "sources \(origins.map(\.label).joined(separator: ", "))"
+    }
+
+    private var originAccessibilityID: String {
+        guard origins.count == 1 else { return origins.isEmpty ? "unknown-source" : "multiple-sources" }
+        return safeAccessibilityID(origins[0].label)
     }
 }
 

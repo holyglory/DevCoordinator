@@ -3,17 +3,34 @@ import CryptoKit
 import Foundation
 import SwiftUI
 
+#if SWIFT_PACKAGE
+@testable import DevOpsBoard
+#endif
+
+#if !SWIFT_PACKAGE
 @main
+#endif
 struct MenuBarSnapshotMain {
     @MainActor
     static func main() async throws {
-        let output = CommandLine.arguments.dropFirst().first ?? ".build/qa/snapshots/menu-error.png"
-        let mode = CommandLine.arguments.dropFirst().dropFirst().first
+        try render(arguments: Array(CommandLine.arguments.dropFirst()))
+    }
+
+    @MainActor
+    static func render(arguments: [String]) throws {
+        let output = arguments.first ?? ".build/qa/snapshots/menu-error.png"
+        let mode = arguments.dropFirst().first
         let width: CGFloat = 430
         let height: CGFloat = 600
         let store = OpsStore()
         let fixture = try menuFixtureInventory()
         store.inventory = fixture.inventory
+        guard store.repositoryCatalog.repositories.count == 1,
+              store.projectGroups.count == 1,
+              store.projectGroups.first?.isRepository == true
+        else {
+            throw MenuBarSnapshotError.invalidRepositoryFixture
+        }
         store.sourceStates = [
             CoordinatorSourceState(
                 origin: fixture.origin,
@@ -166,7 +183,12 @@ private struct MenuFixtureInventory {
 }
 
 private func menuFixtureInventory() throws -> MenuFixtureInventory {
-    var inventory = try JSONDecoder().decode(Inventory.self, from: Data(menuFixtureInventoryJSON.utf8))
+    let repositoryPath = try SnapshotSourceProvenance.fixtureRepository(named: "sample-console").path
+    let fixtureJSON = menuFixtureInventoryJSON.replacingOccurrences(
+        of: "/fixtures/projects/sample-console",
+        with: repositoryPath
+    )
+    var inventory = try JSONDecoder().decode(Inventory.self, from: Data(fixtureJSON.utf8))
     let origin = CoordinatorOrigin(
         label: "Fixture",
         home: "/fixtures/coordinator",
@@ -367,5 +389,6 @@ private func menuPNGRemovingSensitiveMetadata(_ data: Data) throws -> Data {
 enum MenuBarSnapshotError: Error {
     case fixtureCopyDoesNotFit
     case invalidPNG
+    case invalidRepositoryFixture
     case renderFailed
 }

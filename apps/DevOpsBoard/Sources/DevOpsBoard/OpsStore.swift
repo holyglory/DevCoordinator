@@ -104,16 +104,25 @@ enum RefreshSurface: Hashable {
     case popover
 }
 
+/// A logical server row whose identity is independent of the coordinator
+/// observation currently chosen for display and control.
+struct PresentedServerRow: Identifiable, Equatable {
+    let id: String
+    let server: ManagedServer
+}
+
 @MainActor
 final class OpsStore: ObservableObject {
     static let bulkStopMaximumItems = 50
     @Published var inventory: Inventory = .empty {
         didSet {
             guard oldValue != inventory else { return }
-            let groups = makeProjectGroups(from: inventory)
-            if groups != projectGroups { projectGroups = groups }
+            let catalog = stagedRepositoryCatalog ?? RepositoryCatalog.build(from: inventory)
+            stagedRepositoryCatalog = nil
+            publishRepositoryPresentation(catalog: catalog, inventory: inventory)
         }
     }
+    @Published private(set) var repositoryCatalog: RepositoryCatalog = .empty
     @Published private(set) var projectGroups: [ProjectGroup] = []
     @Published var selectedServerID: ManagedServer.ID?
     @Published var selectedDockerID: String?
@@ -172,6 +181,7 @@ final class OpsStore: ObservableObject {
     private var followUpRequested = false
     private var verifiedBackupsByKey: [String: BackupRecord] = [:]
     private var backupVerificationTasks: [String: Task<Void, Never>] = [:]
+    private var stagedRepositoryCatalog: RepositoryCatalog?
 
     init(
         coordinatorService: (any CoordinatorServing)? = nil,
@@ -206,23 +216,42 @@ final class OpsStore: ObservableObject {
         }
     }
 
+    private func publishRepositoryPresentation(catalog: RepositoryCatalog, inventory: Inventory) {
+        if catalog != repositoryCatalog { repositoryCatalog = catalog }
+        let groups = makeProjectGroups(from: catalog, inventory: inventory)
+        if groups != projectGroups { projectGroups = groups }
+    }
+
+    private func publishInventory(_ decoded: Inventory, catalog: RepositoryCatalog) {
+        let needsInventoryPublication = decoded != inventory
+            || !inventoryUsesCurrentSourcePresentation(inventory)
+        if needsInventoryPublication {
+            stagedRepositoryCatalog = catalog
+            inventory = decoded
+        } else {
+            publishRepositoryPresentation(catalog: catalog, inventory: decoded)
+        }
+    }
+
     var selectedServer: ManagedServer? {
         guard let selectedServerID else { return nil }
-        return inventory.servers.first { $0.id == selectedServerID }
+        return presentedServerRows.first { $0.id == selectedServerID }?.server
+            ?? inventory.servers.first { serverSelectionID(for: $0) == selectedServerID }
     }
 
     var selectedDocker: DockerContainer? {
         guard let selectedDockerID else { return nil }
-        return inventory.docker.containers.first { $0.stableID == selectedDockerID }
+        return inventory.docker.containers.first { $0.containerSelectionID == selectedDockerID }
     }
 
     var selectedDatabase: DockerContainer? {
         guard let selectedDatabaseID else { return nil }
-        return inventory.postgres.first { $0.stableID == selectedDatabaseID }
+        return inventory.postgres.first { $0.databaseSelectionID == selectedDatabaseID }
     }
 
-    var filteredServers: [ManagedServer] {
-        inventory.servers.filter { server in
+    var filteredServerRows: [PresentedServerRow] {
+        presentedServerRows.filter { row in
+            let server = row.server
             let status = (server.status ?? "").lowercased()
             let matchesFilter: Bool
             switch filter {
@@ -243,6 +272,60 @@ final class OpsStore: ObservableObject {
                 .compactMap { $0?.lowercased() }
                 .contains { $0.contains(query) }
         }
+    }
+
+    var filteredServers: [ManagedServer] {
+        filteredServerRows.map(\.server)
+    }
+
+    /// Repository-catalog representatives are the user-facing server rows.
+    /// Raw source records remain in `inventory.servers` for provenance and
+    /// exact action reconciliation, but repeated observations of one logical
+    /// service must not inflate the Board.
+    private var presentedServerRows: [PresentedServerRow] {
+        var seen = Set<String>()
+        return projectGroups.flatMap { group in
+            group.servers.compactMap { server in
+                let id = serverSelectionID(for: server, in: group)
+                guard seen.insert(id).inserted else { return nil }
+                return PresentedServerRow(id: id, server: server)
+            }
+        }
+    }
+
+    private var presentedServers: [ManagedServer] {
+        presentedServerRows.map(\.server)
+    }
+
+    /// Match the repository catalog's logical service identity for every
+    /// visible repository row. Unassigned evidence deliberately remains bound
+    /// to its exact source-qualified observation.
+    func serverSelectionID(for server: ManagedServer) -> String {
+        if let presented = presentedServerRows.first(where: { $0.server.id == server.id }) {
+            return presented.id
+        }
+        if let repository = [server.project, server.cwd]
+            .compactMap({ RepositoryIdentity(projectPath: $0) })
+            .first
+        {
+            return RepositoryLogicalServerIdentity(
+                repository: repository,
+                serviceName: server.name
+            ).id
+        }
+        return "server-observation:\(server.id)"
+    }
+
+    private func serverSelectionID(for server: ManagedServer, in group: ProjectGroup) -> String {
+        if group.isRepository,
+           let repository = RepositoryIdentity(projectPath: group.projectPath)
+        {
+            return RepositoryLogicalServerIdentity(
+                repository: repository,
+                serviceName: server.name
+            ).id
+        }
+        return "server-observation:\(server.id)"
     }
 
     var visibleDockerContainers: [DockerContainer] {
@@ -523,14 +606,20 @@ final class OpsStore: ObservableObject {
         else {
             return .blocked(.invalidResource, "No canonical project path is available")
         }
-        let origins = Set(
-            group.servers.compactMap(\.origin)
-                + group.containers.compactMap(\.origin)
-                + group.databases.compactMap(\.origin)
-                + [group.usage?.origin].compactMap { $0 }
-        )
-        guard origins.count == 1, let origin = origins.first else {
-            return .blocked(.invalidResource, "The project does not have exactly one owning coordinator source")
+        guard group.isRepository else {
+            return .blocked(.invalidResource, "Unassigned resources do not have a repository runtime")
+        }
+        guard group.serverConflicts.isEmpty else {
+            return .blocked(.invalidResource, "The repository has conflicting active server observations")
+        }
+        guard group.serverMembershipConflicts.isEmpty else {
+            return .blocked(.invalidResource, "A server resource is claimed by several repository paths")
+        }
+        guard group.dockerMembershipConflicts.isEmpty else {
+            return .blocked(.invalidResource, "A Docker container is claimed by several repositories")
+        }
+        guard let origin = group.actionOrigin else {
+            return .blocked(.invalidResource, "The repository does not have one proven coordinator control binding")
         }
         let identity = ResourceIdentity(origin: origin, kind: .project, nativeID: projectPath)
         let knownReportRequiresDocker = projectRuntimeReports[group.id]?.requiresDockerRuntime == true
@@ -659,7 +748,7 @@ final class OpsStore: ObservableObject {
     }
 
     private var resourceHealthSignals: [ResourceHealthSignal] {
-        var signals: [ResourceHealthSignal] = inventory.servers.compactMap { server in
+        var signals: [ResourceHealthSignal] = presentedServers.compactMap { server in
             guard let identity = server.resourceIdentity else { return nil }
             let status = (server.status ?? "unknown").lowercased()
             guard server.health?.ok == false || ["unhealthy", "degraded", "orphaned"].contains(status) else { return nil }
@@ -671,6 +760,7 @@ final class OpsStore: ObservableObject {
             guard status.contains("unhealthy") || status.contains("dead") || status.contains("restart") else { return nil }
             return ResourceHealthSignal(identity: identity, level: .unhealthy, reason: status)
         })
+        signals.append(contentsOf: repositoryCatalogConflictHealthSignals(repositoryCatalog))
         return signals
     }
 
@@ -926,13 +1016,15 @@ final class OpsStore: ObservableObject {
         }
         let activeIDs = Set(origins.map(\.id))
         inventoryByOrigin = inventoryByOrigin.filter { activeIDs.contains($0.key) }
-        var decoded = mergeInventories(origins.compactMap { inventoryByOrigin[$0.id] })
+        let sourceInventories = origins.compactMap { origin -> RepositoryInventorySource? in
+            guard let inventory = inventoryByOrigin[origin.id] else { return nil }
+            return RepositoryInventorySource(origin: origin, inventory: inventory)
+        }
+        let catalog = RepositoryCatalog.build(from: sourceInventories)
+        var decoded = mergeInventories(sourceInventories.map(\.inventory))
         decoded.servers = deduplicatedManagedServers(decoded.servers)
         decoded = await discoverDatabases(in: decoded)
-        if decoded != inventory { inventory = decoded }
-        else if !inventoryUsesCurrentSourcePresentation(inventory) {
-            inventory = decoded
-        }
+        publishInventory(decoded, catalog: catalog)
         rebuildBackupRecords(from: decoded.backups)
         reconcileLeaseResults(now: clock.now())
         keepSelectionValid()
@@ -1007,15 +1099,18 @@ final class OpsStore: ObservableObject {
             .sorted()
             .joined(separator: ",")
         let serverCounts = serverCountEvidence.isEmpty ? "none" : serverCountEvidence
-        let managedServers = inventory.servers.count
+        let managedServers = presentedServers.count
         let visibleServers = filteredServers.count
+        let canonicalRepositories = repositoryCatalog.repositories.count
+        let repositoryGroups = projectGroups.filter(\.isRepository).count
+        let unassignedGroups = projectGroups.filter { !$0.isRepository }.count
         if loaded > 0 {
             inventoryLogger.info(
-                "Inventory refresh completed pid=\(pid, privacy: .public) loaded=\(loaded, privacy: .public) total=\(total, privacy: .public) sources=\(sourceEvidence, privacy: .public) disabled=\(disabledEvidence, privacy: .public) server_counts=\(serverCounts, privacy: .public) managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public)"
+                "Inventory refresh completed pid=\(pid, privacy: .public) loaded=\(loaded, privacy: .public) total=\(total, privacy: .public) sources=\(sourceEvidence, privacy: .public) disabled=\(disabledEvidence, privacy: .public) server_counts=\(serverCounts, privacy: .public) managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public) repositories=\(canonicalRepositories, privacy: .public) repository_groups=\(repositoryGroups, privacy: .public) unassigned_groups=\(unassignedGroups, privacy: .public)"
             )
         } else {
             inventoryLogger.error(
-                "Inventory refresh failed pid=\(pid, privacy: .public) loaded=0 total=\(total, privacy: .public) sources=none disabled=\(disabledEvidence, privacy: .public) server_counts=none managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public)"
+                "Inventory refresh failed pid=\(pid, privacy: .public) loaded=0 total=\(total, privacy: .public) sources=none disabled=\(disabledEvidence, privacy: .public) server_counts=none managed=\(managedServers, privacy: .public) visible=\(visibleServers, privacy: .public) repositories=\(canonicalRepositories, privacy: .public) repository_groups=\(repositoryGroups, privacy: .public) unassigned_groups=\(unassignedGroups, privacy: .public)"
             )
         }
     }
@@ -1456,20 +1551,21 @@ final class OpsStore: ObservableObject {
 
     func selectServer(_ server: ManagedServer) {
         activeTab = .servers
-        selectedServerID = server.id
-        sidebarSelection = .server(server.id)
+        let selectionID = serverSelectionID(for: server)
+        selectedServerID = selectionID
+        sidebarSelection = .server(selectionID)
     }
 
     func selectDocker(_ container: DockerContainer) {
         activeTab = .docker
-        selectedDockerID = container.stableID
-        sidebarSelection = .docker(container.stableID)
+        selectedDockerID = container.containerSelectionID
+        sidebarSelection = .docker(container.containerSelectionID)
     }
 
     func selectDatabase(_ container: DockerContainer) {
         activeTab = .databases
-        selectedDatabaseID = container.stableID
-        sidebarSelection = .database(container.stableID)
+        selectedDatabaseID = container.databaseSelectionID
+        sidebarSelection = .database(container.databaseSelectionID)
         requestBackupVerification(for: container)
     }
 
@@ -2415,19 +2511,23 @@ final class OpsStore: ObservableObject {
     }
 
     private func keepSelectionValid() {
-        if let selectedServerID, !inventory.servers.contains(where: { $0.id == selectedServerID }) {
+        if let selectedServerID, !presentedServerRows.contains(where: { $0.id == selectedServerID }) {
             self.selectedServerID = nil
         }
-        if let selectedDockerID, !inventory.docker.containers.contains(where: { $0.stableID == selectedDockerID }) {
+        if let selectedDockerID,
+           !inventory.docker.containers.contains(where: { $0.containerSelectionID == selectedDockerID })
+        {
             self.selectedDockerID = nil
         }
-        if let selectedDatabaseID, !inventory.postgres.contains(where: { $0.stableID == selectedDatabaseID }) {
+        if let selectedDatabaseID,
+           !inventory.postgres.contains(where: { $0.databaseSelectionID == selectedDatabaseID })
+        {
             self.selectedDatabaseID = nil
         }
         if selectedServerID == nil, selectedDockerID == nil, selectedDatabaseID == nil {
-            if let fallback = inventory.servers.first?.id {
-                selectedServerID = fallback
-                sidebarSelection = .server(fallback)
+            if let fallback = presentedServerRows.first {
+                selectedServerID = fallback.id
+                sidebarSelection = .server(fallback.id)
                 activeTab = .servers
             }
         }
@@ -2665,23 +2765,12 @@ final class OpsStore: ObservableObject {
             )
             return
         }
-        let origins = Set(
-            group.servers.compactMap(\.origin)
-                + group.containers.compactMap(\.origin)
-                + group.databases.compactMap(\.origin)
-                + [group.usage?.origin].compactMap { $0 }
-        )
-        guard origins.count == 1, let origin = origins.first else {
-            reportAmbiguousSource("Project runtime \(action)")
-            return
-        }
         let kind: ActionKind = switch action {
         case "start": .projectStart
         case "restart": .projectRestart
         case "stop": .projectStop
         default: .projectStatus
         }
-        let identity = ResourceIdentity(origin: origin, kind: .project, nativeID: projectPath)
         let availability = projectMutationAvailability(kind: kind, group: group)
         guard availability.isAllowed else {
             let message = availability.message ?? "The project runtime action is unavailable"
@@ -2693,6 +2782,11 @@ final class OpsStore: ObservableObject {
             )
             return
         }
+        guard let origin = group.actionOrigin else {
+            reportAmbiguousSource("Project runtime \(action)")
+            return
+        }
+        let identity = ResourceIdentity(origin: origin, kind: .project, nativeID: projectPath)
         let request = beginAction(kind: kind, title: "Project \(action) \(group.name)", resource: identity)
         Task {
             markActionRunning(request.id)

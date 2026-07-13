@@ -117,29 +117,45 @@ def main() -> int:
         check("snapshot-empty-region" in sparse_rules, "missing required UI regions must be caught")
 
         source_root = temporary / "app"
-        (source_root / "Sources").mkdir(parents=True)
+        (source_root / "Sources" / "DevOpsBoard").mkdir(parents=True)
         (source_root / "Tools").mkdir(parents=True)
-        source_a = source_root / "Sources" / "View.swift"
-        source_b = source_root / "Tools" / "Renderer.swift"
-        source_a.write_text("struct ViewFixture {}\n", encoding="utf-8")
-        source_b.write_text("struct RendererFixture {}\n", encoding="utf-8")
-        expected_files = ("Tools/Renderer.swift", "Sources/View.swift")
-        provenance_path = Path(f"{good_rgb}.provenance.json")
-        provenance_path.write_text(
-            json.dumps(
-                {
-                    "source_files": sorted(expected_files),
-                    "source_sha256": VERIFIER.source_fingerprint(source_root, expected_files),
-                }
-            ),
+        package_source = source_root / "Package.swift"
+        view_source = source_root / "Sources" / "DevOpsBoard" / "Views.swift"
+        generation_source = source_root / "Tools" / "CanonicalSnapshotGenerationTests.swift"
+        renderer_source = source_root / "Tools" / "SnapshotMain.swift"
+        package_source.write_text(
+            '.testTarget(name: "DevOpsBoardSnapshotTests", sources: ["CanonicalSnapshotGenerationTests.swift"])\n',
             encoding="utf-8",
         )
+        view_source.write_text("struct ViewFixture {}\n", encoding="utf-8")
+        generation_source.write_text('let state = "servers"\nlet width = 1440\n', encoding="utf-8")
+        renderer_source.write_text("struct RendererFixture {}\n", encoding="utf-8")
+        expected_files = (
+            "Package.swift",
+            "Sources/DevOpsBoard/Views.swift",
+            "Tools/CanonicalSnapshotGenerationTests.swift",
+            "Tools/SnapshotMain.swift",
+        )
+        provenance_path = Path(f"{good_rgb}.provenance.json")
+
+        def write_source_provenance() -> None:
+            provenance_path.write_text(
+                json.dumps(
+                    {
+                        "source_files": sorted(expected_files),
+                        "source_sha256": VERIFIER.source_fingerprint(source_root, expected_files),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        write_source_provenance()
         check(
             not VERIFIER.verify_source_binding(good_rgb, source_root, expected_files),
             "current renderer source with exact portable provenance should pass",
         )
 
-        source_a.write_text("struct ViewFixture { let changed = true }\n", encoding="utf-8")
+        view_source.write_text("struct ViewFixture { let changed = true }\n", encoding="utf-8")
         stale_rules = {
             finding.rule for finding in VERIFIER.verify_source_binding(good_rgb, source_root, expected_files)
         }
@@ -148,7 +164,35 @@ def main() -> int:
             "a realistic UI source edit after rendering must make the committed snapshot stale",
         )
 
-        source_a.write_text("struct ViewFixture {}\n", encoding="utf-8")
+        view_source.write_text("struct ViewFixture {}\n", encoding="utf-8")
+        write_source_provenance()
+        generation_source.write_text('let state = "servers"\nlet width = 1280\n', encoding="utf-8")
+        generation_rules = {
+            finding.rule for finding in VERIFIER.verify_source_binding(good_rgb, source_root, expected_files)
+        }
+        check(
+            "snapshot-stale-source" in generation_rules,
+            "changing the authoritative snapshot mode or dimensions must make the artifact stale",
+        )
+
+        generation_source.write_text('let state = "servers"\nlet width = 1440\n', encoding="utf-8")
+        write_source_provenance()
+        package_source.write_text(
+            '.testTarget(name: "DevOpsBoardSnapshotTests", sources: ["SnapshotMain.swift"])\n',
+            encoding="utf-8",
+        )
+        package_rules = {
+            finding.rule for finding in VERIFIER.verify_source_binding(good_rgb, source_root, expected_files)
+        }
+        check(
+            "snapshot-stale-source" in package_rules,
+            "changing SwiftPM snapshot-target membership must make the artifact stale",
+        )
+
+        package_source.write_text(
+            '.testTarget(name: "DevOpsBoardSnapshotTests", sources: ["CanonicalSnapshotGenerationTests.swift"])\n',
+            encoding="utf-8",
+        )
         provenance_path.write_text(json.dumps({"source_sha256": "0" * 64}), encoding="utf-8")
         missing_binding_rules = {
             finding.rule for finding in VERIFIER.verify_source_binding(good_rgb, source_root, expected_files)

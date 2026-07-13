@@ -10,10 +10,44 @@ APP_ROOT="$ROOT_DIR/apps/DevOpsBoard"
 APP_BUNDLE="$APP_ROOT/.build/app/DevOpsBoard.app"
 APP_BINARY="$APP_BUNDLE/Contents/MacOS/DevOpsBoard"
 PYTHON_COMMAND="python3"
+SWIFT_COMMAND="swift"
 PS_COMMAND="/bin/ps"
 PGREP_COMMAND="/usr/bin/pgrep"
 LOG_COMMAND="/usr/bin/log"
 VERIFIER="$APP_ROOT/Tools/verify_launch_readiness.py"
+
+run_tests() (
+  set -euo pipefail
+  cd "$ROOT_DIR"
+  unset DEVOPS_BOARD_REGENERATE_CANONICAL_SNAPSHOTS
+  unset DEVOPS_BOARD_SNAPSHOT_OUTPUT_DIR
+
+  "$SWIFT_COMMAND" test --package-path "$APP_ROOT"
+)
+
+regenerate_snapshots() (
+  set -euo pipefail
+  cd "$ROOT_DIR"
+
+  DEVOPS_BOARD_REGENERATE_CANONICAL_SNAPSHOTS=1 \
+    DEVOPS_BOARD_SNAPSHOT_OUTPUT_DIR="$APP_ROOT/Artifacts/Canonical" \
+    "$SWIFT_COMMAND" test \
+      --package-path "$APP_ROOT" \
+      --filter DevOpsBoardSnapshotTests.CanonicalSnapshotGenerationTests/testRegenerateCanonicalArtifactsWhenExplicitlyEnabled
+
+  "$PYTHON_COMMAND" "$ROOT_DIR/scripts/public_artifact_guard.py"
+  "$PYTHON_COMMAND" "$ROOT_DIR/scripts/verify_snapshot_artifacts.py"
+)
+
+if [[ "$MODE" == "test" || "$MODE" == "--test" ]]; then
+  run_tests
+  exit 0
+fi
+
+if [[ "$MODE" == "snapshots" || "$MODE" == "--snapshots" ]]; then
+  regenerate_snapshots
+  exit 0
+fi
 
 /usr/bin/pkill -u "$(id -u)" -x "$APP_NAME" >/dev/null 2>&1 || true
 
@@ -191,7 +225,7 @@ case "$MODE" in
     verify_launch
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--test|--snapshots]" >&2
     exit 2
     ;;
 esac
