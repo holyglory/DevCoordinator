@@ -1900,3 +1900,14 @@ Result: Diagnostics now derives a stable, deduplicated origin list from the
 selected group's servers, containers, and databases. The same plugin entrypoint
 is the repeatable build, package, launch, log, telemetry, debug, and process
 verification surface.
+
+Follow-up: The first provenance-bound signed package exposed that macOS
+`codesign` rewrites the Mach-O executable, while packaged provenance schema 3
+incorrectly required its post-sign whole-file hash to equal the pre-sign build
+hash. The Python packager test had modeled `codesign` as a no-op and therefore
+missed this real signing behavior. Schema 4 records the verified pre-sign build
+hash, verifies the copied bytes before signing, uses the bundle signature as the
+post-sign integrity boundary, and reports the final executable hash separately.
+The deterministic packager test now mutates executable bytes during its fake
+signing step and requires signed packaging to preserve both facts; unsigned
+packages retain exact whole-file hash verification and tamper rejection.

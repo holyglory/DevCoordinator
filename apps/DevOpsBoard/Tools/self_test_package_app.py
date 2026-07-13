@@ -207,8 +207,10 @@ def main() -> int:
         calls: list[list[str]] = []
         git_status_output = ""
         head_mismatch_paths: set[str] = set()
+        mutate_codesigned_executable = False
 
         def fake_run(command: list[str], *, cwd: Path = app_root, capture: bool = False) -> str:
+            nonlocal mutate_codesigned_executable
             del cwd, capture
             calls.append(command.copy())
             if command[:2] == ["swift", "build"] and "--show-bin-path" in command:
@@ -235,6 +237,12 @@ def main() -> int:
                     plistlib.load(stream)
                 return ""
             if command and command[0] == "codesign":
+                if mutate_codesigned_executable and "--sign" in command:
+                    signed_app = Path(command[-1])
+                    signed_executable = signed_app / "Contents" / "MacOS" / packager.PRODUCT_NAME
+                    signed_executable.write_bytes(
+                        signed_executable.read_bytes() + b"realistic-mutated-code-signature\n"
+                    )
                 return ""
             raise AssertionError(f"unexpected external command: {command}")
 
@@ -289,7 +297,7 @@ def main() -> int:
 
         provenance_path = output / "Contents" / "Resources" / packager.RUNTIME_PROVENANCE_NAME
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-        check(provenance["schema_version"] == 3, "packaged provenance schema was not upgraded")
+        check(provenance["schema_version"] == 4, "packaged provenance schema was not upgraded")
         check(
             provenance["repository"]
             == {"commit": "1" * 40, "tree": "2" * 40, "tracked_changes": False},
@@ -311,8 +319,8 @@ def main() -> int:
             encoding="utf-8",
         )
         check(
-            provenance["executable"]["sha256"] == digest(executable),
-            "packaged provenance does not bind the executable bytes",
+            provenance["executable"]["build_sha256"] == digest(executable),
+            "packaged provenance does not bind the verified build executable bytes",
         )
         expected_source_paths = ["Package.swift", "Sources/DevOpsBoard/Main.swift"]
         check(
@@ -330,6 +338,41 @@ def main() -> int:
             check(bundled.is_file() and not bundled.is_symlink(), f"bundled helper missing or linked: {relative}")
             check(digest(canonical) == digest(bundled), f"bundled helper drifted: {relative}")
         check(len(provenance["runtime_helpers"]) == len(packager.RUNTIME_SCRIPTS), "runtime provenance is incomplete")
+
+        # Real macOS codesign rewrites the Mach-O signature bytes. The signed
+        # package must preserve the verified pre-sign build hash in provenance,
+        # accept the signature-mutated executable, and report its actual final
+        # whole-file hash. A no-op codesign fake cannot exercise this boundary.
+        mutate_codesigned_executable = True
+        signed_output = temp / "signed-DevOpsBoard.app"
+        signed_result = packager.package_app(
+            configuration="debug",
+            output=signed_output,
+            version="1.0.0",
+            build="1",
+            skip_build=True,
+            sign=True,
+            force=False,
+        )
+        mutate_codesigned_executable = False
+        signed_executable = signed_output / "Contents" / "MacOS" / packager.PRODUCT_NAME
+        signed_provenance = json.loads(
+            (signed_output / "Contents" / "Resources" / packager.RUNTIME_PROVENANCE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        check(
+            signed_provenance["executable"]["build_sha256"] == digest(binary),
+            "signed provenance lost the verified pre-sign build hash",
+        )
+        check(
+            signed_result["executable_sha256"] == digest(signed_executable),
+            "signed package did not report the final executable hash",
+        )
+        check(
+            signed_result["executable_sha256"] != signed_provenance["executable"]["build_sha256"],
+            "signed regression fixture did not mutate the executable like real codesign",
+        )
 
         # A commit id is not reproducible provenance when tracked source is
         # dirty. The packager must fail even if the modified file is outside

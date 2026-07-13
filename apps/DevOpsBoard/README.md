@@ -47,8 +47,8 @@ are shown as unavailable; they are not replaced by fixture data.
 SwiftPM builds a bare executable. The packaging tool creates a standard,
 ad-hoc-signed `.app`, validates its plist and signature, and bundles exact
 copies of the coordinator and PostgreSQL helper scripts so the app does not
-depend on a developer-specific repository path. It also records the packaged
-executable SHA-256 together with the exact `Package.swift`, optional
+depend on a developer-specific repository path. It also records the verified
+pre-sign build-executable SHA-256 together with the exact `Package.swift`, optional
 `Package.resolved`, and production `Sources/**/*.swift` paths and hashes. The
 runtime provenance also records the DevCoordinator commit/tree and whether
 that checkout had tracked changes, binding both bundled skills to one source:

@@ -28,7 +28,7 @@ RUNTIME_SCRIPTS = (
     Path("skills/postgres-docker-backup/scripts/postgres_docker_backup.py"),
 )
 BUILD_PROVENANCE_SCHEMA = 1
-PACKAGED_PROVENANCE_SCHEMA = 3
+PACKAGED_PROVENANCE_SCHEMA = 4
 BUILD_PROVENANCE_DIRECTORY = Path(".build/devcoordinator-packaging")
 RUNTIME_PROVENANCE_NAME = "devcoordinator-runtime.json"
 
@@ -365,7 +365,12 @@ def copy_runtime_scripts(resources: Path) -> list[dict[str, str]]:
     return evidence
 
 
-def verify_packaged_app(app: Path, *, require_signature: bool) -> dict[str, Any]:
+def verify_packaged_app(
+    app: Path,
+    *,
+    require_signature: bool,
+    expected_build_sha256: str | None = None,
+) -> dict[str, Any]:
     app = require_safe_output(app)
     contents = app / "Contents"
     executable = contents / "MacOS" / PRODUCT_NAME
@@ -410,7 +415,17 @@ def verify_packaged_app(app: Path, *, require_signature: bool) -> dict[str, Any]
     if executable_record.get("path") != expected_executable_path:
         raise PackagingError("runtime provenance names the wrong packaged executable")
     executable_hash = sha256(executable)
-    if executable_record.get("sha256") != executable_hash:
+    recorded_build_hash = executable_record.get("build_sha256")
+    if not isinstance(recorded_build_hash, str) or len(recorded_build_hash) != 64:
+        raise PackagingError("runtime provenance is missing the verified build executable hash")
+    if expected_build_sha256 is not None and recorded_build_hash != expected_build_sha256:
+        raise PackagingError("runtime provenance does not match the verified build executable")
+    # Ad-hoc bundle signing legitimately rewrites the Mach-O code signature and
+    # therefore its whole-file hash. The copy is compared byte-for-byte with
+    # the verified build before signing; after signing, the bundle signature is
+    # the integrity boundary. Unsigned packages retain exact whole-file hash
+    # verification because their executable bytes must remain unchanged.
+    if not require_signature and recorded_build_hash != executable_hash:
         raise PackagingError("packaged executable does not match runtime provenance")
     configuration = executable_record.get("configuration")
     if configuration not in {"debug", "release"}:
@@ -532,7 +547,7 @@ def package_app(
             "repository": revision_after_copy,
             "executable": {
                 "path": f"Contents/MacOS/{PRODUCT_NAME}",
-                "sha256": packaged_binary_hash,
+                "build_sha256": packaged_binary_hash,
                 "configuration": configuration,
                 "build_inputs": build_provenance["build_inputs"],
                 "build_inputs_sha256": build_provenance["build_inputs_sha256"],
@@ -547,7 +562,11 @@ def package_app(
         run(["plutil", "-lint", str(contents / "Info.plist")])
         if sign:
             run(["codesign", "--force", "--deep", "--sign", "-", str(staging)])
-        verified_staging = verify_packaged_app(staging, require_signature=sign)
+        verified_staging = verify_packaged_app(
+            staging,
+            require_signature=sign,
+            expected_build_sha256=recorded_build_hash,
+        )
 
         backup: Path | None = None
         if output.exists():
