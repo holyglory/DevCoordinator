@@ -2017,11 +2017,12 @@ first snapshot that was discarded at the transport boundary.
 
 Result: The exact live Board request is now 650,020 bytes and completes in
 2.86 seconds with Docker available, 16 servers, 15 containers, seven PostgreSQL
-projections, and 450 returned history samples. The signed app at commit
-`7d77304d1925080a25d2f11465d5599f30d6265b` passed the new real-source launch
-gate and emitted four consecutive `loaded=1 total=1` completion markers over
-99 seconds. Process sampling observed 0% idle CPU, a brief 5.5% refresh peak,
-roughly 118-124 MiB RSS, and no persistent coordinator child. Native tests now
+projections, and 450 returned history samples. The signed app built from code
+commit `7d77304d1925080a25d2f11465d5599f30d6265b` passed the new real-source
+launch gate; two independent provenance-bound launches emitted four and then
+three consecutive `loaded=1 total=1` completion markers. Process sampling
+observed 0% idle CPU, a brief 17.3% refresh sample, roughly 116-124 MiB RSS,
+and no persistent coordinator child. Native tests now
 cover the realistic over-1-MiB failure shape, ordinary-cap preservation,
 single-decode handoff, and capability truth; coordinator tests cover compact
 formatting, limits 0/30/120, current-stat preservation, out-of-range inputs,
