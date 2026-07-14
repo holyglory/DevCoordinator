@@ -17,12 +17,15 @@ A single Node process that is the public edge of the VPS `vr.ae`:
    `<slug>.vr.ae` → reverse proxy to `127.0.0.1:<port>` (HTTP + WebSocket/HMR).
    Apex `vr.ae` and `www.vr.ae` → redirect to the console. Foreign hosts → 421.
 3. **Google auth (OIDC)**: authorization-code flow + PKCE against
-   `https://accounts.google.com`, allowlist of emails, HMAC-signed session
-   cookie on `Domain=.vr.ae` so one login covers every subdomain.
-4. **Per-route access control**: each subdomain route is `google` (default) or
-   `public`. **Unknown slugs behave exactly like protected ones for anonymous
-   users** (redirect to login) so route names cannot be enumerated; after
-   login an unknown slug renders the styled 404 page.
+   `https://accounts.google.com`, verified Google email identity, and one
+   HMAC-signed session cookie on `Domain=.vr.ae` so a login can cover every
+   granted subdomain.
+4. **Per-account access control**: `ALLOWED_EMAILS` is the configured owner
+   set (full access + access administration). Invited Google accounts and
+   exact `console` / `route:<slug>` grants live in private Console state. Each
+   route is `google` (default) or `public`; public bypasses identity, while a
+   protected route requires its exact grant. **Unknown slugs behave exactly
+   like protected ones for anonymous users** so names cannot be enumerated.
 5. **Coordinator as control engine**: all server/docker/lease state and
    mutations go through the coordinator HTTP API on `127.0.0.1:29876`
    (`docs/coordinator-http-api.json` is the authoritative endpoint map). The
@@ -35,7 +38,7 @@ A single Node process that is the public edge of the VPS `vr.ae`:
 |---|---|
 | A core | `package.json`, `bin/devops-console.mjs`, `src/config.mjs`, `src/log.mjs`, `src/certs.mjs`, `src/server.mjs`, `src/router.mjs`, `src/proxy.mjs` |
 | B auth | `src/auth/session.mjs`, `src/auth/oidc.mjs`, `src/auth/guard.mjs`, `src/auth/pages.mjs` |
-| C control | `src/coordinator.mjs`, `src/routes.mjs`, `src/api.mjs`, `src/metrics.mjs`, `src/prefs.mjs` |
+| C control | `src/coordinator.mjs`, `src/routes.mjs`, `src/access.mjs`, `src/api.mjs`, `src/metrics.mjs`, `src/prefs.mjs` |
 | D ui | `src/static.mjs`, `src/ui/index.html`, `src/ui/app.css`, `src/ui/app.js`, `docs/journeys.md` |
 
 Nobody else touches another agent's files; the integrator reconciles.
@@ -62,7 +65,7 @@ single/double-quoted; no interpolation). **`process.env` wins over the file.**
   tlsCertFile, tlsKeyFile,        // absolute paths (resolved from appRoot)
   google: { clientId, clientSecret },  // may be '' — see "degraded mode" below
   oidcIssuer,             // default 'https://accounts.google.com'
-  allowedEmails,          // Set<string> lowercased, from ALLOWED_EMAILS csv
+  allowedEmails,          // configured owner Set<string>, lowercased from ALLOWED_EMAILS csv
   sessionSecret,          // Buffer (from 64-hex SESSION_SECRET; required)
   sessionTtlMs,           // from SESSION_TTL_HOURS (default 168h)
   cookieName,             // SESSION_COOKIE_NAME default 'dc_session'
@@ -143,9 +146,9 @@ Dispatch (both request and upgrade paths):
 3. apex / `www.` → 301 `config.consoleOrigin + '/'`.
 4. `host === consoleHost` → console app:
    - `/auth/*` → auth endpoints (below), no session required.
-   - everything else requires a valid **allowlisted** session
-     (`guard`): browser GETs redirect to `/auth/login?rt=<orig>`, API/XHR
-     (`Accept: application/json` or `/api/*`) get `401 {"error":"unauthenticated"}`.
+   - everything else requires a current known session plus the `console`
+     grant (owners always pass). Missing sessions redirect browser GETs to
+     login or return JSON 401; known accounts without the grant receive 403.
    - `/api/*` → `consoleApi.handle(req, res, session)`.
    - else `staticServer.handle(req, res)` (UI).
    - upgrades on consoleHost: destroy (no WS on console in v1).
@@ -155,6 +158,8 @@ Dispatch (both request and upgrade paths):
    - `needAuth` and no valid session → browser GET/HEAD: 302 to
      `${consoleOrigin}/auth/login?rt=${encodeURIComponent(fullUrl)}`;
      non-browser or upgrade: 401 / socket destroy.
+   - a known signed-in account without `route:<slug>` → 403 for both HTTP and
+     WebSocket. Owners always pass. Public routes bypass this check.
    - no route (after auth) → `pages.renderNotFound` 404.
    - `target = await routeStore.resolve(slug, coordinator)`;
      unresolvable (linked server stopped) → `pages.renderUpstreamError` 502
@@ -167,9 +172,10 @@ Auth endpoints (console host only):
   button → `/auth/start?rt=`; degraded mode → setup banner instead.
 - `GET /auth/start?rt=` — 302 to Google authorize URL; sets flow cookie.
 - `GET /auth/callback` — validates flow, exchanges code, verifies ID token,
-  allowlist check → session cookie (`Domain=.vr.ae`) → 302 validated `rt` or `/`.
-  Not allowlisted → 403 `pages.renderDenied` (no cookie). OIDC errors → 400
-  login page with error note.
+  current owner/invited-user membership check → session cookie
+  (`Domain=.vr.ae`) → 302 validated `rt` or `/`. Unknown email → 403
+  `pages.renderDenied` (no cookie). A known account may then receive a
+  resource-specific 403 at its return host. OIDC errors → 400 login page.
 - `GET|POST /auth/logout` — expire cookie, 302 `/auth/login`.
 
 `rt` validation (in guard): absolute URL, scheme matches deployment
@@ -255,8 +261,11 @@ export class OidcError extends Error {} // .code: 'state_mismatch'|'exchange_fai
 ## Guard (`src/auth/guard.mjs`)
 
 ```js
-export function createGuard({ sessions, allowedEmails, config, log })
-// → { sessionFrom(req): session|null,          // parse + allowlist re-check
+export function createGuard({ sessions, access, config, log })
+// → { sessionFrom(req): session|null,          // parse + live membership re-check
+//     isKnownEmail(email): boolean,
+//     isAdmin(sessionOrEmail): boolean,
+//     hasAccess(sessionOrEmail, resource): boolean,
 //     wantsHtml(req): boolean,
 //     loginRedirectUrl(req): string,           // console /auth/login?rt=<abs url of req>
 //     validateRt(rt): string,                  // safe return URL or '/'
@@ -268,7 +277,7 @@ Every mutating console-API request must pass `checkOrigin` (403 otherwise).
 
 ```js
 export function createPages({ config })
-// → { renderLogin({ rt, error, degraded }), renderDenied({ email }),
+// → { renderLogin({ rt, error, degraded }), renderDenied({ email, resource, sessionSet }),
 //     renderNotFound({ slug }), renderUpstreamError({ slug, kind, detail, consoleUrl }),
 //     renderError({ status, title, detail }) } // each → { status, html }
 ```
@@ -367,10 +376,40 @@ is container name + container-side port, so remapped host ports keep working.
 Every resolved port (all kinds) passes `guardCoordinatorPort` — a route can
 never proxy into the coordinator API (invariant #1).
 
+## Access policy store (`src/access.mjs`)
+
+```js
+export function createAccessStore({ file, adminEmails, routeStore, log })
+// file: <stateDir>/access-control.json
+// → { load(), isAdmin(email), isKnown(email), canAccess(email, resource), list(),
+//     addUser({email,grants}), setGrant(email,resource,allowed), removeUser(email),
+//     clearResource(resource), moveResource(fromResource,toResource) }
+export const CONSOLE_GRANT = 'console'
+export const routeGrant = (slug) => `route:${slug}`
+export class AccessError extends Error {} // .status 400|404|409|500
+```
+
+Configured `adminEmails` (the normalized `ALLOWED_EMAILS` set) are immutable
+owners and are not written to state. Owners are always known, may administer
+access, and bypass every resource grant. Invited accounts are stored as
+`{version:1,users:{"email":{"grants":[...]}}}` and written atomically at mode
+`0600`. Email/grant mutations are serialized as server-side deltas so
+concurrent changes merge. A failed write leaves memory unchanged. Invalid
+policy is renamed to `.corrupt-<epoch>` and fails closed to owners only.
+Successful invitation, grant, and removal mutations are logged with the acting
+configured owner and affected account/resource for operator audit trails.
+
+`isKnown` is checked for every signed request, so deleting a user invalidates
+an existing cookie immediately. `canAccess` is checked separately for
+`console` or `route:<slug>`, so revoking one grant preserves the user's other
+sessions/grants. Loading prunes grants for absent routes. Route deletion clears
+the resource, new slug creation clears stale grants before the route appears,
+and server/container slug renames move grants to the new host.
+
 ## Console API (`src/api.mjs`)
 
 ```js
-export function createConsoleApi({ config, log, coordinator, routeStore, guard, certManager, metrics })
+export function createConsoleApi({ config, log, coordinator, routeStore, accessStore, guard, certManager, metrics, prefs })
 // → { handle(req, res, session): Promise<void> }   // only called for /api/*
 ```
 JSON in/out; errors `{ "error": "<message>" }` with 400/401/403/404/409/502.
@@ -382,6 +421,10 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 | Method+Path | Behavior |
 |---|---|
 | `GET /api/overview` | `{ console: { version, domain, consoleHost, now, tls: certManager.info(), devInsecureHttp }, coordinator: coordinator.status(), inventory: Inventory\|null, routes: RouteView[] }`. Inventory from `coordinator.inventory()`; on CoordError → `inventory: null` and `coordinator.ok:false` with error (HTTP still 200 — UI shows degraded state). `RouteView = Route + { url: 'https://<slug>.<domain>', resolved: { port, reason?, serverStatus?, containerStatus? } }` (kind=server resolves via `serversRaw`; kind=docker via the cached `inventory()` — both shared/coalesced). |
+| `GET /api/access` | Owner-only `{ version, users: [{ email, owner, grants }], resources: [{ id, kind, host, title, auth, target }], invitedCount }`. Configured owners appear locked; only owners may read the full email list. |
+| `POST /api/access/users` | Owner-only `{ email, grants? }` → 201 full access view. Invites an email identity; the invitation becomes usable only when verified Google OIDC returns that exact address. An empty grant list is allowed. |
+| `PATCH /api/access/users/:email` | Owner-only delta `{ resource, allowed: boolean }` → full access view. Configured owners are immutable. |
+| `DELETE /api/access/users/:email` | Owner-only removal → full access view; current sessions become unknown immediately. |
 | `POST /api/routes` | body `{ slug, kind, port?, project?, serverName?, containerName?, containerPort?, auth?, title? }` → 201 RouteView |
 | `PATCH /api/routes/:slug` | any of `{ auth, title, port, project, serverName, containerName, containerPort, kind }` → RouteView |
 | `DELETE /api/routes/:slug` | → `{ ok: true }` |
@@ -397,7 +440,7 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 | `POST /api/projects/action` | `{ project, action: 'start'\|'stop'\|'restart' }` → coordinator `/v1/projects/<action>` with console-user attribution. HTTP 200 reports with `ok:false`/`partial`/`action_errors` remain visible failures, never UI success. |
 | `GET /api/prefs` | UI preferences: `{ version, hidden: { servers: [identity keys], docker: [names], projects: [usage_keys] } }` from `<stateDir>/ui-prefs.json` |
 | `PATCH /api/prefs` | `{ hide?: { servers?, docker?, projects? }, unhide?: {…} }` — DELTAS only, merged server-side (validated: strings, trimmed, deduped, ≤500 entries × ≤300 chars) → the full prefs. Whole-list replacement is deliberately unsupported so a stale client snapshot can never wipe hides made elsewhere. Origin-guarded like every mutation. |
-| `GET /api/session` | `{ email, name, pic, exp }` |
+| `GET /api/session` | `{ email, name, pic, exp, accessAdmin }`; `accessAdmin` is true only for configured owners. |
 | anything else | 404 |
 
 `GET /api/overview` also feeds its fresh inventory into `metrics.ingest()`.
@@ -415,7 +458,8 @@ check), GET/HEAD only.
 ## UI (`src/ui/`)
 
 Vanilla JS control panel split into hash-routed pages (`#/projects` default,
-`#/servers`, `#/routes`, `#/docker`, `#/ports`, `#/performance`);
+`#/servers`, `#/routes`, `#/docker`, `#/ports`, `#/performance`, and the
+owner-only `#/access`);
 unknown/empty hashes fall back to Projects. One sticky SINGLE-ROW header on
 every page and viewport: brand + section nav (tabs with live counts inline
 ≥1024px; a hamburger-toggled drawer dropping below the row on narrower
@@ -465,7 +509,10 @@ CPU with cores and load averages, memory used/available, per-disk storage
 and uptime as stat tiles with meters, alarm tint above 90%, plus host
 CPU/memory history charts — then per-entity CPU and memory history
 charts for every sampled server/container + per-project usage bars with
-sparklines). Docker/Ports lists are grouped by repo with project subheaders.
+sparklines), **Access** (the real owner/invited-user collection first; each
+invited user has exact Console/domain checkboxes; configured owners are locked;
+Add user opens a focused in-viewport dialog; remove names the account and
+immediate revocation consequence). Docker/Ports lists are grouped by repo with project subheaders.
 **Hiding:** stopped servers/containers and idle projects can be hidden
 (persisted server-side via `/api/prefs`, shared across devices); anything the
 coordinator reports as running is auto-unhidden on the next poll, and every
@@ -535,7 +582,9 @@ active lease.
 4. `rt` open-redirect guard; flow cookie signed; `state`+`nonce`+PKCE all
    enforced; ID-token signature verified against Google JWKS.
 5. Cookies: HttpOnly, Secure (prod), SameSite=Lax, HMAC-SHA256, timing-safe
-   compare. Session parse re-checks the allowlist on every request. The edge
+   compare. Session parse re-checks current policy membership on every request;
+   protected HTTP and WebSocket traffic then checks its exact resource grant.
+   Only configured owners may inspect or mutate the access list. The edge
    consumes `cookieName` and `dc_flow` for authentication but never forwards
    them to routed HTTP/WebSocket projects or accepts those names from upstream
    `Set-Cookie`; unrelated project cookies remain end-to-end.

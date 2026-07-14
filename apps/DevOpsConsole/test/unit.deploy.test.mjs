@@ -227,6 +227,7 @@ test('existing-host runbook models the legacy Console child-coordinator topology
     '--sync-state-only',
     'user-runtime.writer-free/routes.json',
     'user-runtime.writer-free/ui-prefs.json',
+    'user-runtime.writer-free/access-control.json',
     'sha256sum --check "$CUTOVER_BACKUP/console.env.sha256"',
     'coordinator-state.poststop.json',
     'coordinator-state.pre-relocate.json',

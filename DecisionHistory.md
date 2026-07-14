@@ -1,5 +1,37 @@
 # Decision History
 
+Direction: DevOps Console is an operator-controlled, default-private edge and
+control plane: real coordinator state stays authoritative, protected domains
+require verified Google identity, access changes revoke live sessions at the
+next request, and public exposure remains an explicit per-route choice
+([DC-2026-07-14-ACCESS-01](DecisionDetails/DC-2026-07-14-ACCESS-01.md),
+[2026-07-05 Console edge](#2026-07-05---devops-console-web-app-tls-edge--subdomain-reverse-proxy-on-vrae),
+[2026-07-07 Projects hierarchy](#2026-07-07---devops-console-projects-tree-repo-grouping-everywhere-hideable-items-that-self-reveal)).
+Confirmed user intent is that access is manageable in the Console per Google
+account and per assigned domain, including the Console itself. The retained
+inference is that configured owners need a non-UI recovery path; revisit it if
+the user requests transferable ownership or delegated access administration.
+
+## DC-2026-07-14-ACCESS-01 - Per-account domain grants with configured owners
+
+Decision: Add a private, atomic access-control store for invited Google account
+emails and explicit grants to the Console or an assigned domain. Keep
+`ALLOWED_EMAILS` as the configured owner set: owners always retain full access
+and alone may edit invitations and grants. Existing configured accounts
+therefore migrate without lockout, while invited users may receive a routed
+server without receiving the Console. Removing a user or grant is enforced on
+the next HTTP or WebSocket request even when the signed session cookie remains
+valid. See [details](DecisionDetails/DC-2026-07-14-ACCESS-01.md).
+
+Why: A single editable allowlist cannot express per-server access, and letting
+every Console user edit access would allow an invited operator to expand their
+own privileges. Separate external IAM or Google Workspace groups add another
+control plane and do not naturally model the Console's dynamic route inventory.
+Configured owners plus local per-domain grants preserve the proven OIDC and
+zero-dependency design, provide a recovery boundary outside the UI, keep
+public routes truthful, and satisfy the requested email-by-server control with
+the least new operational dependency.
+
 ## 2026-07-11 - The final legacy-cgroup gate is a handoff, not a second quiescence window
 
 Decision: Existing-host cutover keeps the initial five-second exact-cgroup

@@ -711,6 +711,14 @@ else:
     assert.equal(assigned.json.route.serverName, 'sub-web');
     assert.equal(assigned.json.route.auth, 'public');
 
+    // Per-account grants follow the same server when its assigned domain is
+    // renamed, and disappear when that domain is unassigned.
+    const renameViewer = 'rename.viewer@gmail.com';
+    const invited = await apiCall(stack, jar, 'POST', '/api/access/users', {
+      email: renameViewer, grants: ['route:srvsub'],
+    }, { origin: stack.consoleOrigin });
+    assert.equal(invited.status, 201, invited.text);
+
     // Overview reflects exactly one route mapped to this server.
     const ov1 = await apiCall(stack, jar, 'GET', '/api/overview');
     const mapped1 = ov1.json.routes.filter((r) => r.kind === 'server' && r.serverName === 'sub-web');
@@ -738,6 +746,12 @@ else:
     assert.ok(slugs.includes('srvsub2'), 'new slug present');
     assert.ok(!slugs.includes('srvsub'), 'old slug removed');
     assert.equal(ov2.json.routes.filter((r) => r.serverName === 'sub-web').length, 1, 'exactly one mapping remains');
+    const afterRenameAccess = await apiCall(stack, jar, 'GET', '/api/access');
+    assert.deepEqual(
+      afterRenameAccess.json.users.find((user) => user.email === renameViewer).grants,
+      ['route:srvsub2'],
+      'renaming a server domain must move its per-account grants',
+    );
 
     // Remove the subdomain entirely.
     const removed = await apiCall(stack, jar, 'POST', '/api/servers/subdomain',
@@ -747,6 +761,15 @@ else:
 
     const ov3 = await apiCall(stack, jar, 'GET', '/api/overview');
     assert.equal(ov3.json.routes.filter((r) => r.serverName === 'sub-web').length, 0, 'mapping gone after removal');
+    const afterUnassignAccess = await apiCall(stack, jar, 'GET', '/api/access');
+    assert.deepEqual(
+      afterUnassignAccess.json.users.find((user) => user.email === renameViewer).grants,
+      [],
+      'unassigning a server domain must clear its per-account grants',
+    );
+    const removeViewer = await apiCall(stack, jar, 'DELETE',
+      `/api/access/users/${encodeURIComponent(renameViewer)}`, null, { origin: stack.consoleOrigin });
+    assert.equal(removeViewer.status, 200, removeViewer.text);
 
     await stack.coordinator.api('POST', '/v1/servers/stop',
       { agent: 'e2e', project: toplevel, name: 'sub-web', reason: 'e2e subdomain teardown' }, { timeoutMs: 30_000 });
@@ -1362,5 +1385,143 @@ else:
     }, { origin: stack.consoleOrigin });
     assert.equal(removed.status, 200, removed.text);
     assert.equal(removed.json.route, null);
+  });
+
+  it('18. per-user access: exact domains, Console grant, live revocation, WebSockets, and slug reuse', { timeout: 60_000 }, async () => {
+    const adminJar = await authedJar();
+    const guestEmail = 'invited.viewer@gmail.com';
+
+    const adminSession = await apiCall(stack, adminJar, 'GET', '/api/session');
+    assert.equal(adminSession.status, 200);
+    assert.equal(adminSession.json.accessAdmin, true);
+
+    const initial = await apiCall(stack, adminJar, 'GET', '/api/access');
+    assert.equal(initial.status, 200, initial.text);
+    assert.ok(initial.json.users.some((user) => user.email === FIXTURE_EMAIL && user.owner === true));
+    assert.ok(initial.json.resources.some((resource) => resource.id === 'console'));
+    assert.ok(initial.json.resources.some((resource) => resource.id === 'route:app'));
+
+    const noOrigin = await apiCall(stack, adminJar, 'POST', '/api/access/users', {
+      email: guestEmail, grants: ['route:app'],
+    });
+    assert.equal(noOrigin.status, 403, 'access mutations require the same CSRF boundary as every Console mutation');
+
+    const added = await apiCall(stack, adminJar, 'POST', '/api/access/users', {
+      email: guestEmail, grants: ['route:app'],
+    }, { origin: stack.consoleOrigin });
+    assert.equal(added.status, 201, added.text);
+    assert.deepEqual(
+      added.json.users.find((user) => user.email === guestEmail).grants,
+      ['route:app'],
+    );
+
+    stack.issuer.setClaims({
+      sub: 'fixture-invited-viewer', email: guestEmail, name: 'Invited Viewer', email_verified: true,
+    });
+    const guestJar = makeJar();
+    const loginResult = await login(stack, guestJar, { rt: `https://app.${stack.domain}/` });
+    assert.equal(loginResult.status, 200, loginResult.text);
+    assert.equal(loginResult.finalUrl, `https://app.${stack.domain}/`);
+
+    const granted = await fetchUrl(stack, `https://app.${stack.domain}/`, { jar: guestJar });
+    assert.equal(granted.status, 200, granted.text);
+    const duplicateApp = await apiCall(stack, adminJar, 'POST', '/api/routes', {
+      slug: 'app', kind: 'port', port: stack.upstream.port,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(duplicateApp.status, 409, duplicateApp.text);
+    assert.equal(
+      (await fetchUrl(stack, `https://app.${stack.domain}/`, { jar: guestJar })).status,
+      200,
+      'a conflicting route create must not clear the existing domain grant',
+    );
+    const otherPrivate = await fetchUrl(stack, `https://echo.${stack.domain}/`, { jar: guestJar });
+    assert.equal(otherPrivate.status, 403);
+    assert.match(otherPrivate.text, /does not have access to/);
+    const consoleDenied = await fetchUrl(stack, `${stack.consoleOrigin}/`, { jar: guestJar });
+    assert.equal(consoleDenied.status, 403);
+    assert.match(consoleDenied.text, /console\.vr\.ae/);
+
+    async function websocketStatus(host, jar) {
+      const socket = await edgeTlsSocket();
+      const cookie = jar.headerFor(host, '/', true);
+      const key = crypto.randomBytes(16).toString('base64');
+      socket.write([
+        'GET /acl HTTP/1.1',
+        `Host: ${host}`,
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Key: ${key}`,
+        'Sec-WebSocket-Version: 13',
+        cookie ? `Cookie: ${cookie}` : '',
+        '',
+        '',
+      ].filter((line, index, lines) => line !== '' || index >= lines.length - 2).join('\r\n'));
+      const response = await readUntil(socket, (buf) => buf.includes(Buffer.from('\r\n\r\n')));
+      const match = response.toString('latin1').match(/^HTTP\/1\.1\s+(\d+)/);
+      socket.destroy();
+      return Number(match?.[1]);
+    }
+
+    assert.equal(await websocketStatus(`app.${stack.domain}`, guestJar), 101);
+    assert.equal(await websocketStatus(`echo.${stack.domain}`, guestJar), 403);
+
+    const grantConsole = await apiCall(stack, adminJar, 'PATCH',
+      `/api/access/users/${encodeURIComponent(guestEmail)}`,
+      { resource: 'console', allowed: true }, { origin: stack.consoleOrigin });
+    assert.equal(grantConsole.status, 200, grantConsole.text);
+    const consoleNow = await fetchUrl(stack, `${stack.consoleOrigin}/`, { jar: guestJar });
+    assert.equal(consoleNow.status, 200, 'an existing session gains a newly granted Console immediately');
+    const guestSession = await apiCall(stack, guestJar, 'GET', '/api/session');
+    assert.equal(guestSession.status, 200);
+    assert.equal(guestSession.json.accessAdmin, false);
+    const guestCannotAdmin = await apiCall(stack, guestJar, 'GET', '/api/access');
+    assert.equal(guestCannotAdmin.status, 403, 'Console access does not imply access-administration rights');
+
+    const ownerImmutable = await apiCall(stack, adminJar, 'PATCH',
+      `/api/access/users/${encodeURIComponent(FIXTURE_EMAIL)}`,
+      { resource: 'console', allowed: false }, { origin: stack.consoleOrigin });
+    assert.equal(ownerImmutable.status, 400);
+    assert.match(ownerImmutable.json.error, /owner access cannot be changed/);
+
+    const revokeApp = await apiCall(stack, adminJar, 'PATCH',
+      `/api/access/users/${encodeURIComponent(guestEmail)}`,
+      { resource: 'route:app', allowed: false }, { origin: stack.consoleOrigin });
+    assert.equal(revokeApp.status, 200, revokeApp.text);
+    assert.equal((await fetchUrl(stack, `https://app.${stack.domain}/`, { jar: guestJar })).status, 403);
+    assert.equal(await websocketStatus(`app.${stack.domain}`, guestJar), 403);
+
+    // A deleted hostname cannot carry an old account grant into a later route
+    // that happens to reuse the same slug for another target.
+    const created = await apiCall(stack, adminJar, 'POST', '/api/routes', {
+      slug: 'aclreuse', kind: 'port', port: stack.upstream.port,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(created.status, 201, created.text);
+    const grantReuse = await apiCall(stack, adminJar, 'PATCH',
+      `/api/access/users/${encodeURIComponent(guestEmail)}`,
+      { resource: 'route:aclreuse', allowed: true }, { origin: stack.consoleOrigin });
+    assert.equal(grantReuse.status, 200, grantReuse.text);
+    assert.equal((await fetchUrl(stack, `https://aclreuse.${stack.domain}/`, { jar: guestJar })).status, 200);
+
+    const deleted = await apiCall(stack, adminJar, 'DELETE', '/api/routes/aclreuse', null, {
+      origin: stack.consoleOrigin,
+    });
+    assert.equal(deleted.status, 200, deleted.text);
+    const recreated = await apiCall(stack, adminJar, 'POST', '/api/routes', {
+      slug: 'aclreuse', kind: 'port', port: stack.upstream.port,
+    }, { origin: stack.consoleOrigin });
+    assert.equal(recreated.status, 201, recreated.text);
+    assert.equal(
+      (await fetchUrl(stack, `https://aclreuse.${stack.domain}/`, { jar: guestJar })).status,
+      403,
+      'reusing a slug must not resurrect the deleted route grant',
+    );
+    await apiCall(stack, adminJar, 'DELETE', '/api/routes/aclreuse', null, { origin: stack.consoleOrigin });
+
+    const removed = await apiCall(stack, adminJar, 'DELETE',
+      `/api/access/users/${encodeURIComponent(guestEmail)}`, null, { origin: stack.consoleOrigin });
+    assert.equal(removed.status, 200, removed.text);
+    const afterRemoval = await fetchUrl(stack, `https://app.${stack.domain}/`, { jar: guestJar });
+    assert.equal(afterRemoval.status, 302, 'user removal invalidates an existing signed session immediately');
+    assert.match(afterRemoval.headers.location, /\/auth\/login\?rt=/);
   });
 });
