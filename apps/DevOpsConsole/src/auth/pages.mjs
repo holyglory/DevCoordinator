@@ -126,21 +126,28 @@ Sign-in stays disabled until this console has an OAuth client. To finish setup:
 </form>`;
     }
     const body = `<h1>Sign in</h1>
-<p>The console and every <code>*.${escapeHtml(domain)}</code> route are restricted to approved Google accounts.</p>
+<p>Sign in with an approved Google account. Access is granted separately for the console and each protected <code>*.${escapeHtml(domain)}</code> domain.</p>
 ${errorNote}${action}
 <p class="small gap-top">After signing in you will be returned to the page you asked for.</p>`;
     return { status: error ? 400 : 200, html: page({ title: 'Sign in', body }) };
   }
 
-  function renderDenied({ email = '' } = {}) {
+  function renderDenied({ email = '', resource = '', sessionSet = false } = {}) {
     const who = email
-      ? `<code>${escapeHtml(email)}</code> signed in with Google successfully, but that address`
+      ? `<code>${escapeHtml(email)}</code> signed in with Google successfully, but that account`
       : 'Your Google account';
+    const target = resource
+      ? ` does not have access to <code>${escapeHtml(resource)}</code>.`
+      : ' has not been invited to any Console-managed domain.';
+    const cookieNote = sessionSet
+      ? 'Your sign-in is still valid for any other domains the owner granted to you.'
+      : 'No session cookie was set.';
+    const action = sessionSet ? '/auth/logout' : '/auth/login';
     const body = `<div class="status-code">403</div>
 <h1>Access denied</h1>
-<p>${who} is not on the allowlist for this console.</p>
-<p class="small">If you should have access, ask the operator to add your address to <code>ALLOWED_EMAILS</code> and restart the console. No session cookie was set.</p>
-<a class="btn btn-ghost" href="/auth/login">Try a different account</a>`;
+<p>${who}${target}</p>
+<p class="small">Ask the Console owner to add your Google account or grant this domain from the Access page. ${cookieNote}</p>
+<a class="btn btn-ghost" href="${action}">Try a different account</a>`;
     return { status: 403, html: page({ title: 'Access denied', body }) };
   }
 

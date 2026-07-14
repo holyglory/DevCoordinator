@@ -23,6 +23,7 @@ import { createCoordinator } from '../src/coordinator.mjs';
 import { createMetricsStore } from '../src/metrics.mjs';
 import { createPrefsStore } from '../src/prefs.mjs';
 import { createRouteStore } from '../src/routes.mjs';
+import { createAccessStore } from '../src/access.mjs';
 import { createConsoleApi } from '../src/api.mjs';
 import { createStaticServer } from '../src/static.mjs';
 
@@ -203,7 +204,7 @@ function buildProxy({ log, pages, config }) {
  * @param {object} [options.env]          env object for loadConfig (defaults to process.env)
  * @param {object} [options.overrides]    shallow config overrides (e.g. bindHost)
  * @param {object} [options.listenPorts]  { https?, http? } bind-port overrides
- * @returns {Promise<{ config, log, addresses, sessions, coordinator, routeStore, close }>}
+ * @returns {Promise<{ config, log, addresses, sessions, coordinator, routeStore, accessStore, close }>}
  */
 export async function start({ envFile, env, overrides = {}, listenPorts } = {}) {
   const config = loadConfig({ envFile, env });
@@ -221,8 +222,6 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     cookieDomain: `.${config.domain}`,
     secure: !config.devInsecureHttp,
   });
-  const guard = createGuard({ sessions, allowedEmails: config.allowedEmails, config, log });
-
   const coordinator = createCoordinator({ config, log });
   try {
     await coordinator.ensureRunning();
@@ -235,6 +234,14 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
 
   const routeStore = createRouteStore({ file: path.join(config.stateDir, 'routes.json'), config, log });
   await routeStore.load();
+  const accessStore = createAccessStore({
+    file: path.join(config.stateDir, 'access-control.json'),
+    adminEmails: config.allowedEmails,
+    routeStore,
+    log,
+  });
+  await accessStore.load();
+  const guard = createGuard({ sessions, access: accessStore, config, log });
 
   // Listen first (router attaches afterwards) so OS-assigned ports are known
   // before any consoleOrigin-derived value is captured.
@@ -280,7 +287,9 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     log,
   });
   const prefs = createPrefsStore({ file: path.join(config.stateDir, 'ui-prefs.json'), log });
-  const consoleApi = createConsoleApi({ config, log, coordinator, routeStore, guard, certManager, metrics, prefs });
+  const consoleApi = createConsoleApi({
+    config, log, coordinator, routeStore, accessStore, guard, certManager, metrics, prefs,
+  });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
   const proxy = buildProxy({ log, pages, config });
 
@@ -321,7 +330,7 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     }
   }
 
-  return { config, log, addresses: servers.addresses, sessions, coordinator, routeStore, close };
+  return { config, log, addresses: servers.addresses, sessions, coordinator, routeStore, accessStore, close };
 }
 
 async function main() {
@@ -374,7 +383,6 @@ async function main() {
     sessions,
     log,
   });
-  const guard = createGuard({ sessions, allowedEmails: config.allowedEmails, config, log });
   const pages = createPages({ config });
 
   // Control engine.
@@ -392,9 +400,19 @@ async function main() {
 
   const routeStore = createRouteStore({ file: path.join(config.stateDir, 'routes.json'), config, log });
   await routeStore.load();
+  const accessStore = createAccessStore({
+    file: path.join(config.stateDir, 'access-control.json'),
+    adminEmails: config.allowedEmails,
+    routeStore,
+    log,
+  });
+  await accessStore.load();
+  const guard = createGuard({ sessions, access: accessStore, config, log });
 
   const prefs = createPrefsStore({ file: path.join(config.stateDir, 'ui-prefs.json'), log });
-  const consoleApi = createConsoleApi({ config, log, coordinator, routeStore, guard, certManager, metrics, prefs });
+  const consoleApi = createConsoleApi({
+    config, log, coordinator, routeStore, accessStore, guard, certManager, metrics, prefs,
+  });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
 
   const proxy = buildProxy({ log, pages, config });

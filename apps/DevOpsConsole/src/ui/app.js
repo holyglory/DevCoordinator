@@ -1,6 +1,7 @@
 /* DevOps Console control panel.
  * Vanilla JS, no dependencies. Talks only to same-origin /api/*.
- * Hash-routed pages (#/servers, #/routes, #/docker, #/ports, #/performance)
+ * Hash-routed pages (#/projects, #/servers, #/routes, #/docker, #/ports,
+ * #/performance, #/access)
  * share one sticky status bar. Polls GET /api/overview every 6s and
  * GET /api/metrics/history every 10s (both paused while the tab is hidden),
  * and refetches immediately after every mutation. All user data goes through
@@ -26,6 +27,7 @@
     metricsMap: new Map(), // entity key ('srv:<id>'|'dock:<name>'|'proj:<key>') -> entity
     metricsAt: 0,
     prefs: null,         // GET /api/prefs payload ({ hidden: { servers, docker, projects } })
+    access: null,        // owner-only GET /api/access payload ({ users, resources })
   };
 
   const ui = {
@@ -300,12 +302,15 @@
     { id: 'docker', title: 'Docker' },
     { id: 'ports', title: 'Port leases' },
     { id: 'performance', title: 'Performance' },
+    { id: 'access', title: 'Access' },
   ];
 
   function currentPage() {
     const m = /^#\/([a-z-]+)/.exec(location.hash || '');
     const id = m ? m[1] : '';
-    return PAGES.some((p) => p.id === id) ? id : 'projects';
+    if (!PAGES.some((p) => p.id === id)) return 'projects';
+    if (id === 'access' && state.session?.accessAdmin !== true) return 'projects';
+    return id;
   }
 
   const navOpen = () => $('#site-nav').classList.contains('open');
@@ -331,6 +336,7 @@
     popover.close();
     // The performance page charts use a longer history window than sparklines.
     if (page === 'performance') refreshMetrics();
+    if (page === 'access' && state.session?.accessAdmin === true) loadAccess();
   }
 
   function wireNav() {
@@ -343,6 +349,209 @@
     });
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && navOpen()) setNavOpen(false);
+    });
+  }
+
+  // ---------------------------------------------------------------- access policy
+
+  let accessFetching = false;
+  let accessRoutesSig = '';
+
+  function syncAccessVisibility() {
+    const admin = state.session?.accessAdmin === true;
+    $('#nav-access').hidden = !admin;
+    $('#access-add').hidden = !admin;
+    if (!admin) state.access = null;
+    applyPage();
+  }
+
+  function currentAccessRoutesSig() {
+    return JSON.stringify((state.overview?.routes || []).map((route) => [
+      route.slug, route.auth, route.kind, route.title, route.project, route.serverName,
+      route.containerName, route.containerPort, route.port,
+    ]));
+  }
+
+  async function loadAccess({ force = false } = {}) {
+    if (state.session?.accessAdmin !== true || accessFetching) return;
+    if (!force && state.access) {
+      renderAccess();
+      return;
+    }
+    accessFetching = true;
+    try {
+      state.access = await api('/api/access');
+      accessRoutesSig = currentAccessRoutesSig();
+      clearBanner('access');
+      renderAccess();
+    } catch (err) {
+      if (err.status === 401) return;
+      $('#access-body').replaceChildren(
+        h('p', { class: 'empty err' }, 'Could not load the access list. Use Retry above.'));
+      showBanner(err.message, () => loadAccess({ force: true }), 'access');
+    } finally {
+      accessFetching = false;
+    }
+  }
+
+  function accessResourceControl(resource, { checked, disabled = false, email = '' } = {}) {
+    const input = h('input', {
+      type: 'checkbox',
+      checked: checked ? true : null,
+      disabled: disabled ? true : null,
+      name: email ? null : 'grants',
+      value: resource.id,
+      'data-fk': email ? `access:${email}:${resource.id}` : null,
+      'aria-label': `${checked ? 'Remove' : 'Grant'} access to ${resource.host}`,
+    });
+    if (email) {
+      input.addEventListener('change', () => changeAccessGrant(email, resource, input));
+    }
+    const publicBadge = resource.auth === 'public'
+      ? h('span', { class: 'access-public-badge' }, 'Public')
+      : null;
+    const detail = resource.auth === 'public'
+      ? `${resource.target} · Public now; this grant applies if the domain becomes private.`
+      : resource.target;
+    return h('label', { class: 'access-resource' },
+      input,
+      h('span', { class: 'access-resource-main' },
+        h('span', { class: 'access-resource-title' },
+          h('span', { class: 'access-resource-host' }, resource.host), publicBadge),
+        h('span', { class: 'access-resource-detail' }, detail)));
+  }
+
+  function buildAccess() {
+    const policy = state.access;
+    if (!policy) return [
+      h('div', { class: 'skel', 'aria-hidden': 'true' }),
+      h('div', { class: 'skel', 'aria-hidden': 'true' }),
+    ];
+    const out = [];
+    const invited = policy.users.filter((user) => !user.owner);
+    for (const user of policy.users) {
+      const header = h('div', { class: 'access-user-head' },
+        h('span', { class: 'access-email' }, user.email),
+        user.owner ? h('span', { class: 'access-owner-badge' }, 'Owner') : null,
+        user.owner ? null : h('button', {
+          class: 'iconbtn danger access-remove', type: 'button',
+          'data-fk': `access-remove:${user.email}`,
+          'aria-label': `Remove ${user.email} and revoke all access`,
+          title: 'Remove user',
+          onclick: () => removeAccessUser(user.email),
+        }, icon('trash')));
+      const content = user.owner
+        ? h('p', { class: 'access-owner-note' },
+            'Full access to the Console and every assigned domain. Owners are changed only in the private ALLOWED_EMAILS configuration.')
+        : h('div', { class: 'access-resource-list' },
+            ...policy.resources.map((resource) => accessResourceControl(resource, {
+              checked: user.grants.includes(resource.id),
+              email: user.email,
+            })));
+      out.push(h('article', {
+        class: 'item access-user',
+        'data-access-user': user.email,
+        tabindex: '-1',
+      }, header, content));
+    }
+    if (invited.length === 0) {
+      out.push(h('p', { class: 'empty access-empty' },
+        'No invited users yet. Add a Google account when someone needs a private domain.'));
+    }
+    return out;
+  }
+
+  function renderAccess() {
+    if (state.session?.accessAdmin !== true) return;
+    setSection('access-body', sig(state.access), buildAccess, true);
+    const count = state.access?.users?.length;
+    setCount('access-count', count);
+    setNavCount('access', count);
+  }
+
+  async function changeAccessGrant(email, resource, input, desired = input.checked) {
+    const allowed = desired;
+    input.checked = allowed;
+    input.disabled = true;
+    try {
+      state.access = await api(`/api/access/users/${encodeURIComponent(email)}`, {
+        method: 'PATCH',
+        body: { resource: resource.id, allowed },
+      });
+      announce(`${resource.host} ${allowed ? 'granted to' : 'removed from'} ${email}`);
+      renderAccess();
+    } catch (err) {
+      input.checked = !allowed;
+      input.disabled = false;
+      if (err.status !== 401) {
+        showBanner(err.message, () => changeAccessGrant(email, resource, input, allowed));
+      }
+    }
+  }
+
+  async function removeAccessUser(email) {
+    if (!window.confirm(`Remove ${email}?\n\nEvery Console and private-domain grant is revoked immediately, including existing signed-in sessions.`)) return;
+    try {
+      state.access = await api(`/api/access/users/${encodeURIComponent(email)}`, { method: 'DELETE' });
+      announce(`${email} removed`);
+      renderAccess();
+      $('#access-add').focus({ preventScroll: true });
+    } catch (err) {
+      if (err.status !== 401) showBanner(err.message, () => removeAccessUser(email));
+    }
+  }
+
+  function openAccessDialog() {
+    if (!state.access) return loadAccess({ force: true });
+    const form = $('#access-form');
+    form.reset();
+    $('#access-form-error').hidden = true;
+    $('#access-resource-picker').replaceChildren(
+      ...state.access.resources.map((resource) => accessResourceControl(resource, { checked: false })));
+    const dialog = $('#access-dialog');
+    dialog.showModal();
+    queueMicrotask(() => $('#access-email').focus());
+  }
+
+  function closeAccessDialog() {
+    const dialog = $('#access-dialog');
+    if (dialog.open) dialog.close();
+  }
+
+  function wireAccessDialog() {
+    $('#access-add').addEventListener('click', openAccessDialog);
+    $('#access-dialog-close').append(icon('x'));
+    $('#access-dialog-close').addEventListener('click', closeAccessDialog);
+    $('#access-cancel').addEventListener('click', closeAccessDialog);
+    $('#access-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const emailInput = $('#access-email');
+      const error = $('#access-form-error');
+      if (!emailInput.reportValidity()) return;
+      const grants = [...document.querySelectorAll('#access-resource-picker input[name="grants"]:checked')]
+        .map((input) => input.value);
+      const submit = $('#access-submit');
+      submit.disabled = true;
+      submit.textContent = 'Adding…';
+      error.hidden = true;
+      try {
+        state.access = await api('/api/access/users', {
+          method: 'POST', body: { email: emailInput.value, grants },
+        });
+        const normalized = emailInput.value.trim().toLowerCase();
+        closeAccessDialog();
+        renderAccess();
+        announce(`${normalized} added`);
+        const row = document.querySelector(`[data-access-user="${CSS.escape(normalized)}"]`);
+        row?.scrollIntoView({ block: 'nearest' });
+        row?.focus({ preventScroll: true });
+      } catch (err) {
+        error.textContent = err.message;
+        error.hidden = false;
+      } finally {
+        submit.disabled = false;
+        submit.textContent = 'Add user';
+      }
     });
   }
 
@@ -827,6 +1036,9 @@
       state.lastFetch = Date.now();
       clearBanner('overview');
       renderAll(force);
+      if (state.session?.accessAdmin === true && state.access && accessRoutesSig !== currentAccessRoutesSig()) {
+        loadAccess({ force: true });
+      }
       // A failed boot-time prefs fetch retries with the polling cadence.
       if (!prefsLoaded) loadPrefs();
       // Anything running must never stay hidden (fire-and-forget PATCH).
@@ -3009,6 +3221,7 @@
         refreshMetrics();
         // Pick up hides made on another device while this tab slept.
         loadPrefs();
+        if (state.session?.accessAdmin === true) loadAccess({ force: true });
       }
     });
   }
@@ -3033,17 +3246,25 @@
     wireForm();
     wireLeaseForm();
     wireNav();
+    wireAccessDialog();
     applyPage();
 
     loadPrefs();
 
     api('/api/session')
-      .then((s) => { state.session = s; renderHeader(); })
+      .then((s) => {
+        state.session = s;
+        syncAccessVisibility();
+        renderHeader();
+        if (s.accessAdmin === true) loadAccess();
+      })
       .catch((err) => {
         if (err.status !== 401) {
           showBanner(err.message, () => api('/api/session').then((s) => {
             state.session = s;
+            syncAccessVisibility();
             renderHeader();
+            if (s.accessAdmin === true) loadAccess();
           }).catch(() => {}));
         }
       });

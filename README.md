@@ -155,4 +155,5 @@ The coordinator is not a remote orchestrator, multi-user authorization system,
 container scheduler, or production service manager. PostgreSQL logical backups
 are not encryption, off-site storage, replication, continuous archiving, or
 point-in-time recovery. The Console is purpose-built for an operator-controlled
-host and must remain behind its documented TLS/OIDC controls.
+host and adds owner-managed per-Google-account domain grants behind its
+documented TLS/OIDC controls; it is not a general organization IAM service.

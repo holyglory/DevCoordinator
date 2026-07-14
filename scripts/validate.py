@@ -819,6 +819,13 @@ def check_devops_console() -> None:
         "pinned ports card wired into render loop": "setSection('assignments-body'",
         "pin removal confirmed in UI": "Unassign port ${a.port} from server",
         "whole-project runtime control endpoint": "'/api/projects/action'",
+        "private per-user access policy store": "access-control.json",
+        "configured-owner access administration": "if (!accessStore?.isAdmin(session?.email))",
+        "exact route grants checked at edge": "guard.hasAccess(session, routeGrant(slug))",
+        "route rename moves access grants": "accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug))",
+        "route deletion clears access grants": "accessStore.clearResource(routeGrant(removed.slug))",
+        "access collection page": "function buildAccess(",
+        "access add dialog wired": "function wireAccessDialog(",
         "ui prefs persisted server-side": "ui-prefs.json",
         "hidden items auto-reveal when running": "async function autoUnhide(",
         "hidden items auto-reveal wired into overview refresh": "autoUnhide(data);",
@@ -864,6 +871,9 @@ def check_devops_console() -> None:
     missing = [label for label, needle in required.items() if needle not in haystack]
     if missing:
         raise SystemExit("DevOpsConsole guardrail failed: " + ", ".join(missing))
+
+    if source_text.count("!guard.hasAccess(session, routeGrant(slug))") < 2:
+        raise SystemExit("DevOpsConsole guardrail requires exact route grants on HTTP and WebSocket paths")
 
     for banned in ("TODO", "FIXME", "wired later"):
         if banned in source_text or banned in app_js or banned in app_css or banned in index_html:

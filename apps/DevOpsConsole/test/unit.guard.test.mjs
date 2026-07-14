@@ -1,6 +1,6 @@
 // Unit tests for src/auth/guard.mjs — the rt open-redirect guard, the
 // Origin/Referer CSRF check (exact-origin only), wantsHtml heuristics, and
-// sessionFrom's allowlist re-check. Uses a REAL session manager (only config
+// sessionFrom's live policy re-check. Uses a REAL session manager (only config
 // data objects are stubbed — no module mocks).
 
 import test from 'node:test';
@@ -35,8 +35,17 @@ function makeSessions() {
   });
 }
 
-function makeGuard({ config = PROD_CONFIG, allowedEmails = new Set(['admin@vr.ae']) } = {}) {
-  return createGuard({ sessions: makeSessions(), allowedEmails, config });
+function makeAccess(knownEmails = new Set(['admin@vr.ae']), grants = new Map()) {
+  return {
+    isKnown: (email) => knownEmails.has(String(email).toLowerCase()),
+    isAdmin: (email) => String(email).toLowerCase() === 'admin@vr.ae',
+    canAccess: (email, resource) => String(email).toLowerCase() === 'admin@vr.ae'
+      || grants.get(String(email).toLowerCase())?.has(resource) === true,
+  };
+}
+
+function makeGuard({ config = PROD_CONFIG, knownEmails = new Set(['admin@vr.ae']) } = {}) {
+  return createGuard({ sessions: makeSessions(), access: makeAccess(knownEmails), config });
 }
 
 test('validateRt accepts same-deployment absolute URLs (apex + subdomains)', () => {
@@ -141,10 +150,10 @@ test('wantsHtml heuristics: /api/* and JSON accept are API, everything else is n
   assert.equal(guard.wantsHtml(req('/apifoo', undefined)), true);
 });
 
-test('sessionFrom: valid session accepted, allowlist re-checked on EVERY request', () => {
+test('sessionFrom: valid session accepted, policy membership re-checked on EVERY request', () => {
   const sessions = makeSessions();
-  const allowedEmails = new Set(['admin@vr.ae']);
-  const guard = createGuard({ sessions, allowedEmails, config: PROD_CONFIG });
+  const knownEmails = new Set(['admin@vr.ae']);
+  const guard = createGuard({ sessions, access: makeAccess(knownEmails), config: PROD_CONFIG });
 
   const { cookie } = sessions.issue({ sub: '1', email: 'ADMIN@vr.ae' });
   const cookieHeader = cookie.slice(0, cookie.indexOf(';'));
@@ -153,13 +162,13 @@ test('sessionFrom: valid session accepted, allowlist re-checked on EVERY request
   assert.ok(ok);
   assert.equal(ok.email, 'admin@vr.ae');
 
-  // Same valid cookie, but email no longer allowlisted → revoked immediately.
-  allowedEmails.delete('admin@vr.ae');
+  // Same valid cookie, but email no longer known → revoked immediately.
+  knownEmails.delete('admin@vr.ae');
   assert.equal(guard.sessionFrom({ headers: { cookie: cookieHeader } }), null);
 
-  // Cookie signed for an email that was never allowlisted.
+  // Cookie signed for an email that was never approved.
   const { cookie: strangerCookie } = sessions.issue({ sub: '2', email: 'stranger@evil.com' });
-  const guard2 = createGuard({ sessions, allowedEmails: new Set(['admin@vr.ae']), config: PROD_CONFIG });
+  const guard2 = createGuard({ sessions, access: makeAccess(new Set(['admin@vr.ae'])), config: PROD_CONFIG });
   assert.equal(guard2.sessionFrom({ headers: { cookie: strangerCookie.slice(0, strangerCookie.indexOf(';')) } }), null);
 
   // No cookie / tampered cookie.
@@ -172,6 +181,21 @@ test('sessionFrom: valid session accepted, allowlist re-checked on EVERY request
   assert.notDeepEqual(tamperedSignature, originalSignature);
   const tampered = `dc_session=${body}.${tamperedSignature.toString('base64url')}`;
   assert.equal(guard2.sessionFrom({ headers: { cookie: tampered } }), null);
+});
+
+test('resource authorization separates known sessions, owners, console, and route grants', () => {
+  const sessions = makeSessions();
+  const known = new Set(['admin@vr.ae', 'viewer@gmail.com']);
+  const grants = new Map([['viewer@gmail.com', new Set(['route:app'])]]);
+  const guard = createGuard({ sessions, access: makeAccess(known, grants), config: PROD_CONFIG });
+
+  assert.equal(guard.isKnownEmail('VIEWER@gmail.com'), true);
+  assert.equal(guard.isAdmin('viewer@gmail.com'), false);
+  assert.equal(guard.isAdmin({ email: 'ADMIN@vr.ae' }), true);
+  assert.equal(guard.hasAccess({ email: 'viewer@gmail.com' }, 'route:app'), true);
+  assert.equal(guard.hasAccess({ email: 'viewer@gmail.com' }, 'route:other'), false);
+  assert.equal(guard.hasAccess({ email: 'viewer@gmail.com' }, 'console'), false);
+  assert.equal(guard.hasAccess({ email: 'admin@vr.ae' }, 'console'), true);
 });
 
 test('loginRedirectUrl builds an absolute rt from the request, host sanitized', () => {

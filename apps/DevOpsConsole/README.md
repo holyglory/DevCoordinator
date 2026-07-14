@@ -10,14 +10,14 @@ third-party dependencies) that:
 - gates every subdomain behind **Google sign-in by default**, with a per-route
   *public / login-required* toggle in the control panel,
 - serves the control panel at `https://console.vr.ae` — hash-routed pages
-  (Projects, Servers, Routes, Docker, Port leases, Performance; tab nav on
+  (Projects, Servers, Routes, Docker, Port leases, Performance, Access; tab nav on
   desktop, a hamburger drawer on phones). The default Projects page is a tree
   of repos with their servers, databases and containers: start/stop/restart
   single items or whole projects, live CPU/memory everywhere, and hideable
   idle items that automatically reappear when an agent starts them through
   the coordinator. Other pages cover servers with per-server subdomains
   (grouped by repo), routes, Docker containers, port leases + permanent pins,
-  and history charts, all driven by the
+  history charts, and owner-only per-account domain grants, all driven by the
   [codex-dev-coordinator](../../skills/codex-dev-coordinator/SKILL.md) HTTP API
   on loopback `127.0.0.1:29876`, authenticated with a private token. Production
   runs it as the dedicated `dev-coordinator.service`; optional local autostart
@@ -67,7 +67,7 @@ ones:
 | `DOMAIN` | Base domain (`vr.ae`). Console at `console.<DOMAIN>`, routes at `<slug>.<DOMAIN>`. |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` | Wildcard cert + key PEMs. Watched and hot-reloaded; `systemctl reload devops-console` (SIGHUP) forces it. |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth client (setup below). Empty = degraded mode: public routes still proxy, everything auth-gated shows a setup page. |
-| `ALLOWED_EMAILS` | Comma-separated Google accounts allowed to sign in. Everyone else gets a 403 after Google auth. |
+| `ALLOWED_EMAILS` | Comma-separated configured owner accounts. Owners always have full Console/domain access and alone may edit the invited-user list. Keep at least one break-glass owner here. |
 | `SESSION_SECRET` | 64 hex chars (`openssl rand -hex 32`). Rotating it signs everyone out. |
 | `COORDINATOR_URL` | Coordinator API origin, default `http://127.0.0.1:29876`; only loopback `http(s)` origins without credentials, paths, queries, or fragments are accepted. |
 | `COORDINATOR_TOKEN_FILE` | Private mode-0600 bearer token created by the coordinator and read only by the server-side Console client. |
@@ -669,8 +669,14 @@ for name in routes.json ui-prefs.json; do
   install -m 600 "$LEGACY_STATE/$name" \
     "$CUTOVER_BACKUP/user-runtime.writer-free/$name"
 done
-sha256sum "$CUTOVER_BACKUP/user-runtime.writer-free/routes.json" \
-  "$CUTOVER_BACKUP/user-runtime.writer-free/ui-prefs.json" \
+# access-control.json is optional until the first invited user exists, but if
+# present it is authorization state and must travel in the same checkpoint.
+if test -f "$LEGACY_STATE/access-control.json"; then
+  install -m 600 "$LEGACY_STATE/access-control.json" \
+    "$CUTOVER_BACKUP/user-runtime.writer-free/access-control.json"
+fi
+find "$CUTOVER_BACKUP/user-runtime.writer-free" -maxdepth 1 -type f -name '*.json' \
+  -print0 | sort -z | xargs -0 sha256sum \
   > "$CUTOVER_BACKUP/user-runtime.writer-free.sha256"
 
 # This is the first lossless state checkpoint: every captured legacy writer
@@ -710,6 +716,12 @@ cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/routes.json" \
   "$CONSOLE_STATE/routes.json"
 cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/ui-prefs.json" \
   "$CONSOLE_STATE/ui-prefs.json"
+if test -f "$CUTOVER_BACKUP/user-runtime.writer-free/access-control.json"; then
+  cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/access-control.json" \
+    "$CONSOLE_STATE/access-control.json"
+else
+  test ! -e "$CONSOLE_STATE/access-control.json"
+fi
 
 install -m 600 "$COORDINATOR_HOME/state.json" \
   "$CUTOVER_BACKUP/coordinator-state.pre-relocate.json"
@@ -807,15 +819,28 @@ cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/routes.json" \
   "$CONSOLE_STATE/routes.json"
 cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/ui-prefs.json" \
   "$CONSOLE_STATE/ui-prefs.json"
+if test -f "$CUTOVER_BACKUP/user-runtime.writer-free/access-control.json"; then
+  cmp -s "$CUTOVER_BACKUP/user-runtime.writer-free/access-control.json" \
+    "$CONSOLE_STATE/access-control.json"
+else
+  test ! -e "$CONSOLE_STATE/access-control.json"
+fi
 python3 - "$CONSOLE_STATE" "$CUTOVER_BACKUP/user-runtime-counts.json" <<'PY'
 import json, pathlib, sys
 state = pathlib.Path(sys.argv[1])
 routes = json.loads((state / "routes.json").read_text(encoding="utf-8"))["routes"]
 hidden = json.loads((state / "ui-prefs.json").read_text(encoding="utf-8"))["hidden"]
-if not isinstance(routes, dict) or not isinstance(hidden, dict):
-    raise SystemExit("invalid route or UI-preference schema after cutover")
+access_path = state / "access-control.json"
+access_users = (
+    json.loads(access_path.read_text(encoding="utf-8"))["users"]
+    if access_path.is_file()
+    else {}
+)
+if not isinstance(routes, dict) or not isinstance(hidden, dict) or not isinstance(access_users, dict):
+    raise SystemExit("invalid route, access, or UI-preference schema after cutover")
 result = {
     "routes": len(routes),
+    "invited_access_users": len(access_users),
     "hidden_preference_owners": len(hidden),
     "hidden_preferences": sum(len(value) for value in hidden.values() if isinstance(value, list)),
 }
@@ -1003,6 +1028,25 @@ launched into their own explicitly configured transient systemd scopes/units,
 not inherit policy from the coordinator API unit. The Console remains hardened
 because it owns no managed children when `COORDINATOR_AUTOSTART=0`.
 
+## Manage Google account access
+
+1. Sign in as a configured owner from `ALLOWED_EMAILS`, then open Console →
+   *Access*. The real owner/invited-user collection is the first content.
+2. Choose *Add user*, enter a Gmail or Google Workspace email, and select the
+   exact destinations it may open. `DevOps Console` is a separate high-
+   privilege grant: it allows all existing server/route operations but does
+   not allow access administration.
+3. Change a grant from the user card at any time. The next HTTP or WebSocket
+   request uses the new policy; no re-login or service restart is required.
+   Removing a user invalidates that user's existing signed session immediately.
+
+Configured owners are intentionally not editable in the web UI. Change them in
+the private `console.env` `ALLOWED_EMAILS` value and restart the service. This
+provides a recovery path if invited policy is empty or corrupt. Invited state
+is private `<STATE_DIR>/access-control.json` (atomic writes, mode `0600`).
+Public routes remain public regardless of grants; saved grants become effective
+again if the route returns to login-required mode.
+
 ## Exposing a dev server
 
 1. Start the server through the coordinator (or the console UI) so it has a
@@ -1033,13 +1077,15 @@ because it owns no managed children when `COORDINATOR_AUTOSTART=0`.
   token stays in a private external file and is never returned to browser
   JavaScript, logs, URLs, screenshots, or Git.
 - Sessions: HMAC-SHA256-signed cookie, `Domain=.vr.ae`, `HttpOnly`, `Secure`,
-  `SameSite=Lax`; allowlist re-checked on every request.
+  `SameSite=Lax`; current owner/invited membership and the exact Console/domain
+  grant are re-checked on every HTTP and WebSocket request.
 - OIDC: authorization code + PKCE, `state`/`nonce` enforced, ID-token
   signature verified against Google's JWKS in-process.
 - Unknown subdomains are indistinguishable from protected ones until you log
   in (no route enumeration). New routes default to login-required. Proxy
   targets are always `127.0.0.1`.
-- Console API mutations require a same-origin `Origin` header (CSRF).
+- Console API mutations require a same-origin `Origin` header (CSRF). Access
+  list read/write endpoints additionally require a configured owner.
 
 ## Dev mode
 

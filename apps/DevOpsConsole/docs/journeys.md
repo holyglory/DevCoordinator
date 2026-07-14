@@ -6,16 +6,18 @@ and review; no external audit-skill checkout is required.
 
 ## App Idea
 
-- Product promise: **One private page where the VPS operator sees every dev
-  server, container, port lease and public subdomain on `vr.ae`, and can
-  expose, restart, inspect or retract any of them in a couple of clicks.**
-- Primary users: the machine's operator (owner of the allowlisted Google
-  accounts). Single-tenant; no anonymous or multi-role UI.
+- Product promise: **One private page where the VPS owner sees every dev
+  server, container, port lease and public subdomain on `vr.ae`, can expose,
+  restart, inspect or retract them, and can grant exact domains to invited
+  Google accounts.**
+- Primary users: configured owners; invited Google users may be domain-only
+  viewers or Console operators. Only configured owners administer access.
 - Primary value: replaces SSH + `dev_coordinator.py` CLI + editing proxy
   config with a phone-friendly control panel; makes "share this dev build at
   a URL" a 15-second task instead of a config change.
-- Non-goals: multi-user roles/permissions, editing coordinator state files,
-  arbitrary shell access, container creation, certificate issuance (certs are
+- Non-goals: fine-grained roles for individual Console actions, delegated
+  access administration, editing coordinator state files, arbitrary shell
+  access, container creation, certificate issuance (certs are
   provisioned out-of-band and only *observed* here), durable metrics storage
   (CPU/memory history is in-process only and resets with the console — the
   UI says so).
@@ -29,11 +31,12 @@ and review; no external audit-skill checkout is required.
 | --- | --- | --- | --- | --- | --- |
 | VPS operator (desktop) | Expert dev/ops; knows ports, Docker, OIDC | Many times/day while developing | Workstation, big screen, keyboard | Low–medium | Medium: wrong toggle exposes a dev app publicly; deleting a route breaks a shared link |
 | VPS operator (phone) | Same person, reduced attention | Few times/week | Mobile, one-handed, flaky network | Medium–high (usually reacting to "the link you sent me is down") | Same as above, plus mistaps — destructive actions need confirmation |
-| Invited viewer (client/teammate) | Non-technical | Rare | Opens a shared `<slug>.vr.ae` link | Low | None — they never see the console UI; they only benefit from routes being correct |
+| Invited domain viewer (client/teammate) | Non-technical | Rare | Opens one granted `<slug>.vr.ae` link | Low | Low — an absent grant must deny without exposing other domains |
+| Invited Console operator | Technical | Occasional | Uses the Console to operate servers | Medium | High — Console access is full operational control, but never access administration |
 
-The invited viewer never uses this page (unknown/protected slugs bounce them
-to Google login or a styled 404); they are listed because their experience is
-the *output* of journeys 2 and 4.
+Domain-only viewers never use the Console page. They sign in through the same
+Google flow and can open only assigned private hosts. A Console grant is a
+separate, explicit high-privilege destination.
 
 ## Journey Inventory
 
@@ -49,6 +52,7 @@ Prioritized: top rows are the most frequent and most important.
 | J6 Housekeeping: leases, TLS runway | Operator | Monthly | 6 | Low–medium | Port leases page, TLS chip | Stale leases released; new port leased without collisions; TLS renewal not overdue |
 | J7 Watch performance: who is eating CPU/RAM? | Operator | Weekly | 7 | Low–medium | CPU/mem cells on rows; Performance page | Hog identified with numbers + history; act via restart/stop |
 | J8 Run a whole project; keep the console tidy | Operator | Daily | 2 | Medium | Projects page (default) | A repo's full stack up/down in one action; idle noise hidden but self-revealing |
+| J9 Grant a Google user exact domains | Owner | Monthly+ | 2 | High | Access page | User can open only selected domains; revocation is immediate |
 
 ## Journey Detail
 
@@ -58,8 +62,8 @@ Prioritized: top rows are the most frequent and most important.
 - Goal: within ~5 seconds, know whether anything needs action, and what.
 - Trigger: habitual check; a message that "the link is down"; after a deploy
   or reboot.
-- Preconditions: valid allowlisted session (the page never renders without
-  one; an expired session reloads into Google login).
+- Preconditions: valid session with the `console` grant (configured owners
+  always have it; an expired/removed session reloads into Google login).
 - Entry point: `https://console.vr.ae/` — the single-row sticky header,
   present on every page.
 - Route/screen sequence: hash-routed pages (`#/projects` default,
@@ -250,11 +254,11 @@ Prioritized: top rows are the most frequent and most important.
 
 - User: operator, frequently on phone ("make it public for the client call,
   lock it after").
-- Goal: change who can open `https://<slug>.vr.ae` — allowlisted Google
-  accounts vs. anyone.
-- Trigger: a demo/call starts or ends; a link needs sharing with someone not
-  on the allowlist.
-- Preconditions: session; route exists. Coordinator is NOT required.
+- Goal: change who can open `https://<slug>.vr.ae` — specifically granted
+  Google accounts vs. anyone.
+- Trigger: a demo/call starts or ends; a link needs sharing with someone who
+  does not yet have a grant for that private domain.
+- Preconditions: Console-granted session; route exists. Coordinator is NOT required.
 - Entry point: the access switch on the route row.
 - Route/screen sequence: single interaction on the row; confirm dialog only
   when going public.
@@ -477,6 +481,57 @@ Prioritized: top rows are the most frequent and most important.
   agent; hiding is reflected on both the Projects and Servers pages; the
   reveal toggle shows hidden rows dimmed with working unhide buttons.
 
+### J9 — Grant a Google user exact domains
+
+- User: configured owner; desktop is common, phone must support urgent revoke.
+- Goal: invite one Gmail or Google Workspace account and grant only the
+  Console and/or assigned domains it genuinely needs.
+- Trigger: a client or teammate needs a private preview; a technical teammate
+  needs Console control; access needs to be removed.
+- Preconditions: owner session. A Console-granted invited operator is not an
+  access administrator.
+- Entry point: owner-only `#/access` page.
+- Route/screen sequence: real user collection first → Add user opens a focused
+  modal in the current viewport → email + destination checkboxes → Add → new
+  user appears in the collection → later checkbox changes save immediately;
+  remove is confirmed and returns focus to Add user.
+- Primary decisions: which Google account email (verified at sign-in); which exact private hosts;
+  whether the user needs the high-privilege Console destination.
+- Required information: configured owners are visibly locked and described as
+  full-access recovery accounts; every resource shows its real host and target;
+  public routes are marked Public and explain that a saved grant matters only
+  if the route becomes private; Console says it grants full server/route
+  control, not access administration.
+- Warning/flag conditions: removing a user confirms that existing sessions are
+  revoked immediately; removing a single grant does not require a destructive
+  confirm but announces the exact host; attempts to edit owners or unknown
+  resources surface the server error.
+- Empty/loading/error states: owners remain visible even with zero invitees;
+  the list then says “No invited users yet.” Loading uses list skeletons;
+  load/save failures stay honest in the banner and never claim a disk write.
+- Recovery and undo: a removed user can be invited again; a removed grant can
+  be rechecked. Owners can recover even if policy state is corrupt because
+  they live in the private environment configuration.
+- Device/context constraints: user cards and destination controls are one
+  column at 390px; the add dialog is viewport-bounded and internally scrolls
+  for long domain lists; no horizontal document scroll.
+- Accessibility: every checkbox names its host; public/owner state is text,
+  not color-only; dialog heading/close controls are labelled; Add focuses the
+  email field; new users are scrolled into view and focused; cancellation
+  returns to the collection context.
+- Acceptance criteria:
+  - A newly invited account granted only `app.vr.ae` can sign in there, gets
+    403 at another private domain and at `console.vr.ae`, and receives the
+    same result for WebSocket upgrades.
+  - Granting Console access makes the existing session work immediately but
+    `/api/access` remains owner-only.
+  - Removing a domain grant denies the next request without re-login; removing
+    the user makes the existing cookie unauthenticated on the next request.
+  - Deleting and later reusing a slug never revives its old grants; renaming a
+    server/container subdomain moves its grants to the new hostname.
+  - Populated, empty, long-list, add, cancel, save, remove, desktop, and phone
+    states keep the collection first and every control visible/reachable.
+
 ## Journey Decision Model
 
 | Surface | Primary user goal | Primary decision | Required facts | Warning/flag conditions | Frequent actions | Secondary/rare actions | Unresolved assumptions |
@@ -488,6 +543,7 @@ Prioritized: top rows are the most frequent and most important.
 | Docker section | Keep service dependencies alive | Start/stop/restart a container | Name, image, status string, ports, logs | Stop confirmations; docker daemon unavailable | Open logs; restart | Stop; read stats popover | No compose-up in UI (by design) |
 | Port leases page | Keep the port pool clean | Lease, release, or leave a lease | Port, purpose, project, countdown; lease-form validity | Countdown amber <15m; expired; "no free port" errors verbatim | Lease a port; release (confirmed) | Pick preferred port/TTL/project | Lease attribution is the console user |
 | Pinned ports card | Know each server's permanent port | Keep or unassign a pin | Port, server name, project, live server status ("not registered" = record pruned, pin still holds) | Unassign confirm explains the port may change on next start | Read; unassign (confirmed) | Cross-check on Servers page (dotted pin marker on the port) | Pins are coordinator-wide policy, not console state |
+| Access page | Grant exact private destinations | Which user gets which host | Google email; real host + target; owner/public state; Console privilege consequence | User removal revokes live sessions; owners immutable | Add user; toggle a host grant | Remove user | Ownership transfer remains environment-only |
 | Servers/Docker usage cells | Spot a hog in place | Is this row's load normal? | Live CPU % + memory numbers; sparkline shape | Sampling failure note | Click for history charts | — | CPU normalized to observed peak, numbers absolute |
 | Performance page | Find resource hogs with history | Which entity/project to act on | Per-entity CPU/mem charts (current, peak, window); per-project bars | Sampler error note; stale (not running) cards dimmed | Read; navigate to the row to act | Cross-reference project bars | History is in-process, resets with console |
 
@@ -519,6 +575,9 @@ Prioritized: top rows are the most frequent and most important.
 | J7 | Server/Docker row | live CPU % + memory numbers | primary-frequent | Hog spotting without leaving the row | While running | Inline numbers + sparkline |
 | J7 | Usage popover / Performance page | CPU & memory history charts | secondary-occasional | Sustained-vs-blip judgment | On demand | Click popover; Performance page |
 | J7 | Usage row | cpu/mem per project | secondary-occasional | Hog spotting | Always on Performance page | Inline bars + numbers |
+| J9 | Access user collection | Google email + owner state | critical-always | Identifies the authorization subject and recovery boundary | Always | User card heading; locked Owner badge |
+| J9 | Access resource control | Host + target + current grant | critical-always | The exact authorization decision | Every invited user/resource pair | Labelled checkbox; Public badge and consequence text |
+| J9 | Add-user dialog | Email + initial grants | primary-on-invocation | Creates real access state | Only after Add user | Focused viewport modal; collection remains behind it |
 | All | Error banner | Server error message verbatim | conditional | Exact failure text is the fix hint | On any failed fetch | Banner, dismissible, with Retry |
 
 ## Interaction And Metadata Model
@@ -548,6 +607,7 @@ Binding affordance rules, made concrete for this app:
 | Docker | J5 | Screenshots: list, log panel, unavailable-daemon state | empty, unavailable, busy, stop-confirm | none | No compose-up in UI |
 | Port leases | J6 | Screenshots: form + populated table incl. countdown warning; lease→release round trip | empty, degraded, ticking countdown, form error, release confirm | none | Attribution = console user |
 | Performance | J7 | Screenshots: populated chart cards (running + dimmed stale), usage bars; row sparkline popover | collecting (no history yet), populated, sampler-error note, degraded | none | CPU normalized to observed peak |
+| Access | J9 | Browser evidence: owner-only nav, owners + invitees, exact grant toggles, add dialog at 1440×900 and 390×844 | loading, owner-only/zero invitees, populated, long domains, add open, invalid email, save failure | none | Configured ownership is intentionally not transferable in UI |
 | Nav | All | Screenshots: desktop tabs with counts + active state; mobile drawer open/closed | drawer open/closed, active page marked, counts hidden when unknown | none | None |
 | Global | All | Deterministic browser verification at 1440px and 390px per page: no horizontal document scroll, no clipped text, visible scrollbar inventory (expected: document vertical + log boxes + popover when open); the ten labels above each marked pass with evidence | error banner, 401 reload, reduced-motion, focus-visible pass | none | None |
 
@@ -558,7 +618,7 @@ is supported and every relevance tier keeps its documented access path
 
 ## Screen Requirements
 
-Five hash-routed pages behind one sticky header (summary bar + nav; the
+Seven hash-routed pages behind one sticky header (summary bar + nav; the
 header is identical on every page):
 
 | Screen area | Journey | Critical info | Primary actions | Secondary actions | Rare details | Device/context constraints |
@@ -571,6 +631,7 @@ header is identical on every page):
 | Docker page (`#/docker`) | J5, J7 | Status, name, image, ports, CPU/mem numbers; subdomain chip on web-serving containers | Logs; restart; start; open history charts; assign/edit subdomain | Stop | stats/labels | Same card pattern |
 | Port leases page (`#/ports`) | J6 | Port, purpose, countdown; lease form; pinned ports (port permanently owned per server, with server status) | Lease; release (confirmed); unassign pin (confirmed) | Preferred port/TTL/project | Lease id, ISO expiry, agent, pin provenance (title) | Form stacks at 390px |
 | Performance page (`#/performance`) | J7 | Machine panel first: whole-box CPU (cores + load), memory used/available, per-disk storage, uptime — with meters, >90% alarm tint and CPU/mem history charts; then per-entity CPU/mem charts; per-project bars | Read; jump to rows to act | — | Sampling cadence note | Tiles and chart grid single-column on phone |
+| Access page (`#/access`, owners only) | J9 | Real owner/invited-user collection first; exact Console/domain grants; real hosts/targets; owner and public state | Add user in focused dialog; change grant immediately | Remove user with live-revocation confirm | Configured-owner recovery note | Cards and grant list single-column on phone; dialog viewport-bounded |
 
 ## QA And Acceptance
 
@@ -586,17 +647,22 @@ header is identical on every page):
   URL → copy; J3 expand → logs → restart → healthy; J4 public toggle with
   confirm then revert; J5 container stop/start with logs; J6 lease with a
   preferred port → row appears → release → row gone, countdown ticks; J7
-  running server shows live CPU/mem numbers, sparkline, and popover charts;
-  page switching via tabs and via the mobile hamburger drawer.
+  history grows and identifies a running process; J8 whole-project start/stop
+  plus hide/auto-reveal; J9 add user → grant one domain → verify exact access
+  → grant Console without admin rights → revoke grant/user immediately.
+  A running server shows live CPU/mem numbers, sparkline, and popover charts;
+  page switching works via tabs and the mobile hamburger drawer.
 - Edge cases: reserved/duplicate/invalid slugs; server without command
   (restart disabled); `url_is_current=false` flag; docker daemon down; empty
   every section; lease without TTL; released/nonexistent lease ("matching
   lease not found" verbatim, HTTP 400); deep link to an unknown page hash
-  (falls back to Servers); metrics history empty right after console
+  (falls back to Projects); metrics history empty right after console
   restart; coordinator error strings with quotes
-  (`"'matching server not found'"`) shown verbatim.
+  (`"'matching server not found'"`) shown verbatim; invited user with no
+  grants; public route with a saved dormant grant; deleted/reused slug;
+  deep link to Access as a non-owner (falls back to Projects).
 - Failure/recovery scenarios: coordinator killed mid-session (degraded panels
-  + Attention sentence, Routes still usable); overview fetch failing (banner
+  + needs-attention badge, Routes and Access still usable); overview fetch failing (banner
   + stale note, Retry works); mutation 400/409/502 (verbatim banner, state
   reverts on refetch); 401 (silent reload into login).
 - Mobile scenarios: 390px — no horizontal document scroll, rows read as

@@ -1,25 +1,33 @@
-// Request-level auth guard: session extraction with allowlist re-check,
+// Request-level auth guard: session extraction with live access-policy re-check,
 // browser detection, login redirect construction, the `rt` open-redirect
 // guard, and the Origin/Referer CSRF check for mutating console-API calls.
 
 const HOST_RE = /^[a-z0-9.-]+(?::\d{1,5})?$/;
 
-export function createGuard({ sessions, allowedEmails, config, log }) {
+export function createGuard({ sessions, access, config, log }) {
   /**
-   * Parse + verify the session cookie AND re-check the email allowlist on
-   * every request, so removing an email from ALLOWED_EMAILS revokes access
-   * immediately even for already-issued cookies.
+   * Parse + verify the session cookie AND re-check current policy membership
+   * on every request, so removing an invited user revokes an already-issued
+   * cookie immediately. Exact resource grants are checked separately.
    */
   function sessionFrom(req) {
     const session = sessions.parse(req?.headers?.cookie);
     if (!session) return null;
     const email = String(session.email || '').toLowerCase();
-    if (!allowedEmails || !allowedEmails.has(email)) {
-      log?.debug?.('session rejected: email not on allowlist', { email });
+    if (!access?.isKnown(email)) {
+      log?.debug?.('session rejected: email no longer approved', { email });
       return null;
     }
     return session;
   }
+
+  const isKnownEmail = (email) => Boolean(access?.isKnown(email));
+  const isAdmin = (sessionOrEmail) => Boolean(
+    access?.isAdmin(typeof sessionOrEmail === 'string' ? sessionOrEmail : sessionOrEmail?.email),
+  );
+  const hasAccess = (sessionOrEmail, resource) => Boolean(
+    access?.canAccess(typeof sessionOrEmail === 'string' ? sessionOrEmail : sessionOrEmail?.email, resource),
+  );
 
   /**
    * Browser-navigation detection per the architecture contract: API/XHR
@@ -93,5 +101,5 @@ export function createGuard({ sessions, allowedEmails, config, log }) {
     return false;
   }
 
-  return { sessionFrom, wantsHtml, loginRedirectUrl, validateRt, checkOrigin };
+  return { sessionFrom, isKnownEmail, isAdmin, hasAccess, wantsHtml, loginRedirectUrl, validateRt, checkOrigin };
 }

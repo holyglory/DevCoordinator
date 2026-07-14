@@ -3,6 +3,8 @@
 // → <slug> reverse proxy (default-deny auth) → 421 for foreign hosts.
 // Upgrades perform the SAME auth checks as requests.
 
+import { CONSOLE_GRANT, routeGrant } from './access.mjs';
+
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const FLOW_COOKIE_NAME = 'dc_flow';
 
@@ -148,6 +150,19 @@ export function createRouter(deps) {
     }
   }
 
+  function forbidden(req, res, pathname, session, resource) {
+    const apiLike =
+      pathname === '/api' ||
+      pathname.startsWith('/api/') ||
+      String(req.headers.accept || '').includes('application/json');
+    if (apiLike) return sendJson(res, 403, { error: 'forbidden' });
+    return sendPage(res, pages.renderDenied({
+      email: session?.email,
+      resource,
+      sessionSet: true,
+    }), { fallbackStatus: 403 });
+  }
+
   // --- auth endpoints (console host only) -------------------------------------
 
   async function handleAuth(req, res, pathname, searchParams) {
@@ -191,8 +206,8 @@ export function createRouter(deps) {
         const flowCookieValue = readCookie(req, FLOW_COOKIE_NAME);
         try {
           const { profile, rt } = await oidc.handleCallback(searchParams, flowCookieValue);
-          if (!config.allowedEmails.has(String(profile.email || '').toLowerCase())) {
-            log.warn('login denied: email not allowlisted', { email: profile.email });
+          if (!guard.isKnownEmail(profile.email)) {
+            log.warn('login denied: email not approved', { email: profile.email });
             return sendPage(res, pages.renderDenied({ email: profile.email }), {
               fallbackStatus: 403,
               headers: { 'set-cookie': clearFlowCookie() },
@@ -235,6 +250,9 @@ export function createRouter(deps) {
 
     const session = guard.sessionFrom(req);
     if (!session) return unauthenticated(req, res, pathname, guard.loginRedirectUrl(req));
+    if (!guard.hasAccess(session, CONSOLE_GRANT)) {
+      return forbidden(req, res, pathname, session, config.consoleHost);
+    }
 
     if (pathname === '/api' || pathname.startsWith('/api/')) {
       return consoleApi.handle(req, res, session);
@@ -256,6 +274,9 @@ export function createRouter(deps) {
         const fullUrl = `${proto}://${hostPort}${rawUrl}`;
         const loginUrl = `${config.consoleOrigin}/auth/login?rt=${encodeURIComponent(fullUrl)}`;
         return unauthenticated(req, res, '/', loginUrl);
+      }
+      if (route && !guard.hasAccess(session, routeGrant(slug))) {
+        return forbidden(req, res, '/', session, `${slug}.${config.domain}`);
       }
     }
 
@@ -388,6 +409,9 @@ export function createRouter(deps) {
       // Same auth checks as plain requests — an upgrade must never bypass them.
       const session = guard.sessionFrom(req);
       if (!session) return refuseUpgrade(socket, 401, 'Unauthorized');
+      if (route && !guard.hasAccess(session, routeGrant(slug))) {
+        return refuseUpgrade(socket, 403, 'Forbidden');
+      }
     }
     if (!route) return refuseUpgrade(socket, 404, 'Not Found');
 

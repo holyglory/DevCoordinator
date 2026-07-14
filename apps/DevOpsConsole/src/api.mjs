@@ -6,6 +6,7 @@
 import { CoordError } from './coordinator.mjs';
 import { PrefsError } from './prefs.mjs';
 import { RouteError, publishedContainerPorts } from './routes.mjs';
+import { AccessError, CONSOLE_GRANT, routeGrant } from './access.mjs';
 
 const BODY_LIMIT = 64 * 1024;
 const SERVER_ACTIONS = new Set(['stop', 'restart']);
@@ -22,7 +23,9 @@ class ApiError extends Error {
   }
 }
 
-export function createConsoleApi({ config, log, coordinator, routeStore, guard, certManager, metrics, prefs }) {
+export function createConsoleApi({
+  config, log, coordinator, routeStore, accessStore, guard, certManager, metrics, prefs,
+}) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'api' }) : log;
 
   function sendJson(res, status, payload) {
@@ -113,6 +116,85 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
     return view;
   }
 
+  function accessResources() {
+    const resources = [{
+      id: CONSOLE_GRANT,
+      kind: 'console',
+      host: config.consoleHost,
+      title: 'DevOps Console',
+      auth: 'google',
+      target: 'Full server and route control',
+    }];
+    for (const route of routeStore.list()) {
+      let target;
+      if (route.kind === 'server') target = `${route.serverName} · ${route.project}`;
+      else if (route.kind === 'docker') target = `${route.containerName}:${route.containerPort}`;
+      else target = `127.0.0.1:${route.port}`;
+      resources.push({
+        id: routeGrant(route.slug),
+        kind: 'route',
+        host: `${route.slug}.${config.domain}`,
+        title: route.title || route.serverName || route.containerName || route.slug,
+        auth: route.auth,
+        target,
+      });
+    }
+    return resources;
+  }
+
+  function requireAccessAdmin(session) {
+    if (!accessStore?.isAdmin(session?.email)) {
+      throw new ApiError(403, 'only configured Console owners can manage access');
+    }
+  }
+
+  function accessView() {
+    const users = accessStore.list();
+    return {
+      version: 1,
+      users,
+      resources: accessResources(),
+      invitedCount: users.filter((user) => !user.owner).length,
+    };
+  }
+
+  function handleAccessGet(res, session) {
+    requireAccessAdmin(session);
+    sendJson(res, 200, accessView());
+  }
+
+  async function handleAccessAdd(req, res, session) {
+    requireAccessAdmin(session);
+    const body = await readJsonBody(req);
+    const added = await accessStore.addUser({ email: body.email, grants: body.grants ?? [] });
+    clog?.info?.('access user added', {
+      admin: session.email,
+      email: added.email,
+      grants: added.grants,
+    });
+    sendJson(res, 201, accessView());
+  }
+
+  async function handleAccessGrant(req, res, session, email) {
+    requireAccessAdmin(session);
+    const body = await readJsonBody(req);
+    const updated = await accessStore.setGrant(email, body.resource, body.allowed);
+    clog?.info?.('access grant changed', {
+      admin: session.email,
+      email: updated.email,
+      resource: body.resource,
+      allowed: body.allowed,
+    });
+    sendJson(res, 200, accessView());
+  }
+
+  async function handleAccessRemove(res, session, email) {
+    requireAccessAdmin(session);
+    const removed = await accessStore.removeUser(email);
+    clog?.info?.('access user removed', { admin: session.email, email: removed.email });
+    sendJson(res, 200, accessView());
+  }
+
   async function routeViews() {
     // serversRaw() is cached+coalesced, so parallel resolves share one call.
     return Promise.all(
@@ -169,6 +251,12 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
 
   async function handleRouteCreate(req, res) {
     const body = await readJsonBody(req);
+    const requestedSlug = typeof body.slug === 'string' ? body.slug.trim().toLowerCase() : '';
+    if (requestedSlug && !routeStore.get(requestedSlug)) {
+      // A deleted hostname must never resurrect grants if the same slug is
+      // assigned to a different server later.
+      await accessStore.clearResource(routeGrant(requestedSlug));
+    }
     const route = await routeStore.create({
       slug: body.slug,
       kind: body.kind,
@@ -197,7 +285,8 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
   }
 
   async function handleRouteDelete(res, slug) {
-    await routeStore.remove(slug);
+    const removed = await routeStore.remove(slug);
+    await accessStore.clearResource(routeGrant(removed.slug));
     sendJson(res, 200, { ok: true });
   }
 
@@ -245,7 +334,10 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
 
     // Unassign: remove the mapped route (idempotent when none exists).
     if (!rawSlug) {
-      if (existing) await routeStore.remove(existing.slug);
+      if (existing) {
+        await routeStore.remove(existing.slug);
+        await accessStore.clearResource(routeGrant(existing.slug));
+      }
       clog?.info?.('server subdomain removed', { server: server.name, slug: existing?.slug ?? null });
       return sendJson(res, 200, { route: null });
     }
@@ -261,6 +353,9 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
 
     // New or renamed mapping: create the new route (validates + enforces
     // uniqueness), then drop the old one so a server maps to a single subdomain.
+    const occupied = routeStore.get(rawSlug);
+    if (occupied && rawSlug === occupied.slug) throw new ApiError(409, `route '${rawSlug}' already exists`);
+    if (!occupied) await accessStore.clearResource(routeGrant(rawSlug));
     const route = await routeStore.create({
       slug: rawSlug,
       kind: 'server',
@@ -269,7 +364,10 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
       auth: authGiven ?? existing?.auth,
       title: existing?.title,
     });
-    if (existing) await routeStore.remove(existing.slug);
+    if (existing) {
+      await accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug));
+      await routeStore.remove(existing.slug);
+    }
     clog?.info?.('server subdomain assigned', { server: server.name, slug: route.slug, auth: route.auth });
     return sendJson(res, 201, { route: toRouteView(route, await resolveSafe(route.slug)) });
   }
@@ -301,7 +399,10 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
 
     // Unassign: remove the mapped route (idempotent when none exists).
     if (!rawSlug) {
-      if (existing) await routeStore.remove(existing.slug);
+      if (existing) {
+        await routeStore.remove(existing.slug);
+        await accessStore.clearResource(routeGrant(existing.slug));
+      }
       clog?.info?.('docker subdomain removed', { container: name, slug: existing?.slug ?? null });
       return sendJson(res, 200, { route: null });
     }
@@ -357,6 +458,9 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
 
     // New or renamed mapping: create the new route (validates + enforces
     // uniqueness), then drop the old one so a container maps to one subdomain.
+    const occupied = routeStore.get(rawSlug);
+    if (occupied && rawSlug === occupied.slug) throw new ApiError(409, `route '${rawSlug}' already exists`);
+    if (!occupied) await accessStore.clearResource(routeGrant(rawSlug));
     const route = await routeStore.create({
       slug: rawSlug,
       kind: 'docker',
@@ -365,7 +469,10 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
       auth: authGiven ?? existing?.auth,
       title: existing?.title,
     });
-    if (existing) await routeStore.remove(existing.slug);
+    if (existing) {
+      await accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug));
+      await routeStore.remove(existing.slug);
+    }
     clog?.info?.('docker subdomain assigned', { container: name, slug: route.slug, auth: route.auth, containerPort });
     return sendJson(res, 201, { route: toRouteView(route, await resolveSafe(route.slug)) });
   }
@@ -546,7 +653,7 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
   function handleError(res, err) {
     let status = 500;
     let message = 'internal error';
-    if (err instanceof ApiError || err instanceof RouteError || err instanceof PrefsError) {
+    if (err instanceof ApiError || err instanceof RouteError || err instanceof PrefsError || err instanceof AccessError) {
       status = Number.isInteger(err.status) ? err.status : 500;
       message = err.message;
     } else if (err instanceof CoordError) {
@@ -603,7 +710,21 @@ export function createConsoleApi({ config, log, coordinator, routeStore, guard, 
           name: session.name ?? null,
           pic: session.pic ?? null,
           exp: session.exp ?? null,
+          accessAdmin: accessStore.isAdmin(session.email),
         });
+      }
+      if (method === 'GET' && pathname === '/api/access') {
+        return handleAccessGet(res, session);
+      }
+      if (method === 'POST' && pathname === '/api/access/users') {
+        return await handleAccessAdd(req, res, session);
+      }
+      const accessUserMatch = pathname.match(/^\/api\/access\/users\/([^/]+)$/);
+      if (accessUserMatch && method === 'PATCH') {
+        return await handleAccessGrant(req, res, session, safeDecode(accessUserMatch[1]));
+      }
+      if (accessUserMatch && method === 'DELETE') {
+        return await handleAccessRemove(res, session, safeDecode(accessUserMatch[1]));
       }
       if (method === 'POST' && pathname === '/api/routes') {
         return await handleRouteCreate(req, res);
