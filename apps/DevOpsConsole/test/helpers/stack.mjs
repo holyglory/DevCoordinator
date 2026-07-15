@@ -12,7 +12,7 @@
 // jar keyed by domain suffix like a browser (Domain=.vr.ae is sent to
 // console.vr.ae AND app.vr.ae).
 
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
 import { promises as fsp } from 'node:fs';
@@ -22,6 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import { start as startConsole } from '../../bin/devops-console.mjs';
 import { startIssuer } from './fixture-issuer.mjs';
@@ -39,6 +40,8 @@ export const COORDINATOR_SCRIPT = path.join(
 );
 
 import { DEV_CERT, DEV_KEY, ensureDevCert } from './dev-cert.mjs';
+
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Cookie jar (browser-style: Domain cookies match by suffix, ports ignored)
@@ -251,7 +254,131 @@ export async function apiCall(stack, jar, method, apiPath, body, extraHeaders = 
 // Real coordinator (isolated home, OS-assigned port)
 // ---------------------------------------------------------------------------
 
-async function spawnCoordinator(home, extraEnv = {}) {
+async function runNormalizedObservation({
+  home,
+  extraEnv,
+  legacySeedHome,
+  agent,
+  project,
+}) {
+  const { stdout } = await execFileAsync(
+    'python3',
+    [
+      COORDINATOR_SCRIPT,
+      'observe',
+      '--agent',
+      agent,
+      '--project',
+      project,
+      '--max-age-seconds',
+      '0',
+      '--legacy-home',
+      legacySeedHome,
+      '--compact-json',
+    ],
+    {
+      env: {
+        ...process.env,
+        ...extraEnv,
+        CODEX_AGENT_COORDINATOR_HOME: home,
+        DEVCOORDINATOR_STATE_BACKEND: 'sqlite',
+      },
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    },
+  );
+  try {
+    return JSON.parse(stdout);
+  } catch (err) {
+    throw new Error(`normalized coordinator observation emitted invalid JSON: ${err}; stdout=${JSON.stringify(stdout.slice(0, 600))}`);
+  }
+}
+
+async function initializeNormalizedCoordinator(home, extraEnv = {}, { expectDocker = false } = {}) {
+  // A production SQLite mutation deliberately discovers every eligible
+  // same-UID legacy home before it establishes authority. E2E must not import
+  // the developer/runner's real coordinator state, so create one exact,
+  // isolated legacy source through the public compatibility CLI and name only
+  // that source on the explicit normalized observation.
+  const legacySeedHome = path.join(home, 'legacy-seed');
+  const baseEnv = { ...process.env, ...extraEnv };
+  await execFileAsync(
+    'python3',
+    [
+      COORDINATOR_SCRIPT,
+      'state',
+      'reset',
+      '--force',
+      '--agent',
+      'devops-console-e2e-bootstrap',
+      '--project',
+      REPO_ROOT,
+    ],
+    {
+      env: {
+        ...baseEnv,
+        CODEX_AGENT_COORDINATOR_HOME: legacySeedHome,
+        DEVCOORDINATOR_STATE_BACKEND: 'legacy-json-test-only',
+      },
+      timeout: 60_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+
+  const observation = await runNormalizedObservation({
+    home,
+    extraEnv,
+    legacySeedHome,
+    agent: 'devops-console-e2e-bootstrap',
+    project: REPO_ROOT,
+  });
+
+  const imported = observation?.imported;
+  if (
+    observation?.schema_version !== 2
+    || observation?.status !== 'completed'
+    || observation?.observer_domain !== 'host-runtime-v2:full-docker'
+    || imported?.committed !== true
+    || imported?.source_count !== 1
+    || imported?.blocking_conflict_count !== 0
+  ) {
+    throw new Error(
+      `E2E coordinator bootstrap must commit one conflict-free legacy seed into a schema-v2 full-Docker observation: ${JSON.stringify(observation)}`,
+    );
+  }
+  if (expectDocker && observation?.observed !== true) {
+    throw new Error(`E2E fake Docker was not freshly observed: ${JSON.stringify(observation)}`);
+  }
+  return { observation, legacySeedHome };
+}
+
+async function assertNormalizedCoordinatorAuthority(coordinator, initialization, { expectDocker = false } = {}) {
+  const inventory = await coordinator.api('GET', '/v1/inventory');
+  const canonicalHome = await fsp.realpath(coordinator.home);
+  const completedFullDockerSnapshot = (inventory?.observations?.snapshots || []).some(
+    (snapshot) => snapshot?.observer_domain === 'host-runtime-v2:full-docker' && snapshot?.status === 'completed',
+  );
+  if (
+    initialization?.observation?.imported?.blocking_conflict_count !== 0
+    || inventory?.schema_version !== 2
+    || inventory?.store?.schema_version !== 2
+    || inventory?.store?.authority_mode !== 'sqlite'
+    || inventory?.store?.migration_state !== 'ready'
+    || inventory?.coordinator_home !== canonicalHome
+    || inventory?.state_path !== path.join(canonicalHome, 'coordinator.sqlite3')
+    || !completedFullDockerSnapshot
+  ) {
+    throw new Error(
+      `E2E coordinator authority guard failed (expected schema v2, sqlite/ready, no blocking migration conflicts, and one committed full-Docker snapshot): ${JSON.stringify({ initialization, inventory })}`,
+    );
+  }
+  if (expectDocker && inventory?.docker?.available !== true) {
+    throw new Error(`E2E fake Docker observation is unavailable in normalized inventory: ${JSON.stringify(inventory?.docker)}`);
+  }
+}
+
+async function spawnCoordinator(home, extraEnv = {}, { expectDocker = false } = {}) {
+  const initialization = await initializeNormalizedCoordinator(home, extraEnv, { expectDocker });
   const tokenFile = path.join(home, 'api-token');
   const proc = spawn(
     'python3',
@@ -360,7 +487,36 @@ async function spawnCoordinator(home, extraEnv = {}) {
     return data;
   }
 
-  return { proc, port, url, home, tokenFile, api };
+  async function observe({
+    agent = 'devops-console-e2e-observer',
+    project = REPO_ROOT,
+  } = {}) {
+    const result = await runNormalizedObservation({
+      home,
+      extraEnv,
+      legacySeedHome: initialization.legacySeedHome,
+      agent,
+      project,
+    });
+    if (
+      result?.schema_version !== 2
+      || result?.status !== 'completed'
+      || result?.observer_domain !== 'host-runtime-v2:full-docker'
+      || (result?.imported?.blocking_conflict_count ?? 0) !== 0
+    ) {
+      throw new Error(`E2E normalized observation failed its authority guard: ${JSON.stringify(result)}`);
+    }
+    return result;
+  }
+
+  const coordinator = { proc, port, url, home, tokenFile, api, observe };
+  try {
+    await assertNormalizedCoordinatorAuthority(coordinator, initialization, { expectDocker });
+  } catch (err) {
+    await stopProcess(proc);
+    throw err;
+  }
+  return { ...coordinator, initialization };
 }
 
 async function stopProcess(proc) {
@@ -387,8 +543,16 @@ async function stopProcess(proc) {
  *   coordinator }) so seeds can reference the fixtures' OS-assigned ports.
  * @param {object} [options.coordinatorEnv]  extra env for the coordinator
  *   process only (e.g. a PATH with a fake `docker` first).
+ * @param {boolean} [options.expectDocker] require the supplied Docker fixture
+ *   to be available in the committed normalized observation.
  */
-export async function startStack({ allowedEmails = ['ja@vr.ae'], claims, routes = [], coordinatorEnv = {} } = {}) {
+export async function startStack({
+  allowedEmails = ['ja@vr.ae'],
+  claims,
+  routes = [],
+  coordinatorEnv = {},
+  expectDocker = false,
+} = {}) {
   ensureDevCert(); // fresh clones (CI) generate the throwaway TLS fixture
   const cleanups = []; // LIFO
   const runCleanups = async () => {
@@ -414,7 +578,7 @@ export async function startStack({ allowedEmails = ['ja@vr.ae'], claims, routes 
     const wsEcho = await startWsEcho();
     cleanups.push(() => wsEcho.close());
 
-    const coordinator = await spawnCoordinator(coordHome, coordinatorEnv);
+    const coordinator = await spawnCoordinator(coordHome, coordinatorEnv, { expectDocker });
     cleanups.push(async () => {
       // Stop any servers the coordinator still manages (e.g. a test failed
       // between servers/start and servers/stop), then the coordinator itself.

@@ -80,6 +80,16 @@ describe('metrics store: ingest', () => {
     assert.deepEqual(proj.points, [[t, 13.7, 157_286_400]]);
   });
 
+  it('records normalized Docker lifecycle status "running" as live telemetry', () => {
+    const store = makeStore();
+    const normalized = inventoryFixture();
+    normalized.docker.containers[0].status = 'running';
+    store.ingest(normalized, { at: 1_000_000 });
+    const dock = store.history().entities.find((entity) => entity.key === 'dock:pg');
+    assert.ok(dock, 'schema-v2 Docker lifecycle must not be discarded as stopped');
+    assert.deepEqual(dock.points, [[1_000_000, 1.2, 52_428_800]]);
+  });
+
   it('replaces the last point instead of appending when a reading lands inside the sampling window', () => {
     const store = makeStore();
     const t0 = 1_000_000;
@@ -143,6 +153,28 @@ describe('metrics store: ingest', () => {
       'each usage_key gets its own history series');
     const work = store.history().entities.find((e) => e.key === 'proj:path:/home/example/work/app');
     assert.deepEqual(work.points, [[1_000_000, 10, 100]], 'series must not merge same-named projects');
+  });
+
+  it('does not invent a zero project reading when normalized telemetry is unobserved', () => {
+    const store = makeStore();
+    store.ingest({
+      servers: [],
+      docker: { available: false, containers: [] },
+      project_usage: [
+        {
+          usage_key: 'path:/repos/unobserved',
+          project: '/repos/unobserved',
+          cpu_percent: null,
+          memory_bytes: null,
+        },
+      ],
+    }, { at: 1_000_000 });
+
+    assert.equal(
+      store.history().entities.some((entity) => entity.key === 'proj:path:/repos/unobserved'),
+      false,
+      'absence of a committed sample must remain a chart gap, not a fake zero',
+    );
   });
 
   it('ignores malformed payloads without throwing', () => {

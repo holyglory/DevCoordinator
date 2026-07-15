@@ -17,14 +17,27 @@ private let boardInventoryArguments = [
 ]
 
 private enum OriginInventoryExecutionResult: Sendable {
-    case success(Inventory, enrichedBackups: [DatabaseBackup]?, databaseWarning: String?)
+    case success(NormalizedBoardProjection)
     case failure(String)
+}
+
+private enum OriginInventoryFailureStage: String, Sendable {
+    case processLaunch = "process-launch"
+    case outputLimit = "output-limit"
+    case timeout
+    case cancelled
+    case nonzeroExit = "nonzero-exit"
+    case jsonDecode = "json-decode"
+    case graphProjection = "graph-projection"
 }
 
 private struct OriginInventoryLoadOutcome: Sendable {
     let index: Int
     let origin: CoordinatorOrigin
     let result: OriginInventoryExecutionResult
+    let observationFailure: String?
+    let failureStage: OriginInventoryFailureStage?
+    let failureExitStatus: Int32?
 }
 
 private func validateInventoryExecution(_ execution: CommandExecution) throws -> CommandExecution {
@@ -45,56 +58,125 @@ private func validateInventoryExecution(_ execution: CommandExecution) throws ->
     return execution
 }
 
+private func validateObservationExecution(_ execution: CommandExecution) throws {
+    if execution.outputTruncated {
+        throw RuntimeError("Coordinator observation output exceeded its safety limit")
+    }
+    if execution.timedOut {
+        throw RuntimeError("Coordinator observation timed out")
+    }
+    if execution.cancelled {
+        throw RuntimeError("Coordinator observation was cancelled")
+    }
+    guard execution.exitStatus == 0 else {
+        throw RuntimeError(execution.stderr.isEmpty ? execution.stdout : execution.stderr)
+    }
+}
+
+private func decodingFailureDiagnostic(_ error: Error) -> String {
+    func path(_ context: DecodingError.Context, terminal: CodingKey? = nil) -> String {
+        let components = context.codingPath.map(\.stringValue) + [terminal?.stringValue].compactMap { $0 }
+        return components.isEmpty ? "root" : components.joined(separator: ".")
+    }
+    switch error {
+    case DecodingError.keyNotFound(let key, let context):
+        return "key-not-found:\(path(context, terminal: key))"
+    case DecodingError.typeMismatch(_, let context):
+        return "type-mismatch:\(path(context))"
+    case DecodingError.valueNotFound(_, let context):
+        return "value-not-found:\(path(context))"
+    case DecodingError.dataCorrupted(let context):
+        return "data-corrupted:\(path(context))"
+    default:
+        return "decoder-error"
+    }
+}
+
 private func loadOriginInventory(
     index: Int,
     origin: CoordinatorOrigin,
     arguments: [String],
-    shouldEnrichBackups: Bool,
+    observationMaxAgeSeconds: Double?,
     coordinatorService: any CoordinatorServing
 ) async -> OriginInventoryLoadOutcome {
-    do {
-        let initial = try validateInventoryExecution(
-            await coordinatorService.execute(origin: origin, arguments: arguments)
-        )
-        let decoded = try JSONDecoder().decode(Inventory.self, from: Data(initial.stdout.utf8))
-        var enrichedBackups: [DatabaseBackup]?
-        var databaseWarning: String?
-        if shouldEnrichBackups {
-            let backupDirectories = Set(
-                (decoded.servers.compactMap(\.project) + decoded.docker.containers.compactMap(\.project))
-                    .map { URL(fileURLWithPath: $0).appendingPathComponent(".codex-db-backups").path }
-            ).sorted()
-            if !backupDirectories.isEmpty {
-                var enrichedArguments = arguments
-                // The first inventory already contains the authoritative
-                // Docker/process snapshot. This second pass exists only to
-                // include project-local backup directories, so repeating
-                // Docker's expensive `stats --no-stream` sample is wasteful.
-                enrichedArguments.append("--no-docker")
-                for directory in backupDirectories {
-                    enrichedArguments.append(contentsOf: ["--backup-dir", directory])
-                }
-                do {
-                    let enriched = try validateInventoryExecution(
-                        await coordinatorService.execute(origin: origin, arguments: enrichedArguments)
-                    )
-                    let enrichedInventory = try JSONDecoder().decode(Inventory.self, from: Data(enriched.stdout.utf8))
-                    enrichedBackups = enrichedInventory.backups
-                } catch {
-                    databaseWarning = "Backup inventory incomplete: \(error.localizedDescription)"
-                }
+    var observationFailure: String?
+    if let observationMaxAgeSeconds {
+        do {
+            if let observation = try await coordinatorService.observe(
+                origin: origin,
+                maxAgeSeconds: observationMaxAgeSeconds
+            ) {
+                try validateObservationExecution(observation)
             }
+        } catch {
+            observationFailure = error.localizedDescription
         }
+    }
+    let initial: CommandExecution
+    do {
+        initial = try await coordinatorService.execute(origin: origin, arguments: arguments)
+    } catch {
         return OriginInventoryLoadOutcome(
             index: index,
             origin: origin,
-            result: .success(decoded, enrichedBackups: enrichedBackups, databaseWarning: databaseWarning)
+            result: .failure(error.localizedDescription),
+            observationFailure: observationFailure,
+            failureStage: .processLaunch,
+            failureExitStatus: nil
+        )
+    }
+    do {
+        _ = try validateInventoryExecution(initial)
+    } catch {
+        let stage: OriginInventoryFailureStage = initial.outputTruncated ? .outputLimit
+            : (initial.timedOut ? .timeout
+                : (initial.cancelled ? .cancelled : .nonzeroExit))
+        return OriginInventoryLoadOutcome(
+            index: index,
+            origin: origin,
+            result: .failure(error.localizedDescription),
+            observationFailure: observationFailure,
+            failureStage: stage,
+            failureExitStatus: initial.exitStatus
+        )
+    }
+    let graph: NormalizedInventoryGraph
+    do {
+        graph = try JSONDecoder().decode(
+            NormalizedInventoryGraph.self,
+            from: Data(initial.stdout.utf8)
+        )
+    } catch {
+        inventoryLogger.error(
+            "Inventory JSON decode failed pid=\(Int(Darwin.getpid()), privacy: .public) reason=\(decodingFailureDiagnostic(error), privacy: .public)"
+        )
+        return OriginInventoryLoadOutcome(
+            index: index,
+            origin: origin,
+            result: .failure(error.localizedDescription),
+            observationFailure: observationFailure,
+            failureStage: .jsonDecode,
+            failureExitStatus: initial.exitStatus
+        )
+    }
+    do {
+        let decoded = try graph.boardProjection(origin: origin)
+        return OriginInventoryLoadOutcome(
+            index: index,
+            origin: origin,
+            result: .success(decoded),
+            observationFailure: observationFailure,
+            failureStage: nil,
+            failureExitStatus: initial.exitStatus
         )
     } catch {
         return OriginInventoryLoadOutcome(
             index: index,
             origin: origin,
-            result: .failure(error.localizedDescription)
+            result: .failure(error.localizedDescription),
+            observationFailure: observationFailure,
+            failureStage: .graphProjection,
+            failureExitStatus: initial.exitStatus
         )
     }
 }
@@ -141,6 +223,9 @@ final class OpsStore: ObservableObject {
     @Published var showingStartSheet = false
     @Published var showingLeaseSheet = false
     @Published var showingServerLogs = false
+    @Published var repositoryDecommissionPrompt: RepositoryDecommissionPrompt?
+    @Published var resourceAttachPrompt: ResourceAttachPrompt?
+    @Published var resourceRetirementPrompt: ResourceRetirementPrompt?
     @Published var serverLogTitle = "Server Logs"
     @Published var serverLogText = ""
     @Published var serverLogMetadata = ""
@@ -168,12 +253,13 @@ final class OpsStore: ObservableObject {
     private let coordinatorService: any CoordinatorServing
     private let backupService: any BackupServing
     private let commandExecutor: any CommandExecuting
-    private let databaseDiscovery: any DatabaseDiscovering
     private let originDiscovery: any CoordinatorOriginDiscovering
+    private let usesNormalizedAccountStore: Bool
     private let configurationStore: any CoordinatorConfigurationPersisting
     private let clock: any Clock
     private var lastErrorSource: String?
     private var inventoryByOrigin: [String: Inventory] = [:]
+    private var normalizedCatalogByOrigin: [String: RepositoryCatalog] = [:]
     private var lastInventoryAttemptAt: Date?
     private var visibleSurfaces: Set<RefreshSurface> = []
     private var autoRefreshTask: Task<Void, Never>?
@@ -187,16 +273,20 @@ final class OpsStore: ObservableObject {
         coordinatorService: (any CoordinatorServing)? = nil,
         backupService: (any BackupServing)? = nil,
         commandExecutor: (any CommandExecuting)? = nil,
+        // Accepted for initializer source compatibility only. Normalized v2
+        // observations are authoritative; OpsStore never invokes this legacy
+        // per-container dependency (the service remains tested independently).
         databaseDiscovery: (any DatabaseDiscovering)? = nil,
-        originDiscovery: any CoordinatorOriginDiscovering = FileSystemCoordinatorOriginDiscovery(),
+        originDiscovery: any CoordinatorOriginDiscovering = AccountCoordinatorOriginDiscovery(),
         configurationStore: any CoordinatorConfigurationPersisting = PrivateCoordinatorConfigurationStore(),
         clock: any Clock = SystemClock(),
         skillLocator: any SkillLocating = PortableSkillLocator()
     ) {
         let executor = commandExecutor ?? SystemCommandExecutor()
         self.commandExecutor = executor
-        self.databaseDiscovery = databaseDiscovery ?? DockerPostgresDiscoveryService(executor: executor)
+        _ = databaseDiscovery
         self.originDiscovery = originDiscovery
+        usesNormalizedAccountStore = originDiscovery is AccountCoordinatorOriginDiscovery
         self.configurationStore = configurationStore
         self.coordinatorService = coordinatorService ?? LocatedCoordinatorService(executor: executor, locator: skillLocator)
         self.backupService = backupService ?? LocatedBackupService(executor: executor, locator: skillLocator)
@@ -361,9 +451,54 @@ final class OpsStore: ObservableObject {
     var resourceAttentionItems: [ResourceAttentionItem] {
         var items: [ResourceAttentionItem] = []
 
+        // A completed removal is normally absent from the active projection.
+        // If a later host observation proves one of its exact resources is
+        // running, that is a critical lifecycle invariant violation—not a new
+        // project and not an ordinary unassigned-resource suggestion.
+        for row in presentedServerRows {
+            let server = row.server
+            guard let attribution = server.attribution,
+                  attribution.lifecycleViolation,
+                  hasLoadedEvidence(primary: server.origin, observations: server.observationOrigins)
+            else { continue }
+            items.append(
+                ResourceAttentionItem(
+                    id: "start-fence-violation:server:\(row.id)",
+                    kind: .server,
+                    title: "\(server.name) is running after removal",
+                    reason: attribution.explanation,
+                    recommendedNextStep: attribution.recommendedNextStep
+                        ?? "Stop this exact server and resume its retained removal operation with the Coordinator skill.",
+                    reviewTarget: AttentionReviewTarget(kind: .server, selectionID: row.id)
+                )
+            )
+        }
+
+        var seenFenceViolationContainers = Set<String>()
+        for container in inventory.docker.containers {
+            let selectionID = container.containerSelectionID
+            guard let attribution = container.attribution,
+                  attribution.lifecycleViolation,
+                  seenFenceViolationContainers.insert(selectionID).inserted,
+                  hasLoadedEvidence(primary: container.origin, observations: container.observationOrigins)
+            else { continue }
+            items.append(
+                ResourceAttentionItem(
+                    id: "start-fence-violation:docker:\(selectionID)",
+                    kind: .docker,
+                    title: "\(container.name ?? "Docker container") is running after removal",
+                    reason: attribution.explanation,
+                    recommendedNextStep: attribution.recommendedNextStep
+                        ?? "Stop this exact container and resume its retained removal operation with the Coordinator skill.",
+                    reviewTarget: AttentionReviewTarget(kind: .docker, selectionID: selectionID)
+                )
+            )
+        }
+
         for row in presentedServerRows {
             let server = row.server
             guard server.resourceIdentity != nil,
+                  server.attribution?.lifecycleViolation != true,
                   serverRequiresAttention(server),
                   hasLoadedEvidence(primary: server.origin, observations: server.observationOrigins)
             else { continue }
@@ -401,6 +536,7 @@ final class OpsStore: ObservableObject {
             let selectionID = container.containerSelectionID
             guard seenDocker.insert(selectionID).inserted,
                   container.resourceIdentity != nil,
+                  container.attribution?.lifecycleViolation != true,
                   dockerRequiresAttention(container),
                   hasLoadedEvidence(primary: container.origin, observations: container.observationOrigins)
             else { continue }
@@ -420,7 +556,8 @@ final class OpsStore: ObservableObject {
 
         var seenConflicts = Set<String>()
         for repository in repositoryCatalog.repositories {
-            let projectGroupID = "path:\(repository.identity.canonicalRoot)"
+            let projectGroupID = repository.identity.repoID.map { "repo:\($0)" }
+                ?? "path:\(repository.identity.canonicalRoot)"
             let projectTarget = AttentionReviewTarget(kind: .project, selectionID: projectGroupID)
             for conflict in repository.serverConflicts
                 where seenConflicts.insert("server-endpoint:\(conflict.id)").inserted
@@ -516,6 +653,10 @@ final class OpsStore: ObservableObject {
         coordinatorConfiguration.refreshPolicy.mode == .interval
             ? coordinatorConfiguration.refreshPolicy.intervalSeconds
             : nil
+    }
+
+    var usesNormalizedAccountCoordinator: Bool {
+        usesNormalizedAccountStore
     }
 
     /// Blocking loading presentation is reserved for the first snapshot. A
@@ -762,7 +903,11 @@ final class OpsStore: ObservableObject {
         guard let origin = group.actionOrigin else {
             return .blocked(.invalidResource, "The repository does not have one proven coordinator control binding")
         }
-        let identity = ResourceIdentity(origin: origin, kind: .project, nativeID: projectPath)
+        let identity = ResourceIdentity(
+            origin: origin,
+            kind: .project,
+            nativeID: group.repositoryID ?? projectPath
+        )
         let knownReportRequiresDocker = projectRuntimeReports[group.id]?.requiresDockerRuntime == true
         return mutationAvailability(
             kind: kind,
@@ -855,7 +1000,9 @@ final class OpsStore: ObservableObject {
         case .refreshInventory,
              .startServer, .stopServer, .restartServer, .serverLogs,
              .leasePort, .releasePort,
-             .projectStatus, .projectStart, .projectStop, .projectRestart:
+             .projectStatus, .projectStart, .projectStop, .projectRestart,
+             .repositoryDecommissionPlan, .repositoryDecommission,
+             .attachResource, .retireStandaloneResource:
             return .coordinator
         }
     }
@@ -941,7 +1088,13 @@ final class OpsStore: ObservableObject {
     @discardableResult
     func saveCoordinatorConfiguration(_ configuration: CoordinatorConfiguration) -> Bool {
         do {
-            let validated = try configuration.validated()
+            var effectiveConfiguration = configuration
+            if usesNormalizedAccountStore {
+                // Legacy homes are imported once by the account coordinator;
+                // they are never independently polled Board sources.
+                effectiveConfiguration.sources = []
+            }
+            let validated = try effectiveConfiguration.validated()
             try configurationStore.save(validated)
             coordinatorConfiguration = validated
             restartAutoRefreshTask()
@@ -991,6 +1144,9 @@ final class OpsStore: ObservableObject {
     private func originsForRefresh() -> [CoordinatorOrigin] {
         var byHome: [String: CoordinatorOrigin] = [:]
         for origin in originDiscovery.origins() { byHome[origin.id] = origin }
+        if usesNormalizedAccountStore {
+            return byHome.values.sorted { $0.id < $1.id }
+        }
         for source in coordinatorConfiguration.sources {
             let origin = source.origin
             if source.enabled {
@@ -1063,6 +1219,10 @@ final class OpsStore: ObservableObject {
         if refreshingCapabilities != capabilityStates { capabilityStates = refreshingCapabilities }
         let projectScope = scopedProjectPath
         let arguments = boardInventoryArguments + (projectScope.map { ["--project", $0] } ?? [])
+        let observationMaxAgeSeconds: Double? = usesNormalizedAccountStore
+            ? (force ? 0 : (coordinatorConfiguration.refreshPolicy.intervalSeconds
+                ?? CoordinatorRefreshPolicy.defaultIntervalSeconds))
+            : nil
         let service = coordinatorService
         let outcomes = await withTaskGroup(
             of: OriginInventoryLoadOutcome.self,
@@ -1074,7 +1234,7 @@ final class OpsStore: ObservableObject {
                         index: index,
                         origin: origin,
                         arguments: arguments,
-                        shouldEnrichBackups: projectScope == nil,
+                        observationMaxAgeSeconds: observationMaxAgeSeconds,
                         coordinatorService: service
                     )
                 }
@@ -1088,19 +1248,22 @@ final class OpsStore: ObservableObject {
         var states: [CoordinatorSourceState] = []
         var capabilities: [CoordinatorCapabilityState] = []
         var sourceFailures: [String] = []
+        var observationFailures: [String] = []
         var capabilityFailures: [String] = []
         for outcome in outcomes {
             let origin = outcome.origin
+            if let stage = outcome.failureStage {
+                inventoryLogger.error(
+                    "Inventory source load failed pid=\(Int(Darwin.getpid()), privacy: .public) stage=\(stage.rawValue, privacy: .public) exit_status=\(outcome.failureExitStatus ?? -999, privacy: .public) observation_failed=\(outcome.observationFailure != nil, privacy: .public)"
+                )
+            }
             var decoded: Inventory?
             var databaseWarning: String?
             var sourceFailure: String?
             switch outcome.result {
-            case .success(let inventory, let enrichedBackups, let warning):
-                decoded = inventory
-                if let enrichedBackups {
-                    decoded?.backups = enrichedBackups
-                }
-                databaseWarning = warning
+            case .success(let projection):
+                decoded = projection.inventory
+                normalizedCatalogByOrigin[origin.id] = projection.catalog
             case .failure(let failure):
                 sourceFailure = failure
             }
@@ -1111,6 +1274,12 @@ final class OpsStore: ObservableObject {
                 let dockerWarning: String? = decoded.docker.available == false || dockerError?.isEmpty == false
                     ? "Docker inventory unavailable: \(dockerFailureReason)"
                     : nil
+                let databaseErrors = Array(
+                    Set(decoded.postgres.compactMap(\.databaseDiscoveryError))
+                ).sorted()
+                databaseWarning = databaseErrors.isEmpty
+                    ? nil
+                    : "Database observation unavailable: \(databaseErrors.joined(separator: "; "))"
                 if let dockerWarning {
                     let dependencyWarning = "Database capability unavailable because \(dockerWarning.lowercased())"
                     databaseWarning = [databaseWarning, dependencyWarning]
@@ -1162,11 +1331,19 @@ final class OpsStore: ObservableObject {
                 if let databaseWarning {
                     capabilityFailures.append("\(origin.label) (\(origin.home)) — Database: \(databaseWarning)")
                 }
+                if let observationFailure = outcome.observationFailure {
+                    observationFailures.append(
+                        "\(origin.label) (\(origin.home)): \(observationFailure)"
+                    )
+                }
             } else {
                 let retained = inventoryByOrigin[origin.id]
                 let phase: CoordinatorSourcePhase = retained == nil ? .failed : .stale
                 let resourceCount = retained.map { $0.servers.count + $0.leases.count + $0.docker.containers.count + $0.postgres.count } ?? 0
-                let failure = sourceFailure ?? "Coordinator inventory unavailable"
+                let inventoryFailure = sourceFailure ?? "Coordinator inventory unavailable"
+                let failure = outcome.observationFailure.map {
+                    "Inventory read failed: \(inventoryFailure). Live observation also failed: \($0)"
+                } ?? inventoryFailure
                 states.append(.init(origin: origin, phase: phase, checkedAt: clock.now(), resourceCount: resourceCount, error: failure))
                 capabilities.append(contentsOf: CoordinatorCapability.allCases.map {
                     CoordinatorCapabilityState(
@@ -1190,14 +1367,26 @@ final class OpsStore: ObservableObject {
         }
         let activeIDs = Set(origins.map(\.id))
         inventoryByOrigin = inventoryByOrigin.filter { activeIDs.contains($0.key) }
+        normalizedCatalogByOrigin = normalizedCatalogByOrigin.filter { activeIDs.contains($0.key) }
         let sourceInventories = origins.compactMap { origin -> RepositoryInventorySource? in
             guard let inventory = inventoryByOrigin[origin.id] else { return nil }
             return RepositoryInventorySource(origin: origin, inventory: inventory)
         }
-        let catalog = RepositoryCatalog.build(from: sourceInventories)
+        // Production has exactly one normalized per-account graph. Use its
+        // durable repo_id/membership/control-binding projection directly.
+        // The multi-origin branch exists only for injected migration fixtures;
+        // it still derives from v2 projections, never from v1 compatibility.
+        let catalog: RepositoryCatalog
+        if usesNormalizedAccountStore,
+           origins.count == 1,
+           let direct = normalizedCatalogByOrigin[origins[0].id]
+        {
+            catalog = direct
+        } else {
+            catalog = RepositoryCatalog.build(from: sourceInventories)
+        }
         var decoded = mergeInventories(sourceInventories.map(\.inventory))
         decoded.servers = deduplicatedManagedServers(decoded.servers)
-        decoded = await discoverDatabases(in: decoded)
         publishInventory(decoded, catalog: catalog)
         rebuildBackupRecords(from: decoded.backups)
         reconcileLeaseResults(now: clock.now())
@@ -1205,7 +1394,7 @@ final class OpsStore: ObservableObject {
         if let selectedDatabase {
             requestBackupVerification(for: selectedDatabase)
         }
-        if sourceFailures.isEmpty && capabilityFailures.isEmpty {
+        if sourceFailures.isEmpty && observationFailures.isEmpty && capabilityFailures.isEmpty {
             if let configurationWarning {
                 inventoryIssue = OpsIssue(
                     kind: .configuration,
@@ -1225,12 +1414,23 @@ final class OpsStore: ObservableObject {
                 if lastErrorSource == "inventory" || lastErrorSource == "configuration" { clearLegacyError() }
             }
         } else if !sourceFailures.isEmpty {
-            let details = ([configurationWarning] + sourceFailures.map(Optional.some) + capabilityFailures.map(Optional.some))
+            let details = ([configurationWarning] + sourceFailures.map(Optional.some) + observationFailures.map(Optional.some) + capabilityFailures.map(Optional.some))
                 .compactMap { $0 }
                 .joined(separator: "\n")
             setLastError(
                 title: "Inventory incomplete",
                 summary: "\(sourceFailures.count) coordinator source\(sourceFailures.count == 1 ? "" : "s") could not be refreshed",
+                details: details,
+                source: "inventory"
+            )
+        } else if !observationFailures.isEmpty {
+            let nextStep = "The Board loaded the last committed snapshot. Resolve the reported host observation error, then choose Refresh."
+            let details = ([configurationWarning] + observationFailures.map(Optional.some) + capabilityFailures.map(Optional.some) + [nextStep])
+                .compactMap { $0 }
+                .joined(separator: "\n")
+            setLastError(
+                title: "Live inventory refresh unavailable",
+                summary: "Showing the last committed inventory; live host observation failed",
                 details: details,
                 source: "inventory"
             )
@@ -1395,53 +1595,6 @@ final class OpsStore: ObservableObject {
         }
     }
 
-    private func discoverDatabases(in inventory: Inventory) async -> Inventory {
-        var result = inventory
-        var databases: [DockerContainer] = []
-        for container in inventory.postgres {
-            guard let origin = container.origin, container.ownershipError == nil else {
-                var unavailable = container
-                unavailable.databaseDiscoveryError = container.ownershipError ?? "coordinator ownership is unavailable"
-                databases.append(unavailable)
-                continue
-            }
-            guard container.isRunning else {
-                var unavailable = container
-                unavailable.databaseDiscoveryError = "container is not running"
-                databases.append(unavailable)
-                continue
-            }
-            guard let name = container.name, !name.isEmpty else {
-                var unavailable = container
-                unavailable.databaseDiscoveryError = "container identity is unavailable"
-                databases.append(unavailable)
-                continue
-            }
-            do {
-                let discovered = try await databaseDiscovery.discover(origin: origin, container: name, containerID: container.id)
-                if discovered.isEmpty {
-                    var unavailable = container
-                    unavailable.databaseDiscoveryError = "no connectable databases were returned"
-                    databases.append(unavailable)
-                } else {
-                    databases.append(contentsOf: discovered.map { database in
-                        var row = container
-                        row.database = database.identity.database
-                        row.databaseSizeBytes = database.sizeBytes
-                        row.databaseDiscoveryError = nil
-                        return row
-                    })
-                }
-            } catch {
-                var unavailable = container
-                unavailable.databaseDiscoveryError = error.localizedDescription
-                databases.append(unavailable)
-            }
-        }
-        result.postgres = databases
-        return result
-    }
-
     private func mergeInventories(_ inventories: [Inventory]) -> Inventory {
         guard var first = inventories.first else { return .empty }
         first.coordinatorHome = inventories.compactMap(\.coordinatorHome).joined(separator: ", ")
@@ -1512,6 +1665,26 @@ final class OpsStore: ObservableObject {
             container.id ?? "name:\(container.name ?? "unknown")"
         }
         return grouped.values.compactMap { bucket in
+            // Normalized inventory already carries the coordinator's explicit
+            // attribution decision. Do not erase its one account-scoped
+            // action route merely because legacy sidecar/Compose labels are
+            // absent; those labels are importer evidence, not the v2 owner.
+            let explicitlyAttributed = bucket.filter {
+                $0.origin != nil
+                    && $0.project?.isEmpty == false
+                    && $0.ownershipError == nil
+                    && $0.ownershipCandidates.count == 1
+            }
+            let explicitOrigins = Set(explicitlyAttributed.compactMap(\.origin))
+            if explicitOrigins.count == 1,
+               var selected = explicitlyAttributed.max(by: {
+                   dockerContainerRank($0) < dockerContainerRank($1)
+               })
+            {
+                selected.ownershipCandidates = Array(explicitOrigins)
+                selected.ownershipError = nil
+                return selected
+            }
             let sidecarOwners = Dictionary(
                 grouping: bucket.filter {
                     $0.metadataSource == "coordinator_sidecar" && $0.project?.isEmpty == false && $0.origin != nil
@@ -1778,6 +1951,457 @@ final class OpsStore: ObservableObject {
         runProjectRuntime("stop", group: group)
     }
 
+    func planRepositoryDecommission(_ group: ProjectGroup) {
+        guard group.isRepository,
+              let projectPath = group.projectPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !projectPath.isEmpty
+        else {
+            setLastError(
+                title: "Repository removal unavailable",
+                summary: "This selection is not a validated repository",
+                details: "Only one canonical local Git repository can be removed through this action.",
+                source: "action"
+            )
+            return
+        }
+        guard let origin = group.actionOrigin else {
+            setLastError(
+                title: "Repository removal unavailable",
+                summary: "No authoritative coordinator controls this repository",
+                details: "Resolve the repository's control binding before planning removal.",
+                source: "action"
+            )
+            return
+        }
+        let identity = ResourceIdentity(origin: origin, kind: .project, nativeID: projectPath)
+        guard requireMutationAvailability(
+            title: "Plan removal of \(group.name)",
+            kind: .repositoryDecommissionPlan,
+            origin: origin,
+            resource: identity,
+            projectPath: projectPath
+        ) else { return }
+        let request = beginAction(
+            kind: .repositoryDecommissionPlan,
+            title: "Plan removal of \(group.name)",
+            origin: origin,
+            resource: identity,
+            projectPath: projectPath
+        )
+        Task {
+            markActionRunning(request.id)
+            let arguments = [
+                "repository", "plan-remove",
+                "--project", projectPath,
+                "--agent", agentID,
+                "--reason", "Removed from DevOps Board",
+            ]
+            do {
+                let result = try await coordinatorService.execute(origin: origin, arguments: arguments)
+                guard result.exitStatus == 0 else {
+                    failAction(request.id, execution: result, failure: commandFailureMessage(result))
+                    setCommandFailure(
+                        title: "Plan removal of \(group.name)",
+                        command: ["python3", "<coordinator>"] + arguments,
+                        result: result,
+                        actionID: request.id
+                    )
+                    return
+                }
+                let plan = try JSONDecoder().decode(
+                    RepositoryDecommissionPlan.self,
+                    from: Data(result.stdout.utf8)
+                )
+                guard plan.kind == "repository_decommission",
+                      group.repositoryID == nil || plan.repoID == group.repositoryID,
+                      plan.canonicalRoot == nil
+                        || URL(fileURLWithPath: plan.canonicalRoot!).standardizedFileURL.path
+                            == URL(fileURLWithPath: projectPath).standardizedFileURL.path
+                else {
+                    throw RuntimeError("Coordinator returned a removal plan for a different repository")
+                }
+                repositoryDecommissionPrompt = RepositoryDecommissionPrompt(
+                    plan: plan,
+                    origin: origin,
+                    projectPath: projectPath,
+                    repositoryID: group.repositoryID
+                )
+                finishAction(request.id, execution: result)
+                clearActionErrorIfPresent(actionID: request.id)
+            } catch {
+                failAction(request.id, error: error)
+                setLastError(
+                    title: "Removal plan unavailable",
+                    summary: error.localizedDescription,
+                    details: commandFailureDetails(
+                        title: "Plan removal of \(group.name)",
+                        command: ["python3", "<coordinator>"] + arguments,
+                        result: nil,
+                        thrownError: error
+                    ),
+                    source: "action",
+                    actionID: request.id
+                )
+            }
+        }
+    }
+
+    func cancelRepositoryDecommission() {
+        repositoryDecommissionPrompt = nil
+    }
+
+    func applyRepositoryDecommission(_ prompt: RepositoryDecommissionPrompt) {
+        let identity = ResourceIdentity(
+            origin: prompt.origin,
+            kind: .project,
+            nativeID: prompt.repositoryID ?? prompt.projectPath
+        )
+        guard requireMutationAvailability(
+            title: "Remove \(prompt.plan.displayName ?? prompt.projectPath)",
+            kind: .repositoryDecommission,
+            origin: prompt.origin,
+            resource: identity,
+            projectPath: prompt.projectPath
+        ) else { return }
+        let request = beginAction(
+            kind: .repositoryDecommission,
+            title: "Remove \(prompt.plan.displayName ?? prompt.projectPath)",
+            origin: prompt.origin,
+            resource: identity,
+            projectPath: prompt.projectPath
+        )
+        Task {
+            markActionRunning(request.id)
+            let arguments = [
+                "repository", "remove",
+                "--project", prompt.projectPath,
+                "--agent", agentID,
+                "--plan-id", prompt.plan.planID,
+                "--plan-fingerprint", prompt.plan.fingerprint,
+            ]
+            do {
+                let execution = try await coordinatorService.execute(
+                    origin: prompt.origin,
+                    arguments: arguments
+                )
+                guard execution.exitStatus == 0 else {
+                    failAction(request.id, execution: execution, failure: commandFailureMessage(execution))
+                    setCommandFailure(
+                        title: "Remove \(prompt.plan.displayName ?? prompt.projectPath)",
+                        command: ["python3", "<coordinator>"] + arguments,
+                        result: execution,
+                        actionID: request.id
+                    )
+                    return
+                }
+                let result = try JSONDecoder().decode(
+                    RepositoryLifecycleResult.self,
+                    from: Data(execution.stdout.utf8)
+                )
+                guard result.status == "succeeded" || result.status == "already_complete" else {
+                    let failures = result.errors.map(\.message)
+                        + result.targets.compactMap { $0.error?.message }
+                    throw RuntimeError(
+                        failures.isEmpty
+                            ? "Repository removal needs attention"
+                            : failures.joined(separator: "\n")
+                    )
+                }
+                guard prompt.repositoryID == nil || result.repoID == prompt.repositoryID else {
+                    throw RuntimeError("Coordinator returned a removal result for a different repository")
+                }
+                guard result.hidden, !result.started else {
+                    throw RuntimeError(
+                        "Coordinator did not prove the repository hidden and stopped after removal"
+                    )
+                }
+                repositoryDecommissionPrompt = nil
+                finishAction(request.id, execution: execution)
+                clearActionErrorIfPresent(actionID: request.id)
+                await loadInventory(force: true)
+            } catch {
+                failAction(request.id, error: error)
+                setLastError(
+                    title: "Repository removal needs attention",
+                    summary: error.localizedDescription,
+                    details: "The coordinator keeps the start fence after a partial removal. Review the retained per-target action result, then retry the same removal safely.",
+                    source: "action",
+                    actionID: request.id
+                )
+                await loadInventory(force: true)
+            }
+        }
+    }
+
+    var attachableRepositoryGroups: [ProjectGroup] {
+        projectGroups
+            .filter { group in
+                group.isRepository
+                    && group.projectPath?.isEmpty == false
+                    && group.actionOrigin != nil
+                    && !group.projectActionsBlocked
+            }
+            .sorted { ($0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending) }
+    }
+
+    func prepareResourceAttach(_ target: ExactUnassignedResource) {
+        guard !attachableRepositoryGroups.isEmpty else {
+            setLastError(
+                title: "Resource attachment unavailable",
+                summary: "No installed repository is ready to receive this resource",
+                details: "Install the destination repository with the Coordinator skill, refresh inventory, then explicitly attach this exact resource.",
+                source: "action"
+            )
+            return
+        }
+        resourceAttachPrompt = ResourceAttachPrompt(target: target)
+    }
+
+    func cancelResourceAttach() {
+        resourceAttachPrompt = nil
+    }
+
+    func attachResource(_ prompt: ResourceAttachPrompt, to group: ProjectGroup) {
+        guard let projectPath = group.projectPath,
+              let actionOrigin = group.actionOrigin,
+              actionOrigin.id == prompt.target.origin.id
+        else {
+            setLastError(
+                title: "Resource attachment unavailable",
+                summary: "The destination repository has no matching authoritative controller",
+                details: "Choose an installed repository controlled by the same normalized coordinator source.",
+                source: "action"
+            )
+            return
+        }
+        let identity = resourceIdentity(for: prompt.target)
+        guard requireMutationAvailability(
+            title: "Attach \(prompt.target.displayName)",
+            kind: .attachResource,
+            origin: prompt.target.origin,
+            resource: identity,
+            projectPath: projectPath
+        ) else { return }
+        let request = beginAction(
+            kind: .attachResource,
+            title: "Attach \(prompt.target.displayName) to \(group.name)",
+            origin: prompt.target.origin,
+            resource: identity,
+            projectPath: projectPath
+        )
+        Task {
+            markActionRunning(request.id)
+            let arguments = ["resource", "attach"]
+                + prompt.target.identityArguments
+                + [
+                    "--project", projectPath,
+                    "--agent", agentID,
+                    "--reason", "Attached from DevOps Board",
+                ]
+            do {
+                let execution = try await coordinatorService.execute(
+                    origin: prompt.target.origin,
+                    arguments: arguments
+                )
+                guard execution.exitStatus == 0 else {
+                    failAction(request.id, execution: execution, failure: commandFailureMessage(execution))
+                    setCommandFailure(
+                        title: "Attach \(prompt.target.displayName)",
+                        command: ["python3", "<coordinator>"] + arguments,
+                        result: execution,
+                        actionID: request.id
+                    )
+                    await loadInventory(force: true)
+                    return
+                }
+                let result = try JSONDecoder().decode(
+                    ResourceAttachResult.self,
+                    from: Data(execution.stdout.utf8)
+                )
+                guard result.attached,
+                      !result.started,
+                      result.resourceID == prompt.target.hostResourceID,
+                      group.repositoryID == nil || result.repoID == group.repositoryID
+                else {
+                    throw RuntimeError("Coordinator did not prove this exact resource attached without starting it")
+                }
+                resourceAttachPrompt = nil
+                finishAction(request.id, execution: execution)
+                clearActionErrorIfPresent(actionID: request.id)
+                await loadInventory(force: true)
+            } catch {
+                failAction(request.id, error: error)
+                setLastError(
+                    title: "Resource attachment failed",
+                    summary: error.localizedDescription,
+                    details: "The resource remains unassigned unless the refreshed coordinator inventory proves the exact attachment.",
+                    source: "action",
+                    actionID: request.id
+                )
+                await loadInventory(force: true)
+            }
+        }
+    }
+
+    func planResourceRetirement(_ target: ExactUnassignedResource) {
+        let identity = resourceIdentity(for: target)
+        guard requireMutationAvailability(
+            title: "Plan retirement of \(target.displayName)",
+            kind: .retireStandaloneResource,
+            origin: target.origin,
+            resource: identity
+        ) else { return }
+        let request = beginAction(
+            kind: .retireStandaloneResource,
+            title: "Plan retirement of \(target.displayName)",
+            origin: target.origin,
+            resource: identity
+        )
+        Task {
+            markActionRunning(request.id)
+            do {
+                guard let requestProject = try await coordinatorService.requestProjectRoot() else {
+                    throw RuntimeError("Coordinator request-project provenance is unavailable")
+                }
+                let arguments = ["resource", "plan-retire"]
+                    + target.identityArguments
+                    + [
+                        "--request-project", requestProject,
+                        "--agent", agentID,
+                        "--reason", "Retired from DevOps Board",
+                    ]
+                let execution = try await coordinatorService.execute(
+                    origin: target.origin,
+                    arguments: arguments
+                )
+                guard execution.exitStatus == 0 else {
+                    failAction(request.id, execution: execution, failure: commandFailureMessage(execution))
+                    setCommandFailure(
+                        title: "Plan retirement of \(target.displayName)",
+                        command: ["python3", "<coordinator>"] + arguments,
+                        result: execution,
+                        actionID: request.id
+                    )
+                    return
+                }
+                let plan = try JSONDecoder().decode(
+                    StandaloneRetirementPlan.self,
+                    from: Data(execution.stdout.utf8)
+                )
+                guard plan.kind == "standalone_resource_retirement",
+                      plan.resourceID == target.hostResourceID,
+                      plan.targets.count == 1,
+                      plan.targets[0].hostResourceID == target.hostResourceID
+                else {
+                    throw RuntimeError("Coordinator returned a retirement plan for a different resource")
+                }
+                resourceRetirementPrompt = ResourceRetirementPrompt(
+                    target: target,
+                    plan: plan,
+                    requestProject: requestProject
+                )
+                finishAction(request.id, execution: execution)
+                clearActionErrorIfPresent(actionID: request.id)
+            } catch {
+                failAction(request.id, error: error)
+                setLastError(
+                    title: "Resource retirement plan unavailable",
+                    summary: error.localizedDescription,
+                    details: "No resource was changed. Refresh the exact host observation and try again.",
+                    source: "action",
+                    actionID: request.id
+                )
+            }
+        }
+    }
+
+    func cancelResourceRetirement() {
+        resourceRetirementPrompt = nil
+    }
+
+    func applyResourceRetirement(_ prompt: ResourceRetirementPrompt) {
+        let identity = resourceIdentity(for: prompt.target)
+        guard requireMutationAvailability(
+            title: "Retire \(prompt.target.displayName)",
+            kind: .retireStandaloneResource,
+            origin: prompt.target.origin,
+            resource: identity
+        ) else { return }
+        let request = beginAction(
+            kind: .retireStandaloneResource,
+            title: "Retire \(prompt.target.displayName)",
+            origin: prompt.target.origin,
+            resource: identity
+        )
+        Task {
+            markActionRunning(request.id)
+            let arguments = ["resource", "retire"]
+                + prompt.target.identityArguments
+                + [
+                    "--request-project", prompt.requestProject,
+                    "--agent", agentID,
+                    "--plan-id", prompt.plan.planID,
+                    "--plan-fingerprint", prompt.plan.fingerprint,
+                ]
+            do {
+                let execution = try await coordinatorService.execute(
+                    origin: prompt.target.origin,
+                    arguments: arguments
+                )
+                guard execution.exitStatus == 0 else {
+                    failAction(request.id, execution: execution, failure: commandFailureMessage(execution))
+                    setCommandFailure(
+                        title: "Retire \(prompt.target.displayName)",
+                        command: ["python3", "<coordinator>"] + arguments,
+                        result: execution,
+                        actionID: request.id
+                    )
+                    await loadInventory(force: true)
+                    return
+                }
+                let result = try JSONDecoder().decode(
+                    RepositoryLifecycleResult.self,
+                    from: Data(execution.stdout.utf8)
+                )
+                guard result.resourceID == prompt.target.hostResourceID,
+                      (result.status == "succeeded" || result.status == "already_complete"),
+                      result.hidden,
+                      !result.started
+                else {
+                    let failures = result.errors.map(\.message)
+                        + result.targets.compactMap { $0.error?.message }
+                    throw RuntimeError(
+                        failures.isEmpty
+                            ? "Coordinator did not prove this exact resource retired and hidden"
+                            : failures.joined(separator: "\n")
+                    )
+                }
+                resourceRetirementPrompt = nil
+                finishAction(request.id, execution: execution)
+                clearActionErrorIfPresent(actionID: request.id)
+                await loadInventory(force: true)
+            } catch {
+                failAction(request.id, error: error)
+                setLastError(
+                    title: "Resource retirement needs attention",
+                    summary: error.localizedDescription,
+                    details: "The coordinator keeps the retirement fence after partial work. Review the retained exact-target evidence before retrying.",
+                    source: "action",
+                    actionID: request.id
+                )
+                await loadInventory(force: true)
+            }
+        }
+    }
+
+    private func resourceIdentity(for target: ExactUnassignedResource) -> ResourceIdentity {
+        ResourceIdentity(
+            origin: target.origin,
+            kind: target.kind == "server" ? .server : .docker,
+            nativeID: target.hostResourceID
+        )
+    }
+
     func selectServer(_ server: ManagedServer) {
         activeTab = .servers
         let selectionID = serverSelectionID(for: server)
@@ -1817,10 +2441,15 @@ final class OpsStore: ObservableObject {
             guard let record = backup.manifestRecord(),
                   record.identity.isSameImmutableDatabase(as: identity)
             else { return nil }
+            guard backup.normalizedBackupID == nil || record.isStronglyVerified else { return nil }
             return (backup, record)
         }
         guard let candidate = candidates.max(by: { $0.record.createdAt < $1.record.createdAt }) else { return }
         let key = candidate.backup.verificationCacheKey
+        if candidate.record.isStronglyVerified {
+            verifiedBackupsByKey[key] = candidate.record
+            return
+        }
         if verifiedBackupsByKey[key] != nil || backupVerificationTasks[key] != nil { return }
 
         backupVerificationInProgress.insert(identity.id)
@@ -2058,25 +2687,47 @@ final class OpsStore: ObservableObject {
         }
     }
 
+    private func currentAuthoritativeDatabase(matching identity: DatabaseIdentity) -> DockerContainer? {
+        let matches = inventory.postgres.filter { database in
+            guard database.ownershipError == nil,
+                  let currentIdentity = database.databaseIdentity
+            else { return false }
+            return currentIdentity.isSameImmutableDatabase(as: identity)
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
     func backupDatabase(container: DockerContainer?) {
         guard let container,
-              let origin = container.origin,
-              let identity = container.databaseIdentity,
+              container.ownershipError == nil,
+              let requestedIdentity = container.databaseIdentity
+        else {
+            setLastError(
+                title: "Backup database refused",
+                summary: "The selected database does not have authoritative coordinator control",
+                details: "Refresh inventory and resolve the repository ownership or control binding before backup.",
+                source: "action"
+            )
+            return
+        }
+        guard let current = currentAuthoritativeDatabase(matching: requestedIdentity),
+              let origin = current.origin,
+              let identity = current.databaseIdentity,
               let containerID = identity.containerID,
-              let project = container.project,
+              let project = current.project,
               !project.isEmpty
         else {
             setLastError(
-                title: "Backup database failed",
-                summary: "Select an exact discovered database with a known project and coordinator source",
-                details: "A container alone is not a database identity. Refresh discovery and choose a concrete database before backup.",
+                title: "Backup database refused",
+                summary: "The current inventory no longer proves one exact controlled database",
+                details: "Refresh inventory and retry only after the exact repository membership and control binding are authoritative.",
                 source: "action"
             )
             return
         }
         let args = [
             "backup",
-            "--out-dir", "\(project)/.codex-db-backups",
             "--container", identity.container,
             "--database", identity.database,
             "--expect-container-id", containerID,
@@ -2089,6 +2740,7 @@ final class OpsStore: ObservableObject {
             container: identity.container,
             containerID: containerID,
             database: identity.database,
+            projectRoot: project,
             arguments: args
         )
     }
@@ -2134,6 +2786,18 @@ final class OpsStore: ObservableObject {
             )
             return
         }
+        guard let current = currentAuthoritativeDatabase(matching: target),
+              let projectRoot = current.project,
+              !projectRoot.isEmpty
+        else {
+            setLastError(
+                title: "Restore refused",
+                summary: "The current inventory does not prove one exact controlled database target",
+                details: "Refresh inventory and resolve the repository ownership or control binding before restoring.",
+                source: "action"
+            )
+            return
+        }
         let resource = ResourceIdentity(
             origin: target.origin,
             kind: .database,
@@ -2146,33 +2810,71 @@ final class OpsStore: ObservableObject {
             resource: resource
         ) else { return }
         let request = beginAction(kind: .restoreDatabase, title: "Restore \(target.database)", resource: resource)
-        let safetyDirectory = URL(fileURLWithPath: backup.path)
-            .deletingLastPathComponent()
-            .appendingPathComponent("pre-restore", isDirectory: true)
-            .path
-        let arguments = [
-            "restore",
-            "--container", target.container,
-            "--database", target.database,
-            "--file", backup.path,
-            "--expect-container-id", targetContainerID,
-            "--confirm-restore",
-            "--safety-out-dir", safetyDirectory,
-        ]
         Task {
             markActionRunning(request.id)
             var retainedExecution: CommandExecution?
             do {
-                let execution = try await backupService.execute(origin: target.origin, arguments: arguments)
+                let authority = try await backupService.executionAuthority(
+                    origin: target.origin,
+                    projectRoot: projectRoot
+                )
+                let arguments: [String]
+                switch authority {
+                case .broker:
+                    guard let databaseBackupID = backup.normalizedBackupID,
+                          !databaseBackupID.isEmpty,
+                          backup.databaseBindingID != nil,
+                          backup.dockerResourceID != nil
+                    else {
+                        throw RuntimeError(
+                            "Broker restore requires one strongly verified normalized backup registry identity"
+                        )
+                    }
+                    arguments = [
+                        "restore",
+                        "--container", target.container,
+                        "--database", target.database,
+                        "--database-backup-id", databaseBackupID,
+                        "--expect-container-id", targetContainerID,
+                        "--confirm-restore",
+                    ]
+                case .direct:
+                    let safetyDirectory = URL(fileURLWithPath: backup.path)
+                        .deletingLastPathComponent()
+                        .appendingPathComponent("pre-restore", isDirectory: true)
+                        .path
+                    arguments = [
+                        "restore",
+                        "--container", target.container,
+                        "--database", target.database,
+                        "--file", backup.path,
+                        "--expect-container-id", targetContainerID,
+                        "--confirm-restore",
+                        "--safety-out-dir", safetyDirectory,
+                    ]
+                }
+                let execution = try await backupService.execute(
+                    origin: target.origin,
+                    projectRoot: projectRoot,
+                    arguments: arguments
+                )
                 retainedExecution = execution
                 if execution.exitStatus == 0 {
-                    let evidence = try validatedRestoreEvidence(
-                        execution: execution,
-                        target: target,
-                        backup: backup,
-                        actionID: request.id
-                    )
-                    restoreEvidence[target] = evidence
+                    if authority == .broker {
+                        try validateBrokerRestoreResult(
+                            execution: execution,
+                            target: target,
+                            backup: backup
+                        )
+                    } else {
+                        let evidence = try validatedRestoreEvidence(
+                            execution: execution,
+                            target: target,
+                            backup: backup,
+                            actionID: request.id
+                        )
+                        restoreEvidence[target] = evidence
+                    }
                     finishAction(request.id, execution: execution)
                     clearActionErrorIfPresent(actionID: request.id)
                     await loadInventory(force: true)
@@ -2195,6 +2897,30 @@ final class OpsStore: ObservableObject {
                     actionID: request.id
                 )
             }
+        }
+    }
+
+    private func validateBrokerRestoreResult(
+        execution: CommandExecution,
+        target: DatabaseIdentity,
+        backup: BackupRecord
+    ) throws {
+        let payload = try JSONDecoder().decode(
+            BrokerRestoreCommandPayload.self,
+            from: Data(execution.stdout.utf8)
+        )
+        guard payload.databaseBackupID == backup.normalizedBackupID,
+              payload.databaseBindingID == backup.databaseBindingID,
+              payload.dockerResourceID == backup.dockerResourceID,
+              payload.databaseName == target.database,
+              payload.transactional == true,
+              payload.status == "restored",
+              !(payload.restoreEventID ?? "").isEmpty,
+              !(payload.safetyDatabaseBackupID ?? "").isEmpty
+        else {
+            throw RuntimeError(
+                "Broker restore result did not prove the exact normalized database, backup, and transactional safety backup"
+            )
         }
     }
 
@@ -2849,6 +3575,7 @@ final class OpsStore: ObservableObject {
         container: String,
         containerID: String,
         database: String,
+        projectRoot: String,
         arguments: [String]
     ) {
         guard requireMutationAvailability(title: title, kind: .backupDatabase, origin: origin, resource: resource) else { return }
@@ -2857,7 +3584,15 @@ final class OpsStore: ObservableObject {
             markActionRunning(request.id)
             var retainedExecution: CommandExecution?
             do {
-                let backup = try await backupService.execute(origin: origin, arguments: arguments)
+                let authority = try await backupService.executionAuthority(
+                    origin: origin,
+                    projectRoot: projectRoot
+                )
+                let backup = try await backupService.execute(
+                    origin: origin,
+                    projectRoot: projectRoot,
+                    arguments: arguments
+                )
                 retainedExecution = backup
                 guard backup.exitStatus == 0 else {
                     failAction(request.id, execution: backup, failure: commandFailureMessage(backup))
@@ -2869,6 +3604,27 @@ final class OpsStore: ObservableObject {
                     )
                     return
                 }
+                if authority == .broker {
+                    let payload = try JSONDecoder().decode(
+                        BrokerBackupCommandPayload.self,
+                        from: Data(backup.stdout.utf8)
+                    )
+                    guard !(payload.databaseBackupID ?? "").isEmpty,
+                          !(payload.databaseBindingID ?? "").isEmpty,
+                          !(payload.dockerResourceID ?? "").isEmpty,
+                          payload.databaseName == database,
+                          payload.verificationStatus == "strong",
+                          payload.status == "available"
+                    else {
+                        throw RuntimeError(
+                            "Broker backup result did not prove one strongly verified normalized backup for the exact database"
+                        )
+                    }
+                    finishAction(request.id, execution: backup)
+                    clearActionErrorIfPresent(actionID: request.id)
+                    await loadInventory(force: true)
+                    return
+                }
                 let payload = try JSONDecoder().decode(BackupCommandPayload.self, from: Data(backup.stdout.utf8))
                 let verifyArguments = [
                     "verify",
@@ -2878,7 +3634,11 @@ final class OpsStore: ObservableObject {
                     "--expect-container-id", containerID,
                     "--test-restore",
                 ]
-                let verification = try await backupService.execute(origin: origin, arguments: verifyArguments)
+                let verification = try await backupService.execute(
+                    origin: origin,
+                    projectRoot: projectRoot,
+                    arguments: verifyArguments
+                )
                 let combined = CommandExecution(
                     stdout: backup.stdout + "\n" + verification.stdout,
                     stderr: [backup.stderr, verification.stderr].filter { !$0.isEmpty }.joined(separator: "\n"),
@@ -3660,15 +4420,37 @@ struct LocatedCoordinatorService: CoordinatorServing, Sendable {
         let service = PythonCoordinatorService(executor: executor, scriptPath: try locator.scriptPath(for: .coordinator))
         return try await service.execute(origin: origin, arguments: arguments)
     }
+
+    func observe(origin: CoordinatorOrigin, maxAgeSeconds: Double) async throws -> CommandExecution? {
+        let service = PythonCoordinatorService(executor: executor, scriptPath: try locator.scriptPath(for: .coordinator))
+        return try await service.observe(origin: origin, maxAgeSeconds: maxAgeSeconds)
+    }
+
+    func requestProjectRoot() async throws -> String? {
+        let service = PythonCoordinatorService(executor: executor, scriptPath: try locator.scriptPath(for: .coordinator))
+        return try await service.requestProjectRoot()
+    }
 }
 
 struct LocatedBackupService: BackupServing, Sendable {
     let executor: any CommandExecuting
     let locator: any SkillLocating
 
-    func execute(origin: CoordinatorOrigin?, arguments: [String]) async throws -> CommandExecution {
+    func executionAuthority(
+        origin: CoordinatorOrigin?,
+        projectRoot: String
+    ) async throws -> BackupExecutionAuthority {
         let service = PythonBackupService(executor: executor, scriptPath: try locator.scriptPath(for: .postgresBackup))
-        return try await service.execute(origin: origin, arguments: arguments)
+        return try await service.executionAuthority(origin: origin, projectRoot: projectRoot)
+    }
+
+    func execute(
+        origin: CoordinatorOrigin?,
+        projectRoot: String,
+        arguments: [String]
+    ) async throws -> CommandExecution {
+        let service = PythonBackupService(executor: executor, scriptPath: try locator.scriptPath(for: .postgresBackup))
+        return try await service.execute(origin: origin, projectRoot: projectRoot, arguments: arguments)
     }
 }
 
@@ -3682,4 +4464,43 @@ struct BackupCommandPayload: Decodable, Sendable {
     let backup: String
     let manifest: String?
     let sha256: String?
+}
+
+struct BrokerBackupCommandPayload: Decodable, Sendable {
+    let databaseBackupID: String?
+    let databaseBindingID: String?
+    let dockerResourceID: String?
+    let databaseName: String?
+    let verificationStatus: String?
+    let status: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case databaseBackupID = "database_backup_id"
+        case databaseBindingID = "database_binding_id"
+        case dockerResourceID = "docker_resource_id"
+        case databaseName = "database_name"
+        case verificationStatus = "verification_status"
+    }
+}
+
+struct BrokerRestoreCommandPayload: Decodable, Sendable {
+    let restoreEventID: String?
+    let databaseBackupID: String?
+    let safetyDatabaseBackupID: String?
+    let databaseBindingID: String?
+    let dockerResourceID: String?
+    let databaseName: String?
+    let transactional: Bool?
+    let status: String?
+
+    enum CodingKeys: String, CodingKey {
+        case transactional, status
+        case restoreEventID = "restore_event_id"
+        case databaseBackupID = "database_backup_id"
+        case safetyDatabaseBackupID = "safety_database_backup_id"
+        case databaseBindingID = "database_binding_id"
+        case dockerResourceID = "docker_resource_id"
+        case databaseName = "database_name"
+    }
 }

@@ -392,7 +392,12 @@ def main() -> int:
     check(not verifier.process_state_is_alive("Z+"), "zombie process state was treated as alive")
     check(not verifier.process_state_is_alive("  "), "empty process state was treated as alive")
     with tempfile.TemporaryDirectory(prefix="devops-board-launch-readiness-") as raw_temp:
-        temp = Path(raw_temp)
+        # This fixture owns the temporary root. Canonicalize it before deriving
+        # identity paths so macOS's platform-managed /var -> /private/var alias
+        # cannot make normalized production paths disagree with lexical fixture
+        # expectations. Operator-provided paths remain subject to their normal
+        # production symlink policy; only this test-created root is resolved.
+        temp = Path(raw_temp).resolve(strict=True)
 
         account_home = temp / "account-home"
         canonical_source = account_home / ".codex/agent-coordinator"
@@ -416,21 +421,10 @@ def main() -> int:
         absent_home = temp / "account-without-coordinator"
         absent_home.mkdir()
         check(
-            verifier.expected_automatic_source_fingerprint(account_home=absent_home, environment={}) is None,
-            "absent automatic source incorrectly became a launch requirement",
+            verifier.expected_automatic_source_fingerprint(account_home=absent_home, environment={})
+            == verifier.source_fingerprint(absent_home / ".codex/agent-coordinator"),
+            "the deterministic account-store source disappeared before first initialization",
         )
-        try:
-            verifier.expected_automatic_source_fingerprint(
-                account_home=account_home,
-                environment={},
-                entry_exists=lambda _path: (_ for _ in ()).throw(PermissionError("fixture denied")),
-            )
-        except PermissionError:
-            # An injected observer is already outside the production
-            # sanitizer; separately exercise that sanitizer below.
-            pass
-        else:
-            raise AssertionError("unobservable automatic source was collapsed to absent")
         original_stat = verifier.os.stat
 
         def denied_stat(_path: object) -> object:
@@ -450,9 +444,10 @@ def main() -> int:
         finally:
             verifier.os.stat = original_stat
 
-        # Must-catch: all auto-discovery channels used by the product are
-        # required, including two Parall-hosted Codex instances. Lexical aliases
-        # of one physical source are deduplicated by canonical path.
+        # Must-catch: legacy Codex/Claude/Parall state homes are importer inputs,
+        # not independent Board authorities. Polling all four recreates duplicate
+        # projects and duplicate Docker sampling. An explicit configured alias is
+        # still canonicalized to the one selected account store.
         multi_home = temp / "multi-instance-account"
         multi_sources = (
             multi_home / ".codex/agent-coordinator",
@@ -471,20 +466,19 @@ def main() -> int:
         alias.symlink_to(multi_sources[0], target_is_directory=True)
         discovered = verifier.automatic_source_paths(
             account_home=multi_home,
-            environment={"CODEX_AGENT_COORDINATOR_HOME": str(alias)},
+            environment={},
         )
         check(
-            discovered == multi_sources,
-            f"multi-instance automatic discovery was incomplete or not canonical: {discovered!r}",
+            discovered == (multi_sources[0],),
+            f"legacy instance homes leaked into the active account-store set: {discovered!r}",
         )
-        multi_fingerprints = tuple(sorted(verifier.source_fingerprint(path) for path in multi_sources))
         check(
-            verifier.expected_automatic_source_fingerprints(
+            verifier.automatic_source_paths(
                 account_home=multi_home,
                 environment={"CODEX_AGENT_COORDINATOR_HOME": str(alias)},
             )
-            == multi_fingerprints,
-            "automatic source evidence did not cover both Codex instances and both account channels",
+            == (multi_sources[0],),
+            "configured account-store alias was not canonicalized to one physical source",
         )
 
         fake_coordinator = temp / "fixture-coordinator.py"
@@ -497,21 +491,116 @@ def main() -> int:
             from pathlib import Path
 
             home = Path(os.environ["CODEX_AGENT_COORDINATOR_HOME"])
-            count = json.loads((home / "state.json").read_text())["fixture_server_count"]
-            print(json.dumps({"coordinator_home": str(home), "servers": [{}] * count}))
+            state = json.loads((home / "state.json").read_text())
+            count = state["fixture_server_count"]
+            unassigned_count = state.get("fixture_unassigned_server_count", 0)
+            payload = {"coordinator_home": str(home), "servers": [{}] * count}
+            if unassigned_count:
+                unassigned = [
+                    {
+                        "resource_kind": "server",
+                        "resource_id": f"unassigned-{index}",
+                        "reason_code": "missing_repo",
+                    }
+                    for index in range(unassigned_count)
+                ]
+                payload.update(
+                    {
+                        "schema_version": 2,
+                        "resources": {
+                            "servers": [
+                                {"server_definition_id": f"server-{index}"}
+                                for index in range(count)
+                            ]
+                        },
+                        "unassigned_resources": unassigned,
+                        # The normalized API may repeat the same incident in
+                        # both collections; the Board presents it only once.
+                        "lifecycle_violations": unassigned,
+                    }
+                )
+            print(json.dumps(payload))
             """,
         )
         measured_inventory = verifier.collect_expected_source_inventory(
             coordinator_script=fake_coordinator,
-            source_paths=multi_sources,
+            source_paths=discovered,
         )
         expected_count_by_fingerprint = {
             verifier.source_fingerprint(path): count
-            for path, count in zip(multi_sources, source_counts)
+            for path, count in zip(discovered, source_counts)
         }
         check(
             dict(measured_inventory) == expected_count_by_fingerprint,
             "packaged-helper preflight did not bind each source to its real server count",
+        )
+        (multi_sources[0] / "state.json").write_text(
+            '{"fixture_server_count":18,"fixture_unassigned_server_count":1}\n',
+            encoding="utf-8",
+        )
+        normalized_with_unassigned = verifier.collect_expected_source_inventory(
+            coordinator_script=fake_coordinator,
+            source_paths=discovered,
+        )
+        check(
+            dict(normalized_with_unassigned) == {verifier.source_fingerprint(discovered[0]): 19},
+            "packaged-helper preflight did not count the normalized unassigned server shown by the Board",
+        )
+        normalized_fingerprint = verifier.source_fingerprint(discovered[0])
+        normalized_inventory_argument = verifier.format_expected_source_inventory(
+            normalized_with_unassigned
+        )
+        normalized_unassigned_ready = temp / "normalized-unassigned-ready.log"
+        normalized_unassigned_ready.write_text(
+            unified_line(
+                4088,
+                "completed",
+                1,
+                1,
+                sources=(normalized_fingerprint,),
+                server_counts=((normalized_fingerprint, 19),),
+                managed=19,
+                visible=19,
+                repositories=9,
+                unassigned_groups=1,
+            ),
+            encoding="utf-8",
+        )
+        check(
+            run_wait(
+                normalized_unassigned_ready,
+                expected_pid=4088,
+                expected_source_inventory=normalized_inventory_argument,
+                require_unfiltered_servers=True,
+            ).managed_servers
+            == 19,
+            "normalized definitions plus one unassigned server did not pass readiness at the measured count",
+        )
+        normalized_unassigned_dropped = temp / "normalized-unassigned-dropped.log"
+        normalized_unassigned_dropped.write_text(
+            unified_line(
+                4089,
+                "completed",
+                1,
+                1,
+                sources=(normalized_fingerprint,),
+                server_counts=((normalized_fingerprint, 18),),
+                managed=18,
+                visible=18,
+                repositories=9,
+                unassigned_groups=1,
+            ),
+            encoding="utf-8",
+        )
+        expect_failure(
+            lambda: run_wait(
+                normalized_unassigned_dropped,
+                expected_pid=4089,
+                expected_source_inventory=normalized_inventory_argument,
+                require_unfiltered_servers=True,
+            ),
+            "did not match packaged-helper preflight",
+            "dropping the normalized unassigned server passed readiness",
         )
         measured_inventory_argument = verifier.format_expected_source_inventory(measured_inventory)
 
@@ -755,84 +844,89 @@ def main() -> int:
             "populated source decoded as zero servers passed readiness",
         )
 
-        multi_loaded_counts = tuple(
+        account_loaded_counts = tuple(measured_inventory)
+        account_store_only = temp / "account-store-only.log"
+        account_store_only.write_text(
+            unified_line(
+                4095,
+                "completed",
+                1,
+                1,
+                sources=tuple(fingerprint for fingerprint, _count in account_loaded_counts),
+                server_counts=account_loaded_counts,
+                managed=source_counts[0],
+                visible=source_counts[0],
+            ),
+            encoding="utf-8",
+        )
+        check(
+            run_wait(
+                account_store_only,
+                expected_pid=4095,
+                expected_source_inventory=measured_inventory_argument,
+                require_unfiltered_servers=True,
+            ).loaded
+            == 1,
+            "normalized account-store source did not pass source-bound readiness",
+        )
+
+        legacy_loaded_counts = tuple(
             sorted(
                 (verifier.source_fingerprint(path), count)
                 for path, count in zip(multi_sources, source_counts)
             )
         )
-        all_instances = temp / "all-codex-instances.log"
-        all_instances.write_text(
+        legacy_sources_polled = temp / "legacy-sources-polled.log"
+        legacy_sources_polled.write_text(
             unified_line(
-                4095,
+                4096,
                 "completed",
                 4,
                 4,
-                sources=tuple(fingerprint for fingerprint, _count in multi_loaded_counts),
-                server_counts=multi_loaded_counts,
+                sources=tuple(fingerprint for fingerprint, _count in legacy_loaded_counts),
+                server_counts=legacy_loaded_counts,
                 managed=sum(source_counts),
                 visible=sum(source_counts),
             ),
             encoding="utf-8",
         )
-        check(
-            run_wait(
-                all_instances,
-                expected_pid=4095,
+        expect_failure(
+            lambda: run_wait(
+                legacy_sources_polled,
+                expected_pid=4096,
                 expected_source_inventory=measured_inventory_argument,
-                require_unfiltered_servers=True,
-            ).loaded
-            == 4,
-            "two-instance source set did not pass source-bound readiness",
+            ),
+            "3 unexpected coordinator source(s)",
+            "legacy Codex/Claude/Parall homes passed as independent Board sources",
         )
 
-        missing_instance = temp / "missing-codex-instance.log"
-        present_counts = multi_loaded_counts[:-1]
-        missing_instance.write_text(
+        missing_account_store = temp / "missing-account-store.log"
+        # Bind this fixture to an explicitly legacy source. Selecting the last
+        # hash after sorting is nondeterministic with respect to source kind and
+        # can accidentally select the canonical account store.
+        legacy_fingerprint = verifier.source_fingerprint(multi_sources[1])
+        legacy_count = source_counts[1]
+        missing_account_store.write_text(
             unified_line(
-                4096,
+                4097,
                 "completed",
-                3,
-                3,
-                sources=tuple(fingerprint for fingerprint, _count in present_counts),
-                server_counts=present_counts,
-                managed=sum(count for _fingerprint, count in present_counts),
+                1,
+                1,
+                sources=(legacy_fingerprint,),
+                server_counts=((legacy_fingerprint, legacy_count),),
+                managed=legacy_count,
+                visible=legacy_count,
             ),
             encoding="utf-8",
         )
         expect_failure(
             lambda: run_wait(
-                missing_instance,
-                expected_pid=4096,
+                missing_account_store,
+                expected_pid=4097,
                 expected_source_inventory=measured_inventory_argument,
             ),
             "1 automatic OS-account coordinator source(s)",
-            "one missing Codex-instance source passed multi-source readiness",
-        )
-
-        disabled_fingerprint, _disabled_count = multi_loaded_counts[-1]
-        intentionally_disabled_instance = temp / "disabled-codex-instance.log"
-        intentionally_disabled_instance.write_text(
-            unified_line(
-                4097,
-                "completed",
-                3,
-                3,
-                sources=tuple(fingerprint for fingerprint, _count in present_counts),
-                disabled=(disabled_fingerprint,),
-                server_counts=present_counts,
-                managed=sum(count for _fingerprint, count in present_counts),
-            ),
-            encoding="utf-8",
-        )
-        check(
-            run_wait(
-                intentionally_disabled_instance,
-                expected_pid=4097,
-                expected_source_inventory=measured_inventory_argument,
-            ).loaded
-            == 3,
-            "explicitly disabled second-instance source caused a false readiness failure",
+            "a legacy instance substituted for the account store",
         )
 
         # Explicitly disabling the automatic source is intentional. Another
@@ -858,8 +952,7 @@ def main() -> int:
         check(disabled_ready.loaded == 1, "explicitly disabled automatic source caused a false failure")
 
         # Must-catch: an unmeasured helper preflight cannot silently bless a
-        # loaded source. The same unknown evidence is intentional when that
-        # source is explicitly disabled and therefore not read by the Board.
+        # loaded normalized account source.
         unmeasured_loaded = temp / "unmeasured-loaded-source.log"
         unmeasured_loaded.write_text(
             unified_line(
@@ -880,16 +973,6 @@ def main() -> int:
             "could not measure a loaded automatic source",
             "unmeasured loaded source passed packaged-helper readiness",
         )
-        unknown_but_disabled = run_wait(
-            explicitly_disabled,
-            expected_pid=4092,
-            expected_source_inventory=f"{canonical_fingerprint}:?",
-        )
-        check(
-            unknown_but_disabled.loaded == 1,
-            "an intentionally disabled unmeasured source caused a false readiness failure",
-        )
-
         # No account source means there is no identity requirement. This is a
         # separate control from a present-but-empty account source.
         no_account_requirement = temp / "no-account-source.log"

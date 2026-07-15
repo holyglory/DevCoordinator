@@ -10,12 +10,15 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import functools
 import glob
+import hashlib
 import hmac
 import http.server
 import ipaddress
 import json
 import os
+import platform
 import pwd
 import re
 import secrets
@@ -32,12 +35,69 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from devcoordinator.observer import ObservationOutcome, SingleFlightObserver
+from devcoordinator.host_observation import commit_host_inventory_observation
+from devcoordinator.host_lifecycle import CoordinatorHostLifecycleAdapter
+from devcoordinator.broker_cli import (
+    add_broker_parser,
+    handle_broker_cli,
+    serve_broker,
+)
+from devcoordinator.broker import BrokerError, BrokerOperation
+from devcoordinator.broker_enrollment import enroll_repository
+from devcoordinator.broker_links import BrokerLink, BrokerLinkStore
+from devcoordinator.broker_profile import (
+    BrokerClientProfile,
+    BrokerProfileError,
+    BrokerRepositoryProfile,
+    BrokerServiceProfile,
+    SYSTEM_PROFILE_PATH,
+    call_broker,
+    load_broker_profile,
+)
+from devcoordinator.lifecycle_cli import (
+    add_lifecycle_parsers,
+    handle_lifecycle_cli,
+)
+from devcoordinator.normalized_server_lifecycle import (
+    NormalizedLifecycleConflict,
+    NormalizedPortLifecycle,
+    NormalizedServerLifecycle,
+    PortLeaseRequest,
+    ServerRegistrationRequest,
+    ServerStartRequest,
+)
+from devcoordinator.repository_lifecycle import (
+    ActionFencedError,
+    ConcurrentLifecycleError,
+    RepositoryAction,
+    RepositoryLifecycle,
+)
+from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
+from devcoordinator.store import (
+    AccountStore,
+    deterministic_id,
+    fingerprint,
+    utc_timestamp,
+)
+
 
 VERSION = 2
+NORMALIZED_SCHEMA_VERSION = 2
+NORMALIZED_DATABASE_NAME = "coordinator.sqlite3"
+STATE_BACKEND_ENV = "DEVCOORDINATOR_STATE_BACKEND"
+LEGACY_JSON_BACKEND = "legacy-json-test-only"
+OBSERVER_DOMAIN_FULL_DOCKER = "host-runtime-v2:full-docker"
+OBSERVER_DOMAIN_NO_DOCKER = "host-runtime-v2:no-docker"
 DEFAULT_RANGE = "3000-3999"
 DEFAULT_TTL_SECONDS = 8 * 60 * 60
 DEFAULT_API_PORT = 29876
@@ -76,6 +136,7 @@ _GIT_IDENTITY_CONTEXT = threading.local()
 _STATE_LOCK_CONTEXT = threading.local()
 _PROJECT_OPERATION_CONTEXT = threading.local()
 _SERVER_RESTART_CONTEXT = threading.local()
+_NORMALIZED_ACTION_CONTEXT = threading.local()
 _PROCESS_INSTANCE_ID = uuid.uuid4().hex
 _PROCESS_INSTANCE_PID = os.getpid()
 _PROCESS_OWNER_MARKERS: dict[str, tuple[Path, int]] = {}
@@ -153,6 +214,31 @@ class PrivateStateWriteCleanupError(RuntimeError):
 def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, StructuredCoordinatorError):
         return copy.deepcopy(exc.payload)
+    if isinstance(exc, ActionFencedError):
+        return {
+            "error": str(exc),
+            "code": "repository_action_fenced",
+            "classification": "lifecycle_fenced",
+            "action_required": "Reinstall the removed repository through the Coordinator skill before starting it.",
+        }
+    if isinstance(exc, BrokerError):
+        return {
+            "error": exc.message,
+            "code": exc.code,
+            "classification": "broker_mutation_failed",
+            "operation_id": exc.operation_id,
+            "action_required": (
+                "Keep the local resource stopped/reserved and retry through the Coordinator skill; "
+                "do not bypass the configured host broker."
+            ),
+        }
+    if isinstance(exc, BrokerProfileError):
+        return {
+            "error": str(exc),
+            "code": "broker_profile_invalid",
+            "classification": "broker_configuration_required",
+            "action_required": "Rerun Coordinator skill installation as the host administrator.",
+        }
     return {"error": str(exc), "code": "internal_error", "classification": "unhealthy_process"}
 
 
@@ -359,8 +445,31 @@ def coordinator_home() -> Path:
     return posix_account_home() / ".codex" / "agent-coordinator"
 
 
-def state_path() -> Path:
+def state_backend() -> str:
+    """Return the configured persistence backend.
+
+    SQLite is the product backend.  The JSON implementation is retained only
+    as an explicitly named, temporary test bridge for deterministic legacy
+    fixtures while those fixtures are ported to normalized storage.
+    """
+
+    configured = str(os.environ.get(STATE_BACKEND_ENV) or "sqlite").strip().lower()
+    if configured not in {"sqlite", LEGACY_JSON_BACKEND}:
+        raise ValueError(
+            f"{STATE_BACKEND_ENV} must be 'sqlite' or the explicit temporary "
+            f"test bridge {LEGACY_JSON_BACKEND!r}"
+        )
+    return configured
+
+
+def legacy_state_path() -> Path:
     return coordinator_home() / "state.json"
+
+
+def state_path() -> Path:
+    if state_backend() == LEGACY_JSON_BACKEND:
+        return legacy_state_path()
+    return coordinator_home() / NORMALIZED_DATABASE_NAME
 
 
 def lock_path() -> Path:
@@ -581,8 +690,8 @@ def default_state() -> dict[str, Any]:
     }
 
 
-def read_state() -> dict[str, Any]:
-    path = state_path()
+def read_legacy_json_state() -> dict[str, Any]:
+    path = legacy_state_path()
     if not path.exists():
         return default_state()
     try:
@@ -621,17 +730,88 @@ def read_state() -> dict[str, Any]:
     return data
 
 
-def write_state(state: dict[str, Any]) -> None:
+def read_state() -> dict[str, Any]:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        raise RuntimeError(
+            "read_state is disabled for the SQLite product backend; use a "
+            "normalized domain query"
+        )
+    return read_legacy_json_state()
+
+
+def write_legacy_json_state(state: dict[str, Any]) -> None:
     home = coordinator_home()
     ensure_private_directory(home)
     state["version"] = VERSION
     state["revision"] = int(state.get("revision") or 0) + 1
     state["updated_at"] = iso_timestamp()
-    atomic_write_private(state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
+    atomic_write_private(legacy_state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def write_state(state: dict[str, Any], *, expected_revision: int | None = None) -> None:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        raise RuntimeError(
+            "write_state is disabled for the SQLite product backend; use a "
+            "normalized domain transaction"
+        )
+    write_legacy_json_state(state)
+
+
+def restore_legacy_pending_operation_statuses(
+    store: AccountStore, state: dict[str, Any]
+) -> None:
+    """Hydrate normalized compatibility operations back into the v1 state machine.
+
+    SQLite stores both a v1 ``pending`` operation and a normalized lifecycle
+    guard as ``running``. Only the former must become ``pending`` when handed
+    back to the legacy callback code; translating ``guard:*`` would make the
+    guarded action conflict with its own normalized permit. The reservation's
+    process identity is retained in normalized ``result_json`` until the
+    operation finishes so abandoned-owner reconciliation remains safe.
+    """
+
+    compatibility_prefixes = ("project.", "server.", "docker.", "port.")
+    with store.read_transaction() as connection:
+        encoded = {
+            str(row["operation_id"]): row["result_json"]
+            for row in connection.execute(
+                """
+                SELECT operation_id, result_json FROM operations
+                WHERE status = 'running' AND (
+                    kind LIKE 'project.%' OR kind LIKE 'server.%'
+                    OR kind LIKE 'docker.%' OR kind LIKE 'port.%'
+                )
+                """
+            )
+        }
+    for operation in (state.get("operations") or {}).values():
+        kind = str(operation.get("kind") or "")
+        if operation.get("status") == "running" and kind.startswith(
+            compatibility_prefixes
+        ):
+            try:
+                result = json.loads(str(encoded.get(str(operation.get("id"))) or "{}"))
+            except json.JSONDecodeError:
+                result = {}
+            reservation = result.get("_legacy_reservation") if isinstance(result, dict) else None
+            if not isinstance(reservation, dict):
+                # Pre-cutover rows lack the process-instance evidence required
+                # to decide whether the owner is alive. Keep them normalized
+                # and conflicting instead of guessing that they are pending.
+                continue
+            operation.update(copy.deepcopy(reservation))
+            operation["result"] = copy.deepcopy(result)
+            operation["status"] = "pending"
 
 
 @contextlib.contextmanager
 def locked_state() -> Any:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        raise RuntimeError(
+            "locked_state is disabled for the SQLite product backend; "
+            "route the operation through a direct normalized transaction"
+        )
+
     home = coordinator_home()
     ensure_private_directory(home)
     lock_fd = os.open(lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
@@ -805,8 +985,11 @@ def listening_pid_for_port(port: int) -> int | None:
         if pid is not None:
             return pid
     with contextlib.suppress(Exception):
+        lsof = resolve_lsof_executable()
+        if lsof is None:
+            return None
         completed = subprocess.run(
-            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+            [lsof, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -819,10 +1002,31 @@ def listening_pid_for_port(port: int) -> int | None:
     return None
 
 
+def resolve_lsof_executable() -> str | None:
+    """Resolve lsof without trusting a caller-controlled PATH exclusively.
+
+    Deterministic runtimes intentionally clear PATH, while macOS listener and
+    cwd ownership checks still need the platform's standard system binary.
+    Returning ``None`` preserves the ownership observer's unknown state when
+    no trustworthy executable is available.
+    """
+
+    for candidate in (shutil.which("lsof"), "/usr/sbin/lsof", "/usr/bin/lsof"):
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if executable_file(path):
+            return str(path.resolve())
+    return None
+
+
 def _lsof_listener_observation(
     host: str, port: int, *, expected_pid: int | None = None
 ) -> tuple[bool, int | None]:
-    command = ["lsof", "-nP", "-a"]
+    lsof = resolve_lsof_executable()
+    if lsof is None:
+        return False, None
+    command = [lsof, "-nP", "-a"]
     if expected_pid is not None:
         command.extend(["-p", str(expected_pid)])
     command.extend([f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fpn"])
@@ -1039,9 +1243,12 @@ def process_cwd_from_proc(pid: int) -> str | None:
 
 
 def _lsof_process_cwd_observation(pid: int) -> tuple[bool, str | None]:
+    lsof = resolve_lsof_executable()
+    if lsof is None:
+        return False, None
     try:
         completed = subprocess.run(
-            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            [lsof, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1730,6 +1937,28 @@ def begin_operation(
     }
     if delegated_parent_id:
         operation["parent_operation_id"] = delegated_parent_id
+    operation["result"] = {
+        "_legacy_reservation": {
+            key: copy.deepcopy(operation.get(key))
+            for key in (
+                "action",
+                "target",
+                "agent",
+                "project",
+                "generation",
+                "owner_pid",
+                "owner_thread",
+                "owner_instance_id",
+                "lease_id",
+                "server_id",
+                "created_at",
+                "created_ts",
+                "updated_at",
+                "parent_operation_id",
+            )
+            if operation.get(key) is not None
+        }
+    }
     state.setdefault("operations", {})[operation["id"]] = operation
     record_event(state, "operation.started", {**operation})
     return operation
@@ -2109,6 +2338,349 @@ def canonical_project(project: str) -> str:
             return resolved
     _PROJECT_ROOT_CACHE[cache_key] = cache_key
     return cache_key
+
+
+class RepositoryActionGuardReleaseError(RuntimeError):
+    """A guarded mutation and its permit release both failed."""
+
+    def __init__(self, primary_error: BaseException, release_error: BaseException) -> None:
+        super().__init__(
+            "repository action failed and its normalized permit could not be released: "
+            f"{type(primary_error).__name__}: {primary_error}; release failure: "
+            f"{type(release_error).__name__}: {release_error}"
+        )
+        self.primary_error = primary_error
+        self.release_error = release_error
+
+
+class _GuardOnlyLifecycleAdapter:
+    """Sentinel adapter: action reservation must never perform host work."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise RuntimeError(f"repository action guard unexpectedly requested host adapter method {name}")
+
+
+_GUARD_ONLY_LIFECYCLE_ADAPTER = _GuardOnlyLifecycleAdapter()
+
+
+def _local_normalized_host_id() -> str:
+    machine = f"{platform.system()}\x1f{platform.node()}\x1f{socket.gethostname()}"
+    return deterministic_id("host", hashlib.sha256(machine.encode("utf-8")).hexdigest())
+
+
+def _strict_git_repository_root(project: str) -> Path:
+    root = Path(canonical_project(project))
+    try:
+        root_metadata = root.lstat()
+        marker_metadata = (root / ".git").lstat()
+    except FileNotFoundError as exc:
+        raise ActionFencedError(
+            f"repository action requires an existing canonical Git worktree: {root}"
+        ) from exc
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise ActionFencedError(
+            f"repository action requires a real canonical worktree directory: {root}"
+        )
+    if stat.S_ISLNK(marker_metadata.st_mode) or not (
+        stat.S_ISDIR(marker_metadata.st_mode) or stat.S_ISREG(marker_metadata.st_mode)
+    ):
+        raise ActionFencedError(
+            f"repository action requires a real .git directory or worktree marker: {root}"
+        )
+    return root
+
+
+def _require_normalized_bootstrap_before_mutation(store: AccountStore) -> None:
+    """Import same-UID legacy truth before the first normalized mutation.
+
+    A pure inventory never creates the SQLite store. Once a mutation opens a
+    fresh store, legacy capture/import must run before repository installation
+    or action reservation can establish normalized authority.
+    """
+
+    with store.read_transaction() as connection:
+        metadata = connection.execute(
+            """
+            SELECT migration_state, first_sqlite_mutation_at, state_revision
+            FROM schema_metadata WHERE singleton = 1
+            """
+        ).fetchone()
+    if metadata is None:
+        raise ActionFencedError("normalized coordinator metadata is missing")
+    first_mutation = metadata["first_sqlite_mutation_at"]
+    migration_state = str(metadata["migration_state"] or "empty")
+    if migration_state == "conflicted":
+        raise ActionFencedError(
+            "legacy coordinator migration has unresolved blocking conflicts; "
+            "resolve them through explicit observe before mutation"
+        )
+    if first_mutation is not None and migration_state != "empty":
+        late_writers = store.detect_late_legacy_writers()
+        if late_writers:
+            raise ActionFencedError(
+                "a retired legacy coordinator source changed after capture; run explicit "
+                "observe and reconcile that writer before mutation"
+            )
+        return
+    report = bootstrap_legacy_import(store)
+    if report.get("blocking_conflict_count"):
+        raise ActionFencedError(
+            "legacy coordinator state has blocking migration conflicts; run explicit observe "
+            "and resolve its migration report before mutating this repository"
+        )
+    if report.get("attempted") and not report.get("committed"):
+        raise ActionFencedError(
+            "legacy coordinator state was not committed; run explicit observe before mutation"
+        )
+    if report.get("late_writer_sources"):
+        raise ActionFencedError(
+            "a legacy coordinator source changed after capture; run explicit observe and "
+            "reconcile that writer before mutation"
+        )
+
+
+def _mark_first_normalized_action(store: AccountStore) -> None:
+    with store.read_transaction() as connection:
+        row = connection.execute(
+            "SELECT first_sqlite_mutation_at FROM schema_metadata WHERE singleton = 1"
+        ).fetchone()
+    if row is not None and row[0] is not None:
+        return
+    timestamp = utc_timestamp()
+    with store.immediate_transaction() as connection:
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET authority_mode = 'sqlite',
+                migration_state = CASE
+                    WHEN migration_state = 'empty' THEN 'ready'
+                    ELSE migration_state
+                END,
+                first_sqlite_mutation_at = COALESCE(first_sqlite_mutation_at, ?),
+                updated_at = ?
+            WHERE singleton = 1
+            """,
+            (timestamp, timestamp),
+        )
+
+
+def resolve_or_install_repository_for_action(store: AccountStore, project: str) -> str:
+    """Resolve one repository, installing only a never-before-seen Git root.
+
+    Existing rows are returned unchanged. In particular, this helper never
+    clears a ``disabling``/``disabled`` installation or revives a missing
+    repository; only the explicit lifecycle reinstall journey may do that.
+    """
+
+    root = _strict_git_repository_root(project)
+    host_id = _local_normalized_host_id()
+    with store.read_transaction() as connection:
+        existing = connection.execute(
+            """
+            SELECT repo_id FROM repositories
+            WHERE host_id = ? AND canonical_root = ?
+            """,
+            (host_id, str(root)),
+        ).fetchone()
+    if existing is not None:
+        return str(existing["repo_id"])
+
+    ensured_host_id = ensure_observation_host(store)
+    if ensured_host_id != host_id:
+        raise RuntimeError("normalized local host identity changed during repository installation")
+    timestamp = utc_timestamp()
+    repo_id = deterministic_id("repository", host_id, str(root))
+    with store.immediate_transaction() as connection:
+        # Recheck under the writer boundary. A concurrently created row may
+        # already carry a decommission fence and must never be overwritten.
+        current = connection.execute(
+            """
+            SELECT repo_id FROM repositories
+            WHERE host_id = ? AND canonical_root = ?
+            """,
+            (host_id, str(root)),
+        ).fetchone()
+        if current is not None:
+            return str(current["repo_id"])
+        connection.execute(
+            """
+            INSERT INTO repositories(
+                repo_id, host_id, canonical_root, display_name, state,
+                generation, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
+            """,
+            (repo_id, host_id, str(root), root.name or str(root), timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO repository_installations(
+                repo_id, status, startup_fenced, generation, reason, actor,
+                updated_at
+            ) VALUES (?, 'installed', 0, 0, 'first coordinator use',
+                      'coordinator-skill', ?)
+            """,
+            (repo_id, timestamp),
+        )
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET authority_mode = 'sqlite', migration_state = 'ready',
+                first_sqlite_mutation_at = COALESCE(first_sqlite_mutation_at, ?),
+                updated_at = ?
+            WHERE singleton = 1
+            """,
+            (timestamp, timestamp),
+        )
+    return repo_id
+
+
+def _normalized_guard_stack() -> list[dict[str, str]]:
+    stack = getattr(_NORMALIZED_ACTION_CONTEXT, "stack", None)
+    if stack is None:
+        stack = []
+        _NORMALIZED_ACTION_CONTEXT.stack = stack
+    return stack
+
+
+def _open_normalized_action_store() -> AccountStore:
+    """Open the WAL store; its maintenance lock owns first-open serialization."""
+
+    return AccountStore.open_default(coordinator_home())
+
+
+def _reserve_normalized_repository_action(
+    lifecycle: RepositoryLifecycle,
+    store: AccountStore,
+    *,
+    repo_id: str,
+    action: RepositoryAction,
+    agent: str,
+) -> Any:
+    """Reserve once, queueing only independent same-repository lease guards."""
+
+    request_id = str(uuid.uuid4())
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            return lifecycle.reserve_repository_action(
+                repo_id, action, request_id=request_id, actor=agent
+            )
+        except ConcurrentLifecycleError:
+            if action is not RepositoryAction.LEASE:
+                raise
+            with store.read_transaction() as connection:
+                conflicts = [
+                    str(row[0])
+                    for row in connection.execute(
+                        """
+                        SELECT kind FROM operations
+                        WHERE repo_id = ?
+                          AND status IN ('running','needs_attention','partial')
+                        """,
+                        (repo_id,),
+                    )
+                ]
+            if not conflicts or any(kind != "guard:lease" for kind in conflicts):
+                raise
+            if time.monotonic() >= deadline:
+                raise ConcurrentLifecycleError(
+                    "timed out waiting for another independent repository lease reservation"
+                )
+            time.sleep(0.01)
+
+
+@contextlib.contextmanager
+def normalized_repository_action_guard(
+    *, project: str, agent: str, action: RepositoryAction
+) -> Any:
+    """Reserve the normalized lifecycle boundary before legacy or host work."""
+
+    canonical = canonical_project(project)
+    if state_backend() == LEGACY_JSON_BACKEND:
+        yield None
+        return
+    stack = _normalized_guard_stack()
+    for active in reversed(stack):
+        if active["project"] == canonical:
+            # Only synchronous internal calls can inherit this thread-local
+            # capability. CLI/API payloads cannot manufacture it.
+            yield active["repo_id"]
+            return
+    with _open_normalized_action_store() as store:
+        _require_normalized_bootstrap_before_mutation(store)
+        repo_id = resolve_or_install_repository_for_action(store, canonical)
+        lifecycle = RepositoryLifecycle(
+            SQLiteLifecyclePersistence(store),
+            (
+                CoordinatorHostLifecycleAdapter()
+                if action is RepositoryAction.START
+                else _GUARD_ONLY_LIFECYCLE_ADAPTER
+            ),
+        )
+        permit = _reserve_normalized_repository_action(
+            lifecycle,
+            store,
+            repo_id=repo_id,
+            action=action,
+            agent=agent,
+        )
+        try:
+            _mark_first_normalized_action(store)
+            if action is RepositoryAction.START:
+                # Reinstallation only clears the normalized fence. The first
+                # explicit start restores the exact captured native policies
+                # under this permit, before any compatibility or host start
+                # path is entered. This preflight is deliberately not a
+                # cross-host-work state lock; a later observation remains the
+                # durable detector for the residual post-preflight race.
+                lifecycle.restore_startup_policies_for_start(permit)
+        except BaseException as primary_error:
+            try:
+                lifecycle.release_action_permit(permit, outcome="failed")
+            except BaseException as release_error:
+                raise RepositoryActionGuardReleaseError(
+                    primary_error, release_error
+                ) from primary_error
+            raise
+        active = {"project": canonical, "repo_id": repo_id, "permit_id": permit.permit_id}
+        stack.append(active)
+        try:
+            yield repo_id
+        except BaseException as primary_error:
+            try:
+                lifecycle.release_action_permit(permit, outcome="failed")
+            except BaseException as release_error:
+                raise RepositoryActionGuardReleaseError(
+                    primary_error, release_error
+                ) from primary_error
+            raise
+        else:
+            lifecycle.release_action_permit(permit, outcome="succeeded")
+        finally:
+            if stack and stack[-1] is active:
+                stack.pop()
+            else:
+                with contextlib.suppress(ValueError):
+                    stack.remove(active)
+
+
+def normalized_guarded_action(
+    action: RepositoryAction, command: str
+) -> Any:
+    """Decorate one options-dict public mutation before its first side effect."""
+
+    def decorate(function: Any) -> Any:
+        @functools.wraps(function)
+        def guarded(options: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+            agent, project = require_identity(options, command)
+            with normalized_repository_action_guard(
+                project=project, agent=agent, action=action
+            ):
+                return function(options, *args, **kwargs)
+
+        return guarded
+
+    return decorate
 
 
 # --- durable port assignments -------------------------------------------------
@@ -3777,6 +4349,43 @@ def docker_ps_inventory(
                     inspect_by_id[short_id] = inspected
     for container in containers:
         inspected = inspect_by_id.get(str(container.get("id") or ""))
+        if inspected:
+            full_id = str(inspected.get("Id") or "").strip()
+            if full_id:
+                container["full_id"] = full_id
+            state_payload = inspected.get("State") if isinstance(inspected.get("State"), dict) else {}
+            health_payload = state_payload.get("Health") if isinstance(state_payload.get("Health"), dict) else {}
+            container["container_health"] = health_payload.get("Status")
+            host_config = inspected.get("HostConfig") if isinstance(inspected.get("HostConfig"), dict) else {}
+            restart = host_config.get("RestartPolicy") if isinstance(host_config.get("RestartPolicy"), dict) else {}
+            container["restart_policy"] = restart.get("Name") or "no"
+            port_bindings: list[dict[str, Any]] = []
+            network = inspected.get("NetworkSettings") if isinstance(inspected.get("NetworkSettings"), dict) else {}
+            published = network.get("Ports") if isinstance(network.get("Ports"), dict) else {}
+            for destination, bindings in sorted(published.items()):
+                raw_port, _separator, protocol = str(destination).partition("/")
+                with contextlib.suppress(ValueError):
+                    container_port = int(raw_port)
+                    if not bindings:
+                        port_bindings.append(
+                            {
+                                "host_address": None,
+                                "host_port": None,
+                                "container_port": container_port,
+                                "protocol": protocol or "tcp",
+                            }
+                        )
+                    for binding in bindings or []:
+                        host_port = binding.get("HostPort")
+                        port_bindings.append(
+                            {
+                                "host_address": binding.get("HostIp"),
+                                "host_port": int(host_port) if host_port else None,
+                                "container_port": container_port,
+                                "protocol": protocol or "tcp",
+                            }
+                        )
+            container["port_bindings"] = port_bindings
         labels = ((inspected or {}).get("Config") or {}).get("Labels") or {}
         if labels:
             container["labels"] = labels
@@ -3802,6 +4411,50 @@ def docker_ps_inventory(
     if stats_error:
         payload["stats_error"] = stats_error
     return payload
+
+
+def discover_postgres_databases(container: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    """Read a running container's real PostgreSQL catalog once per observation."""
+
+    if not str(container.get("status") or "").lower().startswith("up"):
+        return [], "container is not running"
+    target = str(container.get("full_id") or container.get("id") or container.get("name") or "")
+    if not target:
+        return [], "container identity is unavailable"
+    identity = docker_available_command(
+        [
+            "exec",
+            target,
+            "sh",
+            "-c",
+            "printf '%s\\n%s\\n' \"${POSTGRES_USER:-postgres}\" \"${POSTGRES_DB:-postgres}\"",
+        ]
+    )
+    if not identity.get("ok"):
+        return [], str(identity.get("stderr") or identity.get("error") or "PostgreSQL identity query failed").strip()
+    lines = str(identity.get("stdout") or "").splitlines()
+    user = lines[0].strip() if lines and lines[0].strip() else "postgres"
+    database = lines[1].strip() if len(lines) > 1 and lines[1].strip() else "postgres"
+    query = (
+        "SELECT datname, pg_database_size(datname) FROM pg_database "
+        "WHERE datallowconn AND NOT datistemplate ORDER BY datname"
+    )
+    catalog = docker_available_command(
+        ["exec", target, "psql", "-U", user, "-d", database, "-At", "-F", "\t", "-c", query]
+    )
+    if not catalog.get("ok"):
+        return [], str(catalog.get("stderr") or catalog.get("error") or "PostgreSQL catalog query failed").strip()
+    databases: list[dict[str, Any]] = []
+    for line in str(catalog.get("stdout") or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2 or not fields[0]:
+            return [], f"unexpected PostgreSQL catalog row: {line}"
+        try:
+            size_bytes = int(fields[1])
+        except ValueError:
+            return [], f"unexpected PostgreSQL database size: {line}"
+        databases.append({"name": fields[0], "size_bytes": size_bytes})
+    return databases, None
 
 
 def backup_inventory(project: str | None, backup_dirs: list[str] | None = None) -> list[dict[str, Any]]:
@@ -5316,6 +5969,9 @@ def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, An
         operation["lease_source"] = "manual"
         operation["lease_port"] = port
         operation["phase"] = "reserved"
+        operation["result"]["_legacy_reservation"].update(
+            {"lease_source": "manual", "lease_port": port}
+        )
         lease["pending_operation_id"] = operation["id"]
         lease["pending_server_id"] = server_id
         lease["attachment_status"] = "reserved"
@@ -5565,9 +6221,11 @@ def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, An
     return committed
 
 
-def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
+def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
     """Start a process with only reservation/commit phases under the state lock."""
 
+    if state_backend() != LEGACY_JSON_BACKEND:
+        return _coordinated_start_server_normalized(options)
     if options.get("lease_id"):
         return coordinated_start_server_with_lease(options)
     agent, project = require_identity(options, "server start")
@@ -5772,7 +6430,197 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
     return committed
 
 
+@normalized_guarded_action(RepositoryAction.START, "server start")
+def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
+    agent, project = require_identity(options, "server start")
+    broker_context = configured_broker_context(project)
+    if broker_context is None:
+        return _coordinated_start_server_local(options)
+    profile, repository = broker_context
+    name = str(options.get("name") or "").strip()
+    if not name:
+        raise ValueError("server start requires --name")
+
+    if options.get("lease_id"):
+        link = broker_lease_link_for_local(str(options["lease_id"]))
+        if link is None:
+            raise BrokerProfileError(
+                "a host broker is configured, but the supplied local lease has no exact broker linkage"
+            )
+        if link.repo_id != repository.repo_id or link.server_definition_id != repository.server_id(name):
+            raise BrokerProfileError("the supplied broker lease belongs to another enrolled server")
+        result = _coordinated_start_server_local(options)
+        return {
+            **result,
+            "broker": {
+                "lease_id": link.broker_resource_id,
+                "link_id": link.link_id,
+                "status": link.status,
+            },
+        }
+
+    # Do not allocate a second global lease when this exact process is already
+    # healthy. The local implementation repeats the identity check before it
+    # returns, so a race remains fail-safe.
+    if state_backend() == LEGACY_JSON_BACKEND:
+        with locked_state() as state:
+            _existing_id, existing = find_server(state, project=project, name=name)
+            existing_snapshot = copy.deepcopy(existing) if existing else None
+            _assignment_key, assignment = find_port_assignment(
+                state, project=project, name=name
+            )
+    else:
+        with AccountStore.open_default(coordinator_home()) as store:
+            servers = NormalizedServerLifecycle(store)
+            try:
+                existing_snapshot = servers.server(
+                    canonical_project=project, name=name
+                )
+            except KeyError:
+                existing_snapshot = None
+            assignment = next(
+                (
+                    item
+                    for item in NormalizedPortLifecycle(store).list_assignments(
+                        canonical_project=project, active_only=True
+                    )
+                    if str(item["name"]) == name
+                ),
+                None,
+            )
+    if existing_snapshot:
+        existing_health = server_health(existing_snapshot)
+        require_listener_identity_observable(
+            existing_health, action="start", server=existing_snapshot
+        )
+        if existing_health.get("ok"):
+            return _coordinated_start_server_local(options)
+
+    requested_port = options.get("preferred")
+    if requested_port is None and assignment is not None:
+        requested_port = int(assignment["port"])
+    link, broker_result = acquire_broker_lease_link(
+        profile=profile,
+        repository=repository,
+        server_name=name,
+        requested_port=(None if requested_port is None else int(requested_port)),
+        ttl_seconds=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+    )
+    prepared = dict(options)
+    prepared["range"] = f"{link.port}-{link.port}"
+    prepared["preferred"] = link.port
+    try:
+        result = _coordinated_start_server_local(prepared)
+        local_lease_id = str(result.get("lease_id") or "")
+        if not local_lease_id:
+            raise RuntimeError("broker-backed server start returned no local lease identity")
+        bound = bind_broker_lease_link(link.link_id, local_lease_id)
+        if state_backend() == LEGACY_JSON_BACKEND:
+            with locked_state() as state:
+                local = state.get("leases", {}).get(local_lease_id)
+                current = state.get("servers", {}).get(result.get("id"))
+                if local is None or current is None:
+                    raise RuntimeError(
+                        "broker-backed server committed without its local lease/server record"
+                    )
+                local["broker_lease_id"] = bound.broker_resource_id
+                local["broker_link_id"] = bound.link_id
+                local["broker_operation_id"] = bound.broker_operation_id
+                current["broker_lease_id"] = bound.broker_resource_id
+                current["broker_link_id"] = bound.link_id
+                result = copy.deepcopy(current)
+        else:
+            with AccountStore.open_default(coordinator_home()) as store:
+                local = next(
+                    (
+                        item
+                        for item in NormalizedPortLifecycle(store).list_leases(
+                            canonical_project=project, active_only=True
+                        )
+                        if str(item["id"]) == local_lease_id
+                    ),
+                    None,
+                )
+                if local is None:
+                    raise RuntimeError(
+                        "broker-backed server committed without its local lease record"
+                    )
+                result = normalized_public_server(
+                    NormalizedServerLifecycle(store).server(
+                        server_definition_id=str(result["id"])
+                    )
+                )
+    except BaseException as local_error:
+        rollback_errors: list[str] = []
+        if "result" in locals() and result.get("id"):
+            try:
+                coordinated_stop_server(
+                    {
+                        "server_id": result["id"],
+                        "agent": agent,
+                        "project": project,
+                        "name": name,
+                        "release_port": True,
+                        "reason": "Rolled back after broker-link commit failure",
+                    }
+                )
+            except BaseException as stop_error:
+                rollback_errors.append(
+                    f"exact local stop failed: {type(stop_error).__name__}: {stop_error}"
+                )
+                payload = coordinator_exception_payload(stop_error)
+                with AccountStore.open_default(coordinator_home()) as store:
+                    BrokerLinkStore(store).fail_lease_release(
+                        link.link_id,
+                        operation_id=str(uuid.uuid4()),
+                        error_code=str(payload.get("code") or "local_stop_failed"),
+                        error_message=str(payload.get("error") or stop_error),
+                        rollback=True,
+                    )
+                raise StructuredCoordinatorError(
+                    "broker-backed server started but local linkage and exact rollback stop failed",
+                    {
+                        "code": "broker_server_start_outcome_uncertain",
+                        "classification": "reconciliation_required",
+                        "broker_lease_id": link.broker_resource_id,
+                        "local_error": f"{type(local_error).__name__}: {local_error}",
+                        "rollback_errors": rollback_errors,
+                        "action_required": "Do not release or reuse this port until the exact process and broker lease are reconciled.",
+                    },
+                ) from local_error
+        try:
+            release_broker_lease_link(link, rollback=True)
+        except BaseException as rollback_error:
+            rollback_errors.append(
+                f"{type(rollback_error).__name__}: {rollback_error}"
+            )
+        if rollback_errors:
+            raise StructuredCoordinatorError(
+                "broker-backed server start failed and lease rollback requires reconciliation",
+                {
+                    "code": "broker_server_start_rollback_failed",
+                    "classification": "reconciliation_required",
+                    "broker_lease_id": link.broker_resource_id,
+                    "local_error": f"{type(local_error).__name__}: {local_error}",
+                    "rollback_errors": rollback_errors,
+                },
+            ) from local_error
+        raise
+    return {
+        **result,
+        "broker": {
+            "lease_id": bound.broker_resource_id,
+            "link_id": bound.link_id,
+            "operation_id": bound.broker_operation_id,
+            "status": bound.status,
+            "expires_at": broker_result.get("expires_at"),
+        },
+    }
+
+
 def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        return _coordinated_stop_server_normalized(options)
     prepared = dict(options)
     agent = str(prepared.get("agent") or "").strip()
     if not agent:
@@ -5802,6 +6650,16 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
         if str(server.get("project") or "") != project:
             raise ValueError("server stop project does not match the registered server project")
         observed_snapshot = copy.deepcopy(server)
+    requested_release = bool(prepared.get("release_port", True))
+    broker_link = (
+        broker_lease_link_for_local(str(observed_snapshot.get("lease_id")))
+        if requested_release and observed_snapshot.get("lease_id")
+        else None
+    )
+    if broker_link is not None:
+        # Exact process stop is corrective and happens first. The local lease
+        # stays active until the host-global broker confirms release.
+        prepared["release_port"] = False
 
     health = server_health(observed_snapshot)
     require_listener_identity_observable(
@@ -5861,10 +6719,71 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
             with contextlib.suppress(KeyError):
                 release_port(state, lease_id=str(current["lease_id"]))
         finish_operation(state, operation["id"], status="completed", phase="committed")
-        return copy.deepcopy(current)
+        committed = copy.deepcopy(current)
+
+    if broker_link is None:
+        return committed
+    try:
+        broker_result = release_broker_lease_link(broker_link, rollback=False)
+    except BaseException as release_error:
+        with locked_state() as state:
+            current = state.get("servers", {}).get(server_id)
+            if current is not None:
+                current["reconciliation_required"] = True
+                current["broker_release_error"] = coordinator_exception_payload(
+                    release_error
+                )
+                current["updated_at"] = iso_timestamp()
+                committed = copy.deepcopy(current)
+        raise StructuredCoordinatorError(
+            "server stopped, but its host-global broker lease could not be released",
+            {
+                "code": "broker_lease_release_pending",
+                "classification": "reconciliation_required",
+                "broker_lease_id": broker_link.broker_resource_id,
+                "server": committed,
+                "release_error": coordinator_exception_payload(release_error),
+                "action_required": "Keep the local lease reserved and retry the exact broker release through the Coordinator skill.",
+            },
+        ) from release_error
+    try:
+        with locked_state() as state:
+            local_lease_id = str(observed_snapshot.get("lease_id") or "")
+            if local_lease_id in state.get("leases", {}):
+                release_port(state, lease_id=local_lease_id)
+            current = state.get("servers", {}).get(server_id)
+            if current is not None:
+                current["broker_lease_id"] = broker_link.broker_resource_id
+                current["broker_lease_status"] = "released"
+                current["reconciliation_required"] = False
+                current.pop("broker_release_error", None)
+                current["updated_at"] = iso_timestamp()
+                committed = copy.deepcopy(current)
+    except BaseException as local_release_error:
+        raise StructuredCoordinatorError(
+            "broker lease was released, but the local stopped-server lease record needs reconciliation",
+            {
+                "code": "local_lease_release_reconciliation_required",
+                "classification": "reconciliation_required",
+                "broker_lease_id": broker_link.broker_resource_id,
+                "broker_result": broker_result,
+                "local_error": f"{type(local_release_error).__name__}: {local_release_error}",
+            },
+        ) from local_release_error
+    return {
+        **committed,
+        "broker": {
+            "lease_id": broker_link.broker_resource_id,
+            "status": "released",
+            "result": broker_result,
+        },
+    }
 
 
+@normalized_guarded_action(RepositoryAction.START, "server restart")
 def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        return _coordinated_restart_server_normalized(options)
     agent, project = require_identity(options, "server restart")
     with locked_state() as state:
         server_id, server = find_server(state, project=project, name=options["name"])
@@ -5947,13 +6866,801 @@ def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
 def snapshot_coordinator_state() -> dict[str, Any]:
     """Take a consistent state snapshot and release the lock immediately."""
 
+    if state_backend() != LEGACY_JSON_BACKEND:
+        return normalized_control_snapshot()
     with locked_state() as state:
         return copy.deepcopy(state)
+
+
+def normalized_control_snapshot_from_store(store: AccountStore) -> dict[str, Any]:
+    """Build the v1-shaped read model solely from normalized SQL tables."""
+
+    graph = store.inventory_v2()
+    compatibility = graph["v1_compatibility"]
+    operations = {}
+    with store.read_transaction() as connection:
+        for row in connection.execute(
+            """
+            SELECT o.*, r.canonical_root FROM operations o
+            LEFT JOIN repositories r USING(repo_id)
+            ORDER BY o.created_at, o.operation_id
+            """
+        ):
+            operations[str(row["operation_id"])] = {
+                "id": row["operation_id"],
+                "project": row["canonical_root"],
+                "kind": row["kind"],
+                "status": row["status"],
+                "phase": row["phase"],
+                "agent": row["actor"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+    return {
+        "version": VERSION,
+        "revision": int(graph["store"]["state_revision"]),
+        "created_at": None,
+        "updated_at": graph["store"]["updated_at"],
+        "servers": {
+            str(item["id"]): copy.deepcopy(item)
+            for item in compatibility["servers"]
+        },
+        "leases": {
+            str(item["id"]): copy.deepcopy(item)
+            for item in compatibility["leases"]
+        },
+        "port_assignments": {
+            f"{item['project']}::{item['name']}": copy.deepcopy(item)
+            for item in compatibility["port_assignments"]
+        },
+        "operations": operations,
+        "history": copy.deepcopy(compatibility["recent_events"]),
+        "docker": copy.deepcopy(compatibility["docker"]),
+    }
+
+
+def normalized_control_snapshot() -> dict[str, Any]:
+    """Return the direct normalized control read model."""
+
+    with AccountStore.open_default(coordinator_home()) as store:
+        return normalized_control_snapshot_from_store(store)
+
+
+def normalized_public_server(server: dict[str, Any]) -> dict[str, Any]:
+    """Strip private CAS fields from one normalized lifecycle result."""
+
+    return {
+        key: copy.deepcopy(value)
+        for key, value in server.items()
+        if not str(key).startswith("_")
+    }
+
+
+def normalized_process_instance_evidence(
+    *, pid: int, project: str, host: str, port: int
+) -> tuple[str | None, str]:
+    """Bind retained PID metadata to a stable host-observed process instance."""
+
+    start_time: str | None = None
+    if sys.platform.startswith("linux"):
+        try:
+            stat_text = (Path("/proc") / str(int(pid)) / "stat").read_text(
+                encoding="utf-8"
+            )
+            _prefix, separator, suffix = stat_text.rpartition(") ")
+            fields = suffix.split() if separator else []
+            # /proc/PID/stat field 22; suffix begins at field 3.
+            if len(fields) > 19:
+                start_time = fields[19]
+        except (OSError, RuntimeError, ValueError):
+            start_time = None
+    else:
+        try:
+            completed = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(int(pid))],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=3,
+            )
+            if completed.returncode == 0 and completed.stdout.strip():
+                start_time = completed.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            start_time = None
+    cwd_observation = process_cwd_observation(int(pid))
+    evidence = {
+        "pid": int(pid),
+        "process_start_time": start_time,
+        "project": canonical_project(project),
+        "cwd": cwd_observation.get("cwd"),
+        "cwd_observable": cwd_observation.get("observable"),
+        "host": host,
+        "port": int(port),
+    }
+    return start_time, "sha256:" + fingerprint(evidence)
+
+
+def _normalized_start_candidates(
+    *,
+    port_start: int,
+    port_end: int,
+    preferred: int | None,
+) -> list[int]:
+    candidates: list[int] = []
+    if preferred is not None:
+        candidates.append(int(preferred))
+    candidates.extend(
+        port
+        for port in range(int(port_start), int(port_end) + 1)
+        if port != preferred
+    )
+    return candidates
+
+
+def _coordinated_start_server_normalized(
+    options: dict[str, Any]
+) -> dict[str, Any]:
+    prepared = dict(options)
+    agent, project = require_identity(prepared, "server start")
+    name = str(prepared.get("name") or "").strip()
+    if not name:
+        raise ValueError("server start requires --name")
+    if prepared.get("lease_id") and (
+        prepared.get("argv") is None
+        or prepared.get("cmd")
+        or prepared.get("command")
+    ):
+        raise ValueError(
+            "server start --lease-id requires structured --argv and does not accept --cmd"
+        )
+    argv_template = command_argv(prepared)
+    cwd = str(Path(prepared.get("cwd") or project).expanduser().resolve())
+    if not Path(cwd).is_dir():
+        raise FileNotFoundError(
+            f"server cwd does not exist or is not a directory: {cwd}"
+        )
+    host = str(prepared.get("host") or "127.0.0.1")
+
+    with AccountStore.open_default(coordinator_home()) as store:
+        servers = NormalizedServerLifecycle(store)
+        try:
+            existing = servers.server(canonical_project=project, name=name)
+        except KeyError:
+            existing = None
+    if existing is not None:
+        existing_health = server_health(existing)
+        require_listener_identity_observable(
+            existing_health, action="start", server=existing
+        )
+        if existing_health.get("ok") is True:
+            with AccountStore.open_default(coordinator_home()) as store:
+                refreshed = NormalizedServerLifecycle(store).commit_status(
+                    server_definition_id=str(existing["id"]),
+                    expected_definition_generation=int(existing["generation"]),
+                    expected_observation_fingerprint=existing.get(
+                        "_observation_fingerprint"
+                    ),
+                    health=existing_health,
+                    stopped_reason=None,
+                )
+            return normalized_public_server(refreshed)
+        if existing.get("status") != "stopped" or pid_alive(
+            int(existing.get("pid") or 0)
+        ):
+            coordinated_stop_server(
+                {
+                    "server_id": existing["id"],
+                    "agent": agent,
+                    "project": project,
+                    "name": name,
+                    "release_port": True,
+                    "reason": "Replaced by coordinator start",
+                }
+            )
+
+    explicit_range = prepared.get("range") is not None
+    preferred = (
+        None if prepared.get("preferred") is None else int(prepared["preferred"])
+    )
+    manual_lease_id = str(prepared.get("lease_id") or "") or None
+    with AccountStore.open_default(coordinator_home()) as store:
+        ports = NormalizedPortLifecycle(store)
+        assignments = ports.list_assignments(
+            canonical_project=project, active_only=True
+        )
+        assignment = next(
+            (item for item in assignments if str(item["name"]) == name), None
+        )
+        if manual_lease_id:
+            lease = next(
+                (
+                    item
+                    for item in ports.list_leases(
+                        canonical_project=project, active_only=True
+                    )
+                    if str(item["id"]) == manual_lease_id
+                ),
+                None,
+            )
+            if lease is None:
+                raise KeyError(f"manual lease not found: {manual_lease_id}")
+            port_start = port_end = int(lease["port"])
+        elif assignment is not None and not explicit_range and preferred is None:
+            port_start = port_end = int(assignment["port"])
+            preferred = int(assignment["port"])
+        else:
+            port_start, port_end = parse_range(
+                str(prepared.get("range") or DEFAULT_RANGE)
+            )
+    candidates = _normalized_start_candidates(
+        port_start=port_start,
+        port_end=port_end,
+        preferred=preferred,
+    )
+    observed_available = [
+        candidate for candidate in candidates if port_available(candidate, host)
+    ]
+    if assignment is not None and not explicit_range and prepared.get("preferred") is None:
+        assigned_port = int(assignment["port"])
+        if assigned_port not in observed_available:
+            raise RuntimeError(
+                f"server '{name}' is pinned to port {assigned_port}, but that port is occupied; "
+                "free the port, or explicitly choose a range/preferred port to repin"
+            )
+    health_url_template = prepared.get("health_url")
+    environment_template = normalize_env(prepared.get("env") or [])
+    request = ServerStartRequest(
+        agent=agent,
+        canonical_project=project,
+        name=name,
+        cwd=cwd,
+        argv=tuple(argv_template),
+        environment=environment_template,
+        host=host,
+        health_url=(str(health_url_template) if health_url_template else None),
+        role=prepared.get("role"),
+        port_start=port_start,
+        port_end=port_end,
+        preferred=preferred,
+        ttl_seconds=int(prepared.get("ttl") or DEFAULT_TTL_SECONDS),
+        explicit_range=explicit_range,
+        manual_lease_id=manual_lease_id,
+    )
+    with AccountStore.open_default(coordinator_home()) as store:
+        reservation = NormalizedServerLifecycle(store).reserve_start(
+            request,
+            observed_available_ports=observed_available,
+        )
+    reserved_port = int(reservation["port"])
+    argv = format_argv(argv_template, port=reserved_port, host=host)
+    environment = dict(environment_template)
+    environment.setdefault("PORT", str(reserved_port))
+    environment.setdefault("HOST", host)
+    health_url = (
+        format_command(str(health_url_template), port=reserved_port, host=host)
+        if health_url_template
+        else None
+    )
+    try:
+        with AccountStore.open_default(coordinator_home()) as store:
+            reservation = NormalizedServerLifecycle(
+                store
+            ).finalize_reserved_start_definition(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(reservation["id"]),
+                definition_generation=int(reservation["_definition_generation"]),
+                argv=tuple(argv),
+                environment=environment,
+                health_url=health_url,
+            )
+            reservation["_manual_lease"] = bool(manual_lease_id)
+    except BaseException as definition_error:
+        with AccountStore.open_default(coordinator_home()) as store:
+            NormalizedServerLifecycle(store).fail_start(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(reservation["id"]),
+                error=f"reserved argv commit failed: {definition_error}",
+                process_launched=False,
+                process_active=False,
+                manual_lease=bool(manual_lease_id),
+            )
+        raise
+    launch = LaunchSpec(tuple(argv), cwd, environment, agent, project, "server_start")
+    pid: int | None = None
+    log_path: str | None = None
+    try:
+        pid, log_path = start_process(
+            launch=launch, server_id=str(reservation["id"])
+        )
+    except BaseException as launch_error:
+        with AccountStore.open_default(coordinator_home()) as store:
+            NormalizedServerLifecycle(store).fail_start(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(reservation["id"]),
+                error=f"Process launch failed: {launch_error}",
+                process_launched=False,
+                process_active=False,
+                manual_lease=bool(reservation.get("_manual_lease")),
+                log_path=str(logs_dir() / f"{reservation['id']}.log"),
+            )
+        raise
+
+    process_start_time, process_fingerprint = normalized_process_instance_evidence(
+        pid=int(pid), project=project, host=host, port=reserved_port
+    )
+    try:
+        with AccountStore.open_default(coordinator_home()) as store:
+            launched = NormalizedServerLifecycle(store).mark_start_launched(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(reservation["id"]),
+                definition_generation=int(reservation["_definition_generation"]),
+                pid=int(pid),
+                log_path=str(log_path),
+                process_start_time=process_start_time,
+                process_fingerprint=process_fingerprint,
+            )
+    except BaseException as commit_error:
+        cleanup_errors: list[str] = []
+        try:
+            stop_pid(int(pid))
+        except BaseException as cleanup_error:
+            cleanup_errors.append(
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        process_active = pid_alive(int(pid)) or not port_available(reserved_port, host)
+        with AccountStore.open_default(coordinator_home()) as store:
+            failed = NormalizedServerLifecycle(store).fail_start(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(reservation["id"]),
+                error=f"server launch commit failed: {commit_error}",
+                process_launched=True,
+                process_active=process_active,
+                manual_lease=bool(reservation.get("_manual_lease")),
+                pid=int(pid),
+                log_path=str(log_path),
+                cleanup_errors=cleanup_errors,
+            )
+        if cleanup_errors or process_active:
+            raise StructuredCoordinatorError(
+                "server launch committed on the host but cleanup is uncertain",
+                {
+                    "code": "server_start_cleanup_uncertain",
+                    "server": normalized_public_server(failed),
+                    "primary_error": f"{type(commit_error).__name__}: {commit_error}",
+                    "cleanup_errors": cleanup_errors,
+                },
+            ) from commit_error
+        raise
+
+    launched["created_ts"] = now()
+    health = wait_for_health(
+        launched, float(prepared.get("health_timeout") or 10)
+    )
+    health_unobservable = listener_identity_unobservable(health)
+    manual_health_failure = bool(manual_lease_id and health.get("ok") is not True)
+    if health_unobservable or manual_health_failure:
+        cleanup_errors = []
+        try:
+            stop_pid(int(pid))
+        except BaseException as cleanup_error:
+            cleanup_errors.append(
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        process_active = pid_alive(int(pid)) or not port_available(reserved_port, host)
+        reason = (
+            "listener identity is unobservable after server launch"
+            if health_unobservable
+            else f"server failed health check using manual lease {manual_lease_id}"
+        )
+        with AccountStore.open_default(coordinator_home()) as store:
+            failed = NormalizedServerLifecycle(store).fail_start(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(reservation["id"]),
+                error=reason,
+                process_launched=True,
+                process_active=process_active,
+                manual_lease=bool(manual_lease_id),
+                pid=int(pid),
+                log_path=str(log_path),
+                health=health,
+                cleanup_errors=cleanup_errors,
+            )
+        if health_unobservable:
+            raise ListenerIdentityUnobservable(
+                f"refusing to complete start for {name}: {reason}; "
+                f"cleanup reconciliation_required={bool(process_active or cleanup_errors)}"
+            )
+        raise StructuredCoordinatorError(
+            reason,
+            {
+                "code": "manual_lease_server_health_failed",
+                "server": normalized_public_server(failed),
+                "cleanup_errors": cleanup_errors,
+            },
+        )
+    with AccountStore.open_default(coordinator_home()) as store:
+        committed = NormalizedServerLifecycle(store).commit_start_health(
+            operation_id=str(reservation["operation_id"]),
+            server_definition_id=str(reservation["id"]),
+            definition_generation=int(reservation["_definition_generation"]),
+            health=health,
+        )
+    return normalized_public_server(committed)
+
+
+def _coordinated_register_server_normalized(
+    options: dict[str, Any]
+) -> dict[str, Any]:
+    prepared = dict(options)
+    agent, project = require_identity(prepared, "server register")
+    name = str(prepared.get("name") or "").strip()
+    if not name:
+        raise ValueError("server register requires --name")
+    host, port, url = parse_server_endpoint(prepared)
+    cwd = str(Path(prepared.get("cwd") or project).expanduser().resolve())
+    if not Path(cwd).is_dir():
+        raise FileNotFoundError(
+            f"server cwd does not exist or is not a directory: {cwd}"
+        )
+    command_template = prepared.get("cmd") or prepared.get("command")
+    argv_template = (
+        command_argv(prepared)
+        if command_template or prepared.get("argv") is not None
+        else []
+    )
+    argv = tuple(format_argv(argv_template, port=port, host=host))
+    environment = normalize_env(prepared.get("env") or [])
+    health_url_template = prepared.get("health_url") or url
+    health_url = (
+        format_command(str(health_url_template), port=port, host=host)
+        if health_url_template
+        else None
+    )
+    # Registration host proof happens before the server-specific operation is
+    # written. A caller-supplied live PID is never accepted without exact cwd
+    # and LISTEN ownership evidence.
+    pid, registration_identity = resolve_registration_pid(
+        prepared, host=host, port=port, project=project
+    )
+    candidate = {
+        "id": "registration-preflight",
+        "name": name,
+        "project": project,
+        "cwd": cwd,
+        "pid": int(pid) if pid else None,
+        "host": host,
+        "port": port,
+        "url": url,
+        "health_url": health_url,
+        "registration_identity": registration_identity,
+        "created_ts": now(),
+    }
+    health = wait_for_health(
+        candidate, float(prepared.get("health_timeout") or 3)
+    )
+    require_listener_identity_observable(
+        health, action="register", server=candidate
+    )
+    process_start_time = None
+    process_fingerprint = None
+    if pid:
+        # Re-run the exact listener proof after health probing so the retained
+        # PID cannot switch identity between preflight and durable commit.
+        registration_identity = registration_pid_identity(
+            pid=int(pid), host=host, port=port, project=project
+        )
+        process_start_time, process_fingerprint = normalized_process_instance_evidence(
+            pid=int(pid), project=project, host=host, port=port
+        )
+    with AccountStore.open_default(coordinator_home()) as store:
+        committed = NormalizedServerLifecycle(store).commit_registration(
+            ServerRegistrationRequest(
+                agent=agent,
+                canonical_project=project,
+                name=name,
+                cwd=cwd,
+                argv=argv,
+                environment=environment,
+                host=host,
+                port=port,
+                health_url=health_url,
+                role=prepared.get("role"),
+                pid=int(pid) if pid else None,
+                process_start_time=process_start_time,
+                process_fingerprint=process_fingerprint,
+                health=health,
+                ttl_seconds=int(prepared.get("ttl") or DEFAULT_TTL_SECONDS),
+                log_path=None,
+            )
+        )
+    result = normalized_public_server(committed)
+    if registration_identity is not None:
+        result["registration_identity"] = registration_identity
+    return result
+
+
+def _normalized_server_from_options(options: dict[str, Any]) -> dict[str, Any]:
+    project = (
+        canonical_project(str(options["project"]))
+        if options.get("project")
+        else None
+    )
+    with AccountStore.open_default(coordinator_home()) as store:
+        return NormalizedServerLifecycle(store).server(
+            canonical_project=project,
+            name=(str(options["name"]) if options.get("name") else None),
+            server_definition_id=(
+                str(options["server_id"]) if options.get("server_id") else None
+            ),
+        )
+
+
+def _coordinated_status_server_normalized(
+    options: dict[str, Any]
+) -> dict[str, Any]:
+    # A concurrent explicit host observation may commit the same server after
+    # this status call samples it. Re-read and re-observe a bounded number of
+    # times instead of surfacing that ordinary optimistic-CAS race to either
+    # Codex app instance. Every retry uses a fresh exact identity snapshot.
+    for attempt in range(3):
+        snapshot = _normalized_server_from_options(options)
+        health = server_health(snapshot, attempts=HEALTH_RETRY_ATTEMPTS)
+        reason = stop_reason_from_health(snapshot, health)
+        try:
+            with AccountStore.open_default(coordinator_home()) as store:
+                committed = NormalizedServerLifecycle(store).commit_status(
+                    server_definition_id=str(snapshot["id"]),
+                    expected_definition_generation=int(snapshot["generation"]),
+                    expected_observation_fingerprint=snapshot.get(
+                        "_observation_fingerprint"
+                    ),
+                    health=health,
+                    stopped_reason=reason,
+                )
+            return normalized_public_server(committed)
+        except NormalizedLifecycleConflict:
+            if attempt == 2:
+                raise
+    raise AssertionError("bounded normalized status retry did not return or raise")
+
+
+def _coordinated_server_logs_normalized(
+    options: dict[str, Any]
+) -> dict[str, Any]:
+    server = _normalized_server_from_options(options)
+    tail = int(options.get("tail") or 200)
+    log_path = Path(str(server.get("log_path") or ""))
+    text = tail_text(log_path, tail) if server.get("log_path") else ""
+    return {
+        "server": {
+            key: server.get(key)
+            for key in (
+                "id",
+                "name",
+                "project",
+                "status",
+                "url",
+                "port",
+                "stopped_at",
+                "stopped_reason",
+                "log_path",
+            )
+        },
+        "text": text,
+        "tail": tail,
+    }
+
+
+def _coordinated_stop_server_normalized(
+    options: dict[str, Any]
+) -> dict[str, Any]:
+    prepared = dict(options)
+    agent = str(prepared.get("agent") or "").strip()
+    if not agent:
+        raise ValueError(
+            "server stop requires --agent so the coordinator can attribute the action"
+        )
+    snapshot = _normalized_server_from_options(prepared)
+    project = canonical_project(
+        str(prepared.get("project") or snapshot.get("project") or "")
+    )
+    if canonical_project(str(snapshot.get("project") or "")) != project:
+        raise ValueError(
+            "server stop project does not match the registered server project"
+        )
+    prime_git_head_identity(project)
+    health = server_health(snapshot)
+    require_listener_identity_observable(
+        health, action="stop", server=snapshot
+    )
+    requested_release = bool(prepared.get("release_port", True))
+    broker_link = (
+        broker_lease_link_for_local(str(snapshot.get("lease_id")))
+        if requested_release and snapshot.get("lease_id")
+        else None
+    )
+    with AccountStore.open_default(coordinator_home()) as store:
+        reservation = NormalizedServerLifecycle(store).reserve_stop(
+            agent=agent,
+            server_definition_id=str(snapshot["id"]),
+            expected_definition_generation=int(snapshot["generation"]),
+            expected_observation_fingerprint=snapshot.get(
+                "_observation_fingerprint"
+            ),
+        )
+    identity_wrong = (health.get("identity") or {}).get("ok") is False
+    try:
+        if not identity_wrong and snapshot.get("pid"):
+            stop_pid(int(snapshot["pid"]))
+        final_health = server_health(snapshot)
+        if snapshot.get("pid") and not identity_wrong and final_health.get(
+            "pid_alive"
+        ) is not False:
+            raise RuntimeError(
+                f"server process {snapshot['pid']} did not reach a proved stopped boundary"
+            )
+        if listener_identity_unobservable(final_health):
+            raise ListenerIdentityUnobservable(
+                "listener identity became unobservable while proving server stop"
+            )
+    except BaseException as stop_error:
+        cleanup_errors: list[str] = []
+        try:
+            still_alive = bool(
+                snapshot.get("pid") and pid_alive(int(snapshot["pid"]))
+            )
+        except BaseException as observation_error:
+            still_alive = True
+            cleanup_errors.append(
+                f"{type(observation_error).__name__}: {observation_error}"
+            )
+        with AccountStore.open_default(coordinator_home()) as store:
+            failed = NormalizedServerLifecycle(store).fail_stop(
+                operation_id=str(reservation["operation_id"]),
+                server_definition_id=str(snapshot["id"]),
+                error=f"{type(stop_error).__name__}: {stop_error}",
+                cleanup_errors=cleanup_errors,
+            )
+        raise StructuredCoordinatorError(
+            "server stop outcome is uncertain",
+            {
+                "code": "server_stop_outcome_uncertain",
+                "server": normalized_public_server(failed),
+                "process_still_alive": still_alive,
+                "primary_error": f"{type(stop_error).__name__}: {stop_error}",
+                "cleanup_errors": cleanup_errors,
+            },
+        ) from stop_error
+    reason = (
+        stop_reason_from_health(snapshot, health)
+        if identity_wrong
+        else str(prepared.get("reason") or "Stopped by coordinator")
+    )
+    final_identity_wrong = (final_health.get("identity") or {}).get("ok") is False
+    with AccountStore.open_default(coordinator_home()) as store:
+        committed = NormalizedServerLifecycle(store).commit_stop(
+            operation_id=str(reservation["operation_id"]),
+            server_definition_id=str(snapshot["id"]),
+            agent=agent,
+            reason=reason,
+            release_port=requested_release and broker_link is None,
+            stale_lease=identity_wrong or final_identity_wrong,
+            final_health=final_health,
+        )
+    if broker_link is None:
+        return normalized_public_server(committed)
+    try:
+        broker_result = release_broker_lease_link(broker_link, rollback=False)
+    except BaseException as release_error:
+        raise StructuredCoordinatorError(
+            "server stopped, but its host-global broker lease could not be released",
+            {
+                "code": "broker_lease_release_pending",
+                "classification": "reconciliation_required",
+                "broker_lease_id": broker_link.broker_resource_id,
+                "server": normalized_public_server(committed),
+                "release_error": coordinator_exception_payload(release_error),
+                "action_required": (
+                    "Keep the local lease reserved and retry the exact broker "
+                    "release through the Coordinator skill."
+                ),
+            },
+        ) from release_error
+    try:
+        if snapshot.get("lease_id"):
+            with AccountStore.open_default(coordinator_home()) as store:
+                NormalizedPortLifecycle(store).release(
+                    agent=agent,
+                    canonical_project=project,
+                    lease_id=str(snapshot["lease_id"]),
+                )
+                committed = NormalizedServerLifecycle(store).server(
+                    server_definition_id=str(snapshot["id"])
+                )
+    except BaseException as local_release_error:
+        raise StructuredCoordinatorError(
+            "broker lease was released, but the local stopped-server lease record needs reconciliation",
+            {
+                "code": "local_lease_release_reconciliation_required",
+                "classification": "reconciliation_required",
+                "broker_lease_id": broker_link.broker_resource_id,
+                "broker_result": broker_result,
+                "local_error": (
+                    f"{type(local_release_error).__name__}: {local_release_error}"
+                ),
+            },
+        ) from local_release_error
+    result = normalized_public_server(committed)
+    result["broker"] = {
+        "lease_id": broker_link.broker_resource_id,
+        "status": "released",
+        "result": broker_result,
+    }
+    return result
+
+
+def _coordinated_restart_server_normalized(
+    options: dict[str, Any]
+) -> dict[str, Any]:
+    prepared = dict(options)
+    agent, project = require_identity(prepared, "server restart")
+    prepared["project"] = project
+    snapshot = _normalized_server_from_options(prepared)
+    if not snapshot.get("argv"):
+        raise RuntimeError(
+            f"server {snapshot.get('name')} is registered without a command; "
+            "missing_command=true"
+        )
+    health = server_health(snapshot)
+    require_listener_identity_observable(
+        health, action="restart", server=snapshot
+    )
+    fixed_port = int(snapshot.get("assigned_port") or snapshot["port"])
+    restart_options = {
+        "agent": agent,
+        "project": project,
+        "name": snapshot["name"],
+        "cwd": snapshot["cwd"],
+        "argv": list(snapshot["argv"]),
+        "range": prepared.get("range") or f"{fixed_port}-{fixed_port}",
+        "preferred": fixed_port,
+        "host": snapshot.get("host") or "127.0.0.1",
+        "health_url": snapshot.get("health_url"),
+        "health_timeout": prepared.get("health_timeout") or 10,
+        "env": [
+            f"{key}={value}"
+            for key, value in (snapshot.get("env") or {}).items()
+            if key not in {"PORT", "HOST"}
+        ],
+    }
+    coordinated_stop_server(
+        {
+            "server_id": snapshot["id"],
+            "agent": agent,
+            "project": project,
+            "name": snapshot["name"],
+            "release_port": True,
+            "reason": "Restarted by coordinator",
+        }
+    )
+    return coordinated_start_server(restart_options)
 
 
 def snapshot_runtime_observation(*, project: str | None = None) -> dict[str, Any]:
     """Reserve a monotonic per-server observation ticket and return its snapshot."""
 
+    if state_backend() != LEGACY_JSON_BACKEND:
+        with AccountStore.open_default(coordinator_home()) as store:
+            snapshot = normalized_control_snapshot_from_store(store)
+            servers = NormalizedServerLifecycle(store).list_servers(
+                canonical_project=(
+                    canonical_project(project) if project is not None else None
+                )
+            )
+        snapshot["servers"] = {
+            str(server["id"]): copy.deepcopy(server) for server in servers
+        }
+        return snapshot
     with locked_state() as state:
         for server in state.get("servers", {}).values():
             if project and str(server.get("project") or "") != project:
@@ -6011,6 +7718,72 @@ def merge_docker_stats_history(state: dict[str, Any], observed: dict[str, Any]) 
         del current[:-DOCKER_STATS_HISTORY_LIMIT]
 
 
+def persist_normalized_docker_stats(
+    store: AccountStore, samples: list[dict[str, Any]]
+) -> int:
+    """Persist measured Docker telemetry against exact normalized resources."""
+
+    inserted = 0
+    with store.immediate_transaction(revision_kind="observation") as connection:
+        for sample in samples:
+            native_id = str(
+                sample.get("container_id") or sample.get("id") or ""
+            ).strip()
+            sampled_at = str(sample.get("timestamp") or "").strip()
+            if not native_id or not sampled_at:
+                continue
+            matches = list(
+                connection.execute(
+                    """
+                    SELECT docker_resource_id, full_container_id
+                    FROM docker_resources
+                    WHERE lower(full_container_id) = lower(?)
+                       OR lower(full_container_id) LIKE lower(?) || '%'
+                    ORDER BY CASE WHEN lower(full_container_id) = lower(?)
+                                  THEN 0 ELSE 1 END,
+                             docker_resource_id
+                    LIMIT 2
+                    """,
+                    (native_id, native_id, native_id),
+                )
+            )
+            if not matches:
+                continue
+            exact = [
+                row
+                for row in matches
+                if str(row["full_container_id"]).lower() == native_id.lower()
+            ]
+            if not exact and len(matches) != 1:
+                continue
+            resource_id = str((exact or matches)[0]["docker_resource_id"])
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO telemetry_samples(
+                    sample_id, host_resource_kind, host_resource_id, sampled_at,
+                    cpu_percent, memory_bytes, network_rx_bytes, network_tx_bytes,
+                    block_read_bytes, block_write_bytes
+                ) VALUES (?, 'docker', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    deterministic_id(
+                        "telemetry", "docker", resource_id, sampled_at
+                    ),
+                    resource_id,
+                    sampled_at,
+                    sample.get("cpu_percent"),
+                    sample.get("memory_usage_bytes"),
+                    sample.get("network_rx_bytes"),
+                    sample.get("network_tx_bytes"),
+                    sample.get("block_read_bytes"),
+                    sample.get("block_write_bytes"),
+                ),
+            )
+            inserted += int(connection.total_changes > before)
+    return inserted
+
+
 def commit_runtime_observations(baseline: dict[str, Any], observed: dict[str, Any]) -> None:
     """Commit health/stat observations only when the observed server is current.
 
@@ -6018,6 +7791,43 @@ def commit_runtime_observations(baseline: dict[str, Any], observed: dict[str, An
     after the state lock has been released. This optimistic commit intentionally
     skips a server whose lifecycle generation changed while the checks ran.
     """
+
+    if state_backend() != LEGACY_JSON_BACKEND:
+        with AccountStore.open_default(coordinator_home()) as store:
+            lifecycle = NormalizedServerLifecycle(store)
+            baseline_servers = baseline.get("servers", {})
+            for server_id, observed_server in observed.get("servers", {}).items():
+                baseline_server = baseline_servers.get(server_id)
+                health = observed_server.get("health")
+                if not baseline_server or not isinstance(health, dict):
+                    continue
+                try:
+                    lifecycle.commit_status(
+                        server_definition_id=str(server_id),
+                        expected_definition_generation=int(
+                            baseline_server.get("generation") or 0
+                        ),
+                        expected_observation_fingerprint=baseline_server.get(
+                            "_observation_fingerprint"
+                        ),
+                        health=copy.deepcopy(health),
+                        stopped_reason=observed_server.get("stopped_reason"),
+                    )
+                except NormalizedLifecycleConflict:
+                    # The lifecycle changed while slow host observation ran.
+                    # Preserve the newer decision and skip this stale sample.
+                    continue
+            latest_samples: list[dict[str, Any]] = []
+            for history in (
+                observed.get("docker", {}).get("stats_history", {}) or {}
+            ).values():
+                if isinstance(history, list) and history:
+                    sample = history[-1]
+                    if isinstance(sample, dict):
+                        latest_samples.append(sample)
+            if latest_samples:
+                persist_normalized_docker_stats(store, latest_samples)
+        return
 
     with locked_state() as state:
         baseline_servers = baseline.get("servers", {})
@@ -6050,6 +7860,8 @@ def commit_runtime_observations(baseline: dict[str, Any], observed: dict[str, An
 
 
 def coordinated_status_server(options: dict[str, Any]) -> dict[str, Any]:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        return _coordinated_status_server_normalized(options)
     prepared = dict(options)
     if prepared.get("project"):
         prepared["project"] = canonical_project(str(prepared["project"]))
@@ -6061,15 +7873,19 @@ def coordinated_status_server(options: dict[str, Any]) -> dict[str, Any]:
 
 
 def coordinated_server_logs(options: dict[str, Any]) -> dict[str, Any]:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        return _coordinated_server_logs_normalized(options)
     prepared = dict(options)
     if prepared.get("project"):
         prepared["project"] = canonical_project(str(prepared["project"]))
     return server_logs(snapshot_coordinator_state(), prepared)
 
 
-def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
+def _coordinated_register_server_local(options: dict[str, Any]) -> dict[str, Any]:
     """Inspect and health-check an adopted server outside ``state.lock``."""
 
+    if state_backend() != LEGACY_JSON_BACKEND:
+        return _coordinated_register_server_normalized(options)
     prepared = dict(options)
     agent, project = require_identity(prepared, "server register")
     name = str(prepared.get("name") or "").strip()
@@ -6204,9 +8020,113 @@ def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
     return candidate
 
 
+@normalized_guarded_action(RepositoryAction.REGISTER, "server register")
+def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
+    """Adopt a listener through the host broker when cross-UID mode is active."""
+
+    prepared = dict(options)
+    agent, project = require_identity(prepared, "server register")
+    broker_context = configured_broker_context(project)
+    if broker_context is None:
+        return _coordinated_register_server_local(prepared)
+    profile, repository = broker_context
+    name = str(prepared.get("name") or "").strip()
+    if not name:
+        raise ValueError("server register requires --name")
+    _host, port, _url = parse_server_endpoint(prepared)
+    link, broker_result = acquire_broker_lease_link(
+        profile=profile,
+        repository=repository,
+        server_name=name,
+        requested_port=int(port),
+        ttl_seconds=int(prepared.get("ttl") or DEFAULT_TTL_SECONDS),
+        adopt_existing_listener=True,
+    )
+    try:
+        result = _coordinated_register_server_local(prepared)
+        local_lease_id = str(result.get("lease_id") or "")
+        if not local_lease_id:
+            raise RuntimeError(
+                "broker-verified listener registration produced no local lease identity"
+            )
+        bound = bind_broker_lease_link(link.link_id, local_lease_id)
+        if state_backend() == LEGACY_JSON_BACKEND:
+            with locked_state() as state:
+                local = state.get("leases", {}).get(local_lease_id)
+                current = state.get("servers", {}).get(result.get("id"))
+                if local is None or current is None:
+                    raise RuntimeError(
+                        "broker-verified registration committed without its exact local records"
+                    )
+                local["broker_lease_id"] = bound.broker_resource_id
+                local["broker_link_id"] = bound.link_id
+                local["broker_operation_id"] = bound.broker_operation_id
+                current["broker_lease_id"] = bound.broker_resource_id
+                current["broker_link_id"] = bound.link_id
+                result = copy.deepcopy(current)
+        else:
+            with AccountStore.open_default(coordinator_home()) as store:
+                local = next(
+                    (
+                        item
+                        for item in NormalizedPortLifecycle(store).list_leases(
+                            canonical_project=project, active_only=True
+                        )
+                        if str(item["id"]) == local_lease_id
+                    ),
+                    None,
+                )
+                if local is None:
+                    raise RuntimeError(
+                        "broker-verified registration committed without its exact local lease"
+                    )
+                result = normalized_public_server(
+                    NormalizedServerLifecycle(store).server(
+                        server_definition_id=str(result["id"])
+                    )
+                )
+    except BaseException as local_error:
+        # The adopted process pre-existed the coordinator call and must never
+        # be killed as rollback. If local registration did not commit, release
+        # only the broker lease. A committed-but-unlinked registration remains
+        # reserved for explicit reconciliation rather than guessing.
+        if "result" not in locals() or not result.get("lease_id"):
+            try:
+                release_broker_lease_link(link, rollback=True)
+            except BaseException as rollback_error:
+                raise StructuredCoordinatorError(
+                    "listener registration failed and broker lease rollback requires reconciliation",
+                    {
+                        "code": "broker_register_rollback_failed",
+                        "classification": "reconciliation_required",
+                        "broker_lease_id": link.broker_resource_id,
+                        "local_error": f"{type(local_error).__name__}: {local_error}",
+                        "rollback_error": f"{type(rollback_error).__name__}: {rollback_error}",
+                    },
+                ) from local_error
+        raise
+    return {
+        **result,
+        "broker": {
+            "lease_id": bound.broker_resource_id,
+            "link_id": bound.link_id,
+            "operation_id": bound.broker_operation_id,
+            "status": bound.status,
+            "listener_identity": broker_result.get("listener_identity"),
+        },
+    }
+
+
+@normalized_guarded_action(RepositoryAction.REGISTER, "docker register")
 def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, Any]:
     prepared = dict(options)
     agent, project = require_identity(prepared, "docker register")
+    if configured_broker_context(project) is not None:
+        raise BrokerProfileError(
+            "Docker registration in broker mode is service-owned: run a full service "
+            "observation and rerun Coordinator skill enrollment; client-side Docker "
+            "inspection and local ownership fallback are disabled"
+        )
     container = normalize_container_name(prepared.get("container"))
     if not container:
         raise ValueError("docker register requires --container")
@@ -6215,6 +8135,118 @@ def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, A
         raise RuntimeError(
             f"cannot register Docker metadata for {container}: immutable container identity was not verified"
         )
+    if state_backend() != LEGACY_JSON_BACKEND:
+        if prepared.get("dry_run"):
+            return {
+                "container": container,
+                "project": project,
+                "agent": agent,
+                "role": prepared.get("role"),
+                "metadata_source": "planned_normalized_observation",
+                "adopted": True,
+                "dry_run": True,
+            }
+        immutable_id = str((inspected or {}).get("Id") or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{12,64}", immutable_id):
+            raise RuntimeError(
+                f"cannot register Docker metadata for {container}: Docker omitted "
+                "the immutable full container id"
+            )
+        inspected_name = normalize_container_name((inspected or {}).get("Name"))
+        compose_project = compose_project_from_inspection(inspected)
+        with AccountStore.open_default(coordinator_home()) as store:
+            snapshot = normalized_control_snapshot_from_store(store)
+            docker = docker_ps_inventory(state=snapshot)
+            if docker.get("available") is not True:
+                raise RuntimeError(
+                    "cannot register Docker metadata without a complete Docker inventory: "
+                    f"{docker.get('error') or 'Docker is unavailable'}"
+                )
+            candidates = [
+                item
+                for item in docker.get("containers", [])
+                if str(item.get("full_id") or "").lower()
+                == immutable_id.lower()
+            ]
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    "the complete Docker inventory did not contain exactly the "
+                    f"inspected container {immutable_id}"
+                )
+            selected = candidates[0]
+            skipped = bool(compose_project and not prepared.get("force"))
+            if skipped:
+                selected["project"] = compose_project
+                selected["metadata_source"] = "docker_labels"
+            else:
+                selected["project"] = project
+                selected["metadata_source"] = "coordinator_sidecar"
+                selected["agent"] = agent
+                selected["role"] = prepared.get("role")
+                selected["adopted"] = True
+                selected["agent_metadata"] = agent_metadata(
+                    agent=agent,
+                    project=project,
+                    cwd=prepared.get("cwd"),
+                    source="docker_register",
+                )
+            sample = {"sampled_at": iso_timestamp(), "inventory": {"docker": docker}}
+            host_id = ensure_observation_host(store)
+            outcome = SingleFlightObserver(store).observe(
+                host_id=host_id,
+                observer_domain=f"docker-register:{immutable_id.lower()}",
+                sampler=lambda: sample,
+                commit=lambda connection, snapshot_id, measured: (
+                    commit_host_inventory_observation(
+                        connection,
+                        snapshot_id,
+                        measured,
+                        host_id=host_id,
+                        coordinator_home=str(coordinator_home()),
+                    )
+                ),
+            )
+            with store.read_transaction() as connection:
+                membership = connection.execute(
+                    """
+                    SELECT r.canonical_root
+                    FROM docker_resources d
+                    LEFT JOIN repository_memberships m
+                      ON m.resource_kind = 'container'
+                     AND m.host_resource_id = d.docker_resource_id
+                    LEFT JOIN repositories r USING(repo_id)
+                    WHERE lower(d.full_container_id) = lower(?)
+                    """,
+                    (immutable_id,),
+                ).fetchone()
+            if not skipped and (
+                membership is None
+                or canonical_project(str(membership[0] or "")) != project
+            ):
+                raise RuntimeError(
+                    "Docker observation found conflicting repository ownership; "
+                    "the container was not reassigned"
+                )
+        payload = {
+            "container": inspected_name or container,
+            "id": immutable_id[:12],
+            "project": compose_project if skipped else project,
+            "agent": agent,
+            "role": prepared.get("role"),
+            "metadata_source": (
+                "docker_labels" if skipped else "coordinator_sidecar"
+            ),
+            "adopted": not skipped,
+            "skipped": skipped,
+            "message": (
+                "container already has Docker Compose project metadata"
+                if skipped
+                else "container ownership recorded in normalized inventory"
+            ),
+            "snapshot_id": outcome.snapshot_id,
+            "updated_at": outcome.completed_at,
+        }
+        return payload
     prepared["_coordinator_inspected_container"] = inspected
     target_identity = (
         f"container-alias:{container}"
@@ -6262,6 +8294,22 @@ def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, A
 def coordinated_sample_docker_stats(*, dry_run: bool = False) -> dict[str, Any]:
     if dry_run:
         return sample_docker_stats({}, dry_run=True)
+    if state_backend() != LEGACY_JSON_BACKEND:
+        with AccountStore.open_default(coordinator_home()) as store:
+            state = normalized_control_snapshot_from_store(store)
+            result = sample_docker_stats(state)
+            samples = [
+                item
+                for item in result.get("stats", [])
+                if isinstance(item, dict)
+            ]
+            if samples:
+                result["persisted_samples"] = persist_normalized_docker_stats(
+                    store, samples
+                )
+            else:
+                result["persisted_samples"] = 0
+            return result
     baseline = snapshot_coordinator_state()
     observed = copy.deepcopy(baseline)
     result = sample_docker_stats(observed)
@@ -6277,6 +8325,12 @@ def coordinated_build_inventory(
     backup_dirs: list[str] | None = None,
     stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
 ) -> dict[str, Any]:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        return pure_normalized_inventory(
+            project=project,
+            include_docker=include_docker,
+            stats_history_limit=stats_history_limit,
+        )
     prepared_project = canonical_project(project) if project else None
     baseline = snapshot_runtime_observation(project=prepared_project)
     observed = copy.deepcopy(baseline)
@@ -6291,19 +8345,803 @@ def coordinated_build_inventory(
     return result
 
 
+def empty_normalized_inventory(*, project: str | None = None) -> dict[str, Any]:
+    resolved_project = canonical_project(project) if project else None
+    compatibility = {
+        "coordinator_home": str(coordinator_home()),
+        "state_path": str(coordinator_home() / NORMALIZED_DATABASE_NAME),
+        "project": resolved_project,
+        "urls": [],
+        "servers": [],
+        "leases": [],
+        "port_assignments": [],
+        "recent_events": [],
+        "docker": {"available": None, "containers": [], "postgres": []},
+        "postgres": [],
+        "backups": [],
+        "project_usage": [],
+    }
+    result = {
+        "schema_version": NORMALIZED_SCHEMA_VERSION,
+        "store": {
+            "schema_version": 1,
+            "state_revision": 0,
+            "observation_revision": 0,
+            "authority_mode": "sqlite",
+            "migration_state": "empty",
+        },
+        "repositories": [],
+        "coordinator_sources": [],
+        "docker_engines": [],
+        "memberships": [],
+        "resources": {
+            "servers": [],
+            "docker": [],
+            "docker_ports": [],
+            "databases": [],
+        },
+        "leases": [],
+        "port_assignments": [],
+        "backup_evidence": [],
+        "database_backups": [],
+        "database_restore_events": [],
+        "events": [],
+        "unassigned_resources": [],
+        "lifecycle_violations": [],
+        "observations": {
+            "servers": [],
+            "docker": [],
+            "databases": [],
+            "telemetry": [],
+            "snapshots": [],
+        },
+        "control_bindings": [],
+        "v1_compatibility": compatibility,
+    }
+    for key, value in compatibility.items():
+        result.setdefault(key, value)
+    return result
+
+
+def filter_normalized_inventory_project(
+    inventory: dict[str, Any], project: str | None
+) -> dict[str, Any]:
+    """Shape one pure normalized snapshot without sampling or persisting."""
+
+    if not project:
+        return inventory
+    resolved = canonical_project(project)
+    result = copy.deepcopy(inventory)
+    repositories = [
+        row for row in result.get("repositories", []) if row.get("canonical_root") == resolved
+    ]
+    repo_ids = {str(row.get("repo_id")) for row in repositories if row.get("repo_id")}
+    root_matched_violations = [
+        row
+        for row in result.get("lifecycle_violations", [])
+        if row.get("affected_canonical_root") == resolved
+    ]
+    repo_ids.update(
+        str(row.get("affected_repo_id"))
+        for row in root_matched_violations
+        if row.get("affected_repo_id")
+    )
+    scoped_lifecycle_violations = [
+        row
+        for row in result.get("lifecycle_violations", [])
+        if row.get("affected_canonical_root") == resolved
+        or str(row.get("affected_repo_id")) in repo_ids
+    ]
+    server_violation_ids = {
+        str(row.get("resource_id"))
+        for row in scoped_lifecycle_violations
+        if row.get("resource_kind") == "server" and row.get("resource_id")
+    }
+    docker_violation_ids = {
+        str(row.get("resource_id"))
+        for row in scoped_lifecycle_violations
+        if row.get("resource_kind") == "container" and row.get("resource_id")
+    }
+    result["repositories"] = repositories
+    result["memberships"] = [
+        row for row in result.get("memberships", []) if str(row.get("repo_id")) in repo_ids
+    ]
+    result["control_bindings"] = [
+        row for row in result.get("control_bindings", []) if str(row.get("repo_id")) in repo_ids
+    ]
+    result["leases"] = [
+        row for row in result.get("leases", []) if str(row.get("repo_id")) in repo_ids
+    ]
+    result["port_assignments"] = [
+        row
+        for row in result.get("port_assignments", [])
+        if str(row.get("repo_id")) in repo_ids
+    ]
+    resources = result.get("resources") if isinstance(result.get("resources"), dict) else {}
+    resources["servers"] = [
+        row
+        for row in resources.get("servers", [])
+        if str(row.get("repo_id")) in repo_ids
+        or str(row.get("server_definition_id")) in server_violation_ids
+    ]
+    server_ids = {
+        str(row.get("server_definition_id"))
+        for row in resources["servers"]
+        if row.get("server_definition_id")
+    }
+    repository_databases = [
+        row
+        for row in resources.get("databases", [])
+        if str(row.get("repo_id")) in repo_ids
+    ]
+    docker_scope_ids = {
+        str(row.get("host_resource_id"))
+        for row in result.get("memberships", [])
+        if row.get("resource_kind") in {"container", "docker"}
+        and row.get("host_resource_id")
+    }
+    docker_scope_ids.update(
+        str(row.get("docker_resource_id"))
+        for row in repository_databases
+        if row.get("docker_resource_id")
+    )
+    docker_scope_ids.update(
+        str(row.get("resource_id"))
+        for row in result.get("control_bindings", [])
+        if row.get("resource_kind") in {"container", "docker"}
+        and row.get("resource_id")
+    )
+    docker_scope_ids.update(docker_violation_ids)
+    resources["docker"] = [
+        row
+        for row in resources.get("docker", [])
+        if str(row.get("docker_resource_id")) in docker_scope_ids
+    ]
+    docker_ids = {
+        str(row.get("docker_resource_id"))
+        for row in resources["docker"]
+        if row.get("docker_resource_id")
+    }
+    docker_engine_ids = {
+        str(row.get("engine_id"))
+        for row in resources["docker"]
+        if row.get("engine_id")
+    }
+    result["docker_engines"] = [
+        row
+        for row in result.get("docker_engines", [])
+        if str(row.get("engine_id")) in docker_engine_ids
+    ]
+    resources["docker_ports"] = [
+        row
+        for row in resources.get("docker_ports", [])
+        if str(row.get("docker_resource_id")) in docker_ids
+    ]
+    resources["databases"] = [
+        row
+        for row in resources.get("databases", [])
+        if str(row.get("repo_id")) in repo_ids
+        or str(row.get("docker_resource_id")) in docker_ids
+    ]
+    database_ids = {
+        str(row.get("database_binding_id"))
+        for row in resources["databases"]
+        if row.get("database_binding_id")
+    }
+    result["resources"] = resources
+    result["unassigned_resources"] = []
+    result["lifecycle_violations"] = [
+        row
+        for row in result.get("lifecycle_violations", [])
+        if str(row.get("affected_repo_id")) in repo_ids
+        or row.get("affected_canonical_root") == resolved
+        or (
+            row.get("resource_kind") == "server"
+            and str(row.get("resource_id")) in server_ids
+        )
+        or (
+            row.get("resource_kind") == "container"
+            and str(row.get("resource_id")) in docker_ids
+        )
+    ]
+    observations = (
+        result.get("observations")
+        if isinstance(result.get("observations"), dict)
+        else {}
+    )
+    observations["servers"] = [
+        row
+        for row in observations.get("servers", [])
+        if str(row.get("server_definition_id")) in server_ids
+    ]
+    observations["docker"] = [
+        row
+        for row in observations.get("docker", [])
+        if str(row.get("docker_resource_id")) in docker_ids
+    ]
+    observations["databases"] = [
+        row
+        for row in observations.get("databases", [])
+        if str(row.get("database_binding_id")) in database_ids
+    ]
+    observations["telemetry"] = [
+        row
+        for row in observations.get("telemetry", [])
+        if (
+            row.get("host_resource_kind") == "server"
+            and str(row.get("host_resource_id")) in server_ids
+        )
+        or (
+            row.get("host_resource_kind") in {"docker", "container"}
+            and str(row.get("host_resource_id")) in docker_ids
+        )
+        or (
+            row.get("host_resource_kind") == "database"
+            and str(row.get("host_resource_id")) in database_ids
+        )
+    ]
+    # Observation snapshots are host-global sampler runs and cannot be
+    # truthfully attributed to one project.
+    observations["snapshots"] = []
+    result["observations"] = observations
+    result["backup_evidence"] = [
+        row
+        for row in result.get("backup_evidence", [])
+        if str(row.get("repo_id")) in repo_ids
+    ]
+    result["database_backups"] = [
+        row
+        for row in result.get("database_backups", [])
+        if str(row.get("repo_id")) in repo_ids
+        or str(row.get("database_binding_id")) in database_ids
+        or str(row.get("docker_resource_id")) in docker_ids
+    ]
+    database_backup_ids = {
+        str(row.get("database_backup_id"))
+        for row in result["database_backups"]
+        if row.get("database_backup_id")
+    }
+    result["database_restore_events"] = [
+        row
+        for row in result.get("database_restore_events", [])
+        if str(row.get("database_backup_id")) in database_backup_ids
+        or str(row.get("safety_database_backup_id")) in database_backup_ids
+        or str(row.get("target_database_binding_id")) in database_ids
+        or str(row.get("target_docker_resource_id")) in docker_ids
+    ]
+    result["events"] = [
+        row for row in result.get("events", []) if str(row.get("repo_id")) in repo_ids
+    ]
+    source_ids = {
+        str(row.get("source_id"))
+        for rows in (
+            result.get("control_bindings", []),
+            result.get("leases", []),
+            result.get("backup_evidence", []),
+            result.get("database_backups", []),
+            result.get("events", []),
+        )
+        for row in rows
+        if row.get("source_id")
+    }
+    result["coordinator_sources"] = [
+        row
+        for row in result.get("coordinator_sources", [])
+        if str(row.get("source_id")) in source_ids
+    ]
+    result["project"] = resolved
+    compatibility = copy.deepcopy(result.get("v1_compatibility") or {})
+    for key in (
+        "leases",
+        "port_assignments",
+        "recent_events",
+        "backups",
+        "project_usage",
+    ):
+        compatibility[key] = [
+            row for row in compatibility.get(key, []) if row.get("project") == resolved
+        ]
+    compatibility["servers"] = [
+        row
+        for row in compatibility.get("servers", [])
+        if (
+            str(row.get("id")) in server_ids
+            if row.get("id")
+            else row.get("project") == resolved
+        )
+    ]
+    compatibility["project"] = resolved
+    retained_server_url_keys = {
+        (
+            row.get("name"),
+            row.get("url"),
+            row.get("health_url"),
+            row.get("status"),
+        )
+        for row in compatibility["servers"]
+        if row.get("url") is not None and row.get("url_is_current")
+    }
+    compatibility["urls"] = [
+        row
+        for row in compatibility.get("urls", [])
+        if row.get("project") == resolved
+        or (
+            row.get("name"),
+            row.get("url"),
+            row.get("health_url"),
+            row.get("status"),
+        )
+        in retained_server_url_keys
+    ]
+    containers = [
+        row
+        for row in (compatibility.get("docker") or {}).get("containers", [])
+        if (
+            str(row.get("host_resource_id")) in docker_ids
+            if row.get("host_resource_id")
+            else row.get("project") == resolved
+        )
+    ]
+    postgres = [
+        row
+        for row in compatibility.get("postgres", [])
+        if (
+            str(row.get("database_binding_id")) in database_ids
+            if row.get("database_binding_id")
+            else (
+                str(row.get("host_resource_id")) in docker_ids
+                if row.get("host_resource_id")
+                else row.get("project") == resolved
+            )
+        )
+    ]
+    compatibility["docker"] = {
+        **(compatibility.get("docker") or {}),
+        "containers": containers,
+        "postgres": postgres,
+    }
+    compatibility["postgres"] = postgres
+    result["v1_compatibility"] = compatibility
+    for key, value in compatibility.items():
+        if key not in {"leases", "port_assignments"}:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def pure_normalized_inventory(
+    *,
+    project: str | None = None,
+    include_docker: bool = True,
+    stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
+) -> dict[str, Any]:
+    """Return one query-only account-store snapshot.
+
+    A missing database is represented as an empty normalized graph rather than
+    being created by a read. `observe` is the explicit bootstrap/write path.
+    """
+
+    database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
+    if not database_path.exists():
+        return empty_normalized_inventory(project=project)
+    with AccountStore.open_default(coordinator_home()) as store:
+        result = store.inventory_v2()
+    result = filter_normalized_inventory_project(result, project)
+    if not include_docker:
+        result["docker"] = {"available": None, "containers": [], "postgres": []}
+        result["postgres"] = []
+        result["v1_compatibility"]["docker"] = copy.deepcopy(result["docker"])
+        result["v1_compatibility"]["postgres"] = []
+    if stats_history_limit < DOCKER_STATS_HISTORY_LIMIT:
+        for container in result.get("docker", {}).get("containers", []):
+            history = list(container.get("stats_history") or [])
+            container["stats_history"] = history[-stats_history_limit:] if stats_history_limit else []
+    return result
+
+
+def discover_same_uid_legacy_homes(
+    *, explicit_homes: list[str] | None = None
+) -> list[Path]:
+    """Find migration-only JSON homes owned by this effective account."""
+
+    uid = os.geteuid()
+    candidates: set[Path] = set()
+    if explicit_homes is not None:
+        candidates.update(Path(item).expanduser().absolute() for item in explicit_homes)
+    else:
+        account_home = posix_account_home()
+        candidates.add(account_home / ".codex" / "agent-coordinator")
+        candidates.add(account_home / ".claude" / "agent-coordinator")
+        parall_root = account_home / "Library" / "Application Support" / "Parall"
+        if parall_root.is_dir() and not parall_root.is_symlink():
+            # Bound discovery to known application state suffixes. rglob is
+            # migration-only and candidates still pass the importer's strict
+            # no-symlink/private-owner checks.
+            for state_file in parall_root.rglob(".codex/agent-coordinator/state.json"):
+                candidates.add(state_file.parent)
+    safe: list[Path] = []
+    for candidate in sorted(candidates, key=str):
+        state_file = candidate / "state.json"
+        try:
+            home_metadata = candidate.lstat()
+            state_metadata = state_file.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISLNK(home_metadata.st_mode)
+            or not stat.S_ISDIR(home_metadata.st_mode)
+            or home_metadata.st_uid != uid
+            or stat.S_IMODE(home_metadata.st_mode) != 0o700
+            or stat.S_ISLNK(state_metadata.st_mode)
+            or not stat.S_ISREG(state_metadata.st_mode)
+            or state_metadata.st_uid != uid
+            or stat.S_IMODE(state_metadata.st_mode) != 0o600
+        ):
+            continue
+        safe.append(candidate)
+    return safe
+
+
+def bootstrap_legacy_import(
+    store: AccountStore,
+    *,
+    explicit_homes: list[str] | None = None,
+    backup_root: str | None = None,
+) -> dict[str, Any]:
+    candidates = discover_same_uid_legacy_homes(explicit_homes=explicit_homes)
+    reconciliation = store.reconcile_imported_legacy_conflicts()
+    with store.read_transaction() as connection:
+        imported_homes = {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT canonical_home FROM coordinator_sources
+                WHERE captured_sha256 IS NOT NULL AND status IN ('imported', 'retired')
+                """
+            )
+        }
+    pending = [candidate for candidate in candidates if str(candidate) not in imported_homes]
+    if not pending:
+        return {
+            "attempted": bool(reconciliation.attempted),
+            "source_count": int(reconciliation.source_count),
+            "committed": bool(reconciliation.committed),
+            "conflict_count": int(reconciliation.conflict_count),
+            "blocking_conflict_count": int(
+                reconciliation.blocking_conflict_count
+            ),
+            "reclassified_conflict_count": int(
+                reconciliation.reclassified_count
+            ),
+            "destination_generation": reconciliation.destination_generation,
+            "late_writer_sources": list(store.detect_late_legacy_writers()),
+        }
+    root = Path(backup_root).expanduser().absolute() if backup_root else coordinator_home() / "legacy-import-backups"
+    report = store.import_legacy_homes(pending, root)
+    with store.read_transaction() as connection:
+        aggregate_conflicts = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT conflict_kind, severity FROM migration_conflicts
+                WHERE disposition='open'
+                ORDER BY conflict_kind, conflict_id
+                """
+            )
+        ]
+    return {
+        "attempted": True,
+        "committed": bool(report.committed),
+        "source_count": int(report.source_count) + int(reconciliation.source_count),
+        "repository_count": int(report.repository_count),
+        "missing_repository_count": int(report.missing_repository_count),
+        "unassigned_count": int(report.unassigned_count),
+        "exact_duplicate_count": int(report.exact_duplicate_count),
+        "conflict_count": len(aggregate_conflicts),
+        "blocking_conflict_count": sum(
+            1 for item in aggregate_conflicts if item["severity"] == "blocking"
+        ),
+        "conflict_kinds": sorted(
+            {str(item["conflict_kind"]) for item in aggregate_conflicts}
+        ),
+        "destination_generation": report.destination_generation,
+        "reclassified_conflict_count": int(reconciliation.reclassified_count),
+        "late_writer_sources": list(store.detect_late_legacy_writers()),
+    }
+
+
+def ensure_observation_host(store: AccountStore) -> str:
+    """Create the local-host row only when it is actually absent."""
+
+    machine = f"{platform.system()}\x1f{platform.node()}\x1f{socket.gethostname()}"
+    machine_fingerprint = hashlib.sha256(machine.encode("utf-8")).hexdigest()
+    host_id = deterministic_id("host", machine_fingerprint)
+    with store.read_transaction() as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM hosts WHERE host_id = ?", (host_id,)
+        ).fetchone()
+    if exists is None:
+        return store.ensure_local_host()
+    return host_id
+
+
+def latest_fresh_observation(
+    store: AccountStore,
+    *,
+    host_id: str,
+    observer_domain: str,
+    max_age_seconds: float,
+) -> ObservationOutcome | None:
+    if max_age_seconds <= 0:
+        return None
+    with store.read_transaction() as connection:
+        row = connection.execute(
+            """
+            SELECT snapshot_id, material_fingerprint, completed_at
+            FROM observation_snapshots
+            WHERE host_id = ? AND observer_domain = ? AND status = 'completed'
+            ORDER BY completed_at DESC LIMIT 1
+            """,
+            (host_id, observer_domain),
+        ).fetchone()
+    if row is None or not row[2]:
+        return None
+    try:
+        completed = datetime.fromisoformat(str(row[2]).replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+    if (datetime.now(timezone.utc) - completed).total_seconds() > max_age_seconds:
+        return None
+    return ObservationOutcome(
+        snapshot_id=str(row[0]),
+        host_id=host_id,
+        observer_domain=observer_domain,
+        joined=True,
+        material_fingerprint=str(row[1]),
+        completed_at=str(row[2]),
+    )
+
+
+def observation_domain_for_scope(
+    *, include_docker: bool, backup_dirs: list[str] | None
+) -> str:
+    """Return one deterministic single-flight/freshness domain per sample scope."""
+
+    base = (
+        OBSERVER_DOMAIN_FULL_DOCKER
+        if include_docker
+        else OBSERVER_DOMAIN_NO_DOCKER
+    )
+    canonical_backups = sorted(
+        {
+            str(Path(value).expanduser().resolve())
+            for value in (backup_dirs or [])
+        }
+    )
+    if not canonical_backups:
+        return base
+    digest = hashlib.sha256(
+        json.dumps(canonical_backups, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"{base}:backups-{digest}"
+
+
+def sample_host_inventory_for_normalized_store(
+    store: AccountStore,
+    *,
+    include_docker: bool,
+    backup_dirs: list[str] | None,
+) -> dict[str, Any]:
+    state = normalized_control_snapshot_from_store(store)
+    state["servers"] = {
+        str(server["id"]): server
+        for server in NormalizedServerLifecycle(store).list_servers()
+    }
+    inventory = build_inventory(
+        state,
+        project=None,
+        include_docker=include_docker,
+        backup_dirs=backup_dirs,
+        stats_history_limit=DOCKER_STATS_HISTORY_LIMIT,
+    )
+    if include_docker:
+        postgres_ids = {
+            str(item.get("full_id") or item.get("id") or "")
+            for item in inventory.get("docker", {}).get("postgres", [])
+        }
+        for container in inventory.get("docker", {}).get("containers", []):
+            identity = str(container.get("full_id") or container.get("id") or "")
+            if identity not in postgres_ids:
+                continue
+            databases, error = discover_postgres_databases(container)
+            container["databases"] = databases
+            if error:
+                container["database_discovery_error"] = error
+    return {"sampled_at": iso_timestamp(), "inventory": inventory}
+
+
+def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
+    if state_backend() == LEGACY_JSON_BACKEND:
+        raise RuntimeError("explicit host observation requires the normalized SQLite backend")
+    agent, project = require_identity(options, "observe")
+    max_age_seconds = float(options.get("max_age_seconds") or 0)
+    if not 0 <= max_age_seconds <= 24 * 60 * 60:
+        raise ValueError("--max-age-seconds must be between 0 and 86400")
+    with AccountStore.open_default(coordinator_home()) as store:
+        imported = bootstrap_legacy_import(
+            store,
+            explicit_homes=options.get("legacy_home"),
+            backup_root=options.get("legacy_backup_root"),
+        )
+        host_id = ensure_observation_host(store)
+        include_docker = not bool(options.get("no_docker"))
+        observer_domain = observation_domain_for_scope(
+            include_docker=include_docker,
+            backup_dirs=options.get("backup_dir"),
+        )
+        fresh = latest_fresh_observation(
+            store,
+            host_id=host_id,
+            observer_domain=observer_domain,
+            max_age_seconds=max_age_seconds,
+        )
+        observed = fresh is None
+        if fresh is None:
+            observer = SingleFlightObserver(store)
+            outcome = observer.observe(
+                host_id=host_id,
+                observer_domain=observer_domain,
+                sampler=lambda: sample_host_inventory_for_normalized_store(
+                    store,
+                    include_docker=include_docker,
+                    backup_dirs=options.get("backup_dir"),
+                ),
+                commit=lambda connection, snapshot_id, sample: commit_host_inventory_observation(
+                    connection,
+                    snapshot_id,
+                    sample,
+                    host_id=host_id,
+                    coordinator_home=str(coordinator_home()),
+                ),
+            )
+        else:
+            outcome = fresh
+        metadata = store.metadata
+        return {
+            "schema_version": NORMALIZED_SCHEMA_VERSION,
+            "status": "completed" if observed else "fresh",
+            "observed": observed,
+            "joined": bool(outcome.joined),
+            "snapshot_id": outcome.snapshot_id,
+            "host_id": outcome.host_id,
+            "observer_domain": outcome.observer_domain,
+            "material_fingerprint": outcome.material_fingerprint,
+            "completed_at": outcome.completed_at,
+            "max_age_seconds": max_age_seconds,
+            "request": {"agent": agent, "project": project},
+            "imported": imported,
+            "state_revision": metadata.state_revision,
+            "observation_revision": metadata.observation_revision,
+        }
+
+
+def observe_broker_service_store_for_enrollment(
+    store: AccountStore,
+) -> dict[str, Any]:
+    """Run one full service-owned observation before publishing client ACLs.
+
+    Enrollment is an administrator transaction journey: the repository and
+    runtime definitions exist first, then the service observes Docker once,
+    then exact grants/profile mappings are derived.  A failed observation
+    aborts before a client profile is installed.
+    """
+
+    host_id = ensure_observation_host(store)
+    observer = SingleFlightObserver(store)
+    outcome = observer.observe(
+        host_id=host_id,
+        observer_domain=OBSERVER_DOMAIN_FULL_DOCKER,
+        sampler=lambda: sample_host_inventory_for_normalized_store(
+            store,
+            include_docker=True,
+            backup_dirs=None,
+        ),
+        commit=lambda connection, snapshot_id, sample: commit_host_inventory_observation(
+            connection,
+            snapshot_id,
+            sample,
+            host_id=host_id,
+            coordinator_home=str(store.database_path.parent),
+        ),
+    )
+    with store.read_transaction() as connection:
+        capability = connection.execute(
+            """
+            SELECT docker_available, capability_fingerprint, committed_at
+            FROM observation_capabilities
+            WHERE snapshot_id = ? AND observer_domain = ?
+            """,
+            (outcome.snapshot_id, OBSERVER_DOMAIN_FULL_DOCKER),
+        ).fetchone()
+    if capability is None:
+        raise RuntimeError(
+            "completed broker observation lacks exact committed Docker capability evidence"
+        )
+    return {
+        "observer_domain": OBSERVER_DOMAIN_FULL_DOCKER,
+        "snapshot_id": outcome.snapshot_id,
+        "joined": bool(outcome.joined),
+        "completed_at": outcome.completed_at,
+        "material_fingerprint": outcome.material_fingerprint,
+        "docker_available": bool(capability["docker_available"]),
+        "capability_fingerprint": str(capability["capability_fingerprint"]),
+        "capability_committed_at": str(capability["committed_at"]),
+    }
+
+
+def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
+    """Synchronize one repository into the service broker and publish trust."""
+
+    project = canonical_project(str(args.project))
+    start_port, end_port = parse_range(str(args.port_range))
+    profile_output = (
+        Path(str(args.profile_output)).expanduser()
+        if args.profile_output
+        else SYSTEM_PROFILE_PATH
+    )
+    specification = build_project_runtime_spec(
+        {"servers": {}, "docker": {}, "leases": {}, "port_assignments": {}},
+        project=project,
+        runtime_file=args.runtime_file,
+        include_docker=False,
+    )
+    servers = list(specification.get("servers") or [])
+    compose = specification.get("compose")
+    result = enroll_repository(
+        database_path=Path(str(args.database)).expanduser().absolute(),
+        socket_path=Path(str(args.socket)).expanduser().absolute(),
+        socket_gid=int(args.access_gid),
+        client_uid=int(args.client_uid),
+        account_id=str(args.account_id),
+        canonical_root=project,
+        servers=servers,
+        port_start=start_port,
+        port_end=end_port,
+        profile_path=profile_output.absolute(),
+        compose=compose if isinstance(compose, dict) else None,
+        observe_host=observe_broker_service_store_for_enrollment,
+        explicit_reinstall=bool(args.explicit_reinstall),
+        validity_seconds=int(args.profile_valid_days) * 24 * 60 * 60,
+    )
+    result["observation"] = {
+        "scope": OBSERVER_DOMAIN_FULL_DOCKER,
+        "completed_before_profile_publish": True,
+    }
+    result["runtime_file"] = specification.get("runtime_file")
+    result["agent"] = str(args.agent)
+    return result
+
+
 def observe_project_runtime(
     options: dict[str, Any], *, action: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     prepared = dict(options)
     prepared["project"] = canonical_project(str(prepared["project"]))
+    broker_configured = configured_broker_context(prepared["project"]) is not None
     baseline = snapshot_runtime_observation(project=prepared["project"])
     observed = copy.deepcopy(baseline)
     spec = build_project_runtime_spec(
         observed,
         project=prepared["project"],
         runtime_file=prepared.get("runtime_file"),
+        include_docker=not broker_configured,
     )
     report = project_runtime_report(observed, spec, action=action)
+    if broker_configured and project_docker_requirement_reasons(spec):
+        report["docker_observation"] = {
+            "authority": "host_broker",
+            "client_docker_required": False,
+            "status": "service_observation_required",
+        }
     commit_runtime_observations(baseline, observed)
     return spec, report
 
@@ -6312,7 +9150,16 @@ def begin_project_operation(options: dict[str, Any], action: str) -> tuple[dict[
     prepared = dict(options)
     agent, project = require_identity(prepared, f"project {action}")
     if not prepared.get("dry_run"):
-        preflight_state = snapshot_coordinator_state()
+        # The normalized compatibility projection deliberately omits private
+        # definition generations, active lease IDs, and other CAS fields.
+        # Compare direct lifecycle rows before and after the slow listener
+        # identity preflight; mixing the compatibility shape with the direct
+        # shape would reject every stable managed server as a false TOCTOU.
+        preflight_state = (
+            snapshot_runtime_observation(project=project)
+            if state_backend() != LEGACY_JSON_BACKEND
+            else snapshot_coordinator_state()
+        )
         preflight_spec = build_project_runtime_spec(
             preflight_state,
             project=project,
@@ -6325,6 +9172,78 @@ def begin_project_operation(options: dict[str, Any], action: str) -> tuple[dict[
         )
     else:
         preflight_fingerprints = {}
+    if state_backend() != LEGACY_JSON_BACKEND:
+        stack = _normalized_guard_stack()
+        active = next(
+            (
+                item
+                for item in reversed(stack)
+                if item.get("project") == project
+            ),
+            None,
+        )
+        if active is None:
+            raise RuntimeError(
+                f"project {action} requires a normalized repository action guard"
+            )
+        if not prepared.get("dry_run"):
+            current = snapshot_runtime_observation(project=project)
+            current_fingerprints = {
+                str(server_id): server_lifecycle_fingerprint(server)
+                for server_id, server in current.get("servers", {}).items()
+                if str(server.get("project") or "") == project
+            }
+            if current_fingerprints != preflight_fingerprints:
+                raise RuntimeError(
+                    f"project {action} server lifecycle changed during listener "
+                    "identity preflight; retry"
+                )
+        operation = {
+            "id": str(uuid.uuid4()),
+            "permit_id": str(active["permit_id"]),
+            "project": project,
+            "agent": agent,
+            "action": f"project.{action}",
+        }
+        timestamp = utc_timestamp()
+        request = {
+            "permit_id": operation["permit_id"],
+            "project": project,
+            "agent": agent,
+            "action": operation["action"],
+            "runtime_file": prepared.get("runtime_file"),
+            "dry_run": bool(prepared.get("dry_run")),
+        }
+        with AccountStore.open_default(coordinator_home()) as store:
+            with store.immediate_transaction() as connection:
+                permit = connection.execute(
+                    "SELECT status FROM operations WHERE operation_id = ? "
+                    "AND repo_id = ? AND status = 'running'",
+                    (operation["permit_id"], str(active["repo_id"])),
+                ).fetchone()
+                if permit is None:
+                    raise RuntimeError("normalized project action permit disappeared")
+                connection.execute(
+                    """
+                    INSERT INTO operations(
+                        operation_id, repo_id, kind, status, phase, generation,
+                        request_fingerprint, owner_uid, actor, result_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, 'running', 'executing', 0, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        operation["id"],
+                        str(active["repo_id"]),
+                        operation["action"],
+                        fingerprint(request),
+                        os.geteuid(),
+                        agent,
+                        json.dumps(request, separators=(",", ":"), sort_keys=True),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+        return prepared, operation
     target = f"project:{project}"
     operation_action = f"project.{action}"
     with locked_state() as state:
@@ -6368,6 +9287,61 @@ def finish_project_operation(
     result: dict[str, Any] | None = None,
     error: BaseException | None = None,
 ) -> None:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        with AccountStore.open_default(coordinator_home()) as store:
+            with store.immediate_transaction() as connection:
+                operation = connection.execute(
+                    "SELECT result_json FROM operations WHERE operation_id = ? "
+                    "AND status = 'running'",
+                    (operation_id,),
+                ).fetchone()
+                if operation is None:
+                    return
+                payload = json.loads(str(operation[0] or "{}"))
+                if result is not None:
+                    payload["project_result"] = {
+                        "action": result.get("action"),
+                        "ok": result.get("ok"),
+                        "classification": result.get("classification"),
+                        "action_error_count": len(
+                            result.get("action_errors") or []
+                        ),
+                        "service_count": len(result.get("services") or []),
+                        "partial": bool(result.get("partial")),
+                        "preflight_failed": bool(result.get("preflight_failed")),
+                    }
+                if error is not None:
+                    payload["failure"] = coordinator_exception_payload(error)
+                incomplete = bool(result is not None and result.get("ok") is False)
+                status = "failed" if error is not None or incomplete else "succeeded"
+                phase = (
+                    "failed"
+                    if error is not None
+                    else ("committed-incomplete" if incomplete else "committed")
+                )
+                connection.execute(
+                    "UPDATE operations SET status = ?, phase = ?, result_json = ?, "
+                    "error_code = ?, error_message = ?, updated_at = ? "
+                    "WHERE operation_id = ? AND status = 'running'",
+                    (
+                        status,
+                        phase,
+                        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+                        (
+                            str(payload["failure"].get("code") or "project_action_failed")
+                            if error is not None
+                            else ("project_action_incomplete" if incomplete else None)
+                        ),
+                        (
+                            str(payload["failure"].get("error") or error)
+                            if error is not None
+                            else ("project action reported an incomplete result" if incomplete else None)
+                        ),
+                        utc_timestamp(),
+                        operation_id,
+                    ),
+                )
+        return
     with locked_state() as state:
         operation = state.get("operations", {}).get(operation_id)
         if not operation or operation.get("status") != "pending":
@@ -6395,6 +9369,42 @@ def finish_project_operation(
 
 
 def record_project_status_evidence(report: dict[str, Any]) -> None:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        project = canonical_project(str(report.get("project") or ""))
+        with AccountStore.open_default(coordinator_home()) as store:
+            with store.immediate_transaction() as connection:
+                repository = connection.execute(
+                    "SELECT repo_id FROM repositories WHERE canonical_root = ? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (project,),
+                ).fetchone()
+                diagnostic = {
+                    "project": project,
+                    "runtime_id": report.get("runtime_id"),
+                    "ok": report.get("ok"),
+                    "classification": report.get("classification"),
+                    "service_count": len(report.get("services") or []),
+                    "at": iso_timestamp(),
+                }
+                connection.execute(
+                    """
+                    INSERT INTO events(
+                        event_id, repo_id, source_id, operation_id, event_kind,
+                        code, message, diagnostic_json, occurred_at
+                    ) VALUES (?, ?, NULL, NULL, 'project.status',
+                              'project_status_observed', ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        str(repository[0]) if repository is not None else None,
+                        f"Project runtime status observed for {project}",
+                        json.dumps(
+                            diagnostic, separators=(",", ":"), sort_keys=True
+                        ),
+                        utc_timestamp(),
+                    ),
+                )
+        return
     with locked_state() as state:
         record_event(
             state,
@@ -6421,6 +9431,39 @@ def coordinated_reclaim_runtime_port(*, project: str, port: int, reason: str) ->
 
     if not port_available(port):
         return []
+    if state_backend() != LEGACY_JSON_BACKEND:
+        canonical = canonical_project(project)
+        released: list[dict[str, Any]] = []
+        with AccountStore.open_default(coordinator_home()) as store:
+            ports = NormalizedPortLifecycle(store)
+            servers = {
+                str(server["id"]): server
+                for server in NormalizedServerLifecycle(store).list_servers(
+                    canonical_project=canonical
+                )
+            }
+            candidates = [
+                lease
+                for lease in ports.list_leases(
+                    canonical_project=canonical, active_only=True
+                )
+                if int(lease.get("port") or 0) == int(port)
+                and str(lease.get("purpose") or "").startswith("server:")
+            ]
+            for lease in candidates:
+                server = servers.get(str(lease.get("server_id") or ""))
+                if server is not None and server.get("status") != "stopped":
+                    pid = int(server.get("pid") or 0)
+                    if pid and pid_alive(pid):
+                        continue
+                released.append(
+                    ports.release(
+                        agent=str(lease.get("agent") or "coordinator"),
+                        canonical_project=canonical,
+                        lease_id=str(lease["id"]),
+                    )
+                )
+        return released
     baseline = snapshot_coordinator_state()
     candidates: list[str] = []
     for lease_id, lease in baseline.get("leases", {}).items():
@@ -6816,6 +9859,49 @@ def preflight_project_docker(
     reasons = project_docker_requirement_reasons(spec)
     if not reasons:
         return {"required": False, "capability": "docker_cli", "reasons": []}
+    broker_context = configured_broker_context(str(spec["project"]))
+    if broker_context is not None:
+        profile, repository = broker_context
+        compose = spec.get("compose") or {}
+        compose_id = None
+        if compose.get("declared") and compose.get("autostart"):
+            compose_id = repository.compose_id()
+        container_ids: list[str] = []
+        for dependency in mutable_runtime_docker_dependencies(
+            spec, exclude_compose_owned=True
+        ):
+            identity = str(
+                dependency.get("container") or dependency.get("name") or ""
+            )
+            if not identity:
+                raise BrokerProfileError(
+                    "declared Docker dependency has no exact broker enrollment identity"
+                )
+            container_ids.append(repository.container_id(identity))
+        declared_services = [str(item) for item in compose.get("services") or []]
+        compose_restart_plan = None
+        if action == "restart" and compose_id is not None:
+            # The broker owns the complete Compose definition. The later typed
+            # restart is one service-owned down/up sequence; the client does
+            # not query Docker or select paths/services.
+            compose_restart_plan = {
+                "restart_services": declared_services,
+                "start_services": [],
+                "declared_services": declared_services,
+                "all_services_action": "service_owned_down_up",
+            }
+        return {
+            "required": True,
+            "capability": "host_broker",
+            "reasons": reasons,
+            "dry_run": bool(dry_run),
+            "service": str(profile.service.socket_path),
+            "repository_id": repository.repo_id,
+            "compose_definition_id": compose_id,
+            "container_resource_ids": sorted(set(container_ids)),
+            "compose_restart_plan": compose_restart_plan,
+            "client_docker_required": False,
+        }
     if dry_run:
         compose = spec.get("compose") or {}
         compose_restart_plan = None
@@ -6951,16 +10037,17 @@ def execute_project_start(
                 "files": compose.get("files") or [],
             }
         )
-    try:
-        actions.extend(ensure_runtime_docker_metadata_coordinated(spec, options))
-    except Exception as exc:
-        action_errors.append(
-            project_action_error_from_exception(
-                exc,
-                name="docker-metadata",
-                fallback_classification="unhealthy_process",
+    if configured_broker_context(str(spec["project"])) is None:
+        try:
+            actions.extend(ensure_runtime_docker_metadata_coordinated(spec, options))
+        except Exception as exc:
+            action_errors.append(
+                project_action_error_from_exception(
+                    exc,
+                    name="docker-metadata",
+                    fallback_classification="unhealthy_process",
+                )
             )
-        )
     containers = spec.get("docker", {}).get("containers", [])
     for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
         status = docker_dependency_status(dep, containers)
@@ -7020,6 +10107,7 @@ def execute_project_start(
     return after
 
 
+@normalized_guarded_action(RepositoryAction.START, "project start")
 def coordinated_project_runtime_start(options: dict[str, Any]) -> dict[str, Any]:
     prepared, operation = begin_project_operation(options, "start")
     try:
@@ -7043,6 +10131,7 @@ def coordinated_project_runtime_start(options: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+@normalized_guarded_action(RepositoryAction.START, "project restart")
 def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, Any]:
     prepared, operation = begin_project_operation(options, "restart")
     delegation = delegated_project_operation(operation)
@@ -7175,6 +10264,7 @@ def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, An
     return result
 
 
+@normalized_guarded_action(RepositoryAction.STOP, "project stop")
 def coordinated_project_runtime_stop(options: dict[str, Any]) -> dict[str, Any]:
     prepared, operation = begin_project_operation(options, "stop")
     delegation = delegated_project_operation(operation)
@@ -7433,6 +10523,144 @@ def docker_command_is_mutating(command: list[str]) -> bool:
     return docker_compose_subcommand(command) in COMPOSE_MUTATING_COMMANDS
 
 
+def coordinated_broker_compose_command(
+    *,
+    profile: BrokerClientProfile,
+    repository: BrokerRepositoryProfile,
+    command: list[str],
+    cwd: str | None,
+    project: str,
+    agent: str,
+) -> dict[str, Any]:
+    subcommand = docker_compose_subcommand(command)
+    if subcommand is None:
+        raise BrokerProfileError("Docker Compose command has no typed lifecycle action")
+    compose_id = repository.compose_id()
+    try:
+        up_operation = BrokerOperation("compose.up")
+        down_operation = BrokerOperation("compose.down")
+    except ValueError as error:
+        raise BrokerProfileError(
+            "the installed coordinator broker does not support typed Compose lifecycle"
+        ) from error
+    if subcommand in {"up", "create", "start", "unpause"}:
+        sequence = [up_operation]
+    elif subcommand in {"down", "stop", "kill", "pause", "rm"}:
+        sequence = [down_operation]
+    elif subcommand == "restart":
+        # The service owns the complete definition. A full down/up cycle is
+        # explicit and globally serialized; no client-selected services or
+        # file paths cross the trust boundary.
+        sequence = [down_operation, up_operation]
+    else:
+        raise BrokerProfileError(
+            f"Compose mutation {subcommand!r} has no typed broker operation"
+        )
+    operations: list[dict[str, Any]] = []
+    for operation in sequence:
+        operation_id, broker_result = profile.call(
+            repository=repository,
+            resource_id=compose_id,
+            operation=operation,
+        )
+        operations.append(
+            {
+                "operation_id": operation_id,
+                "operation": operation.value,
+                "result": broker_result,
+            }
+        )
+    result = {
+        "returncode": 0,
+        "stdout": "",
+        "stderr": "",
+        "command": command,
+        "cwd": cwd,
+        "agent": agent,
+        "project": project,
+        "broker": {
+            "resource_id": compose_id,
+            "operations": operations,
+        },
+    }
+    # The service database is the sole durable authority for brokered host
+    # mutations.  Do not open or project into the client's local state here:
+    # the broker reply already carries the service-owned post-action
+    # observation and operation identities.
+    return result
+
+
+COMPOSE_START_LIKE_COMMANDS = {"create", "restart", "run", "start", "unpause", "up"}
+
+
+def normalized_guarded_docker_action(function: Any) -> Any:
+    """Guard Docker commands that can create or resume repository resources."""
+
+    @functools.wraps(function)
+    def guarded(
+        command: list[str],
+        *,
+        cwd: str | None = None,
+        dry_run: bool = False,
+        project: str | None = None,
+        agent: str | None = None,
+        container: str | None = None,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        action: RepositoryAction | None = None
+        if len(command) >= 2 and command[0] == "docker":
+            if command[1] in {"start", "restart"}:
+                action = RepositoryAction.START
+            elif command[1] == "stop":
+                action = RepositoryAction.STOP
+            elif docker_compose_subcommand(command) in COMPOSE_START_LIKE_COMMANDS:
+                action = RepositoryAction.COMPOSE
+            elif docker_command_is_mutating(command):
+                action = RepositoryAction.STOP
+        if action is None:
+            return function(
+                command,
+                cwd=cwd,
+                dry_run=dry_run,
+                project=project,
+                agent=agent,
+                container=container,
+                role=role,
+            )
+        guarded_agent, guarded_project = require_identity(
+            {"agent": agent, "project": project},
+            "docker " + " ".join(command[1:3]),
+        )
+        if configured_broker_context(guarded_project) is not None:
+            # The service reserves and fences the authoritative repository
+            # operation.  Opening the account-local action store here would
+            # establish a competing lock/state authority and fails for a
+            # different-UID broker client whose local store is unavailable.
+            return function(
+                command,
+                cwd=cwd,
+                dry_run=dry_run,
+                project=guarded_project,
+                agent=guarded_agent,
+                container=container,
+                role=role,
+            )
+        with normalized_repository_action_guard(
+            project=guarded_project, agent=guarded_agent, action=action
+        ):
+            return function(
+                command,
+                cwd=cwd,
+                dry_run=dry_run,
+                project=guarded_project,
+                agent=guarded_agent,
+                container=container,
+                role=role,
+            )
+
+    return guarded
+
+
 def record_docker_command(
     state: dict[str, Any],
     command: list[str],
@@ -7454,6 +10682,96 @@ def record_docker_command(
         }
     )
     del history[:-20]
+
+
+def record_normalized_docker_result(
+    command: list[str],
+    cwd: str | None,
+    result: dict[str, Any],
+    project: str | None,
+    agent: str | None,
+    *,
+    outcome: str,
+) -> None:
+    """Record a bounded Docker command diagnostic in normalized SQL."""
+
+    canonical = canonical_project(project) if project else None
+    diagnostic = {
+        "command": [str(item) for item in command],
+        "cwd": cwd,
+        "agent": agent,
+        "project": canonical,
+        "outcome": outcome,
+        "returncode": result.get("returncode"),
+        "dry_run": bool(result.get("dry_run")),
+        "docker_executable": result.get("docker_executable"),
+        "timeout_seconds": result.get("timeout_seconds"),
+        "stdout": str(result.get("stdout") or "")[-4096:],
+        "stderr": str(result.get("stderr") or "")[-4096:],
+        "code": result.get("code"),
+        "error": result.get("error"),
+        "broker": copy.deepcopy(result.get("broker")),
+    }
+    active = next(
+        (
+            item
+            for item in reversed(_normalized_guard_stack())
+            if canonical and item.get("project") == canonical
+        ),
+        None,
+    )
+    timestamp = utc_timestamp()
+    with AccountStore.open_default(coordinator_home()) as store:
+        with store.immediate_transaction() as connection:
+            repository = None
+            if canonical:
+                repository = connection.execute(
+                    "SELECT repo_id FROM repositories WHERE canonical_root = ? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (canonical,),
+                ).fetchone()
+            operation_id = str(active["permit_id"]) if active is not None else None
+            if operation_id is not None:
+                operation = connection.execute(
+                    "SELECT result_json FROM operations WHERE operation_id = ? "
+                    "AND status = 'running'",
+                    (operation_id,),
+                ).fetchone()
+                if operation is not None:
+                    operation_result = json.loads(str(operation[0] or "{}"))
+                    commands = list(operation_result.get("docker_commands") or [])
+                    commands.append(diagnostic)
+                    operation_result["docker_commands"] = commands[-20:]
+                    connection.execute(
+                        "UPDATE operations SET result_json = ?, updated_at = ? "
+                        "WHERE operation_id = ? AND status = 'running'",
+                        (
+                            json.dumps(
+                                operation_result,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            timestamp,
+                            operation_id,
+                        ),
+                    )
+            connection.execute(
+                """
+                INSERT INTO events(
+                    event_id, repo_id, source_id, operation_id, event_kind,
+                    code, message, diagnostic_json, occurred_at
+                ) VALUES (?, ?, NULL, ?, 'docker.command', ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    str(repository[0]) if repository is not None else None,
+                    operation_id,
+                    f"docker_command_{outcome}",
+                    f"Docker command {outcome}: {' '.join(command)}",
+                    json.dumps(diagnostic, separators=(",", ":"), sort_keys=True),
+                    timestamp,
+                ),
+            )
 
 
 def docker_command_failed_error(result: dict[str, Any]) -> StructuredCoordinatorError:
@@ -7541,6 +10859,7 @@ def run_docker(
     return result
 
 
+@normalized_guarded_docker_action
 def coordinated_run_docker(
     command: list[str],
     *,
@@ -7560,6 +10879,64 @@ def coordinated_run_docker(
         )
     elif project:
         project = canonical_project(project)
+    broker_context = configured_broker_context(project) if project else None
+    if broker_context is not None and mutating:
+        profile, repository = broker_context
+        if dry_run:
+            return {
+                "dry_run": True,
+                "broker": True,
+                "command_class": (
+                    "compose" if docker_compose_subcommand(command) else "docker"
+                ),
+                "project": project,
+                "agent": agent,
+            }
+        if len(command) >= 3 and command[1] in {"start", "stop", "restart"}:
+            container_identity = str(container or command[2])
+            resource_id = repository.container_id(container_identity)
+            operation = {
+                "start": BrokerOperation.DOCKER_START,
+                "stop": BrokerOperation.DOCKER_STOP,
+                "restart": BrokerOperation.DOCKER_RESTART,
+            }[command[1]]
+            operation_id, broker_result = profile.call(
+                repository=repository,
+                resource_id=resource_id,
+                operation=operation,
+            )
+            result = {
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "command": command,
+                "cwd": cwd,
+                "agent": agent,
+                "project": project,
+                "broker": {
+                    "operation_id": operation_id,
+                    "operation": operation.value,
+                    "resource_id": resource_id,
+                    "result": broker_result,
+                },
+            }
+            # Broker service persistence and its authoritative post-action
+            # observation are the durable record.  A client-local diagnostic
+            # write would create a second authority and breaks cross-UID
+            # operation when that local store is unavailable.
+            return result
+        if docker_compose_subcommand(command) is None:
+            raise BrokerProfileError(
+                "configured broker mode refuses an untyped host-global Docker mutation"
+            )
+        return coordinated_broker_compose_command(
+            profile=profile,
+            repository=repository,
+            command=command,
+            cwd=cwd,
+            project=str(project),
+            agent=str(agent),
+        )
     if dry_run:
         result: dict[str, Any] = {
             "dry_run": True,
@@ -7579,8 +10956,13 @@ def coordinated_run_docker(
                     "dry_run": True,
                 }
             )
-        with locked_state() as state:
-            record_docker_command(state, command, cwd, result, project, agent)
+        if state_backend() == LEGACY_JSON_BACKEND:
+            with locked_state() as state:
+                record_docker_command(state, command, cwd, result, project, agent)
+        else:
+            record_normalized_docker_result(
+                command, cwd, result, project, agent, outcome="dry_run"
+            )
         return result
 
     try:
@@ -7594,8 +10976,15 @@ def coordinated_run_docker(
             "project": project,
             **coordinator_exception_payload(exc),
         }
-        with locked_state() as state:
-            record_docker_command(state, command, cwd, failure_result, project, agent)
+        if state_backend() == LEGACY_JSON_BACKEND:
+            with locked_state() as state:
+                record_docker_command(
+                    state, command, cwd, failure_result, project, agent
+                )
+        else:
+            record_normalized_docker_result(
+                command, cwd, failure_result, project, agent, outcome="failed"
+            )
         raise
 
     operation_id: str | None = None
@@ -7608,18 +10997,39 @@ def coordinated_run_docker(
                 )
         else:
             target_suffix = canonical_project(project or cwd or "")
-        with locked_state() as state:
-            compose_action = docker_compose_subcommand(command)
-            operation_action = compose_action if command[1] == "compose" else command[1]
-            operation = begin_operation(
-                state,
-                action=f"docker.{command[1]}.{operation_action}" if command[1] == "compose" else f"docker.{operation_action}",
-                target=f"docker:{target_suffix}",
-                agent=str(agent),
-                project=str(project),
-                generation=int(state.get("revision") or 0) + 1,
+        if state_backend() == LEGACY_JSON_BACKEND:
+            with locked_state() as state:
+                compose_action = docker_compose_subcommand(command)
+                operation_action = (
+                    compose_action if command[1] == "compose" else command[1]
+                )
+                operation = begin_operation(
+                    state,
+                    action=(
+                        f"docker.{command[1]}.{operation_action}"
+                        if command[1] == "compose"
+                        else f"docker.{operation_action}"
+                    ),
+                    target=f"docker:{target_suffix}",
+                    agent=str(agent),
+                    project=str(project),
+                    generation=int(state.get("revision") or 0) + 1,
+                )
+                operation_id = str(operation["id"])
+        else:
+            active = next(
+                (
+                    item
+                    for item in reversed(_normalized_guard_stack())
+                    if item.get("project") == project
+                ),
+                None,
             )
-            operation_id = str(operation["id"])
+            if active is None:
+                raise RuntimeError(
+                    "mutating Docker command requires a normalized repository guard"
+                )
+            operation_id = str(active["permit_id"])
 
     try:
         completed, executable, timeout_seconds = execute_docker_subprocess(
@@ -7649,10 +11059,23 @@ def coordinated_run_docker(
             "docker_executable": docker_executable,
             **coordinator_exception_payload(exc),
         }
-        with locked_state() as state:
-            record_docker_command(state, command, cwd, failure_result, project, agent)
-            if operation_id:
-                finish_operation(state, operation_id, status="failed", phase="execute", error=str(exc))
+        if state_backend() == LEGACY_JSON_BACKEND:
+            with locked_state() as state:
+                record_docker_command(
+                    state, command, cwd, failure_result, project, agent
+                )
+                if operation_id:
+                    finish_operation(
+                        state,
+                        operation_id,
+                        status="failed",
+                        phase="execute",
+                        error=str(exc),
+                    )
+        else:
+            record_normalized_docker_result(
+                command, cwd, failure_result, project, agent, outcome="failed"
+            )
         raise
 
     if completed.returncode == 0 and container and agent and project:
@@ -7662,24 +11085,807 @@ def coordinated_run_docker(
             )
         except Exception as exc:
             result["metadata_error"] = str(exc)
-            with locked_state() as state:
-                record_docker_command(state, command, cwd, result, project, agent)
-                if operation_id:
-                    finish_operation(state, operation_id, status="failed", phase="metadata", error=str(exc))
+            if state_backend() == LEGACY_JSON_BACKEND:
+                with locked_state() as state:
+                    record_docker_command(
+                        state, command, cwd, result, project, agent
+                    )
+                    if operation_id:
+                        finish_operation(
+                            state,
+                            operation_id,
+                            status="failed",
+                            phase="metadata",
+                            error=str(exc),
+                        )
+            else:
+                record_normalized_docker_result(
+                    command, cwd, result, project, agent, outcome="metadata_failed"
+                )
             raise
-    with locked_state() as state:
-        record_docker_command(state, command, cwd, result, project, agent)
-        if operation_id:
-            finish_operation(
-                state,
-                operation_id,
-                status="completed" if completed.returncode == 0 else "failed",
-                phase="committed",
-                error=completed.stderr.strip() if completed.returncode != 0 else None,
-            )
+    if state_backend() == LEGACY_JSON_BACKEND:
+        with locked_state() as state:
+            record_docker_command(state, command, cwd, result, project, agent)
+            if operation_id:
+                finish_operation(
+                    state,
+                    operation_id,
+                    status="completed" if completed.returncode == 0 else "failed",
+                    phase="committed",
+                    error=(
+                        completed.stderr.strip()
+                        if completed.returncode != 0
+                        else None
+                    ),
+                )
+    else:
+        record_normalized_docker_result(
+            command,
+            cwd,
+            result,
+            project,
+            agent,
+            outcome="succeeded" if completed.returncode == 0 else "failed",
+        )
     if completed.returncode != 0:
         raise docker_command_failed_error(result)
     return result
+
+
+def configured_broker_context(
+    project: str,
+) -> tuple[BrokerClientProfile, BrokerRepositoryProfile] | None:
+    """Resolve the root-provisioned broker for one canonical repository.
+
+    Absence means this host has not installed multi-user broker mode.  Once a
+    root-owned profile exists, missing/stale/spoofed repository data is an
+    error; host-global mutations never fall back to the per-user authority.
+    """
+
+    profile = load_broker_profile()
+    if profile is None:
+        return None
+    return profile, profile.repository(canonical_project(project))
+
+
+def _validated_broker_lease_result(result: dict[str, Any]) -> tuple[str, int, str, str | None]:
+    lease_id = str(result.get("lease_id") or "")
+    if not lease_id:
+        raise BrokerError("invalid_reply", "Broker lease result omitted lease_id.")
+    try:
+        port = int(result["port"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise BrokerError("invalid_reply", "Broker lease result omitted a valid port.") from error
+    if not 1 <= port <= 65535 or result.get("status") != "active":
+        raise BrokerError("invalid_reply", "Broker lease result is not an active valid port.")
+    protocol = str(result.get("protocol") or "tcp")
+    if protocol not in {"tcp", "udp"}:
+        raise BrokerError("invalid_reply", "Broker lease result has an invalid protocol.")
+    expires_at = None if result.get("expires_at") is None else str(result["expires_at"])
+    return lease_id, port, protocol, expires_at
+
+
+def acquire_broker_lease_link(
+    *,
+    profile: BrokerClientProfile,
+    repository: BrokerRepositoryProfile,
+    server_name: str,
+    requested_port: int | None,
+    ttl_seconds: int,
+    adopt_existing_listener: bool = False,
+) -> tuple[BrokerLink, dict[str, Any]]:
+    server_definition_id = repository.server_id(server_name)
+    arguments: dict[str, Any] = {"protocol": "tcp", "ttl_seconds": ttl_seconds}
+    if requested_port is not None:
+        arguments["requested_port"] = int(requested_port)
+    if adopt_existing_listener:
+        arguments["adopt_existing_listener"] = True
+    operation_id, result = profile.call(
+        repository=repository,
+        resource_id=server_definition_id,
+        operation=BrokerOperation.PORT_LEASE,
+        arguments=arguments,
+    )
+    lease_id, port, protocol, expires_at = _validated_broker_lease_result(result)
+    try:
+        with AccountStore.open_default(coordinator_home()) as store:
+            link = BrokerLinkStore(store).reserve_lease(
+                profile=profile,
+                repository=repository,
+                server_name=server_name,
+                server_definition_id=server_definition_id,
+                broker_lease_id=lease_id,
+                port=port,
+                protocol=protocol,
+                operation_id=operation_id,
+                expires_at=expires_at,
+            )
+    except BaseException as local_error:
+        rollback_id = str(uuid.uuid4())
+        try:
+            profile.call(
+                repository=repository,
+                resource_id=lease_id,
+                operation=BrokerOperation.PORT_RELEASE,
+                operation_id=rollback_id,
+            )
+        except BaseException as rollback_error:
+            raise StructuredCoordinatorError(
+                "broker lease succeeded but local linkage and broker rollback both failed",
+                {
+                    "code": "broker_lease_link_and_rollback_failed",
+                    "classification": "reconciliation_required",
+                    "broker_lease_id": lease_id,
+                    "broker_operation_id": operation_id,
+                    "rollback_operation_id": rollback_id,
+                    "local_error": f"{type(local_error).__name__}: {local_error}",
+                    "rollback_error": f"{type(rollback_error).__name__}: {rollback_error}",
+                    "action_required": "Do not reuse this port; reconcile the exact broker lease through the Coordinator skill.",
+                },
+            ) from local_error
+        raise
+    return link, result
+
+
+def bind_broker_lease_link(link_id: str, local_lease_id: str) -> BrokerLink:
+    with AccountStore.open_default(coordinator_home()) as store:
+        return BrokerLinkStore(store).bind_local_lease(link_id, local_lease_id)
+
+
+def broker_lease_link_for_local(local_lease_id: str) -> BrokerLink | None:
+    if not state_path().exists() or state_backend() == LEGACY_JSON_BACKEND:
+        return None
+    with AccountStore.open_default(coordinator_home()) as store:
+        return BrokerLinkStore(store).lease_for_local(local_lease_id)
+
+
+def broker_lease_link_for_server(
+    repository: BrokerRepositoryProfile, server_name: str
+) -> BrokerLink | None:
+    if not state_path().exists() or state_backend() == LEGACY_JSON_BACKEND:
+        return None
+    server_definition_id = repository.server_id(server_name)
+    with AccountStore.open_default(coordinator_home()) as store:
+        return BrokerLinkStore(store).lease_for_server(
+            repository.repo_id, server_definition_id
+        )
+
+
+def release_broker_lease_link(link: BrokerLink, *, rollback: bool) -> dict[str, Any]:
+    release_operation_id = str(uuid.uuid4())
+    with AccountStore.open_default(coordinator_home()) as store:
+        links = BrokerLinkStore(store)
+        pending = links.begin_lease_release(link.link_id, release_operation_id)
+        release_operation_id = str(pending.release_operation_id or release_operation_id)
+    service = BrokerServiceProfile(
+        socket_path=Path(link.broker_socket),
+        service_uid=link.broker_service_uid,
+        socket_gid=link.broker_socket_gid,
+        socket_mode=link.broker_socket_mode,
+        database_generation=link.broker_database_generation,
+    )
+    try:
+        _operation_id, result = call_broker(
+            service=service,
+            account_id=link.account_id,
+            repo_id=link.repo_id,
+            resource_id=link.broker_resource_id,
+            operation=BrokerOperation.PORT_RELEASE,
+            operation_id=release_operation_id,
+        )
+    except BaseException as error:
+        payload = coordinator_exception_payload(error)
+        with AccountStore.open_default(coordinator_home()) as store:
+            BrokerLinkStore(store).fail_lease_release(
+                link.link_id,
+                operation_id=release_operation_id,
+                error_code=str(payload.get("code") or "broker_release_failed"),
+                error_message=str(payload.get("error") or error),
+                rollback=rollback,
+            )
+        raise
+    with AccountStore.open_default(coordinator_home()) as store:
+        BrokerLinkStore(store).complete_lease_release(link.link_id)
+    return result
+
+
+def _validated_broker_assignment_result(
+    result: dict[str, Any], *, expected_port: int
+) -> tuple[str, int]:
+    assignment_id = str(result.get("assignment_id") or "")
+    try:
+        port = int(result["port"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise BrokerError(
+            "invalid_reply", "Broker assignment result omitted a valid port."
+        ) from error
+    if (
+        not assignment_id
+        or port != int(expected_port)
+        or result.get("status") != "active"
+    ):
+        raise BrokerError(
+            "invalid_reply", "Broker assignment result does not match the requested port."
+        )
+    return assignment_id, port
+
+
+def acquire_broker_assignment_link(
+    *,
+    profile: BrokerClientProfile,
+    repository: BrokerRepositoryProfile,
+    server_name: str,
+    port: int,
+) -> tuple[BrokerLink, dict[str, Any]]:
+    server_definition_id = repository.server_id(server_name)
+    operation_id, result = profile.call(
+        repository=repository,
+        resource_id=server_definition_id,
+        operation=BrokerOperation.PORT_ASSIGN,
+        arguments={"port": int(port)},
+    )
+    assignment_id, assigned_port = _validated_broker_assignment_result(
+        result, expected_port=port
+    )
+    try:
+        with AccountStore.open_default(coordinator_home()) as store:
+            link = BrokerLinkStore(store).reserve_assignment(
+                profile=profile,
+                repository=repository,
+                server_name=server_name,
+                server_definition_id=server_definition_id,
+                broker_assignment_id=assignment_id,
+                port=assigned_port,
+                operation_id=operation_id,
+            )
+    except BaseException as local_error:
+        rollback_id = str(uuid.uuid4())
+        try:
+            profile.call(
+                repository=repository,
+                resource_id=server_definition_id,
+                operation=BrokerOperation.PORT_UNASSIGN,
+                operation_id=rollback_id,
+            )
+        except BaseException as rollback_error:
+            raise StructuredCoordinatorError(
+                "broker assignment succeeded but local linkage and broker rollback both failed",
+                {
+                    "code": "broker_assignment_link_and_rollback_failed",
+                    "classification": "reconciliation_required",
+                    "broker_assignment_id": assignment_id,
+                    "broker_operation_id": operation_id,
+                    "rollback_operation_id": rollback_id,
+                    "local_error": f"{type(local_error).__name__}: {local_error}",
+                    "rollback_error": f"{type(rollback_error).__name__}: {rollback_error}",
+                },
+            ) from local_error
+        raise
+    return link, result
+
+
+def release_broker_assignment_link(
+    link: BrokerLink, *, rollback: bool
+) -> dict[str, Any]:
+    release_operation_id = str(uuid.uuid4())
+    with AccountStore.open_default(coordinator_home()) as store:
+        links = BrokerLinkStore(store)
+        pending = links.begin_assignment_release(link.link_id, release_operation_id)
+        release_operation_id = str(pending.release_operation_id or release_operation_id)
+    service = BrokerServiceProfile(
+        socket_path=Path(link.broker_socket),
+        service_uid=link.broker_service_uid,
+        socket_gid=link.broker_socket_gid,
+        socket_mode=link.broker_socket_mode,
+        database_generation=link.broker_database_generation,
+    )
+    try:
+        _operation_id, result = call_broker(
+            service=service,
+            account_id=link.account_id,
+            repo_id=link.repo_id,
+            resource_id=link.server_definition_id,
+            operation=BrokerOperation.PORT_UNASSIGN,
+            operation_id=release_operation_id,
+        )
+    except BaseException as error:
+        payload = coordinator_exception_payload(error)
+        with AccountStore.open_default(coordinator_home()) as store:
+            BrokerLinkStore(store).fail_assignment_release(
+                link.link_id,
+                operation_id=release_operation_id,
+                error_code=str(payload.get("code") or "broker_unassign_failed"),
+                error_message=str(payload.get("error") or error),
+                rollback=rollback,
+            )
+        raise
+    with AccountStore.open_default(coordinator_home()) as store:
+        BrokerLinkStore(store).complete_assignment_release(link.link_id)
+    return result
+
+
+@normalized_guarded_action(RepositoryAction.LEASE, "port lease")
+def coordinated_lease_port(options: dict[str, Any]) -> dict[str, Any]:
+    agent, project = require_identity(options, "port lease")
+    prime_git_head_identity(project)
+    broker_context = configured_broker_context(project)
+    if broker_context is not None:
+        profile, repository = broker_context
+        server_name = str(options.get("name") or "").strip()
+        if not server_name:
+            raise BrokerProfileError(
+                "broker-backed port lease requires the enrolled server name (--name)"
+            )
+        link, broker_result = acquire_broker_lease_link(
+            profile=profile,
+            repository=repository,
+            server_name=server_name,
+            requested_port=(
+                None if options.get("preferred") is None else int(options["preferred"])
+            ),
+            ttl_seconds=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+        )
+        try:
+            if state_backend() == LEGACY_JSON_BACKEND:
+                with locked_state() as state:
+                    local = lease_port(
+                        state,
+                        agent=agent,
+                        project=project,
+                        port_range=f"{link.port}-{link.port}",
+                        preferred=link.port,
+                        ttl=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+                        purpose=str(options.get("purpose") or "manual"),
+                    )
+            else:
+                with AccountStore.open_default(coordinator_home()) as store:
+                    local = NormalizedPortLifecycle(store).lease(
+                        PortLeaseRequest(
+                            agent=agent,
+                            canonical_project=project,
+                            port_start=link.port,
+                            port_end=link.port,
+                            preferred=link.port,
+                            ttl_seconds=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+                            purpose=str(options.get("purpose") or "manual"),
+                        ),
+                        port_available=lambda candidate: port_available(candidate),
+                    )
+            local["broker_lease_id"] = link.broker_resource_id
+            local["broker_link_id"] = link.link_id
+            local["broker_operation_id"] = link.broker_operation_id
+            bound = bind_broker_lease_link(link.link_id, str(local["id"]))
+        except BaseException as local_error:
+            cleanup_errors: list[str] = []
+            with contextlib.suppress(BaseException):
+                if "local" in locals():
+                    if state_backend() == LEGACY_JSON_BACKEND:
+                        with locked_state() as state:
+                            if str(local.get("id") or "") in state.get("leases", {}):
+                                release_port(state, lease_id=str(local["id"]))
+                    else:
+                        with AccountStore.open_default(coordinator_home()) as store:
+                            NormalizedPortLifecycle(store).release(
+                                agent=agent,
+                                canonical_project=project,
+                                lease_id=str(local["id"]),
+                            )
+            try:
+                release_broker_lease_link(link, rollback=True)
+            except BaseException as rollback_error:
+                cleanup_errors.append(
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                )
+            if cleanup_errors:
+                raise StructuredCoordinatorError(
+                    "local broker-lease commit failed and rollback requires reconciliation",
+                    {
+                        "code": "broker_lease_local_commit_failed",
+                        "classification": "reconciliation_required",
+                        "broker_lease_id": link.broker_resource_id,
+                        "local_error": f"{type(local_error).__name__}: {local_error}",
+                        "cleanup_errors": cleanup_errors,
+                    },
+                ) from local_error
+            raise
+        return {
+            **local,
+            "broker": {
+                "lease_id": bound.broker_resource_id,
+                "link_id": bound.link_id,
+                "operation_id": bound.broker_operation_id,
+                "status": bound.status,
+                "expires_at": broker_result.get("expires_at"),
+            },
+        }
+    if state_backend() == LEGACY_JSON_BACKEND:
+        with locked_state() as state:
+            return lease_port(
+                state,
+                agent=agent,
+                project=project,
+                port_range=str(options.get("range") or DEFAULT_RANGE),
+                preferred=options.get("preferred"),
+                ttl=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+                purpose=str(options.get("purpose") or "manual"),
+            )
+    port_start, port_end = parse_range(str(options.get("range") or DEFAULT_RANGE))
+    with AccountStore.open_default(coordinator_home()) as store:
+        return NormalizedPortLifecycle(store).lease(
+            PortLeaseRequest(
+                agent=agent,
+                canonical_project=project,
+                port_start=port_start,
+                port_end=port_end,
+                preferred=(
+                    None
+                    if options.get("preferred") is None
+                    else int(options["preferred"])
+                ),
+                ttl_seconds=int(options.get("ttl") or DEFAULT_TTL_SECONDS),
+                purpose=str(options.get("purpose") or "manual"),
+            ),
+            port_available=lambda candidate: port_available(candidate),
+        )
+
+
+def coordinated_release_port(options: dict[str, Any]) -> dict[str, Any]:
+    agent, project = require_identity(options, "port release")
+    prime_git_head_identity(project)
+    if state_backend() == LEGACY_JSON_BACKEND:
+        with locked_state() as state:
+            lease_id = options.get("lease_id")
+            if not lease_id and options.get("port") is not None:
+                port = int(options["port"])
+                matches = [
+                    item
+                    for item in state.get("leases", {}).values()
+                    if int(item.get("port") or 0) == port
+                    and item.get("status") == "active"
+                ]
+                if len(matches) != 1:
+                    raise KeyError(f"could not resolve one active lease for port {port}")
+                lease_id = matches[0].get("id")
+            lease = state.get("leases", {}).get(str(lease_id or ""))
+            if lease is None:
+                raise KeyError("matching lease not found")
+            if canonical_project(str(lease.get("project") or "")) != project:
+                raise PermissionError("lease belongs to another repository")
+            resolved_lease_id = str(lease["id"])
+    else:
+        with AccountStore.open_default(coordinator_home()) as store:
+            leases = NormalizedPortLifecycle(store).list_leases(active_only=True)
+        if options.get("lease_id"):
+            matches = [
+                item
+                for item in leases
+                if str(item["id"]) == str(options["lease_id"])
+            ]
+        elif options.get("port") is not None:
+            matches = [
+                item for item in leases if int(item["port"]) == int(options["port"])
+            ]
+        else:
+            raise ValueError("port release requires --lease-id or --port")
+        if len(matches) != 1:
+            raise KeyError("matching lease not found")
+        lease = matches[0]
+        if canonical_project(str(lease.get("project") or "")) != project:
+            raise PermissionError("lease belongs to another repository")
+        resolved_lease_id = str(lease["id"])
+    link = broker_lease_link_for_local(resolved_lease_id)
+    broker_result = None
+    if link is not None:
+        broker_result = release_broker_lease_link(link, rollback=False)
+    try:
+        if state_backend() == LEGACY_JSON_BACKEND:
+            with locked_state() as state:
+                released = release_port_for_identity(
+                    state,
+                    agent=agent,
+                    project=project,
+                    lease_id=resolved_lease_id,
+                    port=None,
+                )
+        else:
+            with AccountStore.open_default(coordinator_home()) as store:
+                released = NormalizedPortLifecycle(store).release(
+                    agent=agent,
+                    canonical_project=project,
+                    lease_id=resolved_lease_id,
+                )
+    except BaseException as local_error:
+        if link is not None:
+            raise StructuredCoordinatorError(
+                "host-global broker lease was released, but the local lease record needs reconciliation",
+                {
+                    "code": "local_lease_release_reconciliation_required",
+                    "classification": "reconciliation_required",
+                    "broker_lease_id": link.broker_resource_id,
+                    "broker_result": broker_result,
+                    "local_error": f"{type(local_error).__name__}: {local_error}",
+                },
+            ) from local_error
+        raise
+    if link is not None:
+        released["broker"] = {
+            "lease_id": link.broker_resource_id,
+            "status": "released",
+            "result": broker_result,
+        }
+    return released
+
+
+@normalized_guarded_action(RepositoryAction.LEASE, "port assign")
+def coordinated_assign_port(options: dict[str, Any]) -> dict[str, Any]:
+    agent, project = require_identity(options, "port assign")
+    prime_git_head_identity(project)
+    broker_context = configured_broker_context(project)
+    if broker_context is not None:
+        profile, repository = broker_context
+        name = str(options.get("name") or "").strip()
+        port = int(options["port"])
+        link, broker_result = acquire_broker_assignment_link(
+            profile=profile,
+            repository=repository,
+            server_name=name,
+            port=port,
+        )
+        try:
+            if state_backend() == LEGACY_JSON_BACKEND:
+                with locked_state() as state:
+                    assignment = assign_port(
+                        state,
+                        agent=agent,
+                        project=project,
+                        name=name,
+                        port=port,
+                        force=bool(options.get("force")),
+                    )
+            else:
+                with AccountStore.open_default(coordinator_home()) as store:
+                    assignment = NormalizedPortLifecycle(store).assign(
+                        agent=agent,
+                        canonical_project=project,
+                        name=name,
+                        port=port,
+                        force=bool(options.get("force")),
+                    )
+            assignment["broker_assignment_id"] = link.broker_resource_id
+            assignment["broker_link_id"] = link.link_id
+            local_assignment_id = deterministic_id(
+                "port-assignment", repository.repo_id, name
+            )
+            with AccountStore.open_default(coordinator_home()) as store:
+                bound = BrokerLinkStore(store).bind_local_assignment(
+                    link.link_id, local_assignment_id
+                )
+        except BaseException as local_error:
+            with contextlib.suppress(BaseException):
+                if state_backend() == LEGACY_JSON_BACKEND:
+                    with locked_state() as state:
+                        unassign_port(
+                            state,
+                            agent=agent,
+                            project=project,
+                            name=name,
+                            port=port,
+                            force=True,
+                        )
+                else:
+                    with AccountStore.open_default(coordinator_home()) as store:
+                        NormalizedPortLifecycle(store).unassign(
+                            agent=agent,
+                            canonical_project=project,
+                            name=name,
+                            port=port,
+                            force=True,
+                        )
+            try:
+                release_broker_assignment_link(link, rollback=True)
+            except BaseException as rollback_error:
+                raise StructuredCoordinatorError(
+                    "local assignment commit failed and broker rollback requires reconciliation",
+                    {
+                        "code": "broker_assignment_local_commit_failed",
+                        "classification": "reconciliation_required",
+                        "broker_assignment_id": link.broker_resource_id,
+                        "local_error": f"{type(local_error).__name__}: {local_error}",
+                        "rollback_error": f"{type(rollback_error).__name__}: {rollback_error}",
+                    },
+                ) from local_error
+            raise
+        return {
+            **assignment,
+            "broker": {
+                "assignment_id": bound.broker_resource_id,
+                "link_id": bound.link_id,
+                "operation_id": bound.broker_operation_id,
+                "status": bound.status,
+                "result": broker_result,
+            },
+        }
+    if state_backend() == LEGACY_JSON_BACKEND:
+        with locked_state() as state:
+            return assign_port(
+                state,
+                agent=agent,
+                project=project,
+                name=str(options.get("name") or ""),
+                port=int(options["port"]),
+                force=bool(options.get("force")),
+            )
+    with AccountStore.open_default(coordinator_home()) as store:
+        return NormalizedPortLifecycle(store).assign(
+            agent=agent,
+            canonical_project=project,
+            name=str(options.get("name") or ""),
+            port=int(options["port"]),
+            force=bool(options.get("force")),
+        )
+
+
+def coordinated_unassign_port(options: dict[str, Any]) -> dict[str, Any]:
+    agent, requested_project = require_identity(options, "port unassign")
+    if state_backend() == LEGACY_JSON_BACKEND:
+        with locked_state() as state:
+            matching = None
+            for candidate in state.setdefault("port_assignments", {}).values():
+                if options.get("name") is not None and (
+                    str(candidate.get("name") or "") != str(options["name"])
+                    or canonical_project(str(candidate.get("project") or ""))
+                    != requested_project
+                ):
+                    continue
+                if options.get("port") is not None and int(
+                    candidate.get("port") or 0
+                ) != int(options["port"]):
+                    continue
+                matching = copy.deepcopy(candidate)
+                break
+    else:
+        with AccountStore.open_default(coordinator_home()) as store:
+            assignments = NormalizedPortLifecycle(store).list_assignments(
+                canonical_project=(
+                    requested_project if options.get("name") is not None else None
+                ),
+                active_only=True,
+            )
+        matching = next(
+            (
+                candidate
+                for candidate in assignments
+                if (
+                    options.get("name") is None
+                    or str(candidate["name"]) == str(options["name"])
+                )
+                and (
+                    options.get("port") is None
+                    or int(candidate["port"]) == int(options["port"])
+                )
+            ),
+            None,
+        )
+    if matching is None:
+        raise KeyError("matching port assignment not found")
+    owner_project = canonical_project(str(matching["project"]))
+    if owner_project != requested_project and not bool(options.get("force")):
+        raise PermissionError(
+            f"port {matching['port']} is durably assigned to server "
+            f"'{matching['name']}' of {owner_project}; pass --force to remove "
+            "another project's assignment"
+        )
+    name = str(matching["name"])
+    selector_name = (
+        str(options["name"]) if options.get("name") is not None else None
+    )
+    broker_context = configured_broker_context(owner_project)
+    broker_result = None
+    link = None
+    if broker_context is not None:
+        _profile, repository = broker_context
+        server_definition_id = repository.server_id(name)
+        with AccountStore.open_default(coordinator_home()) as store:
+            link = BrokerLinkStore(store).assignment_for_server(
+                repository.repo_id, server_definition_id
+            )
+        if link is None:
+            raise BrokerProfileError(
+                "configured broker assignment has no exact local linkage; reconcile it before unassigning"
+            )
+        broker_result = release_broker_assignment_link(link, rollback=False)
+    try:
+        if state_backend() == LEGACY_JSON_BACKEND:
+            with locked_state() as state:
+                removed = unassign_port(
+                    state,
+                    agent=agent,
+                    project=requested_project,
+                    name=selector_name,
+                    port=int(matching["port"]),
+                    force=bool(options.get("force")),
+                )
+        else:
+            with AccountStore.open_default(coordinator_home()) as store:
+                removed = NormalizedPortLifecycle(store).unassign(
+                    agent=agent,
+                    canonical_project=requested_project,
+                    name=selector_name,
+                    port=int(matching["port"]),
+                    force=bool(options.get("force")),
+                )
+    except BaseException as local_error:
+        if link is not None:
+            raise StructuredCoordinatorError(
+                "host-global assignment was released, but the local assignment record needs reconciliation",
+                {
+                    "code": "local_assignment_release_reconciliation_required",
+                    "classification": "reconciliation_required",
+                    "broker_assignment_id": link.broker_resource_id,
+                    "broker_result": broker_result,
+                    "local_error": f"{type(local_error).__name__}: {local_error}",
+                },
+            ) from local_error
+        raise
+    if link is not None:
+        removed["broker"] = {
+            "assignment_id": link.broker_resource_id,
+            "status": "released",
+            "result": broker_result,
+        }
+    return removed
+
+
+def coordinated_relocate_port_assignment(options: dict[str, Any]) -> dict[str, Any]:
+    agent = str(options.get("agent") or "").strip()
+    if not agent:
+        raise ValueError("port relocate requires --agent")
+    old_project = canonical_project(str(options.get("old_project") or ""))
+    new_project = canonical_project(str(options.get("new_project") or ""))
+    with normalized_repository_action_guard(
+        project=new_project, agent=agent, action=RepositoryAction.LEASE
+    ):
+        prime_git_head_identity(old_project)
+        prime_git_head_identity(new_project)
+        if state_backend() != LEGACY_JSON_BACKEND:
+            name = str(options.get("name") or "")
+            port = int(options["port"])
+            lease_id = str(options.get("lease_id") or "")
+            with AccountStore.open_default(coordinator_home()) as store:
+                lifecycle = NormalizedServerLifecycle(store)
+                snapshot = lifecycle.relocation_snapshot(
+                    old_project=old_project,
+                    name=name,
+                    port=port,
+                    lease_id=lease_id,
+                )
+            listener_evidence = listener_evidence_for_port(port)
+            recorded_pid = int(snapshot.get("pid") or 0)
+            process_is_alive = bool(recorded_pid and pid_alive(recorded_pid))
+            with AccountStore.open_default(coordinator_home()) as store:
+                relocated = NormalizedServerLifecycle(store).relocate(
+                    agent=agent,
+                    old_project=old_project,
+                    new_project=new_project,
+                    name=name,
+                    port=port,
+                    lease_id=lease_id,
+                    listener_present=bool(listener_evidence.get("present")),
+                    process_alive=process_is_alive,
+                )
+            result = normalized_public_server(relocated)
+            result["listener_evidence"] = listener_evidence
+            return result
+        with locked_state() as state:
+            return relocate_port_assignment(
+                state,
+                agent=agent,
+                old_project=old_project,
+                new_project=new_project,
+                name=str(options.get("name") or ""),
+                port=int(options["port"]),
+                lease_id=str(options.get("lease_id") or ""),
+            )
 
 
 def print_result(value: Any, *, as_json: bool = True, compact_json: bool = False) -> None:
@@ -7739,6 +11945,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"return the newest N Docker stats samples per container (0-{DOCKER_STATS_HISTORY_LIMIT})",
     )
 
+    observe = sub.add_parser(
+        "observe",
+        help="explicitly sample host runtime state once and persist normalized observations",
+    )
+    observe.add_argument("--agent", required=True)
+    observe.add_argument("--project", required=True)
+    observe.add_argument("--max-age-seconds", type=float, default=0.0)
+    observe.add_argument("--backup-dir", action="append")
+    observe.add_argument("--no-docker", action="store_true")
+    observe.add_argument("--compact-json", action="store_true")
+    observe.add_argument(
+        "--legacy-home",
+        action="append",
+        help="explicit same-UID legacy coordinator home (migration/testing override)",
+    )
+    observe.add_argument(
+        "--legacy-backup-root",
+        help="private backup root outside Git for captured legacy state",
+    )
+
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="action", required=True)
     state_sub.add_parser("show")
@@ -7752,6 +11978,10 @@ def build_parser() -> argparse.ArgumentParser:
     lease = port_sub.add_parser("lease")
     lease.add_argument("--agent", required=True)
     lease.add_argument("--project", required=True)
+    lease.add_argument(
+        "--name",
+        help="enrolled server identity (required when the host broker is configured)",
+    )
     lease.add_argument("--range", default=DEFAULT_RANGE)
     lease.add_argument("--preferred", type=int)
     lease.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
@@ -7889,6 +12119,9 @@ def build_parser() -> argparse.ArgumentParser:
     docker_register.add_argument("--force", action="store_true")
     docker_register.add_argument("--dry-run", action="store_true")
 
+    add_lifecycle_parsers(sub)
+    add_broker_parser(sub)
+
     api = sub.add_parser("api")
     api_sub = api.add_subparsers(dest="action", required=True)
     serve = api_sub.add_parser("serve")
@@ -7903,11 +12136,53 @@ def namespace_to_options(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def handle_cli(args: argparse.Namespace) -> Any:
+    if args.group in {"repository", "resource"}:
+        return handle_lifecycle_cli(
+            args,
+            coordinator_home=coordinator_home(),
+            canonical_project=canonical_project,
+            bootstrap_legacy_import=bootstrap_legacy_import,
+            observe_before_plan=lambda project, agent: coordinated_observe_host(
+                {
+                    "project": project,
+                    "agent": agent,
+                    "max_age_seconds": 0,
+                    "no_docker": False,
+                    "backup_dir": None,
+                    "legacy_home": [],
+                    "legacy_backup_root": None,
+                }
+            ),
+            observe_before_apply=lambda project, agent: coordinated_observe_host(
+                {
+                    "project": project,
+                    "agent": agent,
+                    "max_age_seconds": 0,
+                    "no_docker": False,
+                    "backup_dir": None,
+                    "legacy_home": [],
+                    "legacy_backup_root": None,
+                }
+            ),
+        )
+    if args.group == "broker" and args.action == "enroll":
+        return coordinated_broker_enroll(args)
+    if args.group == "broker":
+        return handle_broker_cli(args)
+    if args.group == "observe":
+        return coordinated_observe_host(namespace_to_options(args))
     if args.group == "state" and args.action == "reset":
         if not args.force:
             raise SystemExit("--force is required")
         identity = namespace_to_options(args)
         agent, project = require_identity(identity, "state reset")
+        if state_backend() != LEGACY_JSON_BACKEND:
+            raise RuntimeError(
+                "state reset is available only with "
+                f"{STATE_BACKEND_ENV}={LEGACY_JSON_BACKEND}; the normalized "
+                "product backend must be decommissioned through exact "
+                "repository/resource lifecycle commands"
+            )
         with locked_state() as state:
             prior = {
                 "revision": state.get("revision"),
@@ -8000,67 +12275,37 @@ def handle_cli(args: argparse.Namespace) -> Any:
     if args.group == "docker" and args.action == "register":
         return coordinated_register_docker_metadata(namespace_to_options(args))
     if args.group == "port" and args.action == "lease":
-        args.project = canonical_project(args.project)
-        prime_git_head_identity(args.project)
-    if args.group == "port" and args.action == "release":
-        args.project = canonical_project(args.project)
-        prime_git_head_identity(args.project)
+        return coordinated_lease_port(namespace_to_options(args))
+    if args.group == "port" and args.action == "assign":
+        return coordinated_assign_port(namespace_to_options(args))
     if args.group == "port" and args.action == "relocate":
-        args.old_project = canonical_project(args.old_project)
-        args.new_project = canonical_project(args.new_project)
-        prime_git_head_identity(args.old_project)
-        prime_git_head_identity(args.new_project)
+        return coordinated_relocate_port_assignment(namespace_to_options(args))
+    if args.group == "port" and args.action == "release":
+        return coordinated_release_port(namespace_to_options(args))
+    if args.group == "port" and args.action == "unassign":
+        return coordinated_unassign_port(namespace_to_options(args))
+    if state_backend() != LEGACY_JSON_BACKEND:
+        if args.group == "state" and args.action == "show":
+            return normalized_control_snapshot()
+        if args.group == "port" and args.action == "list":
+            with AccountStore.open_default(coordinator_home()) as store:
+                return NormalizedPortLifecycle(store).list_leases(active_only=True)
+        if args.group == "port" and args.action == "assignments":
+            requested_project = (
+                canonical_project(args.project) if args.project is not None else None
+            )
+            with AccountStore.open_default(coordinator_home()) as store:
+                return NormalizedPortLifecycle(store).list_assignments(
+                    canonical_project=requested_project,
+                    active_only=True,
+                )
+        if args.group == "server" and args.action == "list":
+            return list(normalized_control_snapshot()["servers"].values())
     with locked_state() as state:
         if args.group == "state" and args.action == "show":
             return state
-        if args.group == "port" and args.action == "lease":
-            return lease_port(
-                state,
-                agent=args.agent,
-                project=args.project,
-                port_range=args.range,
-                preferred=args.preferred,
-                ttl=args.ttl,
-                purpose=args.purpose,
-            )
-        if args.group == "port" and args.action == "release":
-            return release_port_for_identity(
-                state,
-                agent=args.agent,
-                project=args.project,
-                lease_id=args.lease_id,
-                port=args.port,
-            )
         if args.group == "port" and args.action == "list":
             return list(state["leases"].values())
-        if args.group == "port" and args.action == "assign":
-            return assign_port(
-                state,
-                agent=args.agent,
-                project=args.project,
-                name=args.name,
-                port=args.port,
-                force=bool(args.force),
-            )
-        if args.group == "port" and args.action == "relocate":
-            return relocate_port_assignment(
-                state,
-                agent=args.agent,
-                old_project=args.old_project,
-                new_project=args.new_project,
-                name=args.name,
-                port=args.port,
-                lease_id=args.lease_id,
-            )
-        if args.group == "port" and args.action == "unassign":
-            return unassign_port(
-                state,
-                agent=args.agent,
-                project=args.project,
-                name=args.name,
-                port=args.port,
-                force=bool(args.force),
-            )
         if args.group == "port" and args.action == "assignments":
             return list_port_assignments(state, project=args.project)
         if args.group == "server" and args.action == "list":
@@ -8255,6 +12500,7 @@ API_POST_ROUTES = frozenset(
         "/v1/ports/release",
         "/v1/ports/assign",
         "/v1/ports/unassign",
+        "/v1/ports/relocate",
     }
 )
 
@@ -8349,15 +12595,31 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 # daemon availability part of the service-start boundary.
                 result = coordinated_build_inventory(include_docker=False)
             elif path in {"/v1/state", "/v1/ports", "/v1/ports/assignments", "/v1/servers"}:
-                snapshot = snapshot_coordinator_state()
-                if path == "/v1/state":
-                    result = snapshot
-                elif path == "/v1/ports":
-                    result = list(snapshot["leases"].values())
-                elif path == "/v1/ports/assignments":
-                    result = list_port_assignments(snapshot)
+                if state_backend() == LEGACY_JSON_BACKEND:
+                    snapshot = snapshot_coordinator_state()
+                    if path == "/v1/state":
+                        result = snapshot
+                    elif path == "/v1/ports":
+                        result = list(snapshot["leases"].values())
+                    elif path == "/v1/ports/assignments":
+                        result = list_port_assignments(snapshot)
+                    else:
+                        result = list(snapshot["servers"].values())
+                elif path in {"/v1/ports", "/v1/ports/assignments"}:
+                    with AccountStore.open_default(coordinator_home()) as store:
+                        ports = NormalizedPortLifecycle(store)
+                        result = (
+                            ports.list_leases(active_only=True)
+                            if path == "/v1/ports"
+                            else ports.list_assignments(active_only=True)
+                        )
                 else:
-                    result = list(snapshot["servers"].values())
+                    snapshot = normalized_control_snapshot()
+                    result = (
+                        snapshot
+                        if path == "/v1/state"
+                        else list(snapshot["servers"].values())
+                    )
             else:
                 self._send(404, {"error": "not found"})
                 return
@@ -8452,61 +12714,31 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             if path == "/v1/ports/lease":
-                payload["project"] = canonical_project(payload["project"])
-                prime_git_head_identity(payload["project"])
+                self._send(200, coordinated_lease_port(payload))
+                return
             elif path == "/v1/ports/release":
-                release_agent, release_project = require_identity(payload, "port release")
-                payload["agent"] = release_agent
-                payload["project"] = release_project
+                self._send(200, coordinated_release_port(payload))
+                return
+            elif path == "/v1/ports/relocate":
+                self._send(200, coordinated_relocate_port_assignment(payload))
+                return
             elif path in {"/v1/ports/assign", "/v1/ports/unassign"}:
                 assignment_agent = str(payload.get("agent") or "").strip()
                 if not assignment_agent:
                     raise ValueError("port assignment mutation requires agent attribution")
                 payload["agent"] = assignment_agent
-                if payload.get("project"):
-                    payload["project"] = canonical_project(str(payload["project"]))
-                    prime_git_head_identity(payload["project"])
+                if path == "/v1/ports/assign":
+                    # The guarded public helper must be the first repository
+                    # mutation boundary. In particular, do not invoke Git to
+                    # prime identity before a disabled repository is rejected.
+                    self._send(200, coordinated_assign_port(payload))
+                    return
+                self._send(200, coordinated_unassign_port(payload))
+                return
             else:
                 self._send(404, {"error": "not found"})
                 return
-            with locked_state() as state:
-                if path == "/v1/ports/lease":
-                    result = lease_port(
-                        state,
-                        agent=payload["agent"],
-                        project=payload["project"],
-                        port_range=payload.get("range") or DEFAULT_RANGE,
-                        preferred=payload.get("preferred"),
-                        ttl=int(payload.get("ttl") or DEFAULT_TTL_SECONDS),
-                        purpose=payload.get("purpose") or "manual",
-                    )
-                elif path == "/v1/ports/release":
-                    result = release_port_for_identity(
-                        state,
-                        agent=payload["agent"],
-                        project=payload["project"],
-                        lease_id=payload.get("lease_id"),
-                        port=payload.get("port"),
-                    )
-                elif path == "/v1/ports/assign":
-                    result = assign_port(
-                        state,
-                        agent=payload["agent"],
-                        project=payload["project"],
-                        name=payload["name"],
-                        port=payload["port"],
-                        force=bool(payload.get("force")),
-                    )
-                elif path == "/v1/ports/unassign":
-                    result = unassign_port(
-                        state,
-                        agent=payload["agent"],
-                        project=payload.get("project"),
-                        name=payload.get("name"),
-                        port=payload.get("port"),
-                        force=bool(payload.get("force")),
-                    )
-            self._send(200, result)
+            self._send(404, {"error": "not found"})
         except OverflowError as exc:
             self._send(413, {"error": str(exc)})
         except TypeError as exc:
@@ -8605,6 +12837,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.group == "api" and args.action == "serve":
         try:
             serve_api(args.host, args.port, token_file=args.token_file)
+            return 0
+        except Exception as exc:
+            print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)
+            return 1
+    if args.group == "broker" and args.action == "serve":
+        try:
+            clear_exec_capability_inheritance()
+            serve_broker(
+                args,
+                observe_before_lifecycle_plan=observe_broker_service_store_for_enrollment,
+            )
             return 0
         except Exception as exc:
             print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)

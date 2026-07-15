@@ -67,6 +67,181 @@ Restart affected Codex, Claude, and desktop runtimes after the link migration;
 skill metadata is loaded at session startup. Retain the rollback transaction
 until fresh-session discovery and repository validation succeed.
 
+## Coordinator state, identity, and refresh
+
+The product state store is a private SQLite database in WAL mode at
+`~/.codex/agent-coordinator/coordinator.sqlite3`. The default home comes from
+the effective POSIX account, not a desktop application's remapped `HOME`, so
+two Codex or Parall processes running as the same user share one repository,
+lease, operation, and observation authority. The directory is required to be
+mode `0700`; the database, WAL, and shared-memory files are private and reject
+foreign ownership and unsafe path components.
+
+One canonical local Git worktree root is one repository/project. Coordinator
+homes, application instances, display names, and container-name resemblance
+are provenance or discovery evidence, never project identity. Resources whose
+repository ownership cannot be proved appear once as **Unassigned Resources**
+with their exact blocker. They can be attached only by an explicit operator
+choice or retired through their immutable host-resource identity.
+
+`inventory` is a pure database query: it does not run Docker, inspect
+processes, scan backups, or rewrite state. `observe` is the explicit bounded
+write path. Concurrent same-scope observations join one database-backed
+single-flight ticket, while full-Docker, no-Docker, and different backup-scan
+scopes cannot incorrectly satisfy one another. DevOps Board observes one
+account source and then reads the committed snapshot; imported legacy Parall
+homes are not polled as independent projects.
+
+The first normalized observation transactionally imports eligible same-UID
+legacy JSON homes after creating private, checksummed preservation evidence.
+Exact duplicates collapse; conflicting repository, port, process, or immutable
+Docker claims remain explicit and fail closed. Legacy files are retained for
+rollback and later writes are reported as conflicts instead of silently
+overwriting SQLite truth.
+
+### Cross-user broker deployment
+
+Different effective UIDs never share the account database. If they must
+coordinate host-global ports or Docker, a root operator installs the local
+peer-authenticated broker. This is an explicit service deployment: the
+repository does not install or enable a daemon automatically.
+
+The operator creates a root-private state directory, a root-owned runtime
+directory whose configured group has traversal, and adds authorized clients to
+that group. For example, use mode `0700` for `/var/lib/devcoordinator` and mode
+`0710` for `/run/devcoordinator`; the broker creates a root-owned, group-readable
+and group-writable `0660` socket. Then enroll each exact repository before
+starting or reloading the supervised service:
+
+```bash
+sudo python3 /absolute/path/to/dev_coordinator.py broker enroll \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --socket /run/devcoordinator/broker.sock \
+  --access-gid NUMERIC_DEVCOORDINATOR_GID \
+  --client-uid NUMERIC_CLIENT_UID \
+  --account-id EXACT_CLIENT_ACCOUNT_ID \
+  --project /absolute/path/to/repository \
+  --agent "$USER" \
+  --port-range 3000-3999
+
+sudo python3 /absolute/path/to/dev_coordinator.py broker serve \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --socket /run/devcoordinator/broker.sock \
+  --access-gid NUMERIC_DEVCOORDINATOR_GID
+```
+
+Enrollment resolves the real Git root, imports its declared runtime, performs a
+fresh full-Docker observation, grants only exact normalized repository/resource
+IDs, and installs the protected client profile at
+`/etc/devcoordinator/client-profiles.json` on Linux or
+`/private/etc/devcoordinator/client-profiles.json` on macOS. It does not start
+resources. The root operator must supervise `broker serve`, arrange group
+membership before clients connect, renew expiring profiles by reenrollment, and
+back up the service database. Once a valid profile covers a repository, client
+commands fail closed if the broker is unavailable; they never fall back to the
+client's Docker socket or private account store for broker-owned mutations.
+
+### Coordinator-store backup and recovery
+
+Use the same administrative surface for either an account-owned or
+service-owned normalized store. Artifact roots must be private absolute paths
+outside Git:
+
+```bash
+python3 /absolute/path/to/dev_coordinator.py broker store-backup \
+  --database /absolute/path/to/coordinator.sqlite3 \
+  --store-role account \
+  --output-root /private/backup/root
+
+python3 /absolute/path/to/dev_coordinator.py broker store-export \
+  --database /absolute/path/to/coordinator.sqlite3 \
+  --store-role account \
+  --output-root /private/backup/root
+```
+
+`store-restore` restores a verified binary backup of the same database
+generation; `store-import` imports a verified logical export. Both require a
+readable current normalized store, create and verify a safety backup first, and
+require `--manifest`, `--safety-root`, and explicit `--confirm`. A logical
+export is a migration/reconstruction artifact, not a corrupt-database recovery
+shortcut.
+
+If SQLite validation fails, stop every service and client using that authority
+and preserve the evidence. Recovery is a separate explicit journey:
+
+```bash
+python3 /absolute/path/to/dev_coordinator.py broker store-recover \
+  --database /absolute/path/to/coordinator.sqlite3 \
+  --store-role account \
+  --manifest /private/backup/root/VERIFIED_BINARY_MANIFEST.json \
+  --forensic-root /private/forensic/root \
+  --confirm-corrupt-recovery
+```
+
+`store-recover` accepts only a strongly verified binary artifact for the same
+store role. Because a corrupt current database cannot prove its generation, it
+first captures the exact database, WAL, and shared-memory bytes with SHA-256
+evidence, retains that forensic capture, validates the replacement, and rolls
+back exact bytes if publication fails. It is an offline recovery operation;
+the command does not stop or supervise services for the operator.
+
+## Reversible repository removal
+
+Removing a repository is a coordinated decommission, not a Board preference or
+filesystem deletion. The coordinator first records a durable start fence,
+captures and disables every proved automatic-start policy, stops each exact
+owned process/container/supervisor, verifies the stopped and listener
+boundaries, releases active leases and assignments, and only then removes the
+repository from active inventory. Repository files, containers, volumes,
+databases, backups, and audit history are retained.
+
+The destructive step requires the exact plan identifier and fingerprint
+returned by the read/observe-backed planning command:
+
+```bash
+PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py \
+  repository plan-remove \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --reason "No longer used on this machine"
+
+python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py \
+  repository remove \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --plan-id EXACT_PLAN_ID \
+  --plan-fingerprint EXACT_PLAN_FINGERPRINT
+```
+
+Any ownership, observation, policy, or plan drift blocks before the unsafe
+effect. Partial host failure keeps the start fence and exact per-target evidence
+visible for an idempotent retry; it never reports the repository removed.
+
+List retained removal records or explicitly reinstall later:
+
+```bash
+python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py \
+  repository list-removed
+
+python3 skills/codex-dev-coordinator/scripts/dev_coordinator.py \
+  repository reinstall \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --reason "Needed again" \
+  --explicit
+```
+
+Reinstall clears the fence but does not start anything. The first later
+explicit Start restores only the exact automatic-start state captured during
+removal before starting the retained runtime.
+
+An unassigned resource is not silently folded into a similarly named project.
+Use the immutable identity, control binding, and ownership fingerprint returned
+by inventory to attach it explicitly, or use the two-step
+`resource plan-retire` / `resource retire` journey to stop, fence, verify, and
+hide that standalone resource without deleting its data.
+
 ## Coordinator API security
 
 The coordinator API is a local capability boundary. It accepts only loopback
@@ -151,8 +326,11 @@ inventory.
 
 ## Boundaries
 
-The coordinator is not a remote orchestrator, multi-user authorization system,
-container scheduler, or production service manager. PostgreSQL logical backups
+The coordinator is not a remote orchestrator, general identity provider,
+container scheduler, or production service manager. Its optional cross-user
+broker is a narrow local peer-UID and explicit-ACL authority for ports, Docker,
+repository decommission, and protected database actions; it is not remote IAM
+or an OS service supervisor. PostgreSQL logical backups
 are not encryption, off-site storage, replication, continuous archiving, or
 point-in-time recovery. The Console is purpose-built for an operator-controlled
 host and adds owner-managed per-Google-account domain grants behind its

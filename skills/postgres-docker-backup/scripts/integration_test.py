@@ -336,6 +336,7 @@ def scalar(container: str, sql: str) -> str:
 
 
 def main() -> int:
+    os.environ["DEVCOORDINATOR_BACKUP_REGISTRY"] = "off"
     required = os.environ.get("POSTGRES_BACKUP_INTEGRATION_REQUIRED") == "1"
     if os.environ.get("POSTGRES_BACKUP_INTEGRATION_INVENTORY_CHECKED") != "1":
         message = "integration skipped: run coordinator inventory, then set POSTGRES_BACKUP_INTEGRATION_INVENTORY_CHECKED=1"

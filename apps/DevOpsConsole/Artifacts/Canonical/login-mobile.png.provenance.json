@@ -6,12 +6,12 @@
   "generator": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
   "width": 390,
   "height": 844,
-  "sha256": "ee09c4592f9d9841f2d186a5c316d6e4dafcca84743b816c8a3c5402147ef889",
+  "sha256": "dbf64172c5e9d96fec569e49b4585decc7596356df110e94ffab6052f14b0e20",
   "viewport": {
     "width": 390,
     "height": 844
   },
-  "source_sha256": "eee9d4d9141196b7d7664c43dc0c661030323823cca304f0d82956b5317a3c6f",
+  "source_sha256": "16da2de63008219dbd3d103a996c0bfa12ed7d963986a0fbce669462c61bf1cd",
   "source_files": [
     {
       "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
@@ -35,7 +35,7 @@
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.js",
-      "sha256": "3a8f3936c53a74d366faa5b7c0829f1b1dd54ce7324de45237f2f26b1704460f"
+      "sha256": "8928ee13b8456dc63914156223a6c93d045578a4e9fc0c129fb004f92f26991a"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/index.html",
@@ -43,7 +43,7 @@
     },
     {
       "path": "apps/DevOpsConsole/test/helpers/stack.mjs",
-      "sha256": "0adefde2a48963b2d4d3e2631364063074eedff6f987744748ea0f413abdcecc"
+      "sha256": "26bc300b926749e34d4f114c166eedfdab6582a0aea1ad864179e5dbaa2aa564"
     },
     {
       "path": "ci/playwright/package-lock.json",

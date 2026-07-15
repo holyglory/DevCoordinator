@@ -33,6 +33,14 @@ async function loadGroupOrder() {
   return { appJs, projectGroupOrder: new Function(`${src}; return projectGroupOrder;`)() };
 }
 
+async function loadContainerStatus() {
+  const appJs = await fsp.readFile(APP_JS_URL, 'utf8');
+  const runningSource = extractFunction(appJs, 'function isContainerRunning(c)');
+  const metaSource = extractFunction(appJs, 'function containerStatusMeta(c)');
+  // eslint-disable-next-line no-new-func
+  return new Function(`${runningSource}; ${metaSource}; return { isContainerRunning, containerStatusMeta };`)();
+}
+
 const group = (name, runningCount, cpu, key = `path:/repo/${name}`) => ({
   name,
   key,
@@ -83,4 +91,14 @@ test('ordering wiring: the stable comparator is used and no live-metric sort key
     'no list may order by live cpu_percent');
   assert.ok(!appJs.includes('lastCpu(b) - lastCpu(a)'),
     'performance cards may not order by current load');
+});
+
+test('browser container status accepts normalized and docker-CLI running vocabularies', async () => {
+  const { isContainerRunning, containerStatusMeta } = await loadContainerStatus();
+  for (const status of ['running', 'Up 3 minutes (healthy)']) {
+    assert.equal(isContainerRunning({ status }), true, status);
+    assert.deepEqual(containerStatusMeta({ status }), { css: 'ok', label: 'running' }, status);
+  }
+  assert.equal(isContainerRunning({ status: 'stopped' }), false);
+  assert.deepEqual(containerStatusMeta({ status: 'stopped' }), { css: 'dim', label: 'stopped' });
 });

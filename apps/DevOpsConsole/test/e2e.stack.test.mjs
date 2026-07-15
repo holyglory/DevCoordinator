@@ -78,6 +78,7 @@ describe('e2e: full console stack', () => {
   async function writeFakeDocker(binDir, webHostPort, callsLog) {
     const projectDir = path.join(binDir, 'e2eweb-project');
     await fsp.mkdir(projectDir, { recursive: true });
+    execFileSync('git', ['-C', projectDir, 'init', '-q']);
     const labels = {
       'com.docker.compose.project': 'e2eweb',
       'com.docker.compose.project.working_dir': projectDir,
@@ -106,7 +107,23 @@ describe('e2e: full console stack', () => {
     ];
     const inspectMap = {};
     for (const row of psRows) {
-      const full = { Id: `${row.ID}deadbeef`, Name: `/${row.Names}`, Config: { Labels: labels } };
+      const published = {};
+      for (const mapping of row.Ports.split(',')) {
+        const matched = mapping.trim().match(/^(?:[^:]+:)?(\d+)->(\d+)\/(tcp|udp)$/);
+        if (!matched) continue;
+        const [, hostPort, containerPort, protocol] = matched;
+        const key = `${containerPort}/${protocol}`;
+        published[key] ??= [];
+        published[key].push({ HostIp: '0.0.0.0', HostPort: hostPort });
+      }
+      const full = {
+        Id: row.ID.padEnd(64, '0'),
+        Name: `/${row.Names}`,
+        Config: { Labels: labels },
+        State: { Status: 'running', Running: true, Health: { Status: 'healthy' } },
+        HostConfig: { RestartPolicy: { Name: 'unless-stopped' } },
+        NetworkSettings: { Ports: published },
+      };
       inspectMap[row.ID] = full;
       inspectMap[row.Names] = full;
     }
@@ -148,6 +165,7 @@ else:
     stack = await startStack({
       allowedEmails: [FIXTURE_EMAIL],
       coordinatorEnv: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` },
+      expectDocker: true,
       routes: ({ upstream, wsEcho }) => [
         // app -> ws-echo (answers plain GET too) — protected by default.
         { slug: 'app', kind: 'port', port: wsEcho.port },
@@ -873,6 +891,14 @@ else:
         if (server.status === 'running') break;
       }
       assert.equal(server.status, 'running', `metrics target should run: ${JSON.stringify(server?.health)}`);
+
+      // Inventory is a pure normalized read. Commit one explicit post-start
+      // sample so process CPU/RSS is real observed telemetry, not a dynamic
+      // side effect or an invented fixture value.
+      await stack.coordinator.observe({
+        agent: 'e2e-metrics-observer',
+        project: toplevel,
+      });
 
       let entity = null;
       const deadline = Date.now() + 30_000;

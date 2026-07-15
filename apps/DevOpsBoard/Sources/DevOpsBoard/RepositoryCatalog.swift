@@ -36,15 +36,40 @@ private func verifiedGitWorktreeRoot(_ projectPath: String?) -> String? {
 /// A local repository is identified only by its canonical worktree root.
 /// Source homes and display labels are observation provenance, not identity.
 struct RepositoryIdentity: Hashable, Sendable, Identifiable, Comparable {
+    /// Durable normalized identity. Legacy/test catalogs do not have one and
+    /// fall back to the canonical root, but production v2 projections always
+    /// populate this field from `repositories.repo_id`.
+    let repoID: String?
     let canonicalRoot: String
+    private let authoritativeDisplayName: String?
 
     init?(projectPath: String?) {
         guard let root = verifiedGitWorktreeRoot(projectPath) else { return nil }
+        self.repoID = nil
         self.canonicalRoot = root
+        self.authoritativeDisplayName = nil
     }
 
-    var id: String { canonicalRoot }
-    var displayName: String { URL(fileURLWithPath: canonicalRoot).lastPathComponent }
+    init(repoID: String, canonicalRoot: String, displayName: String? = nil) {
+        self.repoID = repoID
+        self.canonicalRoot = canonicalRoot
+        let candidate = displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.authoritativeDisplayName = candidate?.isEmpty == false ? candidate : nil
+    }
+
+    var id: String { repoID ?? canonicalRoot }
+    var displayName: String {
+        authoritativeDisplayName ?? URL(fileURLWithPath: canonicalRoot).lastPathComponent
+    }
+
+    static func == (lhs: RepositoryIdentity, rhs: RepositoryIdentity) -> Bool {
+        lhs.repoID == rhs.repoID && lhs.canonicalRoot == rhs.canonicalRoot
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(repoID)
+        hasher.combine(canonicalRoot)
+    }
 
     static func < (lhs: RepositoryIdentity, rhs: RepositoryIdentity) -> Bool {
         lhs.canonicalRoot < rhs.canonicalRoot
@@ -249,6 +274,7 @@ struct ProjectGroup: Equatable {
     var id: String
     var name: String
     var projectPath: String?
+    var repositoryID: String? = nil
     var servers: [ManagedServer]
     var containers: [DockerContainer]
     var databases: [DockerContainer]
@@ -270,6 +296,12 @@ struct ProjectGroup: Equatable {
     }
 
     var isRepository: Bool { kind == .repository }
+    var projectActionsBlocked: Bool {
+        actionOrigin == nil
+            || !serverConflicts.isEmpty
+            || !serverMembershipConflicts.isEmpty
+            || !dockerMembershipConflicts.isEmpty
+    }
 
     /// Existing focused tests and hand-built fixtures predate the catalog and
     /// still carry one unambiguous origin directly on their resources. Live
@@ -360,9 +392,11 @@ func makeProjectGroups(from catalog: RepositoryCatalog, inventory: Inventory) ->
         )
         usage.origin = aggregate.controlOrigin
         return ProjectGroup(
-            id: "path:\(aggregate.identity.canonicalRoot)",
+            id: aggregate.identity.repoID.map { "repo:\($0)" }
+                ?? "path:\(aggregate.identity.canonicalRoot)",
             name: aggregate.displayName,
             projectPath: aggregate.identity.canonicalRoot,
+            repositoryID: aggregate.identity.repoID,
             servers: servers,
             containers: physicalContainers.filter { !$0.isPostgresLike },
             databases: databases,

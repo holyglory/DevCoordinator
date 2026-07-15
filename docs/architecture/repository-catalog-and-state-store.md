@@ -1,13 +1,17 @@
 # Repository catalog and coordinator state-store architecture
 
-Status: Board repository catalog implemented; coordinator state-store refactor proposed
+Status: Owner-approved on 2026-07-14; implementation complete, release
+acceptance evidence pending
 
 This document records both the bounded Board repair implemented for the
-2026-07-13 repository-duplication incident and the larger target model for
-DevCoordinator storage. The in-memory Board repository catalog described below
-exists. The SQLite store, same-UID importer, broker, v2 inventory graph, and
-single host-resource observer remain proposals and must not be reported as
-implemented.
+2026-07-13 repository-duplication incident and the owner-approved target model
+for DevCoordinator storage. On 2026-07-14 the owner approved the SQLite store, same-UID
+importer, broker for shared cross-user resources, v2 inventory graph, single
+host-resource observer, and reversible repository-decommission semantics after
+receiving the alternatives, costs, risks, and recommendation recorded in
+`DecisionHistory.md`. The implementation now exists; the acceptance matrix in
+this document remains the release gate and results must not be overstated until
+the final normal/optimized, native, cross-UID, packaging, and launch runs pass.
 
 ## Decision
 
@@ -21,46 +25,44 @@ observations, display names, and derived name keys are not project identities.
 They may contribute resources or observations to a repository, but they must
 never create another project for the same canonical worktree root.
 
-The long-term source of truth should be one private, normalized SQLite database
+The source of truth is one private, normalized SQLite database
 in WAL mode per effective POSIX account. The coordinator owns repository
 identity, resource membership, observation, aggregation, and control routing.
-The Board consumes the resulting graph and does not merge independent
-coordinator snapshots into its own competing identity model.
+The Board consumes one account-store projection and no longer polls imported
+legacy homes as independent authorities. Its production Swift models decode
+the normalized v2 graph directly. A bounded v1 compatibility projection is
+generated from the same v2 query only for older external clients; it cannot
+create identities, observe the host, or mutate state independently.
 
 ## Confirmed current design
 
 ### Persisted state
 
-The current coordinator resolves a home and stores one private monolithic
-`state.json` plus `state.lock` and logs. See `coordinator_home`, `state_path`,
-`default_state`, and `locked_state` in
-[`dev_coordinator.py`](../../skills/codex-dev-coordinator/scripts/dev_coordinator.py).
-The JSON has these top-level persisted collections:
+The coordinator resolves the effective POSIX account home and opens
+`coordinator.sqlite3` through `AccountStore`. SQLite WAL, foreign keys, private
+ownership/mode checks, schema versioning, distinct state/observation revisions,
+and invariant queries are authoritative. Canonical repositories, installations,
+definitions, source records, host resources, memberships, control bindings,
+observations, policies, leases, assignments, operations, events, telemetry,
+backup/import evidence, conflicts, and unassigned resources have separate
+tables and lifecycles.
 
-| Collection | Current meaning |
-| --- | --- |
-| `servers` | Server definitions, process/listener state, commands, log paths, and repeated project path strings. |
-| `leases` | Time-bounded port ownership and optional server attachment. |
-| `port_assignments` | Durable `(project path, server name) -> port` pins. |
-| `operations` | Pending and completed lifecycle transaction records. |
-| `history` | A bounded event list containing denormalized payloads. |
-| `docker.metadata` | Coordinator sidecar ownership metadata keyed by a container alias or ID. |
-| `docker.stats_history` | Per-container telemetry arrays, including arrays for containers that no longer exist. |
-| `docker.last_commands` | Recent Docker command evidence. |
+Legacy `state.json` homes are migration inputs only. The first normalized
+bootstrap captures private checksummed evidence, imports same-UID homes in one
+transaction, and leaves the source files untouched. Exact duplicates collapse;
+contradictory immutable Docker claims become one conflicting physical resource
+with no active membership or arbitrary controller. A later source write is a
+reported conflict, not a competing live authority. The JSON backend remains
+only under the explicit `legacy-json-test-only` name for deterministic fixtures.
 
-There is no persisted repository or project table. A project path is repeated
-inside servers, assignments, leases, operations, event payloads, and Docker
-metadata. `canonical_project` resolves a real path and walks upward to a `.git`
-file or directory, but when it finds no Git root it accepts the raw path. The
-set of projects is reconstructed during every inventory from server records,
-permanent assignments, and live Docker metadata.
+The old callback-shaped dictionary mutation adapter is not a production
+backend. Historical deterministic fixtures may opt into the explicitly named
+`legacy-json-test-only` backend, but the default CLI and API lifecycle paths
+commit through typed normalized services. A default-runtime guard makes an
+accidental `locked_state` call fail instead of materializing and rewriting a
+legacy projection.
 
-`build_project_usage` produces a transient denormalized rollup. A path-backed
-resource becomes `path:<canonical path>`. A container without a project path
-becomes `name:<derived name>`. The latter is a read-only attribution hint, not a
-repository, but the current Board turns every rollup row into a project node.
-
-### Reproduced pre-repair Board source and merge model
+### Reproduced pre-repair Board source and merge model (historical)
 
 `FileSystemCoordinatorOriginDiscovery` in
 [`Models.swift`](../../apps/DevOpsBoard/Sources/DevOpsBoard/Models.swift)
@@ -110,10 +112,10 @@ health non-nominal, and block mutation. The launch-readiness marker compares
 canonical repository count with rendered repository-group count so the
 production-shaped one-repository/three-row regression fails the delivery gate.
 
-This catalog is a compatibility repair over independent JSON snapshots. It
-does not eliminate repeated source polling, host-global Docker resampling,
-state rewrites, or legacy-home telemetry amplification; those require the
-state-store and observer refactor below.
+The catalog originated as a compatibility repair over independent snapshots.
+After the normalized cutover, it receives one account-store projection and acts
+as a defensive presentation layer. Imported legacy homes are not Board sources;
+host-global observation is coalesced before inventory is queried.
 
 ## Reproduced production-shaped evidence
 
@@ -193,7 +195,7 @@ All observed server records were stopped at capture time, so this evidence does
 not establish a current listener collision. It does prove that a migration
 cannot concatenate stores or silently pick a winner.
 
-## Target domain model
+## Implemented domain model
 
 Identity, observation, aggregation, and control authority must be separate.
 
@@ -330,6 +332,15 @@ subprocess is launched:
 6. Persist changed current observations and new telemetry once.
 7. Build all project aggregates from the deduplicated observation.
 
+The database-backed single-flight key includes whether Docker is present and a
+digest of the canonical backup-directory set. A no-Docker readiness probe or a
+different backup scan therefore cannot satisfy/join a full Board or removal
+observation. Automatic Board refresh waits its configured interval after the
+prior refresh completes and retains the last presentation while work runs.
+This is coalesced interval observation, not an event stream. PostgreSQL catalog
+discovery still performs bounded container queries during a full observation;
+that measurable residual must not be described as eliminated polling.
+
 Source homes may contribute sidecar metadata or server definitions, but they
 must not independently resample the same Docker engine. Conflicting sidecar
 claims are stored as conflicts; Compose working-directory evidence remains
@@ -339,14 +350,15 @@ Backup discovery should likewise run once per distinct active repository, not
 once per source snapshot. It produces immutable backup evidence or a bounded
 cache entry, separate from project identity.
 
-## Target private SQLite WAL schema
+## Implemented private SQLite WAL schema
 
 The database remains private to the effective UID: its directory is mode
 `0700`, files are mode `0600`, symlink components are refused, and ownership is
 validated before open. WAL and sidecar files receive the same protection.
 
-The following schema is conceptual. Field names may evolve, but entity
-boundaries and uniqueness rules are requirements.
+The schema is created and migrated atomically by `devcoordinator/schema.py`.
+Field names may evolve through a versioned migration, but the following entity
+boundaries and uniqueness rules are current requirements.
 
 | Table | Purpose and required constraints |
 | --- | --- |
@@ -355,6 +367,8 @@ boundaries and uniqueness rules are requirements.
 | `coordinator_sources` | Canonical source identity, home or endpoint, effective UID, enabled/imported/retired state. |
 | `repositories` | `repo_id`, `host_id`, canonical root, display name, active/missing/relocated state. `UNIQUE(host_id, canonical_root)`. |
 | `repository_aliases` | Historical roots and relocation evidence. An alias cannot point at two repositories on one host. |
+| `repository_installations` | Installed/disabling/disabled state, durable start fence, generation, actor/reason, and removal/reinstall operation. One row per repository. |
+| `repository_memberships` | Exact one-repository ownership of server/container/supervisor host resources. A physical resource cannot be active in two repositories. |
 | `server_definitions` | Durable server name, argv/template, cwd, environment references, health template, and log path. `UNIQUE(repo_id, name)`. |
 | `source_resources` | `SourceResourceIdentity`, original legacy/native payload identity, and source provenance. |
 | `control_bindings` | Resource/repository to authoritative source routing, capability, provenance, and conflict state. |
@@ -362,7 +376,10 @@ boundaries and uniqueness rules are requirements.
 | `port_assignments` | Durable scheduling policy. `UNIQUE(repo_id, server_name)` and `UNIQUE(host_id, port)` for an unbrokered host namespace. |
 | `leases` | Active/released/stale reservations with repository, owner, optional server, process identity, and expiry. |
 | `operations` | Durable lifecycle transaction journal, generation, owner process identity, phase, status, and structured result/error. |
+| `operation_targets` and parameter/dependency tables | Exact immutable multi-target plan, phase, per-target result/error, and execution ordering. |
 | `events` | Append-only operator-relevant events referencing normalized entities rather than embedding authoritative copies. |
+| `startup_policies` and `startup_policy_restore_states` | Current disable value plus exact pre-decommission Docker/supervisor/Compose/coordinator policy capture, restore state, and immutable binding evidence. |
+| `resource_retirements` | Standalone resource disabling/retired fence and operation evidence. |
 | `docker_engines` | Physical observation domain: host, context/socket identity, daemon identity, and capability state. |
 | `docker_resources` | Immutable container identity, current name/image, and engine. `UNIQUE(engine_id, full_container_id)`. |
 | `docker_observations` | Latest status, ports, labels digest, health, and sample time for one container. |
@@ -372,15 +389,25 @@ boundaries and uniqueness rules are requirements.
 | `backup_evidence` | Immutable backup/manifests/checksum/verification evidence; not repository configuration. |
 | `legacy_imports` | Source path digest, source revision/hash, backup manifest, phase, and committed/rolled-back state. |
 | `migration_conflicts` | Exact duplicate, identity conflict, port conflict, ownership conflict, or pending-operation disposition requiring review. |
+| `unassigned_resources` | One physical resource, exact reason, suggested root, and active/attached/retired disposition without synthetic project identity. |
+| `broker_lease_links`, `broker_assignment_links`, and reconciliation queue | Client-store link to the service-owned broker reservation/assignment, exact authority generation, rollback state, and unresolved cleanup evidence. |
 
 SQLite foreign keys must be enabled. Mutations use `BEGIN IMMEDIATE` only for
 the bounded reservation/commit phases that require exclusion. Slow process,
 Docker, HTTP, Git, backup, and filesystem observation remains outside write
 transactions and commits with optimistic fingerprints.
 
+A service-owned broker database adds peer principals, per-resource ACLs, port
+policies, durable assignment/lease ownership, idempotent authenticated request
+records, and service-owned Compose definitions/files/services. Clients never
+receive that database path or submit SQL, commands, repository paths, Compose
+paths, or argv through the socket. A root-owned enrollment profile exposes only
+the expected socket identity, service database generation, authenticated UID's
+account ID, canonical repository root, and opaque normalized IDs.
+
 ## Read-only inventory contract
 
-`inventory` and `GET /v1/inventory` become pure reads of one consistent SQLite
+`inventory` and `GET /v1/inventory` are pure reads of one consistent SQLite
 snapshot. They must not:
 
 - increment an observation generation;
@@ -390,7 +417,7 @@ snapshot. They must not:
 - reconcile or prune records; or
 - change an operation, lease, server, or telemetry record.
 
-Observation becomes an explicit, coalesced command or coordinator service job.
+Observation is an explicit, coalesced command or coordinator service job.
 The Board can request refresh and then read a completed snapshot, or read the
 last completed snapshot with its age and an in-progress indicator. Multiple
 Board/Codex clients share the same in-flight observation rather than spawning
@@ -513,15 +540,19 @@ Two supported host-wide policies are possible:
    enforces per-UID repository/resource ACLs, and arbitrates host-global ports
    and Docker resources. Clients never receive shared filesystem write access.
 
-Until the broker exists, the product must state that cross-user uniqueness
-requires disjoint ranges. Lack of cross-user visibility is not proof that a
-port or container is unowned.
+The authorized broker is implemented as a peer-authenticated local Unix-socket
+service. It is an explicit deployment boundary, not an implicit daemon: a root
+operator must create the service-owned database, enroll each UID/repository,
+publish the root-owned client profile, place clients in the socket access
+group, and supervise `broker serve`. Without that installation, isolated user
+coordinators still require disjoint ranges. Lack of cross-user visibility is
+never proof that a port or container is unowned.
 
 ## Compatibility
 
-The CLI and API should introduce an explicit inventory schema version and a v2
-graph with `repositories`, `resources`, `unassigned_resources`, `observations`,
-and `control_bindings`.
+The CLI and API expose an explicit inventory schema version and a v2 graph with
+`repositories`, `resources`, `unassigned_resources`, `observations`, and
+`control_bindings`.
 
 A bounded v1 compatibility projection may continue returning `servers`,
 `leases`, `docker`, and `project_usage`, but:
@@ -533,14 +564,15 @@ A bounded v1 compatibility projection may continue returning `servers`,
 - source/native identities remain available on resource rows for safe action
   routing.
 
-The Board should switch to v2 before v1 is retired. Compatibility code must not
-become a second identity implementation.
+The Board consumes v2 directly. The remaining v1 compatibility code must stay a
+bounded projection of that graph and never become a second identity or
+observation implementation.
 
 ## Delivery phases
 
-Current status: the Board-side portion of phase 2 is implemented and verified
-against the existing v1 inventories. The coordinator storage, importer,
-single-observer, and v2 cutover phases remain unimplemented.
+Current status: phases 1 through 8 are implemented. Release acceptance remains
+pending until the final normal/optimized, native, packaged-app, remote Linux
+cross-UID, rollback, boundary, and freshness gates in this document pass.
 
 1. **Contract and guardrails:** add the domain types, schema contract, realistic
    must-catch fixtures, read-only inventory write detector, and migration
@@ -562,8 +594,8 @@ single-observer, and v2 cutover phases remain unimplemented.
 8. **Legacy retirement:** retain rollback artifacts for the declared window,
    detect late legacy writers, then archive rather than silently delete state.
 
-No phase may report the target architecture as implemented before its original
-surface, migration, action, and rollback checks pass.
+No phase may report release acceptance before its original surface, migration,
+action, and rollback checks pass.
 
 ## Rollback
 
@@ -577,6 +609,16 @@ read pointer back to the unchanged source generation. Once a SQLite-only
 mutation commits, rollback must export a verified compatibility snapshot from
 the database or replay the transaction journal; pointing clients at stale JSON
 would lose state and is forbidden.
+
+Routine normalized-store backup/restore is an explicit administrative CLI
+surface. Binary restore is restricted to a strongly verified artifact from the
+same database generation, logical import is restricted to a verified export,
+and both require a readable current authority plus a newly verified safety
+backup. Neither path guesses through SQLite corruption. Offline corrupt-store
+recovery instead requires every writer stopped, captures and checksums the
+exact current database/WAL/shared-memory files for forensics, accepts only a
+strongly verified binary artifact of the same store role, validates the
+replacement, and restores the exact captured bytes if publication fails.
 
 Rollback verification must compare repositories, server definitions, active
 leases, assignments, pending operations, control bindings, and source hashes.
@@ -665,7 +707,7 @@ state may not be dropped to make counts match.
   file, token, logs, or backups.
 - Isolated-user mode enforces disjoint port ranges with a realistic overlapping
   configuration must-catch and a non-overlapping false-positive control.
-- Broker mode, if implemented, authenticates peer credentials and enforces
+- Broker mode authenticates real peer credentials and enforces
   repository/resource ACLs before host-global mutation.
 
 Every detector added for this migration must prove recall against these
@@ -674,8 +716,8 @@ controls. Passing implementation-shaped fixtures alone is not acceptance.
 
 ## Non-goals
 
-- This proposal does not claim that SQLite, a host broker, or the v2 inventory
-  is currently implemented.
+- This implementation is not a remote orchestrator, general identity provider,
+  or replacement for OS account and service supervision policy.
 - It does not create synthetic repositories or infer ownership from names.
 - It does not merge separate local worktrees because they share a Git remote.
 - It does not weaken source-resource provenance or listener-identity safety to

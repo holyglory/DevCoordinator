@@ -1,0 +1,816 @@
+"""Focused trust-profile and client-side broker linkage regression tests."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import pwd
+import tempfile
+import time
+import unittest
+import uuid
+from unittest import mock
+
+import dev_coordinator
+from devcoordinator.broker import BrokerOperation
+from devcoordinator.broker_links import BrokerLinkStore
+from devcoordinator.broker_profile import (
+    BrokerClientProfile,
+    BrokerProfileError,
+    BrokerRepositoryProfile,
+    BrokerServiceProfile,
+    call_broker,
+    load_broker_profile,
+    profile_from_document,
+)
+import devcoordinator.broker_profile as broker_profile_module
+from devcoordinator.store import AccountStore, utc_timestamp
+
+
+UID = os.geteuid()
+REPO_ID = "repo-alpha"
+DATABASE_GENERATION = "generation-alpha"
+
+
+class CanonicalTemporaryDirectory:
+    """Use a test-owned canonical root rather than a host symlink alias."""
+
+    def __init__(self, prefix: str) -> None:
+        home = Path(pwd.getpwuid(UID).pw_dir).resolve()
+        self._temporary = tempfile.TemporaryDirectory(prefix=prefix, dir=str(home))
+        self.path = Path(self._temporary.name).resolve()
+
+    def __enter__(self) -> Path:
+        return self.path
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self._temporary.cleanup()
+
+
+def profile_document(
+    repository_root: Path,
+    *,
+    client_uid: int = UID,
+    valid_until_epoch: int | None = None,
+) -> dict[str, object]:
+    expiry = int(time.time()) + 3_600 if valid_until_epoch is None else valid_until_epoch
+    return {
+        "version": 1,
+        "service": {
+            "socket": "/run/devcoordinator/broker.sock",
+            "uid": 0,
+            "gid": 62000,
+            "mode": "0660",
+            "database_generation": DATABASE_GENERATION,
+        },
+        "clients": {
+            str(client_uid): {
+                "account_id": "account-alpha",
+                "issued_at": "2026-07-14T00:00:00Z",
+                "valid_until_epoch": expiry,
+                "repositories": [
+                    {
+                        "canonical_root": str(repository_root),
+                        "repo_id": REPO_ID,
+                        "generation": 7,
+                        "servers": {
+                            "web": "server-web",
+                            "worker": "server-worker",
+                            "database": "server-database",
+                        },
+                        "containers": {"postgres": "container-postgres"},
+                        "compose_definition_id": "compose-alpha",
+                    }
+                ],
+            }
+        },
+    }
+
+
+def parsed_profile(repository_root: Path) -> BrokerClientProfile:
+    return profile_from_document(
+        profile_document(repository_root), effective_uid=UID
+    )
+
+
+class BrokerProfileTrustTests(unittest.TestCase):
+    def test_missing_default_is_unconfigured_but_required_default_fails(self) -> None:
+        missing = broker_profile_module.SYSTEM_PROFILE_PATH.parent / (
+            ".devcoordinator-profile-intentionally-missing-for-test"
+        )
+        self.assertFalse(missing.exists() or missing.is_symlink())
+        with mock.patch.object(
+            broker_profile_module, "SYSTEM_PROFILE_PATH", missing
+        ), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(broker_profile_module.PROFILE_PATH_ENV, None)
+            self.assertIsNone(load_broker_profile())
+            with self.assertRaisesRegex(BrokerProfileError, "required.*missing"):
+                load_broker_profile(required=True)
+
+    def test_public_brokered_docker_and_compose_never_open_client_state(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-public-docker-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            repository = profile.repository(str(repository_root))
+            calls: list[tuple[str, str]] = []
+
+            def call(
+                _profile: BrokerClientProfile,
+                *,
+                repository: BrokerRepositoryProfile,
+                resource_id: str,
+                operation: BrokerOperation,
+                arguments: object = None,
+                operation_id: str | None = None,
+            ) -> tuple[str, dict[str, object]]:
+                del _profile, repository, arguments, operation_id
+                calls.append((operation.value, resource_id))
+                return (
+                    f"operation-{len(calls)}",
+                    {
+                        "status": "succeeded",
+                        "broker_observation": {
+                            "snapshot_id": f"snapshot-{len(calls)}"
+                        },
+                    },
+                )
+
+            def client_state_poison(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("brokered Docker reached client-local state")
+
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_context",
+                    return_value=(profile, repository),
+                ),
+                mock.patch.object(BrokerClientProfile, "call", new=call),
+                mock.patch.object(
+                    dev_coordinator,
+                    "_open_normalized_action_store",
+                    side_effect=client_state_poison,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "locked_state",
+                    side_effect=client_state_poison,
+                ),
+            ):
+                docker = dev_coordinator.coordinated_run_docker(
+                    ["docker", "start", "postgres"],
+                    project=str(repository_root),
+                    agent="codex-test",
+                    container="postgres",
+                )
+                compose = dev_coordinator.coordinated_run_docker(
+                    ["docker", "compose", "up"],
+                    cwd=str(repository_root),
+                    project=str(repository_root),
+                    agent="codex-test",
+                )
+
+            self.assertEqual(docker["broker"]["resource_id"], "container-postgres")
+            self.assertEqual(
+                compose["broker"]["resource_id"], "compose-alpha"
+            )
+            self.assertEqual(
+                calls,
+                [
+                    ("docker.start", "container-postgres"),
+                    ("compose.up", "compose-alpha"),
+                ],
+            )
+
+    def test_trusted_file_loads_and_symlink_or_replaceable_ancestor_is_rejected(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-profile-trust-") as root:
+            repository = root / "repository"
+            repository.mkdir(mode=0o700)
+            trusted = root / "trusted.json"
+            trusted.write_text(
+                json.dumps(profile_document(repository)), encoding="utf-8"
+            )
+            trusted.chmod(0o600)
+
+            loaded = load_broker_profile(
+                path=trusted,
+                effective_uid=UID,
+                required=True,
+                trusted_owner_uid=UID,
+            )
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.account_id, "account-alpha")
+
+            symlink = root / "profile-link.json"
+            symlink.symlink_to(trusted)
+            with self.assertRaisesRegex(BrokerProfileError, "non-symlink"):
+                load_broker_profile(
+                    path=symlink,
+                    effective_uid=UID,
+                    required=True,
+                    trusted_owner_uid=UID,
+                )
+
+            replaceable = root / "replaceable"
+            replaceable.mkdir(mode=0o700)
+            nested = replaceable / "profile.json"
+            nested.write_text(
+                json.dumps(profile_document(repository)), encoding="utf-8"
+            )
+            nested.chmod(0o600)
+            replaceable.chmod(0o770)
+            with self.assertRaisesRegex(BrokerProfileError, "replaceable ancestor"):
+                load_broker_profile(
+                    path=nested,
+                    effective_uid=UID,
+                    required=True,
+                    trusted_owner_uid=UID,
+                )
+
+    def test_stale_enrollment_and_wrong_authenticated_uid_fail_closed(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-profile-expiry-") as root:
+            repository = root / "repository"
+            repository.mkdir()
+            stale = profile_document(
+                repository, valid_until_epoch=int(time.time()) - 1
+            )
+            with self.assertRaisesRegex(BrokerProfileError, "expired"):
+                profile_from_document(stale, effective_uid=UID)
+
+            current = profile_document(repository)
+            with self.assertRaisesRegex(
+                BrokerProfileError, "authenticated uid.*no valid broker enrollment"
+            ):
+                profile_from_document(current, effective_uid=UID + 100_000)
+
+    def test_repository_lookup_and_resource_mappings_are_exact(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-profile-map-") as root:
+            repository = root / "repository"
+            repository.mkdir()
+            profile = parsed_profile(repository)
+
+            enrolled = profile.repository(str(repository / "."))
+            self.assertEqual(enrolled.repo_id, REPO_ID)
+            self.assertEqual(enrolled.server_id("web"), "server-web")
+            self.assertEqual(enrolled.container_id("postgres"), "container-postgres")
+            self.assertEqual(enrolled.compose_id(), "compose-alpha")
+
+            with self.assertRaisesRegex(BrokerProfileError, "not enrolled"):
+                profile.repository(str(root / "other-repository"))
+            with self.assertRaisesRegex(BrokerProfileError, "server 'api'.*not enrolled"):
+                enrolled.server_id("api")
+            with self.assertRaisesRegex(BrokerProfileError, "Docker resource.*not enrolled"):
+                enrolled.container_id("foreign-container")
+
+    def test_call_binds_profile_database_generation_to_request(self) -> None:
+        captured: list[object] = []
+        constructor: list[tuple[object, dict[str, object]]] = []
+
+        class FakeBrokerClient:
+            def __init__(self, socket_path: object, **kwargs: object) -> None:
+                constructor.append((socket_path, dict(kwargs)))
+
+            def call(self, request: object) -> dict[str, object]:
+                captured.append(request)
+                return {"ok": True, "result": {"status": "accepted"}}
+
+        operation_id = str(uuid.uuid4())
+        service = BrokerServiceProfile(
+            socket_path=Path("/run/devcoordinator/broker.sock"),
+            service_uid=17,
+            socket_gid=62000,
+            socket_mode=0o660,
+            database_generation=DATABASE_GENERATION,
+        )
+        with mock.patch.object(
+            broker_profile_module, "BrokerClient", FakeBrokerClient
+        ):
+            returned_id, result = call_broker(
+                service=service,
+                account_id="account-alpha",
+                repo_id=REPO_ID,
+                resource_id="container-postgres",
+                operation=BrokerOperation.DOCKER_STOP,
+                operation_id=operation_id,
+            )
+
+        self.assertEqual(returned_id, operation_id)
+        self.assertEqual(result, {"status": "accepted"})
+        self.assertEqual(len(captured), 1)
+        request = captured[0]
+        self.assertEqual(request.authority_generation, DATABASE_GENERATION)
+        self.assertEqual(request.account_id, "account-alpha")
+        self.assertEqual(request.project_id, REPO_ID)
+        self.assertEqual(
+            constructor,
+            [
+                (
+                    Path("/run/devcoordinator/broker.sock"),
+                    {
+                        "expected_broker_uid": 17,
+                        "expected_socket_gid": 62000,
+                        "expected_socket_mode": 0o660,
+                        "timeout_seconds": 10.0,
+                    },
+                )
+            ],
+        )
+
+
+class BrokerLinkStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = CanonicalTemporaryDirectory(".broker-links-")
+        self.root = self._temporary.__enter__()
+        self.repository_root = self.root / "repository"
+        self.repository_root.mkdir()
+        self.store = AccountStore.open_default(self.root / "account-store")
+        self._seed_repository()
+        self.profile = parsed_profile(self.repository_root)
+        self.repository = self.profile.repository(str(self.repository_root))
+        self.links = BrokerLinkStore(self.store)
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._temporary.__exit__(None, None, None)
+
+    def _seed_repository(self) -> None:
+        now = utc_timestamp()
+        host_id = "host-alpha"
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO hosts(
+                    host_id, machine_fingerprint, platform, hostname,
+                    created_at, updated_at
+                ) VALUES (?, 'machine-alpha', 'test', 'test-host', ?, ?)
+                """,
+                (host_id, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO repositories(
+                    repo_id, host_id, canonical_root, display_name, state,
+                    generation, created_at, updated_at
+                ) VALUES (?, ?, ?, 'Alpha', 'active', 0, ?, ?)
+                """,
+                (REPO_ID, host_id, str(self.repository_root), now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO repository_installations(
+                    repo_id, status, startup_fenced, generation, actor, updated_at
+                ) VALUES (?, 'installed', 0, 0, 'fixture', ?)
+                """,
+                (REPO_ID, now),
+            )
+
+    def _reserve_lease(
+        self,
+        *,
+        server_name: str = "web",
+        server_id: str = "server-web",
+        broker_lease_id: str = "broker-lease-web",
+        port: int = 43100,
+        operation_id: str = "operation-lease-web",
+    ):
+        return self.links.reserve_lease(
+            profile=self.profile,
+            repository=self.repository,
+            server_name=server_name,
+            server_definition_id=server_id,
+            broker_lease_id=broker_lease_id,
+            port=port,
+            protocol="tcp",
+            operation_id=operation_id,
+            expires_at="2026-07-14T01:00:00Z",
+        )
+
+    def _reserve_assignment(
+        self,
+        *,
+        server_name: str = "database",
+        server_id: str = "server-database",
+        broker_assignment_id: str = "broker-assignment-database",
+        port: int = 43102,
+        operation_id: str = "operation-assignment-database",
+    ):
+        return self.links.reserve_assignment(
+            profile=self.profile,
+            repository=self.repository,
+            server_name=server_name,
+            server_definition_id=server_id,
+            broker_assignment_id=broker_assignment_id,
+            port=port,
+            operation_id=operation_id,
+        )
+
+    def test_fresh_schema_lease_reserve_bind_release_is_idempotent(self) -> None:
+        reserved = self._reserve_lease()
+        repeated = self._reserve_lease()
+        self.assertEqual(repeated, reserved)
+        self.assertEqual(reserved.status, "reserved")
+        self.assertEqual(reserved.broker_database_generation, DATABASE_GENERATION)
+
+        active = self.links.bind_local_lease(reserved.link_id, "local-lease-web")
+        repeated_active = self.links.bind_local_lease(
+            reserved.link_id, "local-lease-web"
+        )
+        self.assertEqual(repeated_active, active)
+        self.assertEqual(
+            self.links.lease_for_local("local-lease-web"), repeated_active
+        )
+        self.assertEqual(
+            self.links.lease_for_server(REPO_ID, "server-web"), repeated_active
+        )
+
+        pending = self.links.begin_lease_release(
+            reserved.link_id, "operation-release-web"
+        )
+        repeated_pending = self.links.begin_lease_release(
+            reserved.link_id, "operation-release-web"
+        )
+        self.assertEqual(repeated_pending, pending)
+        released = self.links.complete_lease_release(reserved.link_id)
+        self.assertEqual(released.status, "released")
+        self.assertIsNone(self.links.lease_for_local("local-lease-web"))
+        self.assertIsNone(self.links.lease_for_server(REPO_ID, "server-web"))
+
+    def test_repository_removal_result_is_mirrored_and_hidden_idempotently(self) -> None:
+        operation_id = str(uuid.uuid4())
+        result = {
+            "repo_id": REPO_ID,
+            "plan_id": str(uuid.uuid4()),
+            "status": "succeeded",
+            "fence": "disabled",
+            "hidden": True,
+            "started": False,
+        }
+        first = self.links.record_and_apply_lifecycle(
+            profile=self.profile,
+            repository=self.repository,
+            operation=BrokerOperation.REPOSITORY_REMOVE,
+            resource_id=REPO_ID,
+            operation_id=operation_id,
+            arguments={
+                "plan_id": result["plan_id"],
+                "plan_fingerprint": "sha256:" + "a" * 64,
+            },
+            result=result,
+        )
+        repeated = self.links.record_and_apply_lifecycle(
+            profile=self.profile,
+            repository=self.repository,
+            operation=BrokerOperation.REPOSITORY_REMOVE,
+            resource_id=REPO_ID,
+            operation_id=operation_id,
+            arguments={
+                "plan_id": result["plan_id"],
+                "plan_fingerprint": "sha256:" + "a" * 64,
+            },
+            result=result,
+        )
+        self.assertEqual(first, repeated)
+        self.assertEqual(first["status"], "applied")
+        with self.store.read_transaction() as connection:
+            installation = connection.execute(
+                """
+                SELECT status, startup_fenced FROM repository_installations
+                WHERE repo_id = ?
+                """,
+                (REPO_ID,),
+            ).fetchone()
+            operation = connection.execute(
+                """
+                SELECT status, kind FROM operations
+                WHERE kind = 'broker.mirror.repository.remove'
+                """
+            ).fetchone()
+        self.assertEqual(tuple(installation), ("disabled", 1))
+        self.assertEqual(tuple(operation), ("succeeded", "broker.mirror.repository.remove"))
+
+    def test_repository_removal_local_mirror_failure_is_executable_reconciliation(self) -> None:
+        operation_id = str(uuid.uuid4())
+        result = {
+            "repo_id": REPO_ID,
+            "plan_id": str(uuid.uuid4()),
+            "status": "succeeded",
+            "fence": "disabled",
+            "hidden": True,
+            "started": False,
+        }
+        with mock.patch.object(
+            self.links,
+            "_apply_lifecycle_link",
+            side_effect=RuntimeError("injected local commit gap"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires reconciliation"):
+                self.links.record_and_apply_lifecycle(
+                    profile=self.profile,
+                    repository=self.repository,
+                    operation=BrokerOperation.REPOSITORY_REMOVE,
+                    resource_id=REPO_ID,
+                    operation_id=operation_id,
+                    arguments={
+                        "plan_id": result["plan_id"],
+                        "plan_fingerprint": "sha256:" + "b" * 64,
+                    },
+                    result=result,
+                )
+        reconciled = self.links.reconcile_pending()
+        self.assertEqual(reconciled["resolved"], 1, reconciled)
+        with self.store.read_transaction() as connection:
+            link = connection.execute(
+                "SELECT status, attempts FROM broker_lifecycle_links"
+            ).fetchone()
+            installation = connection.execute(
+                "SELECT status, startup_fenced FROM repository_installations"
+            ).fetchone()
+        self.assertEqual(tuple(link), ("applied", 1))
+        self.assertEqual(tuple(installation), ("disabled", 1))
+
+    def test_lease_identity_reuse_and_local_binding_mismatch_are_rejected(self) -> None:
+        reserved = self._reserve_lease()
+        with self.assertRaisesRegex(RuntimeError, "conflicting linkage"):
+            self._reserve_lease(port=43101)
+        with self.assertRaisesRegex(RuntimeError, "conflicting linkage"):
+            self._reserve_lease(operation_id="different-operation")
+
+        self.links.bind_local_lease(reserved.link_id, "local-lease-web")
+        with self.assertRaises(RuntimeError):
+            self.links.bind_local_lease(reserved.link_id, "different-local-lease")
+
+    def test_failed_lease_release_is_queued_once_and_later_resolved(self) -> None:
+        link = self._reserve_lease(
+            server_name="worker",
+            server_id="server-worker",
+            broker_lease_id="broker-lease-worker",
+            port=43101,
+            operation_id="operation-lease-worker",
+        )
+        self.links.begin_lease_release(link.link_id, "operation-release-worker")
+        failed = self.links.fail_lease_release(
+            link.link_id,
+            operation_id="operation-release-worker",
+            error_code="broker_unavailable",
+            error_message="socket unavailable",
+            rollback=False,
+        )
+        self.assertEqual(failed.status, "reconciliation_required")
+
+        repeated = self.links.fail_lease_release(
+            link.link_id,
+            operation_id="operation-release-worker-retry",
+            error_code="broker_unavailable",
+            error_message="still unavailable",
+            rollback=False,
+        )
+        self.assertEqual(repeated.status, "reconciliation_required")
+        with self.store.read_transaction() as connection:
+            queued = connection.execute(
+                """
+                SELECT link_kind, link_id, requested_action, status, attempts,
+                       operation_id, error_message
+                FROM broker_reconciliation_queue WHERE link_id = ?
+                """,
+                (link.link_id,),
+            ).fetchall()
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(
+            tuple(queued[0]),
+            (
+                "lease",
+                link.link_id,
+                "release",
+                "pending",
+                1,
+                "operation-release-worker",
+                "still unavailable",
+            ),
+        )
+
+        self.links.begin_lease_release(
+            link.link_id, "operation-release-worker-success"
+        )
+        released = self.links.complete_lease_release(link.link_id)
+        self.assertEqual(released.status, "released")
+        with self.store.read_transaction() as connection:
+            resolved = connection.execute(
+                "SELECT status, resolved_at FROM broker_reconciliation_queue WHERE link_id = ?",
+                (link.link_id,),
+            ).fetchone()
+        self.assertEqual(resolved["status"], "resolved")
+        self.assertIsNotNone(resolved["resolved_at"])
+
+    def test_reconciler_replays_exact_lease_release_and_finishes_local_state(self) -> None:
+        link = self._reserve_lease(
+            server_name="reconcile",
+            server_id="server-reconcile",
+            broker_lease_id="broker-lease-reconcile",
+            port=43105,
+            operation_id="operation-lease-reconcile",
+        )
+        now = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO leases(
+                    lease_id, host_id, repo_id, server_definition_id, port,
+                    status, generation, created_at, updated_at
+                ) VALUES ('local-lease-reconcile', 'host-alpha', ?, ?, 43105,
+                          'active', 0, ?, ?)
+                """,
+                (REPO_ID, "server-reconcile", now, now),
+            )
+        self.links.bind_local_lease(link.link_id, "local-lease-reconcile")
+        release_operation_id = str(uuid.uuid4())
+        self.links.begin_lease_release(link.link_id, release_operation_id)
+        self.links.fail_lease_release(
+            link.link_id,
+            operation_id=release_operation_id,
+            error_code="broker_timeout",
+            error_message="first attempt timed out",
+            rollback=False,
+        )
+        requests = []
+
+        def caller(saved, request):
+            requests.append((saved, request))
+            return {
+                "ok": True,
+                "operation_id": request.operation_id,
+                "result": {
+                    "lease_id": "broker-lease-reconcile",
+                    "port": 43105,
+                    "protocol": "tcp",
+                    "status": "released",
+                },
+            }
+
+        result = self.links.reconcile_pending(caller=caller)
+
+        self.assertEqual(result["resolved"], 1, result)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0][1].operation.value, "port.release")
+        self.assertEqual(requests[0][1].operation_id, release_operation_id)
+        self.assertEqual(requests[0][1].resource_id, "broker-lease-reconcile")
+        with self.store.read_transaction() as connection:
+            local = connection.execute(
+                "SELECT status, deactivated_at FROM leases WHERE lease_id='local-lease-reconcile'"
+            ).fetchone()
+            queue = connection.execute(
+                "SELECT status FROM broker_reconciliation_queue WHERE link_id=?",
+                (link.link_id,),
+            ).fetchone()
+        self.assertEqual(local["status"], "released")
+        self.assertIsNotNone(local["deactivated_at"])
+        self.assertEqual(queue["status"], "resolved")
+
+    def test_fresh_schema_assignment_bind_failure_queue_and_release(self) -> None:
+        reserved = self._reserve_assignment()
+        repeated = self._reserve_assignment()
+        self.assertEqual(repeated, reserved)
+        active = self.links.bind_local_assignment(
+            reserved.link_id, "local-assignment-database"
+        )
+        repeated_active = self.links.bind_local_assignment(
+            reserved.link_id, "local-assignment-database"
+        )
+        self.assertEqual(repeated_active, active)
+        self.assertEqual(
+            self.links.assignment_for_server(REPO_ID, "server-database"), active
+        )
+
+        self.links.begin_assignment_release(
+            reserved.link_id, "operation-unassign-database"
+        )
+        failed = self.links.fail_assignment_release(
+            reserved.link_id,
+            operation_id="operation-unassign-database",
+            error_code="broker_timeout",
+            error_message="bounded broker timeout",
+            rollback=True,
+        )
+        self.assertEqual(failed.status, "rollback_failed")
+        with self.store.read_transaction() as connection:
+            queued = connection.execute(
+                """
+                SELECT link_kind, requested_action, status
+                FROM broker_reconciliation_queue WHERE link_id = ?
+                """,
+                (reserved.link_id,),
+            ).fetchone()
+        self.assertEqual(tuple(queued), ("assignment", "release", "pending"))
+
+        self.links.begin_assignment_release(
+            reserved.link_id, "operation-unassign-database-retry"
+        )
+        released = self.links.complete_assignment_release(reserved.link_id)
+        self.assertEqual(released.status, "released")
+        self.assertIsNone(
+            self.links.assignment_for_server(REPO_ID, "server-database")
+        )
+
+    def test_reconciler_replays_exact_unassign_and_finishes_local_state(self) -> None:
+        link = self._reserve_assignment(
+            server_name="reconcile-db",
+            server_id="server-reconcile-db",
+            broker_assignment_id="broker-assignment-reconcile-db",
+            port=43106,
+            operation_id="operation-assignment-reconcile-db",
+        )
+        now = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO port_assignments(
+                    assignment_id, host_id, repo_id, server_name, port,
+                    status, generation, created_at, updated_at
+                ) VALUES ('local-assignment-reconcile', 'host-alpha', ?,
+                          'reconcile-db', 43106, 'active', 0, ?, ?)
+                """,
+                (REPO_ID, now, now),
+            )
+        self.links.bind_local_assignment(link.link_id, "local-assignment-reconcile")
+        release_operation_id = str(uuid.uuid4())
+        self.links.begin_assignment_release(link.link_id, release_operation_id)
+        self.links.fail_assignment_release(
+            link.link_id,
+            operation_id=release_operation_id,
+            error_code="broker_timeout",
+            error_message="first attempt timed out",
+            rollback=False,
+        )
+        requests = []
+
+        def caller(saved, request):
+            requests.append((saved, request))
+            return {
+                "ok": True,
+                "operation_id": request.operation_id,
+                "result": {
+                    "assignment_id": "broker-assignment-reconcile-db",
+                    "port": 43106,
+                    "status": "released",
+                    "changed": True,
+                },
+            }
+
+        result = self.links.reconcile_pending(caller=caller)
+
+        self.assertEqual(result["resolved"], 1, result)
+        self.assertEqual(requests[0][1].operation.value, "port.unassign")
+        self.assertEqual(requests[0][1].resource_id, "server-reconcile-db")
+        with self.store.read_transaction() as connection:
+            local = connection.execute(
+                "SELECT status, deactivated_at FROM port_assignments WHERE assignment_id='local-assignment-reconcile'"
+            ).fetchone()
+        self.assertEqual(local["status"], "inactive")
+        self.assertIsNotNone(local["deactivated_at"])
+
+    def test_assignment_identity_reuse_and_local_binding_mismatch_are_rejected(self) -> None:
+        reserved = self._reserve_assignment()
+        with self.assertRaisesRegex(RuntimeError, "conflicting linkage"):
+            self._reserve_assignment(port=43103)
+        with self.assertRaisesRegex(RuntimeError, "conflicting linkage"):
+            self._reserve_assignment(operation_id="different-operation")
+
+        self.links.bind_local_assignment(
+            reserved.link_id, "local-assignment-database"
+        )
+        with self.assertRaises(RuntimeError):
+            self.links.bind_local_assignment(
+                reserved.link_id, "different-local-assignment"
+            )
+
+    def test_repository_profile_mismatch_does_not_create_linkage(self) -> None:
+        malformed = BrokerRepositoryProfile(
+            canonical_root=str(self.repository_root),
+            repo_id="repo-foreign",
+            generation=0,
+            server_ids={"web": "server-web"},
+            container_ids={},
+            compose_definition_id=None,
+        )
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            self.links.reserve_lease(
+                profile=self.profile,
+                repository=malformed,
+                server_name="web",
+                server_definition_id="server-web",
+                broker_lease_id="broker-lease-foreign",
+                port=43105,
+                protocol="tcp",
+                operation_id="operation-foreign",
+                expires_at=None,
+            )
+        with self.store.read_transaction() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM broker_lease_links"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

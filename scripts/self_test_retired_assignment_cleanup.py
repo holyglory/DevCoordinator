@@ -235,6 +235,14 @@ def apply_command(plan_path: Path, home: Path, output: Path) -> list[str]:
     ]
 
 
+def legacy_fixture_environment() -> dict[str, str]:
+    """Keep this historical state.json fixture outside the product backend."""
+
+    environment = dict(os.environ)
+    environment["DEVCOORDINATOR_STATE_BACKEND"] = "legacy-json-test-only"
+    return environment
+
+
 def run_apply(case: Path, state: dict[str, Any], plan: dict[str, Any]) -> tuple[subprocess.CompletedProcess[str], bytes, bytes]:
     private_directory(case)
     home = private_directory(case / "coordinator")
@@ -249,6 +257,7 @@ def run_apply(case: Path, state: dict[str, Any], plan: dict[str, Any]) -> tuple[
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=legacy_fixture_environment(),
     )
     return completed, before, state_path.read_bytes()
 
@@ -507,6 +516,7 @@ def main() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=legacy_fixture_environment(),
         )
         time.sleep(0.1)
         require(waiting.poll() is None, "cleanup apply did not wait for the coordinator state lock")

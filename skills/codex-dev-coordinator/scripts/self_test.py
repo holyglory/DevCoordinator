@@ -24,6 +24,8 @@ from shutil import rmtree, which as _which
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "dev_coordinator.py"
 MULTI_RUNTIME_TEST = ROOT / "scripts" / "self_test_multi_runtime.py"
+SQLITE_CUTOVER_TEST = ROOT / "scripts" / "self_test_sqlite_cutover.py"
+LIFECYCLE_ACTION_GUARD_TEST = ROOT / "scripts" / "self_test_lifecycle_action_guard.py"
 SKILL = ROOT / "SKILL.md"
 
 # macOS CI runners black-hole reverse DNS lookups, which hangs
@@ -1804,6 +1806,8 @@ else:
 
 
 def main() -> int:
+    subprocess.run([sys.executable, str(SQLITE_CUTOVER_TEST)], check=True)
+    subprocess.run([sys.executable, str(LIFECYCLE_ACTION_GUARD_TEST)], check=True)
     check_http_fixture_policy()
     check_listener_and_health_helpers()
     check_registration_pid_guards()
@@ -1811,6 +1815,10 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="codex-dev-coordinator-self-test-")).resolve(strict=True)
     env = os.environ.copy()
     env["CODEX_AGENT_COORDINATOR_HOME"] = str(tmp / "state")
+    # The historical fixture corpus intentionally exercises state.json byte
+    # recovery and lock behavior. Keep it on the explicitly named temporary
+    # bridge; self_test_sqlite_cutover.py above is the default-backend gate.
+    env["DEVCOORDINATOR_STATE_BACKEND"] = "legacy-json-test-only"
     # Project-runtime tests must never inherit a real local Docker Desktop
     # daemon. Dedicated Docker command-path tests install their richer fake
     # below; every other fixture sees a deterministic unavailable CLI.
@@ -1821,7 +1829,9 @@ def main() -> int:
     base_fake_docker.chmod(0o755)
     env["PATH"] = f"{base_fake_bin}:{env.get('PATH', '')}"
     original_coordinator_home = os.environ.get("CODEX_AGENT_COORDINATOR_HOME")
+    original_state_backend = os.environ.get("DEVCOORDINATOR_STATE_BACKEND")
     os.environ["CODEX_AGENT_COORDINATOR_HOME"] = env["CODEX_AGENT_COORDINATOR_HOME"]
+    os.environ["DEVCOORDINATOR_STATE_BACKEND"] = env["DEVCOORDINATOR_STATE_BACKEND"]
     api_process: subprocess.Popen[str] | None = None
     external_processes: list[subprocess.Popen[str]] = []
     try:
@@ -1837,9 +1847,10 @@ def main() -> int:
             "--stats-history-limit",
             "Authorization: Bearer",
             "non-loopback",
-            "outside the cross-agent lock",
+            "outside write\ntransactions",
+            "legacy JSON lock and callback",
             "getpwuid(geteuid())",
-            "Separate coordinator homes do not share a reservation lock",
+            "Separate coordinator homes do not share a reservation authority",
             "owned by its effective UID",
         ):
             check(needle in skill_text, f"SKILL.md should retain policy text: {needle}")
@@ -2516,7 +2527,7 @@ exit 0
                 str(wrong_release_project),
             ],
             env=env,
-            expected="does not match",
+            expected="another repository",
         )
         released = run(
             [
@@ -6526,6 +6537,10 @@ else:
             os.environ.pop("CODEX_AGENT_COORDINATOR_HOME", None)
         else:
             os.environ["CODEX_AGENT_COORDINATOR_HOME"] = original_coordinator_home
+        if original_state_backend is None:
+            os.environ.pop("DEVCOORDINATOR_STATE_BACKEND", None)
+        else:
+            os.environ["DEVCOORDINATOR_STATE_BACKEND"] = original_state_backend
         if api_process and api_process.poll() is None:
             api_process.terminate()
             try:

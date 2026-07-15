@@ -10,6 +10,7 @@ Linux procfs, but argparse/usage exit 2 is never accepted as contract evidence.
 
 from __future__ import annotations
 
+import copy
 import http.server
 import importlib.util
 import json
@@ -446,7 +447,7 @@ def current_registration_inventory(
         "listener_inodes": [listener_inode],
         "source": "proc_pid_fd",
     }
-    return {
+    compatibility = {
         "port_assignments": [
             {
                 "key": key,
@@ -489,6 +490,29 @@ def current_registration_inventory(
             }
         ],
         "docker": {"available": None, "containers": [], "postgres": []},
+    }
+    return {
+        **copy.deepcopy(compatibility),
+        "schema_version": 2,
+        "leases": [
+            {
+                "lease_id": "normalized-cli-contract-lease",
+                "repo_id": "normalized-cli-contract-repository",
+                "server_definition_id": "normalized-cli-contract-server",
+                "port": port,
+                "status": "active",
+            }
+        ],
+        "port_assignments": [
+            {
+                "assignment_id": "normalized-cli-contract-assignment",
+                "repo_id": "normalized-cli-contract-repository",
+                "server_name": name,
+                "port": port,
+                "status": "active",
+            }
+        ],
+        "v1_compatibility": compatibility,
     }
 
 

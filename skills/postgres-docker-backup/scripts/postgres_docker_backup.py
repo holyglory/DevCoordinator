@@ -1145,6 +1145,62 @@ def record_verification(path: Path, manifest: dict[str, Any] | None, result: dic
     atomic_json_write(manifest_path_for(path), manifest, exclusive=False)
 
 
+def persist_coordinator_registry(
+    command: str,
+    args: argparse.Namespace,
+    result: Any,
+) -> dict[str, Any] | None:
+    """Persist successful real actions into an existing normalized store."""
+
+    if command not in {"backup", "verify", "restore"}:
+        return None
+    if not isinstance(result, dict):
+        raise RuntimeError("successful backup action returned an invalid result shape")
+    if os.environ.get("DEVCOORDINATOR_BACKUP_REGISTRY", "on").strip().lower() in {
+        "0",
+        "false",
+        "off",
+    }:
+        return {"status": "disabled"}
+    coordinator_scripts = (
+        Path(__file__).resolve().parents[2]
+        / "codex-dev-coordinator"
+        / "scripts"
+    )
+    if not coordinator_scripts.is_dir():
+        return {"status": "coordinator_module_unavailable"}
+    scripts_text = str(coordinator_scripts)
+    if scripts_text not in sys.path:
+        sys.path.insert(0, scripts_text)
+    from devcoordinator.database_backups import (  # type: ignore[import-not-found]
+        register_backup_in_existing_account_store,
+        register_restore_in_existing_account_store,
+    )
+
+    if result.get("dry_run"):
+        return None
+    if command == "backup":
+        return register_backup_in_existing_account_store(
+            result["backup"], result["manifest"]
+        )
+    if command == "verify":
+        return register_backup_in_existing_account_store(args.file)
+    if command == "restore":
+        preflights = result.get("container_identity_preflights") or []
+        if not preflights or not isinstance(preflights[-1], dict):
+            raise RuntimeError("successful restore lacks its final immutable identity evidence")
+        safety = result.get("safety_backup")
+        safety_path = safety.get("backup") if isinstance(safety, dict) else None
+        return register_restore_in_existing_account_store(
+            artifact_path=result["restored"],
+            result=result,
+            target_container_id=str(preflights[-1].get("actual_id") or ""),
+            target_database_name=str(result.get("database") or ""),
+            safety_artifact_path=safety_path,
+        )
+    return None
+
+
 def manifest_container_name(manifest: dict[str, Any] | None) -> str | None:
     return ((((manifest or {}).get("source") or {}).get("container") or {}).get("name") or (manifest or {}).get("container"))
 
@@ -1328,6 +1384,13 @@ def do_restore(args: argparse.Namespace) -> dict[str, Any]:
         expected_container_id=immutable_target,
         phase="restore incoming verification",
     )
+    # The source manifest is the durable truth for later restore choices.
+    # Record this successful strong verification before any target mutation;
+    # a later restore failure does not make the completed scratch verification
+    # untrue.
+    record_verification(
+        path, manifest, incoming_verification, DATABASE_SCOPE, checksum
+    )
     _inspected, _env, post_incoming_identity = container_identity_preflight(
         container,
         immutable_target,
@@ -1436,6 +1499,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list")
     sub.add_parser("doctor")
+    sub.add_parser(
+        "route",
+        help=(
+            "report whether database mutations from the current repository use "
+            "the direct client or the configured host broker"
+        ),
+    )
 
     backup = sub.add_parser("backup")
     backup.add_argument("--container")
@@ -1466,7 +1536,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_container_identity_argument(restore)
     restore.add_argument("--database")
     add_auth_arguments(restore)
-    restore.add_argument("--file", required=True)
+    restore.add_argument("--file")
+    restore.add_argument(
+        "--database-backup-id",
+        help="opaque service registry ID required instead of --file when a host broker profile is installed",
+    )
     restore.add_argument("--format", choices=["custom", "plain", "all"])
     restore.add_argument("--scope", choices=[DATABASE_SCOPE, CLUSTER_SCOPE])
     restore.add_argument("--allow-unmanifested", action="store_true")
@@ -1476,6 +1550,183 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("--safety-out-dir", default=f"{DEFAULT_OUT_DIR}/pre-restore")
     restore.add_argument("--dry-run", action="store_true")
     return parser
+
+
+def _configured_broker_repository() -> tuple[Any, Any] | None:
+    """Resolve the configured broker and exact repository for the process cwd.
+
+    This is shared by the public routing preflight and the mutation itself so a
+    GUI can select the correct argument contract without duplicating protected
+    profile discovery or repository-enrollment rules.
+    """
+
+    if os.environ.get("DEVCOORDINATOR_BROKER_INTERNAL") == "1":
+        return None
+    coordinator_scripts = (
+        Path(__file__).resolve().parents[2]
+        / "codex-dev-coordinator"
+        / "scripts"
+    )
+    if not coordinator_scripts.is_dir():
+        return None
+    scripts_text = str(coordinator_scripts)
+    if scripts_text not in sys.path:
+        sys.path.insert(0, scripts_text)
+    from devcoordinator.broker_profile import (  # type: ignore[import-not-found]
+        BrokerProfileError,
+        load_broker_profile,
+    )
+
+    profile = load_broker_profile()
+    if profile is None:
+        return None
+    cwd = Path.cwd().resolve()
+    candidates = [
+        repository
+        for root, repository in profile.repositories.items()
+        if cwd == Path(root) or Path(root) in cwd.parents
+    ]
+    if not candidates:
+        raise BrokerProfileError(
+            "current working directory is not inside an enrolled repository; "
+            "direct Docker fallback is disabled while a broker profile is installed"
+        )
+    repository = max(candidates, key=lambda item: len(Path(item.canonical_root).parts))
+    return profile, repository
+
+
+def database_action_route() -> dict[str, Any]:
+    configured = _configured_broker_repository()
+    if configured is None:
+        return {"execution_authority": "direct"}
+    _profile, repository = configured
+    return {
+        "execution_authority": "broker",
+        "repository_id": str(repository.repo_id),
+        "canonical_root": str(repository.canonical_root),
+    }
+
+
+def _brokered_database_action(
+    args: argparse.Namespace, raw_argv: list[str]
+) -> dict[str, Any] | None:
+    """Route backup/restore through a configured service authority.
+
+    The service subprocess sets ``DEVCOORDINATOR_BROKER_INTERNAL`` so its own
+    fixed executable can perform the already-authorized host action without
+    recursively reconnecting to itself.  A configured but invalid profile is
+    deliberately an error, never permission to fall back to direct Docker.
+    """
+
+    if args.command not in {"backup", "restore"}:
+        return None
+    configured = _configured_broker_repository()
+    if configured is None:
+        return None
+    profile, repository = configured
+    from devcoordinator.broker import BrokerOperation  # type: ignore[import-not-found]
+
+    if not args.database:
+        raise RuntimeError(
+            "brokered PostgreSQL actions require one explicit --database name"
+        )
+
+    identities = [
+        str(value)
+        for value in (args.container, args.expect_container_id)
+        if value
+    ]
+    if not identities:
+        raise RuntimeError(
+            "brokered PostgreSQL actions require --container or --expect-container-id"
+        )
+
+    def enrolled_resource(identity: str) -> str:
+        exact = repository.container_ids.get(identity)
+        if exact is not None:
+            return str(exact)
+        lowered = identity.lower()
+        matches = {
+            str(resource_id)
+            for display, resource_id in repository.container_ids.items()
+            if len(display) == 64
+            and all(character in "0123456789abcdefABCDEF" for character in display)
+            and display.lower().startswith(lowered)
+        }
+        if len(matches) != 1:
+            raise BrokerProfileError(
+                f"Docker resource {identity!r} is not unambiguously enrolled; "
+                "refresh service observation and rerun Coordinator skill installation"
+            )
+        return next(iter(matches))
+
+    resources = {enrolled_resource(identity) for identity in identities}
+    if len(resources) != 1:
+        raise BrokerProfileError(
+            "--container and --expect-container-id resolve to different enrolled resources"
+        )
+    resource_id = next(iter(resources))
+    supplied_options = {
+        item.split("=", 1)[0] for item in raw_argv if item.startswith("--")
+    }
+    forbidden_common = {
+        "--user",
+        "--password-file",
+        "--password-stdin",
+        "--dry-run",
+        "--allow-unmanifested",
+    }
+    if supplied_options & forbidden_common:
+        raise RuntimeError(
+            "brokered PostgreSQL actions reject client credentials, dry-run, and unmanifested overrides"
+        )
+
+    if args.command == "backup":
+        forbidden = {"--out-dir", "--output"}
+        if supplied_options & forbidden or args.format != "custom" or args.scope not in {
+            None,
+            DATABASE_SCOPE,
+        }:
+            raise RuntimeError(
+                "brokered backup is a service-owned database-scope custom backup; client output paths and alternate formats are unsupported"
+            )
+        _operation_id, result = profile.call(
+            repository=repository,
+            resource_id=resource_id,
+            operation=BrokerOperation.DATABASE_BACKUP,
+            arguments={"database_name": str(args.database)},
+        )
+        return result
+
+    if args.file:
+        raise RuntimeError(
+            "brokered restore rejects client file paths; select --database-backup-id from the service registry"
+        )
+    if not args.database_backup_id or not args.confirm_restore:
+        raise RuntimeError(
+            "brokered restore requires --database-backup-id and --confirm-restore"
+        )
+    if supplied_options & {
+        "--allow-database-remap",
+        "--no-safety-backup",
+        "--safety-out-dir",
+        "--format",
+        "--scope",
+    }:
+        raise RuntimeError(
+            "brokered restore forbids remapping, disabling the safety backup, and client restore options"
+        )
+    _operation_id, result = profile.call(
+        repository=repository,
+        resource_id=resource_id,
+        operation=BrokerOperation.DATABASE_RESTORE,
+        arguments={
+            "database_name": str(args.database),
+            "database_backup_id": str(args.database_backup_id),
+            "explicit": True,
+        },
+    )
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1490,18 +1741,49 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         args = build_parser().parse_args(raw_argv)
         try:
-            if args.command == "list":
+            brokered = _brokered_database_action(args, raw_argv)
+            if brokered is not None:
+                result = brokered
+            elif args.command == "list":
                 result = list_postgres_containers()
             elif args.command == "doctor":
                 result = do_doctor()
+            elif args.command == "route":
+                result = database_action_route()
             elif args.command == "backup":
                 result = do_backup(args)
             elif args.command == "verify":
                 result = do_verify(args)
             elif args.command == "restore":
+                if not args.file:
+                    raise RuntimeError(
+                        "direct restore requires --file; --database-backup-id is valid only with a configured host broker"
+                    )
                 result = do_restore(args)
             else:
                 raise RuntimeError(f"unsupported command: {args.command}")
+            try:
+                registry = (
+                    None
+                    if brokered is not None or args.command == "route"
+                    else persist_coordinator_registry(args.command, args, result)
+                )
+            except Exception as registry_error:
+                print(
+                    json.dumps(
+                        {
+                            "error": "action completed but normalized registry persistence failed",
+                            "registry_error": str(registry_error),
+                            "action_result": result,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            if registry is not None:
+                result["coordinator_registry"] = registry
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
         except Exception as exc:

@@ -149,6 +149,39 @@ def main() -> int:
             "intact controls shifted upward after false-alert removal should pass",
         )
 
+        # The reported cold-capture failure erased only the top toolbar while
+        # leaving bright controls elsewhere. Split the toolbar into three
+        # independent anchors and prove a bottom-edge decoy cannot satisfy any
+        # of them through an accidental vertical flip.
+        toolbar_anchor_spec = VERIFIER.ArtifactSpec(
+            120,
+            80,
+            0.85,
+            (),
+            (
+                VERIFIER.AnchorSpec("toolbar-environment", 0, 0, 40, 10, 100, 3, 1),
+                VERIFIER.AnchorSpec("toolbar-search", 40, 0, 40, 10, 100, 3, 1),
+                VERIFIER.AnchorSpec("toolbar-actions", 80, 0, 40, 10, 100, 3, 1),
+            ),
+        )
+        intact_toolbar = temporary / "intact-split-toolbar.png"
+        write_control_band_png(intact_toolbar, control_y=1)
+        check(
+            not VERIFIER.verify_image(intact_toolbar, toolbar_anchor_spec),
+            "an intact compact toolbar should satisfy all three independent anchors",
+        )
+        footer_toolbar_decoy = temporary / "footer-toolbar-decoy.png"
+        write_control_band_png(footer_toolbar_decoy, control_y=62)
+        toolbar_findings = [
+            finding
+            for finding in VERIFIER.verify_image(footer_toolbar_decoy, toolbar_anchor_spec)
+            if finding.rule == "snapshot-missing-semantic-anchor"
+        ]
+        check(
+            len(toolbar_findings) == 3,
+            "footer controls must not masquerade as any top-toolbar anchor",
+        )
+
         misplaced_controls = temporary / "misplaced-lower-controls.png"
         write_control_band_png(misplaced_controls, control_y=54)
         misplaced_rules = {

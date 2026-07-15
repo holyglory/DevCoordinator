@@ -4,8 +4,11 @@
 
 The user approved the implementation plan containing the journeys and safety
 constraints below on 2026-07-10, then explicitly approved the ImageGen design
-review board on the same date. Consequential SwiftUI changes must follow that
-confirmed hierarchy and safety-flow direction.
+review board on the same date. On 2026-07-14 the user approved the normalized
+coordinator state-store architecture and the complete repository decommission,
+reinstall, attribution, and standalone-resource retirement journeys described
+below. Consequential SwiftUI changes must follow that confirmed hierarchy and
+safety-flow direction.
 
 ## App Idea
 
@@ -42,6 +45,9 @@ confirmed hierarchy and safety-flow direction.
 | Lease and use a port | confirmed | Occasional | High | Wrong or hidden port causes collision or failed startup | Lease action | Actual leased port and expiry are visible and usable |
 | Protect or restore a database | confirmed | Occasional | Critical | Wrong target or weak verification causes data loss | Database surface | Exact database is backed up, verified, and safely restored |
 | Stop selected running resources | confirmed | Rare/destructive | Critical | Unintended services are stopped | Explicit bulk action | Only confirmed selections are stopped with per-item results |
+| Resolve an unassigned resource | confirmed | Occasional/corrective | High | A resource is controlled through an unproved repository or remains permanently unactionable | Unassigned resource detail | User sees the exact attribution blocker and explicitly attaches or retires one immutable resource |
+| Remove a repository from the coordinator | confirmed | Rare/administrative | Critical | A hidden runtime restarts, a port remains reserved, or retained data is deleted | Selected project detail | All proved startup paths are disabled, exact resources are stopped and verified, future starts are fenced, and the project leaves active UI while files/data/evidence remain |
+| Reinstall a removed repository | confirmed | Rare/administrative | High | Old resources restart implicitly or repository identity splits again | Coordinator skill | One canonical repository installation becomes active without automatically starting retained resources |
 
 ## Journey Decision Model
 
@@ -134,6 +140,69 @@ confirmed hierarchy and safety-flow direction.
 - Unresolved assumptions: none in the explicit selection/confirmation layout.
 - Success: only checked resources stop and every result remains visible.
 
+### Resolve An Unassigned Resource
+
+- Primary user goal: understand why a real observed resource is not owned by a
+  project and make it safely manageable or intentionally retired.
+- Primary decision: attach this exact resource to a validated repository, or
+  retire this exact standalone resource?
+- Required facts: immutable resource identity, observer, controller authority,
+  attribution reason code and plain-language explanation, candidate repository
+  evidence, current state, and action preconditions.
+- Warning conditions: name-only evidence, missing/non-Git repository path,
+  conflicting repository claims, ambiguous controller, stale observation, or
+  lack of one exact mutable resource identity.
+- Frequent actions: inspect the reason and authoritative evidence.
+- Corrective actions: `Attach to Project…` requires explicit user selection of
+  one validated repository; `Retire Standalone Resource…` requires a proved
+  immutable controller and never relies on a name match.
+- Success: the physical resource appears under exactly one repository or is
+  stopped, fenced, and removed from the active inventory with retained evidence.
+
+### Remove A Repository From The Coordinator
+
+- Primary user goal: stop using one local repository as an installed project
+  without deleting its files, databases, volumes, backups, or operation history.
+- Primary decision: remove this exact canonical repository and all resources
+  whose controller membership is proved?
+- Required facts: canonical path, repository identity, exact resource targets,
+  known automatic-start policies, active ports/leases/pins, retained data, and
+  unresolved attribution blockers.
+- Warning conditions: stale plan fingerprint, unknown ownership, conflicting
+  operation, unobservable listener identity, automatic-start policy that cannot
+  be disabled, stop failure, or failed stopped-state verification.
+- Destructive action: `Remove from Coordinator…` lives in a low-frequency
+  Project Management disclosure. Its confirmation lists exact effects and
+  retained data. Opening or cancelling the sheet has zero side effects.
+- Safety order: persist a start fence before external changes; disable every
+  proved automatic-start path; stop exact resources; release/deactivate active
+  ports, leases, and pins; verify the complete boundary; only then hide the
+  repository from active UI.
+- Failure behavior: retain the fence, keep the project visible with per-target
+  evidence, and support idempotent continuation; never claim removal after a
+  partial stop.
+- Success: active Board and menu surfaces omit the repository. The Coordinator
+  skill retains the removal record, target outcomes, and reinstall history for
+  audit and recovery; the Board does not add a persistent administrative
+  history panel to the normal operator viewport. Observing a removed resource
+  running again is a critical violation and makes that exact resource visible
+  with a corrective next step, without resurrecting the removed project.
+
+### Reinstall A Removed Repository
+
+- Primary user goal: deliberately reactivate a previously removed repository.
+- Entry: only the Coordinator skill or its authenticated coordinator API; the
+  Board does not offer a casual reinstall shortcut.
+- Required facts: canonical repository identity, prior decommission record,
+  current repository validity, conflicting active installation, retained
+  resources, and operation result.
+- Warning conditions: a different repository at the old path, identity conflict,
+  active decommission operation, or resource membership conflict.
+- Success: exactly one active installation exists and its start fence is cleared;
+  retained services remain stopped until the user explicitly starts them. That
+  later explicit Start restores only the exact startup policy captured during
+  removal before starting the retained runtime.
+
 ## Information Relevance Inventory
 
 | Information/control | Relevance | Default access | Rationale |
@@ -148,6 +217,10 @@ confirmed hierarchy and safety-flow direction.
 | Raw command/environment and operation journal | debug/expert-only | Explicit diagnostics disclosure | Needed for diagnosis, not routine decisions |
 | Bulk stop | rare/destructive | Explicit secondary action | Must not dominate or share implicit row selection |
 | Source configuration and refresh policy | rare/configuration | Settings/Sources surface | Changed infrequently |
+| Attribution reason and controller authority | conditional-critical | Unassigned row/detail callout | Explains why lifecycle actions are unavailable and what can resolve it |
+| Attach or retire unassigned resource | corrective/occasional | Explicit resource detail action | Requires one exact immutable target and deliberate repository choice |
+| Remove repository | rare/administrative | Project Management disclosure | Fences starts and coordinates a multi-target verified decommission |
+| Removed repositories and evidence | rare/audit | Coordinator skill (`repository list-removed`) | Keeps normal Board inventory focused while preserving recovery and history |
 
 ## Interaction And Metadata Model
 
@@ -181,6 +254,13 @@ execution detail move to the result/detail surface.
   verification failed, restore running, restore succeeded, and rollback needed.
 - Bulk selection empty, selected, confirmation, partial success, and complete
   success.
+- Unassigned because of name-only evidence, missing repository, non-Git path,
+  conflicting claims, ambiguous controller, and stale observation.
+- Attach available, attach blocked, attach running, attach failed, and attached.
+- Standalone retirement available, blocked, running, failed, and complete.
+- Repository decommission plan, confirmation, fenced/running, partial failure,
+  verification failure, complete, removed-resource-running violation, and
+  reinstall complete.
 
 ## Feature Inventory
 
@@ -193,6 +273,11 @@ execution detail move to the result/detail surface.
 - Explicit bulk selection and bounded per-item execution.
 - Menu-bar status and actions consistent with the main window.
 - Coordinator source configuration and diagnostics.
+- Normalized repository installation and resource-membership inventory.
+- Explicit unassigned-resource attribution, attach, and standalone retirement.
+- Reversible repository decommission with durable start fencing, automatic-start
+  suppression, exact target verification, and retained evidence.
+- Skill-only reinstall that does not implicitly start retained resources.
 
 ## UI Element Inventory
 
@@ -204,6 +289,12 @@ execution detail move to the result/detail surface.
 - Bulk selection sheet with checkboxes, selected count, confirmation, progress,
   and per-item results.
 - Secondary Coordinator Sources/Settings surface.
+- Unassigned-resource callout with separate `Observed by` and `Controller`
+  facts, exact blocker, and only currently authorized corrective actions.
+- Project Management disclosure and exact decommission confirmation sheet.
+- Critical removed-resource-running violation state; retained removed-project
+  history is accessed through the Coordinator skill rather than occupying the
+  Board's normal inventory.
 - Loading, empty, stale, unavailable, error, and recovery states.
 
 ## Implementation Expectations
@@ -217,6 +308,18 @@ execution detail move to the result/detail surface.
   payloads are never exposed as editable UI.
 - Permission, missing dependency, unavailable integration, and stale-state
   failures remain truthful and recoverable.
+- Active inventory is a pure query from the normalized account store. A UI
+  refresh requests one coalesced, single-flight host observation first, then
+  reads that query projection; it does not independently poll every legacy
+  coordinator home or merge competing project identities. Background refresh
+  keeps the last complete presentation visible until the replacement snapshot
+  is committed.
+- Repository removal is never a Board-only hide preference. Every start,
+  restart, registration, lease, port assignment, Docker/Compose, and adopted
+  resource path checks the durable installation fence before mutation.
+- `Unknown database` is not rendered as a factual database record. When a
+  PostgreSQL container cannot be authoritatively inspected, the UI says
+  `Database discovery unavailable` and presents the container and reason.
 
 ## UI Handoff Constraints
 
@@ -247,3 +350,12 @@ execution detail move to the result/detail surface.
   tooltip text or color.
 - Test-only fixtures are isolated from runtime inventory and are never presented
   as product data.
+- Coordinator tests cover realistic same-name attribution collisions, explicit
+  attach/retire authorization, decommission dry-run and stale-plan rejection,
+  durable fence races, automatic-restart suppression, exact stop verification,
+  partial failure continuation, preserved volumes/data, same-UID import, and
+  peer-authenticated cross-UID broker rejection controls.
+- Swift and native tests cover reason copy, enabled/blocked actions, zero-mutation
+  cancel, success hiding only after authoritative refresh, failure visibility,
+  removed-resource-running violations, menu parity, VoiceOver labels, and full
+  three-pane geometry at minimum and wide window sizes.

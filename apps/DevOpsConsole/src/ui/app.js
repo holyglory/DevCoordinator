@@ -702,7 +702,7 @@
     // Real docker reports paused as "Up 3 minutes (Paused)" — check it
     // before the generic Up match or it reads as a healthy green badge.
     if (/\(paused\)/i.test(status)) return { css: 'warn', label: 'paused' };
-    if (/^\s*up\b/i.test(status)) {
+    if (isContainerRunning(c)) {
       if (/\(unhealthy\)/i.test(status)) return { css: 'err', label: 'unhealthy' };
       if (/\(health: starting\)/i.test(status)) return { css: 'warn', label: 'starting' };
       return { css: 'ok', label: 'running' };
@@ -1399,7 +1399,8 @@
   }
 
   function isContainerRunning(c) {
-    return /^\s*up\b/i.test(String(c.status || ''));
+    const status = String(c.status || '').trim();
+    return /^up\b/i.test(status) || /^running$/i.test(status);
   }
 
   async function copyText(text, btn) {

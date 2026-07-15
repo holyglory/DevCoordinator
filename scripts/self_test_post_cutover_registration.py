@@ -157,6 +157,38 @@ def fixture() -> dict:
     }
 
 
+def schema_v2_fixture() -> dict:
+    """Wrap the legacy registration projection in the production v2 wire shape."""
+
+    compatibility = fixture()
+    return {
+        **copy.deepcopy(compatibility),
+        "schema_version": 2,
+        # These deliberately incompatible normalized rows prove that the
+        # verifier uses the declared compatibility projection for its legacy
+        # registration-graph contract.
+        "leases": [
+            {
+                "lease_id": "normalized-lease",
+                "repo_id": "normalized-repository",
+                "server_definition_id": "normalized-server",
+                "port": PORT,
+                "status": "active",
+            }
+        ],
+        "port_assignments": [
+            {
+                "assignment_id": "normalized-assignment",
+                "repo_id": "normalized-repository",
+                "server_name": NAME,
+                "port": PORT,
+                "status": "active",
+            }
+        ],
+        "v1_compatibility": copy.deepcopy(compatibility),
+    }
+
+
 def verify(inventory: dict, identities: dict | None = None) -> dict:
     return MODULE.verify_registration_graph(
         inventory,
@@ -187,6 +219,42 @@ def main() -> int:
     report = verify(fixture())
     require(report["ok"] is True, "valid registration graph should pass")
     require(report["replacement_lease"] is True, "valid graph should prove lease replacement")
+
+    normalized = schema_v2_fixture()
+    normalized_before = copy.deepcopy(normalized)
+    normalized_report = verify(normalized)
+    require(normalized_report["ok"] is True, "schema-v2 compatibility graph should pass")
+    require(normalized == normalized_before, "schema-v2 verification mutated its wire payload")
+
+    missing_compatibility = schema_v2_fixture()
+    missing_compatibility.pop("v1_compatibility")
+    try:
+        verify(missing_compatibility)
+    except MODULE.RegistrationGraphError as error:
+        require("compatibility" in str(error).lower(), f"missing compatibility had wrong failure: {error}")
+    else:
+        raise AssertionError("schema-v2 inventory without v1_compatibility was accepted")
+
+    incomplete_compatibility = schema_v2_fixture()
+    incomplete_compatibility["v1_compatibility"].pop("leases")
+    try:
+        verify(incomplete_compatibility)
+    except MODULE.RegistrationGraphError as error:
+        require("leases" in str(error).lower(), f"incomplete compatibility had wrong failure: {error}")
+    else:
+        raise AssertionError("schema-v2 inventory with incomplete v1_compatibility was accepted")
+
+    malformed_compatibility = schema_v2_fixture()
+    malformed_compatibility["v1_compatibility"]["port_assignments"] = {}
+    try:
+        verify(malformed_compatibility)
+    except MODULE.RegistrationGraphError as error:
+        require(
+            "port_assignments" in str(error).lower() and "list" in str(error).lower(),
+            f"malformed compatibility had wrong failure: {error}",
+        )
+    else:
+        raise AssertionError("schema-v2 inventory with malformed v1_compatibility was accepted")
 
     must_fail(
         lambda value: value.update({"port_assignments": [], "servers": [], "leases": []}),
@@ -376,7 +444,7 @@ def main() -> int:
         os.chmod(root, 0o700)
         inventory_file = root / "post-cutover-inventory.json"
         identities_file = root / "pre-cutover-identities.json"
-        inventory_file.write_text(json.dumps(fixture()) + "\n", encoding="utf-8")
+        inventory_file.write_text(json.dumps(schema_v2_fixture()) + "\n", encoding="utf-8")
         identities_file.write_text(
             json.dumps({"server_id": SERVER_ID, "lease_id": OLD_LEASE_ID}) + "\n",
             encoding="utf-8",

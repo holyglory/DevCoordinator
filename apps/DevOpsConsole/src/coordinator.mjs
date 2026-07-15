@@ -10,6 +10,20 @@ import { setTimeout as delay } from 'node:timers/promises';
 const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
 const PROJECT_ACTIONS = new Set(['start', 'stop', 'restart']);
 const TOKEN_MAX_BYTES = 4096;
+const CONSOLE_INVENTORY_KEYS = Object.freeze([
+  'coordinator_home',
+  'state_path',
+  'project',
+  'urls',
+  'servers',
+  'leases',
+  'port_assignments',
+  'recent_events',
+  'docker',
+  'postgres',
+  'backups',
+  'project_usage',
+]);
 
 // Connection-level failure codes where the request never reached the
 // coordinator, making a single retry after autostart safe even for mutations.
@@ -64,6 +78,34 @@ function failureCode(err) {
   return null;
 }
 
+// Schema v2 keeps normalized identities at the top level and isolates the
+// legacy Console read model under v1_compatibility. Existing Console journeys
+// deliberately consume that declared projection: overlay only its known keys
+// into a new view, retaining the normalized graph as non-conflicting evidence
+// and never mutating the cached wire response.
+function consoleInventoryView(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.schema_version !== 2) {
+    return value;
+  }
+  const compatibility = value.v1_compatibility;
+  if (!compatibility || typeof compatibility !== 'object' || Array.isArray(compatibility)) {
+    throw new CoordError('coordinator schema-v2 inventory compatibility projection is incomplete', {
+      status: 502,
+    });
+  }
+  const missing = CONSOLE_INVENTORY_KEYS.filter(
+    (key) => !Object.prototype.hasOwnProperty.call(compatibility, key),
+  );
+  if (missing.length > 0) {
+    throw new CoordError('coordinator schema-v2 inventory compatibility projection is incomplete', {
+      status: 502,
+    });
+  }
+  const projected = { ...value };
+  for (const key of CONSOLE_INVENTORY_KEYS) projected[key] = compatibility[key];
+  return projected;
+}
+
 export function createCoordinator({ config, log }) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'coordinator' }) : log;
   const baseUrl = String(config.coordinatorUrl).replace(/\/+$/, '');
@@ -78,8 +120,8 @@ export function createCoordinator({ config, log }) {
   let lastSpawnAt = 0; // autostart rate limit: max one spawn attempt per 30s
   let ensureInflight = null;
 
-  const invCache = { value: undefined, at: 0, inflight: null };
-  const srvCache = { value: undefined, at: 0, inflight: null };
+  const invCache = { value: undefined, at: 0, inflight: null, generation: 0 };
+  const srvCache = { value: undefined, at: 0, inflight: null, generation: 0 };
 
   function noteAlive() {
     ok = true;
@@ -269,10 +311,15 @@ export function createCoordinator({ config, log }) {
   }
 
   function invalidateCaches() {
-    invCache.value = undefined;
-    invCache.at = 0;
-    srvCache.value = undefined;
-    srvCache.at = 0;
+    for (const cache of [invCache, srvCache]) {
+      cache.generation += 1;
+      cache.value = undefined;
+      cache.at = 0;
+      // Detach an older GET instead of returning it to a caller that asked
+      // after the mutation committed. The request may finish normally, but
+      // its captured generation prevents it from repopulating this cache.
+      cache.inflight = null;
+    }
   }
 
   // Every POST except log reads mutates coordinator state (leases, servers,
@@ -408,20 +455,24 @@ export function createCoordinator({ config, log }) {
       return Promise.resolve(cache.value);
     }
     if (cache.inflight) return cache.inflight; // coalesce concurrent callers
-    cache.inflight = request('GET', apiPath)
+    const generation = cache.generation;
+    const inflight = request('GET', apiPath)
       .then((value) => {
-        cache.value = value;
-        cache.at = Date.now();
+        if (cache.generation === generation) {
+          cache.value = value;
+          cache.at = Date.now();
+        }
         return value;
       })
       .finally(() => {
-        cache.inflight = null;
+        if (cache.inflight === inflight) cache.inflight = null;
       });
-    return cache.inflight;
+    cache.inflight = inflight;
+    return inflight;
   }
 
   function inventory({ maxAgeMs = 5000 } = {}) {
-    return cachedGet(invCache, '/v1/inventory', maxAgeMs);
+    return cachedGet(invCache, '/v1/inventory', maxAgeMs).then(consoleInventoryView);
   }
 
   function serversRaw({ maxAgeMs = 3000 } = {}) {

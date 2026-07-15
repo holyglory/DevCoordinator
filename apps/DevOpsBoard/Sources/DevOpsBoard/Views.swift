@@ -112,20 +112,13 @@ struct OpsConsoleView: View {
                 sidebarPreference: sidebarWidth,
                 inspectorPreference: inspectorWidth
             )
-            let mainX = layout.sidebarWidth + splitHandleWidth
-            let inspectorSplitX = mainX + layout.mainWidth
-
-            ZStack(alignment: .topLeading) {
+            HStack(alignment: .top, spacing: 0) {
                 ServiceMapView(store: store)
                     .frame(width: layout.sidebarWidth, height: proxy.size.height)
-                    .position(x: layout.sidebarWidth / 2, y: proxy.size.height / 2)
-                    .zIndex(1)
 
                 if layout.showsMain {
                     SplitHandle(width: $sidebarWidth, range: layout.sidebarResizeRange)
                         .frame(width: splitHandleWidth, height: proxy.size.height)
-                        .position(x: layout.sidebarWidth + (splitHandleWidth / 2), y: proxy.size.height / 2)
-                        .zIndex(5)
                     MainBoardView(store: store)
                         .frame(
                             width: layout.mainWidth,
@@ -133,19 +126,13 @@ struct OpsConsoleView: View {
                             alignment: .topLeading
                         )
                         .clipped()
-                        .position(x: mainX + (layout.mainWidth / 2), y: proxy.size.height / 2)
-                        .zIndex(0)
                 }
 
                 if layout.showsInspector {
                     SplitHandle(width: $inspectorWidth, range: layout.inspectorResizeRange, direction: -1)
                         .frame(width: splitHandleWidth, height: proxy.size.height)
-                        .position(x: inspectorSplitX + (splitHandleWidth / 2), y: proxy.size.height / 2)
-                        .zIndex(5)
                     DetailsRailView(store: store)
                         .frame(width: layout.inspectorWidth, height: proxy.size.height)
-                        .position(x: inspectorSplitX + splitHandleWidth + (layout.inspectorWidth / 2), y: proxy.size.height / 2)
-                        .zIndex(2)
                 }
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .leading)
@@ -166,6 +153,15 @@ struct OpsConsoleView: View {
         }
         .sheet(isPresented: $store.showingServerLogs) {
             ServerLogsSheet(store: store)
+        }
+        .sheet(item: $store.repositoryDecommissionPrompt) { prompt in
+            RepositoryDecommissionSheet(store: store, prompt: prompt)
+        }
+        .sheet(item: $store.resourceAttachPrompt) { prompt in
+            ResourceAttachSheet(store: store, prompt: prompt)
+        }
+        .sheet(item: $store.resourceRetirementPrompt) { prompt in
+            ResourceRetirementSheet(store: store, prompt: prompt)
         }
     }
 }
@@ -1842,7 +1838,7 @@ struct DatabaseSection: View {
                         TableCell(width: widths[0]) {
                             HStack(spacing: 8) {
                                 StatusDot(status: db.status)
-                                Text(db.database ?? "Unknown database")
+                                Text(db.database ?? (db.databaseDiscoveryError == nil ? "Database unavailable" : "Database discovery unavailable"))
                                     .fontWeight(.medium)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
@@ -2080,6 +2076,188 @@ struct SelectionDetailsPanel: View {
     }
 }
 
+struct ResourceAttributionPresentation: Hashable {
+    let reasonCode: AttributionReasonCode
+    let explanation: String
+    let observedBy: [String]
+    let controller: String?
+    let canAttach: Bool
+    let canRetire: Bool
+    let recommendedNextStep: String?
+
+    var nextStep: String {
+        if let recommendedNextStep = recommendedNextStep?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !recommendedNextStep.isEmpty
+        {
+            return recommendedNextStep
+        }
+        if canAttach && canRetire {
+            return "If this resource belongs to an installed repository, attach it there. Otherwise retire it to stop it, block future automatic starts, and hide it without deleting its data."
+        }
+        if canAttach {
+            return "Choose the installed repository that owns this exact resource. Attaching records ownership but does not start it."
+        }
+        if canRetire {
+            return "Retire this exact standalone resource to stop it, block future automatic starts, and hide it without deleting its data."
+        }
+        switch reasonCode {
+        case .missingRepository:
+            return "Restore the repository at its recorded Git root, then reinstall it with the Coordinator skill."
+        case .nonGitRepository:
+            return "Choose a real local Git repository and install it with the Coordinator skill."
+        case .conflictingClaims:
+            return "Resolve the conflicting repository claims before any lifecycle action can run."
+        case .nameOnly, .ambiguousControl, .unknown:
+            return "Register or explicitly attach this exact resource through the Coordinator skill. Lifecycle controls stay unavailable until one controller is proved."
+        case .staleObservation:
+            return "Refresh host observations, then review the current controller evidence."
+        case .startFenceViolated:
+            return "Keep this resource stopped and use the Coordinator skill to resume the retained removal operation before trusting the hidden state again."
+        }
+    }
+}
+
+func attributionPresentation(for server: ManagedServer) -> ResourceAttributionPresentation? {
+    if let attribution = server.attribution {
+        return ResourceAttributionPresentation(
+            reasonCode: attribution.reasonCode,
+            explanation: attribution.explanation,
+            observedBy: attribution.observedBy.isEmpty
+                ? server.observationOrigins.map(\.label)
+                : attribution.observedBy,
+            controller: attribution.controller,
+            canAttach: attribution.canAttach,
+            canRetire: attribution.canRetire,
+            recommendedNextStep: attribution.recommendedNextStep
+        )
+    }
+    guard server.project == nil || server.ownershipError != nil else { return nil }
+    let explanation = server.ownershipError
+        ?? "No validated Git repository path was recorded for this server."
+    return ResourceAttributionPresentation(
+        reasonCode: explanation.localizedCaseInsensitiveContains("conflict")
+            || explanation.localizedCaseInsensitiveContains("several")
+            ? .conflictingClaims
+            : (server.origin == nil ? .ambiguousControl : .nameOnly),
+        explanation: explanation,
+        observedBy: resourceObservationOrigins(
+            primary: server.origin,
+            candidates: server.observationOrigins
+        ).map(\.label),
+        controller: server.ownershipError == nil ? server.origin?.label : nil,
+        canAttach: false,
+        canRetire: false,
+        recommendedNextStep: nil
+    )
+}
+
+func attributionPresentation(for container: DockerContainer) -> ResourceAttributionPresentation? {
+    if let attribution = container.attribution {
+        return ResourceAttributionPresentation(
+            reasonCode: attribution.reasonCode,
+            explanation: attribution.explanation,
+            observedBy: attribution.observedBy.isEmpty
+                ? container.observationOrigins.map(\.label)
+                : attribution.observedBy,
+            controller: attribution.controller,
+            canAttach: attribution.canAttach,
+            canRetire: attribution.canRetire,
+            recommendedNextStep: attribution.recommendedNextStep
+        )
+    }
+    guard container.project == nil || container.ownershipError != nil else { return nil }
+    let explanation = container.ownershipError
+        ?? "No Coordinator registration or Docker Compose repository path was found."
+    return ResourceAttributionPresentation(
+        reasonCode: explanation.localizedCaseInsensitiveContains("conflict")
+            || explanation.localizedCaseInsensitiveContains("several")
+            ? .conflictingClaims
+            : (container.origin == nil ? .ambiguousControl : .nameOnly),
+        explanation: explanation,
+        observedBy: resourceObservationOrigins(
+            primary: container.origin,
+            candidates: container.observationOrigins
+        ).map(\.label),
+        controller: container.ownershipError == nil ? container.origin?.label : nil,
+        canAttach: false,
+        canRetire: false,
+        recommendedNextStep: nil
+    )
+}
+
+struct ResourceAttributionCallout: View {
+    let attribution: ResourceAttributionPresentation
+
+    var body: some View {
+        let isFenceViolation = attribution.reasonCode == .startFenceViolated
+        let accent = isFenceViolation ? Theme.red : Theme.orange
+        VStack(alignment: .leading, spacing: 7) {
+            Label(
+                isFenceViolation ? "Removal fence violated" : "Not linked to a repository",
+                systemImage: isFenceViolation
+                    ? "exclamationmark.octagon.fill"
+                    : "point.3.connected.trianglepath.dotted"
+            )
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(accent)
+            Text(attribution.reasonCode.title)
+                .font(.system(size: 11, weight: .semibold))
+            Text(attribution.explanation)
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            DetailLine(
+                label: "Observed by",
+                value: attribution.observedBy.isEmpty
+                    ? "No current source"
+                    : attribution.observedBy.sorted().joined(separator: ", ")
+            )
+            DetailLine(label: "Controller", value: attribution.controller ?? "No authoritative controller")
+            Text(attribution.nextStep)
+                .font(.system(size: 11, weight: .semibold))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(accent.opacity(0.09))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(accent.opacity(0.32)))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("resource-attribution-callout")
+    }
+}
+
+struct ResourceAttributionActions: View {
+    @ObservedObject var store: OpsStore
+    let target: ExactUnassignedResource
+    let canAttach: Bool
+    let canRetire: Bool
+
+    var body: some View {
+        if canAttach || canRetire {
+            VStack(spacing: 7) {
+                if canAttach {
+                    Button {
+                        store.prepareResourceAttach(target)
+                    } label: {
+                        Label("Attach to Repository…", systemImage: "link.badge.plus")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .accessibilityIdentifier("unassigned-resource-attach")
+                }
+                if canRetire {
+                    Button(role: .destructive) {
+                        store.planResourceRetirement(target)
+                    } label: {
+                        Label("Retire Standalone Resource…", systemImage: "archivebox")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .accessibilityIdentifier("unassigned-resource-retire")
+                }
+            }
+        }
+    }
+}
+
 struct SelectedServerPanel: View {
     @ObservedObject var store: OpsStore
     let server: ManagedServer
@@ -2099,6 +2277,17 @@ struct SelectedServerPanel: View {
             Text(projectDisplayLabel(server.project))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Theme.secondary)
+            if let attribution = attributionPresentation(for: server) {
+                ResourceAttributionCallout(attribution: attribution)
+                if let target = server.exactUnassignedResource {
+                    ResourceAttributionActions(
+                        store: store,
+                        target: target,
+                        canAttach: attribution.canAttach,
+                        canRetire: attribution.canRetire
+                    )
+                }
+            }
             DetailLine(label: "Port", value: server.port.map(String.init) ?? "—")
             DetailLine(label: "Health", value: server.status ?? "unknown")
             if let duplicateCount = server.duplicateCount, duplicateCount > 1 {
@@ -2190,6 +2379,17 @@ struct SelectedDockerPanel: View {
             DetailLine(label: "Status", value: normalizedStatus(container.status))
             DetailLine(label: "Ports", value: container.ports?.isEmpty == false ? container.ports! : "none")
             DetailLine(label: "PIDs", value: container.stats?.pids.map(String.init) ?? "—")
+            if let attribution = attributionPresentation(for: container) {
+                ResourceAttributionCallout(attribution: attribution)
+                if let target = container.exactUnassignedResource {
+                    ResourceAttributionActions(
+                        store: store,
+                        target: target,
+                        canAttach: attribution.canAttach,
+                        canRetire: attribution.canRetire
+                    )
+                }
+            }
             DockerTelemetryPanel(container: container)
             InspectorActionStack {
                 if container.isRunning {
@@ -2243,7 +2443,7 @@ struct SelectedDatabasePanel: View {
         let isVerifyingBackup = store.isBackupVerificationInProgress(for: database)
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                Text(database.database ?? "Unknown database")
+                Text(database.database ?? (database.databaseDiscoveryError == nil ? "Database unavailable" : "Database discovery unavailable"))
                     .font(.system(size: 15, weight: .bold))
                     .lineLimit(2)
                 Spacer()
@@ -2270,6 +2470,17 @@ struct SelectedDatabasePanel: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Theme.orange)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if let attribution = attributionPresentation(for: database) {
+                ResourceAttributionCallout(attribution: attribution)
+                if let target = database.exactUnassignedResource {
+                    ResourceAttributionActions(
+                        store: store,
+                        target: target,
+                        canAttach: attribution.canAttach,
+                        canRetire: attribution.canRetire
+                    )
+                }
             }
 
             VStack(alignment: .leading, spacing: 7) {
@@ -2501,6 +2712,7 @@ struct DatabaseEvidenceSheet: View {
 struct SelectedProjectPanel: View {
     let name: String
     @ObservedObject var store: OpsStore
+    @State private var projectManagementExpanded = false
 
     var body: some View {
         // A dropped cached selection may recover only the persisted usage-key
@@ -2529,8 +2741,11 @@ struct SelectedProjectPanel: View {
             DetailLine(label: "Servers", value: "\(group.servers.count)")
             DetailLine(label: "Docker", value: "\(group.containers.count)")
             DetailLine(label: "Databases", value: "\(group.databases.count)")
-            if !group.isRepository, group.unassignedEvidenceCount > 0 {
-                DetailLine(label: "Attribution hints", value: "\(group.unassignedEvidenceCount)")
+            if !group.isRepository {
+                DetailLine(
+                    label: "Why unassigned",
+                    value: unassignedAttributionSummary(group)
+                )
             }
             if let usage = group.usage {
                 DetailLine(label: "CPU", value: formatCPU(usage.cpuPercent))
@@ -2562,12 +2777,43 @@ struct SelectedProjectPanel: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!projectActionAllowed(store, group: group, kind: .projectStatus))
             } else {
-                Text("These resources have no validated repository path. Use each resource row to inspect the controls available for its exact source.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.secondary)
+                VStack(alignment: .leading, spacing: 7) {
+                    Label("Repository ownership is not proved", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.orange)
+                    Text("Each item below is real host evidence, but it cannot be assigned to exactly one validated local Git repository. Select an item to see the precise reason, observed sources, controller status, and safe next step.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(9)
+                .background(Theme.orange.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .accessibilityIdentifier("unassigned-resources-explanation")
             }
             if let report {
                 ProjectRuntimeSummary(report: report)
+            }
+            if group.isRepository {
+                DisclosureGroup("Project Management", isExpanded: $projectManagementExpanded) {
+                    VStack(alignment: .leading, spacing: 9) {
+                        Text("Remove this repository from the coordinator, stop its proved resources, and block automatic starts. Files, database data, volumes, backups, and history are retained.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button(role: .destructive) {
+                            store.planRepositoryDecommission(group)
+                        } label: {
+                            Label("Remove from Coordinator…", systemImage: "archivebox")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .disabled(group.actionOrigin == nil || group.projectActionsBlocked)
+                        .accessibilityIdentifier("project-remove-from-coordinator")
+                    }
+                    .padding(.top, 6)
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .accessibilityIdentifier("project-management-disclosure")
             }
             DisclosureGroup("Diagnostics") {
                 DetailLine(label: "Project path", value: group.projectPath ?? "Unassigned")
@@ -2599,6 +2845,283 @@ struct SelectedProjectPanel: View {
             .font(.system(size: 11, weight: .semibold))
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+}
+
+func unassignedAttributionSummary(_ group: ProjectGroup) -> String {
+    let values = group.servers.compactMap(attributionPresentation(for:))
+        + group.containers.compactMap(attributionPresentation(for:))
+        + group.databases.compactMap(attributionPresentation(for:))
+    guard !values.isEmpty else {
+        return group.unassignedEvidenceCount > 0
+            ? "\(group.unassignedEvidenceCount) record\(group.unassignedEvidenceCount == 1 ? "" : "s") lack a validated repository path"
+            : "No validated repository path or authoritative controller"
+    }
+    let grouped = Dictionary(grouping: values, by: \.reasonCode)
+    return grouped
+        .map { reason, rows in
+            "\(rows.count) \(reason.title.lowercased())"
+        }
+        .sorted()
+        .joined(separator: "; ")
+}
+
+struct RepositoryDecommissionSheet: View {
+    @ObservedObject var store: OpsStore
+    let prompt: RepositoryDecommissionPrompt
+    @Environment(\.dismiss) private var dismiss
+
+    private var plan: RepositoryDecommissionPlan { prompt.plan }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Remove from Coordinator")
+                    .font(.title2.bold())
+                Text(plan.displayName ?? URL(fileURLWithPath: prompt.projectPath).lastPathComponent)
+                    .font(.headline)
+                Text(prompt.projectPath)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Theme.secondary)
+                    .textSelection(.enabled)
+
+                Label(
+                    "Future coordinator starts are fenced before any resource is changed.",
+                    systemImage: "lock.shield"
+                )
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Theme.orange)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("THE COORDINATOR WILL")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.secondary)
+                    Label("Disable every proved automatic-start policy", systemImage: "nosign")
+                    Label("Stop and verify each exact managed resource", systemImage: "stop.circle")
+                    Label("Release active leases and port assignments", systemImage: "network.slash")
+                    Label("Hide the repository only after all checks pass", systemImage: "eye.slash")
+                }
+                .font(.system(size: 12))
+
+                if !plan.targets.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("EXACT TARGETS (\(plan.targets.count))")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(Theme.secondary)
+                        ForEach(plan.targets) { target in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(target.displayName ?? target.hostResourceID)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                                Text(
+                                    [
+                                        target.kind,
+                                        target.currentState,
+                                        target.policies.isEmpty ? nil : "\(target.policies.count) start polic\(target.policies.count == 1 ? "y" : "ies")",
+                                        target.allocations.isEmpty ? nil : "\(target.allocations.count) allocation\(target.allocations.count == 1 ? "" : "s")",
+                                    ]
+                                    .compactMap { $0 }
+                                    .joined(separator: " • ")
+                                )
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.secondary)
+                            }
+                            .padding(9)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Theme.control)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("RETAINED")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.secondary)
+                    Text(plan.retainedData.map(repositoryRetainedDataLabel).joined(separator: ", "))
+                        .font(.system(size: 12))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Nothing in this action deletes repository files, containers, volumes, database data, backups, or evidence.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.secondary)
+                }
+
+                if !plan.blockers.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Removal is blocked", systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(Theme.orange)
+                        ForEach(plan.blockers, id: \.self) { blocker in
+                            Text(blocker)
+                                .font(.system(size: 11))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(10)
+                    .background(Theme.orange.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+
+                HStack {
+                    Button("Cancel") {
+                        store.cancelRepositoryDecommission()
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Remove Repository", role: .destructive) {
+                        store.applyRepositoryDecommission(prompt)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!plan.blockers.isEmpty)
+                    .accessibilityIdentifier("repository-decommission-confirm")
+                }
+            }
+            .padding(24)
+        }
+        .frame(width: 620, height: 700)
+        .background(Theme.background)
+        .interactiveDismissDisabled(false)
+        .accessibilityIdentifier("repository-decommission-sheet")
+    }
+}
+
+struct ResourceAttachSheet: View {
+    @ObservedObject var store: OpsStore
+    let prompt: ResourceAttachPrompt
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedProjectID: String?
+
+    private var repositories: [ProjectGroup] {
+        store.attachableRepositoryGroups.filter {
+            $0.actionOrigin?.id == prompt.target.origin.id
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Attach to Repository")
+                .font(.title2.bold())
+            Text(prompt.target.displayName)
+                .font(.headline)
+            Text("Choose the one local Git repository that owns this exact resource. The coordinator records membership but does not start it.")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 6) {
+                DetailLine(label: "Resource kind", value: prompt.target.kind)
+                DetailLine(label: "Exact host ID", value: prompt.target.hostResourceID)
+                DetailLine(label: "Controller", value: prompt.target.origin.label)
+            }
+            .textSelection(.enabled)
+
+            Picker("Repository", selection: $selectedProjectID) {
+                Text("Choose a repository…").tag(String?.none)
+                ForEach(repositories, id: \.id) { group in
+                    Text("\(group.name) — \(group.projectPath ?? "")")
+                        .tag(Optional(group.id))
+                }
+            }
+            .accessibilityIdentifier("resource-attach-repository-picker")
+
+            if repositories.isEmpty {
+                Label(
+                    "No installed repository is controlled by this coordinator source.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.orange)
+            }
+
+            Spacer()
+            HStack {
+                Button("Cancel") {
+                    store.cancelResourceAttach()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("Attach") {
+                    guard let selectedProjectID,
+                          let group = repositories.first(where: { $0.id == selectedProjectID })
+                    else { return }
+                    store.attachResource(prompt, to: group)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(selectedProjectID == nil)
+                .accessibilityIdentifier("resource-attach-confirm")
+            }
+        }
+        .padding(24)
+        .frame(width: 560, height: 390)
+        .background(Theme.background)
+        .accessibilityIdentifier("resource-attach-sheet")
+    }
+}
+
+struct ResourceRetirementSheet: View {
+    @ObservedObject var store: OpsStore
+    let prompt: ResourceRetirementPrompt
+    @Environment(\.dismiss) private var dismiss
+
+    private var target: RepositoryDecommissionTarget? { prompt.plan.targets.first }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Retire Standalone Resource")
+                    .font(.title2.bold())
+                Text(prompt.target.displayName)
+                    .font(.headline)
+                Text("The coordinator will fence future starts, disable proved automatic-start policies, stop this exact resource, verify it stopped, and hide it only after success.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    DetailLine(label: "Resource kind", value: prompt.target.kind)
+                    DetailLine(label: "Exact host ID", value: prompt.target.hostResourceID)
+                    DetailLine(label: "Controller binding", value: prompt.target.controlBindingID)
+                    if let target {
+                        DetailLine(label: "Start policies", value: "\(target.policies.count)")
+                        DetailLine(label: "Active allocations", value: "\(target.allocations.count)")
+                    }
+                }
+                .textSelection(.enabled)
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("RETAINED")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.secondary)
+                    Text(prompt.plan.retainedData.map(repositoryRetainedDataLabel).joined(separator: ", "))
+                        .font(.system(size: 12))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Container definitions, volumes, database data, backups, files, and history are not deleted.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.secondary)
+                }
+
+                HStack {
+                    Button("Cancel") {
+                        store.cancelResourceRetirement()
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Retire Resource", role: .destructive) {
+                        store.applyResourceRetirement(prompt)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("resource-retirement-confirm")
+                }
+            }
+            .padding(24)
+        }
+        .frame(width: 600, height: 600)
+        .background(Theme.background)
+        .accessibilityIdentifier("resource-retirement-sheet")
     }
 }
 
@@ -3684,7 +4207,10 @@ struct SidebarFooterView: View {
                 Button {
                     showingSources = true
                 } label: {
-                    Label("Manage Sources", systemImage: "slider.horizontal.3")
+                    Label(
+                        store.usesNormalizedAccountCoordinator ? "Refresh Settings" : "Manage Sources",
+                        systemImage: "slider.horizontal.3"
+                    )
                         .frame(width: contentWidth)
                 }
                 .buttonStyle(.bordered)
@@ -3730,8 +4256,13 @@ struct CoordinatorSourcesSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Coordinator Sources").font(.title2.bold())
-                    Text("Configure typed local coordinator homes and refresh behavior.")
+                    Text(store.usesNormalizedAccountCoordinator ? "Account Coordinator" : "Coordinator Sources")
+                        .font(.title2.bold())
+                    Text(
+                        store.usesNormalizedAccountCoordinator
+                            ? "All Codex instances for this account share one coordinator. Configure how often the Board refreshes it."
+                            : "Configure typed local coordinator homes and refresh behavior."
+                    )
                         .font(.system(size: 12))
                         .foregroundStyle(Theme.secondary)
                 }
@@ -3741,35 +4272,53 @@ struct CoordinatorSourcesSheet: View {
 
             ScrollView {
                 VStack(spacing: 10) {
-                    ForEach($sourceRows) { $source in
+                    if store.usesNormalizedAccountCoordinator {
                         VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                TextField("Source label", text: $source.label)
-                                Toggle("Enabled", isOn: $source.enabled)
-                                Button(role: .destructive) {
-                                    sourceRows.removeAll { $0.id == source.id }
-                                } label: {
-                                    Image(systemName: "trash")
-                                }
-                                .accessibilityLabel("Remove source \(source.label.isEmpty ? "without a label" : source.label)")
+                            Label("One shared account source", systemImage: "externaldrive.badge.checkmark")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("Older local coordinator homes are imported safely; the Board does not poll them as separate projects or duplicate host resources.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if let origin = store.sourceStates.first?.origin {
+                                DetailLine(label: "Coordinator home", value: origin.home)
                             }
-                            TextField("Absolute coordinator home", text: $source.home)
-                            .font(.system(size: 12, design: .monospaced))
                         }
-                        .padding(10)
+                        .padding(12)
                         .background(Theme.control)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
-                    Button {
-                        sourceRows.append(
-                            CoordinatorSourceDraftRow(
-                                configuration: CoordinatorSourceConfiguration(label: "", home: "", enabled: true)
+                        .accessibilityIdentifier("normalized-account-coordinator-source")
+                    } else {
+                        ForEach($sourceRows) { $source in
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    TextField("Source label", text: $source.label)
+                                    Toggle("Enabled", isOn: $source.enabled)
+                                    Button(role: .destructive) {
+                                        sourceRows.removeAll { $0.id == source.id }
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                    .accessibilityLabel("Remove source \(source.label.isEmpty ? "without a label" : source.label)")
+                                }
+                                TextField("Absolute coordinator home", text: $source.home)
+                                .font(.system(size: 12, design: .monospaced))
+                            }
+                            .padding(10)
+                            .background(Theme.control)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                        Button {
+                            sourceRows.append(
+                                CoordinatorSourceDraftRow(
+                                    configuration: CoordinatorSourceConfiguration(label: "", home: "", enabled: true)
+                                )
                             )
-                        )
-                    } label: {
-                        Label("Add Source", systemImage: "plus")
+                        } label: {
+                            Label("Add Source", systemImage: "plus")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .frame(minHeight: 250, maxHeight: 390)
@@ -3815,7 +4364,9 @@ struct CoordinatorSourcesSheet: View {
                 Button("Cancel") { dismiss() }
                 Spacer()
                 Button("Save") {
-                    draft.sources = sourceRows.map(\.configuration)
+                    draft.sources = store.usesNormalizedAccountCoordinator
+                        ? []
+                        : sourceRows.map(\.configuration)
                     if store.saveCoordinatorConfiguration(draft) {
                         dismiss()
                         store.refresh()
@@ -3830,7 +4381,9 @@ struct CoordinatorSourcesSheet: View {
         .onAppear {
             store.reloadCoordinatorConfiguration()
             draft = store.coordinatorConfiguration
-            sourceRows = draft.sources.map { CoordinatorSourceDraftRow(configuration: $0) }
+            sourceRows = store.usesNormalizedAccountCoordinator
+                ? []
+                : draft.sources.map { CoordinatorSourceDraftRow(configuration: $0) }
         }
     }
 }
@@ -3972,7 +4525,8 @@ func databaseProtectionActionAllowed(
     kind: ActionKind,
     database: DockerContainer
 ) -> Bool {
-    guard let identity = database.databaseIdentity,
+    guard database.ownershipError == nil,
+          let identity = database.databaseIdentity,
           identity.containerID?.isEmpty == false,
           !identity.container.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
           !identity.database.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,

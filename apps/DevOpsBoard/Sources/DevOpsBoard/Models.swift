@@ -93,6 +93,7 @@ struct ManagedServer: Decodable, Identifiable, Hashable, Sendable {
     var portReused: Bool?
     var portReusedBy: PortReuseOwner?
     var processUsage: ProcessUsage?
+    var attribution: ResourceAttribution? = nil
     // Populated by the Board's repository catalog after source inventories
     // are reconciled. These are presentation/control facts, not coordinator
     // payload fields, so they deliberately have no CodingKeys.
@@ -121,6 +122,105 @@ struct ManagedServer: Decodable, Identifiable, Hashable, Sendable {
         case portReused = "port_reused"
         case portReusedBy = "port_reused_by"
         case processUsage = "process_usage"
+        case attribution
+    }
+}
+
+enum AttributionReasonCode: String, Codable, Hashable, Sendable {
+    case nameOnly = "name_only"
+    case missingRepository = "missing_repo"
+    case nonGitRepository = "not_git"
+    case conflictingClaims = "conflicting_claims"
+    case ambiguousControl = "ambiguous_control"
+    case staleObservation = "stale_observation"
+    case startFenceViolated = "start_fence_violated"
+    case unknown
+
+    var title: String {
+        switch self {
+        case .nameOnly: return "Only a resource name was observed"
+        case .missingRepository: return "The linked repository is missing"
+        case .nonGitRepository: return "The path is not a Git repository"
+        case .conflictingClaims: return "Several repositories claim this resource"
+        case .ambiguousControl: return "No single controller is authoritative"
+        case .staleObservation: return "The ownership observation is stale"
+        case .startFenceViolated: return "A removed resource is running again"
+        case .unknown: return "Repository attribution is unavailable"
+        }
+    }
+}
+
+struct ResourceAttribution: Decodable, Hashable, Sendable {
+    let reasonCode: AttributionReasonCode
+    let explanation: String
+    let observedBy: [String]
+    let controller: String?
+    let hostResourceID: String?
+    let immutableFingerprint: String?
+    let controlBindingID: String?
+    let ownershipFingerprint: String?
+    let canAttach: Bool
+    let canRetire: Bool
+    let lifecycleViolation: Bool
+    let recommendedNextStep: String?
+
+    enum CodingKeys: String, CodingKey {
+        case reasonCode = "reason_code"
+        case explanation
+        case observedBy = "observed_by"
+        case controller
+        case hostResourceID = "host_resource_id"
+        case immutableFingerprint = "immutable_fingerprint"
+        case controlBindingID = "control_binding_id"
+        case ownershipFingerprint = "ownership_fingerprint"
+        case canAttach = "can_attach"
+        case canRetire = "can_retire"
+        case lifecycleViolation = "lifecycle_violation"
+        case recommendedNextStep = "recommended_next_step"
+    }
+
+    init(
+        reasonCode: AttributionReasonCode,
+        explanation: String,
+        observedBy: [String],
+        controller: String?,
+        hostResourceID: String?,
+        immutableFingerprint: String?,
+        controlBindingID: String?,
+        ownershipFingerprint: String?,
+        canAttach: Bool,
+        canRetire: Bool,
+        lifecycleViolation: Bool,
+        recommendedNextStep: String?
+    ) {
+        self.reasonCode = reasonCode
+        self.explanation = explanation
+        self.observedBy = observedBy
+        self.controller = controller
+        self.hostResourceID = hostResourceID
+        self.immutableFingerprint = immutableFingerprint
+        self.controlBindingID = controlBindingID
+        self.ownershipFingerprint = ownershipFingerprint
+        self.canAttach = canAttach
+        self.canRetire = canRetire
+        self.lifecycleViolation = lifecycleViolation
+        self.recommendedNextStep = recommendedNextStep
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        reasonCode = try values.decodeIfPresent(AttributionReasonCode.self, forKey: .reasonCode) ?? .unknown
+        explanation = try values.decodeIfPresent(String.self, forKey: .explanation) ?? reasonCode.title
+        observedBy = try values.decodeIfPresent([String].self, forKey: .observedBy) ?? []
+        controller = try values.decodeIfPresent(String.self, forKey: .controller)
+        hostResourceID = try values.decodeIfPresent(String.self, forKey: .hostResourceID)
+        immutableFingerprint = try values.decodeIfPresent(String.self, forKey: .immutableFingerprint)
+        controlBindingID = try values.decodeIfPresent(String.self, forKey: .controlBindingID)
+        ownershipFingerprint = try values.decodeIfPresent(String.self, forKey: .ownershipFingerprint)
+        canAttach = try values.decodeIfPresent(Bool.self, forKey: .canAttach) ?? false
+        canRetire = try values.decodeIfPresent(Bool.self, forKey: .canRetire) ?? false
+        lifecycleViolation = try values.decodeIfPresent(Bool.self, forKey: .lifecycleViolation) ?? false
+        recommendedNextStep = try values.decodeIfPresent(String.self, forKey: .recommendedNextStep)
     }
 }
 
@@ -281,11 +381,16 @@ struct DockerContainer: Decodable, Identifiable, Hashable, Sendable {
     var ownershipError: String? = nil
     var ownershipCandidates: [CoordinatorOrigin] = []
     var observationOrigins: [CoordinatorOrigin] = []
+    var attribution: ResourceAttribution? = nil
 
     enum CodingKeys: String, CodingKey {
-        case id, name, image, status, ports, project, agent, role, adopted, stats
+        case id, name, image, status, ports, project, agent, role, adopted, stats, database
         case metadataSource = "metadata_source"
         case statsHistory = "stats_history"
+        case databaseSizeBytes = "database_size_bytes"
+        case databaseDiscoveryError = "database_discovery_error"
+        case startedAt = "started_at"
+        case attribution
     }
 }
 
@@ -332,7 +437,7 @@ struct DockerStats: Decodable, Identifiable, Hashable, Sendable {
 }
 
 struct DatabaseBackup: Decodable, Identifiable, Hashable, Sendable {
-    var id: String { "\(origin?.id ?? "unknown"):\(path)" }
+    var id: String { normalizedBackupID ?? "\(origin?.id ?? "unknown"):\(path)" }
     var origin: CoordinatorOrigin? = nil
     var path: String
     var size: Int?
@@ -342,6 +447,15 @@ struct DatabaseBackup: Decodable, Identifiable, Hashable, Sendable {
     var container: String?
     var format: String?
     var sha256: String?
+    var normalizedBackupID: String? = nil
+    var immutableContainerID: String? = nil
+    var normalizedScope: String? = nil
+    var normalizedVerificationStatus: String? = nil
+    var normalizedVerificationMode: String? = nil
+    var normalizedRegistryStatus: String? = nil
+    var normalizedCreatedAt: String? = nil
+    var databaseBindingID: String? = nil
+    var dockerResourceID: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case path, size, manifest, database, container, format, sha256
@@ -351,6 +465,7 @@ struct DatabaseBackup: Decodable, Identifiable, Hashable, Sendable {
     var verificationCacheKey: String {
         [
             origin?.id ?? "unknown",
+            normalizedBackupID ?? "legacy-backup",
             path,
             size.map(String.init) ?? "unknown-size",
             modifiedAt ?? "unknown-modified-at",
@@ -632,7 +747,8 @@ extension DockerContainer {
     }
 
     var databaseIdentity: DatabaseIdentity? {
-        guard let origin,
+        guard ownershipError == nil,
+              let origin,
               let container = name,
               let database,
               !database.isEmpty,
@@ -711,8 +827,55 @@ extension ManagedServer {
         return origin.map { ResourceIdentity(origin: $0, kind: .server, nativeID: coordinatorID ?? id) }
     }
 
+    var exactUnassignedResource: ExactUnassignedResource? {
+        guard let origin,
+              let attribution,
+              let hostResourceID = attribution.hostResourceID?.nilIfBlank,
+              let immutableFingerprint = attribution.immutableFingerprint?.nilIfBlank,
+              let controlBindingID = attribution.controlBindingID?.nilIfBlank,
+              let ownershipFingerprint = attribution.ownershipFingerprint?.nilIfBlank
+        else { return nil }
+        return ExactUnassignedResource(
+            origin: origin,
+            kind: "server",
+            hostResourceID: hostResourceID,
+            immutableFingerprint: immutableFingerprint,
+            controlBindingID: controlBindingID,
+            ownershipFingerprint: ownershipFingerprint,
+            displayName: name
+        )
+    }
+
     func uptime(now: Date) -> UptimeValue {
         UptimeValue(startedAt: createdTs.map { Date(timeIntervalSince1970: $0) }, now: now)
+    }
+}
+
+extension DockerContainer {
+    var exactUnassignedResource: ExactUnassignedResource? {
+        guard let origin,
+              let attribution,
+              let hostResourceID = attribution.hostResourceID?.nilIfBlank,
+              let immutableFingerprint = attribution.immutableFingerprint?.nilIfBlank,
+              let controlBindingID = attribution.controlBindingID?.nilIfBlank,
+              let ownershipFingerprint = attribution.ownershipFingerprint?.nilIfBlank
+        else { return nil }
+        return ExactUnassignedResource(
+            origin: origin,
+            kind: "container",
+            hostResourceID: hostResourceID,
+            immutableFingerprint: immutableFingerprint,
+            controlBindingID: controlBindingID,
+            ownershipFingerprint: ownershipFingerprint,
+            displayName: name ?? database ?? hostResourceID
+        )
+    }
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -1765,6 +1928,10 @@ enum ActionKind: String, Codable, Hashable, Sendable {
     case projectStart
     case projectStop
     case projectRestart
+    case repositoryDecommissionPlan
+    case repositoryDecommission
+    case attachResource
+    case retireStandaloneResource
     case backupDatabase
     case verifyBackup
     case restoreDatabase
@@ -2089,6 +2256,9 @@ struct BackupRecord: Codable, Hashable, Sendable, Identifiable {
     var format: String?
     var scope: String?
     var compatibilityError: String?
+    var normalizedBackupID: String? = nil
+    var databaseBindingID: String? = nil
+    var dockerResourceID: String? = nil
 
     var isStronglyVerified: Bool {
         checksum == .verified && restoreTest == .passed && compatibilityError == nil
@@ -2141,11 +2311,60 @@ struct BackupManifestV2: Decodable, Sendable {
 
 extension DatabaseBackup {
     func verifiedRecord() -> BackupRecord? {
-        record(verifyArtifactChecksum: true)
+        if normalizedBackupID != nil { return normalizedRegistryRecord() }
+        return record(verifyArtifactChecksum: true)
     }
 
     func manifestRecord() -> BackupRecord? {
-        record(verifyArtifactChecksum: false)
+        if normalizedBackupID != nil { return normalizedRegistryRecord() }
+        return record(verifyArtifactChecksum: false)
+    }
+
+    private func normalizedRegistryRecord() -> BackupRecord? {
+        guard let origin,
+              let container,
+              let database,
+              let immutableContainerID,
+              !container.isEmpty,
+              !database.isEmpty,
+              !immutableContainerID.isEmpty
+        else { return nil }
+        let status = normalizedRegistryStatus ?? "unknown"
+        let scope = normalizedScope ?? "unknown"
+        let verification = normalizedVerificationStatus ?? "unverified"
+        let stronglyVerified = status == "available"
+            && scope == "database"
+            && verification == "strong"
+        let incompatibility: String?
+        if status != "available" {
+            incompatibility = "backup artifact is not available"
+        } else if scope != "database" {
+            incompatibility = "only database-scoped backups can be restored here"
+        } else if verification != "strong" {
+            incompatibility = "backup has not passed strong normalized verification"
+        } else {
+            incompatibility = nil
+        }
+        return BackupRecord(
+            identity: DatabaseIdentity(
+                origin: origin,
+                container: container,
+                database: database,
+                containerID: immutableContainerID
+            ),
+            path: path,
+            createdAt: normalizedCreatedAt.flatMap(parseISOTimestamp)
+                ?? modifiedAt.flatMap(parseISOTimestamp)
+                ?? Date.distantPast,
+            checksum: stronglyVerified ? .verified : .unknown,
+            restoreTest: stronglyVerified ? .passed : .notRun,
+            format: format,
+            scope: scope,
+            compatibilityError: incompatibility,
+            normalizedBackupID: normalizedBackupID,
+            databaseBindingID: databaseBindingID,
+            dockerResourceID: dockerResourceID
+        )
     }
 
     private func record(verifyArtifactChecksum: Bool) -> BackupRecord? {
@@ -2547,10 +2766,55 @@ protocol CommandExecuting: Sendable {
 
 protocol CoordinatorServing: Sendable {
     func execute(origin: CoordinatorOrigin, arguments: [String]) async throws -> CommandExecution
+    /// Request one host observation before reading inventory. Legacy/test
+    /// services may return nil; the production located service implements the
+    /// normalized observer command and inventory itself remains query-only.
+    func observe(origin: CoordinatorOrigin, maxAgeSeconds: Double) async throws -> CommandExecution?
+    func requestProjectRoot() async throws -> String?
+}
+
+extension CoordinatorServing {
+    func observe(origin: CoordinatorOrigin, maxAgeSeconds: Double) async throws -> CommandExecution? {
+        nil
+    }
+
+    func requestProjectRoot() async throws -> String? { nil }
 }
 
 protocol CoordinatorOriginDiscovering: Sendable {
     func origins() -> [CoordinatorOrigin]
+}
+
+/// Production discovery for the normalized per-account coordinator store.
+/// Legacy Codex, Claude, and Parall homes are importer inputs; the Board never
+/// polls them as independent authorities after the account-store cutover.
+struct AccountCoordinatorOriginDiscovery: CoordinatorOriginDiscovering, Sendable {
+    let environment: [String: String]
+    let accountHome: String?
+
+    init(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        accountHomeResolver: POSIXAccountHomeResolver = POSIXAccountHomeResolver()
+    ) {
+        self.environment = environment
+        self.accountHome = accountHomeResolver.resolve()
+    }
+
+    func origins() -> [CoordinatorOrigin] {
+        if let configured = environment["CODEX_AGENT_COORDINATOR_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !configured.isEmpty
+        {
+            return [CoordinatorOrigin(label: "Configured account", home: canonicalCoordinatorHomePath(configured))]
+        }
+        guard let accountHome else { return [] }
+        return [
+            CoordinatorOrigin(
+                label: "Local account",
+                home: canonicalCoordinatorHomePath("\(accountHome)/.codex/agent-coordinator")
+            )
+        ]
+    }
 }
 
 struct FileSystemCoordinatorOriginDiscovery: CoordinatorOriginDiscovering, Sendable {
@@ -2591,8 +2855,29 @@ struct FileSystemCoordinatorOriginDiscovery: CoordinatorOriginDiscovering, Senda
     }
 }
 
+enum BackupExecutionAuthority: String, Decodable, Sendable {
+    case direct
+    case broker
+}
+
+private struct BackupExecutionRoutePayload: Decodable, Sendable {
+    let executionAuthority: BackupExecutionAuthority
+
+    enum CodingKeys: String, CodingKey {
+        case executionAuthority = "execution_authority"
+    }
+}
+
 protocol BackupServing: Sendable {
-    func execute(origin: CoordinatorOrigin?, arguments: [String]) async throws -> CommandExecution
+    func executionAuthority(
+        origin: CoordinatorOrigin?,
+        projectRoot: String
+    ) async throws -> BackupExecutionAuthority
+    func execute(
+        origin: CoordinatorOrigin?,
+        projectRoot: String,
+        arguments: [String]
+    ) async throws -> CommandExecution
 }
 
 struct DiscoveredDatabase: Codable, Hashable, Sendable, Identifiable {
@@ -2673,16 +2958,74 @@ struct PythonCoordinatorService: CoordinatorServing, Sendable {
             )
         )
     }
+
+    func observe(origin: CoordinatorOrigin, maxAgeSeconds: Double) async throws -> CommandExecution? {
+        let requestProject = try await requestProjectRoot()
+        guard let requestProject else {
+            throw RuntimeError("Coordinator request-project provenance is unavailable")
+        }
+        return try await execute(
+            origin: origin,
+            arguments: [
+                "observe",
+                "--agent", NSUserName(),
+                "--project", requestProject,
+                "--max-age-seconds", String(max(0, maxAgeSeconds)),
+                "--compact-json",
+            ]
+        )
+    }
+
+
+    func requestProjectRoot() async throws -> String? {
+        let normalizedScript = URL(fileURLWithPath: scriptPath)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let scriptsDirectory = normalizedScript.deletingLastPathComponent()
+        let skillDirectory = scriptsDirectory.deletingLastPathComponent()
+        let skillsDirectory = skillDirectory.deletingLastPathComponent()
+        return skillsDirectory.deletingLastPathComponent().path
+    }
 }
 
 struct PythonBackupService: BackupServing, Sendable {
     let executor: any CommandExecuting
     let scriptPath: String
 
-    func execute(origin: CoordinatorOrigin?, arguments: [String]) async throws -> CommandExecution {
+    func executionAuthority(
+        origin: CoordinatorOrigin?,
+        projectRoot: String
+    ) async throws -> BackupExecutionAuthority {
+        let environment = origin.map { ["CODEX_AGENT_COORDINATOR_HOME": $0.home] } ?? [:]
+        let execution = try await executor.execute(
+            CommandRequest(
+                executable: "/usr/bin/env",
+                arguments: ["python3", scriptPath, "route"],
+                environment: environment,
+                currentDirectory: projectRoot
+            )
+        )
+        guard execution.exitStatus == 0 else {
+            throw RuntimeError(execution.stderr.isEmpty ? execution.stdout : execution.stderr)
+        }
+        return try JSONDecoder()
+            .decode(BackupExecutionRoutePayload.self, from: Data(execution.stdout.utf8))
+            .executionAuthority
+    }
+
+    func execute(
+        origin: CoordinatorOrigin?,
+        projectRoot: String,
+        arguments: [String]
+    ) async throws -> CommandExecution {
         let environment = origin.map { ["CODEX_AGENT_COORDINATOR_HOME": $0.home] } ?? [:]
         return try await executor.execute(
-            CommandRequest(executable: "/usr/bin/env", arguments: ["python3", scriptPath] + arguments, environment: environment)
+            CommandRequest(
+                executable: "/usr/bin/env",
+                arguments: ["python3", scriptPath] + arguments,
+                environment: environment,
+                currentDirectory: projectRoot
+            )
         )
     }
 }

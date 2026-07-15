@@ -27,6 +27,9 @@ RUNTIME_SCRIPTS = (
     Path("skills/codex-dev-coordinator/scripts/dev_coordinator.py"),
     Path("skills/postgres-docker-backup/scripts/postgres_docker_backup.py"),
 )
+RUNTIME_PACKAGE_DIRECTORIES = (
+    Path("skills/codex-dev-coordinator/scripts/devcoordinator"),
+)
 BUILD_PROVENANCE_SCHEMA = 1
 PACKAGED_PROVENANCE_SCHEMA = 4
 BUILD_PROVENANCE_DIRECTORY = Path(".build/devcoordinator-packaging")
@@ -121,12 +124,41 @@ def build_inputs_sha256(inputs: list[dict[str, str]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def runtime_source_paths() -> list[Path]:
+    """Return the complete production Python runtime copied into the app.
+
+    The coordinator entrypoint imports its normalized SQLite, observation,
+    lifecycle, and broker modules at runtime. Packaging only the historical
+    monolith would therefore produce a signed app that builds successfully but
+    cannot refresh inventory. Tests and bytecode caches are deliberately not
+    product runtime inputs.
+    """
+
+    paths = list(RUNTIME_SCRIPTS)
+    for relative_root in RUNTIME_PACKAGE_DIRECTORIES:
+        root = REPOSITORY_ROOT / relative_root
+        if not root.is_dir() or root.is_symlink():
+            raise PackagingError(f"runtime package is missing or unsafe: {relative_root}")
+        for candidate in sorted(root.rglob("*")):
+            if candidate.is_symlink():
+                raise PackagingError(
+                    f"runtime package contains a symlink: {candidate.relative_to(REPOSITORY_ROOT)}"
+                )
+            if not candidate.is_file() or candidate.suffix != ".py":
+                continue
+            package_relative = candidate.relative_to(root)
+            if "__pycache__" in package_relative.parts or "tests" in package_relative.parts[:-1]:
+                continue
+            paths.append(candidate.relative_to(REPOSITORY_ROOT))
+    return sorted(set(paths), key=lambda item: item.as_posix())
+
+
 def repository_input_paths(inputs: list[dict[str, str]]) -> list[Path]:
     """Return every tracked source path whose HEAD bytes must reproduce the app."""
 
     app_relative = APP_ROOT.relative_to(REPOSITORY_ROOT)
     paths = [app_relative / item["path"] for item in inputs]
-    paths.extend(RUNTIME_SCRIPTS)
+    paths.extend(runtime_source_paths())
     return sorted(set(paths), key=lambda item: item.as_posix())
 
 
@@ -351,14 +383,15 @@ def require_safe_output(output: Path) -> Path:
 
 def copy_runtime_scripts(resources: Path) -> list[dict[str, str]]:
     evidence: list[dict[str, str]] = []
-    for relative in RUNTIME_SCRIPTS:
+    executable_helpers = set(RUNTIME_SCRIPTS)
+    for relative in runtime_source_paths():
         source = REPOSITORY_ROOT / relative
         if not source.is_file() or source.is_symlink():
             raise PackagingError(f"runtime helper is missing or unsafe: {relative}")
         destination = resources / relative
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         shutil.copy2(source, destination, follow_symlinks=False)
-        destination.chmod(0o755)
+        destination.chmod(0o755 if relative in executable_helpers else 0o644)
         if sha256(source) != sha256(destination):
             raise PackagingError(f"runtime helper copy verification failed: {relative}")
         evidence.append({"path": relative.as_posix(), "sha256": sha256(destination)})
@@ -444,7 +477,10 @@ def verify_packaged_app(
         for item in provenance.get("runtime_helpers", [])
         if isinstance(item, dict)
     }
-    for relative in RUNTIME_SCRIPTS:
+    expected_runtime_paths = runtime_source_paths()
+    if set(recorded) != {relative.as_posix() for relative in expected_runtime_paths}:
+        raise PackagingError("runtime provenance does not name the complete normalized helper set")
+    for relative in expected_runtime_paths:
         source = REPOSITORY_ROOT / relative
         bundled = contents / "Resources" / relative
         if not bundled.is_file() or bundled.is_symlink():

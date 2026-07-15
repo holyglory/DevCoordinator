@@ -5,6 +5,8 @@
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 
+import { isDockerContainerRunningStatus } from './docker-status.mjs';
+
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const BASE_RESERVED = ['console', 'www', 'api', 'auth', 'static', 'healthz'];
 const KINDS = new Set(['port', 'server', 'docker']);
@@ -414,7 +416,7 @@ export function createRouteStore({ file, config, log }) {
     if (/\(paused\)/i.test(status)) {
       return { port: null, reason: 'container is paused', container };
     }
-    if (!/^\s*up\b/i.test(status)) {
+    if (!isDockerContainerRunningStatus(status)) {
       return { port: null, reason: 'container is not running', container };
     }
     const hostPort = publishedHostPort(parsePublishedPorts(found.ports), route.containerPort);

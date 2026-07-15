@@ -78,11 +78,13 @@ BOARD_SPEC = ArtifactSpec(
     ),
     anchors=(
         AnchorSpec("window-title", 0, 0, 325, 60, 500, 12, 2),
-        AnchorSpec("global-toolbar", 327, 0, 785, 60, 1_200, 30, 3),
+        AnchorSpec("toolbar-environment", 327, 0, 185, 60, 400, 7, 3),
+        AnchorSpec("toolbar-search", 512, 0, 235, 60, 600, 20, 2),
+        AnchorSpec("toolbar-sources-and-actions", 747, 0, 365, 60, 900, 25, 3),
         AnchorSpec("service-map-heading", 0, 60, 325, 45, 120, 5, 1),
         AnchorSpec("project-tree", 0, 95, 325, 200, 900, 10, 6),
         AnchorSpec("project-load-summary", 327, 60, 785, 80, 900, 20, 3),
-        AnchorSpec("filters-and-resource-tabs", 327, 125, 785, 90, 5_000, 30, 6),
+        AnchorSpec("filters-and-resource-tabs", 327, 125, 785, 90, 2_200, 40, 5),
         AnchorSpec("details-heading", 1125, 0, 315, 80, 300, 6, 2),
         AnchorSpec("sidebar-footer", 0, 920, 325, 104, 400, 10, 4),
         AnchorSpec("center-status-footer", 327, 970, 785, 54, 500, 20, 2),
@@ -100,7 +102,7 @@ DEV_SERVERS_SPEC = ArtifactSpec(
         for region in BOARD_SPEC.regions
     ),
     anchors=tuple(
-        AnchorSpec("filters-and-resource-tabs", 327, 220, 785, 90, 5_000, 30, 6)
+        AnchorSpec("filters-and-resource-tabs", 327, 220, 785, 90, 2_200, 40, 5)
         if anchor.name == "filters-and-resource-tabs"
         else anchor
         for anchor in BOARD_SPEC.anchors

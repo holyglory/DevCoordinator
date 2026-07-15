@@ -4,7 +4,7 @@
   "generator" : "apps\/DevOpsBoard\/Tools\/SnapshotMain.swift",
   "height" : 1024,
   "schema_version" : 1,
-  "sha256" : "723f271976ec8987b727657a7cbc4f6e8b021af34095ff3466d0e20c18a1c15d",
+  "sha256" : "af338af8e9e3086490e3aca04ef070194173dab820c5d756e81381c43c057679",
   "source" : "isolated-test-fixture",
   "source_files" : [
     "Package.swift",
@@ -16,6 +16,6 @@
     "Tools\/SnapshotMain.swift",
     "Tools\/SnapshotProvenance.swift"
   ],
-  "source_sha256" : "8cb75a62347a331e04678226de6968dabbb2dd942b534f56eed92e2a2fc82603",
+  "source_sha256" : "3bc25b093926edee265559b0b793d0081199ddeb6e63bddffdeebcddd4e4d179",
   "width" : 1440
 }

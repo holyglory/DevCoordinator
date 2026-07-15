@@ -197,8 +197,52 @@ def main() -> int:
         write(package_manifest, "// swift-tools-version: 6.0\n")
         write(source, "@main struct Main { static func main() {} }\n")
 
+        packager.APP_ROOT = app_root
+        packager.REPOSITORY_ROOT = repository
+
         for index, relative in enumerate(packager.RUNTIME_SCRIPTS):
             write(repository / relative, f"#!/usr/bin/env python3\n# helper {index}\n", executable=True)
+
+        runtime_package_root = repository / packager.RUNTIME_PACKAGE_DIRECTORIES[0]
+        runtime_module_sources = {
+            Path("__init__.py"): '"""Normalized coordinator runtime fixture."""\n',
+            Path("schema.py"): "SCHEMA_VERSION = 1\n",
+            Path("store.py"): "class SQLiteStore:\n    pass\n",
+            Path("observer.py"): "def observe():\n    return None\n",
+            Path("lifecycle/repository.py"): "def plan_remove():\n    return None\n",
+            Path("broker/server.py"): "def serve():\n    return None\n",
+        }
+        for relative, contents in runtime_module_sources.items():
+            write(runtime_package_root / relative, contents)
+
+        # These files deliberately resemble plausible development artefacts.
+        # They must never become signed runtime inputs or provenance records.
+        excluded_runtime_sources = (
+            runtime_package_root / "tests" / "test_store.py",
+            runtime_package_root / "lifecycle" / "tests" / "test_repository.py",
+            runtime_package_root / "__pycache__" / "generated_source.py",
+            runtime_package_root / "broker" / "__pycache__" / "generated_source.py",
+        )
+        for excluded in excluded_runtime_sources:
+            write(excluded, "raise AssertionError('development artefact was bundled')\n")
+        write(runtime_package_root / "README.md", "fixture documentation\n")
+
+        expected_runtime_paths = sorted(
+            {
+                *packager.RUNTIME_SCRIPTS,
+                *(
+                    packager.RUNTIME_PACKAGE_DIRECTORIES[0] / relative
+                    for relative in runtime_module_sources
+                ),
+            },
+            key=lambda item: item.as_posix(),
+        )
+        discovered_runtime_paths = packager.runtime_source_paths()
+        check(
+            discovered_runtime_paths == expected_runtime_paths,
+            "runtime discovery did not include every production module and only production modules: "
+            f"expected={expected_runtime_paths!r} actual={discovered_runtime_paths!r}",
+        )
 
         binary_dir = app_root / ".build" / "fake" / "debug"
         binary = binary_dir / packager.PRODUCT_NAME
@@ -250,8 +294,6 @@ def main() -> int:
             del args, kwargs
             raise AssertionError("packaging self-test must not launch any external process")
 
-        packager.APP_ROOT = app_root
-        packager.REPOSITORY_ROOT = repository
         packager.run = fake_run
         packager.subprocess.run = forbidden_subprocess
 
@@ -332,12 +374,83 @@ def main() -> int:
             "packaged provenance is missing per-input hashes",
         )
 
-        for relative in packager.RUNTIME_SCRIPTS:
+        for relative in expected_runtime_paths:
             canonical = repository / relative
             bundled = output / "Contents" / "Resources" / relative
             check(bundled.is_file() and not bundled.is_symlink(), f"bundled helper missing or linked: {relative}")
             check(digest(canonical) == digest(bundled), f"bundled helper drifted: {relative}")
-        check(len(provenance["runtime_helpers"]) == len(packager.RUNTIME_SCRIPTS), "runtime provenance is incomplete")
+        recorded_runtime_paths = [item["path"] for item in provenance["runtime_helpers"]]
+        check(
+            recorded_runtime_paths == [relative.as_posix() for relative in expected_runtime_paths],
+            "runtime provenance does not name the complete normalized module graph",
+        )
+        check(
+            len(provenance["runtime_helpers"]) == len(expected_runtime_paths),
+            "runtime provenance is incomplete",
+        )
+        for excluded in excluded_runtime_sources:
+            excluded_relative = excluded.relative_to(repository)
+            check(
+                excluded_relative.as_posix() not in recorded_runtime_paths,
+                f"development-only runtime source leaked into provenance: {excluded_relative}",
+            )
+            check(
+                not (output / "Contents" / "Resources" / excluded_relative).exists(),
+                f"development-only runtime source leaked into the app: {excluded_relative}",
+            )
+
+        # False-positive control: a complete untouched package must pass the
+        # same verifier used by final publication and launch preparation.
+        verified_complete = packager.verify_packaged_app(output, require_signature=False)
+        check(
+            [item["path"] for item in verified_complete["runtime_helpers"]]
+            == recorded_runtime_paths,
+            "valid normalized runtime package failed complete provenance verification",
+        )
+
+        representative_module = (
+            packager.RUNTIME_PACKAGE_DIRECTORIES[0] / "store.py"
+        )
+        bundled_module = output / "Contents" / "Resources" / representative_module
+        canonical_module = repository / representative_module
+        bundled_module.unlink()
+        expect_packaging_error(
+            lambda: packager.verify_packaged_app(output, require_signature=False),
+            "packaged-app verifier accepted a missing normalized runtime module",
+            contains="runtime helper is missing",
+        )
+        shutil.copy2(canonical_module, bundled_module, follow_symlinks=False)
+        bundled_module.chmod(0o644)
+
+        bundled_module.write_text("# tampered normalized store module\n", encoding="utf-8")
+        expect_packaging_error(
+            lambda: packager.verify_packaged_app(output, require_signature=False),
+            "packaged-app verifier accepted a tampered normalized runtime module",
+            contains="runtime helper does not match provenance",
+        )
+        shutil.copy2(canonical_module, bundled_module, follow_symlinks=False)
+        bundled_module.chmod(0o644)
+
+        incomplete_provenance = dict(provenance)
+        incomplete_provenance["runtime_helpers"] = [
+            item
+            for item in provenance["runtime_helpers"]
+            if item["path"] != representative_module.as_posix()
+        ]
+        provenance_path.write_text(
+            json.dumps(incomplete_provenance, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        expect_packaging_error(
+            lambda: packager.verify_packaged_app(output, require_signature=False),
+            "packaged-app verifier accepted provenance omitting a normalized runtime module",
+            contains="complete normalized helper set",
+        )
+        provenance_path.write_text(
+            json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        packager.verify_packaged_app(output, require_signature=False)
 
         # Real macOS codesign rewrites the Mach-O signature bytes. The signed
         # package must preserve the verified pre-sign build hash in provenance,

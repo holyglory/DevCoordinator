@@ -37,19 +37,29 @@ project, and destructive state reset retains attributed prior-state evidence.
 
 ## Shared State
 
-The bundled script stores leases and server metadata under:
+The bundled script stores one normalized private database and related evidence
+under:
 
 ```bash
 ~/.codex/agent-coordinator/
 ```
 
+`coordinator.sqlite3` in WAL mode is the product state store. It owns canonical
+repositories, definitions, observations, immutable Docker resources,
+membership/control bindings, leases, assignments, operations, lifecycle
+fences, removal/retirement records, telemetry, and import evidence. The legacy
+JSON implementation is available only through the explicitly named
+`legacy-json-test-only` backend for deterministic compatibility fixtures; do
+not configure it for product use.
+
 By default the coordinator resolves the effective POSIX account through
 `getpwuid(geteuid())` and stores state below that account home. It deliberately
 does not derive this default from `HOME`, `CFFIXED_USER_HOME`, or a desktop
 host's remapped user-domain root. Two Codex or Parall instances with one
-effective UID therefore converge on one coordinator home and one lock even
-when their runtime-home environment values differ. Run `inventory` in every
-runtime and compare its `coordinator_home` field when verifying the boundary.
+effective UID therefore converge on one database/WAL authority even when their
+runtime-home environment values differ. Run `inventory` in every runtime and
+compare `coordinator_home`, `state_path`, and `store.database_generation` when
+verifying the boundary.
 
 An explicit absolute override remains authoritative. Set the same override in
 every same-UID runtime only when an alternate coordination domain is required:
@@ -58,45 +68,130 @@ every same-UID runtime only when an alternate coordination domain is required:
 export CODEX_AGENT_COORDINATOR_HOME=/path/to/shared/codex-agent-coordinator
 ```
 
-Separate coordinator homes do not share a reservation lock. Two deliberately
-different overrides, different effective UIDs, or separate VMs can each lease
-the same currently free host port, so neither lease is evidence of host-wide
-uniqueness. Listener checks prevent many later collisions, but they cannot
-close a simultaneous pre-launch race between independent homes.
+Separate coordinator homes do not share a reservation authority. Two
+deliberately different overrides, different effective UIDs, or separate VMs can
+each record the same currently free host port, so neither private database is
+evidence of host-wide uniqueness. Listener checks prevent many later
+collisions, but they cannot close a simultaneous reservation race between
+independent authorities.
 
 Do not use one coordinator home across different effective OS users or VM
 security boundaries. The coordinator validates that every private directory is
-owned by its effective UID and has mode `0700`; it has no multi-user ACL,
-authentication, or ownership protocol. Different Linux users therefore keep
-separate homes and do not receive cross-user port uniqueness from the state
-lock. Use deliberately disjoint port ranges or an authorized system-level
-broker when accounts must run services on one host. Aggregate separate homes'
-read-only inventories through an explicitly source-aware tool when
-cross-boundary visibility is needed; keep mutations bound to their source.
+owned by its effective UID and has mode `0700`; database, WAL, shared-memory,
+token, log, backup, and rollback files remain private. Different Linux users
+keep separate account databases. When they must share host-global ports or
+Docker, use the installed peer-authenticated broker: its service-owned database
+and Unix socket authenticate the kernel peer UID and enforce explicit
+repository/resource ACLs. Never make one SQLite file cross-user writable.
 
-The script uses a lock file in that directory so concurrent agents cannot lease
-the same port. The lock protects short state snapshot, reservation, and commit
-phases; it is not held while starting or stopping processes, polling health,
-running Docker, inspecting listeners, scanning inventory/backups, or writing an
-HTTP response. The sole deliberate exception is `port relocate`'s bounded
-final positive-listener check inside its state transaction; that closes the
-race between proving the old listener stopped and moving durable ownership.
-Same-target lifecycle mutations are rejected while an operation
-is pending, while unrelated projects and leases continue independently. A
-pending project lifecycle also excludes direct server and Docker mutations for
-that canonical project. Only synchronous child work carrying the exact internal
-parent-operation capability may run inside it; callers cannot supply that
-capability through CLI or HTTP payloads.
+SQLite foreign keys and uniqueness constraints own the normalized invariants.
+Short `BEGIN IMMEDIATE` reservation/commit phases serialize conflicts while
+WAL permits concurrent reads. Slow process launch/termination, health checks,
+Docker, Git, backup scans, and filesystem observation run outside write
+transactions and commit only against their captured fingerprints. Product
+mutations use typed normalized services; the legacy JSON lock and callback
+projection are isolated to explicit compatibility-test fixtures and fail closed
+if selected by the default SQLite backend.
 
-The coordinator home is mode `0700`; state, lock, API-token, and log files are
-private. State writes use an exclusive temporary file, `fsync`, and atomic
-replacement. State schema v2 includes a monotonic revision and a bounded
-operation journal. Abandoned pre-launch reservations release their leases; a
-still-live process whose operation owner disappeared is retained as `orphaned`
-evidence rather than having its lease silently reassigned. Pending operations
-record a locked process-instance identity, so age alone never retires a verified
-live owner and a reused PID cannot impersonate the process that made the
-reservation.
+Same-target lifecycle mutations are rejected while an operation is active;
+unrelated repositories continue independently. A pending project lifecycle
+also excludes direct server and Docker mutations for that repository. Only
+synchronous child work carrying the exact internal parent-operation capability
+may run inside it; callers cannot supply that capability through CLI or HTTP.
+Abandoned reservations release safe unlaunched leases. A live process whose
+operation owner disappeared remains explicit orphan/reconciliation evidence,
+and a reused PID cannot impersonate the reserving process.
+
+`inventory` and authenticated inventory endpoints are pure snapshot reads.
+They do not inspect Docker/processes, scan backups, prune data, advance a
+revision, or write the database. `observe` performs the bounded host sampling
+transaction. Concurrent same-scope observations join one database-backed
+single-flight ticket; full-Docker, no-Docker, and different backup-directory
+scopes are distinct so a cheaper observation cannot masquerade as complete.
+
+The first normalized observation discovers eligible same-UID legacy homes as
+migration inputs, privately backs them up, and imports them transactionally.
+One canonical Git worktree root becomes one repository. Exact duplicates merge;
+cross-repository claims and other unsafe differences remain explicit conflicts
+or Unassigned Resources. Imported homes are no longer independently polled.
+Later legacy writes are detected and surfaced rather than silently winning.
+
+### Cross-user broker installation
+
+The broker is required only when different effective UIDs must arbitrate the
+same host-global ports or Docker engine. It is never auto-installed. A root
+operator must create a private service database directory, create a root-owned
+runtime directory with traversal for the configured access group, add each
+authorized client to that group, enroll every exact repository, and supervise
+the server process. Keep the database and runtime outside Git.
+
+```bash
+sudo python3 scripts/dev_coordinator.py broker enroll \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --socket /run/devcoordinator/broker.sock \
+  --access-gid NUMERIC_DEVCOORDINATOR_GID \
+  --client-uid NUMERIC_CLIENT_UID \
+  --account-id EXACT_CLIENT_ACCOUNT_ID \
+  --project /absolute/path/to/repository \
+  --agent "$USER" \
+  --port-range 3000-3999
+
+sudo python3 scripts/dev_coordinator.py broker serve \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --socket /run/devcoordinator/broker.sock \
+  --access-gid NUMERIC_DEVCOORDINATOR_GID
+```
+
+Enrollment performs a fresh full-Docker observation, grants only exact opaque
+normalized IDs, writes the protected system client profile, and starts no
+resource. The operator's service manager owns restart and boot policy. Once a
+valid repository profile is installed, a missing, stale, inaccessible, or
+failing broker is a hard stop; never bypass it with local Docker or a private
+account-store mutation. Reenroll to renew the profile or to grant newly
+observed resources. Use `--explicit-reinstall` only when the operator intends
+to clear that repository's durable disabled fence; reenrollment still does not
+start it.
+
+### Normalized store backup, restore, and corrupt recovery
+
+Back up either an account or service authority to a private absolute directory
+outside Git:
+
+```bash
+python3 scripts/dev_coordinator.py broker store-backup \
+  --database /absolute/path/to/coordinator.sqlite3 \
+  --store-role account \
+  --output-root /private/backup/root
+
+python3 scripts/dev_coordinator.py broker store-export \
+  --database /absolute/path/to/coordinator.sqlite3 \
+  --store-role account \
+  --output-root /private/backup/root
+```
+
+For a readable current store, `store-restore` (verified binary, same database
+generation) and `store-import` (verified logical export) first take a verified
+safety backup and require `--manifest`, `--safety-root`, and `--confirm`. They
+fail closed on corruption. A logical export is not corruption recovery.
+
+If the store is unreadable, stop every service/client using it before invoking
+the separate offline path:
+
+```bash
+python3 scripts/dev_coordinator.py broker store-recover \
+  --database /absolute/path/to/coordinator.sqlite3 \
+  --store-role account \
+  --manifest /private/backup/root/VERIFIED_BINARY_MANIFEST.json \
+  --forensic-root /private/forensic/root \
+  --confirm-corrupt-recovery
+```
+
+Recovery accepts only a strongly verified binary backup for the same store
+role. It cannot infer a generation from corrupt bytes, so it first captures
+the exact database/WAL/shared-memory files and checksums, retains that forensic
+evidence, verifies the replacement, and rolls back exact bytes on publication
+failure. The command does not stop or supervise the service; the operator owns
+that quiescent boundary.
 
 ## Quick Start
 
@@ -104,6 +199,11 @@ Resolve the script path relative to this skill directory:
 
 ```bash
 PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 scripts/dev_coordinator.py inventory --project "$PROJECT_ROOT"
+python3 scripts/dev_coordinator.py observe \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --max-age-seconds 30
 python3 scripts/dev_coordinator.py inventory --project "$PROJECT_ROOT"
 ```
 
@@ -123,6 +223,58 @@ python3 scripts/dev_coordinator.py project restart --agent "$USER" --project "$P
 python3 scripts/dev_coordinator.py project stop --agent "$USER" --project "$PROJECT_ROOT"
 ```
 
+## Remove, Reinstall, Attach, Or Retire
+
+Do not hide a repository with a Board preference or delete its state rows.
+Repository removal is a two-step, fingerprint-bound decommission:
+
+```bash
+python3 scripts/dev_coordinator.py repository plan-remove \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --reason "No longer used on this machine"
+
+python3 scripts/dev_coordinator.py repository remove \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --plan-id EXACT_PLAN_ID \
+  --plan-fingerprint EXACT_PLAN_FINGERPRINT
+```
+
+Planning forces a current full-Docker observation. Every container target must
+have an observable immutable identity, one authoritative controller, an
+available engine, and exactly one current Docker restart policy. Apply writes a
+durable start fence before host work, captures and disables the exact automatic
+start state, stops and verifies every target, deactivates leases/assignments,
+and hides only after complete success. Any drift or partial failure retains the
+fence and per-target evidence for idempotent continuation. Files, containers,
+volumes, databases, backups, and history are never deleted by this journey.
+
+Inspect retained removal records or explicitly reinstall:
+
+```bash
+python3 scripts/dev_coordinator.py repository list-removed
+python3 scripts/dev_coordinator.py repository reinstall \
+  --agent "$USER" \
+  --project "$PROJECT_ROOT" \
+  --reason "Needed again" \
+  --explicit
+```
+
+Reinstall only clears the repository fence. It never starts retained resources.
+The first later explicit Start restores only the exact pre-disable policy state
+captured by removal; missing or changed capture fails closed.
+
+Unassigned Resources are physical evidence without one proved repository
+membership. Never infer ownership from a name. Use inventory's
+`host_resource_id`, `immutable_fingerprint`, `control_binding_id`, and
+`ownership_fingerprint` with `resource attach` after the operator chooses a
+validated repository. If the resource is intentionally standalone, use
+`resource plan-retire`, review the exact plan, and pass its identifier and
+fingerprint to `resource retire`. Standalone retirement applies the same fresh
+observation, policy-disable, exact-stop, verification, retained-data, and fence
+rules as repository removal.
+
 For a single managed process inside a project, start a server and let the
 coordinator lease the port, keep the PID, store logs, and health-check it:
 
@@ -141,9 +293,10 @@ python3 scripts/dev_coordinator.py server start \
 
 The first successful `server start` or `server register` for a
 `(canonical project, server name)` identity durably pins that port to the
-server. The pin lives in `state.json` under `port_assignments`, survives
-server stops, lease expiry, and stopped-record pruning, and is removed only by
-an explicit unassign (or `state reset`). Consequences agents can rely on:
+server. The normalized `port_assignments` row survives server stops, lease
+expiry, and stopped-observation pruning, and is removed only by an explicit
+unassign, repository decommission, or destructive state reset. Consequences
+agents can rely on:
 
 - Restarting a server — even weeks later, after its stopped record was pruned —
   lands on the same port, so tests and tooling can hard-code where a repo's
@@ -171,14 +324,16 @@ python3 scripts/dev_coordinator.py port unassign --agent "$USER" --project "$PRO
 
 `port unassign --port N --force` removes another project's pin (for example an
 orphan left by a moved or renamed repo); without `--force` foreign pins are
-protected. Pre-assignment state files are migrated automatically: every
-existing server record seeds a pin for its recorded port, and when two records
-contest one port the most recently stopped record wins.
+protected. Legacy assignments are imported automatically. Exact duplicates
+collapse; two repositories or two materially different definitions contesting
+one port create an explicit blocking migration conflict. The importer never
+picks a winner from timestamps or source order.
 
 For an operator-approved checkout ownership migration, do not unassign and
 race to re-create the pin. Capture the exact active lease ID from inventory,
-stop and verify the old listener, privately back up `state.json`, then transfer
-the assignment and reusable stopped server identity in one locked operation:
+stop and verify the old listener, privately back up the SQLite database and
+its verified control-state manifest, then transfer the assignment and reusable
+stopped server identity in one transaction:
 
 ```bash
 python3 scripts/dev_coordinator.py port relocate \
@@ -485,11 +640,13 @@ The shared inventory includes stopped containers (`docker ps --all`) so agents
 can see containers that are available to start instead of accidentally creating
 duplicates.
 
-Inventory also includes real telemetry for running containers when Docker is
-available. The coordinator samples `docker stats --no-stream`, stores a bounded
-rolling `stats_history` per container, and exposes current CPU, memory, network
-I/O, and block I/O values plus per-second network/block rates. Stopped
-containers remain visible but do not receive live stats.
+After an explicit full-Docker `observe`, inventory includes the committed real
+telemetry for running containers. The observer samples `docker stats
+--no-stream` once per coalesced host scope, stores a bounded rolling
+`stats_history` per immutable container, and exposes current CPU, memory,
+network I/O, and block I/O values plus per-second network/block rates. Pure
+inventory reads never resample Docker. Stopped containers remain visible but
+do not receive live stats.
 
 Machine consumers can reduce inventory transport cost without changing the
 persisted telemetry window. `--compact-json` emits the same inventory as one
@@ -502,9 +659,9 @@ python3 scripts/dev_coordinator.py inventory --compact-json --stats-history-limi
 
 Both controls are opt-in. Ordinary CLI and HTTP inventory responses retain the
 full bounded 120-sample history, and ordinary CLI JSON stays pretty-printed.
-Use a limit of `0` when only the current `stats` sample is needed; this shapes
-the response only and never deletes the coordinator's persisted rolling
-history. Values outside `0..120` are rejected.
+Use a limit of `0` when only the last committed `stats` sample is needed; this
+shapes the response only and never deletes persisted history. Values outside
+`0..120` are rejected.
 
 ## Project Runtime Declarations
 
@@ -574,7 +731,9 @@ reporting success.
 
 1. Set `PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`, then
    run `inventory --project "$PROJECT_ROOT"` before starting, stopping, or replacing any
-   local service.
+   local service. If the snapshot is absent or stale for the task, run one
+   explicit `observe --agent "$USER" --project "$PROJECT_ROOT"` and read
+   inventory again. Do not treat inventory itself as a refresh mutation.
 2. For "run/start/restart/check the dev server", call `project status` or
    `project start` with the canonical repo path. Do not manually run package
    manager dev commands, Docker, database, worker, and web commands unless the
@@ -640,31 +799,24 @@ reporting success.
   changing a lease, acting on Docker, or writing sidecar metadata. Run the
   mutation through a capability-matched coordinator surface; do not retry it
   from an incapable CLI or infer that the port is safe to replace.
-- Stopped-server records are retained for evidence but pruned once they pass the
-  retention window or exceed the per-home cap, so the shared state file does not
-  grow without bound across months of start/stop cycles.
-- Pruning never touches durable port assignments: a server whose stopped record
-  aged out still owns its pinned port and restarts on it.
-- A corrupt state file (for example a partial write after a crash) is backed up
-  to `state.json.corrupt-<epoch>` and replaced with a fresh default state, so
-  read-only commands like `inventory` recover instead of failing. Because a
-  corrupt file cannot supply trustworthy records, recovery clears durable port
-  assignments; each server pins its port again on its next successful start or
-  registration.
-- Managed server and project start, stop, and restart plus direct Docker
-  lifecycle calls reserve and commit state in short locked phases. Process
-  spawn, health polling, termination, Docker execution/inspection, project
-  discovery, inventory collection, server registration, and Docker statistics
-  happen outside the cross-agent lock, so an unrelated lease is not blocked by
-  a slow service operation. Project mutations retain bounded operation-journal
-  evidence with the committed result summary.
-- Read-only health/inventory routes use a consistent state snapshot and commit
-  observations optimistically. Each observation reserves a monotonic per-server
-  ticket; only the newest ticket with the same lifecycle fingerprint may
-  commit. A slow older check or a health result measured before a stop/restart
-  can be returned for its own request, but cannot overwrite the newer server
-  record. Docker statistics histories merge by sample identity instead of
-  replacing concurrent samples.
+- Stopped observations and high-frequency telemetry are retained under bounded
+  policies. Pruning never deletes the normalized server definition, durable
+  assignment, removal record, operation evidence, or current ownership
+  boundary merely because a status sample aged out.
+- SQLite/database validation failures fail closed; the coordinator never
+  replaces damaged normalized control state with an invented empty database.
+  Preserve the database, WAL, and shared-memory files together for diagnosis
+  and restore only from verified coordinator backup/export evidence.
+- Managed server/project and Docker lifecycle calls reserve and commit in
+  short transactions. Process spawn, health polling, termination, Docker
+  execution/inspection, project discovery, and host sampling happen outside
+  the SQLite writer transaction, so an unrelated lease is not blocked by slow
+  host work. Captured generations and immutable fingerprints prevent the slow
+  result from overwriting a newer lifecycle decision.
+- `inventory` is read-only. `observe` owns server/process/Docker/database
+  observation commits and their monotonic observation revision. An older or
+  narrower in-flight sample cannot overwrite or satisfy a newer/different
+  scope; Docker telemetry merges by sample identity and remains bounded.
 - Repository roots, branches, and short commits are read from local `.git`
   metadata; state-critical paths do not invoke the Git executable or a Git
   credential/network helper while holding the coordinator lock.

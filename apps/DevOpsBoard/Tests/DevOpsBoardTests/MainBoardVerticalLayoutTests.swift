@@ -58,6 +58,36 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         )
     }
 
+    func testFullThreePaneMinimumWindowKeepsTheMiddlePaneEdgesAndPrimaryContentVisible() throws {
+        let fixture = try makeDenseMinimumWindowFixture()
+        let raster = try renderOpsConsole(
+            store: fixture.store,
+            width: 1_180,
+            height: minimumWindowHeight
+        )
+        let layout = consoleLayout(
+            totalWidth: 1_180,
+            sidebarPreference: defaultSidebarWidth,
+            inspectorPreference: minimumInspectorWidth
+        )
+        XCTAssertEqual(layout.mainWidth, CGFloat(mainPaneWidth), accuracy: 0.001)
+        let mainStart = Int(layout.sidebarWidth + splitHandleWidth)
+        let middlePane = raster.cropped(
+            xRange: mainStart..<(mainStart + Int(layout.mainWidth))
+        )
+        try captureRasterIfRequested(raster, name: "ops-console-dense-1180x760")
+        let assessment = MainBoardEdgeDetector.assess(middlePane)
+
+        XCTAssertTrue(
+            assessment.hasBothFixedEdges,
+            "the full split shell cropped the middle pane: toolbar=\(assessment.toolbar), status=\(assessment.status)"
+        )
+        XCTAssertTrue(
+            assessment.bodyHasVisibleContent,
+            "the full split shell hid the middle pane's primary inventory content: \(assessment.body)"
+        )
+    }
+
     func testDenseNormalDesktopKeepsFixedEdgesAndUsableBodyInBounds() throws {
         let fixture = try makeDenseMinimumWindowFixture()
         let raster = try renderMainBoard(
@@ -405,6 +435,27 @@ private func renderMainBoard(store: OpsStore, width: Int, height: Int) throws ->
         .frame(width: CGFloat(width), height: CGFloat(height))
         .background(Theme.background)
         .preferredColorScheme(.dark)
+    return try renderRaster(view, width: width, height: height)
+}
+
+@MainActor
+private func renderOpsConsole(store: OpsStore, width: Int, height: Int) throws -> BoardRaster {
+    try renderRaster(
+        OpsConsoleView(store: store)
+            .frame(width: CGFloat(width), height: CGFloat(height), alignment: .topLeading)
+            .background(Theme.background)
+            .preferredColorScheme(.dark),
+        width: width,
+        height: height
+    )
+}
+
+@MainActor
+private func renderRaster<Content: View>(
+    _ view: Content,
+    width: Int,
+    height: Int
+) throws -> BoardRaster {
     let hostingView = NSHostingView(rootView: view)
     hostingView.frame = NSRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
     hostingView.layoutSubtreeIfNeeded()
@@ -588,6 +639,28 @@ private struct BoardRaster {
         guard distance < height else { return output }
         for destinationY in 0..<(height - distance) {
             output.copyRow(from: self, sourceY: destinationY + distance, destinationY: destinationY)
+        }
+        return output
+    }
+
+    func cropped(xRange: Range<Int>) -> BoardRaster {
+        let lower = min(max(0, xRange.lowerBound), width)
+        let upper = min(max(lower, xRange.upperBound), width)
+        let outputWidth = upper - lower
+        var output = BoardRaster(
+            width: outputWidth,
+            height: height,
+            pixels: [UInt8](repeating: 0, count: outputWidth * height * 4)
+        )
+        guard outputWidth > 0 else { return output }
+        for y in 0..<height {
+            let sourceStart = ((y * width) + lower) * 4
+            let destinationStart = y * outputWidth * 4
+            let count = outputWidth * 4
+            output.pixels.replaceSubrange(
+                destinationStart..<(destinationStart + count),
+                with: pixels[sourceStart..<(sourceStart + count)]
+            )
         }
         return output
     }

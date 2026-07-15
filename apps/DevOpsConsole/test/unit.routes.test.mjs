@@ -448,6 +448,16 @@ test('resolve: kind=docker running / stopped / unpublished / missing / docker do
     container: { name: 'web-1', status: 'Up 5 minutes (healthy)' },
   });
 
+  // Normalized SQLite inventory uses lifecycle vocabulary rather than the
+  // human-formatted `docker ps` Status column. It is the same running state.
+  const normalizedRunning = dockerCoordinator([
+    { name: 'web-1', status: 'running', ports: '0.0.0.0:32772->3000/tcp' },
+  ]);
+  assert.deepEqual(await store.resolve('dweb', normalizedRunning), {
+    port: 32772,
+    container: { name: 'web-1', status: 'running' },
+  });
+
   // Stopped container: no port, actionable reason.
   const down = dockerCoordinator([{ name: 'web-1', status: 'Exited (0) 2 hours ago', ports: '' }]);
   const stopped = await store.resolve('dweb', down);

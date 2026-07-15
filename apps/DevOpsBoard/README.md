@@ -1,10 +1,18 @@
 # DevOps Board
 
-DevOps Board is a native macOS SwiftUI board for truthful local inventory
-and actions across coordinator homes, managed dev servers, Docker containers,
-port leases, and PostgreSQL protection. The confirmed product and journey
-contract is in `PRODUCT.md`; committed visual fixtures and their provenance are
-documented in `design-qa.md`.
+DevOps Board is a native macOS SwiftUI board for truthful local inventory and
+actions from one normalized account authority: canonical Git worktrees,
+managed dev servers, Docker containers, port leases, and PostgreSQL protection.
+The confirmed product and journey contract is in `PRODUCT.md`; committed visual
+fixtures and their provenance are documented in `design-qa.md`.
+
+The production store decodes only the coordinator's schema-v2 repository and
+resource graph. One canonical worktree is one project regardless of imported
+source provenance. Legacy homes are migration evidence rather than Board data
+sources, name-only evidence stays in one Unassigned Resources group, and every
+mutation uses an exact normalized control binding. A refresh performs one
+coalesced observation and then reads its committed snapshot; cached content
+remains visible during later scheduled observations.
 
 ## Agent workflow
 
@@ -16,9 +24,10 @@ native validation path remains explicitly pending. The commands below are
 developer references, not authorization for an agent to bypass the plugin.
 
 The user-approved Board and menu-bar redesign is implemented in the current
-source. Native compilation, XCTest, rendering, accessibility inspection,
-packaging, and launch acceptance remain pending until the Build macOS Apps
-workflow is available; static or non-native checks do not establish those
+source. Release acceptance still requires the Build macOS Apps workflow to run
+native compilation, XCTest, canonical rendering, accessibility/layout checks,
+packaging, provenance verification, and packaged launch against the exact
+commit being delivered; static or non-native checks never substitute for those
 results.
 
 ## Snapshot evidence

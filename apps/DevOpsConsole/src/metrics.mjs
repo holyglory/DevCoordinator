@@ -6,18 +6,20 @@
 // and an entity's points age out after the retention window.
 
 import { createHostProbe } from './host.mjs';
+import { isDockerContainerRunningStatus } from './docker-status.mjs';
 
 export const METRICS_MAX_POINTS = 720; // ring capacity per entity
 
 const MIN_INTERVAL_MS = 2000;
 
 function num(value) {
+  if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
 
 function isContainerRunning(container) {
-  return /^\s*up\b/i.test(String(container?.status ?? ''));
+  return isDockerContainerRunningStatus(container?.status);
 }
 
 export function createMetricsStore({ config, log, coordinator, host, maxPoints = METRICS_MAX_POINTS } = {}) {
@@ -116,12 +118,15 @@ export function createMetricsStore({ config, log, coordinator, host, maxPoints =
       // can collide (two repos named "app") and would merge their histories.
       const key = row?.usage_key ?? row?.project_key ?? row?.project ?? row?.name;
       if (!key) continue;
+      const cpu = num(row.cpu_percent);
+      const mem = num(row.memory_bytes);
+      if (cpu === null && mem === null) continue;
       record(
         `proj:${key}`,
         { kind: 'project', id: null, name: row.name ?? null, project: row.project ?? null },
         t,
-        num(row.cpu_percent) ?? 0,
-        num(row.memory_bytes) ?? 0,
+        cpu ?? 0,
+        mem ?? 0,
         dedupe,
       );
     }

@@ -18,6 +18,7 @@ from linux_proc_identity import ProcIdentityError, read_stable_process_identity
 from secure_cutover_io import SecureIOError, read_private_regular
 from verify_post_cutover_registration import (
     RegistrationGraphError,
+    current_registration_inventory_view,
     verify_current_registration_graph,
 )
 
@@ -54,6 +55,11 @@ def classify_registration_snapshot(
     main_pid: int,
 ) -> tuple[str, dict[str, Any]]:
     """Return ``ready`` or an exact retryable baseline; reject everything else."""
+
+    try:
+        inventory = current_registration_inventory_view(inventory)
+    except RegistrationGraphError as error:
+        raise ConsoleRegistrationError(str(error)) from error
 
     try:
         report = verify_current_registration_graph(
@@ -360,10 +366,14 @@ def inventory_probe(
         raise ConsoleRegistrationError(f"authenticated no-Docker inventory JSON is invalid: {error}") from error
     if not isinstance(value, dict):
         raise ConsoleRegistrationError("authenticated no-Docker inventory root is not an object")
-    docker = value.get("docker")
+    try:
+        projected = current_registration_inventory_view(value)
+    except RegistrationGraphError as error:
+        raise ConsoleRegistrationError(str(error)) from error
+    docker = projected.get("docker")
     if docker != {"available": None, "containers": [], "postgres": []}:
         raise ConsoleRegistrationError("inventory endpoint did not prove the no-Docker contract")
-    return value
+    return projected
 
 
 def _require_unit(state: dict[str, Any], *, main_pid: int, cgroup: str | None = None) -> str:

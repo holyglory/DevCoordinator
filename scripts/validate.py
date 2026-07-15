@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -19,10 +21,223 @@ SKILLS = [
     ROOT / "skills" / "postgres-docker-backup",
 ]
 
+DECISION_ENTRY_HEADER = re.compile(r"^## (DC-[A-Z0-9-]+) — ([^\n]+)$", re.MULTILINE)
+DECISION_METADATA = re.compile(
+    r"^ID: (DC-[A-Z0-9-]+) · Details: "
+    r"\[supporting record\]\(DecisionDetails/(DC-[A-Z0-9-]+)\.md\)$"
+)
+DECISION_INDEX_BOILERPLATE = (
+    "the selected contract replaces the earlier behavior documented in the linked record",
+    "that record retains the concrete failure",
+)
 
-def run(args: list[str], *, cwd: Path = ROOT) -> None:
+
+def duplicate_literal_dict_key_errors(source: str, *, label: str) -> list[str]:
+    """Find duplicate literal keys that Python would silently overwrite."""
+
+    errors: list[str] = []
+    for node in ast.walk(ast.parse(source, filename=label)):
+        if not isinstance(node, ast.Dict):
+            continue
+        seen: dict[tuple[type[object], object], int] = {}
+        for key in node.keys:
+            if not isinstance(key, ast.Constant):
+                continue
+            value = key.value
+            try:
+                hash(value)
+            except TypeError:
+                continue
+            identity = (type(value), value)
+            prior = seen.get(identity)
+            if prior is not None:
+                errors.append(
+                    f"{label}:{key.lineno}: duplicate literal dictionary key "
+                    f"{value!r} (first declared at line {prior})"
+                )
+            else:
+                seen[identity] = int(key.lineno)
+    return errors
+
+
+def check_duplicate_literal_dict_keys() -> None:
+    good = "value = {'starts_resources': False, dynamic: 1, other: 2}\n"
+    bad = "value = {'starts_resources': False, 'starts_resources': False}\n"
+    if duplicate_literal_dict_key_errors(good, label="good.py"):
+        raise SystemExit("duplicate-dict-key detector rejected its false-positive control")
+    if not duplicate_literal_dict_key_errors(bad, label="bad.py"):
+        raise SystemExit("duplicate-dict-key detector missed a realistic overwritten key")
+    errors: list[str] = []
+    for path in sorted(ROOT.rglob("*.py")):
+        if ".git" in path.parts or "__pycache__" in path.parts:
+            continue
+        errors.extend(
+            duplicate_literal_dict_key_errors(
+                path.read_text(encoding="utf-8"),
+                label=str(path.relative_to(ROOT)),
+            )
+        )
+    if errors:
+        raise SystemExit("duplicate literal dictionary keys:\n" + "\n".join(errors))
+
+
+def decision_history_contract_errors(history: str, detail_names: set[str]) -> list[str]:
+    """Return dense-index contract violations without reading implementation evidence.
+
+    DecisionHistory is intentionally small enough for routine context. Detailed
+    evidence belongs in one matching DecisionDetails file, so the index format
+    is deliberately strict and mechanically checkable.
+    """
+
+    errors: list[str] = []
+    if history.count("# Decision History") != 1:
+        errors.append("history must contain exactly one top-level Decision History heading")
+    if history.count("## Direction") != 1:
+        errors.append("history must contain exactly one Direction synthesis")
+
+    matches = list(DECISION_ENTRY_HEADER.finditer(history))
+    if not matches:
+        errors.append("history must contain at least one stable decision entry")
+        return errors
+
+    direction_offset = history.find("## Direction")
+    direction_cited_ids: set[str] = set()
+    if direction_offset < 0 or direction_offset > matches[0].start():
+        errors.append("Direction must precede every decision entry")
+    else:
+        direction = history[direction_offset + len("## Direction") : matches[0].start()].strip()
+        if not direction:
+            errors.append("Direction synthesis must not be empty")
+        if "Confirmed" not in direction:
+            errors.append("Direction must distinguish confirmed user intent")
+        direction_cited_ids = set(
+            re.findall(r"DecisionDetails/(DC-[A-Z0-9-]+)\.md", direction)
+        )
+        if not direction_cited_ids:
+            errors.append("Direction must cite supporting decision IDs")
+
+    indexed_ids: list[str] = []
+    for index, match in enumerate(matches):
+        decision_id = match.group(1)
+        indexed_ids.append(decision_id)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(history)
+        block = history[match.start() : end].strip()
+        lines = block.splitlines()
+        nonblank = [line for line in lines if line.strip()]
+        if len(nonblank) != 4:
+            errors.append(
+                f"{decision_id} must contain only its heading, metadata, Decision, and Why"
+            )
+            continue
+
+        metadata_match = DECISION_METADATA.fullmatch(nonblank[1])
+        if metadata_match is None:
+            errors.append(f"{decision_id} metadata/link does not match the stable ID")
+        elif metadata_match.group(1) != decision_id or metadata_match.group(2) != decision_id:
+            errors.append(f"{decision_id} metadata/link points at another decision")
+
+        decision_line, why_line = nonblank[2], nonblank[3]
+        if not decision_line.startswith("Decision: ") or len(decision_line) <= len("Decision: "):
+            errors.append(f"{decision_id} must have one non-empty Decision line")
+        if not why_line.startswith("Why: ") or len(why_line) <= len("Why: "):
+            errors.append(f"{decision_id} must have one non-empty Why line")
+        for label, line in (("Decision", decision_line), ("Why", why_line)):
+            lowered = line.lower()
+            if "…" in line or "..." in line:
+                errors.append(f"{decision_id} {label} is truncated with an ellipsis")
+            if f"{label.lower()}: {label.lower()}:" in lowered:
+                errors.append(f"{decision_id} repeats its {label} label")
+            if any(boilerplate in lowered for boilerplate in DECISION_INDEX_BOILERPLATE):
+                errors.append(f"{decision_id} uses generic detail-file boilerplate")
+            if len(line) > 1_000:
+                errors.append(f"{decision_id} {label} is not a concise index summary")
+
+    duplicate_ids = sorted({item for item in indexed_ids if indexed_ids.count(item) > 1})
+    if duplicate_ids:
+        errors.append("duplicate decision IDs: " + ", ".join(duplicate_ids))
+
+    indexed = set(indexed_ids)
+    unknown_direction_citations = sorted(direction_cited_ids - indexed)
+    if unknown_direction_citations:
+        errors.append(
+            "Direction cites unknown decision IDs: "
+            + ", ".join(unknown_direction_citations)
+        )
+    missing_details = sorted(indexed - detail_names)
+    unindexed_details = sorted(detail_names - indexed)
+    if missing_details:
+        errors.append("decision entries without detail files: " + ", ".join(missing_details))
+    if unindexed_details:
+        errors.append("detail files without decision entries: " + ", ".join(unindexed_details))
+    return errors
+
+
+def check_decision_history_contract() -> None:
+    """Prove the index detector's recall/precision, then validate real records."""
+
+    good = """# Decision History
+
+## Direction
+
+Confirmed user intent keeps one authority; see [DC-TEST-01](DecisionDetails/DC-TEST-01.md).
+
+## DC-TEST-01 — One authority
+
+ID: DC-TEST-01 · Details: [supporting record](DecisionDetails/DC-TEST-01.md)
+
+Decision: Keep one canonical authority.
+
+Why: Separate writable stores can disagree; one authority preserves identity.
+"""
+    good_details = {"DC-TEST-01"}
+    if decision_history_contract_errors(good, good_details):
+        raise SystemExit("DecisionHistory false-positive control is invalid")
+
+    must_catch = {
+        "missing Why": good.replace(
+            "\nWhy: Separate writable stores can disagree; one authority preserves identity.\n",
+            "\n",
+        ),
+        "wrong detail link": good.replace("DecisionDetails/DC-TEST-01.md", "DecisionDetails/DC-WRONG.md", 1),
+        "extra evidence in index": good.replace(
+            "\nWhy: Separate writable stores can disagree; one authority preserves identity.\n",
+            "\nWhy: Separate writable stores can disagree; one authority preserves identity.\n\nEvidence: log\n",
+        ),
+        "truncated summary": good.replace("canonical authority.", "canonical authority…"),
+        "generic boilerplate": good.replace(
+            "Keep one canonical authority.",
+            "The selected contract replaces the earlier behavior documented in the linked record.",
+        ),
+        "repeated label": good.replace(
+            "Decision: Keep one canonical authority.",
+            "Decision: Decision: Keep one canonical authority.",
+        ),
+    }
+    for label, broken in must_catch.items():
+        if not decision_history_contract_errors(broken, good_details):
+            raise SystemExit(f"DecisionHistory detector missed must-catch fixture: {label}")
+    if not decision_history_contract_errors(good, {"DC-TEST-01", "DC-ORPHAN"}):
+        raise SystemExit("DecisionHistory detector missed an unindexed detail file")
+
+    history_path = ROOT / "DecisionHistory.md"
+    detail_dir = ROOT / "DecisionDetails"
+    detail_names = {path.stem for path in detail_dir.glob("DC-*.md") if path.is_file()}
+    errors = decision_history_contract_errors(
+        history_path.read_text(encoding="utf-8"),
+        detail_names,
+    )
+    if errors:
+        raise SystemExit("DecisionHistory contract failed:\n- " + "\n- ".join(errors))
+
+
+def run(
+    args: list[str],
+    *,
+    cwd: Path = ROOT,
+    env: dict[str, str] | None = None,
+) -> None:
     print("+", " ".join(args))
-    subprocess.run(args, cwd=cwd, check=True)
+    subprocess.run(args, cwd=cwd, env=env, check=True)
 
 
 def source_region(source: str, start: str, end: str) -> str:
@@ -220,6 +435,16 @@ def check_devops_board_center_pane_geometry(
     ops_console = source_region(views, "struct OpsConsoleView: View", "struct SplitHandle: View")
     main_board = source_region(views, "struct MainBoardView: View", "struct ProjectUsageStrip: View")
 
+    if "HStack(alignment: .top, spacing: 0)" not in ops_console:
+        raise SystemExit(
+            "DevOpsBoard split shell must lay out panes consecutively from the top; "
+            "the absolute-positioned clipped ZStack can crop only the middle pane"
+        )
+    if ".position(" in ops_console:
+        raise SystemExit(
+            "DevOpsBoard split shell must not absolutely position pane contents inside its clipped frame"
+        )
+
     exact_pane_frame = re.search(
         r"MainBoardView\(store: store\)\s*"
         r"\.frame\(\s*"
@@ -279,6 +504,26 @@ def check_devops_board_center_pane_geometry(
             + ", ".join(missing_fixed_chrome)
         )
 
+    full_shell_test_contract = {
+        "full three-pane production render": (
+            "testFullThreePaneMinimumWindowKeepsTheMiddlePaneEdgesAndPrimaryContentVisible"
+        ),
+        "real split shell renderer": "renderOpsConsole(",
+        "middle-pane extraction": "raster.cropped(",
+        "fixed-edge assertion": "assessment.hasBothFixedEdges",
+        "primary-content assertion": "assessment.bodyHasVisibleContent",
+    }
+    missing_full_shell_checks = [
+        label
+        for label, needle in full_shell_test_contract.items()
+        if needle not in vertical_layout_tests
+    ]
+    if missing_full_shell_checks:
+        raise SystemExit(
+            "DevOpsBoard crop detector must exercise the real three-pane shell, not only MainBoardView: "
+            + ", ".join(missing_full_shell_checks)
+        )
+
     vertical_xctest_contract = {
         "native SwiftUI/AppKit raster test": "NSHostingView(rootView: view)",
         "minimum 760-point window": "private let minimumWindowHeight = 760",
@@ -328,8 +573,137 @@ def check_standalone_skill(skill: Path) -> None:
         copied = tmp / skill.name
         shutil.copytree(skill, copied)
         run([sys.executable, str(copied / "scripts" / "self_test.py")])
+        if copied.name == "codex-dev-coordinator":
+            run_normalized_coordinator_tests(copied)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_broker_tests(skill: Path) -> None:
+    tests = skill / "scripts" / "devcoordinator" / "tests"
+    if not tests.is_dir():
+        raise SystemExit(f"normalized broker tests are missing: {tests}")
+    for optimization in ([], ["-O"]):
+        run(
+            [
+                sys.executable,
+                *optimization,
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                str(tests),
+                "-p",
+                "test_broker.py",
+                "-v",
+            ]
+        )
+
+
+def run_normalized_coordinator_tests(skill: Path) -> None:
+    scripts = skill / "scripts"
+    standalone_suites = [
+        "sqlite_store_test.py",
+        "self_test_sqlite_cutover.py",
+        "self_test_multi_runtime.py",
+        "self_test_repository_lifecycle.py",
+        "self_test_sqlite_lifecycle.py",
+        "self_test_host_lifecycle.py",
+        "self_test_lifecycle_action_guard.py",
+        "self_test_broker_cross_uid.py",
+    ]
+    for script_name in standalone_suites:
+        script = scripts / script_name
+        if not script.is_file():
+            raise SystemExit(f"normalized coordinator test is missing: {script}")
+        run([sys.executable, str(script)])
+        run([sys.executable, "-O", str(script)])
+
+    tests = scripts / "devcoordinator" / "tests"
+    if not tests.is_dir():
+        raise SystemExit(f"normalized coordinator unit tests are missing: {tests}")
+    for optimization in ([], ["-O"]):
+        run(
+            [
+                sys.executable,
+                *optimization,
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                str(tests),
+                "-p",
+                "test_*.py",
+                "-v",
+            ]
+        )
+
+
+def menu_source_summary_toggle_errors(source: str) -> list[str]:
+    """Require the complete Sources row—not only its label—to toggle details."""
+
+    start = source.find("struct MenuBarSourceSummary: View")
+    end = source.find("\nstruct ", start + 1)
+    if start < 0 or end <= start:
+        return ["MenuBarSourceSummary production section is missing"]
+    section = source[start:end]
+    pattern = re.compile(
+        r"Button\s*\{\s*expanded\.toggle\(\)\s*\}\s*label:\s*\{"
+        r"[\s\S]*?Text\(expanded \? \"Hide\" : \"View details\"\)"
+        r"[\s\S]*?\.contentShape\(Rectangle\(\)\)"
+        r"[\s\S]*?\}\s*\.buttonStyle\(\.plain\)"
+    )
+    errors: list[str] = []
+    if pattern.search(section) is None:
+        errors.append(
+            "MenuBarSourceSummary must wrap the full source row in one plain Button "
+            "whose expanded toggle has a rectangular hit shape"
+        )
+    if 'accessibilityIdentifier("menu-source-summary-toggle")' not in section:
+        errors.append("MenuBarSourceSummary toggle accessibility identity is missing")
+    return errors
+
+
+def check_menu_source_summary_toggle(source: str) -> None:
+    good = '''
+struct MenuBarSourceSummary: View {
+    @State private var expanded = false
+    var body: some View {
+        Button {
+            expanded.toggle()
+        } label: {
+            HStack {
+                Text(expanded ? "Hide" : "View details")
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("menu-source-summary-toggle")
+    }
+}
+struct Next: View {}
+'''
+    if menu_source_summary_toggle_errors(good):
+        raise SystemExit("menu source-details toggle false-positive control is invalid")
+    broken_hit_area = good.replace("            .contentShape(Rectangle())\n", "")
+    if not menu_source_summary_toggle_errors(broken_hit_area):
+        raise SystemExit("menu source-details toggle detector missed the label-only hit-area regression")
+    misplaced_control = good.replace(
+        "struct MenuBarSourceSummary: View",
+        "struct AnotherControl: View",
+        1,
+    ).replace(
+        "struct Next: View {}",
+        '''struct MenuBarSourceSummary: View {
+    var body: some View { Text("View details") }
+}
+struct Next: View {}''',
+    )
+    if not menu_source_summary_toggle_errors(misplaced_control):
+        raise SystemExit("menu source-details toggle detector accepted a control outside the source row")
+    errors = menu_source_summary_toggle_errors(source)
+    if errors:
+        raise SystemExit("DevOpsBoard source-details toggle guard failed: " + "; ".join(errors))
 
 
 def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = True) -> None:
@@ -342,6 +716,9 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         for path in sorted((ops_console / "Sources" / "DevOpsBoard").glob("*.swift"))
     )
     views = (ops_console / "Sources" / "DevOpsBoard" / "Views.swift").read_text(encoding="utf-8")
+    menu_bar_views = (
+        ops_console / "Sources" / "DevOpsBoard" / "MenuBarViews.swift"
+    ).read_text(encoding="utf-8")
     store = (ops_console / "Sources" / "DevOpsBoard" / "OpsStore.swift").read_text(encoding="utf-8")
     models = (ops_console / "Sources" / "DevOpsBoard" / "Models.swift").read_text(encoding="utf-8")
     repository_catalog = (
@@ -378,14 +755,15 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
 
     check_devops_board_center_pane_geometry(views, split_sizing, vertical_layout_tests)
+    check_menu_source_summary_toggle(menu_bar_views)
 
     required = {
         "left pane splitter": "SplitHandle(width: $sidebarWidth",
         "right pane splitter": "SplitHandle(width: $inspectorWidth",
         "thin splitter width": "let splitHandleWidth: CGFloat = 8",
-        "absolute pane layout": "ZStack(alignment: .topLeading)",
+        "consecutive top-aligned pane layout": "HStack(alignment: .top, spacing: 0)",
         "exact main pane height": "height: proxy.size.height,",
-        "positioned main pane": ".position(x: mainX +",
+        "top-leading main pane frame": "alignment: .topLeading",
         "global splitter drag": "DragGesture(minimumDistance: 0, coordinateSpace: .global)",
         "stable splitter math": "resizedPaneWidth(",
         "responsive console layout": "func consoleLayout(",
@@ -511,8 +889,25 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "ordinary coordinator output limit control": "testOrdinaryCoordinatorOutputOverOneMiBRemainsTruncated",
         "inventory-specific bounded output budget": "inventoryMaxOutputBytes",
         "compact bounded inventory request": "--stats-history-limit",
-        "background-decoded inventory handoff": "case success(Inventory, enrichedBackups:",
-        "sendable inventory value graph": "struct Inventory: Decodable, Equatable, Sendable",
+        "background-decoded normalized inventory handoff": "case success(NormalizedBoardProjection)",
+        "sendable normalized inventory value graph": "struct NormalizedInventoryGraph: Decodable, Sendable",
+        "direct schema-v2 inventory decoder": "NormalizedInventoryGraph.self",
+        "direct schema-v2 Board projection": "graph.boardProjection(origin: origin)",
+        "schema-v2 fail-closed guard": "guard schemaVersion == 2 else",
+        "normalized repository identity decoding": "case repoID = \"repo_id\"",
+        "normalized database observation decoding": "case servers, docker, databases, telemetry, snapshots",
+        "normalized restorable backup registry": "case databaseBackups = \"database_backups\"",
+        "database identity requires authoritative ownership": "guard ownershipError == nil,\n              let origin",
+        "database UI ownership gate": "guard database.ownershipError == nil,",
+        "database operation rechecks current ownership": "currentAuthoritativeDatabase(matching:",
+        "whole-project definition membership coverage": "requiredMembershipKeys.isSubset(of: presentMembershipKeys)",
+        "v1-only production rejection regression": "testV1OnlyPayloadCannotMasqueradeAsNormalizedInventory",
+        "poisoned v1 identity isolation regression": "testDirectV2ProjectionUsesDurableIdentitiesAndIgnoresEveryPoisonedV1Field",
+        "missing repository membership control regression": "testRepositoryControlRequiresCompleteAuthoritativeMembershipCoverage",
+        "non-database Docker membership regression": "testNonDatabaseDockerResourceRequiresMembershipBeforeProjectControl",
+        "uncontrolled database protection regression": "testDatabaseProtectionFailsClosedWhenCurrentOwnershipIsNotAuthoritative",
+        "normalized database observation regression": "testFailedDatabaseObservationRetainsRuntimeSnapshotAndDegradesOnlyDatabaseCapability",
+        "normalized fence violation regression": "testRunningDisabledRepositoryResourceIsOnlyAnExactUnassignedFenceViolation",
         "bounded command default timeout": "timeout: TimeInterval = 120",
         "concurrent source refresh": "let outcomes = await withTaskGroup(",
         "deterministic source refresh order": "ordered[outcome.index] = outcome",
@@ -764,6 +1159,22 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     if present:
         raise SystemExit("DevOpsBoard interaction guardrail found prohibited pattern: " + ", ".join(present))
 
+    normalized_store_prohibited = {
+        "production v1 Inventory transport decoder": "JSONDecoder().decode(Inventory.self",
+        "production v1 compatibility lookup": "v1_compatibility",
+        "second no-Docker inventory request": '"--no-docker"',
+        "Board-side backup directory enrichment": '"--backup-dir"',
+        "Board-side database rediscovery": "discoverDatabases(",
+    }
+    normalized_present = [
+        label for label, needle in normalized_store_prohibited.items() if needle in store
+    ]
+    if normalized_present:
+        raise SystemExit(
+            "DevOpsBoard normalized-v2 guard found prohibited pattern: "
+            + ", ".join(normalized_present)
+        )
+
     if run_macos_app_checks:
         raise SystemExit(
             "DevOps Board native validation is owned by Build macOS Apps; "
@@ -931,6 +1342,8 @@ def main(argv: list[str] | None = None) -> int:
             "native validation must run through Build macOS Apps; "
             "this CLI only supports --skip-macos-app"
         )
+    check_duplicate_literal_dict_keys()
+    check_decision_history_contract()
     run([sys.executable, str(ROOT / "scripts" / "check_repository_freshness_self_test.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_repository_boundaries.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_production_layout.py")])
@@ -973,6 +1386,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     for skill in SKILLS:
         run([sys.executable, str(skill.relative_to(ROOT) / "scripts" / "self_test.py")])
+    run_normalized_coordinator_tests(ROOT / "skills" / "codex-dev-coordinator")
     run(
         [
             sys.executable,
@@ -992,7 +1406,19 @@ def main(argv: list[str] | None = None) -> int:
         # the safe validation path so stale Swift binaries cannot evade the
         # guardrail merely because the required native plugin is unavailable.
         run([sys.executable, "Tools/self_test_package_app.py"], cwd=ops_console)
-        run([sys.executable, "Tools/self_test_verify_launch_readiness.py"], cwd=ops_console)
+        launch_readiness_self_test = [
+            sys.executable,
+            "Tools/self_test_verify_launch_readiness.py",
+        ]
+        run(launch_readiness_self_test, cwd=ops_console)
+        var_tmp = Path("/var/tmp")
+        if not var_tmp.is_dir():
+            raise SystemExit("launch-readiness alias regression requires /var/tmp")
+        run(
+            launch_readiness_self_test,
+            cwd=ops_console,
+            env={**os.environ, "TMPDIR": str(var_tmp)},
+        )
     print("validation ok (native DevOps Board gate remains Build macOS Apps-owned)")
     return 0
 

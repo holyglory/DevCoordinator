@@ -61,6 +61,34 @@ def ready_fixture(*, project: str = FIXTURES.PROJECT, port: int = FIXTURES.PORT,
     return value
 
 
+def schema_v2_fixture(value: dict) -> dict:
+    compatibility = copy.deepcopy(value)
+    compatibility.setdefault("docker", {"available": None, "containers": [], "postgres": []})
+    return {
+        **copy.deepcopy(compatibility),
+        "schema_version": 2,
+        "leases": [
+            {
+                "lease_id": "normalized-lease",
+                "repo_id": "normalized-repository",
+                "server_definition_id": "normalized-server",
+                "port": FIXTURES.PORT,
+                "status": "active",
+            }
+        ],
+        "port_assignments": [
+            {
+                "assignment_id": "normalized-assignment",
+                "repo_id": "normalized-repository",
+                "server_name": FIXTURES.NAME,
+                "port": FIXTURES.PORT,
+                "status": "active",
+            }
+        ],
+        "v1_compatibility": compatibility,
+    }
+
+
 def stopped_server(*, project: str = FIXTURES.PROJECT, port: int = FIXTURES.PORT, pid=27001, lease_id=None) -> dict:
     server = copy.deepcopy(FIXTURES.fixture()["servers"][0])
     server.update(
@@ -528,6 +556,24 @@ def identity_and_deadline_tests() -> None:
 def main() -> int:
     state, report = classify(ready_fixture())
     require(state == "ready" and report["server_pid"] == FIXTURES.MAIN_PID, "valid graph must pass")
+
+    schema_v2_ready = schema_v2_fixture(ready_fixture())
+    schema_v2_before = copy.deepcopy(schema_v2_ready)
+    state, report = classify(schema_v2_ready)
+    require(state == "ready" and report["server_pid"] == FIXTURES.MAIN_PID, "schema-v2 graph must pass")
+    require(schema_v2_ready == schema_v2_before, "readiness classification mutated schema-v2 input")
+
+    missing_compatibility = schema_v2_fixture(ready_fixture())
+    missing_compatibility.pop("v1_compatibility")
+    must_fail(missing_compatibility, "compatibility", "schema-v2 inventory omitted v1 compatibility")
+
+    malformed_compatibility = schema_v2_fixture(ready_fixture())
+    malformed_compatibility["v1_compatibility"]["leases"] = {}
+    must_fail(
+        malformed_compatibility,
+        "leases",
+        "schema-v2 inventory supplied malformed v1 compatibility rows",
+    )
 
     unrelated_history = {
         "port_assignments": [],

@@ -63,6 +63,18 @@ jobs:
       - name: Run complete safe validation
         run: python3 scripts/validate.py --skip-macos-app
 
+      - name: Prove real cross-UID broker arbitration
+        if: runner.os == 'Linux'
+        env:
+          DEVCOORDINATOR_BROKER_CROSS_UID_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          PYTHON="$(command -v python3)"
+          sudo --preserve-env=DEVCOORDINATOR_BROKER_CROSS_UID_REQUIRED,PYTHONDONTWRITEBYTECODE \
+            "$PYTHON" skills/codex-dev-coordinator/scripts/self_test_broker_cross_uid.py
+          sudo --preserve-env=DEVCOORDINATOR_BROKER_CROSS_UID_REQUIRED,PYTHONDONTWRITEBYTECODE \
+            "$PYTHON" -O skills/codex-dev-coordinator/scripts/self_test_broker_cross_uid.py
+
       - name: Prove split-service capability registration and non-propagation
         if: runner.os == 'Linux'
         env:

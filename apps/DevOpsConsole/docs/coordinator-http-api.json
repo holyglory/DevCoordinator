@@ -31,6 +31,7 @@
       "/v1/ports/release",
       "/v1/ports/assign",
       "/v1/ports/unassign",
+      "/v1/ports/relocate",
       "/v1/servers/start",
       "/v1/servers/register",
       "/v1/servers/stop",
@@ -61,6 +62,7 @@
   },
   "state": {
     "version": 2,
+    "persistence_model": "normalized SQLite",
     "keys": [
       "revision",
       "leases",
@@ -70,12 +72,35 @@
       "history",
       "docker"
     ],
-    "persistence": "private 0700 home; 0600 state/lock/token/log files; fsync plus atomic replace",
+    "read_model": "GET /v1/state is a compatibility control snapshot derived from normalized SQLite; it is not the authoritative persistence format",
+    "persistence": "private 0700 home; 0600 coordinator.sqlite3/token/log files; foreign-keyed SQLite transactions with WAL durability",
     "durable_ports": "successful server start/register pins project+name to a port until explicit unassign or attributed state reset",
     "operations": "short reservation/commit lock phases with same-target exclusion and bounded journal evidence"
   },
   "inventory_contract": {
-    "no_docker": "GET /v1/inventory/no-docker performs the same authenticated server/lease/assignment observation and optimistic commit while intentionally returning docker.available=null with empty containers/postgres; it is the production service-readiness surface and does not test Docker capability",
+    "schema_version": 2,
+    "read_semantics": "query-only",
+    "normalized_top_level": [
+      "store",
+      "repositories",
+      "coordinator_sources",
+      "docker_engines",
+      "memberships",
+      "resources",
+      "leases",
+      "port_assignments",
+      "backup_evidence",
+      "database_backups",
+      "database_restore_events",
+      "events",
+      "unassigned_resources",
+      "lifecycle_violations",
+      "observations",
+      "control_bindings"
+    ],
+    "compatibility_projection": "v1_compatibility",
+    "compatibility_policy": "legacy Console rows are nested under v1_compatibility; non-colliding legacy aliases may also appear at top level, but top-level leases and port_assignments always retain normalized lease_id/assignment_id and repo_id identities",
+    "no_docker": "GET /v1/inventory/no-docker is the same authenticated query-only committed snapshot without a Docker CLI/daemon probe; normalized committed resources remain available while the legacy projection reports docker.available=null with empty containers/postgres",
     "project_usage": "rows include stable usage_key plus authoritative server_ids and container_names",
     "docker_ownership": "Compose labels and verified coordinator sidecars are mutation authority; name similarity is read-only evidence",
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"

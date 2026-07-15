@@ -143,38 +143,19 @@ def automatic_source_paths(
     entry_exists: Callable[[Path], bool] = observable_entry_exists,
     directory_entries: Callable[[Path], tuple[str, ...]] = observable_directory_entries,
 ) -> tuple[Path, ...]:
-    """Discover every source the Board auto-discovers for this OS account."""
+    """Return the one normalized account store the Board reads.
+
+    Legacy Codex, Claude, and Parall homes are migration inputs owned by the
+    coordinator importer.  Treating them as live Board sources would recreate
+    the duplicate-project and repeated-host-polling failure this launch gate is
+    intended to catch.
+    """
 
     account_home = account_home or os_account_home()
     environment = os.environ if environment is None else environment
-    candidates: list[Path] = []
     configured = environment.get("CODEX_AGENT_COORDINATOR_HOME", "").strip()
-    if configured:
-        candidates.append(Path(configured))
-    candidates.extend(
-        (
-            account_home / ".codex/agent-coordinator",
-            account_home / ".claude/agent-coordinator",
-        )
-    )
-    parall_root = account_home / "Library/Application Support/Parall"
-    candidates.extend(
-        parall_root / entry / ".codex/agent-coordinator"
-        for entry in directory_entries(parall_root)
-    )
-
-    result: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        normalized = normalize_source_path(candidate)
-        if normalized in seen:
-            continue
-        path = Path(normalized)
-        if not entry_exists(path) and not entry_exists(path / "state.json"):
-            continue
-        seen.add(normalized)
-        result.append(path)
-    return tuple(result)
+    candidate = Path(configured) if configured else account_home / ".codex/agent-coordinator"
+    return (Path(normalize_source_path(candidate)),)
 
 
 def expected_automatic_source_fingerprints(
@@ -222,6 +203,43 @@ def normalize_expected_source_inventory(
     return tuple(sorted(result))
 
 
+def projected_board_server_count(payload: object) -> int | None:
+    """Count the server rows the Board projects from one inventory response."""
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != 2:
+        servers = payload.get("servers")
+        return len(servers) if isinstance(servers, list) else None
+
+    resources = payload.get("resources")
+    unassigned = payload.get("unassigned_resources")
+    lifecycle_violations = payload.get("lifecycle_violations")
+    if (
+        not isinstance(resources, dict)
+        or not isinstance(resources.get("servers"), list)
+        or not isinstance(unassigned, list)
+        or not isinstance(lifecycle_violations, list)
+    ):
+        return None
+
+    # NormalizedInventoryGraph.boardProjection presents every canonical server
+    # definition, then adds each distinct unassigned/lifecycle server incident.
+    # One incident may intentionally appear in both normalized collections.
+    incidents: set[tuple[str, str, str]] = set()
+    for item in unassigned + lifecycle_violations:
+        if not isinstance(item, dict):
+            return None
+        resource_kind = item.get("resource_kind")
+        resource_id = item.get("resource_id")
+        reason_code = item.get("reason_code")
+        if not all(isinstance(value, str) for value in (resource_kind, resource_id, reason_code)):
+            return None
+        if resource_kind == "server":
+            incidents.add((resource_kind, resource_id, reason_code))
+    return len(resources["servers"]) + len(incidents)
+
+
 def collect_expected_source_inventory(
     *,
     coordinator_script: Path,
@@ -258,15 +276,15 @@ def collect_expected_source_inventory(
                 result.append((fingerprint, None))
                 continue
             payload = json.loads(completed.stdout)
-            servers = payload.get("servers")
-            reported_home = payload.get("coordinator_home")
-            if not isinstance(servers, list) or not isinstance(reported_home, str):
+            expected_count = projected_board_server_count(payload)
+            reported_home = payload.get("coordinator_home") if isinstance(payload, dict) else None
+            if expected_count is None or not isinstance(reported_home, str):
                 result.append((fingerprint, None))
                 continue
             if normalize_source_path(reported_home) != normalize_source_path(source):
                 result.append((fingerprint, None))
                 continue
-            result.append((fingerprint, len(servers)))
+            result.append((fingerprint, expected_count))
         except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
             result.append((fingerprint, None))
     return tuple(sorted(result))
@@ -433,6 +451,13 @@ def evaluate_inventory_marker(
     if missing_expected:
         raise LaunchReadinessError(
             f"{len(missing_expected)} automatic OS-account coordinator source(s) were neither loaded nor explicitly disabled"
+        )
+    expected_fingerprints = {fingerprint for fingerprint, _count in expected_inventory}
+    unexpected = present_or_disabled - expected_fingerprints
+    if expected_inventory and unexpected:
+        raise LaunchReadinessError(
+            f"inventory readiness marker reports {len(unexpected)} unexpected coordinator source(s); "
+            "the Board must read only the normalized account store"
         )
     measured_counts = dict(marker.server_counts)
     for fingerprint, expected_count in expected_inventory:

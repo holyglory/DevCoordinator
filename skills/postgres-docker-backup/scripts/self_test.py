@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import stat
@@ -493,6 +495,140 @@ def test_throwable_cleanup_guards() -> None:
         raise AssertionError("cluster diagnostics control unexpectedly succeeded")
 
 
+def test_public_broker_dispatch_never_reaches_client_docker(tmp: Path) -> None:
+    coordinator_scripts = ROOT.parent / "codex-dev-coordinator" / "scripts"
+    if not coordinator_scripts.is_dir():
+        # A standalone installed skill deliberately has no source dependency
+        # on the coordinator sibling. The canonical repository run exercises
+        # this cross-skill public dispatch contract.
+        return
+    if str(coordinator_scripts) not in sys.path:
+        sys.path.insert(0, str(coordinator_scripts))
+    import devcoordinator.broker_profile as broker_profile
+
+    module = load_production_module()
+    project = tmp / "broker-project"
+    project.mkdir(mode=0o700)
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class Repository:
+        canonical_root = str(project)
+        repo_id = "repo-broker-project"
+        container_ids = {
+            "postgres": "container-postgres",
+            SOURCE_ID: "container-postgres",
+        }
+
+    repository = Repository()
+
+    class Profile:
+        repositories = {str(project): repository}
+
+        def call(self, *, repository, resource_id, operation, arguments):
+            calls.append((operation.value, resource_id, dict(arguments)))
+            return (
+                f"operation-{len(calls)}",
+                {
+                    "status": (
+                        "available"
+                        if operation.value == "database.backup"
+                        else "restored"
+                    )
+                },
+            )
+
+    def poison(*_args, **_kwargs):
+        raise AssertionError("brokered public PostgreSQL command reached client Docker")
+
+    original_loader = broker_profile.load_broker_profile
+    original_backup = module.do_backup
+    original_restore = module.do_restore
+    original_docker = module.docker
+    original_registry = module.persist_coordinator_registry
+    previous_cwd = Path.cwd()
+    broker_profile.load_broker_profile = lambda: Profile()
+    module.do_backup = poison
+    module.do_restore = poison
+    module.docker = poison
+    module.persist_coordinator_registry = poison
+    try:
+        os.chdir(project)
+        route_output = io.StringIO()
+        route_error = io.StringIO()
+        with contextlib.redirect_stdout(route_output), contextlib.redirect_stderr(route_error):
+            route_status = module.main(["route"])
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            backup_status = module.main(
+                [
+                    "backup",
+                    "--expect-container-id",
+                    SOURCE_ID,
+                    "--database",
+                    "app",
+                    "--format",
+                    "custom",
+                    "--scope",
+                    "database",
+                ]
+            )
+            restore_status = module.main(
+                [
+                    "restore",
+                    "--expect-container-id",
+                    SOURCE_ID,
+                    "--database",
+                    "app",
+                    "--database-backup-id",
+                    "backup-1",
+                    "--confirm-restore",
+                ]
+            )
+    finally:
+        os.chdir(previous_cwd)
+        broker_profile.load_broker_profile = original_loader
+        module.do_backup = original_backup
+        module.do_restore = original_restore
+        module.docker = original_docker
+        module.persist_coordinator_registry = original_registry
+    check(
+        route_status == 0 and backup_status == 0 and restore_status == 0,
+        "public broker dispatch failed: "
+        f"route={route_status}, backup={backup_status}, restore={restore_status}, "
+        f"route_output={route_output.getvalue()!r}, route_error={route_error.getvalue()!r}",
+    )
+    check(
+        json.loads(route_output.getvalue())
+        == {
+            "canonical_root": str(project),
+            "execution_authority": "broker",
+            "repository_id": "repo-broker-project",
+        },
+        "public database routing preflight did not bind the enrolled repository",
+    )
+    check(
+        calls
+        == [
+            (
+                "database.backup",
+                "container-postgres",
+                {"database_name": "app"},
+            ),
+            (
+                "database.restore",
+                "container-postgres",
+                {
+                    "database_name": "app",
+                    "database_backup_id": "backup-1",
+                    "explicit": True,
+                },
+            ),
+        ],
+        f"public broker dispatch crossed the wrong typed boundary: {calls}",
+    )
+
+
 def main() -> int:
     p0 = subprocess.run(
         [sys.executable, str(P0_TEST)],
@@ -518,10 +654,12 @@ def main() -> int:
 
     tmp = Path(tempfile.mkdtemp(prefix="postgres-docker-backup-self-test-")).resolve(strict=True)
     try:
+        test_public_broker_dispatch_never_reaches_client_docker(tmp)
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
         make_fake_docker(fake_bin / "docker")
         env = os.environ.copy()
+        env["DEVCOORDINATOR_BACKUP_REGISTRY"] = "off"
         env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
         log_path = tmp / "docker.log"
         state_path = tmp / "docker-state.json"

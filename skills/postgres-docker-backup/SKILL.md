@@ -53,6 +53,31 @@ exception and selects no live candidate.
 python3 scripts/postgres_docker_backup.py list
 ```
 
+## Multi-user Broker Routing
+
+An application that may run under a different effective user than Docker must
+resolve the public mutation contract from the canonical enrolled repository
+directory before building backup or restore arguments:
+
+```bash
+cd "$PROJECT_ROOT"
+python3 scripts/postgres_docker_backup.py route
+```
+
+The result is `direct` when no host broker profile is installed, or `broker`
+with the exact enrolled repository identity. A configured but invalid, stale,
+or non-enrolled broker profile fails closed instead of reporting `direct`.
+
+For `broker`, backup output paths are service-owned: omit `--out-dir` and do
+not run client-side verification after success because the service publishes
+only strongly verified registry evidence. Restore must select the opaque
+`--database-backup-id` from normalized inventory and must not send `--file`,
+`--safety-out-dir`, credentials, remapping, or safety-disable flags. For
+`direct`, the artifact-path backup, verification, and transactional restore
+contracts below remain in force. Run the routing preflight and mutation from
+the same canonical repository directory; a profile change between them still
+fails closed at the mutation.
+
 ## Database Backups
 
 The default is one database in PostgreSQL custom format:
