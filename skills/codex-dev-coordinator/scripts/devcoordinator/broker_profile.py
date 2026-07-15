@@ -124,6 +124,28 @@ class BrokerClientProfile:
             operation_id=operation_id,
         )
 
+    def inventory(self) -> dict[str, Any]:
+        """Read the single host-wide authority through one enrolled repository."""
+
+        if int(time.time()) >= self.valid_until_epoch:
+            raise BrokerProfileError(
+                "host broker enrollment has expired; rerun Coordinator skill installation"
+            )
+        if not self.repositories:
+            raise BrokerProfileError(
+                "authenticated account has no enrolled repository for host inventory access"
+            )
+        repository = min(
+            self.repositories.values(), key=lambda item: item.canonical_root
+        )
+        _operation_id, result = self.call(
+            repository=repository,
+            resource_id=repository.repo_id,
+            operation=BrokerOperation.INVENTORY_READ,
+            arguments={},
+        )
+        return result
+
 
 def call_broker(
     *,

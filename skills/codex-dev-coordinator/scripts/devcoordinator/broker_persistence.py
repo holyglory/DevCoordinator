@@ -27,7 +27,7 @@ from .broker import (
     PeerCredentials,
     authenticated_request_fingerprint,
 )
-from .store import CoordinatorStore, utc_timestamp
+from .store import AccountStore, CoordinatorStore, utc_timestamp
 from .database_backups import (
     inspect_database_backup,
     record_successful_restore,
@@ -61,6 +61,19 @@ _DATABASE_OPERATIONS = frozenset(
     {BrokerOperation.DATABASE_BACKUP, BrokerOperation.DATABASE_RESTORE}
 )
 _REPOSITORY_READ_OPERATIONS = frozenset({BrokerOperation.REPOSITORY_LIST_REMOVED})
+_HOST_READ_OPERATIONS = frozenset({BrokerOperation.INVENTORY_READ})
+
+
+class _BrokerInventoryStore(AccountStore):
+    """Reuse one authorized read snapshot inside the inventory projection."""
+
+    @contextmanager
+    def read_transaction(self) -> Generator[sqlite3.Connection, None, None]:
+        if self.connection.in_transaction:
+            yield self.connection
+            return
+        with super().read_transaction() as connection:
+            yield connection
 
 
 BROKER_SCHEMA = """
@@ -739,6 +752,7 @@ class BrokerPersistence:
                             utc_timestamp(),
                         ),
                     )
+
                 elif operation in {BrokerOperation.COMPOSE_UP, BrokerOperation.COMPOSE_DOWN}:
                     connection.execute(
                         """
@@ -774,6 +788,128 @@ class BrokerPersistence:
                             operation.value,
                             int(enabled),
                             utc_timestamp(),
+                        ),
+                    )
+
+    def replace_server_access(
+        self,
+        *,
+        uid: int,
+        repo_id: str,
+        server_definition_ids: Iterable[str],
+        start_port: int,
+        end_port: int,
+        protocol: str = "tcp",
+        max_ttl_seconds: int = 7 * 24 * 60 * 60,
+    ) -> None:
+        """Atomically replace one principal's exact server mutation allowlist."""
+
+        _require_identifier(repo_id, "project_id")
+        requested = tuple(server_definition_ids)
+        if any(type(item) is not str for item in requested):
+            raise ValueError("server definition ids must be strings")
+        for item in requested:
+            _require_identifier(item, "server_definition_id")
+        selected = tuple(sorted(set(requested)))
+        if not 1 <= start_port <= end_port <= 65535:
+            raise ValueError("server port range is invalid")
+        if protocol not in {"tcp", "udp"}:
+            raise ValueError("protocol must be tcp or udp")
+        if not 1 <= max_ttl_seconds <= 7 * 24 * 60 * 60:
+            raise ValueError("max_ttl_seconds is invalid")
+        now = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _require_principal(connection, uid)
+                known = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT server_definition_id FROM server_definitions WHERE repo_id = ?",
+                        (repo_id,),
+                    )
+                }
+                if any(item not in known for item in selected):
+                    raise BrokerError(
+                        "control_binding_unavailable",
+                        "Server access replacement includes a definition outside the exact repository.",
+                    )
+                connection.execute(
+                    """
+                    UPDATE broker_resource_acl SET enabled = 0, updated_at = ?
+                    WHERE uid = ? AND repo_id = ? AND resource_kind = 'server'
+                      AND operation IN ('port.lease', 'port.release')
+                    """,
+                    (now, uid, repo_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE broker_assignment_acl SET enabled = 0, updated_at = ?
+                    WHERE uid = ? AND repo_id = ?
+                    """,
+                    (now, uid, repo_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE broker_port_policies SET enabled = 0, updated_at = ?
+                    WHERE uid = ? AND repo_id = ?
+                    """,
+                    (now, uid, repo_id),
+                )
+                for server_id in selected:
+                    for operation in (
+                        BrokerOperation.PORT_LEASE,
+                        BrokerOperation.PORT_RELEASE,
+                    ):
+                        connection.execute(
+                            """
+                            INSERT INTO broker_resource_acl(
+                                uid, repo_id, resource_kind, resource_id,
+                                operation, enabled, updated_at
+                            ) VALUES (?, ?, 'server', ?, ?, 1, ?)
+                            ON CONFLICT(uid, repo_id, resource_kind, resource_id, operation)
+                            DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
+                            """,
+                            (uid, repo_id, server_id, operation.value, now),
+                        )
+                    for operation in (
+                        BrokerOperation.PORT_ASSIGN,
+                        BrokerOperation.PORT_UNASSIGN,
+                    ):
+                        connection.execute(
+                            """
+                            INSERT INTO broker_assignment_acl(
+                                uid, repo_id, server_definition_id,
+                                operation, enabled, updated_at
+                            ) VALUES (?, ?, ?, ?, 1, ?)
+                            ON CONFLICT(uid, repo_id, server_definition_id, operation)
+                            DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
+                            """,
+                            (uid, repo_id, server_id, operation.value, now),
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_port_policies(
+                            uid, repo_id, server_definition_id, protocol,
+                            start_port, end_port, max_ttl_seconds,
+                            enabled, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                        ON CONFLICT(
+                            uid, repo_id, server_definition_id,
+                            protocol, start_port, end_port
+                        ) DO UPDATE SET
+                            max_ttl_seconds = excluded.max_ttl_seconds,
+                            enabled = 1,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            uid,
+                            repo_id,
+                            server_id,
+                            protocol,
+                            start_port,
+                            end_port,
+                            max_ttl_seconds,
+                            now,
                         ),
                     )
 
@@ -2387,6 +2523,255 @@ class BrokerPersistence:
                 ).fetchone()
                 return [] if row is None else [dict(row)]
 
+    def inventory(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
+        """Return the one service-owned host graph after live peer authorization."""
+
+        request = authorized.request
+        if request.operation != BrokerOperation.INVENTORY_READ:
+            raise ValueError("request is not a host inventory read")
+        with self._store() as store:
+            # The normalized service and account stores share one schema.  The
+            # broker adapter also keeps authorization and projection inside
+            # the exact same SQLite read snapshot, so live revocation cannot
+            # race a second inventory transaction.
+            store.__class__ = _BrokerInventoryStore
+            with store.read_transaction() as connection:
+                _authorize_connection(
+                    connection, peer=authorized.peer, request=request
+                )
+                return store.inventory_v2()
+
+    def server_publication_target(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> dict[str, Any]:
+        """Resolve the exact active broker lease and enrolled repository root."""
+
+        request = authorized.request
+        if request.operation != BrokerOperation.SERVER_PUBLISH:
+            raise ValueError("request is not a server publication")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                lease = _authorize_connection(
+                    connection, peer=authorized.peer, request=request
+                )
+                if lease is None:
+                    raise BrokerError(
+                        "lease_not_active",
+                        "Server publication requires the exact active broker lease.",
+                        operation_id=request.operation_id,
+                    )
+                root = connection.execute(
+                    "SELECT canonical_root FROM repositories WHERE repo_id = ?",
+                    (request.project_id,),
+                ).fetchone()
+                return {
+                    "canonical_root": str(root["canonical_root"]),
+                    "lease_id": str(request.arguments["lease_id"]),
+                    "port": int(lease["port"]),
+                    "server_definition_id": request.resource_id,
+                }
+
+    def complete_server_publication(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        listener_evidence: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Commit broker-observed lifecycle into the shared authority graph."""
+
+        request = authorized.request
+        arguments = request.arguments
+        now = utc_timestamp()
+        lifecycle = str(arguments["lifecycle"])
+        with self._store() as store:
+            with store.immediate_transaction(revision_kind="observation") as connection:
+                lease = _authorize_connection(
+                    connection, peer=authorized.peer, request=request
+                )
+                if lease is None or lease["status"] != "active":
+                    raise BrokerError(
+                        "lease_not_active",
+                        "Server publication requires the exact active broker lease.",
+                        operation_id=request.operation_id,
+                    )
+                port = int(lease["port"])
+                if port != int(arguments["listener_port"]):
+                    raise BrokerError(
+                        "port_observation_mismatch",
+                        "Published listener port does not match the exact active broker lease.",
+                        operation_id=request.operation_id,
+                    )
+                definition = connection.execute(
+                    """
+                    SELECT d.name, r.host_id
+                    FROM server_definitions d JOIN repositories r USING(repo_id)
+                    WHERE d.repo_id = ? AND d.server_definition_id = ?
+                    """,
+                    (request.project_id, request.resource_id),
+                ).fetchone()
+                if definition is None:
+                    raise BrokerError(
+                        "control_binding_unavailable",
+                        "Published server is no longer enrolled with this repository.",
+                        operation_id=request.operation_id,
+                    )
+
+                pid = None if lifecycle == "stopped" else int(arguments["pid"])
+                evidence = dict(listener_evidence or {})
+                process_fingerprint = (
+                    None if lifecycle == "stopped" else str(evidence["process_identity"])
+                )
+                stopped_at = now if lifecycle == "stopped" else None
+                stopped_reason = (
+                    str(arguments.get("stopped_reason") or "Stopped by coordinator")
+                    if lifecycle == "stopped"
+                    else None
+                )
+                payload = {
+                    "server_definition_id": request.resource_id,
+                    "lifecycle": lifecycle,
+                    "pid": pid,
+                    "process_fingerprint": process_fingerprint,
+                    "listener_host": "127.0.0.1",
+                    "listener_port": port,
+                    "listener_observable": True,
+                    "health_classification": arguments["health_classification"],
+                    "health_ok": arguments["health_ok"],
+                    "stopped_at": stopped_at,
+                    "stopped_reason": stopped_reason,
+                    "sampled_at": now,
+                    "peer_uid": authorized.peer.uid,
+                }
+                observation_fingerprint = hashlib.sha256(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                connection.execute(
+                    """
+                    INSERT INTO server_observations(
+                        server_definition_id, lifecycle, pid,
+                        process_fingerprint, listener_host, listener_port,
+                        listener_observable, health_classification, health_ok,
+                        stopped_at, stopped_reason, sampled_at,
+                        observation_fingerprint
+                    ) VALUES (?, ?, ?, ?, '127.0.0.1', ?, 1, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(server_definition_id) DO UPDATE SET
+                        source_resource_id = NULL,
+                        lifecycle = excluded.lifecycle,
+                        pid = excluded.pid,
+                        process_start_time = NULL,
+                        process_fingerprint = excluded.process_fingerprint,
+                        listener_host = excluded.listener_host,
+                        listener_port = excluded.listener_port,
+                        listener_observable = excluded.listener_observable,
+                        health_classification = excluded.health_classification,
+                        health_ok = excluded.health_ok,
+                        stopped_at = excluded.stopped_at,
+                        stopped_reason = excluded.stopped_reason,
+                        sampled_at = excluded.sampled_at,
+                        observation_fingerprint = excluded.observation_fingerprint
+                    """,
+                    (
+                        request.resource_id,
+                        lifecycle,
+                        pid,
+                        process_fingerprint,
+                        port,
+                        arguments["health_classification"],
+                        (
+                            None
+                            if arguments["health_ok"] is None
+                            else int(bool(arguments["health_ok"]))
+                        ),
+                        stopped_at,
+                        stopped_reason,
+                        now,
+                        observation_fingerprint,
+                    ),
+                )
+
+                if lifecycle != "stopped":
+                    assignment = connection.execute(
+                        """
+                        SELECT assignment_id, port, status FROM port_assignments
+                        WHERE repo_id = ? AND server_name = ?
+                        """,
+                        (request.project_id, str(definition["name"])),
+                    ).fetchone()
+                    if assignment is None:
+                        assignment_id = str(uuid.uuid4())
+                        try:
+                            connection.execute(
+                                """
+                                INSERT INTO port_assignments(
+                                    assignment_id, host_id, repo_id, server_name,
+                                    port, status, generation, created_at, updated_at
+                                ) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)
+                                """,
+                                (
+                                    assignment_id,
+                                    str(definition["host_id"]),
+                                    request.project_id,
+                                    str(definition["name"]),
+                                    port,
+                                    now,
+                                    now,
+                                ),
+                            )
+                        except sqlite3.IntegrityError as exc:
+                            raise BrokerError(
+                                "port_assignment_conflict",
+                                "Another active server assignment owns the published port.",
+                                operation_id=request.operation_id,
+                            ) from exc
+                    elif int(assignment["port"]) != port or assignment["status"] != "active":
+                        raise BrokerError(
+                            "port_assignment_conflict",
+                            "Published listener conflicts with the server's durable assignment.",
+                            operation_id=request.operation_id,
+                        )
+
+                connection.execute(
+                    """
+                    INSERT INTO events(
+                        event_id, repo_id, operation_id, event_kind, code,
+                        message, diagnostic_json, occurred_at
+                    ) VALUES (?, ?, ?, ?, 'broker_server_publication', ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        request.project_id,
+                        request.operation_id,
+                        "server.stopped" if lifecycle == "stopped" else "server.observed",
+                        f"Broker published {lifecycle} lifecycle for {definition['name']}",
+                        json.dumps(
+                            {
+                                "peer_uid": authorized.peer.uid,
+                                "lease_id": arguments["lease_id"],
+                                "listener_evidence": evidence,
+                            },
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                result = {
+                    "server_definition_id": request.resource_id,
+                    "lease_id": str(arguments["lease_id"]),
+                    "lifecycle": lifecycle,
+                    "pid": pid,
+                    "port": port,
+                    "sampled_at": now,
+                    "observation_fingerprint": observation_fingerprint,
+                }
+                _finish_operation(connection, request.operation_id, result=result)
+                return result
+
     def bind_lifecycle_plan_observation(
         self,
         authorized: AuthorizedBrokerRequest,
@@ -2590,7 +2975,11 @@ def _authorize_connection(
         )
     if (
         request.operation
-        in (_REPOSITORY_LIFECYCLE_OPERATIONS | _REPOSITORY_READ_OPERATIONS)
+        in (
+            _REPOSITORY_LIFECYCLE_OPERATIONS
+            | _REPOSITORY_READ_OPERATIONS
+            | _HOST_READ_OPERATIONS
+        )
         and request.resource_id != request.project_id
     ):
         raise BrokerError(
@@ -2606,6 +2995,7 @@ def _authorize_connection(
         BrokerOperation.COMPOSE_UP,
         BrokerOperation.DATABASE_BACKUP,
         BrokerOperation.DATABASE_RESTORE,
+        BrokerOperation.SERVER_PUBLISH,
     }
     if installation["state"] != "active" or (
         start_like
@@ -2623,6 +3013,11 @@ def _authorize_connection(
     resource_id = request.resource_id
     resource_kind = "container"
     lease_row: Optional[sqlite3.Row] = None
+    if request.operation in _HOST_READ_OPERATIONS:
+        # Inventory visibility is host-wide for every enrolled principal.  The
+        # repository identity proves current enrollment; mutation authority
+        # remains constrained by exact per-resource grants below.
+        return None
     if request.operation in _REPOSITORY_READ_OPERATIONS:
         grant = connection.execute(
             """
@@ -2762,7 +3157,33 @@ def _authorize_connection(
                     operation_id=request.operation_id,
                 )
         return None
-    if request.operation == BrokerOperation.PORT_RELEASE:
+    if request.operation == BrokerOperation.SERVER_PUBLISH:
+        lease_row = connection.execute(
+            """
+            SELECT l.status, l.port, b.protocol, b.server_definition_id,
+                   b.uid, b.account_id, b.repo_id
+            FROM leases l JOIN broker_lease_owners b USING(lease_id)
+            WHERE l.lease_id = ?
+            """,
+            (request.arguments["lease_id"],),
+        ).fetchone()
+        if (
+            lease_row is None
+            or lease_row["status"] != "active"
+            or lease_row["uid"] != peer.uid
+            or lease_row["account_id"] != request.account_id
+            or lease_row["repo_id"] != request.project_id
+            or lease_row["server_definition_id"] != request.resource_id
+            or int(lease_row["port"]) != int(request.arguments["listener_port"])
+        ):
+            raise BrokerError(
+                "resource_access_denied",
+                "Server publication does not match the authenticated principal's exact active lease.",
+                operation_id=request.operation_id,
+            )
+        resource_id = request.resource_id
+        resource_kind = "server"
+    elif request.operation == BrokerOperation.PORT_RELEASE:
         lease_row = connection.execute(
             """
             SELECT l.status, l.port, b.protocol, b.server_definition_id,
@@ -2854,6 +3275,15 @@ def _authorize_connection(
               AND operation = ?
             """,
             (peer.uid, request.project_id, resource_id, request.operation.value),
+        ).fetchone()
+    elif request.operation == BrokerOperation.SERVER_PUBLISH:
+        grant = connection.execute(
+            """
+            SELECT enabled FROM broker_resource_acl
+            WHERE uid = ? AND repo_id = ? AND resource_kind = 'server'
+              AND resource_id = ? AND operation = 'port.lease'
+            """,
+            (peer.uid, request.project_id, resource_id),
         ).fetchone()
     else:
         grant = connection.execute(
@@ -3134,6 +3564,7 @@ def _reserved_target_fingerprint(
         BrokerOperation.PORT_LEASE,
         BrokerOperation.PORT_ASSIGN,
         BrokerOperation.PORT_UNASSIGN,
+        BrokerOperation.SERVER_PUBLISH,
     }:
         return _server_definition_fingerprint(
             connection,
@@ -3576,6 +4007,7 @@ def _target_kind(operation: BrokerOperation) -> str:
         BrokerOperation.PORT_LEASE,
         BrokerOperation.PORT_ASSIGN,
         BrokerOperation.PORT_UNASSIGN,
+        BrokerOperation.SERVER_PUBLISH,
     }:
         return "server"
     if operation == BrokerOperation.PORT_RELEASE:

@@ -233,6 +233,9 @@ def main() -> int:
                 "PATH": str(empty_path),
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_NOSYSTEM": "1",
+                # This fixture exercises the explicit isolated-account
+                # compatibility topology. Product default is server-wide.
+                "DEVCOORDINATOR_AUTHORITY": "account",
                 "COORDINATOR_TEST_SCRIPT": str(SCRIPT),
                 "COORDINATOR_TEST_ACCOUNT_HOME": str(account_home),
                 "COORDINATOR_TEST_ACCOUNT_UID": str(effective_uid),
@@ -255,8 +258,8 @@ def main() -> int:
             }
             runtime_environments.append(environment)
 
-        # Same-UID app instances without an explicit override must share one
-        # SQLite WAL authority. The process barrier makes both commands reach
+        # Same-UID app instances in explicit account mode without a home
+        # override must share one SQLite WAL authority. The process barrier makes both commands reach
         # their first store open before either may proceed, so this catches WAL
         # setup races instead of merely hoping the subprocesses overlap.
         issued_ports: set[int] = set()

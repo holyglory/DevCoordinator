@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import grp
 import json
 import os
 from pathlib import Path
@@ -40,7 +41,12 @@ def add_broker_parser(subparsers: Any) -> None:
     serve = actions.add_parser("serve")
     _database_argument(serve)
     serve.add_argument("--socket", required=True)
-    serve.add_argument("--access-gid", type=int)
+    serve_access = serve.add_mutually_exclusive_group()
+    serve_access.add_argument("--access-gid", type=int)
+    serve_access.add_argument(
+        "--access-group",
+        help="Resolve this system group to the broker socket GID at service startup.",
+    )
     serve.add_argument("--max-clients", type=int, default=32)
 
     enroll = actions.add_parser(
@@ -49,12 +55,32 @@ def add_broker_parser(subparsers: Any) -> None:
     )
     _database_argument(enroll)
     enroll.add_argument("--socket", required=True)
-    enroll.add_argument("--access-gid", type=int, required=True)
+    enroll_access = enroll.add_mutually_exclusive_group(required=True)
+    enroll_access.add_argument("--access-gid", type=int)
+    enroll_access.add_argument(
+        "--access-group",
+        help="Resolve this system group to the broker socket GID during enrollment.",
+    )
     enroll.add_argument("--client-uid", type=int, required=True)
     enroll.add_argument("--account-id", required=True)
     enroll.add_argument("--project", required=True)
     enroll.add_argument("--agent", required=True)
     enroll.add_argument("--runtime-file")
+    server_access = enroll.add_mutually_exclusive_group()
+    server_access.add_argument(
+        "--server",
+        action="append",
+        default=None,
+        help=(
+            "Grant this authenticated UID control of one declared server; repeat for an exact allowlist. "
+            "Omit to grant no servers."
+        ),
+    )
+    server_access.add_argument(
+        "--all-servers",
+        action="store_true",
+        help="Explicitly grant this UID every server declared by the repository.",
+    )
     enroll.add_argument("--port-range", default="3000-3999")
     enroll.add_argument("--profile-output")
     enroll.add_argument("--profile-valid-days", type=int, default=30)
@@ -367,11 +393,20 @@ def serve_broker(
     observe_before_lifecycle_plan: Callable[[AccountStore], dict[str, Any]]
     | None = None,
 ) -> None:
+    if args.access_group:
+        try:
+            access_gid = int(grp.getgrnam(str(args.access_group)).gr_gid)
+        except KeyError as error:
+            raise RuntimeError(
+                f"broker access group does not exist: {args.access_group}"
+            ) from error
+    else:
+        access_gid = args.access_gid
     runtime = build_store_backed_broker_runtime(
         database_path=Path(args.database),
         socket_path=Path(args.socket),
         host_mutations=host_mutations_factory(),
-        access_gid=args.access_gid,
+        access_gid=access_gid,
         max_clients=int(args.max_clients),
         observe_before_lifecycle_plan=observe_before_lifecycle_plan,
     )
@@ -391,7 +426,7 @@ def serve_broker(
                 {
                     "status": "ready",
                     "service_uid": os.geteuid(),
-                    "access_gid": os.getegid() if args.access_gid is None else int(args.access_gid),
+                    "access_gid": os.getegid() if access_gid is None else int(access_gid),
                     "socket": str(Path(args.socket)),
                     "database": str(Path(args.database)),
                     "wire_identity": "opaque_normalized_ids_only",

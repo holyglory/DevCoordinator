@@ -37,7 +37,9 @@ test('production units split coordinator ownership and keep runtime data outside
     ['TimeoutStartSec=20'],
     'coordinator startup must have one exact bounded deadline',
   );
-  assert.match(coordinator, /CODEX_AGENT_COORDINATOR_HOME=\/home\/holyglory\/\.codex\/agent-coordinator/);
+  assert.match(coordinator, /^Requires=devcoordinator-broker\.service$/m);
+  assert.match(coordinator, /^Environment=DEVCOORDINATOR_AUTHORITY=system$/m);
+  assert.match(coordinator, /CODEX_AGENT_COORDINATOR_HOME=\/var\/lib\/devcoordinator-clients\/1000/);
   assert.match(coordinator, /^AmbientCapabilities=CAP_NET_BIND_SERVICE$/m);
   assert.doesNotMatch(coordinator, /^CapabilityBoundingSet=/m);
   assert.match(coordinator, /^KillMode=process$/m);
@@ -74,7 +76,8 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_URL=http:\/\/127\.0\.0\.1:29876/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_SCRIPT=\/home\/DevCoordinator\/skills\/codex-dev-coordinator\/scripts\/dev_coordinator\.py/);
   assert.match(consoleUnit, /ExecStart=.*COORDINATOR_TOKEN_FILE=\/home\/holyglory\/\.codex\/agent-coordinator\/api-token/);
-  assert.match(consoleUnit, /ExecStart=.*CODEX_AGENT_COORDINATOR_HOME=\/home\/holyglory\/\.codex\/agent-coordinator/);
+  assert.match(consoleUnit, /ExecStart=.*DEVCOORDINATOR_AUTHORITY=system/);
+  assert.match(consoleUnit, /ExecStart=.*CODEX_AGENT_COORDINATOR_HOME=\/var\/lib\/devcoordinator-clients\/1000/);
   assert.match(consoleUnit, /ExecStart=.*STATE_DIR=\/home\/holyglory\/\.local\/state\/devops-console/);
   assert.match(consoleUnit, /ExecStart=.*ACME_WEBROOT=\/home\/holyglory\/\.local\/state\/devops-console\/acme/);
   assert.match(consoleUnit, /--env-file \/home\/holyglory\/\.config\/devops-console\/console\.env/);

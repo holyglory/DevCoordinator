@@ -12,6 +12,7 @@ import errno
 import fcntl
 import functools
 import glob
+import grp
 import hashlib
 import hmac
 import http.server
@@ -95,6 +96,17 @@ VERSION = 2
 NORMALIZED_SCHEMA_VERSION = 2
 NORMALIZED_DATABASE_NAME = "coordinator.sqlite3"
 STATE_BACKEND_ENV = "DEVCOORDINATOR_STATE_BACKEND"
+AUTHORITY_ENV = "DEVCOORDINATOR_AUTHORITY"
+SYSTEM_AUTHORITY_ROOT = Path(
+    "/Library/Application Support/DevCoordinator"
+    if sys.platform == "darwin"
+    else "/var/lib/devcoordinator"
+)
+SYSTEM_CLIENT_JOURNAL_ROOT = Path(
+    "/Library/Application Support/DevCoordinator/Clients"
+    if sys.platform == "darwin"
+    else "/var/lib/devcoordinator-clients"
+)
 LEGACY_JSON_BACKEND = "legacy-json-test-only"
 OBSERVER_DOMAIN_FULL_DOCKER = "host-runtime-v2:full-docker"
 OBSERVER_DOMAIN_NO_DOCKER = "host-runtime-v2:no-docker"
@@ -442,7 +454,34 @@ def coordinator_home() -> Path:
     configured = os.environ.get("CODEX_AGENT_COORDINATOR_HOME")
     if configured:
         return Path(configured).expanduser().resolve()
+    mode = authority_mode()
+    if mode == "service":
+        return SYSTEM_AUTHORITY_ROOT
+    if mode == "system":
+        # User-owned execution journals live below one host-standard journal
+        # root; they are never an authority or a cross-UID sharing mechanism.
+        return SYSTEM_CLIENT_JOURNAL_ROOT / str(os.geteuid())
     return posix_account_home() / ".codex" / "agent-coordinator"
+
+
+def authority_mode() -> str:
+    """Return explicit authority scope; product default is server-wide."""
+
+    raw = str(os.environ.get(AUTHORITY_ENV) or "").strip().lower()
+    if not raw:
+        # An explicitly selected home is the compatibility/test opt-in.  A
+        # normal installation has no per-app HOME-dependent authority.
+        return "account" if os.environ.get("CODEX_AGENT_COORDINATOR_HOME") else "system"
+    if raw not in {"system", "account", "service"}:
+        raise ValueError(
+            f"{AUTHORITY_ENV} must be 'system', 'account', or 'service'"
+        )
+    if raw == "service" and os.geteuid() == 0:
+        # The broker may be root-owned on a small host, but it must never use
+        # the API path to launch managed user processes.  Service mode itself
+        # is limited to broker/admin commands by CLI dispatch guards below.
+        return raw
+    return raw
 
 
 def state_backend() -> str:
@@ -6458,12 +6497,20 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
         if link.repo_id != repository.repo_id or link.server_definition_id != repository.server_id(name):
             raise BrokerProfileError("the supplied broker lease belongs to another enrolled server")
         result = _coordinated_start_server_local(options)
+        publication = publish_broker_server(
+            profile=profile,
+            repository=repository,
+            server_name=name,
+            broker_lease_id=link.broker_resource_id,
+            server=result,
+        )
         return {
             **result,
             "broker": {
                 "lease_id": link.broker_resource_id,
                 "link_id": link.link_id,
                 "status": link.status,
+                "publication": publication,
             },
         }
 
@@ -6502,7 +6549,30 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
             existing_health, action="start", server=existing_snapshot
         )
         if existing_health.get("ok"):
-            return _coordinated_start_server_local(options)
+            link = broker_lease_link_for_server(repository, name)
+            if link is None:
+                raise BrokerProfileError(
+                    "this healthy server belongs only to a legacy account authority; "
+                    "migrate it with `server register` from the listener-owning UID "
+                    "before treating it as host-wide"
+                )
+            result = _coordinated_start_server_local(options)
+            publication = publish_broker_server(
+                profile=profile,
+                repository=repository,
+                server_name=name,
+                broker_lease_id=link.broker_resource_id,
+                server=result,
+            )
+            return {
+                **result,
+                "broker": {
+                    "lease_id": link.broker_resource_id,
+                    "link_id": link.link_id,
+                    "status": link.status,
+                    "publication": publication,
+                },
+            }
 
     requested_port = options.get("preferred")
     if requested_port is None and assignment is not None:
@@ -6558,6 +6628,13 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
                         server_definition_id=str(result["id"])
                     )
                 )
+        publication = publish_broker_server(
+            profile=profile,
+            repository=repository,
+            server_name=name,
+            broker_lease_id=bound.broker_resource_id,
+            server=result,
+        )
     except BaseException as local_error:
         rollback_errors: list[str] = []
         if "result" in locals() and result.get("id"):
@@ -6622,6 +6699,7 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
             "operation_id": bound.broker_operation_id,
             "status": bound.status,
             "expires_at": broker_result.get("expires_at"),
+            "publication": publication,
         },
     }
 
@@ -7425,7 +7503,33 @@ def _coordinated_status_server_normalized(
                     health=health,
                     stopped_reason=reason,
                 )
-            return normalized_public_server(committed)
+            result = normalized_public_server(committed)
+            link = (
+                broker_lease_link_for_local(str(snapshot.get("lease_id")))
+                if snapshot.get("lease_id")
+                else None
+            )
+            if link is not None:
+                project = canonical_project(str(snapshot["project"]))
+                broker_context = configured_broker_context(project)
+                if broker_context is None:
+                    raise BrokerProfileError(
+                        "broker-linked server status cannot publish without the configured host broker"
+                    )
+                profile, repository = broker_context
+                publication = publish_broker_server(
+                    profile=profile,
+                    repository=repository,
+                    server_name=str(snapshot["name"]),
+                    broker_lease_id=link.broker_resource_id,
+                    server=result,
+                    stopped=result.get("status") == "stopped",
+                )
+                result["broker"] = {
+                    "lease_id": link.broker_resource_id,
+                    "publication": publication,
+                }
+            return result
         except NormalizedLifecycleConflict:
             if attempt == 2:
                 raise
@@ -7557,6 +7661,40 @@ def _coordinated_stop_server_normalized(
         )
     if broker_link is None:
         return normalized_public_server(committed)
+    broker_context = configured_broker_context(project)
+    if broker_context is None:
+        raise StructuredCoordinatorError(
+            "server stopped locally, but its server-wide lifecycle cannot be published",
+            {
+                "code": "broker_server_publication_pending",
+                "classification": "reconciliation_required",
+                "broker_lease_id": broker_link.broker_resource_id,
+                "server": normalized_public_server(committed),
+                "action_required": "Restore the enrolled broker profile and publish the stopped lifecycle before releasing the lease.",
+            },
+        )
+    profile, repository = broker_context
+    try:
+        publication = publish_broker_server(
+            profile=profile,
+            repository=repository,
+            server_name=str(snapshot["name"]),
+            broker_lease_id=broker_link.broker_resource_id,
+            server=normalized_public_server(committed),
+            stopped=True,
+        )
+    except BaseException as publication_error:
+        raise StructuredCoordinatorError(
+            "server stopped locally, but its server-wide lifecycle publication needs reconciliation",
+            {
+                "code": "broker_server_publication_pending",
+                "classification": "reconciliation_required",
+                "broker_lease_id": broker_link.broker_resource_id,
+                "server": normalized_public_server(committed),
+                "publication_error": coordinator_exception_payload(publication_error),
+                "action_required": "Keep the broker lease reserved; prove the listener remains stopped and retry exact publication before release.",
+            },
+        ) from publication_error
     try:
         broker_result = release_broker_lease_link(broker_link, rollback=False)
     except BaseException as release_error:
@@ -7603,6 +7741,7 @@ def _coordinated_stop_server_normalized(
         "lease_id": broker_link.broker_resource_id,
         "status": "released",
         "result": broker_result,
+        "publication": publication,
     }
     return result
 
@@ -8093,6 +8232,13 @@ def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
                         server_definition_id=str(result["id"])
                     )
                 )
+        publication = publish_broker_server(
+            profile=profile,
+            repository=repository,
+            server_name=name,
+            broker_lease_id=bound.broker_resource_id,
+            server=result,
+        )
     except BaseException as local_error:
         # The adopted process pre-existed the coordinator call and must never
         # be killed as rollback. If local registration did not commit, release
@@ -8121,6 +8267,7 @@ def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
             "operation_id": bound.broker_operation_id,
             "status": bound.status,
             "listener_identity": broker_result.get("listener_identity"),
+            "publication": publication,
         },
     }
 
@@ -8333,6 +8480,14 @@ def coordinated_build_inventory(
     backup_dirs: list[str] | None = None,
     stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
 ) -> dict[str, Any]:
+    if state_backend() != LEGACY_JSON_BACKEND:
+        profile = configured_broker_profile()
+        if profile is not None:
+            return broker_authority_inventory(
+                project=project,
+                include_docker=include_docker,
+                stats_history_limit=stats_history_limit,
+            )
     if state_backend() != LEGACY_JSON_BACKEND:
         return pure_normalized_inventory(
             project=project,
@@ -8858,17 +9013,30 @@ def pure_normalized_inventory(
     include_docker: bool = True,
     stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
 ) -> dict[str, Any]:
-    """Return one query-only account-store snapshot.
+    """Return one query-only authority snapshot.
 
     A missing database is represented as an empty normalized graph rather than
     being created by a read. `observe` is the explicit bootstrap/write path.
     """
+
+    profile = configured_broker_profile()
+    if profile is not None:
+        return broker_authority_inventory(
+            project=project,
+            include_docker=include_docker,
+            stats_history_limit=stats_history_limit,
+        )
 
     database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
     if not database_path.exists():
         return empty_normalized_inventory(project=project)
     with AccountStore.open_default_read_only(coordinator_home()) as store:
         result = store.inventory_v2()
+    result["authority"] = {
+        "scope": "service" if authority_mode() == "service" else "isolated-account",
+        "transport": "direct-private-store",
+        "state_path": str(database_path),
+    }
     result = filter_normalized_inventory_project(result, project)
     if not include_docker:
         result["docker"] = {"available": None, "containers": [], "postgres": []}
@@ -9240,14 +9408,25 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
     )
     servers = list(specification.get("servers") or [])
     compose = specification.get("compose")
+    if args.access_group:
+        try:
+            socket_gid = int(grp.getgrnam(str(args.access_group)).gr_gid)
+        except KeyError as error:
+            raise RuntimeError(
+                f"broker access group does not exist: {args.access_group}"
+            ) from error
+    else:
+        socket_gid = int(args.access_gid)
+    allowed_server_names = None if args.all_servers else tuple(args.server or ())
     result = enroll_repository(
         database_path=Path(str(args.database)).expanduser().absolute(),
         socket_path=Path(str(args.socket)).expanduser().absolute(),
-        socket_gid=int(args.access_gid),
+        socket_gid=socket_gid,
         client_uid=int(args.client_uid),
         account_id=str(args.account_id),
         canonical_root=project,
         servers=servers,
+        allowed_server_names=allowed_server_names,
         port_start=start_port,
         port_end=end_port,
         profile_path=profile_output.absolute(),
@@ -11281,15 +11460,64 @@ def configured_broker_context(
 ) -> tuple[BrokerClientProfile, BrokerRepositoryProfile] | None:
     """Resolve the root-provisioned broker for one canonical repository.
 
-    Absence means this host has not installed multi-user broker mode.  Once a
-    root-owned profile exists, missing/stale/spoofed repository data is an
-    error; host-global mutations never fall back to the per-user authority.
+    Server-wide mode is the product default and requires the root-provisioned
+    profile.  Account mode is an explicit compatibility/test scope.  Once a
+    profile exists, missing/stale/spoofed repository data is always an error;
+    host-global operations never fall back to a private account authority.
     """
 
-    profile = load_broker_profile()
+    mode = authority_mode()
+    if mode in {"account", "service"}:
+        return None
+    profile = load_broker_profile(required=mode == "system")
     if profile is None:
         return None
     return profile, profile.repository(canonical_project(project))
+
+
+def configured_broker_profile() -> BrokerClientProfile | None:
+    mode = authority_mode()
+    if mode in {"account", "service"}:
+        return None
+    return load_broker_profile(required=mode == "system")
+
+
+def broker_authority_inventory(
+    *,
+    project: str | None = None,
+    include_docker: bool = True,
+    stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
+) -> dict[str, Any]:
+    """Read the sole host authority without opening a client-local database."""
+
+    profile = configured_broker_profile()
+    if profile is None:
+        raise BrokerProfileError("server-wide broker authority is not configured")
+    result = profile.inventory()
+    if result.get("schema_version") != NORMALIZED_SCHEMA_VERSION:
+        raise BrokerError(
+            "invalid_reply", "Broker inventory omitted the normalized schema-v2 graph."
+        )
+    result = filter_normalized_inventory_project(result, project)
+    result["authority"] = {
+        "scope": "server-wide",
+        "transport": "authenticated-unix-socket",
+        "socket": str(profile.service.socket_path),
+        "service_uid": profile.service.service_uid,
+        "database_generation": profile.service.database_generation,
+    }
+    if not include_docker:
+        result["docker"] = {"available": None, "containers": [], "postgres": []}
+        result["postgres"] = []
+        result["v1_compatibility"]["docker"] = copy.deepcopy(result["docker"])
+        result["v1_compatibility"]["postgres"] = []
+    if stats_history_limit < DOCKER_STATS_HISTORY_LIMIT:
+        for container in result.get("docker", {}).get("containers", []):
+            history = list(container.get("stats_history") or [])
+            container["stats_history"] = (
+                history[-stats_history_limit:] if stats_history_limit else []
+            )
+    return result
 
 
 def _validated_broker_lease_result(result: dict[str, Any]) -> tuple[str, int, str, str | None]:
@@ -11307,6 +11535,63 @@ def _validated_broker_lease_result(result: dict[str, Any]) -> tuple[str, int, st
         raise BrokerError("invalid_reply", "Broker lease result has an invalid protocol.")
     expires_at = None if result.get("expires_at") is None else str(result["expires_at"])
     return lease_id, port, protocol, expires_at
+
+
+def publish_broker_server(
+    *,
+    profile: BrokerClientProfile,
+    repository: BrokerRepositoryProfile,
+    server_name: str,
+    broker_lease_id: str,
+    server: dict[str, Any],
+    stopped: bool = False,
+) -> dict[str, Any]:
+    """Publish one exact client lifecycle after service-side host proof."""
+
+    port = int(server.get("port") or 0)
+    if not 1 <= port <= 65535:
+        raise BrokerProfileError("broker-backed server publication has no valid port")
+    health = server.get("health") if isinstance(server.get("health"), dict) else {}
+    if stopped:
+        lifecycle = "stopped"
+        health_ok: bool | None = False
+        classification = str(
+            health.get("classification") or "stopped"
+        )
+    else:
+        health_ok = health.get("ok")
+        if health_ok is not None:
+            health_ok = bool(health_ok)
+        lifecycle = "running" if health_ok is True else "unhealthy"
+        classification = str(
+            health.get("classification")
+            or ("healthy" if health_ok else "unhealthy")
+        )
+    arguments: dict[str, Any] = {
+        "lease_id": broker_lease_id,
+        "lifecycle": lifecycle,
+        "listener_port": port,
+        "health_classification": classification,
+        "health_ok": health_ok,
+    }
+    if stopped:
+        arguments["stopped_reason"] = str(
+            server.get("stopped_reason") or "Stopped by coordinator"
+        )
+    else:
+        pid = server.get("pid")
+        if type(pid) is not int or pid <= 1:
+            raise BrokerProfileError(
+                "broker-backed running server publication has no exact process id"
+            )
+        arguments["pid"] = pid
+    operation_id, result = profile.call(
+        repository=repository,
+        resource_id=repository.server_id(server_name),
+        operation=BrokerOperation.SERVER_PUBLISH,
+        arguments=arguments,
+    )
+    return {"operation_id": operation_id, **result}
 
 
 def acquire_broker_lease_link(
@@ -12280,6 +12565,16 @@ def namespace_to_options(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def handle_cli(args: argparse.Namespace) -> Any:
+    if authority_mode() == "service":
+        allowed = args.group == "broker" or args.group == "inventory" or (
+            args.group == "state" and args.action == "show"
+        )
+        if not allowed:
+            raise PermissionError(
+                "service authority mode exposes only broker administration and "
+                "read-only inventory/state; it must never use client workload paths "
+                "to launch user-account processes"
+            )
     if args.group in {"repository", "resource"}:
         return handle_lifecycle_cli(
             args,
@@ -12787,6 +13082,17 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                         result = list_port_assignments(snapshot)
                     else:
                         result = list(snapshot["servers"].values())
+                elif configured_broker_profile() is not None:
+                    inventory = broker_authority_inventory(include_docker=False)
+                    compatibility = inventory["v1_compatibility"]
+                    if path == "/v1/state":
+                        result = inventory
+                    elif path == "/v1/ports":
+                        result = compatibility["leases"]
+                    elif path == "/v1/ports/assignments":
+                        result = compatibility["port_assignments"]
+                    else:
+                        result = compatibility["servers"]
                 elif path in {"/v1/ports", "/v1/ports/assignments"}:
                     with AccountStore.open_default(coordinator_home()) as store:
                         ports = NormalizedPortLifecycle(store)

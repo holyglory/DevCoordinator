@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -21,6 +22,20 @@ def parser() -> argparse.ArgumentParser:
 
 
 class LifecycleParserContractTests(unittest.TestCase):
+    def test_service_authority_rejects_user_workload_commands(self) -> None:
+        args = dev_coordinator.build_parser().parse_args(
+            ["server", "list"]
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {dev_coordinator.AUTHORITY_ENV: "service"},
+                clear=False,
+            ),
+            self.assertRaisesRegex(PermissionError, "must never use client workload"),
+        ):
+            dev_coordinator.handle_cli(args)
+
     def test_production_cli_registers_lifecycle_and_broker_dispatch_groups(self) -> None:
         value = dev_coordinator.build_parser()
         commands = (
@@ -201,6 +216,7 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertFalse(result["starts_resources"])
         call = enroll.call_args.kwargs
         self.assertEqual(call["servers"], [])
+        self.assertEqual(call["allowed_server_names"], ())
         self.assertEqual(call["compose"], compose)
         self.assertIs(call["observe_host"], dev_coordinator.observe_broker_service_store_for_enrollment)
 

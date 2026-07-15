@@ -38,7 +38,10 @@ from typing import Any, Callable, FrozenSet, Iterable, Mapping, Optional, Protoc
 
 
 PROTOCOL_VERSION = 1
-DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024
+# Inventory is a bounded whole-host graph.  Keep the local protocol bounded,
+# but size it for a real multi-repository machine rather than a mutation-sized
+# reply.  Reads are not retained in the mutation replay cache.
+DEFAULT_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_SOCKET_MODE = 0o660
 DEFAULT_MAX_CLIENTS = 32
@@ -54,12 +57,14 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class BrokerOperation(str, Enum):
-    """The complete set of mutations accepted from broker clients."""
+    """The complete typed operation set accepted from broker clients."""
 
     PORT_LEASE = "port.lease"
     PORT_RELEASE = "port.release"
     PORT_ASSIGN = "port.assign"
     PORT_UNASSIGN = "port.unassign"
+    INVENTORY_READ = "inventory.read"
+    SERVER_PUBLISH = "server.publish"
     DOCKER_START = "docker.start"
     DOCKER_STOP = "docker.stop"
     DOCKER_RESTART = "docker.restart"
@@ -571,6 +576,13 @@ class SerializedMutationWriter:
             )
 
     def execute(self, request: AuthorizedBrokerRequest) -> dict[str, Any]:
+        if request.request.operation == BrokerOperation.INVENTORY_READ:
+            # A query-only snapshot does not need the mutation lock, durable
+            # idempotency journal, or completed-result cache.  Avoid retaining
+            # up to one full host graph per caller in broker memory.
+            return _normalize_backend_result(
+                self._backend.execute(request), max_bytes=self._max_result_bytes
+            )
         fingerprint = _request_fingerprint(request)
         with self._metrics_condition:
             self._waiting_count += 1
@@ -1358,6 +1370,111 @@ def _validate_arguments(
                 operation_id=operation_id,
             )
         return {}
+
+    if operation == BrokerOperation.INVENTORY_READ:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Host inventory accepts no client-controlled arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
+    if operation == BrokerOperation.SERVER_PUBLISH:
+        allowed = {
+            "lease_id",
+            "lifecycle",
+            "pid",
+            "listener_port",
+            "health_classification",
+            "health_ok",
+            "stopped_reason",
+        }
+        unexpected = sorted(set(value) - allowed)
+        if unexpected:
+            raise BrokerError(
+                "invalid_arguments",
+                "Server publication contains unsupported arguments: "
+                + ", ".join(unexpected)
+                + ".",
+                operation_id=operation_id,
+            )
+        required = {"lease_id", "lifecycle", "listener_port", "health_classification", "health_ok"}
+        if not required.issubset(value):
+            raise BrokerError(
+                "invalid_arguments",
+                "Server publication requires lease_id, lifecycle, listener_port, health_classification, and health_ok.",
+                operation_id=operation_id,
+            )
+        lease_id = _opaque_argument(value["lease_id"], "lease_id", operation_id)
+        lifecycle = value["lifecycle"]
+        if lifecycle not in {"running", "unhealthy", "stopped"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Server lifecycle must be running, unhealthy, or stopped.",
+                operation_id=operation_id,
+            )
+        port = value["listener_port"]
+        if not _is_exact_int(port) or not 1 <= port <= 65535:
+            raise BrokerError(
+                "invalid_arguments",
+                "listener_port must be an integer from 1 through 65535.",
+                operation_id=operation_id,
+            )
+        classification = value["health_classification"]
+        if (
+            not isinstance(classification, str)
+            or not classification
+            or classification != classification.strip()
+            or len(classification.encode("utf-8")) > 128
+            or "\x00" in classification
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "health_classification must be one bounded non-empty string.",
+                operation_id=operation_id,
+            )
+        health_ok = value["health_ok"]
+        if health_ok is not None and type(health_ok) is not bool:
+            raise BrokerError(
+                "invalid_arguments",
+                "health_ok must be a boolean or null.",
+                operation_id=operation_id,
+            )
+        normalized = {
+            "lease_id": lease_id,
+            "lifecycle": lifecycle,
+            "listener_port": port,
+            "health_classification": classification,
+            "health_ok": health_ok,
+        }
+        pid = value.get("pid")
+        if lifecycle == "stopped":
+            if pid is not None:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Stopped server publication must not claim a live pid.",
+                    operation_id=operation_id,
+                )
+            normalized["stopped_reason"] = _bounded_reason(
+                value.get("stopped_reason") or "Stopped by coordinator",
+                operation_id,
+            )
+        else:
+            if not _is_exact_int(pid) or pid <= 1:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Running server publication requires one positive non-system pid.",
+                    operation_id=operation_id,
+                )
+            if "stopped_reason" in value:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Running server publication cannot include stopped_reason.",
+                    operation_id=operation_id,
+                )
+            normalized["pid"] = pid
+        return normalized
 
     if operation in {BrokerOperation.COMPOSE_UP, BrokerOperation.COMPOSE_DOWN}:
         if value:

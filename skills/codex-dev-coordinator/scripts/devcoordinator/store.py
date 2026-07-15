@@ -263,6 +263,39 @@ def _validate_private_sqlite_sidecars(database_path: Path, expected_uid: int) ->
             )
 
 
+def _sqlite_sidecars_exist(database_path: Path) -> bool:
+    return any(
+        sidecar.exists() or sidecar.is_symlink()
+        for sidecar in (Path(f"{database_path}-wal"), Path(f"{database_path}-shm"))
+    )
+
+
+def _immutable_main_schema_version(database_path: Path) -> int | None:
+    """Read only the main file without allowing SQLite to create WAL sidecars."""
+
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA trusted_schema = OFF")
+        row = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return None
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        connection.close()
+
+
 def _precreate_private_file(path: Path, expected_uid: int) -> os.stat_result:
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -518,6 +551,25 @@ class CoordinatorStore:
         )
         try:
             _validate_private_sqlite_sidecars(database_path, uid)
+            if not _sqlite_sidecars_exist(database_path):
+                # SQLite may create empty WAL/SHM files merely while opening a
+                # WAL database read-only. Reject a stale main-file schema first
+                # through an immutable connection, but trust that result only
+                # if no writer created sidecars during the check. The normal
+                # opener below still rechecks the live WAL-aware schema.
+                main_schema_version = _immutable_main_schema_version(database_path)
+                after_preflight = _validate_private_file(database_path, uid)
+                if (
+                    main_schema_version is not None
+                    and main_schema_version != SCHEMA_VERSION
+                    and not _sqlite_sidecars_exist(database_path)
+                    and (before.st_dev, before.st_ino)
+                    == (after_preflight.st_dev, after_preflight.st_ino)
+                ):
+                    raise StoreError(
+                        f"unsupported coordinator database schema {main_schema_version}; "
+                        f"expected {SCHEMA_VERSION}"
+                    )
             connection = sqlite3.connect(
                 f"{database_path.as_uri()}?mode=ro",
                 uri=True,
