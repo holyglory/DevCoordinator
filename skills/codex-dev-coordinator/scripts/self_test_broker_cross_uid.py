@@ -840,6 +840,32 @@ def _spawn_public_journey(
                     str(account_home),
                 ]
             )
+            with CoordinatorStore.open(
+                account_home / "coordinator.sqlite3", expected_uid=FIRST_UID
+            ) as store:
+                with store.read_transaction() as connection:
+                    local_installation = connection.execute(
+                        """
+                        SELECT status, startup_fenced
+                        FROM repository_installations WHERE repo_id = ?
+                        """,
+                        (repo_id,),
+                    ).fetchone()
+                    local_retirement = connection.execute(
+                        """
+                        SELECT status FROM resource_retirements
+                        WHERE host_resource_id = ?
+                        """,
+                        (ORPHAN_CONTAINER_ID,),
+                    ).fetchone()
+                    lifecycle_links = list(
+                        connection.execute(
+                            """
+                            SELECT operation, status FROM broker_lifecycle_links
+                            ORDER BY operation
+                            """
+                        )
+                    )
             _write_framed_result(
                 result_write,
                 {
@@ -856,6 +882,14 @@ def _spawn_public_journey(
                     "removed_ids": [row["repo_id"] for row in removed_rows],
                     "final_reconcile": final_reconcile,
                     "docker_poisoned": poison_sentinel.exists(),
+                    "local_installation": [
+                        local_installation["status"],
+                        local_installation["startup_fenced"],
+                    ],
+                    "local_retirement": local_retirement["status"],
+                    "lifecycle_links": [
+                        [row["operation"], row["status"]] for row in lifecycle_links
+                    ],
                 },
             )
             os._exit(0)
@@ -1048,40 +1082,17 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
             )
             self.assertEqual(retirement["status"], "retired")
 
-            with CoordinatorStore.open(
-                account_home / "coordinator.sqlite3", expected_uid=FIRST_UID
-            ) as store:
-                with store.read_transaction() as connection:
-                    local_installation = connection.execute(
-                        """
-                        SELECT status, startup_fenced
-                        FROM repository_installations WHERE repo_id = ?
-                        """,
-                        (repo_id,),
-                    ).fetchone()
-                    local_retirement = connection.execute(
-                        """
-                        SELECT status FROM resource_retirements
-                        WHERE host_resource_id = ?
-                        """,
-                        (ORPHAN_CONTAINER_ID,),
-                    ).fetchone()
-                    lifecycle_links = list(
-                        connection.execute(
-                            "SELECT operation, status FROM broker_lifecycle_links"
-                        )
-                    )
             self.assertEqual(
-                (local_installation["status"], local_installation["startup_fenced"]),
-                ("disabled", 1),
+                result["local_installation"],
+                ["disabled", 1],
             )
-            self.assertEqual(local_retirement["status"], "retired")
+            self.assertEqual(result["local_retirement"], "retired")
             self.assertEqual(
-                {(row["operation"], row["status"]) for row in lifecycle_links},
-                {
-                    ("resource.retire", "applied"),
-                    ("repository.remove", "applied"),
-                },
+                result["lifecycle_links"],
+                [
+                    ["repository.remove", "applied"],
+                    ["resource.retire", "applied"],
+                ],
             )
         finally:
             if runtime is not None:
