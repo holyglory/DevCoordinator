@@ -13,6 +13,7 @@ import time
 import unittest
 from unittest import mock
 
+from devcoordinator import store as store_module
 from devcoordinator import legacy_import as legacy_import_module
 from devcoordinator.legacy_import import LegacyImportError, LegacySourceChanged
 from devcoordinator.store import (
@@ -256,6 +257,50 @@ class StoreTests(unittest.TestCase):
                     pass
         self.assertEqual(before, database.read_bytes())
 
+    def test_read_only_opener_enables_query_only_before_any_other_sql(self) -> None:
+        with self.open_store() as store:
+            store.ensure_local_host()
+        database = self.store_home / "coordinator.sqlite3"
+        real_connect = store_module.sqlite3.connect
+        statements: list[list[str]] = []
+
+        class RecordingConnection:
+            def __init__(self, connection, connection_statements: list[str]) -> None:
+                object.__setattr__(self, "connection", connection)
+                object.__setattr__(self, "statements", connection_statements)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def __setattr__(self, name, value) -> None:
+                if name in {"connection", "statements"}:
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self.connection, name, value)
+
+            def execute(self, sql, *args, **kwargs):
+                self.statements.append(str(sql).strip().lower())
+                return self.connection.execute(sql, *args, **kwargs)
+
+        def connect_recording(*args, **kwargs):
+            connection_statements: list[str] = []
+            statements.append(connection_statements)
+            return RecordingConnection(real_connect(*args, **kwargs), connection_statements)
+
+        with mock.patch.object(
+            store_module.sqlite3,
+            "connect",
+            side_effect=connect_recording,
+        ):
+            with AccountStore.open_read_only(database) as store:
+                store.connection.execute("PRAGMA query_only = OFF")
+                with self.assertRaises(sqlite3.OperationalError):
+                    store.connection.execute(
+                        "UPDATE schema_metadata SET state_revision = 99 WHERE singleton = 1"
+                    )
+        self.assertTrue(statements)
+        self.assertTrue(all(items[0] == "pragma query_only = on" for items in statements))
+
     def test_read_only_opener_never_creates_missing_maintenance_lock(self) -> None:
         with self.open_store() as store:
             store.ensure_local_host()
@@ -278,9 +323,11 @@ class StoreTests(unittest.TestCase):
         finally:
             connection.close()
         before = database.read_bytes()
+        before_files = {path.name for path in self.store_home.iterdir()}
         with self.assertRaisesRegex(StoreError, "journal mode is delete; expected wal"):
             AccountStore.open_read_only(database)
         self.assertEqual(before, database.read_bytes())
+        self.assertEqual(before_files, {path.name for path in self.store_home.iterdir()})
         verification = sqlite3.connect(
             f"{database.as_uri()}?mode=ro",
             uri=True,

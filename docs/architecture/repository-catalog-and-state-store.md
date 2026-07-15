@@ -425,8 +425,19 @@ parallel work.
 
 State revision changes only for control-state mutations. Observation revision
 changes only when an observation transaction commits a material difference or
-a retained telemetry sample. A pure inventory read leaves file metadata,
-database counters, and revisions unchanged.
+a retained telemetry sample. A pure inventory read leaves logical database
+content, counters, revisions, and the canonical database and maintenance-lock
+identities and bytes unchanged. The read path may create private same-account
+`-wal`/`-shm` coordination files when opening a WAL database whose sidecars are
+absent. An unexposed existing-only `mode=rw` bootstrap makes `query_only` its
+first SQL statement, lets SQLite create sidecars under its own locks, and stays
+open until the real `mode=ro` reader attaches. Only the VFS-enforced read-only
+connection reaches inventory and schema/data reads, so closing inventory cannot
+checkpoint or truncate an orphaned committed WAL. The files are validated
+again after first WAL access and before schema data is trusted, and the
+stabilized set is reused on repeated reads. A non-WAL store is rejected without
+a stray WAL artifact. If journal access and that security check both fail, the
+top-level error retains both causes, including any cleanup failures.
 
 ## Telemetry retention
 

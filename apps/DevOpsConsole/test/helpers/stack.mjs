@@ -43,6 +43,11 @@ import { DEV_CERT, DEV_KEY, ensureDevCert } from './dev-cert.mjs';
 
 const execFileAsync = promisify(execFile);
 
+async function canonicalTempDir(prefix) {
+  const created = await fsp.mkdtemp(path.join(os.tmpdir(), prefix));
+  return fsp.realpath(created);
+}
+
 // ---------------------------------------------------------------------------
 // Cookie jar (browser-style: Domain cookies match by suffix, ports ignored)
 // ---------------------------------------------------------------------------
@@ -566,9 +571,9 @@ export async function startStack({
   };
 
   try {
-    const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-state-'));
+    const stateDir = await canonicalTempDir('devops-console-e2e-state-');
     cleanups.push(() => fsp.rm(stateDir, { recursive: true, force: true }));
-    const coordHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-coord-'));
+    const coordHome = await canonicalTempDir('devops-console-e2e-coord-');
     cleanups.push(() => fsp.rm(coordHome, { recursive: true, force: true }));
 
     const issuer = await startIssuer({ clientId: 'test-client', clientSecret: 'test-secret', claims });

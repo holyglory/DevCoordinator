@@ -344,6 +344,81 @@ def _acquire_maintenance_descriptor(
         raise
 
 
+def _cleanup_failed_store_open(
+    database_path: Path,
+    expected_uid: int,
+    connections: Iterable[tuple[str, Any]],
+    maintenance_descriptor: int,
+) -> list[tuple[str, BaseException]]:
+    """Release every failed-open resource while retaining all cleanup errors."""
+
+    failures: list[tuple[str, BaseException]] = []
+    operations = [
+        (
+            "SQLite sidecar validation",
+            lambda: _validate_private_sqlite_sidecars(database_path, expected_uid),
+        ),
+    ]
+    for label, connection in connections:
+        if connection is not None:
+            operations.append((label, connection.close))
+    operations.extend(
+        [
+            (
+                "maintenance lock release",
+                lambda: fcntl.flock(maintenance_descriptor, fcntl.LOCK_UN),
+            ),
+            ("maintenance descriptor close", lambda: os.close(maintenance_descriptor)),
+        ]
+    )
+    for label, operation in operations:
+        try:
+            operation()
+        except BaseException as error:
+            failures.append((label, error))
+    return failures
+
+
+def _raise_combined_open_failure(
+    primary_error: BaseException,
+    cleanup_failures: list[tuple[str, BaseException]],
+) -> None:
+    detail = "; ".join(
+        f"{label}: {type(error).__name__}: {error}"
+        for label, error in cleanup_failures
+    )
+    raise StoreError(
+        f"{type(primary_error).__name__}: {primary_error}; "
+        f"coordinator store open cleanup also failed: {detail}"
+    ) from primary_error
+
+
+def _read_validated_journal_mode(
+    connection: Any,
+    database_path: Path,
+    expected_uid: int,
+) -> str:
+    """Read WAL mode and validate any sidecars materialized by that access."""
+
+    try:
+        journal_row = connection.execute("PRAGMA journal_mode").fetchone()
+    except BaseException as journal_error:
+        try:
+            _validate_private_sqlite_sidecars(database_path, expected_uid)
+        except BaseException as validation_error:
+            raise StoreError(
+                "coordinator journal-mode read failed: "
+                f"{type(journal_error).__name__}: {journal_error}; "
+                "post-journal SQLite sidecar validation also failed: "
+                f"{type(validation_error).__name__}: {validation_error}"
+            ) from journal_error
+        raise
+    _validate_private_sqlite_sidecars(database_path, expected_uid)
+    if journal_row is None:
+        raise StoreError("coordinator database journal mode is missing")
+    return str(journal_row[0]).lower()
+
+
 @contextmanager
 def exclusive_maintenance_lock(
     database_path: str | os.PathLike[str],
@@ -489,13 +564,16 @@ class CoordinatorStore:
         expected_uid: int | None = None,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     ) -> "CoordinatorStore":
-        """Open an existing current-schema store without any durable mutation.
+        """Open an existing current-schema store without logical-state mutation.
 
         This path never creates the database or maintenance lock, never runs
         schema initialization/upgrades, and never requests a journal-mode
-        transition. SQLite itself receives a ``mode=ro`` URI, while the same
-        private ownership, inode, sidecar, and maintenance-lock boundaries as
-        the writable opener remain enforced.
+        transition. The returned SQLite connection always uses ``mode=ro``.
+        When a WAL-mode database has no WAL file, a temporary existing-only
+        ``mode=rw`` connection lets SQLite create its coordination sidecars,
+        establishes the real read-only connection, and closes before inventory
+        code can run. ``query_only`` is the first SQL statement on both, and
+        sidecars retain the writable opener's private security boundaries.
         """
 
         database_path = _absolute_path(path)
@@ -516,29 +594,56 @@ class CoordinatorStore:
             timeout_seconds=int(busy_timeout_ms) / 1000.0,
             create=False,
         )
+        bootstrap = None
+        connection = None
         try:
             _validate_private_sqlite_sidecars(database_path, uid)
+            wal_path = Path(f"{database_path}-wal")
+            if not wal_path.exists():
+                # Darwin cannot attach a read-only WAL connection when the WAL
+                # file is absent. A temporary, unexposed connection lets SQLite
+                # create its own locked sidecars without ad-hoc file races.
+                bootstrap = sqlite3.connect(
+                    f"{database_path.as_uri()}?mode=rw",
+                    uri=True,
+                    timeout=int(busy_timeout_ms) / 1000.0,
+                    isolation_level=None,
+                )
+                bootstrap.execute("PRAGMA query_only = ON")
+                bootstrap.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+                bootstrap.execute("PRAGMA trusted_schema = OFF")
+                bootstrap_mode = _read_validated_journal_mode(
+                    bootstrap,
+                    database_path,
+                    uid,
+                )
+                if bootstrap_mode != "wal":
+                    raise StoreError(
+                        f"coordinator database journal mode is {bootstrap_mode}; expected wal"
+                    )
             connection = sqlite3.connect(
                 f"{database_path.as_uri()}?mode=ro",
                 uri=True,
                 timeout=int(busy_timeout_ms) / 1000.0,
                 isolation_level=None,
             )
-        except BaseException:
-            fcntl.flock(maintenance_descriptor, fcntl.LOCK_UN)
-            os.close(maintenance_descriptor)
-            raise
-        connection.row_factory = sqlite3.Row
-        try:
+            _validate_private_sqlite_sidecars(database_path, uid)
+            connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only = ON")
             connection.execute("PRAGMA foreign_keys = ON")
             if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
                 raise StoreError("SQLite foreign key enforcement could not be enabled")
             connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
             connection.execute("PRAGMA trusted_schema = OFF")
-            mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            mode = _read_validated_journal_mode(connection, database_path, uid)
             if mode != "wal":
                 raise StoreError(f"coordinator database journal mode is {mode}; expected wal")
+            # Keep the bootstrap alive until the real read-only connection has
+            # attached to WAL. Its successful close precedes all schema/data
+            # reads, and only the VFS-enforced read-only handle is returned.
+            if bootstrap is not None:
+                bootstrap.close()
+                bootstrap = None
             try:
                 row = connection.execute(
                     "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
@@ -569,10 +674,18 @@ class CoordinatorStore:
             )
             store._secure_sidecars()
             return store
-        except BaseException:
-            connection.close()
-            fcntl.flock(maintenance_descriptor, fcntl.LOCK_UN)
-            os.close(maintenance_descriptor)
+        except BaseException as primary_error:
+            cleanup_failures = _cleanup_failed_store_open(
+                database_path,
+                uid,
+                (
+                    ("SQLite bootstrap connection close", bootstrap),
+                    ("SQLite read-only connection close", connection),
+                ),
+                maintenance_descriptor,
+            )
+            if cleanup_failures:
+                _raise_combined_open_failure(primary_error, cleanup_failures)
             raise
 
     def _require_open(self) -> None:

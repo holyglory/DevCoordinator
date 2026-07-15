@@ -30,6 +30,11 @@ import { wsAcceptFor } from './helpers/ws-echo.mjs';
 
 const FIXTURE_EMAIL = 'ja@vr.ae';
 
+async function canonicalTempDir(prefix) {
+  const created = await fsp.mkdtemp(path.join(os.tmpdir(), prefix));
+  return fsp.realpath(created);
+}
+
 // macOS CI runners hang `python3 -m http.server` in getfqdn() before it ever
 // listens; this equivalent fixture uses plain socketserver.TCPServer (same
 // directory listing, no name resolution). {port} is the coordinator template.
@@ -157,7 +162,7 @@ else:
 
   before(async () => {
     dockerWeb = await startDockerWebBackend();
-    const fakeBin = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-dockerbin-'));
+    const fakeBin = await canonicalTempDir('devops-console-e2e-dockerbin-');
     extraTempDirs.push(fakeBin);
     dockerCallsLog = path.join(fakeBin, 'docker-calls.log');
     await writeFakeDocker(fakeBin, dockerWeb.port, dockerCallsLog);
@@ -620,7 +625,7 @@ else:
     const jar = await authedJar();
 
     // A real throwaway project repo for coordinator attribution.
-    const projectDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-project-'));
+    const projectDir = await canonicalTempDir('devops-console-e2e-project-');
     extraTempDirs.push(projectDir);
     execFileSync('git', ['-C', projectDir, 'init', '-q']);
     const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], {
@@ -694,7 +699,7 @@ else:
   it('9b. per-server subdomain: assign / change / remove via /api/servers/subdomain; Origin enforced', { timeout: 120_000 }, async () => {
     const jar = await authedJar();
 
-    const projectDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-subdomain-'));
+    const projectDir = await canonicalTempDir('devops-console-e2e-subdomain-');
     extraTempDirs.push(projectDir);
     execFileSync('git', ['-C', projectDir, 'init', '-q']);
     const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
@@ -867,7 +872,7 @@ else:
 
     // The metrics sampler and the overview piggyback both feed the store; a
     // running coordinator server must eventually produce a charted entity.
-    const projectDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-metrics-'));
+    const projectDir = await canonicalTempDir('devops-console-e2e-metrics-');
     extraTempDirs.push(projectDir);
     execFileSync('git', ['-C', projectDir, 'init', '-q']);
     const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], {
@@ -959,7 +964,7 @@ else:
   it('13. durable port pins: server start pins its port -> survives stop -> unassign via console API', { timeout: 120_000 }, async () => {
     const jar = await authedJar();
 
-    const projectDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-pins-'));
+    const projectDir = await canonicalTempDir('devops-console-e2e-pins-');
     extraTempDirs.push(projectDir);
     execFileSync('git', ['-C', projectDir, 'init', '-q']);
     const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], {
@@ -1133,7 +1138,7 @@ else:
   it('15. project runtime control via console: start whole project -> members running -> stop', { timeout: 180_000 }, async () => {
     const jar = await authedJar();
 
-    const projectDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-e2e-projact-'));
+    const projectDir = await canonicalTempDir('devops-console-e2e-projact-');
     extraTempDirs.push(projectDir);
     execFileSync('git', ['-C', projectDir, 'init', '-q']);
     const toplevel = execFileSync('git', ['-C', projectDir, 'rev-parse', '--show-toplevel'], {

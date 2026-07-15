@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -28,6 +30,7 @@ from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.repository_lifecycle import ResourceKind
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
+import devcoordinator.store as store_module
 from devcoordinator.store import AccountStore, StoreError, deterministic_id, utc_timestamp
 
 
@@ -176,10 +179,11 @@ class SQLiteCutoverTests(unittest.TestCase):
         self.assertEqual(before_bytes, database.read_bytes())
 
     def test_pure_inventory_rejects_v1_without_upgrading_or_changing_database_bytes(self) -> None:
-        with AccountStore.open_default(self.home) as store:
+        source_home = self.root / "stale-schema-source"
+        with AccountStore.open_default(source_home) as store:
             store.ensure_local_host()
-        database = self.home / "coordinator.sqlite3"
-        legacy = sqlite3.connect(str(database), isolation_level=None)
+        source_database = source_home / "coordinator.sqlite3"
+        legacy = sqlite3.connect(str(source_database), isolation_level=None)
         try:
             legacy.execute("BEGIN IMMEDIATE")
             legacy.execute("DROP TABLE startup_policy_restore_states")
@@ -187,15 +191,57 @@ class SQLiteCutoverTests(unittest.TestCase):
                 "UPDATE schema_metadata SET schema_version = 1 WHERE singleton = 1"
             )
             legacy.commit()
+            checkpoint = legacy.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            self.assertEqual(checkpoint[0], 0, "isolated v1 fixture did not checkpoint cleanly")
         finally:
             legacy.close()
 
+        # Copy only the checkpointed canonical files into the test-owned
+        # target. This deterministically starts without WAL/SHM sidecars on
+        # every platform while preserving a real WAL-mode database.
+        self.home.mkdir(mode=0o700)
+        database = self.home / "coordinator.sqlite3"
+        database.write_bytes(source_database.read_bytes())
+        database.chmod(0o600)
+        maintenance_lock = self.home / ".coordinator-maintenance.lock"
+        maintenance_lock.write_bytes((source_home / ".coordinator-maintenance.lock").read_bytes())
+        maintenance_lock.chmod(0o600)
+
         before_bytes = database.read_bytes()
-        before_files = sorted(path.name for path in self.home.iterdir())
+        before_files = {path.name for path in self.home.iterdir()}
+        self.assertEqual(
+            before_files,
+            {".coordinator-maintenance.lock", "coordinator.sqlite3"},
+            "stale-schema fixture unexpectedly retained SQLite sidecars",
+        )
         with self.assertRaisesRegex(StoreError, "unsupported coordinator database schema 1"):
             coordinator.pure_normalized_inventory()
         self.assertEqual(before_bytes, database.read_bytes())
-        self.assertEqual(before_files, sorted(path.name for path in self.home.iterdir()))
+        after_files = {path.name for path in self.home.iterdir()}
+        self.assertLessEqual(before_files, after_files, "read-only inventory removed durable files")
+        added = after_files - before_files
+        self.assertLessEqual(
+            added,
+            {"coordinator.sqlite3-shm", "coordinator.sqlite3-wal"},
+            f"read-only inventory created non-SQLite files: {sorted(added)}",
+        )
+        for name in added:
+            metadata = (self.home / name).lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode), f"unsafe SQLite sidecar: {name}")
+            self.assertEqual(metadata.st_uid, os.geteuid(), f"foreign SQLite sidecar: {name}")
+            self.assertEqual(
+                stat.S_IMODE(metadata.st_mode),
+                0o600,
+                f"non-private SQLite sidecar: {name}",
+            )
+        with self.assertRaisesRegex(StoreError, "unsupported coordinator database schema 1"):
+            coordinator.pure_normalized_inventory()
+        self.assertEqual(
+            after_files,
+            {path.name for path in self.home.iterdir()},
+            "a repeated read-only inventory did not stabilize its coordination files",
+        )
+        self.assertEqual(before_bytes, database.read_bytes())
 
         verification = sqlite3.connect(
             f"{database.as_uri()}?mode=ro",
@@ -219,6 +265,300 @@ class SQLiteCutoverTests(unittest.TestCase):
             )
         finally:
             verification.close()
+
+    def test_read_only_open_revalidates_sidecars_after_first_wal_access(self) -> None:
+        source_home = self.root / "post-journal-source"
+        with AccountStore.open_default(source_home) as store:
+            store.ensure_local_host()
+            checkpoint = store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            self.assertEqual(checkpoint[0], 0, "post-journal fixture did not checkpoint cleanly")
+
+        self.home.mkdir(mode=0o700)
+        database = self.home / "coordinator.sqlite3"
+        database.write_bytes((source_home / "coordinator.sqlite3").read_bytes())
+        database.chmod(0o600)
+        maintenance_lock = self.home / ".coordinator-maintenance.lock"
+        maintenance_lock.write_bytes((source_home / ".coordinator-maintenance.lock").read_bytes())
+        maintenance_lock.chmod(0o600)
+
+        real_validator = store_module._validate_private_sqlite_sidecars
+        materialized_validation_count = 0
+
+        def reject_materialized_shm(database_path: Path, expected_uid: int) -> None:
+            nonlocal materialized_validation_count
+            real_validator(database_path, expected_uid)
+            shm = Path(f"{database_path}-shm")
+            if (
+                materialized_validation_count == 0
+                and shm.is_file()
+                and shm.stat().st_size > 0
+            ):
+                materialized_validation_count += 1
+                raise PermissionError("injected unsafe materialized SQLite SHM")
+
+        with mock.patch.object(
+            store_module,
+            "_validate_private_sqlite_sidecars",
+            side_effect=reject_materialized_shm,
+        ):
+            with self.assertRaisesRegex(
+                PermissionError,
+                "injected unsafe materialized SQLite SHM",
+            ):
+                AccountStore.open_default_read_only(self.home)
+        self.assertEqual(
+            materialized_validation_count,
+            1,
+            "read-only open skipped validation after first WAL access",
+        )
+
+        # The rejected open must close its SQLite connection and release its
+        # shared maintenance descriptor so a subsequent clean open succeeds.
+        with AccountStore.open_default_read_only(self.home) as store:
+            self.assertEqual(store.metadata.schema_version, 2)
+
+    def test_read_only_open_reports_journal_and_sidecar_failures_together(self) -> None:
+        with AccountStore.open_default(self.home) as store:
+            store.ensure_local_host()
+
+        real_connect = store_module.sqlite3.connect
+        real_validator = store_module._validate_private_sqlite_sidecars
+        real_flock = store_module.fcntl.flock
+        real_os_close = store_module.os.close
+        state = {
+            "journal_failed": False,
+            "connection_closed": False,
+            "maintenance_unlocked": False,
+            "descriptor_closed": False,
+        }
+
+        class JournalFailureConnection:
+            def __init__(self, connection) -> None:
+                object.__setattr__(self, "connection", connection)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def __setattr__(self, name, value) -> None:
+                if name == "connection":
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self.connection, name, value)
+
+            def execute(self, sql, *args, **kwargs):
+                if str(sql).strip().lower() == "pragma journal_mode":
+                    state["journal_failed"] = True
+                    raise sqlite3.OperationalError("injected journal read failure")
+                return self.connection.execute(sql, *args, **kwargs)
+
+            def close(self) -> None:
+                self.connection.close()
+                state["connection_closed"] = True
+                raise OSError("injected connection close failure")
+
+        def fail_validation_after_journal(database_path: Path, expected_uid: int) -> None:
+            real_validator(database_path, expected_uid)
+            if state["journal_failed"]:
+                raise PermissionError("injected post-journal validation failure")
+
+        def connect_with_journal_failure(*args, **kwargs):
+            return JournalFailureConnection(real_connect(*args, **kwargs))
+
+        def unlock_then_fail(descriptor: int, operation: int):
+            result = real_flock(descriptor, operation)
+            if operation == store_module.fcntl.LOCK_UN:
+                state["maintenance_unlocked"] = True
+                raise OSError("injected maintenance unlock failure")
+            return result
+
+        def track_descriptor_close(descriptor: int) -> None:
+            real_os_close(descriptor)
+            state["descriptor_closed"] = True
+
+        with mock.patch.object(
+            store_module.sqlite3,
+            "connect",
+            side_effect=connect_with_journal_failure,
+        ):
+            with mock.patch.object(
+                store_module,
+                "_validate_private_sqlite_sidecars",
+                side_effect=fail_validation_after_journal,
+            ):
+                with mock.patch.object(
+                    store_module.fcntl,
+                    "flock",
+                    side_effect=unlock_then_fail,
+                ):
+                    with mock.patch.object(
+                        store_module.os,
+                        "close",
+                        side_effect=track_descriptor_close,
+                    ):
+                        with self.assertRaisesRegex(
+                            StoreError,
+                            "injected journal read failure.*"
+                            "injected post-journal validation failure.*"
+                            "injected connection close failure.*"
+                            "injected maintenance unlock failure",
+                        ):
+                            AccountStore.open_default_read_only(self.home)
+
+        self.assertTrue(state["connection_closed"])
+        self.assertTrue(state["maintenance_unlocked"])
+        self.assertTrue(state["descriptor_closed"])
+
+        with AccountStore.open_default_read_only(self.home) as store:
+            self.assertEqual(store.metadata.schema_version, 2)
+
+    def test_pure_inventory_reads_committed_wal_without_changing_database_files(self) -> None:
+        now = "2026-07-15T12:00:00Z"
+        database = self.home / "coordinator.sqlite3"
+        wal = Path(f"{database}-wal")
+        maintenance_lock = self.home / ".coordinator-maintenance.lock"
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            store.connection.execute("PRAGMA wal_autocheckpoint = 0")
+            checkpoint = store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            self.assertEqual(checkpoint[0], 0, "WAL visibility fixture did not checkpoint cleanly")
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES ('repo-wal-only',?,'/repo/wal-only','WAL Only','active',0,?,?)
+                    """,
+                    (host_id, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, actor, updated_at
+                    ) VALUES ('repo-wal-only','installed',0,0,'test',?)
+                    """,
+                    (now,),
+                )
+
+            self.assertTrue(wal.is_file() and wal.stat().st_size > 0, "fixture has no WAL frames")
+            main_only = self.root / "checkpointed-main-only.sqlite3"
+            main_only.write_bytes(database.read_bytes())
+            main_view = sqlite3.connect(
+                f"{main_only.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+                isolation_level=None,
+            )
+            try:
+                self.assertIsNone(
+                    main_view.execute(
+                        "SELECT 1 FROM repositories WHERE repo_id = 'repo-wal-only'"
+                    ).fetchone(),
+                    "fixture row was checkpointed instead of remaining WAL-only",
+                )
+            finally:
+                main_view.close()
+
+            before_names = {path.name for path in self.home.iterdir()}
+            before_main = (database.stat(), database.read_bytes())
+            before_wal = (wal.stat(), wal.read_bytes())
+            before_lock = (maintenance_lock.stat(), maintenance_lock.read_bytes())
+            result = coordinator.pure_normalized_inventory()
+            self.assertIn(
+                "repo-wal-only",
+                {row["repo_id"] for row in result["repositories"]},
+                "pure inventory ignored committed state that exists only in WAL",
+            )
+            self.assertEqual(before_names, {path.name for path in self.home.iterdir()})
+            after_main = database.stat()
+            after_wal = wal.stat()
+            after_lock = maintenance_lock.stat()
+            self.assertEqual(
+                (before_main[0].st_dev, before_main[0].st_ino, before_main[1]),
+                (after_main.st_dev, after_main.st_ino, database.read_bytes()),
+            )
+            self.assertEqual(
+                (before_wal[0].st_dev, before_wal[0].st_ino, before_wal[1]),
+                (after_wal.st_dev, after_wal.st_ino, wal.read_bytes()),
+            )
+            self.assertEqual(
+                (before_lock[0].st_dev, before_lock[0].st_ino, before_lock[1]),
+                (after_lock.st_dev, after_lock.st_ino, maintenance_lock.read_bytes()),
+            )
+
+    def test_pure_inventory_does_not_checkpoint_orphaned_committed_wal(self) -> None:
+        now = "2026-07-15T12:00:00Z"
+        database = self.home / "coordinator.sqlite3"
+        wal = Path(f"{database}-wal")
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            checkpoint = store.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            self.assertEqual(checkpoint[0], 0, "orphaned-WAL fixture did not checkpoint cleanly")
+
+        writer = """
+import os, sqlite3, sys
+database, host_id, now = sys.argv[1:]
+connection = sqlite3.connect(database, isolation_level=None)
+connection.execute('PRAGMA wal_autocheckpoint = 0')
+connection.execute('BEGIN IMMEDIATE')
+connection.execute(
+    '''INSERT INTO repositories(
+           repo_id, host_id, canonical_root, display_name, state,
+           generation, created_at, updated_at
+       ) VALUES ('repo-orphaned-wal',?,'/repo/orphaned-wal','Orphaned WAL','active',0,?,?)''',
+    (host_id, now, now),
+)
+connection.execute(
+    '''INSERT INTO repository_installations(
+           repo_id, status, startup_fenced, generation, actor, updated_at
+       ) VALUES ('repo-orphaned-wal','installed',0,0,'test',?)''',
+    (now,),
+)
+connection.commit()
+os._exit(0)
+"""
+        subprocess.run(
+            [sys.executable, "-c", writer, str(database), host_id, now],
+            check=True,
+        )
+        self.assertTrue(wal.is_file() and wal.stat().st_size > 0, "child left no committed WAL")
+
+        main_only = self.root / "orphaned-main-only.sqlite3"
+        main_only.write_bytes(database.read_bytes())
+        main_view = sqlite3.connect(
+            f"{main_only.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            isolation_level=None,
+        )
+        try:
+            self.assertIsNone(
+                main_view.execute(
+                    "SELECT 1 FROM repositories WHERE repo_id = 'repo-orphaned-wal'"
+                ).fetchone(),
+                "orphaned fixture row reached the main database before inventory",
+            )
+        finally:
+            main_view.close()
+
+        before_names = {path.name for path in self.home.iterdir()}
+        before_main = (database.stat(), database.read_bytes())
+        before_wal = (wal.stat(), wal.read_bytes())
+        result = coordinator.pure_normalized_inventory()
+        self.assertIn(
+            "repo-orphaned-wal",
+            {row["repo_id"] for row in result["repositories"]},
+            "pure inventory ignored the orphaned committed WAL",
+        )
+        self.assertEqual(before_names, {path.name for path in self.home.iterdir()})
+        after_main = database.stat()
+        after_wal = wal.stat()
+        self.assertEqual(
+            (before_main[0].st_dev, before_main[0].st_ino, before_main[1]),
+            (after_main.st_dev, after_main.st_ino, database.read_bytes()),
+        )
+        self.assertEqual(
+            (before_wal[0].st_dev, before_wal[0].st_ino, before_wal[1]),
+            (after_wal.st_dev, after_wal.st_ino, wal.read_bytes()),
+        )
 
     def test_project_filtered_inventory_preserves_v2_lease_and_assignment_shapes(self) -> None:
         project = Path(__file__).resolve().parents[3]
