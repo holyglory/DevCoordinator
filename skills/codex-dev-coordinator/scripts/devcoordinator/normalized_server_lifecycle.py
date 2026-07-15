@@ -1099,11 +1099,11 @@ class NormalizedServerLifecycle:
             )
             connection.execute(
                 """
-                UPDATE leases SET process_fingerprint = ?,
+                UPDATE leases SET owner = ?, process_fingerprint = ?,
                     generation = generation + 1, updated_at = ?
                 WHERE lease_id = ? AND status = 'active'
                 """,
-                (process_fingerprint, timestamp, lease["lease_id"]),
+                (str(pid), process_fingerprint, timestamp, lease["lease_id"]),
             )
             connection.execute(
                 """
@@ -2436,7 +2436,9 @@ class NormalizedServerLifecycle:
                 "health_classification": "stopped",
                 "health_ok": None,
                 "stopped_at": timestamp,
-                "stopped_reason": f"Relocated from {old_project}",
+                "stopped_reason": (
+                    "Checkout ownership relocated; awaiting exact listener registration"
+                ),
                 "sampled_at": timestamp,
             }
             self._upsert_observation(

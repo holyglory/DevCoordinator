@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
@@ -1504,7 +1504,9 @@ def server_listener_identity(server: dict[str, Any]) -> dict[str, Any]:
         return identity
     pid = int(server.get("pid") or 0)
     if pid and pid_alive(pid):
-        if server.get("registration_identity"):
+        if server.get("registration_identity") or server.get(
+            "_require_exact_listener_identity"
+        ):
             try:
                 return registration_pid_identity(
                     pid=pid,
@@ -5321,6 +5323,8 @@ def build_inventory(
     include_docker: bool = True,
     backup_dirs: list[str] | None = None,
     stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
+    include_process_usage: bool = True,
+    include_backups: bool = True,
 ) -> dict[str, Any]:
     resolved_project = canonical_project(project) if project else None
     servers = []
@@ -5380,7 +5384,7 @@ def build_inventory(
     port_assignments.sort(key=lambda item: int(item.get("port") or 0))
     servers = deduplicate_server_records(servers)
     annotate_server_url_currency(servers)
-    process_table = annotate_server_process_usage(servers)
+    process_table = annotate_server_process_usage(servers) if include_process_usage else {}
     urls = [
         {
             "name": server.get("name"),
@@ -5403,7 +5407,11 @@ def build_inventory(
         if include_docker
         else {"available": None, "containers": [], "postgres": []}
     )
-    project_usage = build_project_usage(servers, docker, process_table, state)
+    project_usage = (
+        build_project_usage(servers, docker, process_table, state)
+        if include_process_usage
+        else []
+    )
     return {
         "coordinator_home": str(coordinator_home()),
         "state_path": str(state_path()),
@@ -5415,7 +5423,7 @@ def build_inventory(
         "recent_events": recent_events[-40:],
         "docker": docker,
         "postgres": docker.get("postgres", []),
-        "backups": backup_inventory(resolved_project, backup_dirs),
+        "backups": backup_inventory(resolved_project, backup_dirs) if include_backups else [],
         "project_usage": project_usage,
     }
 
@@ -8345,6 +8353,142 @@ def coordinated_build_inventory(
     return result
 
 
+def coordinated_build_registration_inventory(
+    *, project: str, name: str, port: int
+) -> dict[str, Any]:
+    """Return one target-scoped no-Docker graph with fresh in-memory proof.
+
+    The systemd readiness loop supplies the exact Console project, server name,
+    and port. Only rows that can affect that registration graph are observed;
+    unrelated services, process-usage sampling, backup discovery, and Docker
+    are deliberately outside this bounded startup path. Derived lifecycle and
+    lease changes remain confined to the copied compatibility projection.
+    """
+
+    resolved_project = canonical_project(project)
+    target_name = str(name).strip()
+    target_port = int(port)
+    if not Path(project).is_absolute() or not target_name:
+        raise ValueError("registration inventory requires an absolute project and server name")
+    if not 1 <= target_port <= 65535:
+        raise ValueError("registration inventory port must be between 1 and 65535")
+    if state_backend() == LEGACY_JSON_BACKEND:
+        return coordinated_build_inventory(
+            project=resolved_project,
+            include_docker=False,
+        )
+
+    result = pure_normalized_inventory(include_docker=False)
+    source_compatibility = result["v1_compatibility"]
+    target_key = f"{resolved_project}::{target_name}"
+    relevant_servers = [
+        copy.deepcopy(server)
+        for server in source_compatibility["servers"]
+        if (
+            server.get("project") == resolved_project
+            and server.get("name") == target_name
+        )
+        or server.get("port") == target_port
+    ]
+    relevant_server_ids = {str(server["id"]) for server in relevant_servers}
+    relevant_leases = [
+        copy.deepcopy(lease)
+        for lease in source_compatibility["leases"]
+        if lease.get("port") == target_port
+        or lease.get("assignment_key") == target_key
+        or str(lease.get("server_id")) in relevant_server_ids
+    ]
+    relevant_assignments = [
+        copy.deepcopy(assignment)
+        for assignment in source_compatibility["port_assignments"]
+        if assignment.get("port") == target_port
+        or assignment.get("key") == target_key
+    ]
+    compatibility = copy.deepcopy(source_compatibility)
+    state = {
+        "servers": {str(server["id"]): server for server in relevant_servers},
+        "leases": {str(lease["id"]): lease for lease in relevant_leases},
+        "port_assignments": {
+            str(assignment["key"]): assignment for assignment in relevant_assignments
+        },
+        "history": [],
+        "docker": {"available": None, "containers": [], "postgres": []},
+    }
+    for server in state["servers"].values():
+        if server.get("pid") is not None and server.get("status") in {
+            "running",
+            "starting",
+            "unhealthy",
+        }:
+            # A stale persisted observability bit is not proof that the current
+            # capability-matched observer can or cannot inspect this listener.
+            server["_require_exact_listener_identity"] = True
+    observed = build_inventory(
+        state,
+        include_docker=False,
+        stats_history_limit=0,
+        include_process_usage=False,
+        include_backups=False,
+    )
+    for server in observed["servers"]:
+        strict_requested = server.pop("_require_exact_listener_identity", False) is True
+        health = server.get("health") or {}
+        identity = health.get("identity") or {}
+        exact_identity = (
+            strict_requested
+            and server.get("status") != "stopped"
+            and health.get("ok") is True
+            and identity.get("ok") is True
+            and identity.get("pid") == server.get("pid")
+            and identity.get("port") == server.get("port")
+            and identity.get("host") == str(server.get("host") or "127.0.0.1")
+            and identity.get("source") in {"proc_pid_fd", "platform_listener_probe"}
+            and isinstance(identity.get("listener_inodes"), list)
+        )
+        if exact_identity:
+            # Publish only the complete identity returned by the strict
+            # listener-owner probe. Generic cwd attribution is not registration
+            # proof and must remain visibly unverified.
+            server["registration_identity"] = copy.deepcopy(identity)
+
+    dead_linked_leases = {
+        str(server["lease_id"])
+        for server in observed["servers"]
+        if server.get("status") == "stopped"
+        and (server.get("health") or {}).get("pid_alive") is False
+        and server.get("lease_id") is not None
+    }
+    if dead_linked_leases:
+        # A copied active lease linked to a proved-dead stopped server is not a
+        # current ownership claim.  Hide it from this readiness observation;
+        # the durable SQLite row remains untouched for the registering writer
+        # to reconcile transactionally.
+        observed["leases"] = [
+            lease
+            for lease in observed["leases"]
+            if str(lease.get("id")) not in dead_linked_leases
+        ]
+
+    compatibility_keys = (
+        "urls",
+        "servers",
+        "leases",
+        "port_assignments",
+        "docker",
+        "postgres",
+    )
+    for key in compatibility_keys:
+        compatibility[key] = copy.deepcopy(observed[key])
+    result["v1_compatibility"] = compatibility
+    # Preserve normalized leases and assignments at the top level.  The other
+    # names are non-colliding transitional aliases and should expose the same
+    # fresh compatibility view as the nested contract.
+    for key in compatibility_keys:
+        if key not in {"leases", "port_assignments"}:
+            result[key] = copy.deepcopy(compatibility[key])
+    return result
+
+
 def empty_normalized_inventory(*, project: str | None = None) -> dict[str, Any]:
     resolved_project = canonical_project(project) if project else None
     compatibility = {
@@ -8723,7 +8867,7 @@ def pure_normalized_inventory(
     database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
     if not database_path.exists():
         return empty_normalized_inventory(project=project)
-    with AccountStore.open_default(coordinator_home()) as store:
+    with AccountStore.open_default_read_only(coordinator_home()) as store:
         result = store.inventory_v2()
     result = filter_normalized_inventory_project(result, project)
     if not include_docker:
@@ -12505,6 +12649,37 @@ API_POST_ROUTES = frozenset(
 )
 
 
+def parse_registration_inventory_query(raw_query: str) -> dict[str, Any] | None:
+    """Parse the exact target for the bounded registration-readiness view."""
+
+    if not raw_query:
+        return None
+    values = parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=True,
+        max_num_fields=3,
+    )
+    required = {"project", "name", "port"}
+    if set(values) != required or any(len(values[key]) != 1 for key in required):
+        raise ValueError(
+            "registration inventory query requires exactly one project, name, and port"
+        )
+    project = values["project"][0]
+    name = values["name"][0].strip()
+    if not project or not Path(project).is_absolute() or not name or len(name) > 200:
+        raise ValueError(
+            "registration inventory query requires an absolute project and valid server name"
+        )
+    try:
+        port = int(values["port"][0])
+    except ValueError as exc:
+        raise ValueError("registration inventory query port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("registration inventory query port must be between 1 and 65535")
+    return {"project": project, "name": name, "port": port}
+
+
 class ApiHandler(http.server.BaseHTTPRequestHandler):
     server_version = "CodexDevCoordinator/2"
 
@@ -12585,15 +12760,22 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format % args}", file=sys.stderr)
 
-    def _handle_get(self, path: str) -> None:
+    def _handle_get(self, path: str, raw_query: str = "") -> None:
         try:
             if path == "/v1/inventory":
                 result: Any = coordinated_build_inventory()
             elif path == "/v1/inventory/no-docker":
-                # Startup/readiness checks must observe the complete
-                # coordinator registration graph without making Docker CLI or
-                # daemon availability part of the service-start boundary.
-                result = coordinated_build_inventory(include_docker=False)
+                target = parse_registration_inventory_query(raw_query)
+                # An ordinary no-Docker inventory remains a pure committed
+                # snapshot. The systemd readiness client supplies an exact
+                # target when it needs bounded current listener proof.
+                result = (
+                    pure_normalized_inventory(include_docker=False)
+                    if target is None and state_backend() != LEGACY_JSON_BACKEND
+                    else coordinated_build_inventory(include_docker=False)
+                    if target is None
+                    else coordinated_build_registration_inventory(**target)
+                )
             elif path in {"/v1/state", "/v1/ports", "/v1/ports/assignments", "/v1/servers"}:
                 if state_backend() == LEGACY_JSON_BACKEND:
                     snapshot = snapshot_coordinator_state()
@@ -12624,6 +12806,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
                 return
             self._send(200, result)
+        except ValueError as exc:
+            self._send(400, {"error": str(exc)})
         except Exception as exc:  # pragma: no cover - defensive endpoint wrapper
             self._send(500, {"error": str(exc)})
 
@@ -12751,7 +12935,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             return
 
         method = self.command.upper()
-        path = urlparse(self.path).path
+        parsed_request = urlparse(self.path)
+        path = parsed_request.path
         if path == "/healthz":
             if method in {"GET", "HEAD"}:
                 self._send(200, {"ok": True, "service": "codex-dev-coordinator", "version": VERSION})
@@ -12774,7 +12959,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             if method != "GET":
                 self._method_not_allowed(("GET",))
                 return
-            self._handle_get(path)
+            self._handle_get(path, parsed_request.query)
             return
         if path in API_POST_ROUTES:
             if method != "POST":

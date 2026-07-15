@@ -15,7 +15,12 @@ from unittest import mock
 
 from devcoordinator import legacy_import as legacy_import_module
 from devcoordinator.legacy_import import LegacyImportError, LegacySourceChanged
-from devcoordinator.store import AccountStore, MutationTimeout, TransactionBoundaryError
+from devcoordinator.store import (
+    AccountStore,
+    MutationTimeout,
+    StoreError,
+    TransactionBoundaryError,
+)
 
 
 def private_directory(path: Path) -> Path:
@@ -237,6 +242,54 @@ class StoreTests(unittest.TestCase):
                     connection.execute("UPDATE schema_metadata SET state_revision = 99")
         finally:
             store.close()
+
+    def test_read_only_opener_exposes_current_schema_but_never_mutation(self) -> None:
+        with self.open_store() as store:
+            store.ensure_local_host()
+        database = self.store_home / "coordinator.sqlite3"
+        before = database.read_bytes()
+        with AccountStore.open_read_only(database) as store:
+            self.assertEqual(store.metadata.schema_version, 2)
+            self.assertEqual(store.inventory_v2()["schema_version"], 2)
+            with self.assertRaisesRegex(StoreError, "opened read-only"):
+                with store.immediate_transaction():
+                    pass
+        self.assertEqual(before, database.read_bytes())
+
+    def test_read_only_opener_never_creates_missing_maintenance_lock(self) -> None:
+        with self.open_store() as store:
+            store.ensure_local_host()
+        database = self.store_home / "coordinator.sqlite3"
+        maintenance_lock = self.store_home / ".coordinator-maintenance.lock"
+        maintenance_lock.unlink()
+        before = database.read_bytes()
+        with self.assertRaises(FileNotFoundError):
+            AccountStore.open_read_only(database)
+        self.assertFalse(maintenance_lock.exists())
+        self.assertEqual(before, database.read_bytes())
+
+    def test_read_only_opener_rejects_non_wal_store_without_changing_journal_mode(self) -> None:
+        with self.open_store() as store:
+            store.ensure_local_host()
+        database = self.store_home / "coordinator.sqlite3"
+        connection = sqlite3.connect(str(database), isolation_level=None)
+        try:
+            self.assertEqual(connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0], "delete")
+        finally:
+            connection.close()
+        before = database.read_bytes()
+        with self.assertRaisesRegex(StoreError, "journal mode is delete; expected wal"):
+            AccountStore.open_read_only(database)
+        self.assertEqual(before, database.read_bytes())
+        verification = sqlite3.connect(
+            f"{database.as_uri()}?mode=ro",
+            uri=True,
+            isolation_level=None,
+        )
+        try:
+            self.assertEqual(verification.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        finally:
+            verification.close()
 
     def test_v2_graph_exposes_authoritative_board_collections_and_bounds_telemetry(self) -> None:
         store = self.open_store()

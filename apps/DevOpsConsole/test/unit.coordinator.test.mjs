@@ -36,6 +36,12 @@ test('published HTTP contract describes normalized query-only inventory and its 
     'control_bindings',
   ]);
   assert.equal(contract.inventory_contract.compatibility_projection, 'v1_compatibility');
+  assert.match(contract.inventory_contract.ordinary_inventory, /without runtime sampling or persistence/);
+  assert.match(contract.inventory_contract.no_docker, /in-memory copy/);
+  assert.match(contract.inventory_contract.no_docker, /never persists/);
+  assert.match(contract.inventory_contract.no_docker, /without a Docker CLI\/daemon probe/);
+  assert.match(contract.inventory_contract.no_docker, /project, name, and port query target/);
+  assert.match(contract.inventory_contract.no_docker, /excludes unrelated services/);
   assert.equal(contract.state.persistence_model, 'normalized SQLite');
   assert.ok(contract.endpoints.POST.includes('/v1/ports/relocate'));
 });

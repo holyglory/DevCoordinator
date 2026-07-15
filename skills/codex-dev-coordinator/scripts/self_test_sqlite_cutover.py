@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -27,7 +28,7 @@ from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.repository_lifecycle import ResourceKind
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
-from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
+from devcoordinator.store import AccountStore, StoreError, deterministic_id, utc_timestamp
 
 
 class SQLiteCutoverTests(unittest.TestCase):
@@ -173,6 +174,51 @@ class SQLiteCutoverTests(unittest.TestCase):
         self.assertEqual(before.state_revision, after.state_revision)
         self.assertEqual(before.observation_revision, after.observation_revision)
         self.assertEqual(before_bytes, database.read_bytes())
+
+    def test_pure_inventory_rejects_v1_without_upgrading_or_changing_database_bytes(self) -> None:
+        with AccountStore.open_default(self.home) as store:
+            store.ensure_local_host()
+        database = self.home / "coordinator.sqlite3"
+        legacy = sqlite3.connect(str(database), isolation_level=None)
+        try:
+            legacy.execute("BEGIN IMMEDIATE")
+            legacy.execute("DROP TABLE startup_policy_restore_states")
+            legacy.execute(
+                "UPDATE schema_metadata SET schema_version = 1 WHERE singleton = 1"
+            )
+            legacy.commit()
+        finally:
+            legacy.close()
+
+        before_bytes = database.read_bytes()
+        before_files = sorted(path.name for path in self.home.iterdir())
+        with self.assertRaisesRegex(StoreError, "unsupported coordinator database schema 1"):
+            coordinator.pure_normalized_inventory()
+        self.assertEqual(before_bytes, database.read_bytes())
+        self.assertEqual(before_files, sorted(path.name for path in self.home.iterdir()))
+
+        verification = sqlite3.connect(
+            f"{database.as_uri()}?mode=ro",
+            uri=True,
+            isolation_level=None,
+        )
+        try:
+            self.assertEqual(
+                verification.execute(
+                    "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertIsNone(
+                verification.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'startup_policy_restore_states'
+                    """
+                ).fetchone()
+            )
+        finally:
+            verification.close()
 
     def test_project_filtered_inventory_preserves_v2_lease_and_assignment_shapes(self) -> None:
         project = Path(__file__).resolve().parents[3]

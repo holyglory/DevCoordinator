@@ -13,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 from linux_proc_identity import ProcIdentityError, read_stable_process_identity
 from secure_cutover_io import SecureIOError, read_private_regular
@@ -320,13 +321,27 @@ def process_identity_probe(pid: int, *, proc_root: Path = Path("/proc")) -> dict
 
 
 def inventory_probe(
-    *, host: str, port: int, token: str, timeout: float
+    *,
+    host: str,
+    port: int,
+    token: str,
+    timeout: float,
+    project: str,
+    name: str,
+    server_port: int,
 ) -> dict[str, Any]:
     connection = http.client.HTTPConnection(host, port, timeout=max(0.1, min(timeout, 3.0)))
     try:
+        query = urlencode(
+            {
+                "project": project,
+                "name": name,
+                "port": int(server_port),
+            }
+        )
         connection.request(
             "GET",
-            "/v1/inventory/no-docker",
+            f"/v1/inventory/no-docker?{query}",
             headers={"Authorization": f"Bearer {token}", "Host": f"{host}:{port}"},
         )
         response = connection.getresponse()
@@ -454,6 +469,9 @@ def wait_for_console_registration(
             port=coordinator_port,
             token=token,
             timeout=remaining,
+            project=project,
+            name=name,
+            server_port=port,
         )
     )
     first_unit = unit_probe_fn()

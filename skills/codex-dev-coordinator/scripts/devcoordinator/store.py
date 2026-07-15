@@ -228,6 +228,41 @@ def _validate_private_file(path: Path, expected_uid: int) -> os.stat_result:
     return metadata
 
 
+def _validate_private_maintenance_lock(path: Path, expected_uid: int) -> os.stat_result:
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise PermissionError(f"coordinator maintenance lock must be a real regular file: {path}")
+    if metadata.st_uid != expected_uid:
+        raise PermissionError(
+            f"coordinator maintenance lock is owned by uid {metadata.st_uid}, "
+            f"not expected uid {expected_uid}: {path}"
+        )
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise PermissionError(
+            f"coordinator maintenance lock must be mode 0600, got "
+            f"{stat.S_IMODE(metadata.st_mode):04o}: {path}"
+        )
+    return metadata
+
+
+def _validate_private_sqlite_sidecars(database_path: Path, expected_uid: int) -> None:
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{database_path}{suffix}")
+        if not sidecar.exists() and not sidecar.is_symlink():
+            continue
+        refuse_symlink_components(sidecar)
+        metadata = sidecar.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise PermissionError(f"SQLite sidecar must be a regular file: {sidecar}")
+        if metadata.st_uid != expected_uid:
+            raise PermissionError(f"SQLite sidecar has foreign ownership: {sidecar}")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise PermissionError(
+                f"SQLite sidecar must be mode 0600, got "
+                f"{stat.S_IMODE(metadata.st_mode):04o}: {sidecar}"
+            )
+
+
 def _precreate_private_file(path: Path, expected_uid: int) -> os.stat_result:
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -253,6 +288,7 @@ def _acquire_maintenance_descriptor(
     expected_uid: int,
     exclusive: bool,
     timeout_seconds: float,
+    create: bool = True,
 ) -> int:
     """Acquire the normalized store-maintenance lock, never legacy ``state.lock``.
 
@@ -263,9 +299,13 @@ def _acquire_maintenance_descriptor(
     """
 
     lock_path = database_path.parent / MAINTENANCE_LOCK_NAME
-    refuse_symlink_components(lock_path, allow_missing_leaf=True)
-    before = _precreate_private_file(lock_path, expected_uid)
-    flags = os.O_RDWR
+    refuse_symlink_components(lock_path, allow_missing_leaf=create)
+    before = (
+        _precreate_private_file(lock_path, expected_uid)
+        if create
+        else _validate_private_maintenance_lock(lock_path, expected_uid)
+    )
+    flags = os.O_RDWR if create else os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(lock_path, flags)
@@ -291,7 +331,12 @@ def _acquire_maintenance_descriptor(
                     )
                 time.sleep(0.01)
         after = lock_path.lstat()
-        if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+        if (
+            (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+            or after.st_uid != expected_uid
+            or not stat.S_ISREG(after.st_mode)
+            or stat.S_IMODE(after.st_mode) != 0o600
+        ):
             raise PermissionError("coordinator maintenance lock changed while opening")
         return descriptor
     except BaseException:
@@ -344,12 +389,14 @@ class CoordinatorStore:
         expected_uid: int,
         busy_timeout_ms: int,
         maintenance_descriptor: int,
+        read_only: bool = False,
     ) -> None:
         self.path = path
         self.connection = connection
         self.expected_uid = expected_uid
         self.busy_timeout_ms = busy_timeout_ms
         self._maintenance_descriptor = maintenance_descriptor
+        self._read_only = bool(read_only)
         self._closed = False
 
     @classmethod
@@ -434,26 +481,106 @@ class CoordinatorStore:
             os.close(maintenance_descriptor)
             raise
 
+    @classmethod
+    def open_read_only(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        expected_uid: int | None = None,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+    ) -> "CoordinatorStore":
+        """Open an existing current-schema store without any durable mutation.
+
+        This path never creates the database or maintenance lock, never runs
+        schema initialization/upgrades, and never requests a journal-mode
+        transition. SQLite itself receives a ``mode=ro`` URI, while the same
+        private ownership, inode, sidecar, and maintenance-lock boundaries as
+        the writable opener remain enforced.
+        """
+
+        database_path = _absolute_path(path)
+        uid = os.geteuid() if expected_uid is None else int(expected_uid)
+        if uid != os.geteuid():
+            raise PermissionError(
+                f"coordinator store expected uid {uid} does not match effective uid {os.geteuid()}"
+            )
+        if not 1 <= int(busy_timeout_ms) <= 60_000:
+            raise ValueError("busy_timeout_ms must be between 1 and 60000")
+        refuse_symlink_components(database_path)
+        _validate_owned_directory(database_path.parent, uid, require_private=True)
+        before = _validate_private_file(database_path, uid)
+        maintenance_descriptor = _acquire_maintenance_descriptor(
+            database_path,
+            expected_uid=uid,
+            exclusive=False,
+            timeout_seconds=int(busy_timeout_ms) / 1000.0,
+            create=False,
+        )
+        try:
+            _validate_private_sqlite_sidecars(database_path, uid)
+            connection = sqlite3.connect(
+                f"{database_path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=int(busy_timeout_ms) / 1000.0,
+                isolation_level=None,
+            )
+        except BaseException:
+            fcntl.flock(maintenance_descriptor, fcntl.LOCK_UN)
+            os.close(maintenance_descriptor)
+            raise
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA foreign_keys = ON")
+            if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+                raise StoreError("SQLite foreign key enforcement could not be enabled")
+            connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+            connection.execute("PRAGMA trusted_schema = OFF")
+            mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            if mode != "wal":
+                raise StoreError(f"coordinator database journal mode is {mode}; expected wal")
+            try:
+                row = connection.execute(
+                    "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+                ).fetchone()
+            except sqlite3.DatabaseError as error:
+                raise StoreError(f"coordinator schema metadata is unreadable: {error}") from error
+            if row is None:
+                raise StoreError("coordinator schema metadata is missing")
+            try:
+                schema_version = int(row[0])
+            except (TypeError, ValueError) as error:
+                raise StoreError("coordinator database schema version is invalid") from error
+            if schema_version != SCHEMA_VERSION:
+                raise StoreError(
+                    f"unsupported coordinator database schema {schema_version}; "
+                    f"expected {SCHEMA_VERSION}"
+                )
+            after = _validate_private_file(database_path, uid)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                raise PermissionError("coordinator database identity changed while opening")
+            store = cls(
+                database_path,
+                connection,
+                expected_uid=uid,
+                busy_timeout_ms=int(busy_timeout_ms),
+                maintenance_descriptor=maintenance_descriptor,
+                read_only=True,
+            )
+            store._secure_sidecars()
+            return store
+        except BaseException:
+            connection.close()
+            fcntl.flock(maintenance_descriptor, fcntl.LOCK_UN)
+            os.close(maintenance_descriptor)
+            raise
+
     def _require_open(self) -> None:
         if self._closed:
             raise StoreError("coordinator store is closed")
 
     def _secure_sidecars(self) -> None:
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(f"{self.path}{suffix}")
-            if not sidecar.exists() and not sidecar.is_symlink():
-                continue
-            refuse_symlink_components(sidecar)
-            metadata = sidecar.lstat()
-            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-                raise PermissionError(f"SQLite sidecar must be a regular file: {sidecar}")
-            if metadata.st_uid != self.expected_uid:
-                raise PermissionError(f"SQLite sidecar has foreign ownership: {sidecar}")
-            if stat.S_IMODE(metadata.st_mode) != 0o600:
-                raise PermissionError(
-                    f"SQLite sidecar must be mode 0600, got "
-                    f"{stat.S_IMODE(metadata.st_mode):04o}: {sidecar}"
-                )
+        _validate_private_sqlite_sidecars(self.path, self.expected_uid)
 
     @property
     def metadata(self) -> StoreMetadata:
@@ -489,7 +616,8 @@ class CoordinatorStore:
                 self.connection.rollback()
             raise
         finally:
-            self.connection.execute("PRAGMA query_only = OFF")
+            if not self._read_only:
+                self.connection.execute("PRAGMA query_only = OFF")
 
     @contextmanager
     def immediate_transaction(
@@ -502,6 +630,8 @@ class CoordinatorStore:
         """Yield a bounded ``BEGIN IMMEDIATE`` mutation and commit atomically."""
 
         self._require_open()
+        if self._read_only:
+            raise StoreError("coordinator store was opened read-only")
         if self.connection.in_transaction:
             raise TransactionBoundaryError("nested store transactions are not allowed")
         if not 0 < float(max_seconds) <= 60.0:
@@ -623,6 +753,36 @@ class AccountStore(CoordinatorStore):
             coordinator_home = account_home / ".codex" / "agent-coordinator"
         home = _absolute_path(coordinator_home)
         base = super().open(
+            home / DEFAULT_DATABASE_NAME,
+            expected_uid=uid,
+            busy_timeout_ms=busy_timeout_ms,
+        )
+        base.__class__ = cls
+        return base  # type: ignore[return-value]
+
+    @classmethod
+    def open_default_read_only(
+        cls,
+        coordinator_home: str | os.PathLike[str] | None = None,
+        *,
+        effective_uid: int | None = None,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        account_lookup: Callable[[int], Any] | None = None,
+    ) -> "AccountStore":
+        uid = os.geteuid() if effective_uid is None else int(effective_uid)
+        if coordinator_home is None:
+            lookup = pwd.getpwuid if account_lookup is None else account_lookup
+            try:
+                record = lookup(uid)
+            except (KeyError, OSError) as error:
+                raise StoreError(f"could not resolve POSIX account home for uid {uid}: {error}") from error
+            raw_home = str(getattr(record, "pw_dir", "") or "")
+            account_home = Path(raw_home)
+            if not raw_home or not account_home.is_absolute():
+                raise StoreError(f"POSIX account home for uid {uid} is not absolute")
+            coordinator_home = account_home / ".codex" / "agent-coordinator"
+        home = _absolute_path(coordinator_home)
+        base = super().open_read_only(
             home / DEFAULT_DATABASE_NAME,
             expected_uid=uid,
             busy_timeout_ms=busy_timeout_ms,
@@ -1110,11 +1270,25 @@ class AccountStore(CoordinatorStore):
                        o.listener_host, o.listener_port, o.listener_observable,
                        o.health_classification, o.health_ok, o.stopped_at,
                        o.stopped_reason, o.sampled_at,
+                       l.lease_id AS latest_lease_id,
+                       l.status AS latest_lease_status,
+                       l.owner AS latest_lease_owner,
+                       p.port AS assigned_port,
                        rr.status AS retirement_status
                 FROM server_definitions d
                 JOIN repositories r USING(repo_id)
                 JOIN repository_installations i USING(repo_id)
                 LEFT JOIN server_observations o USING(server_definition_id)
+                LEFT JOIN leases l ON l.lease_id = (
+                    SELECT candidate.lease_id FROM leases candidate
+                    WHERE candidate.server_definition_id = d.server_definition_id
+                    ORDER BY CASE candidate.status WHEN 'active' THEN 0 ELSE 1 END,
+                             candidate.updated_at DESC, candidate.lease_id DESC
+                    LIMIT 1
+                )
+                LEFT JOIN port_assignments p
+                  ON p.repo_id = d.repo_id AND p.server_name = d.name
+                 AND p.status = 'active'
                 LEFT JOIN resource_retirements rr
                   ON rr.resource_kind = 'server'
                  AND rr.host_resource_id = d.server_definition_id
@@ -1139,37 +1313,105 @@ class AccountStore(CoordinatorStore):
                         (row["server_definition_id"],),
                     )
                 ]
+                projected_port = (
+                    row["listener_port"]
+                    if row["listener_port"] is not None
+                    else row["assigned_port"]
+                )
+                projected_pid = row["pid"]
+                historical_owner = str(row["latest_lease_owner"] or "")
+                if (
+                    projected_pid is None
+                    and row["lifecycle"] == "stopped"
+                    and historical_owner.isdigit()
+                    and int(historical_owner) > 1
+                ):
+                    projected_pid = int(historical_owner)
                 endpoint = None
-                if row["listener_port"] is not None and row["lifecycle"] in {"running", "starting", "unhealthy"}:
-                    endpoint = f"http://{row['listener_host'] or '127.0.0.1'}:{row['listener_port']}"
+                if projected_port is not None and row["lifecycle"] in {"running", "starting", "unhealthy"}:
+                    endpoint = f"http://{row['listener_host'] or '127.0.0.1'}:{projected_port}"
                 item = {
                     "id": row["server_definition_id"],
+                    "key": f"{row['canonical_root']}::{row['name']}",
                     "name": row["name"],
                     "role": row["role"],
                     "project": None if violation else row["canonical_root"],
                     "cwd": row["cwd"],
                     "argv": arguments,
-                    "port": row["listener_port"],
+                    "port": projected_port,
+                    "host": row["listener_host"] or "127.0.0.1",
                     "url": endpoint,
                     "url_is_current": endpoint is not None,
                     "health_url": row["health_url_template"],
                     "log_path": row["log_path"],
                     "status": row["lifecycle"] or "unobserved",
-                    "pid": row["pid"],
+                    "pid": projected_pid,
+                    "lease_id": row["latest_lease_id"],
                     "process_start_time": row["process_start_time"],
                     "process_fingerprint": row["process_fingerprint"],
+                    "metadata_source": "normalized-sqlite",
                     "identity_observable": (
                         None if row["listener_observable"] is None else bool(row["listener_observable"])
                     ),
                     "health": {
                         "classification": row["health_classification"] or "unobserved",
                         "ok": None if row["health_ok"] is None else bool(row["health_ok"]),
+                        "pid_alive": (
+                            False
+                            if row["lifecycle"] == "stopped" and projected_pid is not None
+                            else None
+                        ),
                     },
                     "stopped_at": row["stopped_at"],
                     "stopped_reason": row["stopped_reason"],
                     "updated_at": row["sampled_at"],
                     "attribution": violation,
                 }
+                latest_operation = connection.execute(
+                    """
+                    SELECT o.kind, o.status, o.result_json, o.updated_at
+                    FROM operations o
+                    JOIN operation_targets t USING(operation_id)
+                    WHERE t.target_kind = 'server' AND t.target_id = ?
+                      AND o.status = 'succeeded'
+                    ORDER BY o.updated_at DESC, o.rowid DESC
+                    LIMIT 1
+                    """,
+                    (row["server_definition_id"],),
+                ).fetchone()
+                if (
+                    latest_operation is not None
+                    and latest_operation["kind"] == "port.relocate"
+                    and item["status"] == "stopped"
+                    and row["pid"] is None
+                ):
+                    try:
+                        relocation = json.loads(latest_operation["result_json"])
+                    except (TypeError, ValueError, UnicodeDecodeError):
+                        relocation = None
+                    if (
+                        isinstance(relocation, dict)
+                        and relocation.get("server_definition_id")
+                        == row["server_definition_id"]
+                        and relocation.get("new_project") == row["canonical_root"]
+                        and relocation.get("port") == projected_port
+                        and isinstance(relocation.get("old_project"), str)
+                        and relocation["old_project"]
+                        and relocation["old_project"] != row["canonical_root"]
+                    ):
+                        item.update(
+                            {
+                                "pid": None,
+                                "lease_id": None,
+                                "metadata_source": "port_relocate",
+                                "relocated_from": relocation["old_project"],
+                                "relocated_at": latest_operation["updated_at"],
+                                "stopped_reason": (
+                                    "Checkout ownership relocated; awaiting exact "
+                                    "listener registration"
+                                ),
+                            }
+                        )
                 if item["status"] in {"running", "starting", "unhealthy"}:
                     usage = connection.execute(
                         """
@@ -1198,9 +1440,21 @@ class AccountStore(CoordinatorStore):
                     """
                     SELECT l.lease_id AS id, r.canonical_root AS project, l.port,
                            l.owner, l.agent, l.purpose, l.status, l.expires_at,
-                           l.process_fingerprint, l.deactivated_at, l.created_at, l.updated_at
+                           l.process_fingerprint, l.deactivated_at, l.created_at, l.updated_at,
+                           l.server_definition_id AS server_id,
+                           CASE
+                               WHEN l.owner != '' AND l.owner NOT GLOB '*[^0-9]*'
+                               THEN CAST(l.owner AS INTEGER)
+                               ELSE NULL
+                           END AS owner_pid,
+                           CASE
+                               WHEN d.name IS NOT NULL
+                               THEN r.canonical_root || '::' || d.name
+                               ELSE NULL
+                           END AS assignment_key
                     FROM leases l JOIN repositories r USING(repo_id)
                     JOIN repository_installations i USING(repo_id)
+                    LEFT JOIN server_definitions d USING(server_definition_id)
                     WHERE i.status != 'disabled' AND l.status = 'active'
                     ORDER BY l.port, l.lease_id
                     """
@@ -1210,7 +1464,9 @@ class AccountStore(CoordinatorStore):
                 dict(row)
                 for row in connection.execute(
                     """
-                    SELECT p.assignment_id AS id, r.canonical_root AS project,
+                    SELECT p.assignment_id AS id,
+                           r.canonical_root || '::' || p.server_name AS key,
+                           r.canonical_root AS project,
                            p.server_name AS name, p.port, p.status,
                            p.deactivated_at, p.updated_at,
                            COALESCE(o.lifecycle, 'unregistered') AS server_status

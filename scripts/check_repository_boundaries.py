@@ -343,7 +343,8 @@ def scan_tip(repo: Path) -> list[Finding]:
             "bidirectional lease linkage": '"lease_id", lease_id',
         },
         "Console registration readiness": {
-            "authenticated no-Docker endpoint": '"/v1/inventory/no-docker"',
+            "authenticated targeted no-Docker endpoint": 'f"/v1/inventory/no-docker?{query}"',
+            "exact query target": '"port": int(server_port)',
             "shared exact current graph": "verify_current_registration_graph(",
             "systemd MainPID stability": "Console systemd MainPID changed",
             "runtime argv contract": "Console MainPID argv does not match the production contract",
@@ -356,7 +357,9 @@ def scan_tip(repo: Path) -> list[Finding]:
         "coordinator HTTP contract": {
             "documented no-Docker route": '"/v1/inventory/no-docker"',
             "documented readiness semantics": '"no_docker"',
-            "documented Docker omission": "docker.available=null with empty containers/postgres",
+            "documented Docker omission": "without a Docker CLI/daemon probe",
+            "documented bounded target": "project, name, and port query target",
+            "documented unrelated-work exclusion": "excludes unrelated services",
         },
         "legacy rollback readiness": {
             "fixed systemd identity": "_require_fixed_unit",

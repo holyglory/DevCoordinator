@@ -80,6 +80,7 @@
   "inventory_contract": {
     "schema_version": 2,
     "read_semantics": "query-only",
+    "ordinary_inventory": "GET /v1/inventory returns the committed normalized snapshot without runtime sampling or persistence",
     "normalized_top_level": [
       "store",
       "repositories",
@@ -100,7 +101,7 @@
     ],
     "compatibility_projection": "v1_compatibility",
     "compatibility_policy": "legacy Console rows are nested under v1_compatibility; non-colliding legacy aliases may also appear at top level, but top-level leases and port_assignments always retain normalized lease_id/assignment_id and repo_id identities",
-    "no_docker": "GET /v1/inventory/no-docker is the same authenticated query-only committed snapshot without a Docker CLI/daemon probe; normalized committed resources remain available while the legacy projection reports docker.available=null with empty containers/postgres",
+    "no_docker": "GET /v1/inventory/no-docker returns the authenticated committed normalized snapshot without a Docker CLI/daemon probe; when the systemd readiness client supplies exactly one project, name, and port query target, only compatibility rows that can affect that registration graph receive bounded current process, listener, and health observation on an in-memory copy; the route excludes unrelated services, process-usage sampling, and backup discovery and never persists derived lifecycle or lease changes",
     "project_usage": "rows include stable usage_key plus authoritative server_ids and container_names",
     "docker_ownership": "Compose labels and verified coordinator sidecars are mutation authority; name similarity is read-only evidence",
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"

@@ -264,12 +264,122 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             item for item in ports.list_assignments() if item["name"] == "status-web"
         )
         self.assertEqual(assignment["server_status"], "stopped")
+        compatibility = ports.store.inventory_v2()["v1_compatibility"]
         graph_assignment = next(
             item
-            for item in ports.store.inventory_v2()["v1_compatibility"]["port_assignments"]
+            for item in compatibility["port_assignments"]
             if item["name"] == "status-web"
         )
         self.assertEqual(graph_assignment["server_status"], "stopped")
+        self.assertEqual(
+            graph_assignment["key"], f"{self.project}::status-web"
+        )
+        projected_server = next(
+            item for item in compatibility["servers"] if item["id"] == running["id"]
+        )
+        self.assertEqual(projected_server["pid"], 44001)
+        self.assertEqual(projected_server["lease_id"], running["lease_id"])
+        self.assertFalse(projected_server["health"]["pid_alive"])
+        self.assertEqual(compatibility["leases"], [])
+
+    def test_compatibility_ignores_unusable_relocation_result_payloads(self) -> None:
+        running = self.running_server(name="invalid-relocation-web", port=3214)
+        servers = self.server_service()
+        reserved = servers.reserve_stop(
+            agent="codex-a",
+            server_definition_id=str(running["id"]),
+            expected_definition_generation=int(running["generation"]),
+            expected_observation_fingerprint=running.get("_observation_fingerprint"),
+        )
+        servers.commit_stop(
+            operation_id=str(reserved["operation_id"]),
+            server_definition_id=str(running["id"]),
+            agent="codex-a",
+            reason="invalid relocation projection fixture",
+            release_port=True,
+            stale_lease=False,
+            final_health={
+                "ok": False,
+                "pid_alive": False,
+                "identity": {"ok": False, "observable": True},
+                "classification": "stopped",
+            },
+        )
+        ports = self.service()
+        with ports.store.read_transaction() as connection:
+            repo_id = str(
+                connection.execute(
+                    "SELECT repo_id FROM server_definitions WHERE server_definition_id = ?",
+                    (running["id"],),
+                ).fetchone()[0]
+            )
+
+        for label, result_json in (
+            ("sql-null", None),
+            ("malformed-json", "{not-json"),
+            ("non-object-json", '["not", "an", "object"]'),
+        ):
+            with self.subTest(payload=label):
+                operation_id = deterministic_id(
+                    "invalid-relocation-result", str(running["id"]), label
+                )
+                timestamp = utc_timestamp()
+                with ports.store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO operations(
+                            operation_id, repo_id, source_id, kind, status, phase,
+                            generation, request_fingerprint, owner_uid, actor,
+                            process_fingerprint, error_code, error_message, result_json,
+                            created_at, updated_at
+                        ) VALUES (?, ?, NULL, 'port.relocate', 'succeeded',
+                                  'committed', 0, ?, ?, 'test', NULL, NULL, NULL,
+                                  ?, ?, ?)
+                        """,
+                        (
+                            operation_id,
+                            repo_id,
+                            deterministic_id("request", operation_id),
+                            os.geteuid(),
+                            result_json,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO operation_targets(
+                            operation_id, ordinal, target_kind, target_id, action,
+                            immutable_fingerprint, phase, status, result_json,
+                            error_json, started_at, finished_at
+                        ) VALUES (?, 0, 'server', ?, 'relocate', ?, 'committed',
+                                  'succeeded', ?, NULL, ?, ?)
+                        """,
+                        (
+                            operation_id,
+                            running["id"],
+                            deterministic_id("server", str(running["id"])),
+                            result_json,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+
+                compatibility = ports.store.inventory_v2()["v1_compatibility"]
+                projected_server = next(
+                    item
+                    for item in compatibility["servers"]
+                    if item["id"] == running["id"]
+                )
+                self.assertEqual(
+                    projected_server["metadata_source"], "normalized-sqlite"
+                )
+                self.assertNotIn("relocated_from", projected_server)
+                self.assertNotIn("relocated_at", projected_server)
+                self.assertEqual(projected_server["pid"], 44001)
+                self.assertEqual(
+                    projected_server["lease_id"], running["lease_id"]
+                )
 
     def test_compatibility_usage_projects_only_current_running_samples(self) -> None:
         running = self.running_server(name="metrics-web", port=3213)
@@ -1340,6 +1450,37 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 )
             self.assertEqual(relocated["new_project"], str(self.project_b))
             self.assertEqual(relocated["project"], str(self.project_b))
+            relocation_inventory = command("inventory", "--no-docker")
+            projected_relocation = next(
+                item
+                for item in relocation_inventory["v1_compatibility"]["servers"]
+                if item["id"] == relocated["id"]
+            )
+            for key, expected in {
+                "key": f"{self.project_b}::web",
+                "project": str(self.project_b),
+                "pid": None,
+                "lease_id": None,
+                "metadata_source": "port_relocate",
+                "relocated_from": str(self.project),
+                "stopped_reason": (
+                    "Checkout ownership relocated; awaiting exact listener registration"
+                ),
+            }.items():
+                self.assertEqual(projected_relocation[key], expected)
+            self.assertTrue(projected_relocation["relocated_at"])
+            self.assertEqual(
+                relocation_inventory["v1_compatibility"]["leases"], []
+            )
+            projected_assignment = next(
+                item
+                for item in relocation_inventory["v1_compatibility"][
+                    "port_assignments"
+                ]
+                if item["name"] == "web"
+                and item["project"] == str(self.project_b)
+            )
+            self.assertEqual(projected_assignment["key"], f"{self.project_b}::web")
 
             runtime["stopped"] = False
             with (
