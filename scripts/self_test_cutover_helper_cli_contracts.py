@@ -11,6 +11,7 @@ Linux procfs, but argparse/usage exit 2 is never accepted as contract evidence.
 from __future__ import annotations
 
 import copy
+import http.client
 import http.server
 import importlib.util
 import json
@@ -27,6 +28,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qs, urlencode, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -129,9 +131,38 @@ class CoordinatorFixtureHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self._reply(200, {"ok": True})
             return
-        if self.path in {"/v1/inventory", "/v1/inventory/no-docker"}:
+        if self.path == "/v1/inventory":
             if authorization != f"Bearer {token}":
                 self._reply(401, {"error": "unauthorized"})
+                return
+            self._reply(200, inventory)
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == "/v1/inventory/no-docker":
+            if authorization != f"Bearer {token}":
+                self._reply(401, {"error": "unauthorized"})
+                return
+            expected_query = getattr(server, "fixture_registration_query", None)
+            if expected_query is not None:
+                try:
+                    values = parse_qs(
+                        parsed.query,
+                        keep_blank_values=True,
+                        strict_parsing=True,
+                        max_num_fields=3,
+                    )
+                except ValueError:
+                    self._reply(400, {"error": "invalid registration query"})
+                    return
+                observed_query = {
+                    key: rows[0] if len(rows) == 1 else None
+                    for key, rows in values.items()
+                }
+                if observed_query != expected_query:
+                    self._reply(400, {"error": "wrong registration query"})
+                    return
+            elif parsed.query:
+                self._reply(404, {"error": "not found"})
                 return
             self._reply(200, inventory)
             return
@@ -147,10 +178,15 @@ class CoordinatorFixtureHandler(http.server.BaseHTTPRequestHandler):
 
 
 @contextmanager
-def coordinator_fixture(inventory: dict[str, Any]) -> Iterator[FastThreadingServer]:
+def coordinator_fixture(
+    inventory: dict[str, Any],
+    *,
+    registration_query: dict[str, str] | None = None,
+) -> Iterator[FastThreadingServer]:
     server = FastThreadingServer(("127.0.0.1", 0), CoordinatorFixtureHandler)
     server.fixture_token = FIXTURE_CREDENTIAL  # type: ignore[attr-defined]
     server.fixture_inventory = inventory  # type: ignore[attr-defined]
+    server.fixture_registration_query = registration_query  # type: ignore[attr-defined]
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     try:
@@ -159,6 +195,78 @@ def coordinator_fixture(inventory: dict[str, Any]) -> Iterator[FastThreadingServ
         server.shutdown()
         server.server_close()
         worker.join(timeout=5)
+
+
+def fixture_request_status(
+    server: FastThreadingServer,
+    target: str,
+    *,
+    authenticated: bool = True,
+) -> int:
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        int(server.server_address[1]),
+        timeout=5,
+    )
+    try:
+        connection.request(
+            "GET",
+            target,
+            headers=(
+                {"Authorization": f"Bearer {FIXTURE_CREDENTIAL}"}
+                if authenticated
+                else {}
+            ),
+        )
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    finally:
+        connection.close()
+
+
+def fixture_inventory_status(
+    server: FastThreadingServer,
+    query: dict[str, str] | None,
+) -> int:
+    target = "/v1/inventory/no-docker"
+    if query is not None:
+        target = f"{target}?{urlencode(query)}"
+    return fixture_request_status(server, target)
+
+
+def test_scoped_inventory_fixture() -> None:
+    expected = {
+        "project": "/tmp/project with spaces",
+        "name": "devops-console",
+        "port": "29876",
+    }
+    with coordinator_fixture({"servers": []}, registration_query=expected) as server:
+        require(
+            fixture_inventory_status(server, expected) == 200,
+            "coordinator fixture rejected the exact scoped readiness query",
+        )
+        require(
+            fixture_inventory_status(server, None) == 400,
+            "coordinator fixture accepted a missing readiness scope",
+        )
+        require(
+            fixture_inventory_status(server, {**expected, "port": "29877"}) == 400,
+            "coordinator fixture accepted the wrong readiness scope",
+        )
+        require(
+            fixture_request_status(
+                server,
+                "/healthz?unexpected=1",
+                authenticated=False,
+            )
+            == 404,
+            "coordinator fixture weakened the exact health-probe path contract",
+        )
+        require(
+            fixture_request_status(server, "/v1/inventory?unexpected=1") == 404,
+            "coordinator fixture weakened the exact authenticated inventory path contract",
+        )
 
 
 def captured_process_evidence() -> dict[str, Any]:
@@ -582,7 +690,14 @@ while True:
             port=console_port,
             listener_inode=listener_inode,
         )
-        with coordinator_fixture(inventory) as coordinator:
+        with coordinator_fixture(
+            inventory,
+            registration_query={
+                "project": str(project),
+                "name": "devops-console",
+                "port": str(console_port),
+            },
+        ) as coordinator:
             coordinator_port = int(coordinator.server_address[1])
             completed = run_helper(
                 "check_console_registration_ready.py",
@@ -757,6 +872,7 @@ def main() -> int:
     root = Path(raw).resolve(strict=True)
     root.chmod(0o700)
     try:
+        test_scoped_inventory_fixture()
         test_production_layout(root)
         test_state_only_migration(root)
         evidence = test_captured_process_termination(root)
