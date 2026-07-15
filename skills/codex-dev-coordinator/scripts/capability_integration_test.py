@@ -231,8 +231,9 @@ def run_integration() -> int:
     root = Path(tempfile.mkdtemp(prefix="coordinator-capability-integration-")).resolve(strict=True)
     old_project = root / "legacy"
     project = root / "DevCoordinator"
-    old_project.mkdir()
-    project.mkdir()
+    for repository in (old_project, project):
+        repository.mkdir()
+        (repository / ".git").mkdir()
     home = root / "state"
     processes: list[subprocess.Popen[str]] = []
     try:
