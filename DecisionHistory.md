@@ -4,9 +4,17 @@
 
 Confirmed user intent: one canonical local worktree is one project; removal is a reversible, data-retaining decommission rather than cosmetic hiding; coordinator state and actions must be real, attributable, and fail closed; ports remain stable; background UI work stays bounded; and protected Console access is explicit per account and domain. See [DC-2026-07-14-STATE-01](DecisionDetails/DC-2026-07-14-STATE-01.md), [DC-2026-07-13-01](DecisionDetails/DC-2026-07-13-01.md), [DC-2026-07-10-03](DecisionDetails/DC-2026-07-10-03.md), [DC-2026-07-06-01](DecisionDetails/DC-2026-07-06-01.md), [DC-2026-07-13-05](DecisionDetails/DC-2026-07-13-05.md), and [DC-2026-07-14-ACCESS-01](DecisionDetails/DC-2026-07-14-ACCESS-01.md).
 
-Confirmed operational direction: same-UID clients share a private normalized account authority; cross-UID host-global mutations use peer-authenticated authorization; native work follows the Build macOS Apps workflow; and releases require remote-fresh, production-shaped evidence. See [DC-2026-07-13-02](DecisionDetails/DC-2026-07-13-02.md), [DC-2026-07-10-07](DecisionDetails/DC-2026-07-10-07.md), and [DC-2026-07-11-19](DecisionDetails/DC-2026-07-11-19.md).
+Confirmed operational direction: all enrolled users and agents on one host use one service-owned Coordinator authority through peer-authenticated authorization; clients do not open the authority database; native work follows the Build macOS Apps workflow; and releases require remote-fresh, production-shaped evidence. See [DC-2026-07-15-HOST-01](DecisionDetails/DC-2026-07-15-HOST-01.md), [DC-2026-07-10-07](DecisionDetails/DC-2026-07-10-07.md), and [DC-2026-07-11-19](DecisionDetails/DC-2026-07-11-19.md).
 
 Inferred direction: the owner prefers compact, actionable status over persistent generic warnings and favors durable safety boundaries over UI-only or denormalized shortcuts. See [DC-2026-07-13-08](DecisionDetails/DC-2026-07-13-08.md), [DC-2026-07-07-01](DecisionDetails/DC-2026-07-07-01.md), and [DC-2026-07-14-STATE-01](DecisionDetails/DC-2026-07-14-STATE-01.md); revisit this inference if later explicit direction conflicts.
+
+## DC-2026-07-15-HOST-01 — The host coordinator is one peer-authenticated system authority
+
+ID: DC-2026-07-15-HOST-01 · Details: [supporting record](DecisionDetails/DC-2026-07-15-HOST-01.md)
+
+Decision: Make the service-owned database at `/var/lib/devcoordinator/coordinator.sqlite3` and peer-authenticated socket at `/run/devcoordinator/broker.sock` the default, single host authority for every enrolled OS account and agent. Keep per-user files only as non-authoritative migration, launch-log, or reconciliation evidence; use direct canonical symlinks for code discovery, never as a permission bypass.
+
+Why: The private-account default let `holygloryTT` start a healthy `prtzn-vpn` server that the `holyglory` Console authority could not see. Cross-user writable SQLite through symlinks loses ownership and authentication, while UI-side inventory merging retains conflicting writers. One system broker uniquely provides one inventory and reservation authority without recurring elevation prompts.
 
 ## DC-2026-07-14-ACCESS-01 — Per-account domain grants with configured owners
 

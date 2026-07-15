@@ -37,52 +37,47 @@ project, and destructive state reset retains attributed prior-state evidence.
 
 ## Shared State
 
-The bundled script stores one normalized private database and related evidence
-under:
+Server-wide authority is the product default. Every Codex, Claude Code, and
+other enrolled agent account reads and mutates one service-owned WAL database:
 
-```bash
-~/.codex/agent-coordinator/
+```text
+/var/lib/devcoordinator/coordinator.sqlite3
+/run/devcoordinator/broker.sock
+/etc/devcoordinator/client-profiles.json
 ```
 
-`coordinator.sqlite3` in WAL mode is the product state store. It owns canonical
-repositories, definitions, observations, immutable Docker resources,
-membership/control bindings, leases, assignments, operations, lifecycle
-fences, removal/retirement records, telemetry, and import evidence. The legacy
-JSON implementation is available only through the explicitly named
-`legacy-json-test-only` backend for deterministic compatibility fixtures; do
-not configure it for product use.
+Clients never open the database. The broker authenticates the kernel peer UID,
+requires a current root-owned profile, and enforces exact repository/server
+ACLs. `inventory` returns this host graph, so a server started by one UID is
+immediately visible to the DevOps Console and every other enrolled UID. If the
+profile, socket, or service is missing, system mode fails closed; it never
+silently creates a second authority below an application-specific home.
 
-By default the coordinator resolves the effective POSIX account through
-`getpwuid(geteuid())` and stores state below that account home. It deliberately
-does not derive this default from `HOME`, `CFFIXED_USER_HOME`, or a desktop
-host's remapped user-domain root. Two Codex or Parall instances with one
-effective UID therefore converge on one database/WAL authority even when their
-runtime-home environment values differ. Run `inventory` in every runtime and
-compare `coordinator_home`, `state_path`, and `store.database_generation` when
-verifying the boundary.
+The supervised authority broker runs as root because its enrollment database
+is root-owned and it must prove or stop exact resources across UIDs. Its typed
+protocol has no user-account host-process launch operation, and service
+authority mode rejects all direct CLI server, project, Docker, port,
+repository, resource, and API commands; host-process workloads remain children
+of their enrolled non-root clients. Typed Docker lifecycle stays broker-owned.
 
-An explicit absolute override remains authoritative. Set the same override in
-every same-UID runtime only when an alternate coordination domain is required:
+Each client has a private execution/reconciliation journal at
+`/var/lib/devcoordinator-clients/<uid>/`. That database may retain launch, log,
+rollback, and broker-link evidence, but it is not inventory or reservation
+authority. The installer creates it as the client UID with mode `0700`; normal
+agent operations then require no sudo or repeated permission prompt.
 
-```bash
-export CODEX_AGENT_COORDINATOR_HOME=/path/to/shared/codex-agent-coordinator
-```
+`DEVCOORDINATOR_AUTHORITY=account` or an explicit
+`CODEX_AGENT_COORDINATOR_HOME` without an authority setting is an isolated
+compatibility/test scope. It must not be used as host-global evidence. The
+legacy JSON implementation remains available only as
+`legacy-json-test-only` for deterministic fixtures.
 
-Separate coordinator homes do not share a reservation authority. Two
-deliberately different overrides, different effective UIDs, or separate VMs can
-each record the same currently free host port, so neither private database is
-evidence of host-wide uniqueness. Listener checks prevent many later
-collisions, but they cannot close a simultaneous reservation race between
-independent authorities.
-
-Do not use one coordinator home across different effective OS users or VM
-security boundaries. The coordinator validates that every private directory is
-owned by its effective UID and has mode `0700`; database, WAL, shared-memory,
-token, log, backup, and rollback files remain private. Different Linux users
-keep separate account databases. When they must share host-global ports or
-Docker, use the installed peer-authenticated broker: its service-owned database
-and Unix socket authenticate the kernel peer UID and enforce explicit
-repository/resource ACLs. Never make one SQLite file cross-user writable.
+Never make the service SQLite file group-writable and never point multiple
+users at it through a symlink. Symlinks are used only to install this canonical
+repository skill into Codex/Claude roots so repository updates are picked up;
+the installer gives the client group read/execute-only source ACLs, including
+defaults for future files. Unix-socket peer authentication and ACLs provide
+runtime access; neither mechanism grants database or repository write access.
 
 SQLite foreign keys and uniqueness constraints own the normalized invariants.
 Short `BEGIN IMMEDIATE` reservation/commit phases serialize conflicts while
@@ -116,41 +111,51 @@ cross-repository claims and other unsafe differences remain explicit conflicts
 or Unassigned Resources. Imported homes are no longer independently polled.
 Later legacy writes are detected and surfaced rather than silently winning.
 
-### Cross-user broker installation
+### Server-wide installation
 
-The broker is required only when different effective UIDs must arbitrate the
-same host-global ports or Docker engine. It is never auto-installed. A root
-operator must create a private service database directory, create a root-owned
-runtime directory with traversal for the configured access group, add each
-authorized client to that group, enroll every exact repository, and supervise
-the server process. Keep the database and runtime outside Git.
+Plan and apply the system identity, tmpfiles layout, systemd unit, client group
+membership, private journals, and direct canonical Codex/Claude skill links.
+Apply is transactional for configuration and skill links and does not start the
+service before ACL enrollment:
+
+```bash
+python3 scripts/install_server_wide_coordinator.py plan \
+  --client-user alice --client-user console
+
+sudo python3 scripts/install_server_wide_coordinator.py apply \
+  --client-user alice --client-user console \
+  --transaction-dir /var/lib/devcoordinator-install/$(date +%Y%m%d-%H%M%S)
+```
+
+Enroll each UID/repository. Repeat `--server` to give that account control of
+only those declared servers; omitting it grants no server control unless the
+administrator supplies the explicit `--all-servers` override. Re-enrollment
+atomically replaces the server allowlist and revokes omitted grants:
 
 ```bash
 sudo python3 scripts/dev_coordinator.py broker enroll \
   --database /var/lib/devcoordinator/coordinator.sqlite3 \
   --socket /run/devcoordinator/broker.sock \
-  --access-gid NUMERIC_DEVCOORDINATOR_GID \
+  --access-group devcoordinator-clients \
   --client-uid NUMERIC_CLIENT_UID \
   --account-id EXACT_CLIENT_ACCOUNT_ID \
   --project /absolute/path/to/repository \
   --agent "$USER" \
+  --server web \
+  --server worker \
   --port-range 3000-3999
 
-sudo python3 scripts/dev_coordinator.py broker serve \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --socket /run/devcoordinator/broker.sock \
-  --access-gid NUMERIC_DEVCOORDINATOR_GID
+sudo systemctl enable --now devcoordinator-broker.service
 ```
 
 Enrollment performs a fresh full-Docker observation, grants only exact opaque
 normalized IDs, writes the protected system client profile, and starts no
-resource. The operator's service manager owns restart and boot policy. Once a
-valid repository profile is installed, a missing, stale, inaccessible, or
-failing broker is a hard stop; never bypass it with local Docker or a private
-account-store mutation. Reenroll to renew the profile or to grant newly
-observed resources. Use `--explicit-reinstall` only when the operator intends
-to clear that repository's durable disabled fence; reenrollment still does not
-start it.
+resource. To migrate an already-running listener, enroll its definition and
+run `server register` as the owning UID; the service verifies the exact UID,
+PID, repository cwd, port, and listener before publication. Preserve the old
+account store until the shared inventory and Console show the migrated server.
+Use the install transaction with the installer's `rollback` command if the
+configuration or canonical links must be restored.
 
 ### Normalized store backup, restore, and corrupt recovery
 

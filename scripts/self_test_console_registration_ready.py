@@ -347,7 +347,7 @@ def actual_api_delayed_registration_test() -> None:
             # A developer's other coordinator homes or system broker profile
             # must not influence this isolated normalized fixture.
             dc.discover_same_uid_legacy_homes = lambda **_kwargs: []
-            dc.load_broker_profile = lambda: None
+            dc.load_broker_profile = lambda **_kwargs: None
 
             with dc.AccountStore.open_default(home) as store:
                 host_id = store.ensure_local_host()

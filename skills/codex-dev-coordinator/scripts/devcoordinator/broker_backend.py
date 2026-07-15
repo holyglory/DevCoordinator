@@ -133,6 +133,8 @@ class StoreBackedMutationBackend:
 
     def execute(self, authorized: AuthorizedBrokerRequest) -> Mapping[str, Any]:
         request = authorized.request
+        if request.operation == BrokerOperation.INVENTORY_READ:
+            return self._persistence.inventory(authorized)
         if request.operation == BrokerOperation.REPOSITORY_LIST_REMOVED:
             return {
                 "repositories": self._persistence.list_removed_repository(authorized)
@@ -253,6 +255,45 @@ class StoreBackedMutationBackend:
                 )
             elif request.operation == BrokerOperation.PORT_RELEASE:
                 return self._persistence.complete_port_release(authorized)
+            elif request.operation == BrokerOperation.SERVER_PUBLISH:
+                target = self._persistence.server_publication_target(authorized)
+                lifecycle = str(request.arguments["lifecycle"])
+                listener_evidence: Mapping[str, Any] | None = None
+                if lifecycle == "stopped":
+                    available = self._host_mutations.select_available_port(
+                        candidates=(int(target["port"]),), protocol="tcp"
+                    )
+                    if available != int(target["port"]):
+                        raise BrokerBackendError(
+                            "listener_still_bound",
+                            "The broker cannot publish a stopped server while its exact port remains bound.",
+                            operation_id=request.operation_id,
+                        )
+                else:
+                    listener_evidence = self._host_mutations.verify_owned_tcp_listener(
+                        port=int(target["port"]),
+                        canonical_root=str(target["canonical_root"]),
+                    )
+                    if (
+                        type(listener_evidence.get("owner_uid")) is not int
+                        or int(listener_evidence["owner_uid"]) != authorized.peer.uid
+                    ):
+                        raise BrokerBackendError(
+                            "listener_peer_mismatch",
+                            "The exact listener is not owned by the authenticated operating-system account.",
+                            operation_id=request.operation_id,
+                        )
+                    if int(listener_evidence.get("pid") or 0) != int(
+                        request.arguments["pid"]
+                    ):
+                        raise BrokerBackendError(
+                            "listener_process_mismatch",
+                            "Published process identity does not own the exact enrolled listener.",
+                            operation_id=request.operation_id,
+                        )
+                return self._persistence.complete_server_publication(
+                    authorized, listener_evidence=listener_evidence
+                )
             elif request.operation == BrokerOperation.PORT_ASSIGN:
                 candidates = self._persistence.port_assignment_candidates(authorized)
                 selected_port: Optional[int] = None

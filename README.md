@@ -69,13 +69,19 @@ until fresh-session discovery and repository validation succeed.
 
 ## Coordinator state, identity, and refresh
 
-The product state store is a private SQLite database in WAL mode at
-`~/.codex/agent-coordinator/coordinator.sqlite3`. The default home comes from
-the effective POSIX account, not a desktop application's remapped `HOME`, so
-two Codex or Parall processes running as the same user share one repository,
-lease, operation, and observation authority. The directory is required to be
-mode `0700`; the database, WAL, and shared-memory files are private and reject
-foreign ownership and unsafe path components.
+The product default is one server-wide authority at
+`/var/lib/devcoordinator/coordinator.sqlite3`, reached only through the
+peer-authenticated `/run/devcoordinator/broker.sock`. The service database is
+mode `0600` below a service-owned `0700` directory; clients never open it.
+Every enrolled UID therefore sees the same repositories, servers, leases,
+assignments, Docker resources, and lifecycle observations. A private client
+journal at `/var/lib/devcoordinator-clients/<uid>/` retains launch and
+reconciliation evidence without becoming a competing authority.
+
+System mode requires the protected profile at
+`/etc/devcoordinator/client-profiles.json` and fails closed when the broker is
+unavailable. `DEVCOORDINATOR_AUTHORITY=account` is an explicit isolated
+compatibility/test scope, not host-global evidence.
 
 One canonical local Git worktree root is one repository/project. Coordinator
 homes, application instances, display names, and container-name resemblance
@@ -99,47 +105,60 @@ Docker claims remain explicit and fail closed. Legacy files are retained for
 rollback and later writes are reported as conflicts instead of silently
 overwriting SQLite truth.
 
-### Cross-user broker deployment
+### Server-wide deployment
 
-Different effective UIDs never share the account database. If they must
-coordinate host-global ports or Docker, a root operator installs the local
-peer-authenticated broker. This is an explicit service deployment: the
-repository does not install or enable a daemon automatically.
+The deployment uses a root-owned, narrow authority broker, the
+`devcoordinator-clients` socket access group, systemd sysusers/tmpfiles, a
+supervised broker unit, and direct repository skill links for Codex and Claude.
+Root is required to prove and stop exact cross-UID resources and to match the
+administrator-owned enrollment store. The service protocol cannot launch user
+account host processes; those launches remain in each enrolled client's
+non-root process. Typed Docker lifecycle operations remain service-owned. The
+installer grants the client group read/execute-only ACLs on the canonical skill
+source (plus inherited ACLs for future files); the direct links therefore track
+repository updates without granting source or authority-database write access.
+Plan first; apply requires root once and does not start the service:
 
-The operator creates a root-private state directory, a root-owned runtime
-directory whose configured group has traversal, and adds authorized clients to
-that group. For example, use mode `0700` for `/var/lib/devcoordinator` and mode
-`0710` for `/run/devcoordinator`; the broker creates a root-owned, group-readable
-and group-writable `0660` socket. Then enroll each exact repository before
-starting or reloading the supervised service:
+```bash
+python3 scripts/install_server_wide_coordinator.py plan \
+  --client-user alice --client-user console
+
+sudo python3 scripts/install_server_wide_coordinator.py apply \
+  --client-user alice --client-user console \
+  --transaction-dir /var/lib/devcoordinator-install/$(date +%Y%m%d-%H%M%S)
+```
+
+Then enroll each exact UID/repository before enabling the broker. Repeated
+`--server` flags form that account's server allowlist; re-enrollment atomically
+revokes omitted server grants. Omitting both `--server` and the explicit
+`--all-servers` override grants no server control:
 
 ```bash
 sudo python3 /absolute/path/to/dev_coordinator.py broker enroll \
   --database /var/lib/devcoordinator/coordinator.sqlite3 \
   --socket /run/devcoordinator/broker.sock \
-  --access-gid NUMERIC_DEVCOORDINATOR_GID \
+  --access-group devcoordinator-clients \
   --client-uid NUMERIC_CLIENT_UID \
   --account-id EXACT_CLIENT_ACCOUNT_ID \
   --project /absolute/path/to/repository \
   --agent "$USER" \
+  --server web \
+  --server worker \
   --port-range 3000-3999
 
-sudo python3 /absolute/path/to/dev_coordinator.py broker serve \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --socket /run/devcoordinator/broker.sock \
-  --access-gid NUMERIC_DEVCOORDINATOR_GID
+sudo systemctl enable --now devcoordinator-broker.service
 ```
 
 Enrollment resolves the real Git root, imports its declared runtime, performs a
 fresh full-Docker observation, grants only exact normalized repository/resource
 IDs, and installs the protected client profile at
 `/etc/devcoordinator/client-profiles.json` on Linux or
-`/private/etc/devcoordinator/client-profiles.json` on macOS. It does not start
-resources. The root operator must supervise `broker serve`, arrange group
-membership before clients connect, renew expiring profiles by reenrollment, and
-back up the service database. Once a valid profile covers a repository, client
-commands fail closed if the broker is unavailable; they never fall back to the
-client's Docker socket or private account store for broker-owned mutations.
+`/private/etc/devcoordinator/client-profiles.json` on macOS. It starts no
+resource. Register any pre-existing running listener as its owning UID after
+enrollment; publication succeeds only after the service proves its exact UID,
+PID, repository cwd, port, and listener. Keep the old account store until the
+server appears in the shared inventory and DevOps Console. The installer
+transaction can roll back system configuration and canonical skill links.
 
 ### Coordinator-store backup and recovery
 
@@ -327,10 +346,11 @@ inventory.
 ## Boundaries
 
 The coordinator is not a remote orchestrator, general identity provider,
-container scheduler, or production service manager. Its optional cross-user
-broker is a narrow local peer-UID and explicit-ACL authority for ports, Docker,
-repository decommission, and protected database actions; it is not remote IAM
-or an OS service supervisor. PostgreSQL logical backups
+container scheduler, or remote identity provider. Its default server-wide
+broker is a narrow local peer-UID and explicit-ACL authority for inventory,
+servers, ports, Docker, repository decommission, and protected database
+actions; systemd supervises only the broker, not managed user workloads. It is
+not remote IAM or a general workload supervisor. PostgreSQL logical backups
 are not encryption, off-site storage, replication, continuous archiving, or
 point-in-time recovery. The Console is purpose-built for an operator-controlled
 host and adds owner-managed per-Google-account domain grants behind its

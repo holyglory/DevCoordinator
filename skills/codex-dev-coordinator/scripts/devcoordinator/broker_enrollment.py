@@ -30,6 +30,7 @@ def enroll_repository(
     account_id: str,
     canonical_root: str,
     servers: Sequence[Mapping[str, Any]],
+    allowed_server_names: Sequence[str] | None = None,
     port_start: int,
     port_end: int,
     profile_path: Path,
@@ -196,6 +197,22 @@ def enroll_repository(
                 server_ids[name] = server_id
         database_generation = store.metadata.database_generation
 
+        if allowed_server_names is None:
+            granted_server_ids = dict(server_ids)
+        else:
+            requested_names = tuple(dict.fromkeys(str(item).strip() for item in allowed_server_names))
+            if any(not name for name in requested_names):
+                raise ValueError("allowed server names must be non-empty")
+            unknown = sorted(set(requested_names) - set(server_ids))
+            if unknown:
+                raise ValueError(
+                    "server access allowlist names are absent from the runtime manifest: "
+                    + ", ".join(unknown)
+                )
+            granted_server_ids = {
+                name: server_ids[name] for name in requested_names
+            }
+
         if observe_host is not None:
             observe_host(store)
         with store.read_transaction() as connection:
@@ -225,29 +242,15 @@ def enroll_repository(
             repo_id=repo_id,
             operation=operation,
         )
-    for server_id in server_ids.values():
-        for operation in (
-            BrokerOperation.PORT_LEASE,
-            BrokerOperation.PORT_RELEASE,
-            BrokerOperation.PORT_ASSIGN,
-            BrokerOperation.PORT_UNASSIGN,
-        ):
-            persistence.grant_resource(
-                uid=client_uid,
-                repo_id=repo_id,
-                resource_kind="server",
-                resource_id=server_id,
-                operation=operation,
-            )
-        persistence.grant_port_range(
-            uid=client_uid,
-            repo_id=repo_id,
-            server_definition_id=server_id,
-            start_port=port_start,
-            end_port=port_end,
-            protocol="tcp",
-            max_ttl_seconds=7 * 24 * 60 * 60,
-        )
+    persistence.replace_server_access(
+        uid=client_uid,
+        repo_id=repo_id,
+        server_definition_ids=granted_server_ids.values(),
+        start_port=port_start,
+        end_port=port_end,
+        protocol="tcp",
+        max_ttl_seconds=7 * 24 * 60 * 60,
+    )
 
     container_ids = _grant_observed_containers(
         persistence, repo_id=repo_id, client_uid=client_uid
@@ -280,7 +283,7 @@ def enroll_repository(
             "canonical_root": str(root),
             "repo_id": repo_id,
             "generation": repository_generation,
-            "servers": server_ids,
+            "servers": granted_server_ids,
             "containers": container_ids,
             "compose_definition_id": compose_definition_id,
         },
@@ -291,7 +294,8 @@ def enroll_repository(
         "client_uid": client_uid,
         "account_id": account_id,
         "repo_id": repo_id,
-        "server_ids": server_ids,
+        "server_ids": granted_server_ids,
+        "defined_server_ids": server_ids,
         "container_ids": container_ids,
         "compose_definition_id": compose_definition_id,
         "database_generation": database_generation,
