@@ -2218,6 +2218,16 @@ class SQLiteLifecyclePersistence:
         target_map: dict[tuple[str, str], list[AllocationRef]] = {}
         repository: list[AllocationRef] = []
         raw_rows: list[Mapping[str, Any]] = []
+        managed_server_ids = {
+            str(row["host_resource_id"])
+            for row in connection.execute(
+                """
+                SELECT host_resource_id FROM repository_memberships
+                WHERE repo_id = ? AND resource_kind = 'server'
+                """,
+                (repo_id,),
+            )
+        }
         servers = {
             str(row["server_definition_id"]): str(row["name"])
             for row in connection.execute(
@@ -2225,7 +2235,11 @@ class SQLiteLifecyclePersistence:
                 (repo_id,),
             )
         }
-        server_by_name = {name: server_id for server_id, name in servers.items()}
+        server_by_name = {
+            name: server_id
+            for server_id, name in servers.items()
+            if server_id in managed_server_ids
+        }
         for row in connection.execute(
             "SELECT * FROM leases WHERE repo_id = ? AND status = 'active' ORDER BY lease_id",
             (repo_id,),
@@ -2235,7 +2249,7 @@ class SQLiteLifecyclePersistence:
                 str(row["lease_id"]), AllocationKind.LEASE, _allocation_fingerprint(row)
             )
             server_id = row["server_definition_id"]
-            if server_id is not None and str(server_id) in servers:
+            if server_id is not None and str(server_id) in managed_server_ids:
                 target_map.setdefault((ResourceKind.SERVER.value, str(server_id)), []).append(item)
             else:
                 repository.append(item)

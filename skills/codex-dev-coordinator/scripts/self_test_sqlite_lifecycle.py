@@ -281,11 +281,142 @@ def open_seeded_store(root: Path) -> AccountStore:
     return store
 
 
+def test_server_allocations_require_a_managed_server_target() -> None:
+    with tempfile.TemporaryDirectory(prefix=".sqlite-lifecycle-", dir=Path.home()) as raw:
+        root = Path(raw).resolve()
+        store = AccountStore.open(root / "coordinator.sqlite3")
+        try:
+            with store.immediate_transaction() as connection:
+                seed_base(connection)
+                now = utc_timestamp()
+                for server_id, name in (
+                    ("server-managed", "managed"),
+                    ("server-dormant", "dormant"),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO server_definitions(
+                            server_definition_id, repo_id, name, cwd,
+                            definition_fingerprint, generation, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                        """,
+                        (server_id, REPO_ID, name, str(root), f"definition:{name}", now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO leases(
+                            lease_id, host_id, repo_id, server_definition_id, port,
+                            owner, agent, purpose, status, generation, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 'tester', 'tester', ?,
+                                  'active', 0, ?, ?)
+                        """,
+                        (
+                            f"lease-{name}",
+                            HOST_ID,
+                            REPO_ID,
+                            server_id,
+                            3460 if name == "managed" else 3462,
+                            name,
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO port_assignments(
+                            assignment_id, host_id, repo_id, server_name, port,
+                            status, generation, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, 'active', 0, ?, ?)
+                        """,
+                        (
+                            f"pin-{name}",
+                            HOST_ID,
+                            REPO_ID,
+                            name,
+                            3461 if name == "managed" else 3463,
+                            now,
+                            now,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO control_bindings(
+                        binding_id, repo_id, resource_kind, resource_id, source_id,
+                        capability, provenance, authority_state, priority,
+                        generation, created_at, updated_at
+                    ) VALUES ('binding-server-managed', ?, 'server',
+                              'server-managed', ?, 'process', 'test',
+                              'authoritative', 10, 0, ?, ?)
+                    """,
+                    (REPO_ID, SOURCE_ID, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_memberships(
+                        membership_id, repo_id, resource_kind, host_resource_id,
+                        immutable_fingerprint, control_binding_id, created_at
+                    ) VALUES ('membership-server-managed', ?, 'server',
+                              'server-managed', 'membership-fp:server-managed',
+                              'binding-server-managed', ?)
+                    """,
+                    (REPO_ID, now),
+                )
+
+            snapshot = SQLiteLifecyclePersistence(store).repository_snapshot(REPO_ID)
+            managed = next(
+                target for target in snapshot.targets if target.resource_id == "server-managed"
+            )
+            expect(
+                {item.allocation_id for item in managed.allocations}
+                == {"lease-managed", "pin-managed"},
+                "managed-server allocations were not attached to its exact lifecycle target",
+            )
+            expect(
+                {item.allocation_id for item in snapshot.repository_allocations}
+                == {"lease-dormant", "pin-dormant"},
+                "dormant-server allocations did not fall back to the repository ledger",
+            )
+        finally:
+            store.close()
+
+
 def test_repository_plan_apply_reinstall_and_normalized_ledger() -> None:
     with tempfile.TemporaryDirectory(prefix=".sqlite-lifecycle-", dir=Path.home()) as raw:
         store = open_seeded_store(Path(raw).resolve() / "state")
         try:
             persistence = SQLiteLifecyclePersistence(store)
+            with store.immediate_transaction() as connection:
+                now = utc_timestamp()
+                connection.execute(
+                    """
+                    INSERT INTO server_definitions(
+                        server_definition_id, repo_id, name, cwd,
+                        definition_fingerprint, generation, created_at, updated_at
+                    ) VALUES ('server-dormant', ?, 'dormant', ?,
+                              'definition:dormant', 0, ?, ?)
+                    """,
+                    (REPO_ID, str(Path(raw).resolve()), now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO leases(
+                        lease_id, host_id, repo_id, server_definition_id, port,
+                        owner, agent, purpose, status, generation, created_at, updated_at
+                    ) VALUES ('lease-dormant', ?, ?, 'server-dormant', 3458,
+                              'tester', 'tester', 'dormant', 'active', 0, ?, ?)
+                    """,
+                    (HOST_ID, REPO_ID, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO port_assignments(
+                        assignment_id, host_id, repo_id, server_name, port, status,
+                        generation, created_at, updated_at
+                    ) VALUES ('pin-dormant', ?, ?, 'dormant', 3459,
+                              'active', 0, ?, ?)
+                    """,
+                    (HOST_ID, REPO_ID, now, now),
+                )
             initial_inventory = store.inventory_v2()
             expect(
                 [item["repo_id"] for item in initial_inventory["repositories"]] == [REPO_ID],
@@ -299,8 +430,8 @@ def test_repository_plan_apply_reinstall_and_normalized_ledger() -> None:
             snapshot = persistence.repository_snapshot(REPO_ID)
             expect(len(snapshot.targets) == 1, "repository target was not normalized")
             expect(
-                len(snapshot.repository_allocations) == 2,
-                "unmatched lease/pin were not retained on repository ledger",
+                len(snapshot.repository_allocations) == 4,
+                "allocations without a managed server target were not retained on repository ledger",
             )
             target = snapshot.targets[0]
             native = dict(target.native_identity)
@@ -349,6 +480,16 @@ def test_repository_plan_apply_reinstall_and_normalized_ledger() -> None:
                     connection.execute("SELECT status FROM port_assignments WHERE assignment_id='pin-manual'").fetchone()[0]
                     == "inactive",
                     "port assignment remained active",
+                )
+                expect(
+                    connection.execute("SELECT status FROM leases WHERE lease_id='lease-dormant'").fetchone()[0]
+                    == "released",
+                    "dormant-server lease remained active",
+                )
+                expect(
+                    connection.execute("SELECT status FROM port_assignments WHERE assignment_id='pin-dormant'").fetchone()[0]
+                    == "inactive",
+                    "dormant-server port assignment remained active",
                 )
                 expect(
                     connection.execute("SELECT current_value FROM startup_policies WHERE policy_id=?", (f"policy:{DOCKER_RESOURCE_ID}",)).fetchone()[0]
