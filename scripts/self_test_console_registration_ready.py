@@ -154,6 +154,34 @@ def schema_v2_fixture(value: dict) -> dict:
     }
 
 
+def pending_current_main_pid_fixture() -> dict:
+    """Mirror the brief local-commit/fresh-listener-proof startup boundary."""
+
+    value = ready_fixture()
+    value["port_assignments"][0]["status"] = "active"
+    server = value["servers"][0]
+    server.pop("registration_identity")
+    server["host"] = "127.0.0.1"
+    server["cwd"] = f"{FIXTURES.PROJECT}/apps/DevOpsConsole"
+    server["url_is_current"] = False
+    server["health"] = {
+        "attempts": 1,
+        "check": {"ok": False, "error": "[Errno 111] Connection refused"},
+        "classification": "unverified-listener",
+        "identity": {
+            "cwd": f"{FIXTURES.PROJECT}/apps/DevOpsConsole",
+            "observable": False,
+            "ok": None,
+            "pid": FIXTURES.MAIN_PID,
+            "project": FIXTURES.PROJECT,
+            "reason": "registration PID fd table is not observable yet",
+        },
+        "ok": None,
+        "pid_alive": True,
+    }
+    return value
+
+
 def stopped_server(*, project: str = FIXTURES.PROJECT, port: int = FIXTURES.PORT, pid=27001, lease_id=None) -> dict:
     server = copy.deepcopy(FIXTURES.fixture()["servers"][0])
     server.update(
@@ -1128,6 +1156,24 @@ def main() -> int:
     normalized_producer_contract_test()
     state, report = classify(ready_fixture())
     require(state == "ready" and report["server_pid"] == FIXTURES.MAIN_PID, "valid graph must pass")
+
+    current_pending = pending_current_main_pid_fixture()
+    require(
+        classify(current_pending)[0] == "pending-current-main-pid-proof",
+        "exact current MainPID awaiting fresh listener proof must retry",
+    )
+    pending_wrong_pid = copy.deepcopy(current_pending)
+    pending_wrong_pid["servers"][0]["pid"] = FIXTURES.MAIN_PID + 1
+    must_fail(pending_wrong_pid, "MainPID", "pending current row names another PID")
+    pending_foreign_cwd = copy.deepcopy(current_pending)
+    pending_foreign_cwd["servers"][0]["cwd"] = "/srv/foreign/apps/DevOpsConsole"
+    must_fail(pending_foreign_cwd, "cwd", "pending current row names another checkout")
+    pending_wrong_owner = copy.deepcopy(current_pending)
+    pending_wrong_owner["leases"][0]["owner_pid"] = FIXTURES.MAIN_PID + 1
+    must_fail(pending_wrong_owner, "owner_pid", "pending current lease names another PID")
+    pending_wrong_listener = copy.deepcopy(current_pending)
+    pending_wrong_listener["servers"][0]["health"]["identity"]["ok"] = False
+    must_fail(pending_wrong_listener, "wrong listener", "negative listener proof was retried")
 
     schema_v2_ready = schema_v2_fixture(ready_fixture())
     schema_v2_before = copy.deepcopy(schema_v2_ready)

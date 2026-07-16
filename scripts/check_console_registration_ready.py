@@ -107,9 +107,135 @@ def classify_registration_snapshot(
     ]
 
     if current_port_servers:
-        raise ConsoleRegistrationError(
-            "unsafe registration baseline: a non-stopped server claims the Console port"
-        )
+        if len(current_port_servers) != 1 or len(target_servers) != 1:
+            raise ConsoleRegistrationError(
+                "unsafe registration baseline: a non-stopped server claims the Console port"
+            )
+        current = current_port_servers[0]
+        if target_servers[0] is not current:
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: target and port server rows differ"
+            )
+        if current.get("status") != "running":
+            raise ConsoleRegistrationError(
+                "unsafe registration baseline: a non-stopped server claims the Console port"
+            )
+        for key, expected in {
+            "key": expected_key,
+            "project": project,
+            "name": name,
+            "host": "127.0.0.1",
+            "port": port,
+            "pid": main_pid,
+            "status": "running",
+        }.items():
+            if current.get(key) != expected:
+                raise ConsoleRegistrationError(
+                    "unsafe current MainPID proof: "
+                    f"server {key} is {current.get(key)!r}, expected {expected!r}"
+                )
+        cwd = current.get("cwd")
+        if not isinstance(cwd, str) or not (
+            cwd == project or cwd.startswith(project.rstrip("/") + "/")
+        ):
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: server cwd is outside project"
+            )
+        if "registration_identity" in current:
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: incomplete registration identity is present"
+            )
+        health = current.get("health")
+        if not isinstance(health, dict):
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: server health is missing"
+            )
+        identity = health.get("identity")
+        if isinstance(identity, dict) and identity.get("ok") is False:
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: fresh observation proved a wrong listener"
+            )
+        if (
+            health.get("ok") is not None
+            or health.get("pid_alive") is not True
+            or health.get("classification") != "unverified-listener"
+            or not isinstance(identity, dict)
+            or identity.get("ok") is not None
+            or identity.get("observable") is not False
+            or identity.get("pid") != main_pid
+            or identity.get("project") != project
+        ):
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: listener state is not explicitly unverified"
+            )
+        identity_cwd = identity.get("cwd")
+        if not isinstance(identity_cwd, str) or not (
+            identity_cwd == project
+            or identity_cwd.startswith(project.rstrip("/") + "/")
+        ):
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: identity cwd is outside project"
+            )
+        if len(relevant_assignments) != 1:
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: durable assignment is missing or ambiguous"
+            )
+        assignment = relevant_assignments[0]
+        for key, expected in {
+            "key": expected_key,
+            "project": project,
+            "name": name,
+            "port": port,
+            "status": "active",
+            "server_status": "running",
+        }.items():
+            if assignment.get(key) != expected:
+                raise ConsoleRegistrationError(
+                    "unsafe current MainPID proof: "
+                    f"assignment {key} is {assignment.get(key)!r}, expected {expected!r}"
+                )
+        if len(active_port_leases) != 1 or len(active_target_leases) != 1:
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: active lease is missing or ambiguous"
+            )
+        lease = active_port_leases[0]
+        if active_target_leases[0] is not lease:
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: target and port leases differ"
+            )
+        server_id = current.get("id")
+        lease_id = lease.get("id")
+        if not isinstance(server_id, str) or not server_id.strip():
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: server has no id"
+            )
+        if not isinstance(lease_id, str) or not lease_id.strip():
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: lease has no id"
+            )
+        for key, expected in {
+            "project": project,
+            "port": port,
+            "status": "active",
+            "purpose": f"server:{name}",
+            "server_id": server_id,
+            "owner_pid": main_pid,
+            "assignment_key": expected_key,
+        }.items():
+            if lease.get(key) != expected:
+                raise ConsoleRegistrationError(
+                    "unsafe current MainPID proof: "
+                    f"lease {key} is {lease.get(key)!r}, expected {expected!r}"
+                )
+        if current.get("lease_id") != lease_id:
+            raise ConsoleRegistrationError(
+                "unsafe current MainPID proof: server and lease identities differ"
+            )
+        return "pending-current-main-pid-proof", {
+            "reason": "exact current systemd MainPID awaits fresh listener proof",
+            "server_id": server_id,
+            "lease_id": lease_id,
+        }
 
     # Server-wide installation enrolls every declared server before it has
     # ever been observed.  The normalized broker projects that durable
