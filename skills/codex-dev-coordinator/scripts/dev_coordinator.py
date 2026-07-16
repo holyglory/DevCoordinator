@@ -7934,6 +7934,47 @@ def _coordinated_server_logs_normalized(
     }
 
 
+def release_normalized_local_lease_if_active(
+    store: AccountStore,
+    *,
+    agent: str,
+    project: str,
+    lease_id: str,
+) -> dict[str, Any]:
+    """Converge local cleanup after the broker has released the exact lease.
+
+    Status observation can stale a local lease before a later broker-backed
+    stop publishes the stopped lifecycle.  That is already a safe inactive
+    boundary, not a cleanup failure.  Missing, foreign, or unexpected-status
+    rows still fail closed so an unrelated lease is never accepted as proof.
+    """
+
+    ports = NormalizedPortLifecycle(store)
+    matches = [
+        lease
+        for lease in ports.list_leases(
+            canonical_project=project,
+            active_only=False,
+        )
+        if str(lease["id"]) == str(lease_id)
+    ]
+    if len(matches) != 1:
+        raise KeyError("matching lease not found")
+    current = matches[0]
+    status = str(current.get("status") or "")
+    if status == "active":
+        return ports.release(
+            agent=agent,
+            canonical_project=project,
+            lease_id=str(lease_id),
+        )
+    if status in {"released", "stale"}:
+        return current
+    raise RuntimeError(
+        f"local lease {lease_id} has unexpected cleanup status {status!r}"
+    )
+
+
 def _coordinated_stop_server_normalized(
     options: dict[str, Any]
 ) -> dict[str, Any]:
@@ -8086,9 +8127,10 @@ def _coordinated_stop_server_normalized(
     try:
         if snapshot.get("lease_id"):
             with AccountStore.open_default(coordinator_home()) as store:
-                NormalizedPortLifecycle(store).release(
+                release_normalized_local_lease_if_active(
+                    store,
                     agent=agent,
-                    canonical_project=project,
+                    project=project,
                     lease_id=str(snapshot["lease_id"]),
                 )
                 committed = NormalizedServerLifecycle(store).server(
@@ -11966,10 +12008,14 @@ def publish_broker_server(
             server.get("stopped_reason") or "Stopped by coordinator"
         )
     else:
-        pid = server.get("pid")
+        host = str(server.get("host") or "127.0.0.1")
+        project = str(server.get("project") or repository.canonical_root)
+        pid, _registration_identity = resolve_registration_pid(
+            {}, host=host, port=port, project=project
+        )
         if type(pid) is not int or pid <= 1:
             raise BrokerProfileError(
-                "broker-backed running server publication has no exact process id"
+                "broker-backed running server publication has no exact listener process id"
             )
         arguments["pid"] = pid
     operation_id, result = profile.call(

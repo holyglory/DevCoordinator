@@ -26,6 +26,10 @@ from devcoordinator.broker_profile import (
     profile_from_document,
 )
 import devcoordinator.broker_profile as broker_profile_module
+from devcoordinator.normalized_server_lifecycle import (
+    NormalizedPortLifecycle,
+    PortLeaseRequest,
+)
 from devcoordinator.store import AccountStore, utc_timestamp
 
 
@@ -96,6 +100,58 @@ def parsed_profile(repository_root: Path) -> BrokerClientProfile:
 
 
 class BrokerProfileTrustTests(unittest.TestCase):
+    def test_running_publication_uses_exact_child_listener_pid(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-child-listener-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            repository = profile.repository(str(repository_root))
+            calls: list[dict[str, object]] = []
+
+            def call(
+                _profile: BrokerClientProfile,
+                *,
+                repository: BrokerRepositoryProfile,
+                resource_id: str,
+                operation: BrokerOperation,
+                arguments: object = None,
+                operation_id: str | None = None,
+            ) -> tuple[str, dict[str, object]]:
+                del _profile, repository, resource_id, operation, operation_id
+                calls.append(dict(arguments or {}))
+                return "operation-publish", {"status": "published"}
+
+            with (
+                mock.patch.object(BrokerClientProfile, "call", new=call),
+                mock.patch.object(
+                    dev_coordinator,
+                    "resolve_registration_pid",
+                    return_value=(222, {"pid": 222, "source": "proc_pid_fd"}),
+                ) as resolve,
+            ):
+                result = dev_coordinator.publish_broker_server(
+                    profile=profile,
+                    repository=repository,
+                    server_name="web",
+                    broker_lease_id="broker-lease-web",
+                    server={
+                        "pid": 111,
+                        "project": str(repository_root),
+                        "host": "127.0.0.1",
+                        "port": 43100,
+                        "health": {"ok": True, "classification": "healthy"},
+                    },
+                )
+
+            resolve.assert_called_once_with(
+                {},
+                host="127.0.0.1",
+                port=43100,
+                project=str(repository_root),
+            )
+            self.assertEqual(calls[0]["pid"], 222)
+            self.assertEqual(result["status"], "published")
+
     def test_healthy_legacy_server_cannot_bypass_host_publication(self) -> None:
         with CanonicalTemporaryDirectory(".broker-legacy-server-") as root:
             repository_root = root / "repository"
@@ -656,6 +712,35 @@ class BrokerLinkStoreTests(unittest.TestCase):
                 tuple(repository),
                 (REPO_ID, str(self.repository_root), "installed"),
             )
+
+    def test_stopped_cleanup_accepts_an_already_inactive_local_lease(self) -> None:
+        ports = NormalizedPortLifecycle(self.store)
+        lease = ports.lease(
+            PortLeaseRequest(
+                agent="codex-test",
+                canonical_project=str(self.repository_root),
+                port_start=43108,
+                port_end=43108,
+                preferred=43108,
+                ttl_seconds=3600,
+                purpose="server:web",
+            ),
+            port_available=lambda _port: True,
+        )
+        ports.release(
+            agent="codex-test",
+            canonical_project=str(self.repository_root),
+            lease_id=str(lease["id"]),
+        )
+
+        reconciled = dev_coordinator.release_normalized_local_lease_if_active(
+            self.store,
+            agent="codex-test",
+            project=str(self.repository_root),
+            lease_id=str(lease["id"]),
+        )
+
+        self.assertEqual(reconciled["status"], "released")
 
     def test_fresh_schema_lease_reserve_bind_release_is_idempotent(self) -> None:
         reserved = self._reserve_lease()
