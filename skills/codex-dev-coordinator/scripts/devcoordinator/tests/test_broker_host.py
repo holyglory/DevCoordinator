@@ -1,17 +1,81 @@
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 import unittest
+from unittest import mock
 
 from devcoordinator.broker import BrokerBackendError
+from devcoordinator import broker_host as broker_host_module
 from devcoordinator.broker_host import LocalBrokerHostMutations, _port_available
 from devcoordinator.broker_persistence import DockerMutationTarget
 
 
 class BrokerHostMutationTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux procfs observer")
+    def test_linux_listener_proof_does_not_depend_on_lsof(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".broker-proc-listener-", dir=str(Path.home().resolve())
+        ) as raw_root:
+            root = Path(raw_root).resolve()
+            ready = root / "listener.ready"
+            fixture = (
+                "import os,signal,socket,sys;"
+                "sock=socket.socket();"
+                "sock.bind(('127.0.0.1',0));"
+                "sock.listen();"
+                "open(sys.argv[1],'w').write(str(sock.getsockname()[1]));"
+                "signal.pause()"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", fixture, str(ready)],
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("listener fixture did not become ready")
+                    time.sleep(0.02)
+                self.assertIsNone(process.poll())
+                port = int(ready.read_text(encoding="utf-8"))
+                with mock.patch.object(
+                    broker_host_module,
+                    "_resolve_lsof_executable",
+                    side_effect=AssertionError("Linux listener proof reached lsof"),
+                ):
+                    evidence = broker_host_module._verify_owned_tcp_listener(
+                        port, str(root)
+                    )
+                self.assertEqual(evidence["pid"], process.pid)
+                self.assertEqual(evidence["cwd"], str(root))
+                self.assertEqual(evidence["owner_uid"], os.geteuid())
+                foreign = root / "foreign"
+                foreign.mkdir()
+                with self.assertRaisesRegex(
+                    BrokerBackendError, "another repository"
+                ):
+                    broker_host_module._verify_owned_tcp_listener(
+                        port, str(foreign)
+                    )
+            finally:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+
     def test_listener_adoption_requires_exact_typed_repository_evidence(self) -> None:
         root = str(Path(tempfile.gettempdir()).resolve())
         calls: list[tuple[int, str]] = []

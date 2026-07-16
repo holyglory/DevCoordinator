@@ -584,8 +584,8 @@ def _verify_owned_tcp_listener(port: int, canonical_root: str) -> Mapping[str, A
     root = _strict_current_path(
         canonical_root, directory=True, field="repository root"
     )
-    lsof = _resolve_lsof_executable()
-    first = _listener_pids(lsof, port)
+    lsof = None if sys.platform.startswith("linux") else _resolve_lsof_executable()
+    first = _platform_listener_pids(port, lsof=lsof)
     if len(first) != 1:
         raise BrokerBackendError(
             "listener_identity_unobservable",
@@ -602,7 +602,7 @@ def _verify_owned_tcp_listener(port: int, canonical_root: str) -> Mapping[str, A
         )
     identity_after = _process_identity(pid)
     owner_uid_after = _process_owner_uid(pid)
-    second = _listener_pids(lsof, port)
+    second = _platform_listener_pids(port, lsof=lsof)
     if (
         identity_before != identity_after
         or owner_uid_before != owner_uid_after
@@ -656,6 +656,96 @@ def _listener_pids(lsof: str, port: int) -> set[int]:
         if line.startswith("p") and line[1:].isdigit():
             result.add(int(line[1:]))
     return result
+
+
+def _platform_listener_pids(port: int, *, lsof: str | None) -> set[int]:
+    if sys.platform.startswith("linux"):
+        return _linux_proc_listener_pids(port)
+    if lsof is None:
+        raise BrokerBackendError(
+            "listener_observer_unavailable",
+            "The broker service has no platform listener observer.",
+        )
+    return _listener_pids(lsof, port)
+
+
+def _linux_proc_listener_pids(port: int) -> set[int]:
+    """Resolve every owner of the exact Linux TCP LISTEN socket set.
+
+    ``/proc/net/tcp{,6}`` is the kernel socket inventory; PID fd links bind
+    those socket inodes to processes.  Every matching inode must be accounted
+    for, so permission gaps and process races remain unknown rather than being
+    coerced to a clean no-match.
+    """
+
+    inodes: set[str] = set()
+    for raw_path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        path = Path(raw_path)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()[1:]
+        except OSError as exc:
+            raise BrokerBackendError(
+                "listener_identity_unobservable",
+                "The broker service cannot read the Linux TCP listener table.",
+            ) from exc
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10:
+                raise BrokerBackendError(
+                    "listener_identity_unobservable",
+                    "The Linux TCP listener table is malformed.",
+                )
+            try:
+                local_port = int(fields[1].rsplit(":", 1)[1], 16)
+            except (IndexError, ValueError) as exc:
+                raise BrokerBackendError(
+                    "listener_identity_unobservable",
+                    "The Linux TCP listener endpoint is malformed.",
+                ) from exc
+            if local_port == int(port) and fields[3] == "0A":
+                inode = fields[9]
+                if not inode.isdigit() or inode == "0":
+                    raise BrokerBackendError(
+                        "listener_identity_unobservable",
+                        "The Linux TCP listener inode is malformed.",
+                    )
+                inodes.add(inode)
+    if not inodes:
+        return set()
+
+    targets = {f"socket:[{inode}]": inode for inode in inodes}
+    owners: dict[str, set[int]] = {inode: set() for inode in inodes}
+    try:
+        processes = tuple(Path("/proc").iterdir())
+    except OSError as exc:
+        raise BrokerBackendError(
+            "listener_identity_unobservable",
+            "The broker service cannot enumerate Linux processes.",
+        ) from exc
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            descriptors = tuple(os.scandir(process / "fd"))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor.path)
+            except OSError:
+                continue
+            inode = targets.get(target)
+            if inode is not None:
+                owners[inode].add(int(process.name))
+    missing = sorted(inode for inode, pids in owners.items() if not pids)
+    if missing:
+        raise BrokerBackendError(
+            "listener_identity_unobservable",
+            "The broker service could not bind every Linux listener inode to a process.",
+        )
+    return {pid for pids in owners.values() for pid in pids}
 
 
 def _process_identity(pid: int) -> str:
@@ -728,7 +818,7 @@ def _process_owner_uid(pid: int) -> int:
     return int(raw)
 
 
-def _process_cwd(lsof: str, pid: int) -> str:
+def _process_cwd(lsof: str | None, pid: int) -> str:
     if sys.platform.startswith("linux"):
         try:
             raw = os.readlink(f"/proc/{pid}/cwd")
@@ -738,6 +828,11 @@ def _process_cwd(lsof: str, pid: int) -> str:
                 "The broker service cannot read the listener process cwd.",
             ) from exc
         return _strict_current_path(raw, directory=True, field="listener cwd")
+    if lsof is None:
+        raise BrokerBackendError(
+            "listener_observer_unavailable",
+            "The broker service cannot inspect the listener process cwd.",
+        )
     completed = subprocess.run(
         [lsof, "-nP", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
         stdin=subprocess.DEVNULL,

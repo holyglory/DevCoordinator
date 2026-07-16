@@ -1839,15 +1839,25 @@ class NormalizedServerLifecycle:
                 lifecycle = "starting"
             else:
                 lifecycle = "unhealthy"
-            stopped = lifecycle == "stopped" and prior_lifecycle != "stopped"
+            stopped_transition = (
+                lifecycle == "stopped" and prior_lifecycle != "stopped"
+            )
+            # Imported account journals can already say ``stopped`` while
+            # retaining the old PID.  A later concrete dead/wrong-listener
+            # observation is the missing stopped-boundary proof and must clear
+            # that process evidence so a replacement start can proceed.
+            proved_stopped_boundary = lifecycle == "stopped" and (
+                dead or wrong_listener
+            )
+            stopped_boundary = stopped_transition or proved_stopped_boundary
             observation = {
                 "lifecycle": lifecycle,
-                "pid": None if stopped else row["pid"],
+                "pid": None if stopped_boundary else row["pid"],
                 "process_start_time": (
-                    None if stopped else row["process_start_time"]
+                    None if stopped_boundary else row["process_start_time"]
                 ),
                 "process_fingerprint": (
-                    None if stopped else row["process_fingerprint"]
+                    None if stopped_boundary else row["process_fingerprint"]
                 ),
                 "listener_host": row["listener_host"],
                 "listener_port": row["listener_port"],
@@ -1855,9 +1865,13 @@ class NormalizedServerLifecycle:
                 "health_classification": health.get("classification")
                 or lifecycle,
                 "health_ok": self._nullable_bool(health.get("ok")),
-                "stopped_at": timestamp if stopped else row["stopped_at"],
+                "stopped_at": (
+                    timestamp if stopped_boundary else row["stopped_at"]
+                ),
                 "stopped_reason": (
-                    stopped_reason if stopped else row["stopped_reason"]
+                    stopped_reason
+                    if stopped_boundary
+                    else row["stopped_reason"]
                 ),
                 "sampled_at": timestamp,
             }
@@ -1867,7 +1881,7 @@ class NormalizedServerLifecycle:
                 source_resource_id=row["source_resource_id"],
                 observation=observation,
             )
-            if stopped and row["lease_id"]:
+            if stopped_boundary and row["lease_id"]:
                 connection.execute(
                     """
                     UPDATE leases SET status = 'stale', deactivated_at = ?,

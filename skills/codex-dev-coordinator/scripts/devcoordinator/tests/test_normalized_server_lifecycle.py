@@ -1537,6 +1537,44 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.assertEqual(observed["lease_status"], "active")
         self.assertEqual(observed["identity_observable"], False)
 
+    def test_dead_pid_is_cleared_from_an_already_stopped_migrated_row(self) -> None:
+        running = self.running_server(name="web", port=3306)
+        service = self.server_service()
+        with service.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE server_observations
+                SET lifecycle = 'stopped', stopped_reason = 'legacy import',
+                    stopped_at = sampled_at
+                WHERE server_definition_id = ?
+                """,
+                (running["id"],),
+            )
+        migrated = service.server(
+            server_definition_id=str(running["id"])
+        )
+        self.assertEqual(migrated["status"], "stopped")
+        self.assertIsNotNone(migrated["pid"])
+
+        observed = service.commit_status(
+            server_definition_id=str(migrated["id"]),
+            expected_definition_generation=int(migrated["generation"]),
+            expected_observation_fingerprint=migrated.get(
+                "_observation_fingerprint"
+            ),
+            health={
+                "ok": False,
+                "pid_alive": False,
+                "identity": {"ok": True, "observable": True},
+                "classification": "stopped",
+            },
+            stopped_reason="recorded process is not alive",
+        )
+
+        self.assertEqual(observed["status"], "stopped")
+        self.assertIsNone(observed["pid"])
+        self.assertEqual(observed["lease_status"], "stale")
+
     def test_public_status_retries_a_concurrent_observation_cas(self) -> None:
         self.running_server(name="web", port=3305)
         healthy = {
