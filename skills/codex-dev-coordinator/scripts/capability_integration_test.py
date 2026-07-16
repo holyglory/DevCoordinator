@@ -934,12 +934,20 @@ def run_integration() -> int:
             )
         plain_payload = json.loads(plain_inventory.stdout)
         plain_server = next(item for item in plain_payload["servers"] if item.get("id") == server_id)
-        plain_lease = next(item for item in plain_payload["leases"] if item.get("id") == registered["lease_id"])
+        plain_lease = next(
+            (
+                item
+                for item in plain_payload["leases"]
+                if item.get("lease_id") == registered["lease_id"]
+            ),
+            None,
+        )
         if not (
             plain_server.get("status") == "running"
             and (plain_server.get("health") or {}).get("ok") is True
             and (plain_server.get("health") or {}).get("classification") == "healthy"
             and plain_server.get("identity_observable") is True
+            and isinstance(plain_lease, dict)
             and plain_lease.get("status") == "active"
         ):
             raise AssertionError(
