@@ -284,8 +284,17 @@ class CrossUIDRuntimeFixture:
         self.host_calls: list[tuple[str, str]] = []
         self.lifecycle_calls: list[tuple[str, str]] = []
 
-    def observe(self, store: CoordinatorStore) -> Mapping[str, Any]:
+    def observe(self, store: AccountStore) -> Mapping[str, Any]:
         """Commit one full-Docker snapshot and the fixture's exact resources."""
+
+        if not isinstance(store, AccountStore):
+            raise RuntimeError(
+                "enrollment observation requires the normalized AccountStore adapter"
+            )
+        if store.database_path != store.path:
+            raise RuntimeError(
+                "enrollment observation requires one canonical database path"
+            )
 
         now = utc_timestamp()
         snapshot_id = "cross-uid-snapshot-" + uuid.uuid4().hex
@@ -981,6 +990,14 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                 validity_seconds=3_600,
             )
             repo_id = str(enrollment["repo_id"])
+            profile_parent = profile_path.parent.stat()
+            profile_metadata = profile_path.stat()
+            self.assertEqual(profile_parent.st_uid, SERVICE_UID)
+            self.assertEqual(profile_parent.st_gid, ACCESS_GID)
+            self.assertEqual(stat.S_IMODE(profile_parent.st_mode), 0o750)
+            self.assertEqual(profile_metadata.st_uid, SERVICE_UID)
+            self.assertEqual(profile_metadata.st_gid, ACCESS_GID)
+            self.assertEqual(stat.S_IMODE(profile_metadata.st_mode), 0o640)
             self.assertEqual(
                 enrollment["container_ids"]["cross-uid-main"], MAIN_CONTAINER_ID
             )

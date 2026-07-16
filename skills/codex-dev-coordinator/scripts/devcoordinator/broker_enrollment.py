@@ -18,7 +18,7 @@ from .broker_persistence import BrokerPersistence
 from .broker_profile import PROFILE_VERSION
 from .repository_lifecycle import LifecycleError, RepositoryLifecycle, ResourceKind
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
-from .store import CoordinatorStore, deterministic_id, fingerprint, utc_timestamp
+from .store import AccountStore, CoordinatorStore, deterministic_id, fingerprint, utc_timestamp
 
 
 def enroll_repository(
@@ -64,7 +64,11 @@ def enroll_repository(
 
     persistence = BrokerPersistence(database_path, expected_uid=service_uid)
     now = utc_timestamp()
-    with CoordinatorStore.open(database_path, expected_uid=service_uid) as store:
+    # Host observation and normalized inventory are intentionally implemented
+    # by AccountStore for both account-owned and service-owned databases.  Use
+    # that adapter here so the real enrollment observer receives the same
+    # contract exercised by the normalized coordinator paths.
+    with AccountStore.open(database_path, expected_uid=service_uid) as store:
         host_id = _ensure_host(store)
         repo_id = deterministic_id("repository", host_id, str(root))
         with store.immediate_transaction() as connection:
@@ -524,7 +528,8 @@ def _merge_profile(
     path = profile_path
     if not path.is_absolute():
         raise ValueError("broker profile output must be absolute")
-    _ensure_root_profile_parent(path.parent)
+    access_gid = int(service["gid"])
+    _ensure_root_profile_parent(path.parent, access_gid=access_gid)
     if path.exists():
         metadata = path.lstat()
         if (
@@ -557,14 +562,19 @@ def _merge_profile(
         "valid_until_epoch": now_epoch + validity_seconds,
         "repositories": repositories,
     }
-    _atomic_write_root_json(path, document)
+    _atomic_write_root_json(path, document, access_gid=access_gid)
     return document
 
 
-def _ensure_root_profile_parent(path: Path) -> None:
+def _ensure_root_profile_parent(path: Path, *, access_gid: int) -> None:
     if os.geteuid() != 0:
         raise PermissionError("broker profile installation requires root")
-    if not path.is_absolute() or ".." in path.parts:
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or path == Path(path.anchor)
+        or access_gid < 0
+    ):
         raise PermissionError("broker profile directory must be an absolute protected path")
     current = Path(path.anchor)
     for part in path.parts[1:]:
@@ -581,9 +591,16 @@ def _ensure_root_profile_parent(path: Path) -> None:
             raise PermissionError(
                 "every broker profile directory ancestor must be protected and root-owned"
             )
+    os.chown(path, 0, access_gid)
+    os.chmod(path, 0o750)
 
 
-def _atomic_write_root_json(path: Path, document: Mapping[str, Any]) -> None:
+def _atomic_write_root_json(
+    path: Path,
+    document: Mapping[str, Any],
+    *,
+    access_gid: int,
+) -> None:
     payload = (
         json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     ).encode("utf-8")
@@ -591,14 +608,14 @@ def _atomic_write_root_json(path: Path, document: Mapping[str, Any]) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(temporary, flags, 0o644)
+    descriptor = os.open(temporary, flags, 0o640)
     try:
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chown(temporary, 0, 0)
-        os.chmod(temporary, 0o644)
+        os.chown(temporary, 0, access_gid)
+        os.chmod(temporary, 0o640)
         os.replace(temporary, path)
         directory = os.open(path.parent, os.O_RDONLY)
         try:

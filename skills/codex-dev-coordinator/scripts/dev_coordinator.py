@@ -4238,8 +4238,49 @@ def server_health(
             "identity": {"ok": True, "skipped": "not checked because recorded process is not alive"},
             "classification": "stopped",
         }
+    raw_health_url = server.get("health_url")
+    observed_port = server.get("port")
+    if alive is None and (
+        str(server.get("status") or "") == "unobserved"
+        or (
+            observed_port is None
+            and (not raw_health_url or "{port}" in str(raw_health_url))
+        )
+    ):
+        return {
+            "ok": None,
+            "pid_alive": None,
+            "check": {
+                "ok": None,
+                "skipped": "server definition has no observed endpoint",
+            },
+            "identity": {
+                "ok": None,
+                "skipped": "server definition has no observed process",
+            },
+            "attempts": 0,
+            "classification": "unobserved",
+        }
     identity = server_listener_identity(server)
-    health_url = server.get("health_url")
+    health_url = str(raw_health_url) if raw_health_url else None
+    if health_url and ("{port}" in health_url or "{host}" in health_url):
+        if observed_port is None:
+            return {
+                "ok": None,
+                "pid_alive": alive,
+                "check": {
+                    "ok": None,
+                    "skipped": "server health template has no observed port",
+                },
+                "identity": identity,
+                "attempts": 0,
+                "classification": "unobserved",
+            }
+        health_url = format_command(
+            health_url,
+            port=int(observed_port),
+            host=str(server.get("host") or "127.0.0.1"),
+        )
     attempts = max(1, int(attempts))
     check: dict[str, Any] = {"ok": False}
     for attempt in range(attempts):

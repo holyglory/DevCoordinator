@@ -372,6 +372,13 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
         authority = Path("/var/lib/devcoordinator").lstat()
         if authority.st_uid != service.pw_uid or stat.S_IMODE(authority.st_mode) != 0o700:
             raise InstallError("service authority directory failed ownership/mode verification")
+        profile_parent = Path("/etc/devcoordinator").lstat()
+        if (
+            profile_parent.st_uid != service.pw_uid
+            or profile_parent.st_gid != access.gr_gid
+            or stat.S_IMODE(profile_parent.st_mode) != 0o750
+        ):
+            raise InstallError("client profile directory failed ownership/mode verification")
         run(command("systemctl"), "daemon-reload")
         journal["status"] = "applied"
         journal["starts_service"] = False
@@ -441,6 +448,34 @@ def verify_install(names: list[str]) -> dict[str, Any]:
     for source, destination in SYSTEM_FILES.items():
         if not destination.is_file() or destination.is_symlink() or digest(destination) != digest(source):
             failures.append(f"system file does not match repository: {destination}")
+    profile_parent = Path("/etc/devcoordinator")
+    if access is not None and service is not None:
+        try:
+            metadata = profile_parent.lstat()
+        except FileNotFoundError:
+            failures.append(f"client profile directory is missing: {profile_parent}")
+        else:
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != service.pw_uid
+                or metadata.st_gid != access.gr_gid
+                or stat.S_IMODE(metadata.st_mode) != 0o750
+            ):
+                failures.append(f"client profile directory is unsafe: {profile_parent}")
+    profile = profile_parent / "client-profiles.json"
+    if profile.exists() or profile.is_symlink():
+        metadata = profile.lstat()
+        if (
+            access is None
+            or service is None
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != service.pw_uid
+            or metadata.st_gid != access.gr_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o640
+        ):
+            failures.append(f"client profile is unsafe: {profile}")
     for client in plan["clients"]:
         record = pwd.getpwnam(client["user"])
         journal = Path(client["journal"])

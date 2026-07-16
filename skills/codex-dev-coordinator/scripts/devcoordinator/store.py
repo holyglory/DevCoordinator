@@ -507,6 +507,12 @@ class CoordinatorStore:
         self._read_only = bool(read_only)
         self._closed = False
 
+    @property
+    def database_path(self) -> Path:
+        """Expose the canonical store path to shared observation adapters."""
+
+        return self.path
+
     @classmethod
     def open(
         cls,

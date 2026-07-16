@@ -5532,6 +5532,21 @@ else:
         check(bool(corrupt_backups), "corrupt state file should be backed up for forensics")
 
         # --- server_health classification: fresh+unreachable -> starting, aged -> unhealthy ---
+        unobserved_health = dc.server_health(
+            {
+                "pid": None,
+                "port": None,
+                "health_url": "http://127.0.0.1:{port}/healthz",
+                "status": "unobserved",
+            }
+        )
+        check(
+            unobserved_health.get("ok") is None
+            and unobserved_health.get("classification") == "unobserved"
+            and unobserved_health.get("check", {}).get("skipped")
+            == "server definition has no observed endpoint",
+            "unobserved server definition health template was treated as a live endpoint",
+        )
         original_identity = dc.server_listener_identity
         original_pid_alive = dc.pid_alive
         try:

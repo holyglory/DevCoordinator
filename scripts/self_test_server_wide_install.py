@@ -102,11 +102,13 @@ def main() -> int:
     )
     assert "d /var/lib/devcoordinator 0700 root root" in tmpfiles
     assert "d /var/lib/devcoordinator-clients 0711 root root" in tmpfiles
+    assert "d /etc/devcoordinator 0750 root devcoordinator-clients" in tmpfiles
 
     installer_source = SCRIPT.read_text(encoding="utf-8")
     assert 'f"g:{ACCESS_GROUP}:rX"' in installer_source
     assert 'f"d:g:{ACCESS_GROUP}:rX"' in installer_source
     assert 'f"--restore={backup}"' in installer_source
+    assert 'stat.S_IMODE(metadata.st_mode) != 0o640' in installer_source
     exercise_source_acl_transaction()
     return 0
 
