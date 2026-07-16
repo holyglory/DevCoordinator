@@ -43,6 +43,11 @@ class SQLiteCutoverTests(unittest.TestCase):
             os.environ,
             {
                 "CODEX_AGENT_COORDINATOR_HOME": str(self.home),
+                # These fixtures exercise the isolated account authority. A
+                # real host may have the server-wide profile installed, but
+                # that external runtime state must never redirect temporary
+                # lifecycle repositories through the production broker.
+                "DEVCOORDINATOR_AUTHORITY": "account",
                 "DEVCOORDINATOR_STATE_BACKEND": "sqlite",
             },
             clear=False,
@@ -65,6 +70,14 @@ class SQLiteCutoverTests(unittest.TestCase):
         }
         value.update(changes)
         return value
+
+    def test_fixture_never_loads_an_installed_broker_profile(self) -> None:
+        with mock.patch.object(
+            coordinator,
+            "load_broker_profile",
+            side_effect=AssertionError("host broker profile was consulted"),
+        ):
+            self.assertIsNone(coordinator.configured_broker_profile())
 
     @staticmethod
     def empty_sample() -> dict:

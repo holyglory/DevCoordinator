@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -211,6 +212,228 @@ class BrokerProfileTrustTests(unittest.TestCase):
             )
             self.assertEqual(calls[0]["pid"], 222)
             self.assertEqual(result["status"], "published")
+
+    def test_server_wide_registration_response_retains_exact_proof_and_broker_ids(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-register-response-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            repository = profile.repository(str(repository_root))
+            identity = {
+                "ok": True,
+                "observable": True,
+                "pid": 111,
+                "cwd": str(repository_root),
+                "project": str(repository_root),
+                "host": "127.0.0.1",
+                "port": 43100,
+                "source": "proc_pid_fd",
+                "listener_inodes": ["123456"],
+            }
+            local_result = {
+                "id": "server-web",
+                "name": "web",
+                "project": str(repository_root),
+                "cwd": str(repository_root),
+                "host": "127.0.0.1",
+                "port": 43100,
+                "pid": 111,
+                "status": "running",
+                "lease_id": "local-lease-web",
+                "registration_identity": identity,
+                "health": {
+                    "ok": True,
+                    "classification": "healthy",
+                    "check": {"ok": True, "status": 200},
+                    "identity": identity,
+                },
+            }
+            reread_without_request_proof = {
+                **local_result,
+                "registration_identity": None,
+                "health": {
+                    "ok": True,
+                    "classification": "healthy",
+                    "identity": {"ok": True},
+                },
+            }
+            link = mock.Mock(
+                link_id="link-web",
+                broker_resource_id="broker-lease-web",
+                broker_operation_id="operation-lease-web",
+                status="bound",
+            )
+            publication = {
+                "operation_id": "operation-publish-web",
+                "server_definition_id": "server-web",
+                "lease_id": "broker-lease-web",
+                "lifecycle": "running",
+                "pid": 111,
+                "port": 43100,
+            }
+            store = mock.MagicMock()
+            store.__enter__.return_value = store
+            store.__exit__.return_value = False
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_context",
+                    return_value=(profile, repository),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "acquire_broker_lease_link",
+                    return_value=(link, {"listener_identity": identity}),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "_coordinated_register_server_local",
+                    return_value=local_result,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "bind_broker_lease_link",
+                    return_value=link,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "state_backend",
+                    return_value="sqlite",
+                ),
+                mock.patch.object(
+                    AccountStore,
+                    "open_default",
+                    return_value=store,
+                ),
+                mock.patch.object(
+                    NormalizedPortLifecycle,
+                    "list_leases",
+                    return_value=[{"id": "local-lease-web"}],
+                ),
+                mock.patch.object(
+                    dev_coordinator.NormalizedServerLifecycle,
+                    "server",
+                    return_value=reread_without_request_proof,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "publish_broker_server",
+                    return_value=publication,
+                ),
+            ):
+                result = dev_coordinator.coordinated_register_server(
+                    {
+                        "agent": "console-startup",
+                        "project": str(repository_root),
+                        "name": "web",
+                        "cwd": str(repository_root),
+                        "host": "127.0.0.1",
+                        "port": 43100,
+                        "pid": 111,
+                    }
+                )
+
+            self.assertEqual(result["id"], "server-web")
+            self.assertEqual(result["lease_id"], "broker-lease-web")
+            self.assertEqual(result["status"], "running")
+            self.assertEqual(result["registration_identity"], identity)
+            self.assertEqual(result["health"], local_result["health"])
+            self.assertEqual(result["broker"]["lease_id"], "broker-lease-web")
+
+    def test_normalized_registration_response_retains_measured_health_proof(self) -> None:
+        with CanonicalTemporaryDirectory(".normalized-register-response-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            identity = {
+                "ok": True,
+                "observable": True,
+                "pid": 111,
+                "cwd": str(repository_root),
+                "project": str(repository_root),
+                "host": "127.0.0.1",
+                "port": 43100,
+                "source": "proc_pid_fd",
+                "listener_inodes": ["123456"],
+            }
+            measured_health = {
+                "ok": True,
+                "pid_alive": True,
+                "classification": "healthy",
+                "check": {"ok": True, "status": 200},
+                "identity": identity,
+            }
+            projected_without_request_proof = {
+                "id": "server-web",
+                "name": "web",
+                "project": str(repository_root),
+                "cwd": str(repository_root),
+                "host": "127.0.0.1",
+                "port": 43100,
+                "pid": 111,
+                "status": "running",
+                "lease_id": "local-lease-web",
+                "health": {
+                    "ok": True,
+                    "classification": "healthy",
+                    "identity": {"ok": True},
+                },
+            }
+            store = mock.MagicMock()
+            store.__enter__.return_value = store
+            store.__exit__.return_value = False
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "resolve_registration_pid",
+                    return_value=(111, identity),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "wait_for_health",
+                    return_value=measured_health,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "registration_pid_identity",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "normalized_process_instance_evidence",
+                    return_value=("12345", "linux:111:12345"),
+                ),
+                mock.patch.object(
+                    AccountStore,
+                    "open_default",
+                    return_value=store,
+                ),
+                mock.patch.object(
+                    dev_coordinator.NormalizedServerLifecycle,
+                    "commit_registration",
+                    return_value=projected_without_request_proof,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "normalized_public_server",
+                    return_value=projected_without_request_proof,
+                ),
+            ):
+                result = dev_coordinator._coordinated_register_server_normalized(
+                    {
+                        "agent": "console-startup",
+                        "project": str(repository_root),
+                        "name": "web",
+                        "cwd": str(repository_root),
+                        "host": "127.0.0.1",
+                        "port": 43100,
+                        "pid": 111,
+                        "url": "http://127.0.0.1:43100",
+                        "health_url": "http://127.0.0.1:43100/healthz",
+                    }
+                )
+
+            self.assertEqual(result["registration_identity"], identity)
+            self.assertEqual(result["health"], measured_health)
 
     def test_healthy_legacy_server_cannot_bypass_host_publication(self) -> None:
         with CanonicalTemporaryDirectory(".broker-legacy-server-") as root:
@@ -832,6 +1055,122 @@ class BrokerLinkStoreTests(unittest.TestCase):
         self.assertEqual(released.status, "released")
         self.assertIsNone(self.links.lease_for_local("local-lease-web"))
         self.assertIsNone(self.links.lease_for_server(REPO_ID, "server-web"))
+
+    def test_replacement_broker_lease_rebinds_only_a_released_local_link(self) -> None:
+        prior = self._reserve_lease()
+        self.links.bind_local_lease(prior.link_id, "local-lease-web")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._reserve_lease(
+                broker_lease_id="broker-lease-competing",
+                operation_id="operation-lease-competing",
+            )
+
+        self.links.begin_lease_release(prior.link_id, "operation-release-web")
+        self.links.complete_lease_release(prior.link_id)
+        competing = self._reserve_lease(
+            broker_lease_id="broker-lease-competing",
+            operation_id="operation-lease-competing",
+        )
+        replacement = self.links.bind_local_lease(
+            competing.link_id, "local-lease-web"
+        )
+
+        self.assertEqual(replacement.status, "active")
+        self.assertEqual(replacement.local_resource_id, "local-lease-web")
+        self.assertEqual(replacement.broker_resource_id, "broker-lease-competing")
+        with self.store.read_transaction() as connection:
+            prior_local = connection.execute(
+                "SELECT local_lease_id FROM broker_lease_links WHERE link_id = ?",
+                (prior.link_id,),
+            ).fetchone()[0]
+        self.assertIsNone(prior_local)
+
+    def test_renewed_broker_lease_rebinds_exact_stale_local_process_lease(self) -> None:
+        reserved = self._reserve_lease()
+        now = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO leases(
+                    lease_id, host_id, repo_id, server_definition_id, port,
+                    owner, agent, purpose, status, generation, created_at,
+                    updated_at
+                ) VALUES (
+                    'local-lease-old', 'host-alpha', ?, 'server-web', 43100,
+                    '1001', 'migration', 'server:web', 'active', 0, ?, ?
+                )
+                """,
+                (REPO_ID, now, now),
+            )
+        self.links.bind_local_lease(reserved.link_id, "local-lease-old")
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                UPDATE leases
+                SET status = 'stale', deactivated_at = ?, updated_at = ?
+                WHERE lease_id = 'local-lease-old'
+                """,
+                (now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO leases(
+                    lease_id, host_id, repo_id, server_definition_id, port,
+                    owner, agent, purpose, status, generation, created_at,
+                    updated_at
+                ) VALUES (
+                    'local-lease-new', 'host-alpha', ?, 'server-web', 43100,
+                    '1002', 'codex-test', 'server:web', 'active', 0, ?, ?
+                )
+                """,
+                (REPO_ID, now, now),
+            )
+
+        rebound = self.links.bind_local_lease(
+            reserved.link_id, "local-lease-new"
+        )
+
+        self.assertEqual(rebound.status, "active")
+        self.assertEqual(rebound.local_resource_id, "local-lease-new")
+        self.assertEqual(rebound.broker_resource_id, "broker-lease-web")
+
+    def test_renewed_broker_lease_rejects_foreign_local_replacement(self) -> None:
+        reserved = self._reserve_lease()
+        now = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO leases(
+                    lease_id, host_id, repo_id, server_definition_id, port,
+                    owner, agent, purpose, status, generation, created_at,
+                    updated_at
+                ) VALUES (
+                    'local-lease-old', 'host-alpha', ?, 'server-web', 43100,
+                    '1001', 'migration', 'server:web', 'stale', 0, ?, ?
+                )
+                """,
+                (REPO_ID, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO leases(
+                    lease_id, host_id, repo_id, server_definition_id, port,
+                    owner, agent, purpose, status, generation, created_at,
+                    updated_at
+                ) VALUES (
+                    'local-lease-foreign', 'host-alpha', ?, 'server-web', 43101,
+                    '1002', 'codex-test', 'server:web', 'active', 0, ?, ?
+                )
+                """,
+                (REPO_ID, now, now),
+            )
+        self.links.bind_local_lease(reserved.link_id, "local-lease-old")
+
+        with self.assertRaisesRegex(RuntimeError, "not bindable"):
+            self.links.bind_local_lease(
+                reserved.link_id, "local-lease-foreign"
+            )
 
     def test_repository_removal_result_is_mirrored_and_hidden_idempotently(self) -> None:
         operation_id = str(uuid.uuid4())

@@ -22,6 +22,40 @@ def parser() -> argparse.ArgumentParser:
 
 
 class LifecycleParserContractTests(unittest.TestCase):
+    def test_runtime_compose_project_name_reaches_broker_enrollment(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".compose-project-name-", dir=str(Path.home().resolve())
+        ) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime_dir = root / ".codex"
+            runtime_dir.mkdir()
+            (root / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            (runtime_dir / "dev-runtime.json").write_text(
+                """{
+  "docker": {
+    "compose_files": ["docker-compose.yml"],
+    "services": ["app"],
+    "project_name": "existing_stack"
+  }
+}
+""",
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                dev_coordinator,
+                "docker_ps_inventory",
+                return_value={"available": True, "containers": [], "postgres": []},
+            ):
+                specification = dev_coordinator.build_project_runtime_spec(
+                    {"servers": {}},
+                    project=str(root),
+                )
+
+        self.assertEqual(
+            specification["compose"]["project_name"],
+            "existing_stack",
+        )
+
     def test_system_client_journal_never_imports_legacy_account_authority(self) -> None:
         with (
             mock.patch.object(dev_coordinator, "authority_mode", return_value="system"),

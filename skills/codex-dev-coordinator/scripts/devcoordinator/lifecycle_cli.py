@@ -8,7 +8,7 @@ from typing import Any, Callable, Mapping
 
 from .broker import BrokerOperation
 from .broker_links import BrokerLinkStore
-from .broker_profile import load_broker_profile
+from .broker_profile import BrokerClientProfile, load_broker_profile
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
 from .repository_lifecycle import ExactResourceRef, RepositoryLifecycle, ResourceKind
 from .repository_lifecycle import (
@@ -86,8 +86,17 @@ def handle_lifecycle_cli(
     observe_before_plan: Callable[[str, str], Mapping[str, Any]] | None = None,
     observe_before_apply: Callable[[str, str], Mapping[str, Any]] | None = None,
     adapter_factory: Callable[[], CoordinatorHostLifecycleAdapter] = CoordinatorHostLifecycleAdapter,
+    broker_profile_loader: Callable[[], BrokerClientProfile | None] | None = None,
 ) -> Any:
-    profile = load_broker_profile()
+    # The top-level CLI injects its authority-aware resolver. Keeping the raw
+    # profile loader as the default preserves this module's direct contract,
+    # while explicit account/test authority cannot be redirected through an
+    # installed server-wide profile.
+    profile = (
+        load_broker_profile()
+        if broker_profile_loader is None
+        else broker_profile_loader()
+    )
     if args.group == "repository" and args.action == "list-removed":
         if profile is not None:
             removed: dict[str, dict[str, Any]] = {}

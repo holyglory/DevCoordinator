@@ -131,6 +131,96 @@ class BrokerLinkStore:
     def bind_local_lease(self, link_id: str, local_lease_id: str) -> BrokerLink:
         timestamp = utc_timestamp()
         with self._store.immediate_transaction() as connection:
+            target = connection.execute(
+                "SELECT * FROM broker_lease_links WHERE link_id = ?", (link_id,)
+            ).fetchone()
+            stale_local_lease_id: str | None = None
+            if (
+                target is not None
+                and str(target["status"]) == "active"
+                and target["local_lease_id"] not in {None, local_lease_id}
+            ):
+                previous = connection.execute(
+                    "SELECT * FROM leases WHERE lease_id = ?",
+                    (str(target["local_lease_id"]),),
+                ).fetchone()
+                replacement = connection.execute(
+                    "SELECT * FROM leases WHERE lease_id = ?",
+                    (local_lease_id,),
+                ).fetchone()
+                if (
+                    previous is not None
+                    and replacement is not None
+                    and str(previous["status"]) in {"released", "stale"}
+                    and str(replacement["status"]) == "active"
+                    and all(
+                        row[key] == target[key]
+                        for row in (previous, replacement)
+                        for key in ("repo_id", "server_definition_id", "port")
+                    )
+                ):
+                    stale_local_lease_id = str(previous["lease_id"])
+            if (
+                target is None
+                or str(target["status"]) not in {"reserved", "active"}
+                or (
+                    target["local_lease_id"] not in {None, local_lease_id}
+                    and stale_local_lease_id is None
+                )
+            ):
+                raise RuntimeError("broker lease link is not bindable")
+            conflict = connection.execute(
+                """
+                SELECT * FROM broker_lease_links
+                WHERE local_lease_id = ? AND link_id != ?
+                """,
+                (local_lease_id, link_id),
+            ).fetchone()
+            if conflict is not None:
+                same_boundary = all(
+                    conflict[key] == target[key]
+                    for key in (
+                        "repo_id",
+                        "server_definition_id",
+                        "account_id",
+                        "broker_socket",
+                        "broker_service_uid",
+                        "broker_socket_gid",
+                        "broker_socket_mode",
+                        "broker_database_generation",
+                        "port",
+                        "protocol",
+                    )
+                )
+                if str(conflict["status"]) != "released" or not same_boundary:
+                    raise RuntimeError(
+                        "local lease is already linked to a current broker lease"
+                    )
+                # A normalized adopted server may reuse its local lease row
+                # after the previous host-global lease was cleanly released.
+                # Preserve the old broker link as history but move the unique
+                # local attachment to this exact replacement boundary.
+                connection.execute(
+                    """
+                    UPDATE broker_lease_links
+                    SET local_lease_id = NULL, updated_at = ?
+                    WHERE link_id = ? AND status = 'released'
+                      AND local_lease_id = ?
+                    """,
+                    (timestamp, str(conflict["link_id"]), local_lease_id),
+                )
+            if stale_local_lease_id is not None:
+                changed = connection.execute(
+                    """
+                    UPDATE broker_lease_links
+                    SET local_lease_id = NULL, updated_at = ?
+                    WHERE link_id = ? AND status = 'active'
+                      AND local_lease_id = ?
+                    """,
+                    (timestamp, link_id, stale_local_lease_id),
+                ).rowcount
+                if changed != 1:
+                    raise RuntimeError("broker lease link is not bindable")
             changed = connection.execute(
                 """
                 UPDATE broker_lease_links

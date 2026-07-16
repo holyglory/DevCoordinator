@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
@@ -8,6 +9,15 @@ import {
 } from '../bin/devops-console.mjs';
 
 const config = { projectRoot: '/home/DevCoordinator' };
+
+test('production coordinator definition probes the Console through TLS', async () => {
+  const runtime = JSON.parse(
+    await readFile(new URL('../../../.codex/dev-runtime.json', import.meta.url), 'utf8'),
+  );
+  const definition = runtime.servers?.find((server) => server.name === 'devops-console');
+  assert.ok(definition, 'devops-console coordinator definition must exist');
+  assert.equal(definition.health_url, 'https://127.0.0.1:{port}/healthz');
+});
 
 test('production registration retries and sends the exact edge identity', async () => {
   const calls = [];

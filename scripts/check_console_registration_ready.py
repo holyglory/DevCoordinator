@@ -109,7 +109,10 @@ def classify_registration_snapshot(
     if current_port_servers:
         if len(current_port_servers) != 1 or len(target_servers) != 1:
             raise ConsoleRegistrationError(
-                "unsafe registration baseline: a non-stopped server claims the Console port"
+                "unsafe registration baseline: a non-stopped server claims the Console port "
+                f"(current_port_count={len(current_port_servers)}, "
+                f"target_count={len(target_servers)}, "
+                f"current_statuses={[row.get('status') for row in current_port_servers]!r})"
             )
         current = current_port_servers[0]
         if target_servers[0] is not current:
@@ -118,7 +121,8 @@ def classify_registration_snapshot(
             )
         if current.get("status") != "running":
             raise ConsoleRegistrationError(
-                "unsafe registration baseline: a non-stopped server claims the Console port"
+                "unsafe registration baseline: a non-stopped server claims the Console port "
+                f"(status={current.get('status')!r}, pid={current.get('pid')!r})"
             )
         for key, expected in {
             "key": expected_key,

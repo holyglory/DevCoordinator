@@ -660,6 +660,10 @@ def main() -> int:
         make_fake_docker(fake_bin / "docker")
         env = os.environ.copy()
         env["DEVCOORDINATOR_BACKUP_REGISTRY"] = "off"
+        # The remaining subprocess fixtures exercise the trusted service-side
+        # direct Docker implementation with a fake executable. A real host
+        # profile must not reroute them through the production broker.
+        env["DEVCOORDINATOR_BROKER_INTERNAL"] = "1"
         env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
         log_path = tmp / "docker.log"
         state_path = tmp / "docker-state.json"
@@ -699,7 +703,11 @@ def main() -> int:
             env=replacement_env,
             expect=1,
         )
-        check("identity mismatch" in mismatch.stderr, "same-name replacement must report an identity mismatch")
+        check(
+            "identity mismatch" in mismatch.stderr,
+            "same-name replacement must report an identity mismatch; "
+            f"stderr was {mismatch.stderr!r}",
+        )
         check(not any(command and command[0] == "exec" for command in docker_log(log_path)), "backup identity mismatch must execute no PostgreSQL command")
 
         log_path.write_text("", encoding="utf-8")

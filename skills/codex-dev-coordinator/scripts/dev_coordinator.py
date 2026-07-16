@@ -5249,6 +5249,11 @@ def build_project_runtime_spec(
         "cwd": resolved_project,
         "files": [str(item) for item in compose_files],
         "services": compose_services,
+        "project_name": (
+            None
+            if docker_config.get("project_name") is None
+            else str(docker_config["project_name"])
+        ),
     } if compose_files else None
 
     docker_dependencies: list[dict[str, Any]] = []
@@ -7908,6 +7913,11 @@ def _coordinated_register_server_normalized(
             )
         )
     result = normalized_public_server(committed)
+    # The normalized compatibility projection intentionally stores only the
+    # durable health summary. The mutation response must retain the exact
+    # request-bound check and listener proof measured before commit so callers
+    # can validate the completed registration without a racy follow-up read.
+    result["health"] = copy.deepcopy(health)
     if registration_identity is not None:
         result["registration_identity"] = registration_identity
     return result
@@ -8721,11 +8731,18 @@ def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
                     raise RuntimeError(
                         "broker-verified registration committed without its exact local lease"
                     )
-                result = normalized_public_server(
+                current = normalized_public_server(
                     NormalizedServerLifecycle(store).server(
                         server_definition_id=str(result["id"])
                     )
                 )
+                if (
+                    current.get("id") != result.get("id")
+                    or current.get("lease_id") != local_lease_id
+                ):
+                    raise RuntimeError(
+                        "broker-verified registration local server/lease identity changed before publication"
+                    )
         publication = publish_broker_server(
             profile=profile,
             repository=repository,
@@ -8733,6 +8750,31 @@ def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
             broker_lease_id=bound.broker_resource_id,
             server=result,
         )
+        for key, expected in {
+            "server_definition_id": repository.server_id(name),
+            "lease_id": bound.broker_resource_id,
+            "lifecycle": "running",
+            "pid": result.get("pid"),
+            "port": result.get("port"),
+        }.items():
+            if publication.get(key) != expected:
+                raise RuntimeError(
+                    "broker-verified registration publication returned a mismatched "
+                    f"{key}: {publication.get(key)!r} != {expected!r}"
+                )
+        # The local registration result carries the fresh request-bound health
+        # and exact listener identity that the broker independently proved.
+        # Re-reading the linkage-only client journal drops that proof and its
+        # local lease id is not the server-wide resource identity. Return the
+        # measured proof with the broker's canonical server/lease/PID/port.
+        result = {
+            **result,
+            "id": publication["server_definition_id"],
+            "lease_id": publication["lease_id"],
+            "status": publication["lifecycle"],
+            "pid": publication["pid"],
+            "port": publication["port"],
+        }
     except BaseException as local_error:
         # The adopted process pre-existed the coordinator call and must never
         # be killed as rollback. If local registration did not commit, release
@@ -13113,6 +13155,7 @@ def handle_cli(args: argparse.Namespace) -> Any:
                     "legacy_backup_root": None,
                 }
             ),
+            broker_profile_loader=configured_broker_profile,
         )
     if args.group == "broker" and args.action == "enroll":
         return coordinated_broker_enroll(args)
