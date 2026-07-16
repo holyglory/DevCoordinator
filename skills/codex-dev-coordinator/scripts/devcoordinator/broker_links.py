@@ -74,12 +74,26 @@ class BrokerLinkStore:
             if existing is not None:
                 _require_same_lease(
                     existing,
+                    profile=profile,
                     repository=repository,
                     server_definition_id=server_definition_id,
                     port=port,
-                    operation_id=operation_id,
+                    protocol=protocol,
                 )
-                return _lease_link(existing)
+                connection.execute(
+                    """
+                    UPDATE broker_lease_links
+                    SET expires_at = ?, updated_at = ?
+                    WHERE broker_lease_id = ?
+                      AND status IN ('reserved','active')
+                    """,
+                    (expires_at, timestamp, broker_lease_id),
+                )
+                refreshed = connection.execute(
+                    "SELECT * FROM broker_lease_links WHERE broker_lease_id = ?",
+                    (broker_lease_id,),
+                ).fetchone()
+                return _lease_link(refreshed)
             connection.execute(
                 """
                 INSERT INTO broker_lease_links(
@@ -1288,16 +1302,25 @@ class BrokerLinkStore:
 def _require_same_lease(
     row: Any,
     *,
+    profile: BrokerClientProfile,
     repository: BrokerRepositoryProfile,
     server_definition_id: str,
     port: int,
-    operation_id: str,
+    protocol: str,
 ) -> None:
     if (
         str(row["repo_id"]) != repository.repo_id
         or str(row["server_definition_id"]) != server_definition_id
         or int(row["port"]) != port
-        or str(row["broker_operation_id"]) != operation_id
+        or str(row["protocol"]) != protocol
+        or str(row["status"]) not in {"reserved", "active"}
+        or str(row["account_id"]) != profile.account_id
+        or str(row["broker_socket"]) != str(profile.service.socket_path)
+        or int(row["broker_service_uid"]) != profile.service.service_uid
+        or int(row["broker_socket_gid"]) != profile.service.socket_gid
+        or int(row["broker_socket_mode"]) != profile.service.socket_mode
+        or str(row["broker_database_generation"])
+        != profile.service.database_generation
     ):
         raise RuntimeError("broker lease identity was reused with conflicting linkage")
 

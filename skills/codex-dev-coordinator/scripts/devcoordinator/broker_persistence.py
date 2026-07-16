@@ -1489,6 +1489,98 @@ class BrokerPersistence:
                         "Host-observed port does not match the exact requested or assigned port.",
                         operation_id=request.operation_id,
                     )
+                existing = connection.execute(
+                    """
+                    SELECT l.*, o.uid AS lease_uid,
+                           o.account_id AS lease_account_id,
+                           o.repo_id AS lease_repo_id,
+                           o.server_definition_id AS lease_server_definition_id,
+                           o.protocol AS lease_protocol,
+                           d.name AS lease_server_name
+                    FROM leases l
+                    LEFT JOIN broker_lease_owners o USING(lease_id)
+                    LEFT JOIN server_definitions d USING(server_definition_id)
+                    WHERE l.host_id = ? AND l.port = ? AND l.status = 'active'
+                    """,
+                    (repo["host_id"], observed_available_port),
+                ).fetchone()
+                if (
+                    bool(request.arguments.get("adopt_existing_listener"))
+                    and existing is not None
+                    and existing["repo_id"] == request.project_id
+                    and existing["server_definition_id"] == request.resource_id
+                    and existing["agent"] == request.account_id
+                    and (
+                        (
+                            existing["purpose"] == "broker"
+                            and existing["owner"] == f"uid:{authorized.peer.uid}"
+                        )
+                        or (
+                            existing["purpose"]
+                            == f"server:{existing['lease_server_name']}"
+                            and str(existing["owner"] or "").isdigit()
+                        )
+                    )
+                    and existing["lease_uid"] == authorized.peer.uid
+                    and existing["lease_account_id"] == request.account_id
+                    and existing["lease_repo_id"] == request.project_id
+                    and existing["lease_server_definition_id"] == request.resource_id
+                    and existing["lease_protocol"] == protocol
+                ):
+                    if listener_evidence is None:
+                        raise BrokerError(
+                            "listener_identity_unavailable",
+                            "Exact lease reuse requires fresh listener identity evidence.",
+                            operation_id=request.operation_id,
+                        )
+                    process_fingerprint = "sha256:" + hashlib.sha256(
+                        json.dumps(
+                            dict(listener_evidence),
+                            ensure_ascii=True,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    changed = connection.execute(
+                        """
+                        UPDATE leases
+                        SET owner = ?, agent = ?, purpose = 'broker',
+                            expires_at = ?, process_fingerprint = ?,
+                            generation = generation + 1, updated_at = ?
+                        WHERE lease_id = ? AND status = 'active'
+                          AND repo_id = ? AND server_definition_id = ?
+                          AND port = ?
+                        """,
+                        (
+                            f"uid:{authorized.peer.uid}",
+                            request.account_id,
+                            expires_at,
+                            process_fingerprint,
+                            now,
+                            existing["lease_id"],
+                            request.project_id,
+                            request.resource_id,
+                            observed_available_port,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise BrokerError(
+                            "lease_state_conflict",
+                            "Exact active broker lease changed before listener adoption.",
+                            operation_id=request.operation_id,
+                        )
+                    result = {
+                        "lease_id": str(existing["lease_id"]),
+                        "port": observed_available_port,
+                        "protocol": protocol,
+                        "expires_at": expires_at,
+                        "status": "active",
+                        "reused": True,
+                        "listener_identity": dict(listener_evidence),
+                    }
+                    _finish_operation(connection, request.operation_id, result=result)
+                    return result
                 port = _select_available_port(
                     connection,
                     host_id=str(repo["host_id"]),
@@ -2704,6 +2796,33 @@ class BrokerPersistence:
                     if lifecycle == "stopped"
                     else None
                 )
+                if lifecycle != "stopped":
+                    changed = connection.execute(
+                        """
+                        UPDATE leases
+                        SET owner = ?, purpose = ?, process_fingerprint = ?,
+                            generation = generation + 1, updated_at = ?
+                        WHERE lease_id = ? AND status = 'active'
+                          AND repo_id = ? AND server_definition_id = ?
+                          AND port = ?
+                        """,
+                        (
+                            str(pid),
+                            f"server:{definition['name']}",
+                            process_fingerprint,
+                            now,
+                            arguments["lease_id"],
+                            request.project_id,
+                            request.resource_id,
+                            port,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise BrokerError(
+                            "lease_state_conflict",
+                            "Exact broker lease changed before server publication.",
+                            operation_id=request.operation_id,
+                        )
                 payload = {
                     "server_definition_id": request.resource_id,
                     "lifecycle": lifecycle,

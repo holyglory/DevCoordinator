@@ -930,8 +930,25 @@ class BrokerLinkStoreTests(unittest.TestCase):
         reserved = self._reserve_lease()
         with self.assertRaisesRegex(RuntimeError, "conflicting linkage"):
             self._reserve_lease(port=43101)
-        with self.assertRaisesRegex(RuntimeError, "conflicting linkage"):
-            self._reserve_lease(operation_id="different-operation")
+        renewed = self.links.reserve_lease(
+            profile=self.profile,
+            repository=self.repository,
+            server_name="web",
+            server_definition_id="server-web",
+            broker_lease_id="broker-lease-web",
+            port=43100,
+            protocol="tcp",
+            operation_id="different-operation",
+            expires_at="2026-07-14T02:00:00Z",
+        )
+        self.assertEqual(renewed.link_id, reserved.link_id)
+        self.assertEqual(renewed.broker_operation_id, reserved.broker_operation_id)
+        with self.store.read_transaction() as connection:
+            expires_at = connection.execute(
+                "SELECT expires_at FROM broker_lease_links WHERE link_id = ?",
+                (reserved.link_id,),
+            ).fetchone()[0]
+        self.assertEqual(expires_at, "2026-07-14T02:00:00Z")
 
         self.links.bind_local_lease(reserved.link_id, "local-lease-web")
         with self.assertRaises(RuntimeError):

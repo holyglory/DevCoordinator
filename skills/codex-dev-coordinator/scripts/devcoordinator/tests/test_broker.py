@@ -2775,6 +2775,124 @@ class StoreBackedBrokerTests(unittest.TestCase):
             self.assertEqual(replay["result"], reply["result"])
             self.assertEqual(len(actions.listener_observations), 2)
 
+    def test_listener_adoption_reuses_exact_active_server_reservation(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            service = store_backed_service(persistence, actions)
+            reserved = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_LEASE,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "requested_port": 3107,
+                        "protocol": "tcp",
+                        "ttl_seconds": 600,
+                    },
+                ).to_wire(),
+            )
+            self.assertTrue(reserved["ok"], reserved)
+            lease_id = str(reserved["result"]["lease_id"])
+
+            evidence = {
+                "pid": 12345,
+                "owner_uid": os.geteuid(),
+                "process_start_time": "2026-07-16T13:38:05Z",
+                "canonical_cwd": "/repos/alpha/apps/web",
+                "cwd": "/repos/alpha/apps/web",
+                "canonical_root": "/repos/alpha",
+                "listener_port": 3107,
+                "port": 3107,
+                "protocol": "tcp",
+                "process_identity": "linux:12345:987654",
+            }
+            actions.occupied_ports.add(3107)
+            actions.listener_evidence = evidence
+            adopted = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_LEASE,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "requested_port": 3107,
+                        "protocol": "tcp",
+                        "ttl_seconds": 600,
+                        "adopt_existing_listener": True,
+                    },
+                ).to_wire(),
+            )
+
+            self.assertTrue(adopted["ok"], adopted)
+            self.assertEqual(adopted["result"]["lease_id"], lease_id)
+            self.assertTrue(adopted["result"]["reused"])
+            self.assertEqual(adopted["result"]["listener_identity"], evidence)
+            self.assertEqual(len(actions.listener_observations), 2)
+
+            published = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.SERVER_PUBLISH,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "lease_id": lease_id,
+                        "lifecycle": "running",
+                        "pid": 12345,
+                        "listener_port": 3107,
+                        "health_classification": "healthy",
+                        "health_ok": True,
+                    },
+                ).to_wire(),
+            )
+            self.assertTrue(published["ok"], published)
+            readopted = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_LEASE,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "requested_port": 3107,
+                        "protocol": "tcp",
+                        "ttl_seconds": 600,
+                        "adopt_existing_listener": True,
+                    },
+                ).to_wire(),
+            )
+            self.assertTrue(readopted["ok"], readopted)
+            self.assertEqual(readopted["result"]["lease_id"], lease_id)
+            self.assertTrue(readopted["result"]["reused"])
+            self.assertEqual(len(actions.listener_observations), 5)
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT count(*) FROM leases").fetchone()[0],
+                        1,
+                    )
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT count(*) FROM broker_lease_owners"
+                        ).fetchone()[0],
+                        1,
+                    )
+
+            # Exact reuse is adoption-only. An ordinary second reservation on
+            # the occupied port remains unavailable.
+            ordinary = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_LEASE,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "requested_port": 3107,
+                        "protocol": "tcp",
+                        "ttl_seconds": 600,
+                    },
+                ).to_wire(),
+            )
+            self.assertFalse(ordinary["ok"], ordinary)
+            self.assertEqual(ordinary["error"]["code"], "port_unavailable")
+
     def test_unobservable_listener_adoption_writes_no_broker_operation(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             persistence, _unused = seed_store_backed_broker(root)
@@ -2921,6 +3039,15 @@ class StoreBackedBrokerTests(unittest.TestCase):
             self.assertEqual(visible[0]["status"], "running")
             self.assertEqual(visible[0]["pid"], 12345)
             self.assertEqual(visible[0]["port"], 3112)
+            visible_leases = inventory["result"]["v1_compatibility"]["leases"]
+            self.assertEqual(len(visible_leases), 1)
+            self.assertEqual(visible_leases[0]["id"], lease_id)
+            self.assertEqual(visible_leases[0]["purpose"], "server:web")
+            self.assertEqual(visible_leases[0]["server_id"], SERVER_ID)
+            self.assertEqual(visible_leases[0]["owner_pid"], 12345)
+            self.assertEqual(
+                visible_leases[0]["assignment_key"], "/repos/alpha::web"
+            )
 
             stopped = service.reply_for_document(
                 peer_for(),
