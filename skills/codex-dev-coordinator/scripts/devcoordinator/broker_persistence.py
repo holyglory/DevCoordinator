@@ -1099,6 +1099,66 @@ class BrokerPersistence:
                 _authorize_connection(connection, peer=peer, request=request)
         return AuthorizedBrokerRequest(peer=peer, request=request)
 
+    @staticmethod
+    def _existing_operation_disposition(
+        connection: sqlite3.Connection,
+        *,
+        authorized: AuthorizedBrokerRequest,
+        fingerprint: str,
+    ) -> DurableOperationDisposition | None:
+        request = authorized.request
+        existing = connection.execute(
+            """
+            SELECT o.status, o.result_json, o.error_code, o.error_message,
+                   b.uid, b.request_fingerprint
+            FROM operations o
+            LEFT JOIN broker_operation_requests b USING(operation_id)
+            WHERE o.operation_id = ?
+            """,
+            (request.operation_id,),
+        ).fetchone()
+        if existing is None:
+            return None
+        if (
+            existing["uid"] != authorized.peer.uid
+            or existing["request_fingerprint"] != fingerprint
+        ):
+            raise BrokerError(
+                "operation_id_conflict",
+                "operation_id was already used for a different authenticated request.",
+                operation_id=request.operation_id,
+            )
+        if existing["status"] == "succeeded":
+            return DurableOperationDisposition(
+                "completed", result=_decode_result(existing["result_json"])
+            )
+        if existing["status"] in {
+            "failed",
+            "partial",
+            "needs_attention",
+            "cancelled",
+        }:
+            return DurableOperationDisposition(
+                "failed",
+                error_code=existing["error_code"] or "mutation_failed",
+                error_message=existing["error_message"] or "Broker mutation failed.",
+            )
+        return DurableOperationDisposition("pending")
+
+    def existing_operation_disposition(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> DurableOperationDisposition | None:
+        """Read an idempotent replay result without reserving a new operation."""
+
+        fingerprint = authenticated_request_fingerprint(authorized)
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                return self._existing_operation_disposition(
+                    connection,
+                    authorized=authorized,
+                    fingerprint=fingerprint,
+                )
+
     def reserve_operation(
         self, authorized: AuthorizedBrokerRequest
     ) -> DurableOperationDisposition:
@@ -1107,37 +1167,13 @@ class BrokerPersistence:
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
-                existing = connection.execute(
-                    """
-                    SELECT o.status, o.result_json, o.error_code, o.error_message,
-                           b.uid, b.request_fingerprint
-                    FROM operations o
-                    LEFT JOIN broker_operation_requests b USING(operation_id)
-                    WHERE o.operation_id = ?
-                    """,
-                    (request.operation_id,),
-                ).fetchone()
+                existing = self._existing_operation_disposition(
+                    connection,
+                    authorized=authorized,
+                    fingerprint=fingerprint,
+                )
                 if existing is not None:
-                    if (
-                        existing["uid"] != authorized.peer.uid
-                        or existing["request_fingerprint"] != fingerprint
-                    ):
-                        raise BrokerError(
-                            "operation_id_conflict",
-                            "operation_id was already used for a different authenticated request.",
-                            operation_id=request.operation_id,
-                        )
-                    if existing["status"] == "succeeded":
-                        return DurableOperationDisposition(
-                            "completed", result=_decode_result(existing["result_json"])
-                        )
-                    if existing["status"] in {"failed", "partial", "needs_attention", "cancelled"}:
-                        return DurableOperationDisposition(
-                            "failed",
-                            error_code=existing["error_code"] or "mutation_failed",
-                            error_message=existing["error_message"] or "Broker mutation failed.",
-                        )
-                    return DurableOperationDisposition("pending")
+                    return existing
 
                 _authorize_connection(
                     connection, peer=authorized.peer, request=request
@@ -1390,6 +1426,47 @@ class BrokerPersistence:
                     result["listener_identity"] = dict(listener_evidence)
                 _finish_operation(connection, request.operation_id, result=result)
                 return result
+
+    def listener_adoption_preflight_target(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> tuple[int, str]:
+        """Resolve an authorized adoption target before operation reservation."""
+
+        request = authorized.request
+        if not bool(request.arguments.get("adopt_existing_listener")):
+            raise BrokerError(
+                "invalid_arguments",
+                "Listener adoption was not requested.",
+                operation_id=request.operation_id,
+            )
+        candidates = self.port_lease_candidates(authorized)
+        if len(candidates) != 1:
+            raise BrokerError(
+                "invalid_arguments",
+                "Listener adoption requires one exact authorized port.",
+                operation_id=request.operation_id,
+            )
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _authorize_connection(
+                    connection, peer=authorized.peer, request=request
+                )
+                row = connection.execute(
+                    """
+                    SELECT r.canonical_root
+                    FROM repositories r
+                    JOIN server_definitions s USING(repo_id)
+                    WHERE r.repo_id = ? AND s.server_definition_id = ?
+                    """,
+                    (request.project_id, request.resource_id),
+                ).fetchone()
+                if row is None:
+                    raise BrokerError(
+                        "control_binding_unavailable",
+                        "Server listener adoption target is no longer enrolled.",
+                        operation_id=request.operation_id,
+                    )
+                return int(candidates[0]), str(row["canonical_root"])
 
     def listener_adoption_target(
         self, authorized: AuthorizedBrokerRequest

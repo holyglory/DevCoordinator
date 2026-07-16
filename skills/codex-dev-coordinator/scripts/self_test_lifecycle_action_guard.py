@@ -157,6 +157,25 @@ class LifecycleActionGuardTests(unittest.TestCase):
                     operation_count,
                 )
 
+    def operation_ids(self) -> list[str]:
+        with AccountStore.open_default(self.home) as store:
+            with store.read_transaction() as connection:
+                return [
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT operation_id FROM operations ORDER BY operation_id"
+                    )
+                ]
+
+    def store_revision(self) -> int:
+        with AccountStore.open_default(self.home) as store:
+            with store.read_transaction() as connection:
+                return int(
+                    connection.execute(
+                        "SELECT state_revision FROM schema_metadata WHERE singleton = 1"
+                    ).fetchone()[0]
+                )
+
     def mutation_calls(self):
         base = {"agent": "guard-test", "project": str(self.repository)}
         return {
@@ -324,6 +343,525 @@ class LifecycleActionGuardTests(unittest.TestCase):
         self.assertTrue(any(row["kind"] == "project.start" for row in rows))
         self.assertTrue(any(row["kind"] == "server.register" for row in rows))
         self.assertFalse(any(row["status"] == "running" for row in rows))
+
+    def test_unobservable_listener_fails_before_any_guard_or_lifecycle_operation(self) -> None:
+        identity = {
+            "ok": True,
+            "observable": True,
+            "pid": 43051,
+            "host": "127.0.0.1",
+            "port": 43101,
+            "project": str(self.repository),
+            "cwd": str(self.repository),
+            "source": "fixture",
+            "listener_inodes": ["43101"],
+        }
+        healthy = {
+            "ok": True,
+            "pid_alive": True,
+            "classification": "healthy",
+            "identity": identity,
+        }
+        with (
+            mock.patch.object(coordinator, "configured_broker_context", return_value=None),
+            mock.patch.object(
+                coordinator,
+                "resolve_registration_pid",
+                return_value=(43051, identity),
+            ),
+            mock.patch.object(coordinator, "wait_for_health", return_value=healthy),
+            mock.patch.object(
+                coordinator,
+                "registration_pid_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                coordinator,
+                "normalized_process_instance_evidence",
+                return_value=("fixture-start", "sha256:fixture-process"),
+            ),
+        ):
+            registered = coordinator.coordinated_register_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "web",
+                    "cwd": str(self.repository),
+                    "port": 43101,
+                    "pid": 43051,
+                    "url": "http://127.0.0.1:43101",
+                    "argv": ["python3", "-c", "print('fixture')"],
+                }
+            )
+        self.assertEqual(registered["status"], "running")
+
+        def operation_ids() -> list[str]:
+            with AccountStore.open_default(self.home) as store:
+                with store.read_transaction() as connection:
+                    return [
+                        str(row[0])
+                        for row in connection.execute(
+                            "SELECT operation_id FROM operations ORDER BY operation_id"
+                        )
+                    ]
+
+        before = operation_ids()
+        unobservable = {
+            "ok": None,
+            "pid_alive": True,
+            "classification": "unverified-listener",
+            "identity": {
+                "ok": None,
+                "observable": False,
+                "reason": "injected capability boundary",
+            },
+        }
+        calls = {
+            "server start": lambda: coordinator.coordinated_start_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "web",
+                    "cwd": str(self.repository),
+                    "argv": ["python3", "-c", "print('must not launch')"],
+                }
+            ),
+            "server restart": lambda: coordinator.coordinated_restart_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "web",
+                }
+            ),
+            "project start": lambda: coordinator.coordinated_project_runtime_start(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                }
+            ),
+            "project restart": lambda: coordinator.coordinated_project_runtime_restart(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                }
+            ),
+            "project stop": lambda: coordinator.coordinated_project_runtime_stop(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                }
+            ),
+        }
+        with (
+            mock.patch.object(coordinator, "server_health", return_value=unobservable),
+            mock.patch.object(
+                coordinator,
+                "start_process",
+                side_effect=AssertionError("unobservable preflight launched a process"),
+            ),
+            mock.patch.object(
+                coordinator,
+                "stop_pid",
+                side_effect=AssertionError("unobservable preflight signalled a process"),
+            ),
+        ):
+            for label, invoke in calls.items():
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(
+                        coordinator.ListenerIdentityUnobservable,
+                        "listener identity is unobservable",
+                    ):
+                        invoke()
+                    self.assertEqual(operation_ids(), before)
+
+        with (
+            mock.patch.object(coordinator, "configured_broker_context", return_value=None),
+            mock.patch.object(
+                coordinator,
+                "resolve_registration_pid",
+                side_effect=coordinator.ListenerIdentityUnobservable(
+                    "working directory is not observable"
+                ),
+            ),
+            self.assertRaisesRegex(
+                coordinator.ListenerIdentityUnobservable,
+                "working directory is not observable",
+            ),
+        ):
+            coordinator.coordinated_register_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "web",
+                    "cwd": str(self.repository),
+                    "port": 43101,
+                    "pid": 43051,
+                }
+            )
+        self.assertEqual(operation_ids(), before)
+
+    def test_absent_server_on_exact_unknown_port_fails_before_guard_reservation(self) -> None:
+        self.install_repository()
+        before_operations = self.operation_ids()
+        before_revision = self.store_revision()
+        unknown_owner = {
+            "observable": False,
+            "reason": "injected capability boundary",
+        }
+        with (
+            mock.patch.object(coordinator, "port_open", return_value=True),
+            mock.patch.object(
+                coordinator,
+                "listener_belongs_to_project",
+                return_value=(False, unknown_owner),
+            ),
+            mock.patch.object(
+                coordinator.RepositoryLifecycle,
+                "restore_startup_policies_for_start",
+                side_effect=AssertionError("listener preflight reached startup restoration"),
+            ),
+            mock.patch.object(
+                coordinator,
+                "start_process",
+                side_effect=AssertionError("listener preflight launched a process"),
+            ),
+            self.assertRaisesRegex(
+                coordinator.ListenerIdentityUnobservable,
+                "injected capability boundary",
+            ),
+        ):
+            coordinator.coordinated_start_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "absent",
+                    "cwd": str(self.repository),
+                    "argv": ["python3", "-c", "print('must not launch')"],
+                    "range": "43101-43101",
+                    "preferred": 43101,
+                }
+            )
+        self.assertEqual(self.operation_ids(), before_operations)
+        self.assertEqual(self.store_revision(), before_revision)
+        with AccountStore.open_default(self.home) as store:
+            with store.read_transaction() as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM server_definitions WHERE name = 'absent'"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_broker_registration_proves_listener_before_local_guard(self) -> None:
+        with (
+            mock.patch.object(
+                coordinator,
+                "configured_broker_context",
+                return_value=(object(), object()),
+            ),
+            mock.patch.object(
+                coordinator,
+                "acquire_broker_lease_link",
+                side_effect=coordinator.ListenerIdentityUnobservable(
+                    "broker listener identity is unobservable"
+                ),
+            ) as broker_acquire,
+            self.assertRaisesRegex(
+                coordinator.ListenerIdentityUnobservable,
+                "broker listener identity is unobservable",
+            ),
+        ):
+            coordinator.coordinated_register_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "web",
+                    "cwd": str(self.repository),
+                    "port": 43101,
+                }
+            )
+        broker_acquire.assert_called_once()
+        self.assertFalse((self.home / "coordinator.sqlite3").exists())
+
+    def test_stale_dead_pid_on_assigned_unknown_port_fails_before_guard_reservation(self) -> None:
+        identity = {
+            "ok": True,
+            "observable": True,
+            "pid": 43052,
+            "host": "127.0.0.1",
+            "port": 43101,
+            "project": str(self.repository),
+            "cwd": str(self.repository),
+            "source": "fixture",
+            "listener_inodes": ["43101"],
+        }
+        healthy = {
+            "ok": True,
+            "pid_alive": True,
+            "classification": "healthy",
+            "identity": identity,
+        }
+        with (
+            mock.patch.object(coordinator, "configured_broker_context", return_value=None),
+            mock.patch.object(
+                coordinator,
+                "resolve_registration_pid",
+                return_value=(43052, identity),
+            ),
+            mock.patch.object(coordinator, "wait_for_health", return_value=healthy),
+            mock.patch.object(
+                coordinator,
+                "registration_pid_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                coordinator,
+                "normalized_process_instance_evidence",
+                return_value=("fixture-start", "sha256:fixture-process"),
+            ),
+        ):
+            coordinator.coordinated_register_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "stale",
+                    "cwd": str(self.repository),
+                    "port": 43101,
+                    "pid": 43052,
+                    "url": "http://127.0.0.1:43101",
+                    "argv": ["python3", "-c", "print('fixture')"],
+                }
+            )
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction(revision_kind="observation") as connection:
+                connection.execute(
+                    """
+                    UPDATE server_observations
+                    SET lifecycle = 'running', pid = 987654,
+                        listener_host = '127.0.0.1', listener_port = 43101,
+                        listener_observable = 1, sampled_at = ?
+                    WHERE server_definition_id = (
+                        SELECT server_definition_id FROM server_definitions
+                        WHERE name = 'stale'
+                    )
+                    """,
+                    (coordinator.utc_timestamp(),),
+                )
+        before_operations = self.operation_ids()
+        before_revision = self.store_revision()
+        unknown_owner = {
+            "observable": False,
+            "reason": "stale listener cannot be attributed",
+        }
+        calls = {
+            "start": lambda: coordinator.coordinated_start_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "stale",
+                    "cwd": str(self.repository),
+                    "argv": ["python3", "-c", "print('must not launch')"],
+                }
+            ),
+            "restart": lambda: coordinator.coordinated_restart_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "stale",
+                }
+            ),
+        }
+        with (
+            mock.patch.object(coordinator, "pid_alive", return_value=False),
+            mock.patch.object(coordinator, "port_open", return_value=True),
+            mock.patch.object(
+                coordinator,
+                "listener_belongs_to_project",
+                return_value=(False, unknown_owner),
+            ),
+            mock.patch.object(
+                coordinator.RepositoryLifecycle,
+                "restore_startup_policies_for_start",
+                side_effect=AssertionError("listener preflight reached startup restoration"),
+            ),
+            mock.patch.object(
+                coordinator,
+                "start_process",
+                side_effect=AssertionError("listener preflight launched a process"),
+            ),
+        ):
+            for label, invoke in calls.items():
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(
+                        coordinator.ListenerIdentityUnobservable,
+                        "stale listener cannot be attributed",
+                    ):
+                        invoke()
+                    self.assertEqual(self.operation_ids(), before_operations)
+                    self.assertEqual(self.store_revision(), before_revision)
+
+    def test_existing_conflict_precedes_listener_identity_sampling(self) -> None:
+        repo_id = self.install_repository()
+        timestamp = coordinator.utc_timestamp()
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO operations(
+                        operation_id, repo_id, source_id, kind, status, phase,
+                        generation, request_fingerprint, owner_uid, actor,
+                        process_fingerprint, error_code, error_message,
+                        result_json, created_at, updated_at
+                    ) VALUES (
+                        'fixture-conflict', ?, NULL, 'guard:start', 'running',
+                        'reserved', 0, 'fixture-request', ?, 'other-agent',
+                        NULL, NULL, NULL, '{}', ?, ?
+                    )
+                    """,
+                    (repo_id, os.geteuid(), timestamp, timestamp),
+                )
+        before = self.operation_ids()
+        with (
+            mock.patch.object(
+                coordinator,
+                "resolve_registration_pid",
+                side_effect=AssertionError("conflict path sampled listener identity"),
+            ) as identity_probe,
+            self.assertRaisesRegex(
+                coordinator.ConcurrentLifecycleError,
+                "already active",
+            ),
+        ):
+            coordinator.coordinated_register_server(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "name": "web",
+                    "cwd": str(self.repository),
+                    "port": 43101,
+                }
+            )
+        identity_probe.assert_not_called()
+        self.assertEqual(self.operation_ids(), before)
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    "UPDATE operations SET kind = 'guard:lease' "
+                    "WHERE operation_id = 'fixture-conflict'"
+                )
+            self.assertEqual(
+                coordinator._precheck_normalized_repository_action(
+                    store,
+                    project=str(self.repository),
+                    action=RepositoryAction.LEASE,
+                ),
+                repo_id,
+            )
+
+    def test_guard_uses_local_installation_when_foreign_same_root_exists(self) -> None:
+        local_repo_id = self.install_repository()
+        timestamp = coordinator.utc_timestamp()
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO hosts(
+                        host_id, machine_fingerprint, platform, hostname,
+                        created_at, updated_at
+                    ) VALUES (
+                        'foreign-host', 'foreign-fingerprint', 'Linux',
+                        'foreign', ?, ?
+                    )
+                    """,
+                    (timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (
+                        'foreign-repo', 'foreign-host', ?, 'repo', 'active',
+                        0, ?, ?
+                    )
+                    """,
+                    (str(self.repository), timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO repository_installations(
+                        repo_id, status, startup_fenced, generation, reason,
+                        actor, updated_at
+                    ) VALUES (
+                        'foreign-repo', 'disabled', 1, 0, 'foreign fixture',
+                        'guard-test', ?
+                    )
+                    """,
+                    (timestamp,),
+                )
+
+        options = {
+            "agent": "guard-test",
+            "project": str(self.repository),
+            "name": "web",
+            "cwd": str(self.repository),
+            "port": 43101,
+        }
+        with mock.patch.object(
+            coordinator,
+            "resolve_registration_pid",
+            return_value=(None, None),
+        ):
+            with coordinator.normalized_repository_action_guard(
+                project=str(self.repository),
+                agent="guard-test",
+                action=RepositoryAction.REGISTER,
+                preflight=lambda store: coordinator.preflight_normalized_listener_identity(
+                    options, command="server register", store=store
+                ),
+            ) as guarded_repo_id:
+                self.assertEqual(guarded_repo_id, local_repo_id)
+
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE repository_installations
+                    SET status = 'disabled', startup_fenced = 1,
+                        reason = 'local fixture', updated_at = ?
+                    WHERE repo_id = ?
+                    """,
+                    (coordinator.utc_timestamp(), local_repo_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE repository_installations
+                    SET status = 'installed', startup_fenced = 0,
+                        reason = 'foreign fixture', updated_at = ?
+                    WHERE repo_id = 'foreign-repo'
+                    """,
+                    (coordinator.utc_timestamp(),),
+                )
+        before = self.operation_ids()
+        with (
+            mock.patch.object(
+                coordinator,
+                "resolve_registration_pid",
+                side_effect=AssertionError("local fence sampled listener identity"),
+            ) as identity_probe,
+            self.assertRaisesRegex(ActionFencedError, "start fence is active"),
+        ):
+            with coordinator.normalized_repository_action_guard(
+                project=str(self.repository),
+                agent="guard-test",
+                action=RepositoryAction.REGISTER,
+                preflight=lambda store: coordinator.preflight_normalized_listener_identity(
+                    options, command="server register", store=store
+                ),
+            ):
+                self.fail("disabled local repository received a permit")
+        identity_probe.assert_not_called()
+        self.assertEqual(self.operation_ids(), before)
 
     def test_start_policy_restore_failure_releases_permit_before_legacy_or_host_start(self) -> None:
         @contextlib.contextmanager

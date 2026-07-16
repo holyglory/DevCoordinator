@@ -2751,7 +2751,10 @@ class StoreBackedBrokerTests(unittest.TestCase):
             self.assertEqual(reply["result"]["listener_identity"], evidence)
             self.assertEqual(
                 actions.listener_observations,
-                [(3107, "/repos/alpha", "tcp")],
+                [
+                    (3107, "/repos/alpha", "tcp"),
+                    (3107, "/repos/alpha", "tcp"),
+                ],
             )
             self.assertEqual(actions.port_observations, [])
             with CoordinatorStore.open(
@@ -2763,6 +2766,55 @@ class StoreBackedBrokerTests(unittest.TestCase):
                     ).fetchone()
             self.assertEqual(int(lease["port"]), 3107)
             self.assertTrue(str(lease["process_fingerprint"]).startswith("sha256:"))
+
+            # A completed idempotent replay returns durable truth without
+            # requiring the adopted listener to remain observable forever.
+            actions.listener_evidence = None
+            replay = service.reply_for_document(peer_for(), request.to_wire())
+            self.assertTrue(replay["ok"], replay)
+            self.assertEqual(replay["result"], reply["result"])
+            self.assertEqual(len(actions.listener_observations), 2)
+
+    def test_unobservable_listener_adoption_writes_no_broker_operation(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _unused = seed_store_backed_broker(root)
+            actions = RecordingTypedHostActions(
+                occupied_ports={3107}, listener_evidence=None
+            )
+            service = store_backed_service(persistence, actions)
+            request = request_for(
+                BrokerOperation.PORT_LEASE,
+                resource_id=SERVER_ID,
+                arguments={
+                    "requested_port": 3107,
+                    "protocol": "tcp",
+                    "ttl_seconds": 600,
+                    "adopt_existing_listener": True,
+                },
+            )
+
+            reply = service.reply_for_document(peer_for(), request.to_wire())
+
+            self.assertFalse(reply["ok"], reply)
+            self.assertEqual(reply["error"]["code"], "listener_identity_unavailable")
+            self.assertEqual(
+                actions.listener_observations,
+                [(3107, "/repos/alpha", "tcp")],
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    self.assertIsNone(
+                        connection.execute(
+                            "SELECT status FROM operations WHERE operation_id = ?",
+                            (request.operation_id,),
+                        ).fetchone()
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT count(*) FROM leases").fetchone()[0],
+                        0,
+                    )
 
     def test_existing_listener_adoption_requires_one_exact_requested_port(self) -> None:
         with CanonicalTemporaryDirectory() as root:

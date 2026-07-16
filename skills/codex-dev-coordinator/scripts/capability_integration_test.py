@@ -10,7 +10,9 @@ import http.server
 import json
 import os
 import pwd
+import select
 import shutil
+import signal
 import socket
 import socketserver
 import subprocess
@@ -18,6 +20,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 
 SCRIPT = Path(__file__).with_name("dev_coordinator.py").resolve()
@@ -76,6 +79,186 @@ def wait_health(port: int, process: subprocess.Popen[str], *, timeout: float = 2
             pass
         time.sleep(0.1)
     raise AssertionError(f"listener on {port} did not become healthy")
+
+
+def terminate_test_process(process: subprocess.Popen[str]) -> None:
+    """Terminate one isolated test-owned process group."""
+
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=10)
+
+
+def linux_pid_active(pid: int | None) -> bool:
+    """Return whether one Linux PID still names a non-zombie process."""
+
+    if not pid:
+        return False
+    try:
+        stat_text = (Path("/proc") / str(int(pid)) / "stat").read_text(
+            encoding="utf-8"
+        )
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return True
+    _prefix, separator, suffix = stat_text.rpartition(") ")
+    return bool(separator and suffix and suffix[0] not in {"Z", "X"})
+
+
+def wait_pid_inactive(pid: int, *, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not linux_pid_active(pid):
+            return True
+        time.sleep(0.05)
+    return not linux_pid_active(pid)
+
+
+def _marked_process_identity(
+    process: Path,
+    *,
+    marker_bytes: bytes,
+    expected_cwd: Path,
+) -> tuple[str, tuple[bytes, ...], str] | None:
+    try:
+        stat_text = (process / "stat").read_text(encoding="utf-8")
+        _prefix, separator, suffix = stat_text.rpartition(") ")
+        fields = suffix.split() if separator else []
+        command = tuple((process / "cmdline").read_bytes().split(b"\0"))
+        process_cwd = (process / "cwd").resolve(strict=True)
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        return None
+    if len(fields) <= 19 or marker_bytes not in command:
+        return None
+    if not (
+        process_cwd == expected_cwd or expected_cwd in process_cwd.parents
+    ):
+        return None
+    return fields[19], command, str(process_cwd)
+
+
+def _wait_pidfd(pidfd: int, *, timeout: float) -> bool:
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return bool(poller.poll(round(timeout * 1000)))
+
+
+def _terminate_marked_pidfd(
+    pid: int,
+    *,
+    expected_identity: tuple[str, tuple[bytes, ...], str],
+    marker_bytes: bytes,
+    expected_cwd: Path,
+) -> str | None:
+    opener = getattr(os, "pidfd_open", None)
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if opener is None or sender is None or not hasattr(select, "poll"):
+        return "Linux pidfd support is required for race-free fixture cleanup"
+    try:
+        pidfd = opener(pid, 0)
+    except ProcessLookupError:
+        return None
+    try:
+        bound_identity = _marked_process_identity(
+            Path("/proc") / str(pid),
+            marker_bytes=marker_bytes,
+            expected_cwd=expected_cwd,
+        )
+        if bound_identity is None:
+            if _wait_pidfd(pidfd, timeout=0.0):
+                return None
+            return "process marker or cwd changed while binding pidfd; refusing to signal"
+        if bound_identity != expected_identity:
+            return "process identity changed while binding pidfd; refusing to signal"
+        try:
+            sender(pidfd, signal.SIGTERM, None, 0)
+        except ProcessLookupError:
+            return None
+        if _wait_pidfd(pidfd, timeout=5.0):
+            return None
+        try:
+            sender(pidfd, signal.SIGKILL, None, 0)
+        except ProcessLookupError:
+            return None
+        if not _wait_pidfd(pidfd, timeout=5.0):
+            return "process did not exit after pidfd SIGKILL"
+        return None
+    finally:
+        os.close(pidfd)
+
+
+def terminate_marked_test_processes(marker: Path, *, cwd: Path) -> tuple[list[int], list[str]]:
+    """Race-safely terminate marked children and prove a stable clean sweep."""
+
+    marker_bytes = os.fsencode(str(marker))
+    expected_cwd = cwd.resolve()
+    matched: set[int] = set()
+    failures_by_pid: dict[int, str] = {}
+    deadline = time.monotonic() + 6.0
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        observed: list[tuple[int, tuple[str, tuple[bytes, ...], str]]] = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            identity = _marked_process_identity(
+                entry,
+                marker_bytes=marker_bytes,
+                expected_cwd=expected_cwd,
+            )
+            if identity is not None:
+                observed.append((int(entry.name), identity))
+        if not observed:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= 0.5:
+                return sorted(matched), [
+                    f"marked managed child PID {pid}: {message}"
+                    for pid, message in sorted(failures_by_pid.items())
+                ]
+            time.sleep(0.05)
+            continue
+        stable_since = None
+        for pid, identity in observed:
+            matched.add(pid)
+            failure = _terminate_marked_pidfd(
+                pid,
+                expected_identity=identity,
+                marker_bytes=marker_bytes,
+                expected_cwd=expected_cwd,
+            )
+            if failure is not None:
+                failures_by_pid[pid] = failure
+        time.sleep(0.05)
+    remaining = sorted(
+        int(entry.name)
+        for entry in Path("/proc").iterdir()
+        if entry.name.isdigit()
+        and _marked_process_identity(
+            entry,
+            marker_bytes=marker_bytes,
+            expected_cwd=expected_cwd,
+        )
+        is not None
+    )
+    if remaining:
+        failures_by_pid[-1] = f"stable no-match sweep timed out; remaining PIDs={remaining}"
+    return sorted(matched), [
+        f"marked managed child PID {pid}: {message}"
+        for pid, message in sorted(failures_by_pid.items())
+    ]
 
 
 def api_request(
@@ -150,69 +333,347 @@ def exec_with_capability_snapshot(path: Path, command: list[str]) -> int:
     raise AssertionError("os.execv returned")
 
 
-def write_relocation_fixture(home: Path, *, old_project: Path, new_project: Path, port: int) -> tuple[str, str]:
-    server_id = "capability-cutover-server"
-    lease_id = "capability-cutover-old-lease"
-    old_key = f"{old_project}::devops-console"
-    now = time.time()
-    state = {
+def run_coordinator_json(
+    env: dict[str, str], arguments: list[str], *, context: str
+) -> dict[str, object]:
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(SCRIPT), *arguments],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(f"{context} timed out after 30 seconds") from exc
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"{context} failed ({completed.returncode}): "
+            f"{completed.stdout}\n{completed.stderr}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"{context} returned invalid JSON: {completed.stdout}\n{completed.stderr}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise AssertionError(f"{context} did not return an object: {payload!r}")
+    return payload
+
+
+def control_graph_signature(state: dict[str, object]) -> dict[str, object]:
+    """Select lifecycle fields that an incapable observation must not change."""
+
+    servers = state.get("servers") or {}
+    leases = state.get("leases") or {}
+    assignments = state.get("port_assignments") or {}
+    operations = state.get("operations") or {}
+    if not all(
+        isinstance(value, dict)
+        for value in (servers, leases, assignments, operations)
+    ):
+        raise AssertionError("control state does not contain object lifecycle collections")
+    return {
+        "servers": {
+            str(server_id): {
+                key: server.get(key)
+                for key in ("status", "pid", "lease_id", "generation", "operation_id")
+            }
+            for server_id, server in servers.items()
+            if isinstance(server, dict)
+        },
+        "leases": {
+            str(lease_id): {
+                key: lease.get(key)
+                for key in ("status", "server_id", "owner_pid", "assignment_key")
+            }
+            for lease_id, lease in leases.items()
+            if isinstance(lease, dict)
+        },
+        "assignments": {
+            str(key): {
+                field: assignment.get(field)
+                for field in ("project", "name", "port", "status")
+            }
+            for key, assignment in assignments.items()
+            if isinstance(assignment, dict)
+        },
+        "operation_ids": sorted(str(key) for key in operations),
+    }
+
+
+def bootstrap_normalized_fixture(
+    *, root: Path, project: Path, env: dict[str, str]
+) -> None:
+    """Create isolated SQLite authority without discovering account state."""
+
+    legacy_home = root / "empty-legacy-source"
+    legacy_home.mkdir(mode=0o700)
+    legacy_state = {
         "version": 2,
         "revision": 0,
-        "updated_at": "fixture",
-        "leases": {
-            lease_id: {
-                "id": lease_id,
-                "agent": "legacy-console",
-                "project": str(old_project),
-                "port": port,
-                "purpose": "server:devops-console",
-                "server_id": server_id,
-                "status": "active",
-                "created_at": "fixture",
-                "created_ts": now,
-                "expires_at": now + 3600,
-            }
-        },
-        "servers": {
-            server_id: {
-                "id": server_id,
-                "key": old_key,
-                "name": "devops-console",
-                "agent": "legacy-console",
-                "project": str(old_project),
-                "cwd": str(old_project),
-                "port": port,
-                "pid": 999999999,
-                "lease_id": lease_id,
-                "status": "stopped",
-                "health": {"ok": False},
-                "created_at": "fixture",
-                "updated_at": "fixture",
-                "stopped_at": "fixture",
-                "stopped_ts": now,
-            }
-        },
-        "port_assignments": {
-            old_key: {
-                "key": old_key,
-                "project": str(old_project),
-                "name": "devops-console",
-                "port": port,
-                "agent": "legacy-console",
-                "source": "server_register",
-                "created_at": "fixture",
-                "updated_at": "fixture",
-            }
-        },
+        "created_at": "2026-07-15T00:00:00Z",
+        "updated_at": "2026-07-15T00:00:00Z",
+        "leases": {},
+        "servers": {},
+        "port_assignments": {},
         "history": [],
         "operations": {},
         "docker": {"last_commands": [], "stats_history": {}, "metadata": {}},
     }
-    home.mkdir(mode=0o700)
-    state_file = home / "state.json"
-    state_file.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    state_file.chmod(0o600)
+    legacy_state_file = legacy_home / "state.json"
+    legacy_state_file.write_text(
+        json.dumps(legacy_state, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    legacy_state_file.chmod(0o600)
+    backup_root = root / "legacy-import-backups"
+    observed = run_coordinator_json(
+        env,
+        [
+            "observe",
+            "--agent",
+            "capability-integration",
+            "--project",
+            str(project),
+            "--no-docker",
+            "--legacy-home",
+            str(legacy_home),
+            "--legacy-backup-root",
+            str(backup_root),
+        ],
+        context="normalized fixture bootstrap",
+    )
+    imported = observed.get("imported")
+    if not (
+        isinstance(imported, dict)
+        and imported.get("source_count") == 1
+        and imported.get("repository_count") == 0
+        and imported.get("conflict_count") == 0
+        and imported.get("blocking_conflict_count") == 0
+    ):
+        raise AssertionError(
+            "normalized fixture bootstrap did not import exactly the isolated "
+            f"empty source: {observed}"
+        )
+    inventory = run_coordinator_json(
+        env,
+        ["inventory", "--no-docker"],
+        context="normalized fixture inventory",
+    )
+    source_homes = {
+        str(item.get("canonical_home"))
+        for item in inventory.get("coordinator_sources", [])
+        if isinstance(item, dict)
+    }
+    expected_homes = {
+        str(legacy_home),
+        str(Path(env["CODEX_AGENT_COORDINATOR_HOME"]) / "coordinator.sqlite3"),
+    }
+    if source_homes != expected_homes:
+        raise AssertionError(
+            "normalized fixture imported coordinator state outside its private source: "
+            f"homes={sorted(source_homes)} "
+            f"sources={inventory.get('coordinator_sources')}"
+        )
+
+
+def prepare_relocation_fixture(
+    *,
+    root: Path,
+    old_project: Path,
+    new_project: Path,
+    port: int,
+    env: dict[str, str],
+    processes: list[subprocess.Popen[str]],
+) -> tuple[str, str]:
+    """Build the stopped relocation graph through public normalized actions."""
+
+    fixture_pid_file = root / "relocation-listener.pid"
+    listener = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--listener",
+            str(port),
+            "--pid-file",
+            str(fixture_pid_file),
+        ],
+        cwd=old_project,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    processes.append(listener)
+    wait_health(port, listener)
+    listener_pid = int(fixture_pid_file.read_text(encoding="utf-8").strip())
+    registered = run_coordinator_json(
+        env,
+        [
+            "server",
+            "register",
+            "--agent",
+            "capability-integration",
+            "--project",
+            str(old_project),
+            "--name",
+            "devops-console",
+            "--cwd",
+            str(old_project),
+            "--argv",
+            json.dumps(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--listener",
+                    "{port}",
+                ]
+            ),
+            "--pid",
+            str(listener_pid),
+            "--port",
+            str(port),
+            "--url",
+            f"http://127.0.0.1:{port}",
+            "--health-url",
+            f"http://127.0.0.1:{port}/healthz",
+        ],
+        context="normalized relocation registration",
+    )
+    server_id = str(registered.get("id") or "")
+    lease_id = str(registered.get("lease_id") or "")
+    if not server_id or not lease_id or registered.get("status") != "running":
+        raise AssertionError(
+            f"normalized relocation registration was incomplete: {registered}"
+        )
+    stopped = run_coordinator_json(
+        env,
+        [
+            "server",
+            "stop",
+            "--agent",
+            "capability-integration",
+            "--project",
+            str(old_project),
+            "--name",
+            "devops-console",
+            "--reason",
+            "Prepared normalized relocation fixture",
+        ],
+        context="normalized relocation stop",
+    )
+    if stopped.get("status") != "stopped" or str(stopped.get("lease_id") or "") != lease_id:
+        raise AssertionError(f"normalized relocation stop lost its exact lease: {stopped}")
+    listener.wait(timeout=10)
+    relocated = run_coordinator_json(
+        env,
+        [
+            "port",
+            "relocate",
+            "--agent",
+            "capability-integration",
+            "--old-project",
+            str(old_project),
+            "--new-project",
+            str(new_project),
+            "--name",
+            "devops-console",
+            "--port",
+            str(port),
+            "--lease-id",
+            lease_id,
+        ],
+        context="normalized relocation",
+    )
+    if not (
+        relocated.get("id") == server_id
+        and relocated.get("project") == str(new_project)
+        and relocated.get("lease_id") == lease_id
+        and relocated.get("lease_status") == "stale"
+    ):
+        raise AssertionError(f"normalized relocation changed server identity: {relocated}")
     return server_id, lease_id
+
+
+def run_normalized_relocation_preflight() -> int:
+    """Exercise the platform-neutral half of the Linux cutover fixture."""
+
+    root = Path(
+        tempfile.mkdtemp(prefix="coordinator-relocation-preflight-")
+    ).resolve(strict=True)
+    old_project = root / "legacy"
+    new_project = root / "DevCoordinator"
+    for repository in (old_project, new_project):
+        repository.mkdir()
+        (repository / ".git").mkdir()
+    home = root / "state"
+    env = os.environ.copy()
+    env["CODEX_AGENT_COORDINATOR_HOME"] = str(home)
+    env["DEVCOORDINATOR_STATE_BACKEND"] = "sqlite"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        bootstrap_normalized_fixture(root=root, project=old_project, env=env)
+        port = free_port()
+        server_id, lease_id = prepare_relocation_fixture(
+            root=root,
+            old_project=old_project,
+            new_project=new_project,
+            port=port,
+            env=env,
+            processes=processes,
+        )
+        state = run_coordinator_json(
+            env,
+            ["state", "show"],
+            context="relocation preflight state",
+        )
+        server = (state.get("servers") or {}).get(server_id)
+        assignment = (state.get("port_assignments") or {}).get(
+            f"{new_project}::devops-console"
+        )
+        if not (
+            isinstance(server, dict)
+            and server.get("project") == str(new_project)
+            and server.get("status") == "stopped"
+            and isinstance(assignment, dict)
+            and assignment.get("project") == str(new_project)
+            and assignment.get("port") == port
+        ):
+            raise AssertionError(
+                "public normalized relocation preflight did not preserve its exact graph: "
+                f"server={server} assignment={assignment}"
+            )
+        print("normalized relocation preflight ok")
+        return 0
+    finally:
+        primary_error = sys.exc_info()[1]
+        cleanup_failures: list[str] = []
+        for process in reversed(processes):
+            try:
+                terminate_test_process(process)
+            except BaseException as cleanup_error:
+                cleanup_failures.append(
+                    "tracked process group "
+                    f"{process.pid}: {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        shutil.rmtree(root, ignore_errors=True)
+        if cleanup_failures:
+            cleanup_summary = "; ".join(cleanup_failures)
+            if primary_error is not None:
+                raise RuntimeError(
+                    "normalized relocation preflight failed and cleanup also failed; "
+                    f"primary={type(primary_error).__name__}: {primary_error}; "
+                    f"cleanup={cleanup_summary}"
+                ) from primary_error
+            raise AssertionError(
+                "normalized relocation preflight cleanup failed: " + cleanup_summary
+            )
 
 
 def run_integration() -> int:
@@ -225,7 +686,12 @@ def run_integration() -> int:
         raise RuntimeError("run coordinator inventory before capability integration")
     if os.geteuid() == 0:
         raise RuntimeError("run as the target non-root service user, with passwordless sudo available")
-    subprocess.run(["sudo", "-n", "true"], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(
+        ["sudo", "-n", "true"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        timeout=10,
+    )
     host_default_bounding = int(current_capability_sets()["CapBnd"], 16)
 
     root = Path(tempfile.mkdtemp(prefix="coordinator-capability-integration-")).resolve(strict=True)
@@ -236,41 +702,31 @@ def run_integration() -> int:
         (repository / ".git").mkdir()
     home = root / "state"
     processes: list[subprocess.Popen[str]] = []
+    cap_api: subprocess.Popen[str] | None = None
+    cap_api_port: int | None = None
+    token: str | None = None
+    edge_registered = False
+    child_registered = False
+    edge_start_attempted = False
+    child_start_attempted = False
+    edge_pid: int | None = None
+    child_pid: int | None = None
+    child_marker = root / "managed-child-capabilities.json"
     try:
-        edge_port = free_port()
-        server_id, old_lease_id = write_relocation_fixture(
-            home, old_project=old_project, new_project=project, port=edge_port
-        )
         env = os.environ.copy()
         env["CODEX_AGENT_COORDINATOR_HOME"] = str(home)
+        env["DEVCOORDINATOR_STATE_BACKEND"] = "sqlite"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        relocated = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT),
-                "port",
-                "relocate",
-                "--agent",
-                "capability-integration",
-                "--old-project",
-                str(old_project),
-                "--new-project",
-                str(project),
-                "--name",
-                "devops-console",
-                "--port",
-                str(edge_port),
-                "--lease-id",
-                old_lease_id,
-            ],
+        bootstrap_normalized_fixture(root=root, project=old_project, env=env)
+        edge_port = free_port()
+        server_id, old_lease_id = prepare_relocation_fixture(
+            root=root,
+            old_project=old_project,
+            new_project=project,
+            port=edge_port,
             env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+            processes=processes,
         )
-        if relocated.returncode != 0:
-            raise AssertionError(f"relocation fixture failed: {relocated.stdout}\n{relocated.stderr}")
 
         listener_pid_file = root / "edge-listener.pid"
         listener = subprocess.Popen(
@@ -289,10 +745,12 @@ def run_integration() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
         processes.append(listener)
         wait_health(edge_port, listener)
         listener_pid = int(listener_pid_file.read_text(encoding="utf-8").strip())
+        edge_pid = listener_pid
 
         no_cap_port = free_port()
         no_cap_api = subprocess.Popen(
@@ -310,10 +768,18 @@ def run_integration() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
         processes.append(no_cap_api)
         wait_health(no_cap_port, no_cap_api)
         token = (home / "api-token").read_text(encoding="utf-8").strip()
+        before_no_cap_registration = control_graph_signature(
+            run_coordinator_json(
+                env,
+                ["state", "show"],
+                context="pre-registration control state",
+            )
+        )
         failure = api_request(
             no_cap_port,
             "POST",
@@ -333,6 +799,18 @@ def run_integration() -> int:
         )
         if "working directory is not observable" not in str(failure.get("error")):
             raise AssertionError(f"no-cap coordinator did not reproduce listener invisibility: {failure}")
+        after_no_cap_registration = control_graph_signature(
+            run_coordinator_json(
+                env,
+                ["state", "show"],
+                context="post-registration control state",
+            )
+        )
+        if after_no_cap_registration != before_no_cap_registration:
+            raise AssertionError(
+                "no-cap registration wrote lifecycle or operation state before "
+                "listener identity proof"
+            )
         no_cap_api.terminate()
         no_cap_api.wait(timeout=10)
 
@@ -348,6 +826,7 @@ def run_integration() -> int:
                 "--",
                 "/usr/bin/env",
                 f"CODEX_AGENT_COORDINATOR_HOME={home}",
+                "DEVCOORDINATOR_STATE_BACKEND=sqlite",
                 "PYTHONDONTWRITEBYTECODE=1",
                 sys.executable,
                 str(SCRIPT),
@@ -361,6 +840,7 @@ def run_integration() -> int:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
         processes.append(cap_api)
         wait_health(cap_api_port, cap_api)
@@ -373,6 +853,13 @@ def run_integration() -> int:
             )
         if not expected_child_bounding & (1 << 10):
             raise AssertionError("host capability ceiling cannot supply CAP_NET_BIND_SERVICE")
+        for capability_set in ("CapInh", "CapPrm", "CapEff", "CapAmb"):
+            if not int(str(cap_api_capabilities.get(capability_set, "0")), 16) & (1 << 10):
+                raise AssertionError(
+                    "capability API did not receive CAP_NET_BIND_SERVICE in "
+                    f"{capability_set}: {cap_api_capabilities}"
+                )
+        edge_start_attempted = True
         registered = api_request(
             cap_api_port,
             "POST",
@@ -395,10 +882,14 @@ def run_integration() -> int:
                 ],
             },
         )
+        edge_registered = True
         if (
             registered.get("id") != server_id
             or not registered.get("lease_id")
             or registered.get("lease_id") == old_lease_id
+            or (registered.get("registration_identity") or {}).get("pid") != listener_pid
+            or (registered.get("registration_identity") or {}).get("host") != "127.0.0.1"
+            or not (registered.get("registration_identity") or {}).get("listener_inodes")
         ):
             raise AssertionError(
                 "capability-matched registration did not reuse the server identity with a replacement lease: "
@@ -413,9 +904,10 @@ def run_integration() -> int:
             isinstance(server, dict)
             and server.get("status") == "running"
             and server.get("pid") == listener_pid
-            and (server.get("registration_identity") or {}).get("pid") == listener_pid
-            and (server.get("registration_identity") or {}).get("host") == "127.0.0.1"
-            and bool((server.get("registration_identity") or {}).get("listener_inodes"))
+            and bool(server.get("process_start_time"))
+            and bool(server.get("process_fingerprint"))
+            and server.get("identity_observable") is True
+            and (server.get("health") or {}).get("ok") is True
             and isinstance(lease, dict)
             and lease.get("server_id") == server_id
             and lease.get("owner_pid") == listener_pid
@@ -426,48 +918,13 @@ def run_integration() -> int:
         ):
             raise AssertionError("relocated server, replacement lease, and assignment are not fully linked")
 
-        unobservable_home = root / "unobservable-baseline-state"
-        unobservable_home.mkdir(mode=0o700)
-        unobservable_state = json.loads(json.dumps(state))
-        unobservable_state["servers"][server_id]["status"] = "unhealthy"
-        unobservable_state["servers"][server_id]["health"] = {
-            "ok": False,
-            "classification": "unhealthy",
-            "pid_alive": True,
-        }
-        unobservable_state_file = unobservable_home / "state.json"
-        unobservable_state_file.write_text(
-            json.dumps(unobservable_state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        unobservable_state_file.chmod(0o600)
-        unobservable_env = {**env, "CODEX_AGENT_COORDINATOR_HOME": str(unobservable_home)}
-        preserved = subprocess.run(
-            [sys.executable, str(SCRIPT), "inventory", "--project", str(project), "--no-docker"],
-            env=unobservable_env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if preserved.returncode != 0:
-            raise AssertionError(f"unobservable baseline inventory failed: {preserved.stderr}")
-        preserved_payload = json.loads(preserved.stdout)
-        preserved_server = next(item for item in preserved_payload["servers"] if item.get("id") == server_id)
-        preserved_lease = next(item for item in preserved_payload["leases"] if item.get("id") == registered["lease_id"])
-        if not (
-            preserved_server.get("status") == "unhealthy"
-            and (preserved_server.get("health") or {}).get("classification") == "unverified-listener"
-            and (preserved_server.get("health") or {}).get("ok") is None
-            and preserved_lease.get("status") == "active"
-        ):
-            raise AssertionError("unobservable inventory upgraded an unhealthy baseline or detached its lease")
-
         plain_inventory = subprocess.run(
             [sys.executable, str(SCRIPT), "inventory", "--project", str(project), "--no-docker"],
             env=env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=30,
             check=False,
         )
         if plain_inventory.returncode != 0:
@@ -480,13 +937,13 @@ def run_integration() -> int:
         plain_lease = next(item for item in plain_payload["leases"] if item.get("id") == registered["lease_id"])
         if not (
             plain_server.get("status") == "running"
-            and (plain_server.get("health") or {}).get("ok") is None
-            and (plain_server.get("health") or {}).get("classification") == "unverified-listener"
-            and ((plain_server.get("health") or {}).get("identity") or {}).get("observable") is False
+            and (plain_server.get("health") or {}).get("ok") is True
+            and (plain_server.get("health") or {}).get("classification") == "healthy"
+            and plain_server.get("identity_observable") is True
             and plain_lease.get("status") == "active"
         ):
             raise AssertionError(
-                "an incapable CLI inventory corrupted or misrepresented the registered listener graph"
+                "pure CLI inventory did not preserve the last committed capable observation"
             )
 
         # Real plain-CLI lifecycle commands run without the API's ambient
@@ -564,9 +1021,31 @@ def run_integration() -> int:
             and (plain_status_payload.get("health") or {}).get("ok") is None
             and (plain_status_payload.get("health") or {}).get("classification")
             == "unverified-listener"
+            and plain_status_payload.get("identity_observable") is False
             and edge_signature() == before_incapable
         ):
             raise AssertionError("incapable plain status changed lifecycle/lease state or hid uncertainty")
+
+        cached_inventory = api_request(cap_api_port, "GET", "/v1/inventory", token=token)
+        cached_server = next(
+            item for item in cached_inventory["servers"] if item.get("id") == server_id
+        )
+        cached_lease = next(
+            item
+            for item in cached_inventory["leases"]
+            if item.get("id") == registered["lease_id"]
+        )
+        if not (
+            cached_server.get("status") == "running"
+            and (cached_server.get("health") or {}).get("ok") is None
+            and (cached_server.get("health") or {}).get("classification")
+            == "unverified-listener"
+            and cached_server.get("identity_observable") is False
+            and cached_lease.get("status") == "active"
+        ):
+            raise AssertionError(
+                "pure API inventory did not preserve the cached unknown observation and active lease"
+            )
 
         lifecycle_commands = {
             "start": [
@@ -638,13 +1117,38 @@ def run_integration() -> int:
                     f"incapable project {action} partially mutated before identity proof"
                 )
 
-        capable_inventory = api_request(cap_api_port, "GET", "/v1/inventory", token=token)
-        capable_server = next(item for item in capable_inventory["servers"] if item.get("id") == server_id)
+        readiness_query = urlencode(
+            {
+                "project": str(project),
+                "name": "devops-console",
+                "port": edge_port,
+            }
+        )
+        capable_inventory = api_request(
+            cap_api_port,
+            "GET",
+            f"/v1/inventory/no-docker?{readiness_query}",
+            token=token,
+        )
+        capable_server = next(
+            item
+            for item in capable_inventory["v1_compatibility"]["servers"]
+            if item.get("id") == server_id
+        )
         if not (
             capable_server.get("status") == "running"
-            and (((capable_server.get("health") or {}).get("identity") or {}).get("ok") is True)
+            and (capable_server.get("registration_identity") or {}).get("ok") is True
+            and (capable_server.get("registration_identity") or {}).get("pid") == listener_pid
+            and (capable_server.get("registration_identity") or {}).get("host") == "127.0.0.1"
+            and bool(
+                (capable_server.get("registration_identity") or {}).get(
+                    "listener_inodes"
+                )
+            )
         ):
-            raise AssertionError("capability-matched API did not restore strict listener proof after CLI inventory")
+            raise AssertionError(
+                "target-scoped capable inventory did not provide strict current listener proof"
+            )
         capable_status = api_request(
             cap_api_port,
             "POST",
@@ -657,9 +1161,24 @@ def run_integration() -> int:
             and ((capable_status.get("health") or {}).get("identity") or {}).get("ok") is True
         ):
             raise AssertionError("capability-matched API status lost authorized listener proof")
+        restored_inventory = api_request(
+            cap_api_port, "GET", "/v1/inventory", token=token
+        )
+        restored_server = next(
+            item for item in restored_inventory["servers"] if item.get("id") == server_id
+        )
+        if not (
+            restored_server.get("status") == "running"
+            and (restored_server.get("health") or {}).get("ok") is True
+            and (restored_server.get("health") or {}).get("classification") == "healthy"
+            and restored_server.get("identity_observable") is True
+        ):
+            raise AssertionError(
+                "capable status did not persist restored healthy listener evidence"
+            )
 
         child_port = free_port()
-        child_caps = root / "managed-child-capabilities.json"
+        child_caps = child_marker
         child_code = (
             "import http.server,json,pathlib,socketserver,sys\n"
             "caps={}\n"
@@ -673,6 +1192,7 @@ def run_integration() -> int:
             " def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
             "S(('127.0.0.1',int(sys.argv[1])),H).serve_forever()\n"
         )
+        child_start_attempted = True
         child = api_request(
             cap_api_port,
             "POST",
@@ -690,6 +1210,8 @@ def run_integration() -> int:
                 "health_timeout": 10,
             },
         )
+        child_registered = True
+        child_pid = int(child.get("pid") or 0) or None
         if child.get("status") != "running":
             raise AssertionError(f"managed capability child did not start: {child}")
         caps = json.loads(child_caps.read_text(encoding="utf-8"))
@@ -712,20 +1234,124 @@ def run_integration() -> int:
                 "name": "capability-child",
             },
         )
+        child_registered = False
+        api_request(
+            cap_api_port,
+            "POST",
+            "/v1/servers/stop",
+            token=token,
+            payload={
+                "agent": "capability-integration",
+                "project": str(project),
+                "name": "devops-console",
+            },
+        )
+        edge_registered = False
+        listener.wait(timeout=10)
         print(
             "capability integration ok (asymmetric recall, fail-closed lifecycle, "
             "relocation lease, child active-cap non-propagation, inherited bounding ceiling)"
         )
         return 0
     finally:
+        primary_error = sys.exc_info()[1]
+        cleanup_failures: list[str] = []
+        if (
+            cap_api is not None
+            and cap_api.poll() is None
+            and cap_api_port is not None
+            and token
+        ):
+            cleanup_state: dict[str, object] | None = None
+            try:
+                cleanup_state = api_request(
+                    cap_api_port, "GET", "/v1/state", token=token
+                )
+            except BaseException as cleanup_error:
+                cleanup_failures.append(
+                    "state reconciliation: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            if cleanup_state is not None:
+                state_servers = cleanup_state.get("servers") or {}
+                if not isinstance(state_servers, dict):
+                    cleanup_failures.append("state reconciliation returned invalid servers")
+                    state_servers = {}
+                for attempted, name in (
+                    (child_start_attempted or child_registered, "capability-child"),
+                    (edge_start_attempted or edge_registered, "devops-console"),
+                ):
+                    if not attempted:
+                        continue
+                    matching = next(
+                        (
+                            value
+                            for value in state_servers.values()
+                            if isinstance(value, dict)
+                            and value.get("project") == str(project)
+                            and value.get("name") == name
+                        ),
+                        None,
+                    )
+                    if matching is None:
+                        continue
+                    retained_pid = int(matching.get("pid") or 0) or None
+                    if name == "capability-child" and retained_pid is not None:
+                        child_pid = retained_pid
+                    if name == "devops-console" and retained_pid is not None:
+                        edge_pid = retained_pid
+                    if matching.get("status") == "stopped" and retained_pid is None:
+                        continue
+                    try:
+                        api_request(
+                            cap_api_port,
+                            "POST",
+                            "/v1/servers/stop",
+                            token=token,
+                            payload={
+                                "agent": "capability-integration-cleanup",
+                                "project": str(project),
+                                "name": name,
+                            },
+                        )
+                    except BaseException as cleanup_error:
+                        cleanup_failures.append(
+                            f"{name}: {type(cleanup_error).__name__}: {cleanup_error}"
+                        )
         for process in reversed(processes):
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+            try:
+                terminate_test_process(process)
+            except BaseException as cleanup_error:
+                cleanup_failures.append(
+                    "tracked process group "
+                    f"{process.pid}: {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        try:
+            _marked_pids, marker_failures = terminate_marked_test_processes(
+                child_marker, cwd=project
+            )
+        except BaseException as cleanup_error:
+            cleanup_failures.append(
+                "marked process sweep: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        else:
+            cleanup_failures.extend(marker_failures)
+        for label, pid in (("managed child", child_pid), ("edge listener", edge_pid)):
+            if pid is not None and not wait_pid_inactive(pid):
+                cleanup_failures.append(f"{label} PID {pid} remained active after cleanup")
         shutil.rmtree(root, ignore_errors=True)
+        if cleanup_failures:
+            cleanup_summary = "; ".join(cleanup_failures)
+            if primary_error is not None:
+                raise RuntimeError(
+                    "capability integration failed and cleanup also failed; "
+                    f"primary={type(primary_error).__name__}: {primary_error}; "
+                    f"cleanup={cleanup_summary}"
+                ) from primary_error
+            raise AssertionError(
+                "capability integration cleanup failed: " + cleanup_summary
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -733,6 +1359,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--listener", type=int)
     parser.add_argument("--pid-file", type=Path)
     parser.add_argument("--exec-capability-snapshot", type=Path)
+    parser.add_argument("--normalized-relocation-preflight", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
@@ -746,6 +1373,8 @@ def main() -> int:
         if command and command[0] == "--":
             command.pop(0)
         return exec_with_capability_snapshot(args.exec_capability_snapshot, command)
+    if args.normalized_relocation_preflight:
+        return run_normalized_relocation_preflight()
     return run_integration()
 
 

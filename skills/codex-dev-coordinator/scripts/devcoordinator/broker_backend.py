@@ -137,6 +137,47 @@ class StoreBackedMutationBackend:
             return {
                 "repositories": self._persistence.list_removed_repository(authorized)
             }
+        listener_preflight: tuple[
+            tuple[int, ...], int, str, Mapping[str, Any]
+        ] | None = None
+        if (
+            request.operation == BrokerOperation.PORT_LEASE
+            and bool(request.arguments.get("adopt_existing_listener"))
+        ):
+            existing = self._persistence.existing_operation_disposition(authorized)
+            if existing is not None:
+                if existing.state == "completed":
+                    return dict(existing.result or {})
+                if existing.state == "failed":
+                    raise BrokerBackendError(
+                        existing.error_code or "mutation_failed",
+                        existing.error_message or "Broker mutation failed.",
+                        operation_id=request.operation_id,
+                    )
+                raise BrokerBackendError(
+                    "operation_in_progress",
+                    "This durable operation is already running or requires reconciliation; it was not executed again.",
+                    operation_id=request.operation_id,
+                )
+            candidates = self._persistence.port_lease_candidates(authorized)
+            selected_port, canonical_root = (
+                self._persistence.listener_adoption_preflight_target(authorized)
+            )
+            if type(selected_port) is not int or selected_port not in candidates:
+                raise BrokerBackendError(
+                    "invalid_host_observation",
+                    "Listener adoption target is outside the authorized port candidates.",
+                    operation_id=request.operation_id,
+                )
+            listener_evidence = self._host_mutations.verify_owned_tcp_listener(
+                port=selected_port, canonical_root=canonical_root
+            )
+            listener_preflight = (
+                candidates,
+                selected_port,
+                canonical_root,
+                listener_evidence,
+            )
         disposition = self._persistence.reserve_operation(authorized)
         replay_database_result: Mapping[str, Any] | None = None
         if disposition.state == "completed":
@@ -221,19 +262,46 @@ class StoreBackedMutationBackend:
                     }
             elif request.operation == BrokerOperation.PORT_LEASE:
                 protocol = str(request.arguments.get("protocol", "tcp"))
-                candidates = self._persistence.port_lease_candidates(authorized)
                 listener_evidence: Mapping[str, Any] | None = None
-                if bool(request.arguments.get("adopt_existing_listener")):
-                    selected_port, canonical_root = (
+                if listener_preflight is not None:
+                    (
+                        candidates,
+                        selected_port,
+                        canonical_root,
+                        listener_evidence,
+                    ) = listener_preflight
+                    current_port, current_root = (
                         self._persistence.listener_adoption_target(authorized)
                     )
-                    listener_evidence = self._host_mutations.verify_owned_tcp_listener(
-                        port=selected_port, canonical_root=canonical_root
+                    if current_port != selected_port or current_root != canonical_root:
+                        raise BrokerBackendError(
+                            "listener_identity_changed",
+                            "Listener adoption target changed between broker preflight and reservation.",
+                            operation_id=request.operation_id,
+                        )
+                    current_evidence = self._host_mutations.verify_owned_tcp_listener(
+                        port=current_port, canonical_root=current_root
                     )
+                    if dict(current_evidence) != dict(listener_evidence):
+                        raise BrokerBackendError(
+                            "listener_identity_changed",
+                            "Listener identity changed between broker preflight and reservation.",
+                            operation_id=request.operation_id,
+                        )
+                    listener_evidence = current_evidence
                 else:
-                    selected_port = self._host_mutations.select_available_port(
-                        candidates=candidates, protocol=protocol
-                    )
+                    candidates = self._persistence.port_lease_candidates(authorized)
+                    if bool(request.arguments.get("adopt_existing_listener")):
+                        selected_port, canonical_root = (
+                            self._persistence.listener_adoption_target(authorized)
+                        )
+                        listener_evidence = self._host_mutations.verify_owned_tcp_listener(
+                            port=selected_port, canonical_root=canonical_root
+                        )
+                    else:
+                        selected_port = self._host_mutations.select_available_port(
+                            candidates=candidates, protocol=protocol
+                        )
                 if selected_port is None:
                     raise BrokerBackendError(
                         "port_unavailable",

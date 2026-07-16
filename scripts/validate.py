@@ -619,6 +619,21 @@ def run_normalized_coordinator_tests(skill: Path) -> None:
         run([sys.executable, str(script)])
         run([sys.executable, "-O", str(script)])
 
+    capability_fixture = scripts / "capability_integration_test.py"
+    if not capability_fixture.is_file():
+        raise SystemExit(
+            f"coordinator capability integration is missing: {capability_fixture}"
+        )
+    for optimization in ([], ["-O"]):
+        run(
+            [
+                sys.executable,
+                *optimization,
+                str(capability_fixture),
+                "--normalized-relocation-preflight",
+            ]
+        )
+
     tests = scripts / "devcoordinator" / "tests"
     if not tests.is_dir():
         raise SystemExit(f"normalized coordinator unit tests are missing: {tests}")
@@ -1017,7 +1032,12 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "API capability inheritance clear": "def clear_exec_capability_inheritance(",
         "registration PID false-positive guard": "registration accepted invalid PID",
         "changed owner replacement lease": "changed listener owner must receive a replacement lease",
-        "unobservable listener preservation": "unobservable inventory upgraded an unhealthy baseline",
+        "unobservable listener preservation": (
+            "pure API inventory did not preserve the cached unknown observation and active lease"
+        ),
+        "pre-guard identity no-write": (
+            "no-cap registration wrote lifecycle or operation state before "
+        ),
         "unobservable lifecycle fail closed": "signalled, launched, or changed the registration graph",
         "unobservable project atomicity": "partially mutated before identity proof",
         "read-only lifecycle conflict priority": "def require_operation_slot(",

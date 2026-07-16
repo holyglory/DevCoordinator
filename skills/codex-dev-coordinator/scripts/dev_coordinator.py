@@ -2550,6 +2550,62 @@ def _open_normalized_action_store() -> AccountStore:
     return AccountStore.open_default(coordinator_home())
 
 
+def _precheck_normalized_repository_action(
+    store: AccountStore,
+    *,
+    project: str,
+    action: RepositoryAction,
+) -> str | None:
+    """Fail an existing fence/conflict before slow host identity sampling."""
+
+    with store.read_transaction() as connection:
+        repository = connection.execute(
+            """
+            SELECT r.repo_id, i.status, i.startup_fenced
+            FROM repositories r
+            JOIN repository_installations i USING(repo_id)
+            WHERE r.host_id = ? AND r.canonical_root = ?
+            """,
+            (_local_normalized_host_id(), project),
+        ).fetchone()
+        if repository is None:
+            return None
+        if (
+            str(repository["status"]) != "installed"
+            or bool(repository["startup_fenced"])
+        ):
+            raise ActionFencedError("repository start fence is active")
+        pending_restore = connection.execute(
+            """
+            SELECT policy_id FROM startup_policy_restore_states
+            WHERE repo_id = ? AND restore_required = 1 AND status = 'captured'
+            LIMIT 1
+            """,
+            (repository["repo_id"],),
+        ).fetchone()
+        if pending_restore is not None and action is not RepositoryAction.START:
+            raise ActionFencedError(
+                "repository startup policies require a guarded explicit start first"
+            )
+        conflicts = connection.execute(
+            """
+            SELECT operation_id, kind FROM operations
+            WHERE repo_id = ? AND status IN ('running','needs_attention','partial')
+            """,
+            (repository["repo_id"],),
+        ).fetchall()
+        independent_lease_queue = bool(
+            conflicts
+            and action is RepositoryAction.LEASE
+            and all(str(conflict["kind"]) == "guard:lease" for conflict in conflicts)
+        )
+        if conflicts and not independent_lease_queue:
+            raise ConcurrentLifecycleError(
+                f"repository operation {conflicts[0]['operation_id']} is already active"
+            )
+        return str(repository["repo_id"])
+
+
 def _reserve_normalized_repository_action(
     lifecycle: RepositoryLifecycle,
     store: AccountStore,
@@ -2593,7 +2649,11 @@ def _reserve_normalized_repository_action(
 
 @contextlib.contextmanager
 def normalized_repository_action_guard(
-    *, project: str, agent: str, action: RepositoryAction
+    *,
+    project: str,
+    agent: str,
+    action: RepositoryAction,
+    preflight: Any | None = None,
 ) -> Any:
     """Reserve the normalized lifecycle boundary before legacy or host work."""
 
@@ -2601,6 +2661,7 @@ def normalized_repository_action_guard(
     if state_backend() == LEGACY_JSON_BACKEND:
         yield None
         return
+    canonical = str(_strict_git_repository_root(canonical))
     stack = _normalized_guard_stack()
     for active in reversed(stack):
         if active["project"] == canonical:
@@ -2610,6 +2671,13 @@ def normalized_repository_action_guard(
             return
     with _open_normalized_action_store() as store:
         _require_normalized_bootstrap_before_mutation(store)
+        _precheck_normalized_repository_action(
+            store,
+            project=canonical,
+            action=action,
+        )
+        if preflight is not None:
+            preflight(store)
         repo_id = resolve_or_install_repository_for_action(store, canonical)
         lifecycle = RepositoryLifecycle(
             SQLiteLifecyclePersistence(store),
@@ -2666,8 +2734,239 @@ def normalized_repository_action_guard(
                     stack.remove(active)
 
 
+def _local_normalized_repository_id(
+    store: AccountStore, *, project: str
+) -> str | None:
+    with store.read_transaction() as connection:
+        row = connection.execute(
+            """
+            SELECT repo_id FROM repositories
+            WHERE host_id = ? AND canonical_root = ?
+            """,
+            (_local_normalized_host_id(), project),
+        ).fetchone()
+    return None if row is None else str(row["repo_id"])
+
+
+def _local_normalized_server(
+    store: AccountStore,
+    *,
+    repo_id: str | None,
+    name: str,
+) -> dict[str, Any] | None:
+    if repo_id is None:
+        return None
+    with store.read_transaction() as connection:
+        row = connection.execute(
+            """
+            SELECT server_definition_id FROM server_definitions
+            WHERE repo_id = ? AND name = ?
+            """,
+            (repo_id, name),
+        ).fetchone()
+    if row is None:
+        return None
+    return NormalizedServerLifecycle(store).server(
+        server_definition_id=str(row["server_definition_id"])
+    )
+
+
+def _normalized_fixed_server_port(
+    store: AccountStore,
+    *,
+    options: dict[str, Any],
+    command: str,
+    repo_id: str | None,
+    existing: dict[str, Any] | None,
+    name: str,
+) -> int | None:
+    """Return only a port this invocation cannot safely route around."""
+
+    manual_lease_id = str(options.get("lease_id") or "").strip()
+    if manual_lease_id and repo_id is not None:
+        with store.read_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT port FROM leases
+                WHERE lease_id = ? AND repo_id = ? AND status = 'active'
+                """,
+                (manual_lease_id, repo_id),
+            ).fetchone()
+        return None if row is None else int(row["port"])
+
+    raw_range = options.get("range")
+    if raw_range is not None:
+        port_start, port_end = parse_range(str(raw_range))
+        return (
+            port_start
+            if port_start == port_end and 1 <= port_start <= 65535
+            else None
+        )
+
+    preferred = options.get("preferred")
+    if command == "server restart" and preferred is None and existing is not None:
+        fixed = existing.get("assigned_port") or existing.get("port")
+        return None if fixed is None else int(fixed)
+
+    if preferred is not None:
+        # A preference inside a wider/default range can be skipped without
+        # replacing or adopting the listener that currently owns it.
+        return None
+
+    if repo_id is None:
+        return None
+    with store.read_transaction() as connection:
+        row = connection.execute(
+            """
+            SELECT port FROM port_assignments
+            WHERE repo_id = ? AND server_name = ? AND status = 'active'
+            """,
+            (repo_id, name),
+        ).fetchone()
+    return None if row is None else int(row["port"])
+
+
+def _require_fixed_listener_identity_observable(
+    *,
+    project: str,
+    name: str,
+    action: str,
+    host: str,
+    port: int | None,
+) -> None:
+    if port is None or not port_open(host, int(port)):
+        return
+    belongs, owner = listener_belongs_to_project(
+        int(port), project, host=host
+    )
+    if belongs or owner.get("observable") is not False:
+        return
+    reason = str(owner.get("reason") or "listener ownership cannot be observed")
+    raise ListenerIdentityUnobservable(
+        f"refusing to {action} {name}: "
+        f"listener identity is unobservable; {reason}"
+    )
+
+
+def preflight_normalized_listener_identity(
+    options: dict[str, Any], *, command: str, store: AccountStore
+) -> None:
+    """Reject already-unobservable listeners before a guard journal write.
+
+    The guarded implementation repeats the relevant identity check after it
+    obtains its repository permit.  This first read-only pass preserves the
+    stronger boundary for an identity that is already unknown, while the
+    second pass remains the TOCTOU detector if identity changes during
+    reservation.
+    """
+
+    _agent, project = require_identity(options, command)
+    repo_id = _local_normalized_repository_id(store, project=project)
+    if command == "server register":
+        if configured_broker_context(project) is not None:
+            return
+        name = str(options.get("name") or "").strip()
+        if not name:
+            raise ValueError("server register requires --name")
+        host, port, _url = parse_server_endpoint(options)
+        cwd = str(Path(options.get("cwd") or project).expanduser().resolve())
+        if not Path(cwd).is_dir():
+            raise FileNotFoundError(
+                f"server cwd does not exist or is not a directory: {cwd}"
+            )
+        resolve_registration_pid(
+            options,
+            host=host,
+            port=port,
+            project=project,
+        )
+        return
+
+    if command.startswith("server "):
+        name = str(options.get("name") or "").strip()
+        if not name:
+            return
+        server = _local_normalized_server(
+            store,
+            repo_id=repo_id,
+            name=name,
+        )
+        if server is not None:
+            health = server_health(server)
+            require_listener_identity_observable(
+                health,
+                action=command.removeprefix("server "),
+                server=server,
+            )
+        if command in {"server start", "server restart"}:
+            fixed_port = _normalized_fixed_server_port(
+                store,
+                options=options,
+                command=command,
+                repo_id=repo_id,
+                existing=server,
+                name=name,
+            )
+            _require_fixed_listener_identity_observable(
+                project=project,
+                name=name,
+                action=command.removeprefix("server "),
+                host=str(options.get("host") or (server or {}).get("host") or "127.0.0.1"),
+                port=fixed_port,
+            )
+        return
+
+    if command.startswith("project ") and not options.get("dry_run"):
+        snapshot = normalized_control_snapshot_from_store(store)
+        servers = [
+            server
+            for server in NormalizedServerLifecycle(store).list_servers(
+                canonical_project=project
+            )
+            if repo_id is not None and str(server.get("_repo_id")) == repo_id
+        ]
+        snapshot["servers"] = {
+            str(server["id"]): copy.deepcopy(server) for server in servers
+        }
+        snapshot["port_assignments"] = {
+            key: value
+            for key, value in snapshot.get("port_assignments", {}).items()
+            if canonical_project(str(value.get("project") or "")) != project
+        }
+        if repo_id is not None:
+            with store.read_transaction() as connection:
+                assignments = connection.execute(
+                    """
+                    SELECT server_name, port FROM port_assignments
+                    WHERE repo_id = ? AND status = 'active'
+                    """,
+                    (repo_id,),
+                ).fetchall()
+            for assignment in assignments:
+                name = str(assignment["server_name"])
+                snapshot["port_assignments"][server_key(project, name)] = {
+                    "project": project,
+                    "name": name,
+                    "port": int(assignment["port"]),
+                }
+        specification = build_project_runtime_spec(
+            snapshot,
+            project=project,
+            runtime_file=options.get("runtime_file"),
+            include_docker=False,
+        )
+        require_project_server_identities_observable(
+            snapshot,
+            specification,
+            action=command.removeprefix("project "),
+        )
+
+
 def normalized_guarded_action(
-    action: RepositoryAction, command: str
+    action: RepositoryAction,
+    command: str,
+    *,
+    preflight_listener: bool = False,
 ) -> Any:
     """Decorate one options-dict public mutation before its first side effect."""
 
@@ -2675,8 +2974,30 @@ def normalized_guarded_action(
         @functools.wraps(function)
         def guarded(options: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
             agent, project = require_identity(options, command)
+            if (
+                command == "server register"
+                and configured_broker_context(project) is not None
+            ):
+                # The cross-UID broker must prove the capability-asymmetric
+                # listener before either authority journals an operation. The
+                # registration body acquires that verified broker lease first,
+                # then the normalized server reservation provides the local
+                # transactional boundary. A failed local commit rolls the
+                # broker lease back through the existing compensation path.
+                return function(options, *args, **kwargs)
             with normalized_repository_action_guard(
-                project=project, agent=agent, action=action
+                project=project,
+                agent=agent,
+                action=action,
+                preflight=(
+                    (
+                        lambda store: preflight_normalized_listener_identity(
+                            options, command=command, store=store
+                        )
+                    )
+                    if preflight_listener
+                    else None
+                ),
             ):
                 return function(options, *args, **kwargs)
 
@@ -3984,19 +4305,13 @@ def require_project_server_identities_observable(
         if fixed_port is None:
             continue
         host = str(server_def.get("host") or (server or {}).get("host") or "127.0.0.1")
-        if not port_open(host, int(fixed_port)):
-            continue
-        belongs, owner = listener_belongs_to_project(
-            int(fixed_port), str(server_def["project"]), host=host
+        _require_fixed_listener_identity_observable(
+            project=str(server_def["project"]),
+            name=str(server_def["name"]),
+            action=f"{action} project server",
+            host=host,
+            port=int(fixed_port),
         )
-        if belongs:
-            continue
-        reason = str(owner.get("reason") or "listener does not belong to project")
-        if owner.get("observable") is False:
-            raise ListenerIdentityUnobservable(
-                f"refusing to {action} project server {server_def['name']}: "
-                f"listener identity is unobservable; {reason}"
-            )
         # A positively identified foreign listener follows the established
         # per-server adoption error/report path. This preflight is specifically
         # the no-capability boundary where continuing could create duplicates.
@@ -6438,7 +6753,11 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
     return committed
 
 
-@normalized_guarded_action(RepositoryAction.START, "server start")
+@normalized_guarded_action(
+    RepositoryAction.START,
+    "server start",
+    preflight_listener=True,
+)
 def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
     agent, project = require_identity(options, "server start")
     broker_context = configured_broker_context(project)
@@ -6788,7 +7107,11 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@normalized_guarded_action(RepositoryAction.START, "server restart")
+@normalized_guarded_action(
+    RepositoryAction.START,
+    "server restart",
+    preflight_listener=True,
+)
 def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
     if state_backend() != LEGACY_JSON_BACKEND:
         return _coordinated_restart_server_normalized(options)
@@ -8028,7 +8351,11 @@ def _coordinated_register_server_local(options: dict[str, Any]) -> dict[str, Any
     return candidate
 
 
-@normalized_guarded_action(RepositoryAction.REGISTER, "server register")
+@normalized_guarded_action(
+    RepositoryAction.REGISTER,
+    "server register",
+    preflight_listener=True,
+)
 def coordinated_register_server(options: dict[str, Any]) -> dict[str, Any]:
     """Adopt a listener through the host broker when cross-UID mode is active."""
 
@@ -10251,7 +10578,11 @@ def execute_project_start(
     return after
 
 
-@normalized_guarded_action(RepositoryAction.START, "project start")
+@normalized_guarded_action(
+    RepositoryAction.START,
+    "project start",
+    preflight_listener=True,
+)
 def coordinated_project_runtime_start(options: dict[str, Any]) -> dict[str, Any]:
     prepared, operation = begin_project_operation(options, "start")
     try:
@@ -10275,7 +10606,11 @@ def coordinated_project_runtime_start(options: dict[str, Any]) -> dict[str, Any]
     return result
 
 
-@normalized_guarded_action(RepositoryAction.START, "project restart")
+@normalized_guarded_action(
+    RepositoryAction.START,
+    "project restart",
+    preflight_listener=True,
+)
 def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, Any]:
     prepared, operation = begin_project_operation(options, "restart")
     delegation = delegated_project_operation(operation)
@@ -10408,7 +10743,11 @@ def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, An
     return result
 
 
-@normalized_guarded_action(RepositoryAction.STOP, "project stop")
+@normalized_guarded_action(
+    RepositoryAction.STOP,
+    "project stop",
+    preflight_listener=True,
+)
 def coordinated_project_runtime_stop(options: dict[str, Any]) -> dict[str, Any]:
     prepared, operation = begin_project_operation(options, "stop")
     delegation = delegated_project_operation(operation)
