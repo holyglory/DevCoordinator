@@ -100,6 +100,66 @@ def parsed_profile(repository_root: Path) -> BrokerClientProfile:
 
 
 class BrokerProfileTrustTests(unittest.TestCase):
+    def test_managed_health_requires_listener_in_isolated_launcher_group(self) -> None:
+        server = {
+            "pid": 111,
+            "project": "/srv/repository",
+            "host": "127.0.0.1",
+            "port": 43100,
+            "health_url": "http://127.0.0.1:43100/health",
+            "registration_identity": {"source": "normalized_exact_listener"},
+            "_managed_process_tree": True,
+        }
+        with (
+            mock.patch.object(dev_coordinator, "pid_alive", return_value=True),
+            mock.patch.object(
+                dev_coordinator,
+                "process_cwd_observation",
+                return_value={"observable": True, "cwd": "/srv/repository"},
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "resolve_registration_pid",
+                return_value=(222, {"ok": True, "pid": 222}),
+            ) as resolve,
+            mock.patch.object(dev_coordinator.os, "getpgid", return_value=111),
+            mock.patch.object(dev_coordinator.os, "getsid", return_value=111),
+            mock.patch.object(
+                dev_coordinator, "http_health", return_value={"ok": True}
+            ),
+        ):
+            health = dev_coordinator.server_health(server)
+
+        resolve.assert_called_once_with(
+            {}, host="127.0.0.1", port=43100, project="/srv/repository"
+        )
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["classification"], "healthy")
+        self.assertEqual(health["identity"]["managed_launcher_pid"], 111)
+
+        with (
+            mock.patch.object(dev_coordinator, "pid_alive", return_value=True),
+            mock.patch.object(
+                dev_coordinator,
+                "process_cwd_observation",
+                return_value={"observable": True, "cwd": "/srv/repository"},
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "resolve_registration_pid",
+                return_value=(333, {"ok": True, "pid": 333}),
+            ),
+            mock.patch.object(dev_coordinator.os, "getpgid", return_value=999),
+            mock.patch.object(dev_coordinator.os, "getsid", return_value=999),
+            mock.patch.object(
+                dev_coordinator, "http_health", return_value={"ok": True}
+            ),
+        ):
+            foreign = dev_coordinator.server_health(server)
+
+        self.assertFalse(foreign["ok"])
+        self.assertEqual(foreign["classification"], "wrong-listener")
+
     def test_running_publication_uses_exact_child_listener_pid(self) -> None:
         with CanonicalTemporaryDirectory(".broker-child-listener-") as root:
             repository_root = root / "repository"

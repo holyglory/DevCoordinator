@@ -2679,6 +2679,7 @@ class NormalizedServerLifecycle:
             ),
             "log_path": row["log_path"],
             "adopted": not bool(argv),
+            "_managed_process_tree": bool(argv),
             "missing_command": not bool(argv),
             "metadata_source": "normalized-sqlite",
             "status": lifecycle,

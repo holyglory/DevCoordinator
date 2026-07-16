@@ -1543,6 +1543,83 @@ def server_listener_identity(server: dict[str, Any]) -> dict[str, Any]:
         return identity
     pid = int(server.get("pid") or 0)
     if pid and pid_alive(pid):
+        if server.get("_managed_process_tree") is True:
+            host = str(server.get("host") or "127.0.0.1")
+            port = int(server.get("port") or 0)
+            project = str(server.get("project") or "")
+            try:
+                listener_pid, listener_identity = resolve_registration_pid(
+                    {}, host=host, port=port, project=project
+                )
+            except ListenerIdentityUnobservable as exc:
+                return {
+                    "ok": None,
+                    "observable": False,
+                    "pid": pid,
+                    "cwd": identity.get("cwd"),
+                    "project": identity.get("project"),
+                    "reason": str(exc),
+                }
+            except (OSError, RuntimeError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "observable": True,
+                    "pid": pid,
+                    "cwd": identity.get("cwd"),
+                    "project": identity.get("project"),
+                    "reason": str(exc),
+                }
+            if listener_pid is None or listener_identity is None:
+                return {
+                    "ok": False,
+                    "observable": True,
+                    "pid": pid,
+                    "cwd": identity.get("cwd"),
+                    "project": identity.get("project"),
+                    "reason": f"managed launcher {pid} has no exact listener on port {port}",
+                }
+            if int(listener_pid) != pid:
+                try:
+                    listener_pgid = os.getpgid(int(listener_pid))
+                    listener_sid = os.getsid(int(listener_pid))
+                except PermissionError:
+                    return {
+                        "ok": None,
+                        "observable": False,
+                        "pid": int(listener_pid),
+                        "managed_launcher_pid": pid,
+                        "reason": "managed listener process-group identity is not observable",
+                    }
+                except OSError as exc:
+                    return {
+                        "ok": False,
+                        "observable": True,
+                        "pid": int(listener_pid),
+                        "managed_launcher_pid": pid,
+                        "reason": (
+                            "managed listener process-group identity changed during observation: "
+                            f"{exc}"
+                        ),
+                    }
+                if listener_pgid != pid or listener_sid != pid:
+                    return {
+                        "ok": False,
+                        "observable": True,
+                        "pid": int(listener_pid),
+                        "managed_launcher_pid": pid,
+                        "listener_pgid": listener_pgid,
+                        "listener_sid": listener_sid,
+                        "reason": (
+                            f"listener PID {listener_pid} is outside managed launcher "
+                            f"{pid}'s isolated process group and session"
+                        ),
+                    }
+            return {
+                **listener_identity,
+                "ok": True,
+                "observable": True,
+                "managed_launcher_pid": pid,
+            }
         if server.get("registration_identity") or server.get(
             "_require_exact_listener_identity"
         ):
