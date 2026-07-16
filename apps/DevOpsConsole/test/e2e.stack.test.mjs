@@ -26,6 +26,7 @@ import {
   makeJar,
   startStack,
 } from './helpers/stack.mjs';
+import { FIXTURE_UPSTREAM_AUTHORIZATION } from './helpers/upstream.mjs';
 import { wsAcceptFor } from './helpers/ws-echo.mjs';
 
 const FIXTURE_EMAIL = 'ja@vr.ae';
@@ -176,12 +177,19 @@ else:
         { slug: 'app', kind: 'port', port: wsEcho.port },
         // echo -> HTTP echo upstream — protected (exercised with a session).
         { slug: 'echo', kind: 'port', port: upstream.port },
+        // sso -> an upstream that still requires its own operator token. The
+        // Console injects that private credential only after Google access.
+        { slug: 'sso', kind: 'port', port: upstream.port },
         // pub -> HTTP echo upstream — explicitly public.
         { slug: 'pub', kind: 'port', port: upstream.port, auth: 'public' },
         // A docker route whose container port is NOT currently published —
         // auth changes and renames must keep working on it (test 17).
         { slug: 'dockstale', kind: 'docker', containerName: 'e2estale-app-1', containerPort: 4000 },
       ],
+    });
+    await stack.handle.upstreamAuthStore.set('sso', {
+      scheme: 'bearer',
+      secret: FIXTURE_UPSTREAM_AUTHORIZATION.slice('Bearer '.length), // public-artifact-guard: allow text-secret -- deterministic fixture value
     });
   });
 
@@ -600,6 +608,74 @@ else:
     assert.equal(JSON.parse(after.text).path, '/now-public');
   });
 
+  it('7b. Google-protected route uses private upstream auth without a second browser prompt', async () => {
+    const jar = await authedJar();
+
+    const anonymous = await fetchUrl(stack, 'https://sso.vr.ae/requires-upstream-auth', {
+      headers: { accept: 'text/html' },
+    });
+    assert.equal(anonymous.status, 302, 'Google remains the outer access boundary');
+
+    const authed = await fetchUrl(stack, 'https://sso.vr.ae/requires-upstream-auth', {
+      jar,
+      headers: {
+        accept: 'application/json',
+        authorization: 'Basic caller-controlled-credential',
+      },
+    });
+    assert.equal(authed.status, 200, authed.text);
+    assert.equal(JSON.parse(authed.text).headers.authorization, FIXTURE_UPSTREAM_AUTHORIZATION);
+
+    const overview = await apiCall(stack, jar, 'GET', '/api/overview');
+    assert.equal(overview.status, 200, overview.text);
+    const route = overview.json.routes.find((candidate) => candidate.slug === 'sso');
+    assert.deepEqual(route.upstreamAuth, { configured: true, scheme: 'bearer' });
+    assert.doesNotMatch(overview.text, new RegExp(FIXTURE_UPSTREAM_AUTHORIZATION.slice('Bearer '.length)));
+
+    const wrong = await apiCall(stack, jar, 'PATCH', '/api/routes/sso/upstream-auth', {
+      scheme: 'bearer', secret: 'fixture-wrong-upstream-credential',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(wrong.status, 200, wrong.text);
+    assert.deepEqual(wrong.json.upstreamAuth, { configured: true, scheme: 'bearer' });
+    assert.doesNotMatch(wrong.text, /fixture-wrong-upstream-credential/);
+
+    const refused = await fetchUrl(stack, 'https://sso.vr.ae/requires-upstream-auth', { jar });
+    assert.equal(refused.status, 401);
+    assert.equal(
+      refused.headers['www-authenticate'],
+      undefined,
+      'an invalid backend credential must not fall back to a browser Basic prompt',
+    );
+
+    const restored = await apiCall(stack, jar, 'PATCH', '/api/routes/sso/upstream-auth', {
+      scheme: 'bearer', secret: FIXTURE_UPSTREAM_AUTHORIZATION.slice('Bearer '.length),
+    }, { origin: stack.consoleOrigin });
+    assert.equal(restored.status, 200, restored.text);
+    assert.equal(
+      (await fetchUrl(stack, 'https://sso.vr.ae/requires-upstream-auth', { jar })).status,
+      200,
+    );
+
+    const publicized = await apiCall(stack, jar, 'PATCH', '/api/routes/sso', {
+      auth: 'public',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(publicized.status, 200, publicized.text);
+    assert.deepEqual(publicized.json.upstreamAuth, { configured: false });
+    const protectedAgain = await apiCall(stack, jar, 'PATCH', '/api/routes/sso', {
+      auth: 'google',
+    }, { origin: stack.consoleOrigin });
+    assert.deepEqual(protectedAgain.json.upstreamAuth, { configured: false });
+    const reconfigured = await apiCall(stack, jar, 'PATCH', '/api/routes/sso/upstream-auth', {
+      scheme: 'bearer', secret: FIXTURE_UPSTREAM_AUTHORIZATION.slice('Bearer '.length),
+    }, { origin: stack.consoleOrigin });
+    assert.equal(reconfigured.status, 200, reconfigured.text);
+
+    const publicCredential = await apiCall(stack, jar, 'PATCH', '/api/routes/pub/upstream-auth', {
+      scheme: 'bearer', secret: 'fixture-public-credential',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(publicCredential.status, 400, 'public routes must not receive private injected credentials');
+  });
+
   it('8. unknown slug: 404 page for authed users, login redirect indistinguishable from protected for anonymous', async () => {
     const jar = await authedJar();
 
@@ -757,12 +833,23 @@ else:
     }
     assert.equal(proxied.status, 200, `expected proxied 200, got ${proxied?.status}`);
 
+    // Return to Google protection, then bind a private backend credential so
+    // the rename below also proves credential lifecycle follows the server.
+    const protectedRoute = await apiCall(stack, jar, 'POST', '/api/servers/subdomain',
+      { id: server.id, slug: 'srvsub', auth: 'google' }, { origin: stack.consoleOrigin });
+    assert.equal(protectedRoute.status, 200, protectedRoute.text);
+    const configuredUpstream = await apiCall(stack, jar, 'PATCH', '/api/routes/srvsub/upstream-auth', {
+      scheme: 'bearer', secret: 'fixture-server-route-token',
+    }, { origin: stack.consoleOrigin });
+    assert.equal(configuredUpstream.status, 200, configuredUpstream.text);
+
     // Change the subdomain: new slug created, old one removed atomically.
     const changed = await apiCall(stack, jar, 'POST', '/api/servers/subdomain',
       { id: server.id, slug: 'srvsub2' }, { origin: stack.consoleOrigin });
     assert.equal(changed.status, 201, changed.text);
     assert.equal(changed.json.route.slug, 'srvsub2');
-    assert.equal(changed.json.route.auth, 'public', 'access carries over when only the slug changes');
+    assert.equal(changed.json.route.auth, 'google', 'access carries over when only the slug changes');
+    assert.deepEqual(changed.json.route.upstreamAuth, { configured: true, scheme: 'bearer' });
 
     const ov2 = await apiCall(stack, jar, 'GET', '/api/overview');
     const slugs = ov2.json.routes.map((r) => r.slug);
@@ -1507,6 +1594,19 @@ else:
     assert.equal(guestSession.json.accessAdmin, false);
     const guestCannotAdmin = await apiCall(stack, guestJar, 'GET', '/api/access');
     assert.equal(guestCannotAdmin.status, 403, 'Console access does not imply access-administration rights');
+    const guestCannotSetUpstreamAuth = await apiCall(
+      stack,
+      guestJar,
+      'PATCH',
+      '/api/routes/sso/upstream-auth',
+      { scheme: 'bearer', secret: 'fixture-guest-credential' },
+      { origin: stack.consoleOrigin },
+    );
+    assert.equal(
+      guestCannotSetUpstreamAuth.status,
+      403,
+      'Console access does not permit changing route backend credentials',
+    );
 
     const ownerImmutable = await apiCall(stack, adminJar, 'PATCH',
       `/api/access/users/${encodeURIComponent(FIXTURE_EMAIL)}`,
@@ -1532,6 +1632,15 @@ else:
       { resource: 'route:aclreuse', allowed: true }, { origin: stack.consoleOrigin });
     assert.equal(grantReuse.status, 200, grantReuse.text);
     assert.equal((await fetchUrl(stack, `https://aclreuse.${stack.domain}/`, { jar: guestJar })).status, 200);
+    const configuredReuseAuth = await apiCall(
+      stack,
+      adminJar,
+      'PATCH',
+      '/api/routes/aclreuse/upstream-auth',
+      { scheme: 'bearer', secret: 'fixture-reuse-token' },
+      { origin: stack.consoleOrigin },
+    );
+    assert.equal(configuredReuseAuth.status, 200, configuredReuseAuth.text);
 
     const deleted = await apiCall(stack, adminJar, 'DELETE', '/api/routes/aclreuse', null, {
       origin: stack.consoleOrigin,
@@ -1541,6 +1650,11 @@ else:
       slug: 'aclreuse', kind: 'port', port: stack.upstream.port,
     }, { origin: stack.consoleOrigin });
     assert.equal(recreated.status, 201, recreated.text);
+    assert.deepEqual(
+      recreated.json.upstreamAuth,
+      { configured: false },
+      'reusing a deleted slug must not resurrect its backend credential',
+    );
     assert.equal(
       (await fetchUrl(stack, `https://aclreuse.${stack.domain}/`, { jar: guestJar })).status,
       403,

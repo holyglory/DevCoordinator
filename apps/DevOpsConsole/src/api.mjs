@@ -7,6 +7,7 @@ import { CoordError } from './coordinator.mjs';
 import { PrefsError } from './prefs.mjs';
 import { RouteError, publishedContainerPorts } from './routes.mjs';
 import { AccessError, CONSOLE_GRANT, routeGrant } from './access.mjs';
+import { UpstreamAuthError } from './upstream-auth.mjs';
 
 const BODY_LIMIT = 64 * 1024;
 const SERVER_ACTIONS = new Set(['stop', 'restart']);
@@ -24,7 +25,7 @@ class ApiError extends Error {
 }
 
 export function createConsoleApi({
-  config, log, coordinator, routeStore, accessStore, guard, certManager, metrics, prefs,
+  config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
 }) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'api' }) : log;
 
@@ -108,6 +109,7 @@ export function createConsoleApi({
     const view = {
       ...route,
       url: publicUrl(route.slug),
+      upstreamAuth: upstreamAuthStore?.describe(route.slug) ?? { configured: false },
       resolved: { port: resolved?.port ?? null },
     };
     if (resolved?.reason) view.resolved.reason = resolved.reason;
@@ -256,6 +258,7 @@ export function createConsoleApi({
       // A deleted hostname must never resurrect grants if the same slug is
       // assigned to a different server later.
       await accessStore.clearResource(routeGrant(requestedSlug));
+      await upstreamAuthStore?.remove(requestedSlug);
     }
     const route = await routeStore.create({
       slug: body.slug,
@@ -281,13 +284,46 @@ export function createConsoleApi({
       throw new ApiError(400, 'no updatable fields in request body');
     }
     const route = await routeStore.update(slug, patch);
+    if (route.auth === 'public') await upstreamAuthStore?.remove(route.slug);
     sendJson(res, 200, toRouteView(route, await resolveSafe(route.slug)));
   }
 
   async function handleRouteDelete(res, slug) {
+    const existing = routeStore.get(slug);
+    if (existing) await upstreamAuthStore?.remove(existing.slug);
     const removed = await routeStore.remove(slug);
     await accessStore.clearResource(routeGrant(removed.slug));
     sendJson(res, 200, { ok: true });
+  }
+
+  async function handleRouteUpstreamAuthSet(req, res, session, slug) {
+    requireAccessAdmin(session);
+    const route = routeStore.get(slug);
+    if (!route) throw new ApiError(404, 'route not found');
+    if (route.auth !== 'google') {
+      throw new ApiError(400, 'upstream credentials can be configured only for a Google-protected route');
+    }
+    const body = await readJsonBody(req);
+    const upstreamAuth = await upstreamAuthStore.set(route.slug, {
+      scheme: body.scheme,
+      username: body.username,
+      secret: body.secret, // public-artifact-guard: allow text-secret -- runtime request field, never literal credential material
+    });
+    clog?.info?.('route upstream credential configured', {
+      admin: session.email,
+      slug: route.slug,
+      scheme: upstreamAuth.scheme,
+    });
+    sendJson(res, 200, { slug: route.slug, upstreamAuth });
+  }
+
+  async function handleRouteUpstreamAuthRemove(res, session, slug) {
+    requireAccessAdmin(session);
+    const route = routeStore.get(slug);
+    if (!route) throw new ApiError(404, 'route not found');
+    const removed = await upstreamAuthStore.remove(route.slug);
+    clog?.info?.('route upstream credential removed', { admin: session.email, slug: route.slug, removed });
+    sendJson(res, 200, { slug: route.slug, upstreamAuth: { configured: false } });
   }
 
   async function handleServerAction(req, res, session) {
@@ -335,6 +371,7 @@ export function createConsoleApi({
     // Unassign: remove the mapped route (idempotent when none exists).
     if (!rawSlug) {
       if (existing) {
+        await upstreamAuthStore?.remove(existing.slug);
         await routeStore.remove(existing.slug);
         await accessStore.clearResource(routeGrant(existing.slug));
       }
@@ -348,6 +385,7 @@ export function createConsoleApi({
     if (existing && existing.slug === rawSlug) {
       const route =
         authGiven === undefined ? existing : await routeStore.update(existing.slug, { auth: authGiven });
+      if (route.auth === 'public') await upstreamAuthStore?.remove(route.slug);
       return sendJson(res, 200, { route: toRouteView(route, await resolveSafe(route.slug)) });
     }
 
@@ -355,7 +393,10 @@ export function createConsoleApi({
     // uniqueness), then drop the old one so a server maps to a single subdomain.
     const occupied = routeStore.get(rawSlug);
     if (occupied && rawSlug === occupied.slug) throw new ApiError(409, `route '${rawSlug}' already exists`);
-    if (!occupied) await accessStore.clearResource(routeGrant(rawSlug));
+    if (!occupied) {
+      await accessStore.clearResource(routeGrant(rawSlug));
+      await upstreamAuthStore?.remove(rawSlug);
+    }
     const route = await routeStore.create({
       slug: rawSlug,
       kind: 'server',
@@ -365,6 +406,8 @@ export function createConsoleApi({
       title: existing?.title,
     });
     if (existing) {
+      if (route.auth === 'google') await upstreamAuthStore?.move(existing.slug, route.slug);
+      else await upstreamAuthStore?.remove(existing.slug);
       await accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug));
       await routeStore.remove(existing.slug);
     }
@@ -400,6 +443,7 @@ export function createConsoleApi({
     // Unassign: remove the mapped route (idempotent when none exists).
     if (!rawSlug) {
       if (existing) {
+        await upstreamAuthStore?.remove(existing.slug);
         await routeStore.remove(existing.slug);
         await accessStore.clearResource(routeGrant(existing.slug));
       }
@@ -439,6 +483,7 @@ export function createConsoleApi({
       const route = Object.keys(patch).length
         ? await routeStore.update(existing.slug, patch)
         : existing;
+      if (route.auth === 'public') await upstreamAuthStore?.remove(route.slug);
       return sendJson(res, 200, { route: toRouteView(route, await resolveSafe(route.slug)) });
     }
 
@@ -460,7 +505,10 @@ export function createConsoleApi({
     // uniqueness), then drop the old one so a container maps to one subdomain.
     const occupied = routeStore.get(rawSlug);
     if (occupied && rawSlug === occupied.slug) throw new ApiError(409, `route '${rawSlug}' already exists`);
-    if (!occupied) await accessStore.clearResource(routeGrant(rawSlug));
+    if (!occupied) {
+      await accessStore.clearResource(routeGrant(rawSlug));
+      await upstreamAuthStore?.remove(rawSlug);
+    }
     const route = await routeStore.create({
       slug: rawSlug,
       kind: 'docker',
@@ -470,6 +518,8 @@ export function createConsoleApi({
       title: existing?.title,
     });
     if (existing) {
+      if (route.auth === 'google') await upstreamAuthStore?.move(existing.slug, route.slug);
+      else await upstreamAuthStore?.remove(existing.slug);
       await accessStore.moveResource(routeGrant(existing.slug), routeGrant(route.slug));
       await routeStore.remove(existing.slug);
     }
@@ -653,7 +703,13 @@ export function createConsoleApi({
   function handleError(res, err) {
     let status = 500;
     let message = 'internal error';
-    if (err instanceof ApiError || err instanceof RouteError || err instanceof PrefsError || err instanceof AccessError) {
+    if (
+      err instanceof ApiError
+      || err instanceof RouteError
+      || err instanceof PrefsError
+      || err instanceof AccessError
+      || err instanceof UpstreamAuthError
+    ) {
       status = Number.isInteger(err.status) ? err.status : 500;
       message = err.message;
     } else if (err instanceof CoordError) {
@@ -728,6 +784,22 @@ export function createConsoleApi({
       }
       if (method === 'POST' && pathname === '/api/routes') {
         return await handleRouteCreate(req, res);
+      }
+      const routeUpstreamAuthMatch = pathname.match(/^\/api\/routes\/([^/]+)\/upstream-auth$/);
+      if (routeUpstreamAuthMatch && method === 'PATCH') {
+        return await handleRouteUpstreamAuthSet(
+          req,
+          res,
+          session,
+          safeDecode(routeUpstreamAuthMatch[1]),
+        );
+      }
+      if (routeUpstreamAuthMatch && method === 'DELETE') {
+        return await handleRouteUpstreamAuthRemove(
+          res,
+          session,
+          safeDecode(routeUpstreamAuthMatch[1]),
+        );
       }
       const routeMatch = pathname.match(/^\/api\/routes\/([^/]+)$/);
       if (routeMatch && method === 'PATCH') {

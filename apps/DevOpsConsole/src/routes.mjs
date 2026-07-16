@@ -81,6 +81,18 @@ export function publishedContainerPorts(text) {
 // Status preference order when several coordinator records share project+name.
 const STATUS_RANK = { running: 0, starting: 1, unhealthy: 2, stopped: 3 };
 
+function dockerRouteStatusRank(value) {
+  const status = String(value ?? '');
+  if (/\(paused\)/i.test(status) || /^paused$/i.test(status.trim())) return 1;
+  if (isDockerContainerRunningStatus(status)) return 0;
+  return 2;
+}
+
+function dockerObservationTime(value) {
+  const time = Date.parse(String(value ?? ''));
+  return Number.isFinite(time) ? time : 0;
+}
+
 export class RouteError extends Error {
   constructor(status, message) {
     super(message);
@@ -407,7 +419,15 @@ export function createRouteStore({ file, config, log }) {
       return { port: null, reason: `docker unavailable${detail}` };
     }
     const list = Array.isArray(docker.containers) ? docker.containers : [];
-    const found = list.find((c) => c && c.name === route.containerName);
+    const candidates = list
+      .filter((c) => c && c.name === route.containerName)
+      .sort((a, b) => {
+        const statusDifference =
+          dockerRouteStatusRank(a.status) - dockerRouteStatusRank(b.status);
+        if (statusDifference !== 0) return statusDifference;
+        return dockerObservationTime(b.sampled_at) - dockerObservationTime(a.sampled_at);
+      });
+    const found = candidates[0];
     if (!found) return { port: null, reason: 'container not found' };
     const container = { name: found.name, status: found.status ?? null };
     const status = String(found.status ?? '');

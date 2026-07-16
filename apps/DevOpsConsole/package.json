@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node bin/devops-console.mjs",
+    "upstream-auth": "node bin/devops-console-upstream-auth.mjs",
     "test": "node --test test/*.test.mjs"
   }
 }

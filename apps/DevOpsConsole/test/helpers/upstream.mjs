@@ -6,7 +6,12 @@
 
 import http from 'node:http';
 
-export async function startUpstream({ gapMs = 300 } = {}) {
+export const FIXTURE_UPSTREAM_AUTHORIZATION = 'Bearer fixture-e2e-upstream-credential';
+
+export async function startUpstream({
+  gapMs = 300,
+  requiredAuthorization = FIXTURE_UPSTREAM_AUTHORIZATION,
+} = {}) {
   const server = http.createServer((req, res) => {
     const pathname = (req.url ?? '/').split('?')[0];
 
@@ -32,6 +37,20 @@ export async function startUpstream({ gapMs = 300 } = {}) {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
+      if (
+        pathname === '/requires-upstream-auth'
+        && requiredAuthorization
+        && req.headers.authorization !== requiredAuthorization
+      ) {
+        const body = JSON.stringify({ error: 'upstream authentication required' });
+        res.writeHead(401, {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+          'www-authenticate': 'Basic realm="fixture-upstream"',
+        });
+        res.end(body);
+        return;
+      }
       const payload = JSON.stringify({
         method: req.method,
         path: req.url,

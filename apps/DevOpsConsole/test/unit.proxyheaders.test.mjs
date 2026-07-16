@@ -86,11 +86,23 @@ async function startUpstream(t) {
           'dc_session=project-owned-name; Path=/; HttpOnly',
         ];
       }
-      res.writeHead(200, headers);
+      const status = req.url.startsWith('/resp-upstream-auth-challenge') ? 401 : 200;
+      if (status === 401) headers['www-authenticate'] = 'Basic realm="fixture-upstream"';
+      res.writeHead(status, headers);
       res.end(payload);
     });
   });
   server.on('upgrade', (req, socket) => {
+    if (req.url.startsWith('/reject-upstream-auth')) {
+      socket.end(
+        'HTTP/1.1 401 Unauthorized\r\n' +
+        'WWW-Authenticate: Basic realm="fixture-upstream"\r\n' +
+        'Content-Length: 0\r\n' +
+        'Connection: close\r\n' +
+        '\r\n',
+      );
+      return;
+    }
     state.upgrades.push(req.headers);
     socket.write(
       'HTTP/1.1 101 Switching Protocols\r\n' +
@@ -113,7 +125,14 @@ async function startUpstream(t) {
 // Real edge wired to a fresh proxy instance per test (isolated keep-alive pool).
 async function startEdge(
   t,
-  { upstreamPort, publicHost = 'slug.vr.ae', tls = false, sessionCookieName = 'dc_session' },
+  {
+    upstreamPort,
+    publicHost = 'slug.vr.ae',
+    tls = false,
+    sessionCookieName = 'dc_session',
+    routeAuth = 'google',
+    upstreamAuthorization,
+  },
 ) {
   const badGatewayCalls = [];
   const proxy = createProxy({
@@ -125,7 +144,14 @@ async function startEdge(
       res.end(`bad gateway: ${kind}`);
     },
   });
-  const target = { port: upstreamPort, slug: 'slug', host: '127.0.0.1', publicHost, route: { slug: 'slug' } };
+  const target = {
+    port: upstreamPort,
+    slug: 'slug',
+    host: '127.0.0.1',
+    publicHost,
+    route: { slug: 'slug', auth: routeAuth },
+    upstreamAuthorization,
+  };
   const handler = (req, res) => proxy.forward(req, res, target);
   const server = tls ? https.createServer({ cert: DEV_CERT, key: DEV_KEY }, handler) : http.createServer(handler);
   server.on('upgrade', (req, socket, head) => proxy.forwardUpgrade(req, socket, head, target));
@@ -274,6 +300,90 @@ test('response direction: hop-by-hop headers stripped, incl. Connection-named ex
   JSON.parse(res.body); // body intact
 });
 
+test('Google-protected routes replace browser Authorization and suppress upstream login challenges', async (t) => {
+  const upstream = await startUpstream(t);
+  const injected = 'Bearer fixture-upstream-credential';
+  const edge = await startEdge(t, {
+    upstreamPort: upstream.port,
+    routeAuth: 'google',
+    upstreamAuthorization: injected,
+  });
+
+  const echoed = await request({
+    port: edge.port,
+    method: 'GET',
+    path: '/echo',
+    headers: {
+      host: 'slug.vr.ae',
+      connection: 'close',
+      authorization: 'Basic caller-controlled-credential',
+    },
+  });
+  assert.equal(echoed.status, 200);
+  assert.equal(JSON.parse(echoed.body).headers.authorization, injected);
+
+  const challenged = await request({
+    port: edge.port,
+    method: 'GET',
+    path: '/resp-upstream-auth-challenge',
+    headers: { host: 'slug.vr.ae', connection: 'close' },
+  });
+  assert.equal(challenged.status, 401);
+  assert.equal(
+    challenged.headers['www-authenticate'],
+    undefined,
+    'the Google-authenticated edge owns browser authentication and must not trigger an upstream Basic prompt',
+  );
+
+  const upgradeRefusal = await rawExchange(
+    edge.port,
+    [
+      'GET /reject-upstream-auth HTTP/1.1',
+      'Host: slug.vr.ae',
+      'Connection: Upgrade',
+      'Upgrade: websocket',
+      'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+      'Sec-WebSocket-Version: 13',
+      '',
+      '',
+    ].join('\r\n'),
+  );
+  assert.match(upgradeRefusal, /^HTTP\/1\.1 401 /);
+  assert.doesNotMatch(upgradeRefusal, /^WWW-Authenticate:/im);
+});
+
+test('public routes preserve caller Authorization and upstream login challenges', async (t) => {
+  const upstream = await startUpstream(t);
+  const edge = await startEdge(t, {
+    upstreamPort: upstream.port,
+    routeAuth: 'public',
+    upstreamAuthorization: 'Bearer ignored-for-public-routes',
+  });
+
+  const callerAuthorization = 'Basic public-route-credential';
+  const echoed = await request({
+    port: edge.port,
+    method: 'GET',
+    path: '/echo',
+    headers: {
+      host: 'slug.vr.ae',
+      connection: 'close',
+      authorization: callerAuthorization,
+    },
+  });
+  assert.equal(echoed.status, 200);
+  assert.equal(JSON.parse(echoed.body).headers.authorization, callerAuthorization);
+
+  const challenged = await request({
+    port: edge.port,
+    method: 'GET',
+    path: '/resp-upstream-auth-challenge',
+    headers: { host: 'slug.vr.ae', connection: 'close' },
+  });
+  assert.equal(challenged.status, 401);
+  assert.match(String(challenged.headers['www-authenticate']), /^Basic /);
+});
+
 test('HTTP proxy isolates Console auth cookies while preserving unrelated cookies and Set-Cookie attributes', async (t) => {
   const upstream = await startUpstream(t);
   const edge = await startEdge(t, { upstreamPort: upstream.port });
@@ -354,7 +464,12 @@ test('X-Forwarded-Proto is https when the edge terminates TLS', async (t) => {
 
 test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed', async (t) => {
   const upstream = await startUpstream(t);
-  const edge = await startEdge(t, { upstreamPort: upstream.port, publicHost: 'slug.vr.ae' });
+  const injected = 'Bearer fixture-websocket-upstream-credential';
+  const edge = await startEdge(t, {
+    upstreamPort: upstream.port,
+    publicHost: 'slug.vr.ae',
+    upstreamAuthorization: injected,
+  });
 
   const raw = await rawExchange(
     edge.port,
@@ -365,6 +480,7 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
       'Upgrade: websocket',
       'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
       'Sec-WebSocket-Version: 13',
+      'Authorization: Basic caller-controlled-websocket-credential',
       'Cookie: dc_session=real-console-session; dc_flow=real-login-flow; app_session=keep-me; dc_flow_backup=keep-too',
       'X-Hop: sneak',
       '',
@@ -387,6 +503,7 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
   assert.equal(h['sec-websocket-key'], 'dGhlIHNhbXBsZSBub25jZQ==');
   assert.equal(h['sec-websocket-version'], '13');
   assert.equal(h['x-hop'], undefined, 'Connection-named extra must not reach upstream');
+  assert.equal(h.authorization, injected);
   assert.equal(h.cookie, 'app_session=keep-me; dc_flow_backup=keep-too');
   assert.doesNotMatch(String(h.cookie ?? ''), /real-console-session|real-login-flow/);
   assert.equal(h.host, 'slug.vr.ae');

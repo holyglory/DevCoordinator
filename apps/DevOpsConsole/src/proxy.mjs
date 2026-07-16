@@ -20,6 +20,15 @@ const HOP_BY_HOP = new Set([
   'upgrade',
 ]);
 
+// Once the Console has authenticated a Google-protected route, it owns the
+// browser authentication boundary. Passing an upstream HTTP-auth challenge
+// back to the browser would create a second Basic/Digest prompt and invite the
+// caller to supply credentials outside the route's access policy.
+const UPSTREAM_AUTH_RESPONSE_HEADERS = new Set([
+  'www-authenticate',
+  'authentication-info',
+]);
+
 // Errors that mean "nothing is accepting connections on that port".
 const CONNECT_ERROR_CODES = new Set(['ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EADDRNOTAVAIL', 'ENOTFOUND']);
 
@@ -58,8 +67,9 @@ function filterRequestCookieHeader(value, protectedNames) {
   return kept.length > 0 ? kept.join('; ') : undefined;
 }
 
-function filterResponseHeaders(headers, protectedNames) {
+function filterResponseHeaders(headers, protectedNames, excludedNames = new Set()) {
   const out = stripHopByHop(headers);
+  for (const name of excludedNames) delete out[name];
   const raw = out['set-cookie'];
   if (raw === undefined) return out;
 
@@ -107,6 +117,15 @@ export function createProxy({ log, renderBadGateway, sessionCookieName }) {
       : clientIp;
     headers['x-forwarded-proto'] = req.socket.encrypted ? 'https' : 'http';
     headers['x-forwarded-host'] = req.headers.host || target.publicHost;
+    if (target.route?.auth !== 'public') {
+      // A protected route is authenticated by the Console session, never by a
+      // caller-selected upstream credential. Replace it only with the private
+      // route credential resolved by the server-side store.
+      delete headers.authorization;
+      if (target.upstreamAuthorization) {
+        headers.authorization = target.upstreamAuthorization;
+      }
+    }
     if (upgrade) {
       // Re-add the one hop we intentionally carry across: the upgrade itself.
       headers.connection = 'Upgrade';
@@ -171,10 +190,13 @@ export function createProxy({ log, renderBadGateway, sessionCookieName }) {
       settled = true;
       clearTimeout(connectTimer);
       try {
+        const excluded = target.route?.auth === 'public'
+          ? new Set()
+          : UPSTREAM_AUTH_RESPONSE_HEADERS;
         res.writeHead(
           r.statusCode || 502,
           r.statusMessage || '',
-          filterResponseHeaders(r.headers, protectedCookieNames),
+          filterResponseHeaders(r.headers, protectedCookieNames, excluded),
         );
       } catch (err) {
         log.warn('proxy response relay failed', { slug: target.slug, error: err.message });
@@ -278,7 +300,10 @@ export function createProxy({ log, renderBadGateway, sessionCookieName }) {
       const lines = [
         `HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage || 'Switching Protocols'}`,
       ];
-      appendSafeRawHeaders(lines, upstreamRes.rawHeaders, protectedCookieNames);
+      const excluded = target.route?.auth === 'public'
+        ? new Set()
+        : UPSTREAM_AUTH_RESPONSE_HEADERS;
+      appendSafeRawHeaders(lines, upstreamRes.rawHeaders, protectedCookieNames, excluded);
       try {
         socket.write(lines.join('\r\n') + '\r\n\r\n');
         if (upstreamHead && upstreamHead.length > 0) socket.write(upstreamHead);
@@ -320,7 +345,14 @@ export function createProxy({ log, renderBadGateway, sessionCookieName }) {
         lines,
         upstreamRes.rawHeaders,
         protectedCookieNames,
-        new Set(['connection', 'keep-alive', 'transfer-encoding', 'content-length', 'upgrade']),
+        new Set([
+          'connection',
+          'keep-alive',
+          'transfer-encoding',
+          'content-length',
+          'upgrade',
+          ...(target.route?.auth === 'public' ? [] : UPSTREAM_AUTH_RESPONSE_HEADERS),
+        ]),
       );
       lines.push('Connection: close');
       try {

@@ -1047,6 +1047,44 @@ is private `<STATE_DIR>/access-control.json` (atomic writes, mode `0600`).
 Public routes remain public regardless of grants; saved grants become effective
 again if the route returns to login-required mode.
 
+## Upstreams that require their own HTTP credentials
+
+A login-required route can use Google as the only browser sign-in even when
+its loopback application still requires a Bearer token or Basic credentials.
+The Console keeps that backend credential in private
+`<STATE_DIR>/upstream-auth.json` (atomic writes, mode `0600`), replaces any
+caller-supplied `Authorization` header after the Google/domain-grant check, and
+does not return the secret through route views, logs, URLs, or CLI output.
+Upstream `WWW-Authenticate`/`Authentication-Info` headers are suppressed on a
+Google-protected route so a wrong backend credential yields an ordinary 401,
+never a second browser login prompt. Public routes retain normal HTTP-auth
+behavior and never receive a stored private credential.
+
+Configured owners can rotate a credential live through
+`PATCH /api/routes/<slug>/upstream-auth`; non-owner Console users are denied,
+and the endpoint accepts only Google-protected routes. The deployment CLI is
+the safer shell workflow because the secret is read only from stdin. It writes
+the private state for the next Console start:
+
+```bash
+DEVCOORDINATOR_ROOT=/home/DevCoordinator
+CONSOLE_ENV="$HOME/.config/devops-console/console.env"
+cd "$DEVCOORDINATOR_ROOT/apps/DevOpsConsole"
+read -r -s BACKEND_TOKEN
+printf '%s\n' "$BACKEND_TOKEN" | \
+  node bin/devops-console-upstream-auth.mjs \
+  --env-file "$CONSOLE_ENV" \
+  set prtzn --scheme bearer --secret-stdin
+unset BACKEND_TOKEN
+sudo systemctl restart devops-console
+```
+
+For a Basic-only upstream, use `--scheme basic --username <user>`. `list`
+prints only route/scheme metadata; `remove <slug>` deletes the credential.
+Route deletion removes its credential, server/container route renames move it,
+and changing a route to public erases it. Rotate the Console copy whenever the
+upstream token changes.
+
 ## Exposing a dev server
 
 1. Start the server through the coordinator (or the console UI) so it has a
@@ -1084,8 +1122,13 @@ again if the route returns to login-required mode.
 - Unknown subdomains are indistinguishable from protected ones until you log
   in (no route enumeration). New routes default to login-required. Proxy
   targets are always `127.0.0.1`.
+- On Google-protected routes, browser credentials cannot select an upstream
+  identity: the edge strips caller `Authorization`, optionally injects the
+  route's private backend credential, and suppresses backend HTTP-auth
+  challenges. Public routes preserve ordinary end-to-end HTTP authentication.
 - Console API mutations require a same-origin `Origin` header (CSRF). Access
-  list read/write endpoints additionally require a configured owner.
+  list and backend-credential endpoints additionally require a configured
+  owner.
 
 ## Dev mode
 

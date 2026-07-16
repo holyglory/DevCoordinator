@@ -23,6 +23,7 @@ import { createCoordinator } from '../src/coordinator.mjs';
 import { createMetricsStore } from '../src/metrics.mjs';
 import { createPrefsStore } from '../src/prefs.mjs';
 import { createRouteStore } from '../src/routes.mjs';
+import { createUpstreamAuthStore } from '../src/upstream-auth.mjs';
 import { createAccessStore } from '../src/access.mjs';
 import { createConsoleApi } from '../src/api.mjs';
 import { createStaticServer } from '../src/static.mjs';
@@ -234,6 +235,11 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
 
   const routeStore = createRouteStore({ file: path.join(config.stateDir, 'routes.json'), config, log });
   await routeStore.load();
+  const upstreamAuthStore = createUpstreamAuthStore({
+    file: path.join(config.stateDir, 'upstream-auth.json'),
+    log,
+  });
+  await upstreamAuthStore.load();
   const accessStore = createAccessStore({
     file: path.join(config.stateDir, 'access-control.json'),
     adminEmails: config.allowedEmails,
@@ -288,7 +294,7 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
   });
   const prefs = createPrefsStore({ file: path.join(config.stateDir, 'ui-prefs.json'), log });
   const consoleApi = createConsoleApi({
-    config, log, coordinator, routeStore, accessStore, guard, certManager, metrics, prefs,
+    config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
   const proxy = buildProxy({ log, pages, config });
@@ -303,6 +309,7 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     consoleApi,
     staticServer,
     routeStore,
+    upstreamAuthStore,
     coordinator,
     proxy,
   });
@@ -330,7 +337,17 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     }
   }
 
-  return { config, log, addresses: servers.addresses, sessions, coordinator, routeStore, accessStore, close };
+  return {
+    config,
+    log,
+    addresses: servers.addresses,
+    sessions,
+    coordinator,
+    routeStore,
+    upstreamAuthStore,
+    accessStore,
+    close,
+  };
 }
 
 async function main() {
@@ -400,6 +417,11 @@ async function main() {
 
   const routeStore = createRouteStore({ file: path.join(config.stateDir, 'routes.json'), config, log });
   await routeStore.load();
+  const upstreamAuthStore = createUpstreamAuthStore({
+    file: path.join(config.stateDir, 'upstream-auth.json'),
+    log,
+  });
+  await upstreamAuthStore.load();
   const accessStore = createAccessStore({
     file: path.join(config.stateDir, 'access-control.json'),
     adminEmails: config.allowedEmails,
@@ -411,7 +433,7 @@ async function main() {
 
   const prefs = createPrefsStore({ file: path.join(config.stateDir, 'ui-prefs.json'), log });
   const consoleApi = createConsoleApi({
-    config, log, coordinator, routeStore, accessStore, guard, certManager, metrics, prefs,
+    config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
 
@@ -427,6 +449,7 @@ async function main() {
     consoleApi,
     staticServer,
     routeStore,
+    upstreamAuthStore,
     coordinator,
     proxy,
   });

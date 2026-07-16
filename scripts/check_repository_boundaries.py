@@ -281,8 +281,11 @@ def scan_tip(repo: Path) -> list[Finding]:
         },
         "console proxy": {
             "protected parent-domain cookies": "const protectedCookieNames = new Set([sessionCookieName, FLOW_COOKIE_NAME]);",
-            "HTTP response cookie isolation": "filterResponseHeaders(r.headers, protectedCookieNames)",
-            "WebSocket response cookie isolation": "appendSafeRawHeaders(lines, upstreamRes.rawHeaders, protectedCookieNames)",
+            "HTTP response cookie isolation": "filterResponseHeaders(r.headers, protectedCookieNames, excluded)",
+            "WebSocket response cookie isolation": "appendSafeRawHeaders(lines, upstreamRes.rawHeaders, protectedCookieNames, excluded)",
+            "protected route strips caller Authorization": "delete headers.authorization;",
+            "protected route injects private upstream Authorization": "headers.authorization = target.upstreamAuthorization;",
+            "protected route suppresses upstream HTTP-auth prompts": "UPSTREAM_AUTH_RESPONSE_HEADERS",
         },
         "console server": {
             "explicit production IPv4 bind": "config.bindHost ?? '0.0.0.0'",

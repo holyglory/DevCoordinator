@@ -458,6 +458,29 @@ test('resolve: kind=docker running / stopped / unpublished / missing / docker do
     container: { name: 'web-1', status: 'running' },
   });
 
+  // Coordinator inventory retains historical container identities after a
+  // replacement. A stopped record can therefore precede the current running
+  // record with the same Docker name; routing must select the live identity.
+  const replaced = dockerCoordinator([
+    { id: 'old', name: 'web-1', status: 'stopped', ports: '0.0.0.0:30100->3000/tcp' },
+    { id: 'current', name: 'web-1', status: 'running', ports: '0.0.0.0:32773->3000/tcp' },
+  ]);
+  assert.deepEqual(await store.resolve('dweb', replaced), {
+    port: 32773,
+    container: { name: 'web-1', status: 'running' },
+  });
+
+  // A stale stopped mapping is not a fallback when the current running
+  // container exists but does not publish the route's requested port.
+  const replacedWithoutPublish = dockerCoordinator([
+    { id: 'old', name: 'web-1', status: 'stopped', ports: '0.0.0.0:30100->3000/tcp' },
+    { id: 'current', name: 'web-1', status: 'running', ports: '0.0.0.0:32774->8080/tcp' },
+  ]);
+  const currentUnpublished = await store.resolve('dweb', replacedWithoutPublish);
+  assert.equal(currentUnpublished.port, null);
+  assert.match(currentUnpublished.reason, /does not publish port 3000/);
+  assert.equal(currentUnpublished.container.status, 'running');
+
   // Stopped container: no port, actionable reason.
   const down = dockerCoordinator([{ name: 'web-1', status: 'Exited (0) 2 hours ago', ports: '' }]);
   const stopped = await store.resolve('dweb', down);

@@ -63,9 +63,14 @@ export function createRouter(deps) {
     consoleApi,
     staticServer,
     routeStore,
+    upstreamAuthStore,
     coordinator,
     proxy,
   } = deps;
+
+  const upstreamAuthorizationFor = (route) => (
+    route?.auth === 'public' ? null : upstreamAuthStore?.authorizationFor(route.slug) ?? null
+  );
 
   // Belt-and-suspenders for security invariant #1: even though routeStore now
   // screens every resolved port against the coordinator API port, the router
@@ -307,6 +312,7 @@ export function createRouter(deps) {
       host: '127.0.0.1',
       publicHost: hostPort,
       route,
+      upstreamAuthorization: upstreamAuthorizationFor(route),
     });
   }
 
@@ -429,6 +435,7 @@ export function createRouter(deps) {
       host: '127.0.0.1',
       publicHost: hostPort,
       route,
+      upstreamAuthorization: upstreamAuthorizationFor(route),
     });
   }
 

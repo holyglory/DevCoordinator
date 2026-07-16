@@ -26,7 +26,12 @@ A single Node process that is the public edge of the VPS `vr.ae`:
    route is `google` (default) or `public`; public bypasses identity, while a
    protected route requires its exact grant. **Unknown slugs behave exactly
    like protected ones for anonymous users** so names cannot be enumerated.
-5. **Coordinator as control engine**: all server/docker/lease state and
+5. **Protected upstream credential translation**: after Google identity and
+   an exact route grant pass, a route may replace caller `Authorization` with
+   a private route-scoped Bearer or Basic credential. The credential never
+   enters route/API views; public routes never receive it and retain normal
+   end-to-end HTTP authentication.
+6. **Coordinator as control engine**: all server/docker/lease state and
    mutations go through the coordinator HTTP API on `127.0.0.1:29876`
    (`docs/coordinator-http-api.json` is the authoritative endpoint map). The
    production `dev-coordinator.service` owns that process. Optional local
@@ -36,7 +41,7 @@ A single Node process that is the public edge of the VPS `vr.ae`:
 
 | Agent | Files |
 |---|---|
-| A core | `package.json`, `bin/devops-console.mjs`, `src/config.mjs`, `src/log.mjs`, `src/certs.mjs`, `src/server.mjs`, `src/router.mjs`, `src/proxy.mjs` |
+| A core | `package.json`, `bin/devops-console.mjs`, `bin/devops-console-upstream-auth.mjs`, `src/config.mjs`, `src/log.mjs`, `src/certs.mjs`, `src/server.mjs`, `src/router.mjs`, `src/proxy.mjs`, `src/upstream-auth.mjs` |
 | B auth | `src/auth/session.mjs`, `src/auth/oidc.mjs`, `src/auth/guard.mjs`, `src/auth/pages.mjs` |
 | C control | `src/coordinator.mjs`, `src/routes.mjs`, `src/access.mjs`, `src/api.mjs`, `src/metrics.mjs`, `src/prefs.mjs` |
 | D ui | `src/static.mjs`, `src/ui/index.html`, `src/ui/app.css`, `src/ui/app.js`, `docs/journeys.md` |
@@ -136,7 +141,7 @@ export async function startServers({ config, log, certManager, router })
 
 ```js
 export function createRouter(deps) // → { handleRequest(req,res), handleUpgrade(req,socket,head) }
-// deps: { config, log, guard, oidc, sessions, pages, consoleApi, staticServer, routeStore, coordinator, proxy }
+// deps: { config, log, guard, oidc, sessions, pages, consoleApi, staticServer, routeStore, upstreamAuthStore, coordinator, proxy }
 ```
 
 Dispatch (both request and upgrade paths):
@@ -164,6 +169,9 @@ Dispatch (both request and upgrade paths):
    - `target = await routeStore.resolve(slug, coordinator)`;
      unresolvable (linked server stopped) → `pages.renderUpstreamError` 502
      variant explaining the server is not running, with console link.
+   - for a protected route, `target.upstreamAuthorization` is resolved only
+     from the private upstream-auth store after session/grant authorization;
+     a public route always receives `null`.
    - `proxy.forward(req, res, target)` / `proxy.forwardUpgrade(req, socket, head, target)`.
 6. anything else → 421 `pages.renderError`.
 
@@ -186,7 +194,7 @@ domain. Invalid → fall back to `/`.
 
 ```js
 export function createProxy({ log, sessionCookieName }) // → { forward(req, res, target), forwardUpgrade(req, socket, head, target), close() }
-// target = { port, slug, host: '127.0.0.1', publicHost, route }  (pages via closure? NO —
+// target = { port, slug, host: '127.0.0.1', publicHost, route, upstreamAuthorization? }  (pages via closure? NO —
 // proxy takes an `onError(req,res,kind,target)` callback supplied by router at construction:
 //   createProxy({ log, renderBadGateway(req, res, { kind: 'connect'|'timeout'|'reset', target }) })
 ```
@@ -205,6 +213,12 @@ export function createProxy({ log, sessionCookieName }) // → { forward(req, re
   entry as one field; never comma-split because `Expires` contains a comma.
 - Add `X-Forwarded-For` (append client IP), `X-Forwarded-Proto: https` (or
   http in dev mode), `X-Forwarded-Host: <original host>`.
+- For `route.auth !== 'public'`, delete caller `Authorization` and set it only
+  from `target.upstreamAuthorization` when configured. Remove upstream
+  `WWW-Authenticate` and `Authentication-Info` on HTTP responses, 101s, and
+  upgrade refusals so the Google-authenticated browser never sees a second
+  Basic/Digest prompt. For public routes, preserve caller `Authorization`,
+  ignore any stored credential, and preserve upstream auth response headers.
 - Stream both directions (`req.pipe(upstream)`, `upstreamRes.pipe(res)`); no
   buffering; SSE and chunked responses flow through untouched.
 - Connect timeout 5s → 504 page; `ECONNREFUSED`/reset before headers → 502
@@ -376,6 +390,28 @@ is container name + container-side port, so remapped host ports keep working.
 Every resolved port (all kinds) passes `guardCoordinatorPort` — a route can
 never proxy into the coordinator API (invariant #1).
 
+## Upstream credential store (`src/upstream-auth.mjs`)
+
+```js
+export function createUpstreamAuthStore({ file, log })
+// → { load(), describe(slug), listDescriptions(), authorizationFor(slug),
+//     set(slug, { scheme, username?, secret }), remove(slug), move(from, to) }
+```
+
+Schema on disk:
+`{ "version": 1, "routes": { "<slug>": { "scheme": "bearer", "secret": "…" } } }`
+or Basic `{ scheme, username, secret }`. The external file is a real regular
+file with no group/world permissions; writes use a mode-`0600` temporary file
+and atomic rename. Invalid-permission state fails startup. Malformed state is
+preserved as `.corrupt-<timestamp>` and disabled, never partially trusted.
+Mutations serialize and publish to the live map only after durable persistence.
+
+`describe`/`listDescriptions` return only `{ configured, scheme }` metadata.
+`authorizationFor` is used only inside router/proxy composition and is never
+returned through the Console API. Route deletion/publication removes a stored
+credential; server/container route rename moves it. The deployment CLI accepts
+secrets only on stdin and emits redacted JSON.
+
 ## Access policy store (`src/access.mjs`)
 
 ```js
@@ -409,7 +445,7 @@ and server/container slug renames move grants to the new host.
 ## Console API (`src/api.mjs`)
 
 ```js
-export function createConsoleApi({ config, log, coordinator, routeStore, accessStore, guard, certManager, metrics, prefs })
+export function createConsoleApi({ config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs })
 // → { handle(req, res, session): Promise<void> }   // only called for /api/*
 ```
 JSON in/out; errors `{ "error": "<message>" }` with 400/401/403/404/409/502.
@@ -420,7 +456,7 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 
 | Method+Path | Behavior |
 |---|---|
-| `GET /api/overview` | `{ console: { version, domain, consoleHost, now, tls: certManager.info(), devInsecureHttp }, coordinator: coordinator.status(), inventory: Inventory\|null, routes: RouteView[] }`. Inventory from `coordinator.inventory()`; on CoordError → `inventory: null` and `coordinator.ok:false` with error (HTTP still 200 — UI shows degraded state). `RouteView = Route + { url: 'https://<slug>.<domain>', resolved: { port, reason?, serverStatus?, containerStatus? } }` (kind=server resolves via `serversRaw`; kind=docker via the cached `inventory()` — both shared/coalesced). |
+| `GET /api/overview` | `{ console: { version, domain, consoleHost, now, tls: certManager.info(), devInsecureHttp }, coordinator: coordinator.status(), inventory: Inventory\|null, routes: RouteView[] }`. Inventory from `coordinator.inventory()`; on CoordError → `inventory: null` and `coordinator.ok:false` with error (HTTP still 200 — UI shows degraded state). `RouteView = Route + { url: 'https://<slug>.<domain>', upstreamAuth: { configured, scheme? }, resolved: { port, reason?, serverStatus?, containerStatus? } }` (kind=server resolves via `serversRaw`; kind=docker via the cached `inventory()` — both shared/coalesced). No upstream secret is returned. |
 | `GET /api/access` | Owner-only `{ version, users: [{ email, owner, grants }], resources: [{ id, kind, host, title, auth, target }], invitedCount }`. Configured owners appear locked; only owners may read the full email list. |
 | `POST /api/access/users` | Owner-only `{ email, grants? }` → 201 full access view. Invites an email identity; the invitation becomes usable only when verified Google OIDC returns that exact address. An empty grant list is allowed. |
 | `PATCH /api/access/users/:email` | Owner-only delta `{ resource, allowed: boolean }` → full access view. Configured owners are immutable. |
@@ -428,6 +464,8 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 | `POST /api/routes` | body `{ slug, kind, port?, project?, serverName?, containerName?, containerPort?, auth?, title? }` → 201 RouteView |
 | `PATCH /api/routes/:slug` | any of `{ auth, title, port, project, serverName, containerName, containerPort, kind }` → RouteView |
 | `DELETE /api/routes/:slug` | → `{ ok: true }` |
+| `PATCH /api/routes/:slug/upstream-auth` | Owner-only body `{ scheme:'bearer', secret }` or `{ scheme:'basic', username, secret }`; Google-protected routes only → redacted `{ slug, upstreamAuth }` |
+| `DELETE /api/routes/:slug/upstream-auth` | Owner-only removal → redacted `{ slug, upstreamAuth:{ configured:false } }` |
 | `POST /api/servers/action` | `{ id, action: 'stop'\|'restart' }` — looks up server in `serversRaw` by id → coordinator `serverStop/serverRestart` with `{ agent: 'devops-console:'+session.email, project: server.project, name: server.name, reason }` → `{ server }` |
 | `POST /api/servers/logs` | `{ id, tail=200 }` → coordinator `serverLogs` `{ server_id: id, tail }` → passthrough |
 | `POST /api/docker/action` | `{ name, action: 'start'\|'stop'\|'restart' }`; fresh inventory must provide verified Compose/sidecar project ownership, which is sent as mutation attribution; unattributed containers are refused |
@@ -539,8 +577,9 @@ Composition root: `loadConfig` (respect `--env-file <p>`, `--check-config`
 prints redacted config and exits 0) → logger → certManager (skip in
 devInsecureHttp) → sessions → oidc → guard → pages → coordinator
 (`ensureRunning()` non-fatal) → metrics (`createMetricsStore` + `start()`) →
-routeStore (`load()`) → consoleApi → static →
-proxy → router → `startServers`. SIGHUP → cert reload; SIGTERM/SIGINT →
+routeStore (`load()`) → upstreamAuthStore (`load()`) → accessStore (`load()`)
+→ consoleApi → static → proxy → router → `startServers`. SIGHUP → cert
+reload; SIGTERM/SIGINT →
 graceful close (also `metrics.stop()` and `coordinator.close()`). On listen success, log every
 public URL. Production listeners bind the explicit IPv4 wildcard `0.0.0.0`;
 development listeners bind IPv4 loopback. If `process.env.PORT` is set for an optional coordinator-spawned
@@ -565,7 +604,7 @@ active lease.
 - `ws-echo.mjs`: genuine RFC6455 echo server (handshake `Sec-WebSocket-Accept`,
   frame parse/serialize for text ≤125B is enough) on `net`/`http` upgrade.
 - `upstream.mjs`: HTTP upstream echoing method/path/headers/body + an SSE
-  endpoint.
+  endpoint and an operator-credential challenge path.
 - Tests run the real stack: real coordinator (`api serve`, ephemeral port,
   `CODEX_AGENT_COORDINATOR_HOME=<tmp>`), real console (spawned or in-process),
   ephemeral ports, dev certs from `certs/dev/` (`rejectUnauthorized:false`,
@@ -588,4 +627,9 @@ active lease.
    consumes `cookieName` and `dc_flow` for authentication but never forwards
    them to routed HTTP/WebSocket projects or accepts those names from upstream
    `Set-Cookie`; unrelated project cookies remain end-to-end.
-6. No secrets in logs; no directory traversal; HTML escaping in every page.
+6. Protected routes strip caller `Authorization`, may inject only their
+   private mode-`0600` route credential after exact Google authorization, and
+   suppress backend HTTP-auth challenges. Public routes receive no stored
+   credential and preserve ordinary HTTP-auth headers. Only configured owners
+   may change the credential; route/API/CLI views never expose it.
+7. No secrets in logs; no directory traversal; HTML escaping in every page.

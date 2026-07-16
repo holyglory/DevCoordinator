@@ -4,9 +4,25 @@
 
 Confirmed user intent: one canonical local worktree is one project; removal is a reversible, data-retaining decommission rather than cosmetic hiding; coordinator state and actions must be real, attributable, and fail closed; ports remain stable; background UI work stays bounded; and protected Console access is explicit per account and domain. See [DC-2026-07-14-STATE-01](DecisionDetails/DC-2026-07-14-STATE-01.md), [DC-2026-07-13-01](DecisionDetails/DC-2026-07-13-01.md), [DC-2026-07-10-03](DecisionDetails/DC-2026-07-10-03.md), [DC-2026-07-06-01](DecisionDetails/DC-2026-07-06-01.md), [DC-2026-07-13-05](DecisionDetails/DC-2026-07-13-05.md), and [DC-2026-07-14-ACCESS-01](DecisionDetails/DC-2026-07-14-ACCESS-01.md).
 
-Confirmed operational direction: all enrolled users and agents on one host use one service-owned Coordinator authority through peer-authenticated authorization; clients do not open the authority database; native work follows the Build macOS Apps workflow; and releases require remote-fresh, production-shaped evidence. See [DC-2026-07-15-HOST-01](DecisionDetails/DC-2026-07-15-HOST-01.md), [DC-2026-07-10-07](DecisionDetails/DC-2026-07-10-07.md), and [DC-2026-07-11-19](DecisionDetails/DC-2026-07-11-19.md).
+Confirmed operational direction: all enrolled users and agents on one host use one service-owned Coordinator authority through peer-authenticated authorization; clients do not open the authority database; Docker routes survive container replacement without discarding retained history; a Google-protected route may translate the approved identity into a private route-scoped backend credential without exposing a second browser login; native work follows the Build macOS Apps workflow; and releases require remote-fresh, production-shaped evidence. See [DC-2026-07-15-HOST-01](DecisionDetails/DC-2026-07-15-HOST-01.md), [DC-2026-07-16-ROUTES-01](DecisionDetails/DC-2026-07-16-ROUTES-01.md), [DC-2026-07-16-AUTH-01](DecisionDetails/DC-2026-07-16-AUTH-01.md), [DC-2026-07-10-07](DecisionDetails/DC-2026-07-10-07.md), and [DC-2026-07-11-19](DecisionDetails/DC-2026-07-11-19.md).
 
 Inferred direction: the owner prefers compact, actionable status over persistent generic warnings and favors durable safety boundaries over UI-only or denormalized shortcuts. See [DC-2026-07-13-08](DecisionDetails/DC-2026-07-13-08.md), [DC-2026-07-07-01](DecisionDetails/DC-2026-07-07-01.md), and [DC-2026-07-14-STATE-01](DecisionDetails/DC-2026-07-14-STATE-01.md); revisit this inference if later explicit direction conflicts.
+
+## DC-2026-07-16-AUTH-01 — Google-protected routes translate private upstream credentials
+
+ID: DC-2026-07-16-AUTH-01 · Details: [supporting record](DecisionDetails/DC-2026-07-16-AUTH-01.md)
+
+Decision: After Google identity and the exact domain grant pass, a protected route strips caller `Authorization`, optionally injects a private route-scoped Bearer or Basic credential, and suppresses upstream HTTP-auth challenges; public routes preserve ordinary end-to-end HTTP authentication, and only configured Console owners may change backend credentials.
+
+Why: Disabling an application's operator token would expose privileged controls to other accounts on the shared host; passing Basic auth through created a second browser login and bypassed the intended per-Google-account journey; and trusting a loopback identity header would be locally forgeable. Route-scoped credential translation preserves both the upstream security boundary and one Google sign-in while keeping the secret outside browser-visible route state.
+
+## DC-2026-07-16-ROUTES-01 — Docker routes select the current live replacement
+
+ID: DC-2026-07-16-ROUTES-01 · Details: [supporting record](DecisionDetails/DC-2026-07-16-ROUTES-01.md)
+
+Decision: Resolve a Docker route across every retained same-name container record, preferring a running identity, then a paused identity, then stopped history; use the newest observation only as a tie-breaker within the same lifecycle class.
+
+Why: First-match lookup routed production traffic to an older stopped SkydiveLive container after a replacement. Purging history would violate retained-state requirements, and binding routes to immutable container IDs would make ordinary replacements break by design. Lifecycle ranking preserves both replacement continuity and historical evidence while still reporting a current live container whose requested port is unpublished.
 
 ## DC-2026-07-15-HOST-01 — The host coordinator is one peer-authenticated system authority
 
