@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -95,6 +96,228 @@ def parsed_profile(repository_root: Path) -> BrokerClientProfile:
 
 
 class BrokerProfileTrustTests(unittest.TestCase):
+    def test_healthy_legacy_server_cannot_bypass_host_publication(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-legacy-server-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            repository = profile.repository(str(repository_root))
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_context",
+                    return_value=(profile, repository),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "state_backend",
+                    return_value=dev_coordinator.LEGACY_JSON_BACKEND,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "locked_state",
+                    return_value=contextlib.nullcontext({}),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "find_server",
+                    return_value=("server-web", {"name": "web"}),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "find_port_assignment",
+                    return_value=(None, None),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "server_health",
+                    return_value={"ok": True, "listener_observable": True},
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "require_listener_identity_observable",
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "broker_lease_link_for_server",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "_coordinated_start_server_local",
+                    side_effect=AssertionError("legacy server returned as host-wide"),
+                ),
+                self.assertRaisesRegex(BrokerProfileError, "server register"),
+            ):
+                dev_coordinator.coordinated_start_server(
+                    {
+                        "agent": "codex-test",
+                        "project": str(repository_root),
+                        "name": "web",
+                    }
+                )
+
+    def test_healthy_broker_linked_server_is_republished_to_host_inventory(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-linked-server-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            repository = profile.repository(str(repository_root))
+            link = mock.Mock(
+                broker_resource_id="lease-host-web",
+                link_id="link-web",
+                status="bound",
+            )
+            local = {"id": "server-web", "name": "web", "status": "running"}
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_context",
+                    return_value=(profile, repository),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "state_backend",
+                    return_value=dev_coordinator.LEGACY_JSON_BACKEND,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "locked_state",
+                    return_value=contextlib.nullcontext({}),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "find_server",
+                    return_value=("server-web", {"name": "web"}),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "find_port_assignment",
+                    return_value=(None, None),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "server_health",
+                    return_value={"ok": True, "listener_observable": True},
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "require_listener_identity_observable",
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "broker_lease_link_for_server",
+                    return_value=link,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "_coordinated_start_server_local",
+                    return_value=local,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "publish_broker_server",
+                    return_value={"status": "published"},
+                ) as publish,
+            ):
+                result = dev_coordinator.coordinated_start_server(
+                    {
+                        "agent": "codex-test",
+                        "project": str(repository_root),
+                        "name": "web",
+                    }
+                )
+
+            publish.assert_called_once()
+            self.assertEqual(result["broker"]["publication"]["status"], "published")
+
+    def test_server_wide_inventory_uses_broker_without_opening_client_database(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-inventory-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            payload = {
+                "schema_version": 2,
+                "repositories": [],
+                "docker": {"available": None, "containers": [], "postgres": []},
+                "postgres": [],
+                "v1_compatibility": {
+                    "servers": [
+                        {
+                            "id": "server-web",
+                            "name": "web",
+                            "status": "running",
+                            "port": 3112,
+                        }
+                    ],
+                    "leases": [],
+                    "port_assignments": [],
+                    "docker": {"available": None, "containers": [], "postgres": []},
+                    "postgres": [],
+                },
+            }
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_profile",
+                    return_value=profile,
+                ),
+                mock.patch.object(
+                    BrokerClientProfile,
+                    "inventory",
+                    return_value=payload,
+                ) as inventory,
+                mock.patch.object(
+                    AccountStore,
+                    "open_default_read_only",
+                    side_effect=AssertionError("client database opened for host inventory"),
+                ),
+            ):
+                result = dev_coordinator.coordinated_build_inventory()
+
+            inventory.assert_called_once_with()
+            self.assertEqual(
+                result["v1_compatibility"]["servers"][0]["name"], "web"
+            )
+            self.assertEqual(result["authority"]["scope"], "server-wide")
+
+    def test_product_default_is_required_server_wide_authority(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            dev_coordinator,
+            "load_broker_profile",
+            side_effect=BrokerProfileError("required profile missing"),
+        ) as loader:
+            self.assertEqual(dev_coordinator.authority_mode(), "system")
+            self.assertEqual(
+                dev_coordinator.coordinator_home(),
+                dev_coordinator.SYSTEM_CLIENT_JOURNAL_ROOT / str(os.geteuid()),
+            )
+            with self.assertRaisesRegex(BrokerProfileError, "required profile"):
+                dev_coordinator.configured_broker_profile()
+            loader.assert_called_once_with(required=True)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                dev_coordinator.AUTHORITY_ENV: "account",
+                "CODEX_AGENT_COORDINATOR_HOME": "/tmp/isolated-coordinator-test",
+            },
+            clear=True,
+        ), mock.patch.object(
+            dev_coordinator,
+            "load_broker_profile",
+            side_effect=AssertionError("isolated account mode consulted system profile"),
+        ):
+            self.assertEqual(dev_coordinator.authority_mode(), "account")
+            self.assertEqual(
+                dev_coordinator.coordinator_home(),
+                Path("/tmp/isolated-coordinator-test"),
+            )
+            self.assertIsNone(dev_coordinator.configured_broker_profile())
+
     def test_missing_default_is_unconfigured_but_required_default_fails(self) -> None:
         missing = broker_profile_module.SYSTEM_PROFILE_PATH.parent / (
             ".devcoordinator-profile-intentionally-missing-for-test"

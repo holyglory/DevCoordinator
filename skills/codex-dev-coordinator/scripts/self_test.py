@@ -446,7 +446,11 @@ def check_registration_pid_guards() -> None:
         module.os.readlink = original_readlink
 
     original_run = module.subprocess.run
+    original_resolve_lsof = module.resolve_lsof_executable
     try:
+        # Isolate the executable capability check so a developer machine's
+        # installed (or absent) lsof cannot decide this negative fixture.
+        module.resolve_lsof_executable = lambda: "/fixture/lsof"
         module.subprocess.run = lambda *_args, **_kwargs: subprocess.CompletedProcess(
             [], 1, stdout="", stderr="lsof: permission denied\n"
         )
@@ -473,6 +477,7 @@ def check_registration_pid_guards() -> None:
         )
     finally:
         module.subprocess.run = original_run
+        module.resolve_lsof_executable = original_resolve_lsof
 
     if not sys.platform.startswith("linux"):
         original_pid_alive = module.pid_alive
@@ -1849,9 +1854,10 @@ def main() -> int:
             "non-loopback",
             "outside write\ntransactions",
             "legacy JSON lock and callback",
-            "getpwuid(geteuid())",
-            "Separate coordinator homes do not share a reservation authority",
-            "owned by its effective UID",
+            "/var/lib/devcoordinator/coordinator.sqlite3",
+            "DEVCOORDINATOR_AUTHORITY=account",
+            "not inventory or reservation",
+            "read/execute-only source ACLs",
         ):
             check(needle in skill_text, f"SKILL.md should retain policy text: {needle}")
 

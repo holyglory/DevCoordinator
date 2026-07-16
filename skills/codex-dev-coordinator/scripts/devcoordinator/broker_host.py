@@ -593,6 +593,7 @@ def _verify_owned_tcp_listener(port: int, canonical_root: str) -> Mapping[str, A
         )
     pid = next(iter(first))
     identity_before = _process_identity(pid)
+    owner_uid_before = _process_owner_uid(pid)
     cwd = _process_cwd(lsof, pid)
     if os.path.commonpath((cwd, root)) != root:
         raise BrokerBackendError(
@@ -600,14 +601,20 @@ def _verify_owned_tcp_listener(port: int, canonical_root: str) -> Mapping[str, A
             "The existing listener belongs to another repository.",
         )
     identity_after = _process_identity(pid)
+    owner_uid_after = _process_owner_uid(pid)
     second = _listener_pids(lsof, port)
-    if identity_before != identity_after or second != {pid}:
+    if (
+        identity_before != identity_after
+        or owner_uid_before != owner_uid_after
+        or second != {pid}
+    ):
         raise BrokerBackendError(
             "listener_identity_changed",
             "The existing listener identity changed during broker verification.",
         )
     return {
         "pid": pid,
+        "owner_uid": owner_uid_after,
         "process_identity": identity_after,
         "cwd": cwd,
         "canonical_root": root,
@@ -689,6 +696,36 @@ def _process_identity(pid: int) -> str:
             "The broker service cannot read the listener process identity.",
         )
     return f"process:{pid}:{started}"
+
+
+def _process_owner_uid(pid: int) -> int:
+    """Read a stable kernel/account owner for the already-identified process."""
+
+    if sys.platform.startswith("linux"):
+        try:
+            metadata = os.stat(f"/proc/{pid}", follow_symlinks=False)
+        except OSError as exc:
+            raise BrokerBackendError(
+                "listener_identity_unobservable",
+                "The broker service cannot read the listener process owner.",
+            ) from exc
+        return int(metadata.st_uid)
+    completed = subprocess.run(
+        ["/bin/ps", "-o", "uid=", "-p", str(pid)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=5.0,
+        check=False,
+    )
+    raw = completed.stdout.strip()
+    if completed.returncode != 0 or not raw.isdigit():
+        raise BrokerBackendError(
+            "listener_identity_unobservable",
+            "The broker service cannot read the listener process owner.",
+        )
+    return int(raw)
 
 
 def _process_cwd(lsof: str, pid: int) -> str:

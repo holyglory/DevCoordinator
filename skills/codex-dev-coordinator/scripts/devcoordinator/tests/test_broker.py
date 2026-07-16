@@ -2841,6 +2841,244 @@ class StoreBackedBrokerTests(unittest.TestCase):
                         0,
                     )
 
+    def test_server_publication_is_peer_listener_bound_and_host_inventory_is_cross_uid(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            service = store_backed_service(persistence, actions)
+            leased = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_LEASE,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "requested_port": 3112,
+                        "protocol": "tcp",
+                        "ttl_seconds": 600,
+                    },
+                ).to_wire(),
+            )
+            self.assertTrue(leased["ok"], leased)
+            lease_id = str(leased["result"]["lease_id"])
+            actions.listener_evidence = {
+                "pid": 12345,
+                "owner_uid": os.geteuid(),
+                "process_identity": "linux:12345:987654",
+                "cwd": "/repos/alpha/apps/web",
+                "canonical_root": "/repos/alpha",
+                "port": 3112,
+                "protocol": "tcp",
+            }
+            published = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.SERVER_PUBLISH,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "lease_id": lease_id,
+                        "lifecycle": "running",
+                        "pid": 12345,
+                        "listener_port": 3112,
+                        "health_classification": "healthy",
+                        "health_ok": True,
+                    },
+                ).to_wire(),
+            )
+            self.assertTrue(published["ok"], published)
+
+            second_uid = os.geteuid() + 100_000
+            unauthorized = service.reply_for_document(
+                PeerCredentials(second_uid, os.getegid(), 54321),
+                BrokerRequest.create(
+                    account_id="account-console",
+                    project_id=PROJECT_ID,
+                    resource_id=PROJECT_ID,
+                    operation=BrokerOperation.INVENTORY_READ,
+                    authority_generation=CURRENT_AUTHORITY_GENERATION,
+                ).to_wire(),
+            )
+            self.assertFalse(unauthorized["ok"], unauthorized)
+            self.assertEqual(
+                unauthorized["error"]["code"], "peer_not_authorized"
+            )
+            persistence.provision_principal(
+                uid=second_uid, account_id="account-console"
+            )
+            inventory_request = BrokerRequest.create(
+                account_id="account-console",
+                project_id=PROJECT_ID,
+                resource_id=PROJECT_ID,
+                operation=BrokerOperation.INVENTORY_READ,
+                authority_generation=CURRENT_AUTHORITY_GENERATION,
+            )
+            inventory = service.reply_for_document(
+                PeerCredentials(second_uid, os.getegid(), 54321),
+                inventory_request.to_wire(),
+            )
+            self.assertTrue(inventory["ok"], inventory)
+            visible = inventory["result"]["v1_compatibility"]["servers"]
+            self.assertEqual(len(visible), 1)
+            self.assertEqual(visible[0]["name"], "web")
+            self.assertEqual(visible[0]["status"], "running")
+            self.assertEqual(visible[0]["pid"], 12345)
+            self.assertEqual(visible[0]["port"], 3112)
+
+            stopped = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.SERVER_PUBLISH,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "lease_id": lease_id,
+                        "lifecycle": "stopped",
+                        "listener_port": 3112,
+                        "health_classification": "stopped",
+                        "health_ok": False,
+                        "stopped_reason": "Stopped by regression test",
+                    },
+                ).to_wire(),
+            )
+            self.assertTrue(stopped["ok"], stopped)
+            self.assertEqual(
+                actions.port_observations[-1], ((3112,), "tcp")
+            )
+            refreshed = service.reply_for_document(
+                PeerCredentials(second_uid, os.getegid(), 54321),
+                BrokerRequest.create(
+                    account_id="account-console",
+                    project_id=PROJECT_ID,
+                    resource_id=PROJECT_ID,
+                    operation=BrokerOperation.INVENTORY_READ,
+                    authority_generation=CURRENT_AUTHORITY_GENERATION,
+                ).to_wire(),
+            )
+            self.assertEqual(
+                refreshed["result"]["v1_compatibility"]["servers"][0]["status"],
+                "stopped",
+            )
+
+    def test_server_publication_rejects_foreign_uid_pid_and_bound_stop(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            service = store_backed_service(persistence, actions)
+            lease = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_LEASE,
+                    resource_id=SERVER_ID,
+                    arguments={"requested_port": 3113, "ttl_seconds": 600},
+                ).to_wire(),
+            )["result"]
+            actions.listener_evidence = {
+                "pid": 12345,
+                "owner_uid": os.geteuid() + 1,
+                "process_identity": "linux:12345:987654",
+                "cwd": "/repos/alpha",
+                "canonical_root": "/repos/alpha",
+                "port": 3113,
+                "protocol": "tcp",
+            }
+            arguments = {
+                "lease_id": lease["lease_id"],
+                "lifecycle": "running",
+                "pid": 12345,
+                "listener_port": 3113,
+                "health_classification": "healthy",
+                "health_ok": True,
+            }
+            foreign_owner = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.SERVER_PUBLISH,
+                    resource_id=SERVER_ID,
+                    arguments=arguments,
+                ).to_wire(),
+            )
+            self.assertFalse(foreign_owner["ok"], foreign_owner)
+            self.assertEqual(
+                foreign_owner["error"]["code"], "listener_peer_mismatch"
+            )
+            actions.listener_evidence = {
+                **actions.listener_evidence,
+                "owner_uid": os.geteuid(),
+            }
+            wrong_pid = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.SERVER_PUBLISH,
+                    resource_id=SERVER_ID,
+                    arguments={**arguments, "pid": 12346},
+                ).to_wire(),
+            )
+            self.assertFalse(wrong_pid["ok"], wrong_pid)
+            self.assertEqual(
+                wrong_pid["error"]["code"], "listener_process_mismatch"
+            )
+            actions.occupied_ports.add(3113)
+            bound_stop = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.SERVER_PUBLISH,
+                    resource_id=SERVER_ID,
+                    arguments={
+                        "lease_id": lease["lease_id"],
+                        "lifecycle": "stopped",
+                        "listener_port": 3113,
+                        "health_classification": "stopped",
+                        "health_ok": False,
+                        "stopped_reason": "must not commit",
+                    },
+                ).to_wire(),
+            )
+            self.assertFalse(bound_stop["ok"], bound_stop)
+            self.assertEqual(bound_stop["error"]["code"], "listener_still_bound")
+
+    def test_server_access_replacement_revokes_omitted_servers_atomically(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            persistence.replace_server_access(
+                uid=os.geteuid(),
+                repo_id=PROJECT_ID,
+                server_definition_ids=(),
+                start_port=3100,
+                end_port=3199,
+            )
+            service = store_backed_service(persistence, actions)
+            denied = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_LEASE,
+                    resource_id=SERVER_ID,
+                    arguments={"requested_port": 3115, "ttl_seconds": 600},
+                ).to_wire(),
+            )
+            self.assertFalse(denied["ok"], denied)
+            self.assertEqual(denied["error"]["code"], "operation_access_denied")
+
+            persistence.replace_server_access(
+                uid=os.geteuid(),
+                repo_id=PROJECT_ID,
+                server_definition_ids=(SERVER_ID,),
+                start_port=3100,
+                end_port=3199,
+            )
+            with self.assertRaises(BrokerError):
+                persistence.replace_server_access(
+                    uid=os.geteuid(),
+                    repo_id=PROJECT_ID,
+                    server_definition_ids=("server-foreign",),
+                    start_port=3100,
+                    end_port=3199,
+                )
+            allowed = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_LEASE,
+                    resource_id=SERVER_ID,
+                    arguments={"requested_port": 3115, "ttl_seconds": 600},
+                ).to_wire(),
+            )
+            self.assertTrue(allowed["ok"], allowed)
+
     def test_foreign_dynamic_lease_release_is_rejected_without_mutation(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             persistence, actions = seed_store_backed_broker(root)

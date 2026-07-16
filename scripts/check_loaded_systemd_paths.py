@@ -32,6 +32,7 @@ PROPERTIES = (
 )
 SERVICE_HOME = "/home/holyglory"
 COORDINATOR_HOME = f"{SERVICE_HOME}/.codex/agent-coordinator"
+COORDINATOR_JOURNAL = "/var/lib/devcoordinator-clients/1000"
 CONSOLE_STATE = f"{SERVICE_HOME}/.local/state/devops-console"
 CONSOLE_ENV = f"{SERVICE_HOME}/.config/devops-console/console.env"
 COORDINATOR_ARGV = (
@@ -51,12 +52,12 @@ CONSOLE_PREFLIGHT_ARGV = (
     "--require-token --wait-token-seconds 10"
 )
 CONSOLE_ARGV = (
-    "/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator COORDINATOR_AUTOSTART=0 "
+    "/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator DEVCOORDINATOR_AUTHORITY=system COORDINATOR_AUTOSTART=0 "
     "COORDINATOR_REGISTRATION_REQUIRED=1 "
     "COORDINATOR_URL=http://127.0.0.1:29876 "
     "COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py "
     f"COORDINATOR_TOKEN_FILE={COORDINATOR_HOME}/api-token "
-    f"CODEX_AGENT_COORDINATOR_HOME={COORDINATOR_HOME} STATE_DIR={CONSOLE_STATE} "
+    f"CODEX_AGENT_COORDINATOR_HOME={COORDINATOR_JOURNAL} STATE_DIR={CONSOLE_STATE} "
     f"ACME_WEBROOT={CONSOLE_STATE}/acme /usr/bin/node bin/devops-console.mjs --env-file {CONSOLE_ENV}"
 )
 CONSOLE_POSTSTART_ARGV = (
@@ -234,7 +235,10 @@ def validate_loaded_unit_outputs(
         "User": "holyglory",
         "Group": "holyglory",
         "WorkingDirectory": "/home/DevCoordinator",
-        "Environment": f"CODEX_AGENT_COORDINATOR_HOME={COORDINATOR_HOME}",
+        "Environment": (
+            "DEVCOORDINATOR_AUTHORITY=system "
+            f"CODEX_AGENT_COORDINATOR_HOME={COORDINATOR_JOURNAL}"
+        ),
         "EnvironmentFiles": "",
         "ExecStartPre": "",
         "TimeoutStartUSec": "20s",

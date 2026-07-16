@@ -73,14 +73,14 @@
       "docker"
     ],
     "read_model": "GET /v1/state is a compatibility control snapshot derived from normalized SQLite; it is not the authoritative persistence format",
-    "persistence": "private 0700 home; 0600 coordinator.sqlite3/token/log files; foreign-keyed SQLite transactions with WAL durability",
+    "persistence": "server-wide service-owned 0700 authority directory and 0600 coordinator.sqlite3; authenticated clients use the Unix broker and retain only private execution journals",
     "durable_ports": "successful server start/register pins project+name to a port until explicit unassign or attributed state reset",
     "operations": "short reservation/commit lock phases with same-target exclusion and bounded journal evidence"
   },
   "inventory_contract": {
     "schema_version": 2,
     "read_semantics": "query-only",
-    "ordinary_inventory": "GET /v1/inventory returns the committed normalized snapshot without runtime sampling or persistence",
+    "ordinary_inventory": "GET /v1/inventory returns the single server-wide broker snapshot without runtime sampling or persistence, including servers published by other enrolled UIDs",
     "normalized_top_level": [
       "store",
       "repositories",

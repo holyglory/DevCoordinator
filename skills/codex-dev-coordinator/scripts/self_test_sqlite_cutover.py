@@ -362,6 +362,8 @@ class SQLiteCutoverTests(unittest.TestCase):
                 raise PermissionError("injected post-journal validation failure")
 
         def connect_with_journal_failure(*args, **kwargs):
+            if args and "immutable=1" in str(args[0]):
+                return real_connect(*args, **kwargs)
             return JournalFailureConnection(real_connect(*args, **kwargs))
 
         def unlock_then_fail(descriptor: int, operation: int):

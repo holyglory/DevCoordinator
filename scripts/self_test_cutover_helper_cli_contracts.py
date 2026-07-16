@@ -776,7 +776,8 @@ def loaded_unit_fixtures(module: Any, bounding_names: str) -> tuple[str, str]:
             "User=holyglory",
             "Group=holyglory",
             "WorkingDirectory=/home/DevCoordinator",
-            f"Environment=CODEX_AGENT_COORDINATOR_HOME={module.COORDINATOR_HOME}",
+            "Environment=DEVCOORDINATOR_AUTHORITY=system "
+            f"CODEX_AGENT_COORDINATOR_HOME={module.COORDINATOR_JOURNAL}",
             "EnvironmentFiles=",
             "ExecStartPre=",
             f"ExecStart={command(module.COORDINATOR_ARGV)}",

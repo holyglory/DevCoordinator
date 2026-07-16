@@ -1,0 +1,29 @@
+[Unit]
+Description=DevCoordinator server-wide authority broker
+Documentation=file:///home/DevCoordinator/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=devcoordinator-clients
+WorkingDirectory=/home/DevCoordinator
+Environment=DEVCOORDINATOR_AUTHORITY=service
+RuntimeDirectory=devcoordinator
+RuntimeDirectoryMode=0750
+StateDirectory=devcoordinator
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py broker serve --database /var/lib/devcoordinator/coordinator.sqlite3 --socket /run/devcoordinator/broker.sock --access-group devcoordinator-clients
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator
+
+[Install]
+WantedBy=multi-user.target

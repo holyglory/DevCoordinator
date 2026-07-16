@@ -1,7 +1,8 @@
 [Unit]
 Description=DevCoordinator loopback control API
 Documentation=file:///home/DevCoordinator/skills/codex-dev-coordinator/README.md
-After=network-online.target
+Requires=devcoordinator-broker.service
+After=network-online.target devcoordinator-broker.service
 Wants=network-online.target
 
 [Service]
@@ -9,7 +10,8 @@ Type=simple
 User=holyglory
 Group=holyglory
 WorkingDirectory=/home/DevCoordinator
-Environment=CODEX_AGENT_COORDINATOR_HOME=/home/holyglory/.codex/agent-coordinator
+Environment=DEVCOORDINATOR_AUTHORITY=system
+Environment=CODEX_AGENT_COORDINATOR_HOME=/var/lib/devcoordinator-clients/1000
 ExecStart=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876 --token-file /home/holyglory/.codex/agent-coordinator/api-token
 ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py --token-file /home/holyglory/.codex/agent-coordinator/api-token --host 127.0.0.1 --port 29876 --wait-seconds 10 --poll-interval-seconds 0.1
 TimeoutStartSec=20
