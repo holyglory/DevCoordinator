@@ -176,6 +176,7 @@ def main() -> int:
         make_fake_docker(fake_bin / "docker")
         env = os.environ.copy()
         env["DEVCOORDINATOR_BACKUP_REGISTRY"] = "off"
+        env["DEVCOORDINATOR_BROKER_INTERNAL"] = "1"
         env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
         env["FAKE_DOCKER_LOG"] = str(tmp / "docker.log")
 
