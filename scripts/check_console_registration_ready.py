@@ -114,6 +114,92 @@ def classify_registration_snapshot(
         raise ConsoleRegistrationError(
             "unsafe registration baseline: an active lease still claims the Console port"
         )
+
+    # Server-wide installation enrolls every declared server before it has
+    # ever been observed.  The normalized broker projects that durable
+    # definition without an assignment, PID, or current port and may retain
+    # only the id of the already-released enrollment lease.  This is a safe
+    # retry state because the surrounding readiness loop independently pins
+    # the new systemd MainPID, argv, cwd, and cgroup on every observation.
+    if not relevant_assignments and len(target_servers) == 1:
+        enrolled = target_servers[0]
+        if enrolled.get("status") == "unobserved":
+            for key, expected in {
+                "key": expected_key,
+                "project": project,
+                "name": name,
+                "host": "127.0.0.1",
+                "port": None,
+                "pid": None,
+                "process_start_time": None,
+                "process_fingerprint": None,
+                "status": "unobserved",
+                "metadata_source": "normalized-sqlite",
+                "identity_observable": None,
+                "attribution": None,
+                "url": None,
+                "url_is_current": False,
+                "stopped_at": None,
+                "stopped_reason": None,
+            }.items():
+                if enrolled.get(key) != expected:
+                    raise ConsoleRegistrationError(
+                        "unsafe unobserved enrollment baseline: "
+                        f"server {key} is {enrolled.get(key)!r}, expected {expected!r}"
+                    )
+            server_id = enrolled.get("id")
+            if not isinstance(server_id, str) or not server_id.strip():
+                raise ConsoleRegistrationError(
+                    "unsafe unobserved enrollment baseline: server has no id"
+                )
+            cwd = enrolled.get("cwd")
+            if not isinstance(cwd, str) or not (
+                cwd == project or cwd.startswith(project.rstrip("/") + "/")
+            ):
+                raise ConsoleRegistrationError(
+                    "unsafe unobserved enrollment baseline: server cwd is outside project"
+                )
+            if enrolled.get("argv") != [] or "registration_identity" in enrolled:
+                raise ConsoleRegistrationError(
+                    "unsafe unobserved enrollment baseline: process identity evidence is present"
+                )
+            health = enrolled.get("health")
+            if not isinstance(health, dict) or any(
+                health.get(key) != expected
+                for key, expected in {
+                    "classification": "unobserved",
+                    "ok": None,
+                    "pid_alive": None,
+                }.items()
+            ):
+                raise ConsoleRegistrationError(
+                    "unsafe unobserved enrollment baseline: health is not wholly unobserved"
+                )
+            if enrolled.get("port_reused") is True or enrolled.get("port_reused_by") is not None:
+                raise ConsoleRegistrationError(
+                    "unsafe unobserved enrollment baseline: a raw listener claim is present"
+                )
+            lease_id = enrolled.get("lease_id")
+            if lease_id is not None and (
+                not isinstance(lease_id, str) or not lease_id.strip()
+            ):
+                raise ConsoleRegistrationError(
+                    "unsafe unobserved enrollment baseline: historical lease id is invalid"
+                )
+            if lease_id is not None and any(
+                row.get("id") == lease_id or row.get("lease_id") == lease_id
+                for row in leases
+            ):
+                raise ConsoleRegistrationError(
+                    "unsafe unobserved enrollment baseline: referenced lease is still present"
+                )
+            return "pending-enrolled-unobserved-baseline", {
+                "reason": "exact process-free server-wide enrollment baseline",
+                "server_id": server_id,
+                "inactive_lease_count": 0,
+                "active_stale_lease_count": 0,
+            }
+
     if not relevant_assignments and not target_servers:
         return "pending-clean-absence", {"reason": "registration graph is cleanly absent"}
 

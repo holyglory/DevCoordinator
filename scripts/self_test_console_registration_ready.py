@@ -180,6 +180,44 @@ def pending_assignment(*, project: str = FIXTURES.PROJECT, port: int = FIXTURES.
     }
 
 
+def enrolled_unobserved_server(*, project: str = FIXTURES.PROJECT) -> dict:
+    """Mirror the broker projection created by server-wide enrollment."""
+
+    return {
+        "argv": [],
+        "attribution": None,
+        "cwd": f"{project}/apps/DevOpsConsole",
+        "health": {
+            "classification": "unobserved",
+            "ok": None,
+            "pid_alive": None,
+        },
+        "health_url": "http://127.0.0.1:{port}/healthz",
+        "host": "127.0.0.1",
+        "id": FIXTURES.SERVER_ID,
+        "identity_observable": None,
+        "key": f"{project}::{FIXTURES.NAME}",
+        # Enrollment briefly leases the durable port and retains the released
+        # lease id as history; the v1 projection intentionally hides that
+        # inactive lease row.
+        "lease_id": "released-enrollment-lease",
+        "log_path": None,
+        "metadata_source": "normalized-sqlite",
+        "name": FIXTURES.NAME,
+        "pid": None,
+        "port": None,
+        "process_fingerprint": None,
+        "process_start_time": None,
+        "project": project,
+        "role": "web",
+        "status": "unobserved",
+        "stopped_at": None,
+        "stopped_reason": None,
+        "url": None,
+        "url_is_current": False,
+    }
+
+
 def classify(value: dict, *, project: str = FIXTURES.PROJECT, port: int = FIXTURES.PORT, pid: int = FIXTURES.MAIN_PID):
     return READY.classify_registration_snapshot(
         value,
@@ -1153,6 +1191,36 @@ def main() -> int:
     assignment_only = {"port_assignments": [pending_assignment()], "servers": [], "leases": []}
     assignment_only["port_assignments"][0]["server_status"] = "unregistered"
     require(classify(assignment_only)[0] == "pending-stopped-baseline", "unregistered exact assignment must retry")
+
+    enrolled = {
+        "port_assignments": [],
+        "servers": [enrolled_unobserved_server()],
+        "leases": [],
+    }
+    require(
+        classify(enrolled)[0] == "pending-enrolled-unobserved-baseline",
+        "exact server-wide enrollment baseline must retry",
+    )
+    enrolled_with_pid = copy.deepcopy(enrolled)
+    enrolled_with_pid["servers"][0]["pid"] = FIXTURES.MAIN_PID
+    must_fail(enrolled_with_pid, "unobserved", "enrollment baseline retains a PID")
+    enrolled_with_port = copy.deepcopy(enrolled)
+    enrolled_with_port["servers"][0]["port"] = FIXTURES.PORT
+    must_fail(enrolled_with_port, "Console port", "enrollment baseline retains a current port")
+    enrolled_with_lease = copy.deepcopy(enrolled)
+    enrolled_with_lease["leases"] = [
+        {
+            "id": "released-enrollment-lease",
+            "status": "active",
+            "port": FIXTURES.PORT + 1,
+            "purpose": "broker",
+        }
+    ]
+    must_fail(enrolled_with_lease, "lease", "enrollment baseline retains a referenced lease")
+    enrolled_foreign_cwd = copy.deepcopy(enrolled)
+    enrolled_foreign_cwd["servers"][0]["cwd"] = "/srv/foreign/apps/DevOpsConsole"
+    must_fail(enrolled_foreign_cwd, "cwd", "enrollment baseline names a foreign checkout")
+
     contradictory_assignment = copy.deepcopy(assignment_only)
     contradictory_assignment["port_assignments"][0]["server_status"] = "stopped"
     must_fail(contradictory_assignment, "expected 'unregistered'", "assignment says stopped without server")
