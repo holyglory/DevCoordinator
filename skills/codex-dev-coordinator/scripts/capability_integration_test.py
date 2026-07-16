@@ -405,6 +405,30 @@ def control_graph_signature(state: dict[str, object]) -> dict[str, object]:
     }
 
 
+def normalized_inventory_lease(
+    inventory: dict[str, object], lease_id: str
+) -> dict[str, object]:
+    """Return one exact v2 lease without accepting the legacy `id` shape."""
+
+    leases = inventory.get("leases")
+    if not isinstance(leases, list):
+        raise AssertionError("normalized inventory leases are not a list")
+    matches = [
+        item
+        for item in leases
+        if isinstance(item, dict) and item.get("lease_id") == lease_id
+    ]
+    if len(matches) != 1:
+        observed_ids = [
+            item.get("lease_id") for item in leases if isinstance(item, dict)
+        ]
+        raise AssertionError(
+            f"normalized inventory did not contain lease {lease_id!r} exactly once; "
+            f"observed lease_ids={observed_ids}"
+        )
+    return matches[0]
+
+
 def bootstrap_normalized_fixture(
     *, root: Path, project: Path, env: dict[str, str]
 ) -> None:
@@ -633,6 +657,12 @@ def run_normalized_relocation_preflight() -> int:
             ["state", "show"],
             context="relocation preflight state",
         )
+        inventory = run_coordinator_json(
+            env,
+            ["inventory", "--project", str(new_project), "--no-docker"],
+            context="relocation preflight inventory",
+        )
+        lease = normalized_inventory_lease(inventory, lease_id)
         server = (state.get("servers") or {}).get(server_id)
         assignment = (state.get("port_assignments") or {}).get(
             f"{new_project}::devops-console"
@@ -644,10 +674,11 @@ def run_normalized_relocation_preflight() -> int:
             and isinstance(assignment, dict)
             and assignment.get("project") == str(new_project)
             and assignment.get("port") == port
+            and lease.get("status") == "stale"
         ):
             raise AssertionError(
                 "public normalized relocation preflight did not preserve its exact graph: "
-                f"server={server} assignment={assignment}"
+                f"server={server} assignment={assignment} lease={lease}"
             )
         print("normalized relocation preflight ok")
         return 0
@@ -934,20 +965,14 @@ def run_integration() -> int:
             )
         plain_payload = json.loads(plain_inventory.stdout)
         plain_server = next(item for item in plain_payload["servers"] if item.get("id") == server_id)
-        plain_lease = next(
-            (
-                item
-                for item in plain_payload["leases"]
-                if item.get("lease_id") == registered["lease_id"]
-            ),
-            None,
+        plain_lease = normalized_inventory_lease(
+            plain_payload, str(registered["lease_id"])
         )
         if not (
             plain_server.get("status") == "running"
             and (plain_server.get("health") or {}).get("ok") is True
             and (plain_server.get("health") or {}).get("classification") == "healthy"
             and plain_server.get("identity_observable") is True
-            and isinstance(plain_lease, dict)
             and plain_lease.get("status") == "active"
         ):
             raise AssertionError(
@@ -1038,10 +1063,8 @@ def run_integration() -> int:
         cached_server = next(
             item for item in cached_inventory["servers"] if item.get("id") == server_id
         )
-        cached_lease = next(
-            item
-            for item in cached_inventory["leases"]
-            if item.get("id") == registered["lease_id"]
+        cached_lease = normalized_inventory_lease(
+            cached_inventory, str(registered["lease_id"])
         )
         if not (
             cached_server.get("status") == "running"
