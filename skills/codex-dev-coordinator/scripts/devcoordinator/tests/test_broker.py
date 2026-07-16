@@ -796,6 +796,51 @@ class AuthorizationAndProtocolTests(unittest.TestCase):
         )
         self.assertEqual(len(self.backend.calls), 3)
 
+    def test_atomic_host_inventory_supports_a_bounded_multi_account_graph(self) -> None:
+        class InventoryBackend:
+            def __init__(self, payload_bytes: int) -> None:
+                self.payload = "x" * payload_bytes
+
+            def execute(self, _request: AuthorizedBrokerRequest) -> Mapping[str, Any]:
+                return {"schema_version": 2, "graph_payload": self.payload}
+
+        # The real six-repository host graph crossed the retired 2 MiB result
+        # ceiling because normalized and v1 compatibility views coexist during
+        # migration. Keep one atomic snapshot comfortably above that boundary.
+        backend = InventoryBackend(3 * 1024 * 1024)
+        inventory_policy = {
+            os.geteuid(): AccountAccessPolicy(
+                account_id=ACCOUNT_ID,
+                grants={
+                    PROJECT_ID: {
+                        PROJECT_ID: frozenset({BrokerOperation.INVENTORY_READ})
+                    }
+                },
+            )
+        }
+        writer = SerializedMutationWriter(backend)  # type: ignore[arg-type]
+        service = BrokerService(StaticPeerAuthorizer(inventory_policy), writer)
+        request = request_for(
+            BrokerOperation.INVENTORY_READ, resource_id=PROJECT_ID
+        )
+        accepted = service.reply_for_document(self.peer, request.to_wire())
+
+        self.assertTrue(accepted["ok"], accepted)
+        self.assertEqual(len(accepted["result"]["graph_payload"]), 3 * 1024 * 1024)
+
+        # The boundary remains explicit and fail-closed rather than becoming
+        # an unbounded local-socket allocation.
+        bounded_writer = SerializedMutationWriter(
+            InventoryBackend(2048),  # type: ignore[arg-type]
+            max_result_bytes=1024,
+        )
+        bounded_service = BrokerService(
+            StaticPeerAuthorizer(inventory_policy), bounded_writer
+        )
+        rejected = bounded_service.reply_for_document(self.peer, request.to_wire())
+        self.assertFalse(rejected["ok"], rejected)
+        self.assertEqual(rejected["error"]["code"], "backend_result_too_large")
+
     def test_unknown_peer_and_cross_account_project_resource_operation_are_rejected(self) -> None:
         cases: list[tuple[str, PeerCredentials, dict[str, Any], str]] = []
 

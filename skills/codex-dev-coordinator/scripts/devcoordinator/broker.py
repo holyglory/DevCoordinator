@@ -41,7 +41,7 @@ PROTOCOL_VERSION = 1
 # Inventory is a bounded whole-host graph.  Keep the local protocol bounded,
 # but size it for a real multi-repository machine rather than a mutation-sized
 # reply.  Reads are not retained in the mutation replay cache.
-DEFAULT_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_SOCKET_MODE = 0o660
 DEFAULT_MAX_CLIENTS = 32
