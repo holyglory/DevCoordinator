@@ -110,17 +110,14 @@ def classify_registration_snapshot(
         raise ConsoleRegistrationError(
             "unsafe registration baseline: a non-stopped server claims the Console port"
         )
-    if active_port_leases or active_target_leases:
-        raise ConsoleRegistrationError(
-            "unsafe registration baseline: an active lease still claims the Console port"
-        )
 
     # Server-wide installation enrolls every declared server before it has
     # ever been observed.  The normalized broker projects that durable
-    # definition without an assignment, PID, or current port and may retain
-    # only the id of the already-released enrollment lease.  This is a safe
-    # retry state because the surrounding readiness loop independently pins
-    # the new systemd MainPID, argv, cwd, and cgroup on every observation.
+    # definition without an assignment, PID, or current port.  Before opening
+    # listeners, the Console then reserves its durable port through one linked
+    # broker lease whose owner_pid remains null until registration.  These are
+    # safe retry states because the surrounding readiness loop independently
+    # pins the new systemd MainPID, argv, cwd, and cgroup on every observation.
     if not relevant_assignments and len(target_servers) == 1:
         enrolled = target_servers[0]
         if enrolled.get("status") == "unobserved":
@@ -186,12 +183,73 @@ def classify_registration_snapshot(
                 raise ConsoleRegistrationError(
                     "unsafe unobserved enrollment baseline: historical lease id is invalid"
                 )
-            if lease_id is not None and any(
-                row.get("id") == lease_id or row.get("lease_id") == lease_id
+            referenced = [
+                row
                 for row in leases
-            ):
+                if lease_id is not None
+                and (row.get("id") == lease_id or row.get("lease_id") == lease_id)
+            ]
+            if len(referenced) > 1:
                 raise ConsoleRegistrationError(
-                    "unsafe unobserved enrollment baseline: referenced lease is still present"
+                    "unsafe unobserved enrollment baseline: referenced lease is ambiguous"
+                )
+            if referenced:
+                lease = referenced[0]
+                for key, expected in {
+                    "id": lease_id,
+                    "status": "active",
+                    "project": project,
+                    "port": port,
+                    "purpose": "broker",
+                    "assignment_key": expected_key,
+                    "server_id": server_id,
+                    "owner_pid": None,
+                    "deactivated_at": None,
+                }.items():
+                    if lease.get(key) != expected:
+                        raise ConsoleRegistrationError(
+                            "unsafe unobserved enrollment reservation: "
+                            f"lease {key} is {lease.get(key)!r}, expected {expected!r}"
+                        )
+                owner = lease.get("owner")
+                if not isinstance(owner, str) or not (
+                    owner.startswith("uid:") and owner[4:].isdigit()
+                ):
+                    raise ConsoleRegistrationError(
+                        "unsafe unobserved enrollment reservation: lease owner is invalid"
+                    )
+                agent = lease.get("agent")
+                if not isinstance(agent, str) or not agent.strip():
+                    raise ConsoleRegistrationError(
+                        "unsafe unobserved enrollment reservation: lease agent is invalid"
+                    )
+                fingerprint = lease.get("process_fingerprint")
+                if not isinstance(fingerprint, str) or not (
+                    fingerprint.startswith("sha256:")
+                    and len(fingerprint) == len("sha256:") + 64
+                    and all(character in "0123456789abcdef" for character in fingerprint[7:])
+                ):
+                    raise ConsoleRegistrationError(
+                        "unsafe unobserved enrollment reservation: lease fingerprint is invalid"
+                    )
+                if (
+                    len(active_port_leases) != 1
+                    or active_port_leases[0] is not lease
+                    or active_target_leases
+                ):
+                    raise ConsoleRegistrationError(
+                        "unsafe unobserved enrollment reservation: active lease ownership is ambiguous"
+                    )
+                return "pending-enrolled-reservation-baseline", {
+                    "reason": "exact pre-listener broker reservation",
+                    "server_id": server_id,
+                    "active_reservation_lease_id": lease_id,
+                    "inactive_lease_count": 0,
+                    "active_stale_lease_count": 0,
+                }
+            if active_port_leases or active_target_leases:
+                raise ConsoleRegistrationError(
+                    "unsafe registration baseline: an active lease is not linked to enrollment"
                 )
             return "pending-enrolled-unobserved-baseline", {
                 "reason": "exact process-free server-wide enrollment baseline",
@@ -199,6 +257,11 @@ def classify_registration_snapshot(
                 "inactive_lease_count": 0,
                 "active_stale_lease_count": 0,
             }
+
+    if active_port_leases or active_target_leases:
+        raise ConsoleRegistrationError(
+            "unsafe registration baseline: an active lease still claims the Console port"
+        )
 
     if not relevant_assignments and not target_servers:
         return "pending-clean-absence", {"reason": "registration graph is cleanly absent"}

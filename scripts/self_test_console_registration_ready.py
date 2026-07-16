@@ -1210,13 +1210,44 @@ def main() -> int:
     enrolled_with_lease = copy.deepcopy(enrolled)
     enrolled_with_lease["leases"] = [
         {
+            "agent": "console-startup",
+            "assignment_key": FIXTURES.ASSIGNMENT_KEY,
+            "deactivated_at": None,
             "id": "released-enrollment-lease",
+            "owner": "uid:1000",
+            "owner_pid": None,
             "status": "active",
-            "port": FIXTURES.PORT + 1,
+            "port": FIXTURES.PORT,
+            "process_fingerprint": "sha256:" + ("a" * 64),
+            "project": FIXTURES.PROJECT,
             "purpose": "broker",
+            "server_id": FIXTURES.SERVER_ID,
         }
     ]
-    must_fail(enrolled_with_lease, "lease", "enrollment baseline retains a referenced lease")
+    require(
+        classify(enrolled_with_lease)[0] == "pending-enrolled-reservation-baseline",
+        "exact pre-listener broker reservation must retry",
+    )
+    reservation_with_pid = copy.deepcopy(enrolled_with_lease)
+    reservation_with_pid["leases"][0]["owner_pid"] = FIXTURES.MAIN_PID
+    must_fail(reservation_with_pid, "owner_pid", "reservation already names a process")
+    reservation_for_other_server = copy.deepcopy(enrolled_with_lease)
+    reservation_for_other_server["leases"][0]["server_id"] = "other-server"
+    must_fail(
+        reservation_for_other_server,
+        "server_id",
+        "reservation belongs to another server",
+    )
+    reservation_for_other_port = copy.deepcopy(enrolled_with_lease)
+    reservation_for_other_port["leases"][0]["port"] = FIXTURES.PORT + 1
+    must_fail(
+        reservation_for_other_port,
+        "port",
+        "referenced reservation belongs to another port",
+    )
+    unlinked_active_lease = copy.deepcopy(enrolled_with_lease)
+    unlinked_active_lease["servers"][0]["lease_id"] = None
+    must_fail(unlinked_active_lease, "active lease", "active reservation is not linked")
     enrolled_foreign_cwd = copy.deepcopy(enrolled)
     enrolled_foreign_cwd["servers"][0]["cwd"] = "/srv/foreign/apps/DevOpsConsole"
     must_fail(enrolled_foreign_cwd, "cwd", "enrollment baseline names a foreign checkout")
