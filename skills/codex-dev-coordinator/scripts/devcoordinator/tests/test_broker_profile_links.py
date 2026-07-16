@@ -629,6 +629,34 @@ class BrokerLinkStoreTests(unittest.TestCase):
             operation_id=operation_id,
         )
 
+    def test_first_broker_mutation_bootstraps_exact_profile_repository(self) -> None:
+        with AccountStore.open_default(self.root / "empty-client-journal") as empty:
+            links = BrokerLinkStore(empty)
+            reserved = links.reserve_lease(
+                profile=self.profile,
+                repository=self.repository,
+                server_name="web",
+                server_definition_id="server-web",
+                broker_lease_id="broker-lease-first-use",
+                port=43109,
+                protocol="tcp",
+                operation_id="operation-first-use",
+                expires_at=None,
+            )
+            with empty.read_transaction() as connection:
+                repository = connection.execute(
+                    """
+                    SELECT r.repo_id, r.canonical_root, i.status
+                    FROM repositories r
+                    JOIN repository_installations i USING(repo_id)
+                    """
+                ).fetchone()
+            self.assertEqual(reserved.repo_id, REPO_ID)
+            self.assertEqual(
+                tuple(repository),
+                (REPO_ID, str(self.repository_root), "installed"),
+            )
+
     def test_fresh_schema_lease_reserve_bind_release_is_idempotent(self) -> None:
         reserved = self._reserve_lease()
         repeated = self._reserve_lease()

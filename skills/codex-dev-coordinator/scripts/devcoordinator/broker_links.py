@@ -1063,6 +1063,7 @@ class BrokerLinkStore:
         server_name: str,
         server_definition_id: str,
     ) -> None:
+        self._ensure_repository(repository)
         timestamp = utc_timestamp()
         with self._store.immediate_transaction() as connection:
             repo = connection.execute(
@@ -1097,6 +1098,61 @@ class BrokerLinkStore:
                     timestamp,
                     timestamp,
                 ),
+            )
+
+    def _ensure_repository(self, repository: BrokerRepositoryProfile) -> None:
+        """Bootstrap one empty client journal from its root-provisioned profile."""
+
+        host_id = self._store.ensure_local_host()
+        timestamp = utc_timestamp()
+        with self._store.immediate_transaction() as connection:
+            rows = list(
+                connection.execute(
+                    """
+                    SELECT repo_id, canonical_root FROM repositories
+                    WHERE repo_id = ? OR canonical_root = ?
+                    """,
+                    (repository.repo_id, repository.canonical_root),
+                )
+            )
+            if rows and (
+                len(rows) != 1
+                or str(rows[0]["repo_id"]) != repository.repo_id
+                or str(rows[0]["canonical_root"]) != repository.canonical_root
+            ):
+                raise RuntimeError(
+                    "local normalized repository does not match the root-provisioned broker enrollment"
+                )
+            if not rows:
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+                    """,
+                    (
+                        repository.repo_id,
+                        host_id,
+                        repository.canonical_root,
+                        Path(repository.canonical_root).name
+                        or repository.canonical_root,
+                        int(repository.generation),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO repository_installations(
+                    repo_id, status, startup_fenced, generation,
+                    actor, reason, updated_at
+                ) VALUES (?, 'installed', 0, 0,
+                          'broker-profile-bootstrap',
+                          'root-provisioned broker enrollment', ?)
+                ON CONFLICT(repo_id) DO NOTHING
+                """,
+                (repository.repo_id, timestamp),
             )
 
     def _begin_release(
