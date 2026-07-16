@@ -2439,6 +2439,13 @@ def _require_normalized_bootstrap_before_mutation(store: AccountStore) -> None:
     or action reservation can establish normalized authority.
     """
 
+    if authority_mode() == "system":
+        # A server-wide client journal is a per-UID linkage/reconciliation
+        # cache, never an authority migration destination. Importing the old
+        # account store here would recreate split authority and can fence
+        # valid broker mutations with historical definition conflicts.
+        return
+
     with store.read_transaction() as connection:
         metadata = connection.execute(
             """

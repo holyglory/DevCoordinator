@@ -22,6 +22,18 @@ def parser() -> argparse.ArgumentParser:
 
 
 class LifecycleParserContractTests(unittest.TestCase):
+    def test_system_client_journal_never_imports_legacy_account_authority(self) -> None:
+        with (
+            mock.patch.object(dev_coordinator, "authority_mode", return_value="system"),
+            mock.patch.object(
+                dev_coordinator,
+                "bootstrap_legacy_import",
+                side_effect=AssertionError("system journal imported account authority"),
+            ) as legacy_import,
+        ):
+            dev_coordinator._require_normalized_bootstrap_before_mutation(object())
+        legacy_import.assert_not_called()
+
     def test_service_authority_rejects_user_workload_commands(self) -> None:
         args = dev_coordinator.build_parser().parse_args(
             ["server", "list"]
