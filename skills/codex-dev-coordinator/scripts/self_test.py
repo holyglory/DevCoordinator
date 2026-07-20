@@ -10,6 +10,7 @@ import http.server
 import socketserver
 import json
 import os
+import pwd
 import socket
 import stat
 import subprocess
@@ -52,6 +53,26 @@ class _FastBindThreadingHTTPServer(http.server.ThreadingHTTPServer):
 
 
 _ISSUED_PORTS: set[int] = set()
+
+
+def canonical_test_temp_base() -> Path:
+    """Return a writable canonical base outside any host/user Git marker."""
+
+    candidates = (
+        os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT"),
+        pwd.getpwuid(os.geteuid()).pw_dir,
+        tempfile.gettempdir(),
+    )
+    for raw in dict.fromkeys(value for value in candidates if value):
+        base = Path(str(raw)).resolve()
+        if not base.is_dir() or not os.access(base, os.W_OK | os.X_OK):
+            continue
+        cursor = base
+        while not ((cursor / ".git").exists() or (cursor / ".git").is_symlink()):
+            if cursor.parent == cursor:
+                return base
+            cursor = cursor.parent
+    raise RuntimeError("no writable test temp root exists outside every Git worktree")
 
 
 def free_port() -> int:
@@ -412,11 +433,17 @@ def check_registration_pid_guards() -> None:
     """Prove explicit registration binds the exact process, project and port."""
 
     module = _load_module()
-    root = Path(tempfile.mkdtemp(prefix="coordinator-register-pid-")).resolve(strict=True)
+    root = Path(
+        tempfile.mkdtemp(
+            prefix="coordinator-register-pid-", dir=canonical_test_temp_base()
+        )
+    ).resolve(strict=True)
     project = root / "project"
     foreign_project = root / "foreign"
     project.mkdir()
     foreign_project.mkdir()
+    (project / ".git").mkdir()
+    (foreign_project / ".git").mkdir()
     processes: list[subprocess.Popen[str]] = []
 
     # Cross-version guard: Python 3.9 Path.resolve() can turn an unreadable
@@ -1600,12 +1627,11 @@ def check_inventory_transport_controls(
     state_home.mkdir(parents=True)
     fake_bin.mkdir(parents=True)
 
-    container_id = "abc123def456"
-    full_container_id = f"{container_id}{'0' * 52}"
+    container_id = f"abc123def456{'0' * 52}"
     history = [
         {
             "id": container_id,
-            "container_id": full_container_id,
+            "container_id": container_id,
             "name": "transport-postgres",
             "timestamp": module.iso_timestamp(float(index + 1)),
             "timestamp_ts": float(index),
@@ -1649,7 +1675,7 @@ if args[:1] == ["ps"]:
 elif args[:1] == ["stats"]:
     print(json.dumps({{
         "ID": "{container_id}",
-        "Container": "{full_container_id}",
+        "Container": "{container_id}",
         "Name": "transport-postgres",
         "CPUPerc": "7.50%",
         "MemPerc": "6.25%",
@@ -1661,10 +1687,13 @@ elif args[:1] == ["stats"]:
 elif args[:3] == ["inspect", "--format", "{{{{json .}}}}"]:
     for _container in args[3:]:
         print(json.dumps({{
-            "Id": "{full_container_id}",
+            "Id": "{container_id}",
             "Name": "/transport-postgres",
+            "State": {{"Running": True}},
             "Config": {{"Labels": {{}}}},
         }}))
+elif args[:2] in (["network", "ls"], ["volume", "ls"]):
+    pass
 else:
     sys.exit(1)
 """,
@@ -1698,7 +1727,16 @@ else:
         "default inventory JSON should remain pretty-printed",
     )
     default_payload = json.loads(default_result.stdout)
-    default_container = default_payload["docker"]["containers"][0]
+    default_docker = default_payload["docker"]
+    check(
+        default_docker.get("available") is True
+        and default_docker.get("container_inspection_available") is True
+        and default_docker.get("compose_assets_available") is True
+        and default_docker.get("compose_assets") == [],
+        "inventory transport fixture must provide complete container and empty "
+        f"Compose-asset evidence: {default_docker}",
+    )
+    default_container = default_docker["containers"][0]
     check(
         len(default_container.get("stats_history") or []) == module.DOCKER_STATS_HISTORY_LIMIT,
         "default inventory should retain the full bounded Docker stats history",
@@ -1748,7 +1786,7 @@ else:
     check(
         current_stats.get("live") is True
         and current_stats.get("id") == container_id
-        and current_stats.get("container_id") == full_container_id
+        and current_stats.get("container_id") == container_id
         and current_stats.get("cpu_percent") == 7.5
         and current_stats.get("memory_usage_bytes") == 64 * 1024 * 1024,
         f"zero history limit must preserve the current live Docker stats sample: {current_stats}",
@@ -1817,7 +1855,11 @@ def main() -> int:
     check_listener_and_health_helpers()
     check_registration_pid_guards()
     check_multi_runtime_boundaries()
-    tmp = Path(tempfile.mkdtemp(prefix="codex-dev-coordinator-self-test-")).resolve(strict=True)
+    tmp = Path(
+        tempfile.mkdtemp(
+            prefix="codex-dev-coordinator-self-test-", dir=canonical_test_temp_base()
+        )
+    ).resolve(strict=True)
     env = os.environ.copy()
     env["CODEX_AGENT_COORDINATOR_HOME"] = str(tmp / "state")
     # The historical fixture corpus intentionally exercises state.json byte
@@ -2241,7 +2283,14 @@ exit 0
         finally:
             dc.resolve_docker_executable = original_resolve_docker
         effective_compose_restart = [
-            "docker", "compose", "-f", "compose.yml", "restart", "postgres"
+            "docker",
+            "compose",
+            "--project-directory",
+            str(compose_restart_project.resolve()),
+            "-f",
+            "compose.yml",
+            "restart",
+            "postgres",
         ]
         check(
             compose_restart_commands == [effective_compose_restart],
@@ -2298,7 +2347,17 @@ exit 0
             dc.ensure_runtime_docker_metadata_coordinated = original_metadata_coordinated
         check(
             compose_restart_commands == [
-                ["docker", "compose", "-f", "compose.yml", "up", "-d", "postgres"]
+                [
+                    "docker",
+                    "compose",
+                    "--project-directory",
+                    str(compose_restart_project.resolve()),
+                    "-f",
+                    "compose.yml",
+                    "up",
+                    "-d",
+                    "postgres",
+                ]
             ],
             "Compose restart must create a missing declared service through the same single "
             f"effective lifecycle action: {compose_restart_commands}",
@@ -2350,8 +2409,27 @@ exit 0
         check(
             compose_restart_commands
             == [
-                ["docker", "compose", "-f", "compose.yml", "up", "-d", "postgres"],
-                ["docker", "compose", "-f", "compose.yml", "restart", "worker"],
+                [
+                    "docker",
+                    "compose",
+                    "--project-directory",
+                    str(compose_restart_project.resolve()),
+                    "-f",
+                    "compose.yml",
+                    "up",
+                    "-d",
+                    "postgres",
+                ],
+                [
+                    "docker",
+                    "compose",
+                    "--project-directory",
+                    str(compose_restart_project.resolve()),
+                    "-f",
+                    "compose.yml",
+                    "restart",
+                    "worker",
+                ],
             ],
             "mixed Compose restart must recover missing dependencies before restarting running services: "
             f"{compose_restart_commands}",
@@ -3221,7 +3299,7 @@ exit 0
                 "--health-url",
                 f"http://127.0.0.1:{hanging_health_port}/",
                 "--health-timeout",
-                "1",
+                "3",
             ],
             text=True,
             stdout=subprocess.PIPE,
@@ -3245,6 +3323,7 @@ exit 0
             env=env,
         )
         register_lease_elapsed = time.monotonic() - register_lease_started
+        register_still_running_after_lease = hanging_register.poll() is None
         hanging_register_stdout, hanging_register_stderr = hanging_register.communicate(timeout=10)
         check(
             hanging_register.returncode == 0,
@@ -3257,8 +3336,9 @@ exit 0
             "independent lease should succeed while server registration health-checks",
         )
         check(
-            register_lease_elapsed < 0.75,
-            f"slow server registration held the state lock for {register_lease_elapsed:.2f}s",
+            register_still_running_after_lease,
+            "slow server registration finished before the independent lease; "
+            f"the lease took {register_lease_elapsed:.2f}s and may have waited on the state lock",
         )
         check(hanging_health["status"] == "unhealthy", "hanging HTTP health checks should report unhealthy")
         hanging_inventory = run(["inventory", "--project", str(hanging_health_project), "--no-docker"], env=env)
@@ -3301,6 +3381,7 @@ exit 0
             env=env,
         )
         hanging_lease_elapsed = time.monotonic() - hanging_lease_started
+        inventory_still_running_after_lease = hanging_inventory_process.poll() is None
         hanging_stdout, hanging_stderr = hanging_inventory_process.communicate(timeout=10)
         check(
             hanging_inventory_process.returncode == 0,
@@ -3311,8 +3392,9 @@ exit 0
             "independent lease should succeed while inventory observes a hanging endpoint",
         )
         check(
-            hanging_lease_elapsed < 0.75,
-            f"slow inventory health observation held the state lock for {hanging_lease_elapsed:.2f}s",
+            inventory_still_running_after_lease,
+            "slow inventory observation finished before the independent lease; "
+            f"the lease took {hanging_lease_elapsed:.2f}s and may have waited on the state lock",
         )
         hanging_status_process = subprocess.Popen(
             [
@@ -3347,6 +3429,7 @@ exit 0
             env=env,
         )
         status_lease_elapsed = time.monotonic() - status_lease_started
+        status_still_running_after_lease = hanging_status_process.poll() is None
         status_stdout, status_stderr = hanging_status_process.communicate(timeout=15)
         check(
             hanging_status_process.returncode == 0,
@@ -3357,8 +3440,9 @@ exit 0
             "independent lease should succeed while server status health-checks",
         )
         check(
-            status_lease_elapsed < 0.75,
-            f"slow server status held the state lock for {status_lease_elapsed:.2f}s",
+            status_still_running_after_lease,
+            "slow server status finished before the independent lease; "
+            f"the lease took {status_lease_elapsed:.2f}s and may have waited on the state lock",
         )
         # Optimistic observation commits must not resurrect a server after a
         # newer lifecycle generation stops it. The slow status starts from an
@@ -4178,7 +4262,8 @@ exit 0
         check(docker_ps_all["command"] == ["docker", "ps", "--all"], "docker ps --all command shape drifted")
         docker_stats = run(["docker", "stats", "--dry-run"], env=env)
         check(
-            docker_stats["command"] == ["docker", "stats", "--no-stream", "--format", "{{json .}}"],
+            docker_stats["command"]
+            == ["docker", "stats", "--no-stream", "--no-trunc", "--format", "{{json .}}"],
             "docker stats command shape drifted",
         )
 
@@ -4186,19 +4271,29 @@ exit 0
         fake_bin.mkdir()
         compose_owner = tmp / "compose-owner"
         leak_owner = tmp / "leak-owner"
+        for repository in (compose_owner, leak_owner):
+            repository.mkdir()
+            (repository / ".git").mkdir()
         fake_docker = fake_bin / "docker"
         leak_labels = {
             "com.docker.compose.project.working_dir": str(leak_owner),
             "com.docker.compose.project": "leak-owner",
         }
+        fixture_postgres_id = "abc123def456" + "0" * 52
+        runtime_db_id = "fed789abc012" + "1" * 52
+        fixture_compose_id = "def456abc123" + "2" * 52
+        grouprepo_id = "11aa22bb33cc" + "3" * 52
+        leakrepo_id = "22bb33cc44dd" + "4" * 52
+        duporepo_id = "33cc44dd55ee" + "5" * 52
         fake_containers = {
-            "abc123def456": {"Id": "abc123def4567890", "Name": "/fixture-postgres", "Config": {"Labels": {}}},
-            "fixture-postgres": {"Id": "abc123def4567890", "Name": "/fixture-postgres", "Config": {"Labels": {}}},
-            "fed789abc012": {"Id": "fed789abc0123456", "Name": "/runtime-db", "Config": {"Labels": {}}},
-            "runtime-db": {"Id": "fed789abc0123456", "Name": "/runtime-db", "Config": {"Labels": {}}},
-            "def456abc123": {
-                "Id": "def456abc1237890",
+            fixture_postgres_id: {"Id": fixture_postgres_id, "Name": "/fixture-postgres", "State": {"Running": True}, "Config": {"Labels": {}}},
+            "fixture-postgres": {"Id": fixture_postgres_id, "Name": "/fixture-postgres", "State": {"Running": True}, "Config": {"Labels": {}}},
+            runtime_db_id: {"Id": runtime_db_id, "Name": "/runtime-db", "State": {"Running": True}, "Config": {"Labels": {}}},
+            "runtime-db": {"Id": runtime_db_id, "Name": "/runtime-db", "State": {"Running": True}, "Config": {"Labels": {}}},
+            fixture_compose_id: {
+                "Id": fixture_compose_id,
                 "Name": "/fixture-compose-db",
+                "State": {"Running": True},
                 "Config": {
                     "Labels": {
                         "com.docker.compose.project.working_dir": str(compose_owner),
@@ -4207,8 +4302,9 @@ exit 0
                 },
             },
             "fixture-compose-db": {
-                "Id": "def456abc1237890",
+                "Id": fixture_compose_id,
                 "Name": "/fixture-compose-db",
+                "State": {"Running": True},
                 "Config": {
                     "Labels": {
                         "com.docker.compose.project.working_dir": str(compose_owner),
@@ -4220,20 +4316,20 @@ exit 0
             # an unattributed container named after a real repo, a labeled
             # container whose name also matches a different repo, and an
             # unattributed container whose name matches two repos.
-            "11aa22bb33cc": {"Id": "11aa22bb33cc4455", "Name": "/grouprepo-db", "Config": {"Labels": {}}},
-            "grouprepo-db": {"Id": "11aa22bb33cc4455", "Name": "/grouprepo-db", "Config": {"Labels": {}}},
-            "22bb33cc44dd": {"Id": "22bb33cc44dd5566", "Name": "/leakrepo-db", "Config": {"Labels": leak_labels}},
-            "leakrepo-db": {"Id": "22bb33cc44dd5566", "Name": "/leakrepo-db", "Config": {"Labels": leak_labels}},
-            "33cc44dd55ee": {"Id": "33cc44dd55ee6677", "Name": "/duporepo-db", "Config": {"Labels": {}}},
-            "duporepo-db": {"Id": "33cc44dd55ee6677", "Name": "/duporepo-db", "Config": {"Labels": {}}},
+            grouprepo_id: {"Id": grouprepo_id, "Name": "/grouprepo-db", "State": {"Running": True}, "Config": {"Labels": {}}},
+            "grouprepo-db": {"Id": grouprepo_id, "Name": "/grouprepo-db", "State": {"Running": True}, "Config": {"Labels": {}}},
+            leakrepo_id: {"Id": leakrepo_id, "Name": "/leakrepo-db", "State": {"Running": True}, "Config": {"Labels": leak_labels}},
+            "leakrepo-db": {"Id": leakrepo_id, "Name": "/leakrepo-db", "State": {"Running": True}, "Config": {"Labels": leak_labels}},
+            duporepo_id: {"Id": duporepo_id, "Name": "/duporepo-db", "State": {"Running": True}, "Config": {"Labels": {}}},
+            "duporepo-db": {"Id": duporepo_id, "Name": "/duporepo-db", "State": {"Running": True}, "Config": {"Labels": {}}},
         }
         fake_ps = [
-            {"ID": "abc123def456", "Names": "fixture-postgres", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "0.0.0.0:5544->5432/tcp"},
-            {"ID": "fed789abc012", "Names": "runtime-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
-            {"ID": "def456abc123", "Names": "fixture-compose-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
-            {"ID": "11aa22bb33cc", "Names": "grouprepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
-            {"ID": "22bb33cc44dd", "Names": "leakrepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
-            {"ID": "33cc44dd55ee", "Names": "duporepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
+            {"ID": fixture_postgres_id, "Names": "fixture-postgres", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "0.0.0.0:5544->5432/tcp"},
+            {"ID": runtime_db_id, "Names": "runtime-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
+            {"ID": fixture_compose_id, "Names": "fixture-compose-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
+            {"ID": grouprepo_id, "Names": "grouprepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
+            {"ID": leakrepo_id, "Names": "leakrepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
+            {"ID": duporepo_id, "Names": "duporepo-db", "Image": "postgres:16", "Status": "Up 1 second", "Ports": "5432/tcp"},
         ]
         fake_docker.write_text(
             f"""#!/usr/bin/env python3
@@ -4244,7 +4340,19 @@ import time
 args = sys.argv[1:]
 delay = float(os.environ.get("CODEX_COORDINATOR_FAKE_DOCKER_DELAY", "0"))
 if delay:
-    time.sleep(delay)
+    ready_file = os.environ.get("CODEX_COORDINATOR_FAKE_DOCKER_READY_FILE")
+    release_file = os.environ.get("CODEX_COORDINATOR_FAKE_DOCKER_RELEASE_FILE")
+    if ready_file:
+        with open(ready_file, "w", encoding="utf-8") as marker:
+            marker.write("ready\\n")
+    if release_file:
+        deadline = time.monotonic() + 10
+        while not os.path.exists(release_file) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not os.path.exists(release_file):
+            sys.exit(2)
+    else:
+        time.sleep(delay)
 containers = json.loads({json.dumps(json.dumps(fake_containers))})
 ps_rows = json.loads({json.dumps(json.dumps(fake_ps))})
 if args[:1] == ["info"]:
@@ -4318,6 +4426,14 @@ else:
         # slow Docker executable must not serialize an unrelated state mutation.
         slow_docker_env = fake_env.copy()
         slow_docker_env["CODEX_COORDINATOR_FAKE_DOCKER_DELAY"] = "2"
+        slow_stats_ready = tmp / "slow-docker-stats.ready"
+        slow_stats_release = tmp / "slow-docker-stats.release"
+        slow_docker_env["CODEX_COORDINATOR_FAKE_DOCKER_READY_FILE"] = str(
+            slow_stats_ready
+        )
+        slow_docker_env["CODEX_COORDINATOR_FAKE_DOCKER_RELEASE_FILE"] = str(
+            slow_stats_release
+        )
         slow_stats = subprocess.Popen(
             [sys.executable, str(SCRIPT), "docker", "stats"],
             text=True,
@@ -4325,9 +4441,12 @@ else:
             stderr=subprocess.PIPE,
             env=slow_docker_env,
         )
-        time.sleep(0.25)
+        deadline = time.monotonic() + 10
+        while not slow_stats_ready.exists() and time.monotonic() < deadline:
+            check(slow_stats.poll() is None, "slow Docker stats fixture exited before pausing")
+            time.sleep(0.01)
+        check(slow_stats_ready.exists(), "slow Docker stats fixture did not pause")
         docker_independent_port = free_port()
-        docker_lease_started = time.monotonic()
         docker_independent_lease = run(
             [
                 "port",
@@ -4341,16 +4460,24 @@ else:
             ],
             env=env,
         )
-        docker_lease_elapsed = time.monotonic() - docker_lease_started
+        check(
+            slow_stats.poll() is None,
+            "independent lease waited for read-only Docker stats",
+        )
+        slow_stats_release.write_text("release\n", encoding="utf-8")
         stats_stdout, stats_stderr = slow_stats.communicate(timeout=10)
         check(slow_stats.returncode == 0, f"slow Docker stats fixture should complete: {stats_stdout}\n{stats_stderr}")
         check(
             docker_independent_lease["port"] == docker_independent_port,
             "independent lease should succeed while Docker stats waits",
         )
-        check(
-            docker_lease_elapsed < 0.75,
-            f"slow Docker stats held the state lock for {docker_lease_elapsed:.2f}s",
+        slow_register_ready = tmp / "slow-docker-register.ready"
+        slow_register_release = tmp / "slow-docker-register.release"
+        slow_docker_env["CODEX_COORDINATOR_FAKE_DOCKER_READY_FILE"] = str(
+            slow_register_ready
+        )
+        slow_docker_env["CODEX_COORDINATOR_FAKE_DOCKER_RELEASE_FILE"] = str(
+            slow_register_release
         )
         slow_docker_register = subprocess.Popen(
             [
@@ -4372,8 +4499,14 @@ else:
             stderr=subprocess.PIPE,
             env=slow_docker_env,
         )
-        time.sleep(0.25)
-        docker_register_parallel_started = time.monotonic()
+        deadline = time.monotonic() + 10
+        while not slow_register_ready.exists() and time.monotonic() < deadline:
+            check(
+                slow_docker_register.poll() is None,
+                "slow Docker registration fixture exited before pausing",
+            )
+            time.sleep(0.01)
+        check(slow_register_ready.exists(), "slow Docker registration fixture did not pause")
         docker_register_parallel = subprocess.run(
             [
                 sys.executable,
@@ -4395,17 +4528,15 @@ else:
             env=fake_env,
             timeout=5,
         )
-        docker_register_parallel_elapsed = time.monotonic() - docker_register_parallel_started
         check(
             docker_register_parallel.returncode == 0,
             "a fast metadata registration may complete while another caller is still doing read-only Docker inspection",
         )
         check(
-            docker_register_parallel_elapsed < 0.75,
-            f"read-only Docker identity inspection should not hold a mutation reservation, took {docker_register_parallel_elapsed:.2f}s",
+            slow_docker_register.poll() is None,
+            "fast metadata registration waited for read-only Docker identity inspection",
         )
         docker_register_independent_port = free_port()
-        docker_register_lease_started = time.monotonic()
         docker_register_independent_lease = run(
             [
                 "port",
@@ -4419,7 +4550,11 @@ else:
             ],
             env=env,
         )
-        docker_register_lease_elapsed = time.monotonic() - docker_register_lease_started
+        check(
+            slow_docker_register.poll() is None,
+            "independent lease waited for read-only Docker identity inspection",
+        )
+        slow_register_release.write_text("release\n", encoding="utf-8")
         docker_register_stdout, docker_register_stderr = slow_docker_register.communicate(timeout=10)
         check(
             slow_docker_register.returncode == 0,
@@ -4428,10 +4563,6 @@ else:
         check(
             docker_register_independent_lease["port"] == docker_register_independent_port,
             "independent lease should succeed while Docker register inspects a container",
-        )
-        check(
-            docker_register_lease_elapsed < 0.75,
-            f"slow Docker registration held the state lock for {docker_register_lease_elapsed:.2f}s",
         )
 
         declared_docker_project = tmp / "declared-docker-project"
@@ -4807,7 +4938,11 @@ else:
         api_runtime = post_json(api_port, "/v1/projects/status", {"project": str(tmp)}, token=api_token)
         check("services" in api_runtime and "ok" in api_runtime, "API project status should expose runtime report")
         api_stats = post_json(api_port, "/v1/docker/stats", {"dry_run": True}, token=api_token)
-        check(api_stats["command"] == ["docker", "stats", "--no-stream", "--format", "{{json .}}"], "API docker stats should use real stats command")
+        check(
+            api_stats["command"]
+            == ["docker", "stats", "--no-stream", "--no-trunc", "--format", "{{json .}}"],
+            "API docker stats should use real stats command",
+        )
         api_assign_port = free_port()
         api_assigned = post_json(
             api_port,

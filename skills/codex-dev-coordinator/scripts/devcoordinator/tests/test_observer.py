@@ -16,12 +16,15 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 from devcoordinator.observer import ObservationError, SingleFlightObserver
+from devcoordinator.host_observation import commit_host_inventory_observation
+from devcoordinator.store import CoordinatorStore, utc_timestamp
 
 
 class SQLiteTicketStore:
     def __init__(self, path: Path) -> None:
         self.path = path
-        with self._connection() as connection:
+        connection = self._connection()
+        try:
             connection.executescript(
                 """
                 CREATE TABLE observation_snapshots (
@@ -44,6 +47,8 @@ class SQLiteTicketStore:
                 );
                 """
             )
+        finally:
+            connection.close()
 
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
@@ -52,7 +57,13 @@ class SQLiteTicketStore:
         return connection
 
     @contextmanager
-    def immediate_transaction(self, *, max_seconds: float | None = None):
+    def immediate_transaction(
+        self,
+        *,
+        max_seconds: float | None = None,
+        revision_kind: str | None = "state",
+    ):
+        del max_seconds, revision_kind
         connection = self._connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -82,6 +93,57 @@ class SingleFlightObserverTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_account_store_success_advances_only_observation_revision_once(
+        self,
+    ) -> None:
+        database = Path(self.temp.name) / "normalized.sqlite3"
+        now = utc_timestamp()
+        with CoordinatorStore.open(database) as store:
+            with store.immediate_transaction(revision_kind=None) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO hosts(
+                        host_id, machine_fingerprint, platform, hostname,
+                        created_at, updated_at
+                    ) VALUES ('host-real', 'machine-real', 'test',
+                              'test-host', ?, ?)
+                    """,
+                    (now, now),
+                )
+            before = store.metadata
+            outcome = SingleFlightObserver(store).observe(
+                host_id="host-real",
+                observer_domain="host-runtime-v2:full-docker",
+                sampler=lambda: {
+                    "sampled_at": now,
+                    "inventory": {
+                        "servers": [],
+                        "docker": {
+                            "available": False,
+                            "error": "fixture Docker unavailable",
+                            "containers": [],
+                            "postgres": [],
+                        },
+                    },
+                },
+                commit=lambda connection, snapshot_id, sample: (
+                    commit_host_inventory_observation(
+                        connection,
+                        snapshot_id,
+                        sample,
+                        host_id="host-real",
+                        coordinator_home=self.temp.name,
+                    )
+                ),
+            )
+            after = store.metadata
+        self.assertFalse(outcome.joined)
+        self.assertEqual(after.state_revision, before.state_revision)
+        self.assertEqual(
+            after.observation_revision,
+            before.observation_revision + 1,
+        )
 
     @staticmethod
     def commit(connection: sqlite3.Connection, snapshot_id: str, sample: dict) -> None:
@@ -135,6 +197,11 @@ class SingleFlightObserverTests(unittest.TestCase):
         self.assertEqual(sample_calls, 1)
         self.assertEqual({item.snapshot_id for item in outcomes}, {outcomes[0].snapshot_id})
         self.assertEqual(sorted(item.joined for item in outcomes), [False, True])
+        self.assertRegex(
+            outcomes[0].material_fingerprint,
+            r"^[0-9a-f]{64}$",
+            "material evidence must use the lifecycle persistence fingerprint format",
+        )
         with self.store.read_transaction() as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM observed_values").fetchone()[0], 1)
 

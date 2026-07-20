@@ -169,7 +169,13 @@ test('sessionFrom: valid session accepted, policy membership re-checked on EVERY
   // Cookie signed for an email that was never approved.
   const { cookie: strangerCookie } = sessions.issue({ sub: '2', email: 'stranger@evil.com' });
   const guard2 = createGuard({ sessions, access: makeAccess(new Set(['admin@vr.ae'])), config: PROD_CONFIG });
-  assert.equal(guard2.sessionFrom({ headers: { cookie: strangerCookie.slice(0, strangerCookie.indexOf(';')) } }), null);
+  const strangerHeader = strangerCookie.slice(0, strangerCookie.indexOf(';'));
+  assert.equal(guard2.sessionFrom({ headers: { cookie: strangerHeader } }), null);
+  assert.equal(
+    guard2.identityFrom({ headers: { cookie: strangerHeader } }).email,
+    'stranger@evil.com',
+    'a verified signed identity remains distinguishable from authorization',
+  );
 
   // No cookie / tampered cookie.
   assert.equal(guard2.sessionFrom({ headers: {} }), null);
@@ -210,5 +216,21 @@ test('loginRedirectUrl builds an absolute rt from the request, host sanitized', 
   assert.equal(
     guard.loginRedirectUrl({ headers: { host: 'bad host!!' }, url: '/p' }),
     `https://console.vr.ae/auth/login?rt=${encodeURIComponent('https://console.vr.ae/p')}`,
+  );
+});
+
+test('checkOriginFor accepts only the exact denied-resource origin, not a sibling subdomain', () => {
+  const guard = makeGuard();
+  assert.equal(
+    guard.checkOriginFor({ headers: { origin: 'https://app.vr.ae' } }, 'https://app.vr.ae'),
+    true,
+  );
+  assert.equal(
+    guard.checkOriginFor({ headers: { origin: 'https://evil.vr.ae' } }, 'https://app.vr.ae'),
+    false,
+  );
+  assert.equal(
+    guard.checkOriginFor({ headers: { referer: 'https://app.vr.ae/denied' } }, 'https://app.vr.ae'),
+    true,
   );
 });

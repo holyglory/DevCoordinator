@@ -20,6 +20,12 @@ export const CANONICAL_PREFS = Object.freeze({
   hidden: { servers: [], docker: [], projects: [] },
 });
 
+export const CANONICAL_TELEGRAM = Object.freeze({
+  version: 1,
+  bots: [],
+  projects: [],
+});
+
 export const CANONICAL_OVERVIEW = Object.freeze({
   console: {
     domain: 'example.test',
@@ -151,5 +157,6 @@ export function canonicalApiResponse(url, method = 'GET') {
   if (parsed.pathname === '/api/prefs') return CANONICAL_PREFS;
   if (parsed.pathname === '/api/overview') return CANONICAL_OVERVIEW;
   if (parsed.pathname === '/api/metrics/history') return CANONICAL_METRICS;
+  if (parsed.pathname === '/api/telegram') return CANONICAL_TELEGRAM;
   return null;
 }

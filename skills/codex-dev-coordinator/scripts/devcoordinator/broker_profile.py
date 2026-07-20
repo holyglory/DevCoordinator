@@ -18,10 +18,18 @@ import sys
 import time
 from typing import Any, Mapping, Optional
 
-from .broker import BrokerClient, BrokerError, BrokerOperation, BrokerRequest
+from .broker import (
+    BrokerClient,
+    BrokerError,
+    BrokerOperation,
+    BrokerRequest,
+    DATABASE_BACKUP_CLIENT_TIMEOUT_SECONDS,
+    DATABASE_RESTORE_CLIENT_TIMEOUT_SECONDS,
+)
 
 
 PROFILE_VERSION = 1
+HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS = 11 * 60.0
 SYSTEM_PROFILE_PATH = Path(
     "/private/etc/devcoordinator/client-profiles.json"
     if sys.platform == "darwin"
@@ -54,6 +62,24 @@ class BrokerRepositoryProfile:
     server_ids: Mapping[str, str]
     container_ids: Mapping[str, str]
     compose_definition_id: Optional[str]
+    account_id: Optional[str] = None
+    enabled: bool = True
+    issued_at: str = ""
+    valid_until_epoch: int = 2**63 - 1
+
+    def require_current(self, *, account_id: str) -> None:
+        if not self.enabled:
+            raise BrokerProfileError(
+                "repository broker enrollment is disabled; rerun Coordinator skill installation"
+            )
+        if self.account_id is not None and self.account_id != account_id:
+            raise BrokerProfileError(
+                "repository broker enrollment belongs to another account"
+            )
+        if int(time.time()) >= self.valid_until_epoch:
+            raise BrokerProfileError(
+                "repository broker enrollment has expired; rerun Coordinator skill installation"
+            )
 
     def server_id(self, name: str) -> str:
         value = self.server_ids.get(str(name))
@@ -92,6 +118,10 @@ class BrokerClientProfile:
     repositories: Mapping[str, BrokerRepositoryProfile]
 
     def repository(self, canonical_root: str) -> BrokerRepositoryProfile:
+        if int(time.time()) >= self.valid_until_epoch:
+            raise BrokerProfileError(
+                "host broker enrollment has expired; rerun Coordinator skill installation"
+            )
         canonical = str(Path(canonical_root).expanduser().resolve())
         value = self.repositories.get(canonical)
         if value is None:
@@ -99,10 +129,7 @@ class BrokerClientProfile:
                 f"repository {canonical} is not enrolled with the configured host broker; "
                 "local fallback is disabled while a broker profile is installed"
             )
-        if int(time.time()) >= self.valid_until_epoch:
-            raise BrokerProfileError(
-                "host broker enrollment has expired; rerun Coordinator skill installation"
-            )
+        value.require_current(account_id=self.account_id)
         return value
 
     def call(
@@ -114,6 +141,11 @@ class BrokerClientProfile:
         arguments: Optional[Mapping[str, Any]] = None,
         operation_id: Optional[str] = None,
     ) -> tuple[str, dict[str, Any]]:
+        if int(time.time()) >= self.valid_until_epoch:
+            raise BrokerProfileError(
+                "host broker enrollment has expired; rerun Coordinator skill installation"
+            )
+        repository.require_current(account_id=self.account_id)
         return call_broker(
             service=self.service,
             account_id=self.account_id,
@@ -124,8 +156,50 @@ class BrokerClientProfile:
             operation_id=operation_id,
         )
 
-    def inventory(self) -> dict[str, Any]:
-        """Read the single host-wide authority through one enrolled repository."""
+    def inventory(self, *, canonical_root: str | None = None) -> dict[str, Any]:
+        """Read host authority through the requested or a current enrollment.
+
+        A project-scoped caller must identify its exact repository so the
+        broker authorization request cannot be routed through an unrelated
+        enrollment. Host-wide callers retain the deterministic current-
+        enrollment selection because they have no project scope to prefer.
+        """
+
+        if int(time.time()) >= self.valid_until_epoch:
+            raise BrokerProfileError(
+                "host broker enrollment has expired; rerun Coordinator skill installation"
+            )
+        if canonical_root is not None:
+            repository = self.repository(canonical_root)
+        elif not self.repositories:
+            raise BrokerProfileError(
+                "authenticated account has no enrolled repository for host inventory access"
+            )
+        else:
+            current: list[BrokerRepositoryProfile] = []
+            for candidate in self.repositories.values():
+                try:
+                    candidate.require_current(account_id=self.account_id)
+                except BrokerProfileError:
+                    continue
+                current.append(candidate)
+            if not current:
+                raise BrokerProfileError(
+                    "authenticated account has no current repository enrollment for host inventory access"
+                )
+            repository = min(current, key=lambda item: item.canonical_root)
+        _operation_id, result = self.call(
+            repository=repository,
+            resource_id=repository.repo_id,
+            operation=BrokerOperation.INVENTORY_READ,
+            arguments={},
+        )
+        return result
+
+    def events(
+        self, *, after: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        """Read the host-wide durable event journal through one enrollment."""
 
         if int(time.time()) >= self.valid_until_epoch:
             raise BrokerProfileError(
@@ -133,16 +207,19 @@ class BrokerClientProfile:
             )
         if not self.repositories:
             raise BrokerProfileError(
-                "authenticated account has no enrolled repository for host inventory access"
+                "authenticated account has no enrolled repository for host event access"
             )
         repository = min(
             self.repositories.values(), key=lambda item: item.canonical_root
         )
+        arguments: dict[str, Any] = {"limit": limit}
+        if after is not None:
+            arguments["after"] = after
         _operation_id, result = self.call(
             repository=repository,
             resource_id=repository.repo_id,
-            operation=BrokerOperation.INVENTORY_READ,
-            arguments={},
+            operation=BrokerOperation.EVENTS_READ,
+            arguments=arguments,
         )
         return result
 
@@ -173,19 +250,27 @@ def call_broker(
         expected_socket_mode=service.socket_mode,
         timeout_seconds=(
             (
-                1_800.0
-                if operation
-                in {
+                (
+                    DATABASE_BACKUP_CLIENT_TIMEOUT_SECONDS
+                    if operation == BrokerOperation.DATABASE_BACKUP
+                    else DATABASE_RESTORE_CLIENT_TIMEOUT_SECONDS
+                )
+                if operation in {
                     BrokerOperation.DATABASE_BACKUP,
                     BrokerOperation.DATABASE_RESTORE,
                 }
-                else 60.0
+                else (
+                    HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS
+                    if operation == BrokerOperation.HOST_OBSERVE
+                    else 60.0
+                )
             )
             if operation
             in {
                 BrokerOperation.REPOSITORY_REMOVE,
                 BrokerOperation.RESOURCE_ATTACH,
                 BrokerOperation.RESOURCE_RETIRE,
+                BrokerOperation.HOST_OBSERVE,
                 BrokerOperation.DATABASE_BACKUP,
                 BrokerOperation.DATABASE_RESTORE,
             }
@@ -306,10 +391,22 @@ def profile_from_document(
         raise BrokerProfileError("broker client has no enrolled repositories")
     repositories: dict[str, BrokerRepositoryProfile] = {}
     for item in repositories_raw:
-        repository = _repository_from_document(item)
+        repository = _repository_from_document(
+            item,
+            account_id=account_id,
+            fallback_issued_at=str(raw.get("issued_at") or ""),
+            fallback_valid_until_epoch=valid_until,
+        )
         if repository.canonical_root in repositories:
             raise BrokerProfileError("broker profile duplicates a canonical repository root")
         repositories[repository.canonical_root] = repository
+    if not any(
+        repository.enabled
+        and repository.account_id == account_id
+        and int(time.time()) < repository.valid_until_epoch
+        for repository in repositories.values()
+    ):
+        raise BrokerProfileError("host broker enrollment has expired")
     return BrokerClientProfile(
         service=BrokerServiceProfile(
             socket_path=socket_path,
@@ -326,14 +423,30 @@ def profile_from_document(
     )
 
 
-def _repository_from_document(value: Any) -> BrokerRepositoryProfile:
-    if not isinstance(value, dict) or set(value) != {
+def _repository_from_document(
+    value: Any,
+    *,
+    account_id: str,
+    fallback_issued_at: str,
+    fallback_valid_until_epoch: int,
+) -> BrokerRepositoryProfile:
+    legacy_fields = {
         "canonical_root",
         "repo_id",
         "generation",
         "servers",
         "containers",
         "compose_definition_id",
+    }
+    repository_fields = legacy_fields | {
+        "account_id",
+        "enabled",
+        "issued_at",
+        "valid_until_epoch",
+    }
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(legacy_fields),
+        frozenset(repository_fields),
     }:
         raise BrokerProfileError("broker repository profile fields are invalid")
     canonical_root = str(Path(str(value.get("canonical_root") or "")).expanduser().resolve())
@@ -343,6 +456,26 @@ def _repository_from_document(value: Any) -> BrokerRepositoryProfile:
     containers = _identifier_mapping(value.get("containers"), "container")
     compose_raw = value.get("compose_definition_id")
     compose = None if compose_raw is None else _identifier(compose_raw, "Compose definition")
+    if set(value) == repository_fields:
+        repository_account_id = _identifier(
+            value.get("account_id"), "repository account id"
+        )
+        if repository_account_id != account_id:
+            raise BrokerProfileError(
+                "broker repository profile belongs to another account"
+            )
+        enabled = value.get("enabled")
+        if type(enabled) is not bool:
+            raise BrokerProfileError("repository enrollment enabled must be boolean")
+        issued_at = str(value.get("issued_at") or "")
+        valid_until_epoch = _positive_int(
+            value.get("valid_until_epoch"), "repository profile expiry"
+        )
+    else:
+        repository_account_id = account_id
+        enabled = True
+        issued_at = fallback_issued_at
+        valid_until_epoch = fallback_valid_until_epoch
     return BrokerRepositoryProfile(
         canonical_root=canonical_root,
         repo_id=_identifier(value.get("repo_id"), "repository id"),
@@ -350,6 +483,10 @@ def _repository_from_document(value: Any) -> BrokerRepositoryProfile:
         server_ids=servers,
         container_ids=containers,
         compose_definition_id=compose,
+        account_id=repository_account_id,
+        enabled=enabled,
+        issued_at=issued_at,
+        valid_until_epoch=valid_until_epoch,
     )
 
 

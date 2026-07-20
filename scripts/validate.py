@@ -1281,7 +1281,8 @@ def check_devops_console() -> None:
         "docker route resolution guards coordinator port": "guardCoordinatorPort(hostPort, { container })",
         "docker subdomain endpoint": "'/api/docker/subdomain'",
         "docker subdomain demands one published port": "pass \"port\" to choose one",
-        "servers page lists docker web servers": "visible.push(dockerServerItem(o, c, isHidden));",
+        "servers page records docker web servers before pagination": "entries.push({ group, extraText, kind: 'docker', item: c, isHidden });",
+        "servers page renders typed docker web servers": ": dockerServerItem(o, member.item, member.isHidden));",
         "docker server rows detected by published ports or route": "function isWebServerContainer(",
         "docker server row actions hit docker endpoint": "'data-fk': `srv-dock-${action}:${name}`",
         # Stable ordering contract (docs/journeys.md): list order never keys
@@ -1372,6 +1373,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     check_duplicate_literal_dict_keys()
     check_decision_history_contract()
+    run([sys.executable, str(ROOT / "scripts" / "self_test_cleanup_contract.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_cleanup_contract.py")])
+    run([sys.executable, str(ROOT / "scripts" / "check_cleanup_contract.py"), "--repo", str(ROOT)])
     run([sys.executable, str(ROOT / "scripts" / "check_repository_freshness_self_test.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_repository_boundaries.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_production_layout.py")])
@@ -1394,6 +1398,8 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_legacy_console_rollback_ready.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_loaded_systemd_paths.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_server_wide_install.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_broker_shutdown_unit.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_broker_shutdown_unit.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_cutover_helper_cli_contracts.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_cutover_helper_cli_contracts.py")])
     run([sys.executable, str(ROOT / "scripts" / "check_repository_boundaries.py"), "--repo", str(ROOT)])

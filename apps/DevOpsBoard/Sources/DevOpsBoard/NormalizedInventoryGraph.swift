@@ -710,7 +710,10 @@ struct NormalizedBoardProjection: Sendable {
 }
 
 extension NormalizedInventoryGraph {
-    func boardProjection(origin: CoordinatorOrigin) throws -> NormalizedBoardProjection {
+    func boardProjection(
+        origin: CoordinatorOrigin,
+        now: Date = Date()
+    ) throws -> NormalizedBoardProjection {
         let repositoriesByID = try validatedRepositories()
         let bindingsByID = Dictionary(uniqueKeysWithValues: controlBindings.map { ($0.bindingID, $0) })
         let membershipsByRepository = Dictionary(grouping: memberships) { $0.repoID }
@@ -731,8 +734,14 @@ extension NormalizedInventoryGraph {
                 ("\($0.repoID)|\($0.serverName)", $0)
             }
         )
+        let currentLeases = leases.filter { lease in
+            guard lease.status == "active" else { return false }
+            guard let rawExpiration = lease.expiresAt else { return true }
+            guard let expiration = parseISOTimestamp(rawExpiration) else { return false }
+            return expiration > now
+        }
         let leasesByServer = Dictionary(
-            grouping: leases.compactMap { lease in
+            grouping: currentLeases.compactMap { lease in
                 lease.serverDefinitionID.map { ($0, lease) }
             },
             by: { $0.0 }
@@ -1096,8 +1105,7 @@ extension NormalizedInventoryGraph {
                 status: server.status
             )
         }
-        let leases = self.leases.compactMap { lease -> PortLease? in
-            guard lease.status == "active" else { return nil }
+        let leases = currentLeases.compactMap { lease -> PortLease? in
             guard let repository = repositoriesByID[lease.repoID] else { return nil }
             return PortLease(
                 id: lease.leaseID,

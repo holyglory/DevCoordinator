@@ -5,13 +5,18 @@
 const HOST_RE = /^[a-z0-9.-]+(?::\d{1,5})?$/;
 
 export function createGuard({ sessions, access, config, log }) {
+  /** Parse and verify the Google identity cookie without granting anything. */
+  function identityFrom(req) {
+    return sessions.parse(req?.headers?.cookie);
+  }
+
   /**
    * Parse + verify the session cookie AND re-check current policy membership
    * on every request, so removing an invited user revokes an already-issued
    * cookie immediately. Exact resource grants are checked separately.
    */
   function sessionFrom(req) {
-    const session = sessions.parse(req?.headers?.cookie);
+    const session = identityFrom(req);
     if (!session) return null;
     const email = String(session.email || '').toLowerCase();
     if (!access?.isKnown(email)) {
@@ -83,8 +88,8 @@ export function createGuard({ sessions, access, config, log }) {
    * legitimate caller is a browser on the console UI, which always sends
    * Origin on non-GET fetches.
    */
-  function checkOrigin(req) {
-    const expected = String(config.consoleOrigin).toLowerCase();
+  function checkOriginFor(req, expectedOrigin) {
+    const expected = String(expectedOrigin).toLowerCase();
     const origin = req?.headers?.origin;
     if (typeof origin === 'string' && origin !== '') {
       return origin.toLowerCase() === expected;
@@ -101,5 +106,18 @@ export function createGuard({ sessions, access, config, log }) {
     return false;
   }
 
-  return { sessionFrom, isKnownEmail, isAdmin, hasAccess, wantsHtml, loginRedirectUrl, validateRt, checkOrigin };
+  const checkOrigin = (req) => checkOriginFor(req, config.consoleOrigin);
+
+  return {
+    identityFrom,
+    sessionFrom,
+    isKnownEmail,
+    isAdmin,
+    hasAccess,
+    wantsHtml,
+    loginRedirectUrl,
+    validateRt,
+    checkOrigin,
+    checkOriginFor,
+  };
 }

@@ -144,9 +144,39 @@ def check_boundary(
             sleep_fn(min(poll_interval_seconds, remaining))
             continue
         if observed != expected:
-            # A reachable endpoint with a wrong authorization contract is a
-            # configuration/security failure, not a startup race. Fail closed
-            # immediately instead of waiting for it to become acceptable.
+            authenticated_status = observed["authenticated_inventory"]
+            anonymous_contract_ready = (
+                observed["anonymous_health"] == expected["anonymous_health"]
+                and observed["anonymous_inventory"] == expected["anonymous_inventory"]
+            )
+            if (
+                anonymous_contract_ready
+                and type(authenticated_status) is int
+                and 500 <= authenticated_status <= 599
+            ):
+                # A reachable API can publish its health/auth middleware just
+                # before the authenticated inventory backend finishes opening.
+                # Retry only that exact, fail-closed startup shape. Re-probing
+                # all three endpoints on the next attempt ensures an anonymous
+                # boundary regression is never hidden by readiness polling.
+                remaining = deadline - monotonic_fn()
+                if remaining <= 0:
+                    raise AuthBoundaryError(
+                        "authenticated coordinator inventory did not become ready "
+                        "before the readiness deadline "
+                        f"after {attempts} attempt(s); last status=HTTP {authenticated_status}"
+                    )
+                sleep_fn(min(poll_interval_seconds, remaining))
+                if monotonic_fn() >= deadline:
+                    raise AuthBoundaryError(
+                        "authenticated coordinator inventory did not become ready "
+                        "before the readiness deadline "
+                        f"after {attempts} attempt(s); last status=HTTP {authenticated_status}"
+                    )
+                continue
+            # Any other reachable response is a configuration/security or
+            # protocol-contract failure, not a startup race. That includes an
+            # anonymous mismatch and authenticated 2xx/4xx responses.
             raise AuthBoundaryError(
                 f"coordinator health/auth boundary mismatch: expected {expected}, got {observed}"
             )

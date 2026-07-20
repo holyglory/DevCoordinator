@@ -280,6 +280,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.assertEqual(projected_server["pid"], 44001)
         self.assertEqual(projected_server["lease_id"], running["lease_id"])
         self.assertFalse(projected_server["health"]["pid_alive"])
+        self.assertNotIn("registration_identity", projected_server)
         self.assertEqual(compatibility["leases"], [])
 
     def test_compatibility_ignores_unusable_relocation_result_payloads(self) -> None:
@@ -951,6 +952,10 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             "/v1/ports/assign",
             "/v1/ports/unassign",
             "/v1/ports/relocate",
+            "/v1/lifecycle/plan",
+            "/v1/lifecycle/apply",
+            "/v1/lifecycle/restore",
+            "/v1/observe",
         }
         self.assertEqual(
             set(dev_coordinator.API_GET_ROUTES),
@@ -961,6 +966,8 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "/v1/ports",
                 "/v1/ports/assignments",
                 "/v1/servers",
+                "/v1/archives",
+                "/v1/events",
             },
         )
         self.assertEqual(set(dev_coordinator.API_POST_ROUTES), expected_post_routes)
@@ -1573,6 +1580,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
 
         self.assertEqual(observed["status"], "stopped")
         self.assertIsNone(observed["pid"])
+        self.assertNotIn("registration_identity", observed)
         self.assertEqual(observed["lease_status"], "stale")
 
     def test_public_status_retries_a_concurrent_observation_cas(self) -> None:

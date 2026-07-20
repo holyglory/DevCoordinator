@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -21,6 +22,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+
+MAIN_UID = 1000
+MAIN_ACCOUNT = "holyglory"
+BROKER_NOW_EPOCH = 1_893_456_002.0
 
 
 def load(name: str, path: Path):
@@ -64,6 +69,27 @@ server.serve_forever()
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def fixture_broker_listener_fingerprint() -> str:
+    evidence = {
+        "pid": FIXTURES.MAIN_PID,
+        "owner_uid": MAIN_UID,
+        "process_identity": f"linux:{FIXTURES.MAIN_PID}:123456",
+        "cwd": f"{FIXTURES.PROJECT}/apps/DevOpsConsole",
+        "canonical_root": FIXTURES.PROJECT,
+        "port": FIXTURES.PORT,
+        "protocol": "tcp",
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            evidence,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def start_fast_http_listener(*, cwd: Path, port: int = 0) -> tuple[subprocess.Popen, int]:
@@ -198,6 +224,200 @@ def stopped_server(*, project: str = FIXTURES.PROJECT, port: int = FIXTURES.PORT
     return server
 
 
+def broker_published_stopped_fixture(
+    *,
+    project: str = FIXTURES.PROJECT,
+    port: int = FIXTURES.PORT,
+    lease_id: str | None = "released-broker-lease",
+) -> dict:
+    """Mirror the exact schema-v2 server-wide stop/release projection."""
+
+    repo_id = "broker-console-repository"
+    database_generation = "27ceca76-a195-4dc8-a4a5-7262b786d92c"
+    server = stopped_server(
+        project=project,
+        port=port,
+        pid=None,
+        lease_id=lease_id,
+    )
+    server.pop("registration_identity", None)
+    server.update(
+        {
+            "metadata_source": "normalized-sqlite",
+            "identity_observable": True,
+            "process_start_time": None,
+            "process_fingerprint": None,
+            "stopped_at": "2026-07-18T15:00:00Z",
+            "stopped_reason": "Stopped by coordinator",
+            "url_is_current": False,
+            "health": {
+                "classification": "unhealthy",
+                "ok": False,
+                "pid_alive": None,
+            },
+        }
+    )
+    normalized_lease = (
+        []
+        if lease_id is None
+        else [
+            {
+                "lease_id": lease_id,
+                "repo_id": repo_id,
+                "server_definition_id": FIXTURES.SERVER_ID,
+                "port": port,
+                "status": "released",
+                "deactivated_at": "2026-07-18T15:00:01Z",
+            }
+        ]
+    )
+    compatibility_assignment = pending_assignment(project=project, port=port)
+    compatibility_assignment.update(
+        {
+            "id": "broker-console-assignment",
+            "status": "active",
+        }
+    )
+    return {
+        "schema_version": 2,
+        "authority": {
+            "scope": "server-wide",
+            "transport": "authenticated-unix-socket",
+            "socket": "/run/devcoordinator/broker.sock",
+            "service_uid": 992,
+            "database_generation": database_generation,
+        },
+        "store": {
+            "schema_version": 1,
+            "database_generation": database_generation,
+            "state_revision": 20,
+            "observation_revision": 21,
+            "authority_mode": "sqlite",
+            "migration_state": "ready",
+        },
+        "repositories": [
+            {
+                "repo_id": repo_id,
+                "canonical_root": project,
+                "display_name": "DevCoordinator",
+                "state": "active",
+                "installation_status": "installed",
+            }
+        ],
+        "resources": {
+            "servers": [
+                {
+                    "server_definition_id": FIXTURES.SERVER_ID,
+                    "repo_id": repo_id,
+                    "name": FIXTURES.NAME,
+                    "cwd": f"{project}/apps/DevOpsConsole",
+                    "arguments": ["/usr/bin/node", "bin/devops-console.mjs"],
+                }
+            ],
+            "docker": [],
+            "docker_ports": [],
+            "databases": [],
+        },
+        "observations": {
+            "servers": [
+                {
+                    "server_definition_id": FIXTURES.SERVER_ID,
+                    "lifecycle": "stopped",
+                    "pid": None,
+                    "process_start_time": None,
+                    "process_fingerprint": None,
+                    "listener_host": "127.0.0.1",
+                    "listener_port": port,
+                    "listener_observable": 1,
+                    "health_classification": "unhealthy",
+                    "health_ok": 0,
+                    "stopped_at": "2026-07-18T15:00:00Z",
+                    "stopped_reason": "Stopped by coordinator",
+                    "sampled_at": "2026-07-18T15:00:00Z",
+                    "observation_fingerprint": "a" * 64,
+                }
+            ],
+            "docker": [],
+            "databases": [],
+            "telemetry": [],
+            "snapshots": [],
+        },
+        "leases": normalized_lease,
+        "port_assignments": [
+            {
+                "assignment_id": "broker-console-assignment",
+                "repo_id": repo_id,
+                "server_name": FIXTURES.NAME,
+                "port": port,
+                "status": "active",
+            }
+        ],
+        "v1_compatibility": {
+            "servers": [server],
+            "leases": [],
+            "port_assignments": [compatibility_assignment],
+            "docker": {"available": None, "containers": [], "postgres": []},
+        },
+    }
+
+
+def broker_registration_in_flight_fixture() -> dict:
+    """Mirror RESERVE_PORT after bind and before SERVER_PUBLISH commits."""
+
+    value = broker_published_stopped_fixture(lease_id=None)
+    lease_id = "in-flight-broker-registration-lease"
+    repo_id = value["repositories"][0]["repo_id"]
+    normalized = {
+        "lease_id": lease_id,
+        "repo_id": repo_id,
+        "server_definition_id": FIXTURES.SERVER_ID,
+        "source_id": "server-wide-broker-source",
+        "port": FIXTURES.PORT,
+        "owner": f"uid:{MAIN_UID}",
+        "agent": MAIN_ACCOUNT,
+        "purpose": "broker",
+        "status": "active",
+        "expires_at": "2030-01-01T00:10:00Z",
+        "process_fingerprint": fixture_broker_listener_fingerprint(),
+        "deactivated_at": None,
+        "created_at": "2030-01-01T00:00:00Z",
+        "updated_at": "2030-01-01T00:00:01Z",
+    }
+    compatibility = {
+        "id": lease_id,
+        "project": FIXTURES.PROJECT,
+        "port": FIXTURES.PORT,
+        "owner": normalized["owner"],
+        "agent": normalized["agent"],
+        "purpose": normalized["purpose"],
+        "status": normalized["status"],
+        "expires_at": normalized["expires_at"],
+        "process_fingerprint": normalized["process_fingerprint"],
+        "deactivated_at": normalized["deactivated_at"],
+        "created_at": normalized["created_at"],
+        "updated_at": normalized["updated_at"],
+        "server_id": normalized["server_definition_id"],
+        "owner_pid": None,
+        "assignment_key": FIXTURES.ASSIGNMENT_KEY,
+    }
+    server = value["v1_compatibility"]["servers"][0]
+    server.update(
+        {
+            "lease_id": lease_id,
+            "port_reused": True,
+            "port_reused_by": {
+                "type": "process",
+                "pid": FIXTURES.MAIN_PID,
+                "cwd": f"{FIXTURES.PROJECT}/apps/DevOpsConsole",
+                "project": FIXTURES.PROJECT,
+            },
+        }
+    )
+    value["leases"] = [normalized]
+    value["v1_compatibility"]["leases"] = [compatibility]
+    return value
+
+
 def pending_assignment(*, project: str = FIXTURES.PROJECT, port: int = FIXTURES.PORT) -> dict:
     return {
         "key": f"{project}::{FIXTURES.NAME}",
@@ -253,6 +473,11 @@ def classify(value: dict, *, project: str = FIXTURES.PROJECT, port: int = FIXTUR
         name=FIXTURES.NAME,
         port=port,
         main_pid=pid,
+        main_uid=MAIN_UID,
+        main_account_id=MAIN_ACCOUNT,
+        main_start_ticks="123456",
+        main_cwd=f"{project}/apps/DevOpsConsole",
+        observed_at_epoch=BROKER_NOW_EPOCH,
     )
 
 
@@ -281,6 +506,7 @@ def wait_with_snapshots(snapshots: list[object]) -> dict:
     state = {"active_state": "activating", "main_pid": FIXTURES.MAIN_PID, "cgroup": "/system.slice/devops-console.service"}
     identity = {
         "start_ticks": "123456",
+        "uid": MAIN_UID,
         "argv": ["/usr/bin/node", "bin/devops-console.mjs", "--env-file", "/private/console.env"],
         "cwd": "/home/DevCoordinator/apps/DevOpsConsole",
         "cgroups": {state["cgroup"]},
@@ -309,7 +535,9 @@ def wait_with_snapshots(snapshots: list[object]) -> dict:
         unit_probe_fn=lambda: copy.deepcopy(state),
         process_probe_fn=lambda: copy.deepcopy(identity),
         inventory_probe_fn=observe,
+        account_probe_fn=lambda uid: MAIN_ACCOUNT if uid == MAIN_UID else "foreign",
         clock=clock,
+        wall_clock=lambda: BROKER_NOW_EPOCH,
         sleeper=clock.sleep,
     )
 
@@ -508,6 +736,24 @@ def actual_api_delayed_registration_test() -> None:
                 project=str(old_project),
                 name=FIXTURES.NAME,
                 server_port=listener_port,
+            )
+            normalized_restart_assignment = next(
+                row
+                for row in restart_inventory["port_assignments"]
+                if row.get("port") == listener_port
+            )
+            compatibility_restart_assignment = next(
+                row
+                for row in restart_inventory["v1_compatibility"]["port_assignments"]
+                if row.get("port") == listener_port
+            )
+            require(
+                normalized_restart_assignment.get("repo_id")
+                and normalized_restart_assignment.get("server_name") == FIXTURES.NAME
+                and "project" not in normalized_restart_assignment
+                and compatibility_restart_assignment.get("project") == str(old_project)
+                and compatibility_restart_assignment.get("name") == FIXTURES.NAME,
+                "inventory probe collapsed normalized assignments into compatibility aliases",
             )
             restart_state, _restart_report = READY.classify_registration_snapshot(
                 restart_inventory,
@@ -1082,6 +1328,7 @@ def identity_and_deadline_tests() -> None:
     state = {"active_state": "activating", "main_pid": FIXTURES.MAIN_PID, "cgroup": "/fixture.service"}
     identity = {
         "start_ticks": "123",
+        "uid": MAIN_UID,
         "argv": ["/usr/bin/node", "bin/devops-console.mjs", "--env-file", "/private/console.env"],
         "cwd": "/home/DevCoordinator/apps/DevOpsConsole",
         "cgroups": {state["cgroup"]},
@@ -1101,6 +1348,8 @@ def identity_and_deadline_tests() -> None:
         poll_interval_seconds=0.1,
         process_probe_fn=lambda: copy.deepcopy(identity),
         inventory_probe_fn=lambda _remaining: ready_fixture(),
+        account_probe_fn=lambda uid: MAIN_ACCOUNT if uid == MAIN_UID else "foreign",
+        wall_clock=lambda: BROKER_NOW_EPOCH,
     )
     try:
         READY.wait_for_console_registration(
@@ -1111,6 +1360,65 @@ def identity_and_deadline_tests() -> None:
         require("argv" in str(error), f"wrong runtime argv had wrong error: {error}")
     else:
         raise AssertionError("wrong runtime argv was accepted")
+
+    def missing_nss_account(_uid: int):
+        raise KeyError("fixture account missing")
+
+    try:
+        READY.wait_for_console_registration(
+            **{
+                **base,
+                "account_probe_fn": lambda uid: READY.console_account_identity(
+                    uid,
+                    account_lookup=missing_nss_account,
+                ),
+            },
+            unit_probe_fn=lambda: copy.deepcopy(state),
+        )
+    except READY.ConsoleRegistrationError as error:
+        require("NSS" in str(error), f"missing NSS account had wrong error: {error}")
+    else:
+        raise AssertionError("missing NSS account mapping was accepted")
+
+    account_calls = 0
+
+    def drifting_account(_uid: int) -> str:
+        nonlocal account_calls
+        account_calls += 1
+        return MAIN_ACCOUNT if account_calls == 1 else "holygloryTT"
+
+    try:
+        READY.wait_for_console_registration(
+            **{**base, "account_probe_fn": drifting_account},
+            unit_probe_fn=lambda: copy.deepcopy(state),
+        )
+    except READY.ConsoleRegistrationError as error:
+        require(
+            "account mapping changed" in str(error),
+            f"NSS account drift had wrong error: {error}",
+        )
+    else:
+        raise AssertionError("NSS account drift was accepted")
+
+    uid_calls = 0
+
+    def drifting_uid_identity() -> dict:
+        nonlocal uid_calls
+        uid_calls += 1
+        value = copy.deepcopy(identity)
+        if uid_calls >= 2:
+            value["uid"] = MAIN_UID + 1
+        return value
+
+    try:
+        READY.wait_for_console_registration(
+            **{**base, "process_probe_fn": drifting_uid_identity},
+            unit_probe_fn=lambda: copy.deepcopy(state),
+        )
+    except READY.ConsoleRegistrationError as error:
+        require("UID changed" in str(error), f"UID drift had wrong error: {error}")
+    else:
+        raise AssertionError("systemd MainPID UID drift was accepted")
 
     calls = 0
 
@@ -1322,6 +1630,269 @@ def main() -> int:
     }
     require(classify(restart)[0] == "pending-stopped-baseline", "ordinary restart stale linkage must retry")
 
+    broker_stopped = broker_published_stopped_fixture()
+    require(
+        classify(broker_stopped)[0] == "pending-stopped-baseline",
+        "exact broker-published stopped/unhealthy released baseline must retry",
+    )
+    broker_stopped_classification = copy.deepcopy(broker_stopped)
+    broker_stopped_classification["observations"]["servers"][0][
+        "health_classification"
+    ] = "stopped"
+    broker_stopped_classification["v1_compatibility"]["servers"][0]["health"][
+        "classification"
+    ] = "stopped"
+    require(
+        classify(broker_stopped_classification)[0] == "pending-stopped-baseline",
+        "exact broker-published stopped/stopped baseline must retry",
+    )
+    broker_stopped_incompatible_health = copy.deepcopy(broker_stopped)
+    broker_stopped_incompatible_health["observations"]["servers"][0][
+        "health_classification"
+    ] = "healthy"
+    broker_stopped_incompatible_health["v1_compatibility"]["servers"][0][
+        "health"
+    ]["classification"] = "healthy"
+    must_fail(
+        broker_stopped_incompatible_health,
+        "broker/server-wide",
+        "broker stopped baseline has a successful health classification",
+    )
+    broker_stopped_mismatched_health = copy.deepcopy(broker_stopped)
+    broker_stopped_mismatched_health["v1_compatibility"]["servers"][0]["health"][
+        "classification"
+    ] = "stopped"
+    must_fail(
+        broker_stopped_mismatched_health,
+        "broker/server-wide",
+        "normalized and compatibility stop classifications disagree",
+    )
+    broker_stopped_pruned_lease = broker_published_stopped_fixture(lease_id=None)
+    require(
+        classify(broker_stopped_pruned_lease)[0] == "pending-stopped-baseline",
+        "exact broker-published stopped baseline with pruned lease history must retry",
+    )
+    broker_registration_in_flight = broker_registration_in_flight_fixture()
+    require(
+        classify(broker_registration_in_flight)[0] == "pending-stopped-baseline",
+        "exact in-flight broker registration reservation must retry",
+    )
+    in_flight_reused = copy.deepcopy(broker_registration_in_flight)
+    for lease in (
+        in_flight_reused["leases"][0],
+        in_flight_reused["v1_compatibility"]["leases"][0],
+    ):
+        lease["created_at"] = "2029-12-01T00:00:00Z"
+    require(
+        classify(in_flight_reused)[0] == "pending-stopped-baseline",
+        "old-created lease with a fresh exact broker reuse update must retry",
+    )
+    in_flight_foreign_uid = copy.deepcopy(broker_registration_in_flight)
+    for lease in (
+        in_flight_foreign_uid["leases"][0],
+        in_flight_foreign_uid["v1_compatibility"]["leases"][0],
+    ):
+        lease["owner"] = "uid:1001"
+    must_fail(
+        in_flight_foreign_uid,
+        "active lease",
+        "in-flight broker reservation belongs to another operating-system UID",
+    )
+    in_flight_foreign_account = copy.deepcopy(broker_registration_in_flight)
+    for lease in (
+        in_flight_foreign_account["leases"][0],
+        in_flight_foreign_account["v1_compatibility"]["leases"][0],
+    ):
+        lease["agent"] = "holygloryTT"
+    must_fail(
+        in_flight_foreign_account,
+        "active lease",
+        "in-flight broker reservation belongs to another broker account",
+    )
+    in_flight_expired = copy.deepcopy(broker_registration_in_flight)
+    for lease in (
+        in_flight_expired["leases"][0],
+        in_flight_expired["v1_compatibility"]["leases"][0],
+    ):
+        lease["expires_at"] = "2030-01-01T00:00:01Z"
+    must_fail(
+        in_flight_expired,
+        "active lease",
+        "in-flight broker reservation is expired",
+    )
+    in_flight_stale = copy.deepcopy(broker_registration_in_flight)
+    for lease in (
+        in_flight_stale["leases"][0],
+        in_flight_stale["v1_compatibility"]["leases"][0],
+    ):
+        lease["created_at"] = "2029-12-31T23:00:00Z"
+        lease["updated_at"] = "2029-12-31T23:00:01Z"
+        lease["expires_at"] = "2030-01-01T00:10:00Z"
+    must_fail(
+        in_flight_stale,
+        "active lease",
+        "in-flight broker reservation is not fresh",
+    )
+    in_flight_bad_order = copy.deepcopy(broker_registration_in_flight)
+    for lease in (
+        in_flight_bad_order["leases"][0],
+        in_flight_bad_order["v1_compatibility"]["leases"][0],
+    ):
+        lease["created_at"] = "2030-01-01T00:00:02Z"
+        lease["updated_at"] = "2030-01-01T00:00:01Z"
+    must_fail(
+        in_flight_bad_order,
+        "active lease",
+        "in-flight broker reservation timestamps are incoherent",
+    )
+    in_flight_future_created = copy.deepcopy(broker_registration_in_flight)
+    for lease in (
+        in_flight_future_created["leases"][0],
+        in_flight_future_created["v1_compatibility"]["leases"][0],
+    ):
+        lease["created_at"] = "2030-01-01T00:00:03Z"
+        lease["updated_at"] = "2030-01-01T00:00:04Z"
+    must_fail(
+        in_flight_future_created,
+        "active lease",
+        "in-flight broker reservation was created in the future",
+    )
+    in_flight_wrong_fingerprint = copy.deepcopy(broker_registration_in_flight)
+    for lease in (
+        in_flight_wrong_fingerprint["leases"][0],
+        in_flight_wrong_fingerprint["v1_compatibility"]["leases"][0],
+    ):
+        lease["process_fingerprint"] = "sha256:" + ("c" * 64)
+    must_fail(
+        in_flight_wrong_fingerprint,
+        "active lease",
+        "in-flight broker reservation fingerprint names another process identity",
+    )
+    in_flight_normalized_only = copy.deepcopy(broker_registration_in_flight)
+    in_flight_normalized_only["v1_compatibility"]["leases"] = []
+    must_fail(
+        in_flight_normalized_only,
+        "active lease",
+        "normalized in-flight reservation lacks its compatibility mapping",
+    )
+    in_flight_foreign = copy.deepcopy(broker_registration_in_flight)
+    in_flight_foreign["v1_compatibility"]["leases"][0]["project"] = "/srv/foreign"
+    must_fail(
+        in_flight_foreign,
+        "active lease",
+        "in-flight broker reservation maps to a foreign project",
+    )
+    in_flight_ambiguous = copy.deepcopy(broker_registration_in_flight)
+    duplicate = copy.deepcopy(in_flight_ambiguous["v1_compatibility"]["leases"][0])
+    duplicate["id"] = "duplicate-active-broker-reservation"
+    in_flight_ambiguous["v1_compatibility"]["leases"].append(duplicate)
+    must_fail(
+        in_flight_ambiguous,
+        "active lease",
+        "in-flight broker reservation is ambiguous",
+    )
+    in_flight_server_owned = copy.deepcopy(broker_registration_in_flight)
+    in_flight_server_owned["leases"][0]["purpose"] = f"server:{FIXTURES.NAME}"
+    in_flight_server_owned["v1_compatibility"]["leases"][0][
+        "purpose"
+    ] = f"server:{FIXTURES.NAME}"
+    must_fail(
+        in_flight_server_owned,
+        "active lease",
+        "published server-purpose lease is not an in-flight broker reservation",
+    )
+    in_flight_wrong_listener = copy.deepcopy(broker_registration_in_flight)
+    in_flight_wrong_listener["v1_compatibility"]["servers"][0][
+        "port_reused_by"
+    ]["pid"] = FIXTURES.MAIN_PID + 1
+    must_fail(
+        in_flight_wrong_listener,
+        "raw port listener",
+        "in-flight broker reservation listener is another PID",
+    )
+    broker_stopped_without_authority = copy.deepcopy(broker_stopped)
+    broker_stopped_without_authority.pop("authority")
+    must_fail(
+        broker_stopped_without_authority,
+        "broker/server-wide",
+        "null PID stopped row lacks exact broker authority",
+    )
+    broker_stopped_wrong_listener_pid = copy.deepcopy(broker_stopped)
+    broker_stopped_wrong_listener_pid["v1_compatibility"]["servers"][0].update(
+        {
+            "port_reused": True,
+            "port_reused_by": {
+                "type": "process",
+                "pid": FIXTURES.MAIN_PID + 1,
+                "cwd": f"{FIXTURES.PROJECT}/apps/DevOpsConsole",
+                "project": FIXTURES.PROJECT,
+            },
+        }
+    )
+    must_fail(
+        broker_stopped_wrong_listener_pid,
+        "raw port listener",
+        "broker stopped baseline listener is another PID",
+    )
+    broker_stopped_wrong_listener_project = copy.deepcopy(broker_stopped)
+    broker_stopped_wrong_listener_project["v1_compatibility"]["servers"][0].update(
+        {
+            "port_reused": True,
+            "port_reused_by": {
+                "type": "process",
+                "pid": FIXTURES.MAIN_PID,
+                "cwd": f"{FIXTURES.PROJECT}/apps/DevOpsConsole",
+                "project": "/srv/foreign",
+            },
+        }
+    )
+    must_fail(
+        broker_stopped_wrong_listener_project,
+        "raw port listener",
+        "broker stopped baseline listener is another project",
+    )
+    broker_stopped_partial_listener = copy.deepcopy(broker_stopped)
+    broker_stopped_partial_listener["v1_compatibility"]["servers"][0][
+        "port_reused"
+    ] = True
+    must_fail(
+        broker_stopped_partial_listener,
+        "raw port listener",
+        "broker stopped baseline has only a partial listener claim",
+    )
+    broker_stopped_ambiguous = copy.deepcopy(broker_stopped)
+    broker_stopped_ambiguous["v1_compatibility"]["servers"].append(
+        copy.deepcopy(broker_stopped_ambiguous["v1_compatibility"]["servers"][0])
+    )
+    must_fail(
+        broker_stopped_ambiguous,
+        "at most one target server",
+        "broker stopped baseline has ambiguous target rows",
+    )
+    broker_stopped_active_lease = copy.deepcopy(broker_stopped)
+    broker_stopped_active_lease["v1_compatibility"]["leases"] = [
+        {
+            "id": "unexpected-active-lease",
+            "project": FIXTURES.PROJECT,
+            "port": FIXTURES.PORT,
+            "status": "active",
+            "purpose": f"server:{FIXTURES.NAME}",
+        }
+    ]
+    must_fail(
+        broker_stopped_active_lease,
+        "active lease",
+        "broker stopped baseline retains an active compatibility lease",
+    )
+    broker_stopped_hidden_active_lease = copy.deepcopy(broker_stopped)
+    broker_stopped_hidden_active_lease["leases"][0]["status"] = "active"
+    broker_stopped_hidden_active_lease["leases"][0]["deactivated_at"] = None
+    must_fail(
+        broker_stopped_hidden_active_lease,
+        "broker/server-wide",
+        "broker stopped baseline hides an active normalized lease",
+    )
+
     foreign_live = copy.deepcopy(unrelated_history)
     foreign_live["servers"][0]["status"] = "running"
     must_fail(foreign_live, "non-stopped server", "foreign current port owner")
@@ -1344,6 +1915,13 @@ def main() -> int:
         ready_fixture(),
     ])
     require(converged["attempts"] == 3, "clean absence and exact stopped baseline should retry")
+    in_flight_converged = wait_with_snapshots(
+        [broker_registration_in_flight_fixture(), ready_fixture()]
+    )
+    require(
+        in_flight_converged["attempts"] == 2,
+        "stable MainPID UID/account/fingerprint in-flight proof did not retry",
+    )
     transported = wait_with_snapshots([
         READY.InventoryTransportPending("connection refused"),
         ready_fixture(),

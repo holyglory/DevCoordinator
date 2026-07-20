@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import pwd
 import sqlite3
 import tempfile
 import threading
@@ -16,12 +17,33 @@ from unittest import mock
 from devcoordinator import store as store_module
 from devcoordinator import legacy_import as legacy_import_module
 from devcoordinator.legacy_import import LegacyImportError, LegacySourceChanged
+from devcoordinator.schema import SCHEMA_VERSION
 from devcoordinator.store import (
     AccountStore,
     MutationTimeout,
     StoreError,
     TransactionBoundaryError,
 )
+
+
+def canonical_test_temp_base() -> Path:
+    """Return a writable canonical base outside any host/user Git marker."""
+
+    candidates = (
+        os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT"),
+        pwd.getpwuid(os.geteuid()).pw_dir,
+        tempfile.gettempdir(),
+    )
+    for raw in dict.fromkeys(value for value in candidates if value):
+        base = Path(str(raw)).resolve()
+        if not base.is_dir() or not os.access(base, os.W_OK | os.X_OK):
+            continue
+        cursor = base
+        while not ((cursor / ".git").exists() or (cursor / ".git").is_symlink()):
+            if cursor.parent == cursor:
+                return base
+            cursor = cursor.parent
+    raise RuntimeError("no writable test temp root exists outside every Git worktree")
 
 
 def private_directory(path: Path) -> Path:
@@ -95,7 +117,7 @@ def legacy_state(
 
 class StoreTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(dir=canonical_test_temp_base())
         self.root = Path(self.temporary.name).resolve()
         self.store_home = private_directory(self.root / "store")
 
@@ -168,7 +190,7 @@ class StoreTests(unittest.TestCase):
             legacy.close()
         upgraded = AccountStore.open(database)
         try:
-            self.assertEqual(upgraded.metadata.schema_version, 2)
+            self.assertEqual(upgraded.metadata.schema_version, SCHEMA_VERSION)
             self.assertIsNotNone(
                 upgraded.connection.execute(
                     "SELECT 1 FROM hosts WHERE host_id = 'retained-host'"
@@ -250,7 +272,7 @@ class StoreTests(unittest.TestCase):
         database = self.store_home / "coordinator.sqlite3"
         before = database.read_bytes()
         with AccountStore.open_read_only(database) as store:
-            self.assertEqual(store.metadata.schema_version, 2)
+            self.assertEqual(store.metadata.schema_version, SCHEMA_VERSION)
             self.assertEqual(store.inventory_v2()["schema_version"], 2)
             with self.assertRaisesRegex(StoreError, "opened read-only"):
                 with store.immediate_transaction():
@@ -366,6 +388,18 @@ class StoreTests(unittest.TestCase):
                 )
                 connection.execute(
                     """
+                    INSERT INTO coordinator_sources(
+                        source_id, host_id, canonical_home, state_path,
+                        effective_uid, status, created_at, updated_at
+                    ) VALUES (
+                        'source-board', 'host-board', '/account/board',
+                        '/account/board/coordinator.sqlite3', 1000, 'imported', ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
                     INSERT INTO server_definitions(
                         server_definition_id, repo_id, name, cwd,
                         definition_fingerprint, generation, created_at, updated_at
@@ -373,6 +407,123 @@ class StoreTests(unittest.TestCase):
                               'definition-board',0,?,?)
                     """,
                     (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO server_observations(
+                        server_definition_id, lifecycle, pid, listener_host,
+                        listener_port, health_classification, health_ok,
+                        sampled_at, observation_fingerprint
+                    ) VALUES (
+                        'server-board', 'running', 4317, '127.0.0.1', 4317,
+                        'healthy', 1, ?, 'server-observation-board'
+                    )
+                    """,
+                    (now,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_engines(
+                        engine_id, host_id, context_identity, daemon_identity,
+                        capability_state, created_at, updated_at
+                    ) VALUES (
+                        'engine-board', 'host-board', 'default', 'daemon-board',
+                        'available', ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_resources(
+                        docker_resource_id, engine_id, full_container_id,
+                        current_name, image, created_at, updated_at
+                    ) VALUES (
+                        'container-a', 'engine-board', ?, 'board-container',
+                        'fixture/board:current', ?, ?
+                    )
+                    """,
+                    ("a" * 64, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_observations(
+                        docker_resource_id, lifecycle, health, restart_policy,
+                        sampled_at, observation_fingerprint
+                    ) VALUES (
+                        'container-a', 'running', 'healthy', 'unless-stopped',
+                        ?, 'docker-observation-board'
+                    )
+                    """,
+                    (now,),
+                )
+                for binding_id, resource_kind, resource_id in (
+                    ("binding-server-board", "server", "server-board"),
+                    ("binding-container-a", "container", "container-a"),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO control_bindings(
+                            binding_id, repo_id, resource_kind, resource_id,
+                            source_id, capability, provenance, authority_state,
+                            priority, generation, created_at, updated_at
+                        ) VALUES (?, 'repo-board', ?, ?, 'source-board',
+                                  'lifecycle', 'operator', 'authoritative',
+                                  100, 0, ?, ?)
+                        """,
+                        (binding_id, resource_kind, resource_id, now, now),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repository_memberships(
+                            membership_id, repo_id, resource_kind,
+                            host_resource_id, immutable_fingerprint,
+                            control_binding_id, created_at
+                        ) VALUES (?, 'repo-board', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            f"membership-{resource_id}",
+                            resource_kind,
+                            resource_id,
+                            f"immutable-{resource_id}",
+                            binding_id,
+                            now,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO observation_snapshots(
+                        snapshot_id, host_id, observer_domain, status,
+                        material_fingerprint, started_at, completed_at
+                    ) VALUES (
+                        'snapshot-board', 'host-board', 'full-docker', 'completed',
+                        'snapshot-material-board', ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO observation_capabilities(
+                        snapshot_id, observer_domain, docker_available,
+                        capability_fingerprint, committed_at
+                    ) VALUES (
+                        'snapshot-board', 'full-docker', 1,
+                        'snapshot-capability-board', ?
+                    )
+                    """,
+                    (now,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO observation_snapshot_resources(
+                        snapshot_id, resource_kind, resource_id,
+                        observation_fingerprint
+                    ) VALUES (
+                        'snapshot-board', 'container', 'container-a',
+                        'docker-observation-board'
+                    )
+                    """
                 )
                 connection.execute(
                     """
@@ -415,7 +566,7 @@ class StoreTests(unittest.TestCase):
                         INSERT INTO telemetry_samples(
                             sample_id, host_resource_kind, host_resource_id,
                             sampled_at, cpu_percent, memory_bytes
-                        ) VALUES (?, 'server', 'server-b', ?, ?, ?)
+                        ) VALUES (?, 'server', 'server-board', ?, ?, ?)
                         """,
                         (
                             f"sample-b-{index:02d}",
@@ -480,7 +631,9 @@ class StoreTests(unittest.TestCase):
                 item for item in telemetry if item["host_resource_id"] == "container-a"
             ]
             samples_b = [
-                item for item in telemetry if item["host_resource_id"] == "server-b"
+                item
+                for item in telemetry
+                if item["host_resource_id"] == "server-board"
             ]
             self.assertEqual(len(samples_a), 30)
             self.assertEqual(len(samples_b), 2)

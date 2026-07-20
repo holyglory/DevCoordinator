@@ -3,10 +3,12 @@
 // → <slug> reverse proxy (default-deny auth) → 421 for foreign hosts.
 // Upgrades perform the SAME auth checks as requests.
 
-import { CONSOLE_GRANT, routeGrant } from './access.mjs';
+import { AccessError, CONSOLE_GRANT, routeGrant } from './access.mjs';
 
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const FLOW_COOKIE_NAME = 'dc_flow';
+const INVITE_TOKEN_TTL_MS = 10 * 60 * 1000;
+const INVITE_BODY_LIMIT = 8 * 1024;
 
 // Robust Host parsing: lowercases, splits an optional port, accepts bracketed
 // IPv6 literals, rejects anything else malformed. Returns null on garbage.
@@ -63,10 +65,35 @@ export function createRouter(deps) {
     consoleApi,
     staticServer,
     routeStore,
+    accessStore,
     upstreamAuthStore,
     coordinator,
     proxy,
   } = deps;
+
+  function routeAccessResource(route) {
+    if (!route) return null;
+    let target;
+    if (route.kind === 'server') target = `${route.serverName} · ${route.project}`;
+    else if (route.kind === 'docker') target = `${route.containerName}:${route.containerPort}`;
+    else target = `127.0.0.1:${route.port}`;
+    const resource = routeGrant(route.slug);
+    return {
+      resource,
+      resourceInstance: accessStore.resourceInstance(resource),
+      host: `${route.slug}.${config.domain}`,
+      title: route.title || route.serverName || route.containerName || route.slug,
+      target,
+    };
+  }
+
+  const consoleAccessResource = () => ({
+    resource: CONSOLE_GRANT,
+    resourceInstance: accessStore.resourceInstance(CONSOLE_GRANT),
+    host: config.consoleHost,
+    title: 'DevOps Console',
+    target: 'Full server and route control',
+  });
 
   const upstreamAuthorizationFor = (route) => (
     route?.auth === 'public' ? null : upstreamAuthStore?.authorizationFor(route.slug) ?? null
@@ -117,6 +144,27 @@ export function createRouter(deps) {
     res.end(page?.html ?? '');
   }
 
+  async function readInviteForm(req) {
+    const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+    if (contentType !== 'application/x-www-form-urlencoded') {
+      throw new AccessError(400, 'request form has an invalid content type');
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > INVITE_BODY_LIMIT) throw new AccessError(400, 'request form is too large');
+      chunks.push(chunk);
+    }
+    const form = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+    if ([...form.keys()].some((key) => key !== 'request_token') || form.getAll('request_token').length !== 1) {
+      throw new AccessError(400, 'request form is invalid');
+    }
+    const token = form.get('request_token');
+    if (!token) throw new AccessError(400, 'request token is required');
+    return token;
+  }
+
   function methodNotAllowed(res, allow) {
     res.setHeader('allow', allow);
     sendPage(res, pages.renderError({ status: 405, title: 'Method Not Allowed', detail: `Allowed: ${allow}` }), {
@@ -155,7 +203,19 @@ export function createRouter(deps) {
     }
   }
 
-  function forbidden(req, res, pathname, session, resource) {
+  function inviteTokenFor(session, descriptor, requestHost) {
+    if (!session || !descriptor?.resourceInstance) return '';
+    return sessions.signBlob({
+      purpose: 'access-request',
+      sub: session.sub,
+      email: session.email,
+      resource: descriptor.resource,
+      resourceInstance: descriptor.resourceInstance,
+      requestHost,
+    }, INVITE_TOKEN_TTL_MS);
+  }
+
+  function forbidden(req, res, pathname, session, descriptor, requestHost) {
     const apiLike =
       pathname === '/api' ||
       pathname.startsWith('/api/') ||
@@ -163,19 +223,68 @@ export function createRouter(deps) {
     if (apiLike) return sendJson(res, 403, { error: 'forbidden' });
     return sendPage(res, pages.renderDenied({
       email: session?.email,
-      resource,
+      resource: descriptor?.host || '',
       sessionSet: true,
+      requestToken: inviteTokenFor(session, descriptor, requestHost),
     }), { fallbackStatus: 403 });
+  }
+
+  async function handleInviteRequest(req, res, descriptor, requestOrigin, requestHost) {
+    if (req.method !== 'POST') return methodNotAllowed(res, 'POST');
+    const identity = guard.identityFrom(req);
+    if (!identity) return unauthenticated(req, res, '/auth/request-invite', guard.loginRedirectUrl(req));
+    if (!guard.checkOriginFor(req, requestOrigin)) {
+      return sendPage(res, pages.renderInviteResult({ status: 403, error: 'Cross-origin request rejected.' }), {
+        fallbackStatus: 403,
+      });
+    }
+    try {
+      const token = await readInviteForm(req);
+      const claim = sessions.verifyBlob(token);
+      const valid = claim
+        && claim.purpose === 'access-request'
+        && claim.sub === identity.sub
+        && claim.email === identity.email
+        && claim.resource === descriptor?.resource
+        && claim.resourceInstance === descriptor?.resourceInstance
+        && claim.requestHost === requestHost;
+      if (!valid) throw new AccessError(400, 'request token is invalid or expired');
+      const request = await accessStore.requestAccess({
+        email: identity.email,
+        subject: `${config.oidcIssuer}\0${identity.sub}`,
+        ...descriptor,
+      });
+      log.info('access invite requested', {
+        email: identity.email,
+        resource: descriptor.resource,
+        requestId: request.id,
+        duplicate: request.duplicate === true,
+      });
+      return sendPage(res, pages.renderInviteResult({ status: 202, duplicate: request.duplicate === true }), {
+        fallbackStatus: 202,
+      });
+    } catch (error) {
+      const status = error instanceof AccessError ? error.status : 500;
+      if (!(error instanceof AccessError)) {
+        log.error('access invite request failed', { error: error?.stack || String(error) });
+      }
+      const headers = error?.retryAfter ? { 'retry-after': String(error.retryAfter) } : {};
+      return sendPage(res, pages.renderInviteResult({
+        status,
+        error: status === 500 ? 'The request could not be saved.' : error.message,
+        retryAfter: error?.retryAfter ?? null,
+      }), { fallbackStatus: status, headers });
+    }
   }
 
   // --- auth endpoints (console host only) -------------------------------------
 
-  async function handleAuth(req, res, pathname, searchParams) {
+  async function handleAuth(req, res, pathname, searchParams, requestOrigin, requestHost) {
     switch (pathname) {
       case '/auth/login': {
         if (req.method !== 'GET' && req.method !== 'HEAD') return methodNotAllowed(res, 'GET, HEAD');
         const rt = guard.validateRt(searchParams.get('rt') || '');
-        const session = guard.sessionFrom(req);
+        const session = guard.identityFrom(req);
         if (session) return redirect(res, 302, rt);
         return sendPage(res, pages.renderLogin({ rt, degraded: !oidc.configured }), { fallbackStatus: 200 });
       }
@@ -211,15 +320,11 @@ export function createRouter(deps) {
         const flowCookieValue = readCookie(req, FLOW_COOKIE_NAME);
         try {
           const { profile, rt } = await oidc.handleCallback(searchParams, flowCookieValue);
-          if (!guard.isKnownEmail(profile.email)) {
-            log.warn('login denied: email not approved', { email: profile.email });
-            return sendPage(res, pages.renderDenied({ email: profile.email }), {
-              fallbackStatus: 403,
-              headers: { 'set-cookie': clearFlowCookie() },
-            });
-          }
           const { cookie } = sessions.issue(profile);
-          log.info('login ok', { email: profile.email });
+          log.info('google identity verified', {
+            email: profile.email,
+            accessKnown: guard.isKnownEmail(profile.email),
+          });
           res.setHeader('set-cookie', [cookie, clearFlowCookie()]);
           return redirect(res, 302, guard.validateRt(rt || ''));
         } catch (err) {
@@ -230,6 +335,10 @@ export function createRouter(deps) {
             { status: 400, headers: { 'set-cookie': clearFlowCookie() } },
           );
         }
+      }
+
+      case '/auth/request-invite': {
+        return handleInviteRequest(req, res, consoleAccessResource(), requestOrigin, requestHost);
       }
 
       case '/auth/logout': {
@@ -247,16 +356,18 @@ export function createRouter(deps) {
 
   // --- console host -----------------------------------------------------------
 
-  async function handleConsole(req, res, pathname, rawUrl) {
+  async function handleConsole(req, res, pathname, rawUrl, hostPort) {
+    const proto = config.devInsecureHttp ? 'http' : 'https';
+    const requestOrigin = `${proto}://${hostPort}`;
     if (pathname === '/auth' || pathname.startsWith('/auth/')) {
       const searchParams = new URL(rawUrl, config.consoleOrigin).searchParams;
-      return handleAuth(req, res, pathname, searchParams);
+      return handleAuth(req, res, pathname, searchParams, requestOrigin, hostPort);
     }
 
-    const session = guard.sessionFrom(req);
+    const session = guard.identityFrom(req);
     if (!session) return unauthenticated(req, res, pathname, guard.loginRedirectUrl(req));
-    if (!guard.hasAccess(session, CONSOLE_GRANT)) {
-      return forbidden(req, res, pathname, session, config.consoleHost);
+    if (!guard.isKnownEmail(session.email) || !guard.hasAccess(session, CONSOLE_GRANT)) {
+      return forbidden(req, res, pathname, session, consoleAccessResource(), hostPort);
     }
 
     if (pathname === '/api' || pathname.startsWith('/api/')) {
@@ -269,19 +380,33 @@ export function createRouter(deps) {
 
   async function handleSlug(req, res, slug, hostPort, rawUrl) {
     const route = routeStore.get(slug);
+    const pathname = String(rawUrl || '/').split('?', 1)[0];
+    if (pathname === '/auth/request-invite') {
+      if (!route || route.auth === 'public') {
+        return sendPage(res, pages.renderNotFound({ slug }), { fallbackStatus: 404 });
+      }
+      const proto = config.devInsecureHttp ? 'http' : 'https';
+      return handleInviteRequest(
+        req,
+        res,
+        routeAccessResource(route),
+        `${proto}://${hostPort}`,
+        hostPort,
+      );
+    }
     // Unknown slugs behave exactly like protected ones for anonymous users so
     // route names cannot be enumerated (security invariant #2).
     const needAuth = !route || route.auth !== 'public';
     if (needAuth) {
-      const session = guard.sessionFrom(req);
+      const session = guard.identityFrom(req);
       if (!session) {
         const proto = config.devInsecureHttp ? 'http' : 'https';
         const fullUrl = `${proto}://${hostPort}${rawUrl}`;
         const loginUrl = `${config.consoleOrigin}/auth/login?rt=${encodeURIComponent(fullUrl)}`;
         return unauthenticated(req, res, '/', loginUrl);
       }
-      if (route && !guard.hasAccess(session, routeGrant(slug))) {
-        return forbidden(req, res, '/', session, `${slug}.${config.domain}`);
+      if (route && (!guard.isKnownEmail(session.email) || !guard.hasAccess(session, routeGrant(slug)))) {
+        return forbidden(req, res, '/', session, routeAccessResource(route), hostPort);
       }
     }
 
@@ -341,7 +466,7 @@ export function createRouter(deps) {
     }
 
     if (host === config.consoleHost) {
-      return handleConsole(req, res, pathname, rawUrl);
+      return handleConsole(req, res, pathname, rawUrl, hostPort);
     }
 
     const slug = slugFor(host);
@@ -413,9 +538,9 @@ export function createRouter(deps) {
     const needAuth = !route || route.auth !== 'public';
     if (needAuth) {
       // Same auth checks as plain requests — an upgrade must never bypass them.
-      const session = guard.sessionFrom(req);
+      const session = guard.identityFrom(req);
       if (!session) return refuseUpgrade(socket, 401, 'Unauthorized');
-      if (route && !guard.hasAccess(session, routeGrant(slug))) {
+      if (route && (!guard.isKnownEmail(session.email) || !guard.hasAccess(session, routeGrant(slug)))) {
         return refuseUpgrade(socket, 403, 'Forbidden');
       }
     }

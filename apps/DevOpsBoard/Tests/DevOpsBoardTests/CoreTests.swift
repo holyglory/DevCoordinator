@@ -189,6 +189,35 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(projection.inventory.backups.contains { $0.path.hasPrefix("/poison/") })
     }
 
+    func testDirectV2ProjectionOmitsExpiredActiveLeaseButKeepsCurrentLeases() throws {
+        var object = directV2GraphJSONObject(home: codex.home)
+        var leases = try XCTUnwrap(object["leases"] as? [[String: Any]])
+        var expired = try XCTUnwrap(leases.first)
+        expired["lease_id"] = "lease-expired"
+        expired["expires_at"] = "2026-07-18T11:59:59Z"
+        var future = expired
+        future["lease_id"] = "lease-future"
+        future["expires_at"] = "2026-07-18T12:00:01Z"
+        var nonExpiring = expired
+        nonExpiring["lease_id"] = "lease-no-expiry"
+        nonExpiring["expires_at"] = NSNull()
+        leases = [expired, future, nonExpiring]
+        object["leases"] = leases
+        let now = try XCTUnwrap(parseISOTimestamp("2026-07-18T12:00:00Z"))
+
+        let projection = try directV2Projection(
+            from: object,
+            origin: codex,
+            now: now
+        )
+
+        XCTAssertEqual(
+            projection.inventory.leases.map(\.id),
+            ["lease-future", "lease-no-expiry"]
+        )
+        XCTAssertEqual(projection.inventory.servers.first?.leaseID, "lease-future")
+    }
+
     func testDirectV2ProjectionDoesNotReuseAnInactivePortAssignment() throws {
         var object = directV2GraphJSONObject(home: codex.home)
         var assignments = try XCTUnwrap(object["port_assignments"] as? [[String: Any]])
@@ -5523,12 +5552,13 @@ private func directV2GraphJSONObject(
 
 private func directV2Projection(
     from object: [String: Any],
-    origin: CoordinatorOrigin
+    origin: CoordinatorOrigin,
+    now: Date = Date()
 ) throws -> NormalizedBoardProjection {
     let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     return try JSONDecoder()
         .decode(NormalizedInventoryGraph.self, from: data)
-        .boardProjection(origin: origin)
+        .boardProjection(origin: origin, now: now)
 }
 
 private func directV2InventoryExecution(

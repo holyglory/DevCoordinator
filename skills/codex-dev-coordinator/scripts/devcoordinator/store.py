@@ -108,6 +108,19 @@ def fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _active_lifecycle_projection(record: dict[str, Any]) -> dict[str, Any] | None:
+    """Exclude archived/removed rows except an explicit fence violation marker."""
+
+    lifecycle_state = str(record.get("lifecycle_state") or "active")
+    if lifecycle_state in {"archived", "removed"}:
+        return (
+            record
+            if record.get("reason_code") == "start_fence_violated"
+            else None
+        )
+    return record
+
+
 def _projected_binding_fingerprint(row: Any) -> str | None:
     """Match the lifecycle engine's exact control-binding fingerprint."""
 
@@ -125,6 +138,179 @@ def _projected_binding_fingerprint(row: Any) -> str | None:
             "authority_state": row["authority_state"],
             "generation": row["binding_generation"],
         }
+    )
+
+
+def _latest_available_docker_presence(
+    connection: sqlite3.Connection,
+) -> dict[str, frozenset[str]]:
+    """Return the exact resource set from each host's latest proved Docker sample.
+
+    ``docker_resources`` is durable identity/history, while
+    ``observation_snapshot_resources`` records which resources were actually
+    present in one completed sample.  A committed ``docker_available=1``
+    capability means the sample came from a complete Docker inventory.  Keep
+    hosts with an empty resource set in the result so authoritative absence is
+    distinguishable from a host that has never completed a Docker observation.
+    """
+
+    present: dict[str, set[str]] = {}
+    for row in connection.execute(
+        """
+        WITH ranked AS (
+            SELECT s.host_id, s.snapshot_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY s.host_id
+                       ORDER BY s.completed_at DESC, s.snapshot_id DESC
+                   ) AS snapshot_ordinal
+            FROM observation_snapshots s
+            JOIN observation_capabilities c USING(snapshot_id)
+            WHERE s.status = 'completed'
+              AND s.completed_at IS NOT NULL
+              AND c.observer_domain = s.observer_domain
+              AND c.docker_available = 1
+        ), latest AS (
+            SELECT host_id, snapshot_id
+            FROM ranked WHERE snapshot_ordinal = 1
+        )
+        SELECT latest.host_id, resources.resource_id
+        FROM latest
+        LEFT JOIN observation_snapshot_resources resources
+          ON resources.snapshot_id = latest.snapshot_id
+         AND resources.resource_kind = 'container'
+        ORDER BY latest.host_id, resources.resource_id
+        """
+    ):
+        host_id = str(row["host_id"])
+        resources = present.setdefault(host_id, set())
+        if row["resource_id"] is not None:
+            resources.add(str(row["resource_id"]))
+    return {host_id: frozenset(resources) for host_id, resources in present.items()}
+
+
+def _current_server_resource_ids(
+    connection: sqlite3.Connection, *, observed_at: str
+) -> frozenset[str]:
+    """Return server definitions with current physical or control evidence.
+
+    Definitions and expired leases are retained as history.  A server remains
+    current when it is physically active or an active repository still has
+    exact management evidence for it.  Broker enrollment is management
+    evidence even before the server is first started: the enabled principal,
+    exact ACL, and exact port policy together prove that definition is usable.
+    Archived/tombstoned stopped definitions never regain active status merely
+    because their durable bindings or operations remain in history.
+    """
+
+    broker_tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    broker_management = "0"
+    if {
+        "broker_acl_principals",
+        "broker_resource_acl",
+        "broker_assignment_acl",
+        "broker_port_policies",
+    }.issubset(broker_tables):
+        broker_management = """
+            EXISTS (
+                SELECT 1
+                FROM broker_port_policies policy
+                JOIN broker_acl_principals principal USING(uid)
+                WHERE policy.repo_id = d.repo_id
+                  AND policy.server_definition_id = d.server_definition_id
+                  AND policy.enabled = 1
+                  AND principal.enabled = 1
+                  AND (
+                    EXISTS (
+                        SELECT 1 FROM broker_resource_acl resource_acl
+                        WHERE resource_acl.uid = policy.uid
+                          AND resource_acl.repo_id = policy.repo_id
+                          AND resource_acl.resource_kind = 'server'
+                          AND resource_acl.resource_id = d.server_definition_id
+                          AND resource_acl.enabled = 1
+                          AND resource_acl.operation IN ('port.lease', 'port.release')
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM broker_assignment_acl assignment_acl
+                        WHERE assignment_acl.uid = policy.uid
+                          AND assignment_acl.repo_id = policy.repo_id
+                          AND assignment_acl.server_definition_id = d.server_definition_id
+                          AND assignment_acl.enabled = 1
+                          AND assignment_acl.operation IN ('port.assign', 'port.unassign')
+                    )
+                  )
+            )
+        """
+
+    return frozenset(
+        str(row[0])
+        for row in connection.execute(
+            f"""
+            SELECT d.server_definition_id
+            FROM server_definitions d
+            JOIN repositories r USING(repo_id)
+            JOIN repository_installations i USING(repo_id)
+            LEFT JOIN server_observations o USING(server_definition_id)
+            WHERE o.lifecycle IN ('running', 'starting', 'unhealthy', 'stopping')
+               OR (
+                    r.state = 'active'
+                    AND i.status != 'disabled'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM resource_retirements retirement
+                        WHERE retirement.resource_kind = 'server'
+                          AND retirement.host_resource_id = d.server_definition_id
+                          AND retirement.status = 'retired'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM cleanup_tombstones tombstone
+                        WHERE (tombstone.target_kind = 'project'
+                               AND tombstone.target_id = d.repo_id)
+                           OR (tombstone.target_kind = 'server'
+                               AND tombstone.target_id = d.server_definition_id)
+                    )
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM control_bindings b
+                            WHERE b.resource_kind = 'server'
+                              AND b.resource_id = d.server_definition_id
+                              AND b.authority_state != 'retired'
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM repository_memberships m
+                            WHERE m.resource_kind = 'server'
+                              AND m.host_resource_id = d.server_definition_id
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM port_assignments p
+                            WHERE p.repo_id = d.repo_id AND p.server_name = d.name
+                              AND p.status = 'active'
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM leases l
+                            WHERE l.server_definition_id = d.server_definition_id
+                              AND l.status = 'active'
+                              AND (l.expires_at IS NULL OR l.expires_at > ?)
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM operation_targets target
+                            JOIN operations operation USING(operation_id)
+                            WHERE target.target_kind = 'server'
+                              AND target.target_id = d.server_definition_id
+                              AND operation.status IN (
+                                  'planned', 'running', 'partial', 'needs_attention'
+                              )
+                        )
+                        OR {broker_management}
+                    )
+               )
+            ORDER BY d.server_definition_id
+            """,
+            (observed_at,),
+        )
     )
 
 
@@ -1032,6 +1218,95 @@ class AccountStore(CoordinatorStore):
                     """
                 ).fetchone()
             )
+            inventory_time = utc_timestamp()
+            present_docker_resources = _latest_available_docker_presence(connection)
+
+            def docker_resource_is_present(host_id: Any, resource_id: Any) -> bool:
+                """Preserve legacy visibility until this host has proved presence."""
+
+                current = present_docker_resources.get(str(host_id))
+                return current is None or str(resource_id) in current
+
+            current_docker_resource_ids = frozenset(
+                str(row["docker_resource_id"])
+                for row in connection.execute(
+                    """
+                    SELECT d.docker_resource_id, e.host_id
+                    FROM docker_resources d JOIN docker_engines e USING(engine_id)
+                    ORDER BY d.docker_resource_id
+                    """
+                )
+                if docker_resource_is_present(
+                    row["host_id"], row["docker_resource_id"]
+                )
+            )
+            active_docker_resource_ids = frozenset(
+                str(row["docker_resource_id"])
+                for row in connection.execute(
+                    """
+                    SELECT d.docker_resource_id
+                    FROM docker_resources d
+                    LEFT JOIN docker_observations o USING(docker_resource_id)
+                    WHERE (
+                        (
+                            NOT EXISTS (
+                                SELECT 1 FROM resource_retirements retirement
+                                WHERE retirement.resource_kind = 'container'
+                                  AND retirement.host_resource_id = d.docker_resource_id
+                                  AND retirement.status = 'retired'
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM cleanup_tombstones tombstone
+                                WHERE tombstone.target_kind = 'container'
+                                  AND tombstone.target_id = d.docker_resource_id
+                            )
+                            AND (
+                                NOT EXISTS (
+                                    SELECT 1 FROM repository_memberships membership
+                                    WHERE membership.resource_kind = 'container'
+                                      AND membership.host_resource_id = d.docker_resource_id
+                                )
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM repository_memberships membership
+                                    JOIN repositories repository
+                                      ON repository.repo_id = membership.repo_id
+                                    JOIN repository_installations installation
+                                      ON installation.repo_id = membership.repo_id
+                                    WHERE membership.resource_kind = 'container'
+                                      AND membership.host_resource_id = d.docker_resource_id
+                                      AND repository.state = 'active'
+                                      AND installation.status != 'disabled'
+                                      AND NOT EXISTS (
+                                          SELECT 1 FROM cleanup_tombstones tombstone
+                                          WHERE tombstone.target_kind = 'project'
+                                            AND tombstone.target_id = membership.repo_id
+                                      )
+                                )
+                            )
+                        )
+                        OR o.lifecycle = 'running'
+                    )
+                    ORDER BY d.docker_resource_id
+                    """
+                )
+                if str(row["docker_resource_id"])
+                in current_docker_resource_ids
+            )
+            current_server_resource_ids = _current_server_resource_ids(
+                connection, observed_at=inventory_time
+            )
+            current_database_binding_ids = frozenset(
+                str(row["database_binding_id"])
+                for row in connection.execute(
+                    """
+                    SELECT database_binding_id, docker_resource_id
+                    FROM database_bindings ORDER BY database_binding_id
+                    """
+                )
+                if str(row["docker_resource_id"]) in active_docker_resource_ids
+            )
+
             repositories = [
                 dict(row)
                 for row in connection.execute(
@@ -1043,6 +1318,11 @@ class AccountStore(CoordinatorStore):
                     FROM repositories r
                     JOIN repository_installations i USING(repo_id)
                     WHERE r.state = 'active' AND i.status != 'disabled'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM cleanup_tombstones t
+                        WHERE t.target_kind = 'project'
+                          AND t.target_id = r.repo_id
+                      )
                     ORDER BY lower(r.display_name), r.canonical_root
                     """
                 )
@@ -1073,15 +1353,37 @@ class AccountStore(CoordinatorStore):
                 dict(row)
                 for row in connection.execute(
                     """
-                    SELECT membership_id, repo_id, resource_kind, host_resource_id,
-                           immutable_fingerprint, control_binding_id
+                    SELECT m.membership_id, m.repo_id, m.resource_kind,
+                           m.host_resource_id, m.immutable_fingerprint,
+                           m.control_binding_id
                     FROM repository_memberships m
                     JOIN repositories r USING(repo_id)
                     JOIN repository_installations i USING(repo_id)
+                    LEFT JOIN resource_retirements rr
+                      ON rr.resource_kind = m.resource_kind
+                     AND rr.host_resource_id = m.host_resource_id
                     WHERE r.state = 'active' AND i.status != 'disabled'
-                    ORDER BY repo_id, resource_kind, host_resource_id
+                      AND rr.host_resource_id IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM cleanup_tombstones t
+                        WHERE (t.target_kind = 'project' AND t.target_id = m.repo_id)
+                           OR (t.target_kind = m.resource_kind
+                               AND t.target_id = m.host_resource_id)
+                      )
+                    ORDER BY m.repo_id, m.resource_kind, m.host_resource_id
                     """
                 )
+                if (
+                    row["resource_kind"] == "container"
+                    and str(row["host_resource_id"])
+                    in active_docker_resource_ids
+                )
+                or (
+                    row["resource_kind"] == "server"
+                    and str(row["host_resource_id"])
+                    in current_server_resource_ids
+                )
+                or row["resource_kind"] not in {"container", "server"}
             ]
             control_bindings = [
                 dict(row)
@@ -1092,6 +1394,20 @@ class AccountStore(CoordinatorStore):
                            authority_state, priority, generation
                     FROM control_bindings ORDER BY resource_kind, resource_id, source_id
                     """
+                )
+                if row["authority_state"] != "retired"
+                and (
+                    (
+                        row["resource_kind"] == "container"
+                        and str(row["resource_id"])
+                        in active_docker_resource_ids
+                    )
+                    or (
+                        row["resource_kind"] == "server"
+                        and str(row["resource_id"])
+                        in current_server_resource_ids
+                    )
+                    or row["resource_kind"] not in {"container", "server"}
                 )
             ]
             unassigned: list[dict[str, Any]] = []
@@ -1138,6 +1454,17 @@ class AccountStore(CoordinatorStore):
                 ORDER BY u.resource_kind, u.display_name, u.resource_id
                 """
             ):
+                if (
+                    row["resource_kind"] == "container"
+                    and not docker_resource_is_present(
+                        row["host_id"], row["resource_id"]
+                    )
+                ):
+                    # The normalized row is retained as ownership/history, but
+                    # an absent Docker identity is not an active unassigned
+                    # resource and cannot be attached or retired from this
+                    # inventory surface.
+                    continue
                 item = dict(row)
                 item.pop("source_payload_fingerprint")
                 immutable_fingerprint = item.pop("membership_fingerprint")
@@ -1192,7 +1519,17 @@ class AccountStore(CoordinatorStore):
                         "can_retire": exact,
                     }
                 )
-                unassigned.append(item)
+                projected = _active_lifecycle_projection(
+                    {
+                        **item,
+                        "lifecycle_state": (
+                            "archived" if retirement_status == "retired" else "active"
+                        ),
+                    }
+                )
+                if projected is not None:
+                    projected.pop("lifecycle_state", None)
+                    unassigned.append(projected)
             lifecycle_violations: list[dict[str, Any]] = []
 
             def append_lifecycle_violation(
@@ -1247,7 +1584,12 @@ class AccountStore(CoordinatorStore):
                     "affected_canonical_root": row["canonical_root"],
                 }
                 lifecycle_violations.append(item)
-                unassigned.append(item)
+                projected = _active_lifecycle_projection(
+                    {**item, "lifecycle_state": "archived"}
+                )
+                if projected is not None:
+                    projected.pop("lifecycle_state", None)
+                    unassigned.append(projected)
 
             for row in connection.execute(
                 """
@@ -1286,10 +1628,24 @@ class AccountStore(CoordinatorStore):
                 )
                 LEFT JOIN coordinator_sources controller ON controller.source_id = cb.source_id
                 WHERE o.lifecycle = 'running'
-                  AND (i.status = 'disabled' OR rr.status = 'retired')
+                  AND (
+                    i.status = 'disabled'
+                    OR rr.status = 'retired'
+                    OR EXISTS (
+                        SELECT 1 FROM cleanup_tombstones tombstone
+                        WHERE (tombstone.target_kind = 'project'
+                               AND tombstone.target_id = m.repo_id)
+                           OR (tombstone.target_kind = 'container'
+                               AND tombstone.target_id = d.docker_resource_id)
+                    )
+                  )
                 ORDER BY d.current_name, d.full_container_id
                 """
             ):
+                if not docker_resource_is_present(
+                    row["host_id"], row["resource_id"]
+                ):
+                    continue
                 immutable = row["membership_fingerprint"]
                 if immutable is None:
                     immutable = "sha256:" + fingerprint(
@@ -1346,7 +1702,17 @@ class AccountStore(CoordinatorStore):
                 )
                 LEFT JOIN coordinator_sources controller ON controller.source_id = cb.source_id
                 WHERE o.lifecycle IN ('running', 'starting', 'unhealthy')
-                  AND (i.status = 'disabled' OR rr.status = 'retired')
+                  AND (
+                    i.status = 'disabled'
+                    OR rr.status = 'retired'
+                    OR EXISTS (
+                        SELECT 1 FROM cleanup_tombstones tombstone
+                        WHERE (tombstone.target_kind = 'project'
+                               AND tombstone.target_id = d.repo_id)
+                           OR (tombstone.target_kind = 'server'
+                               AND tombstone.target_id = d.server_definition_id)
+                    )
+                  )
                 ORDER BY d.name, d.server_definition_id
                 """
             ):
@@ -1375,8 +1741,18 @@ class AccountStore(CoordinatorStore):
                     immutable_fingerprint=str(immutable),
                 )
             observations = {
-                "servers": [dict(row) for row in connection.execute("SELECT * FROM server_observations")],
-                "docker": [dict(row) for row in connection.execute("SELECT * FROM docker_observations")],
+                "servers": [
+                    dict(row)
+                    for row in connection.execute("SELECT * FROM server_observations")
+                    if str(row["server_definition_id"])
+                    in current_server_resource_ids
+                ],
+                "docker": [
+                    dict(row)
+                    for row in connection.execute("SELECT * FROM docker_observations")
+                    if str(row["docker_resource_id"])
+                    in active_docker_resource_ids
+                ],
                 "databases": [
                     dict(row)
                     for row in connection.execute(
@@ -1397,6 +1773,8 @@ class AccountStore(CoordinatorStore):
                         ORDER BY o.docker_resource_id, o.database_binding_id
                         """
                     )
+                    if str(row["database_binding_id"])
+                    in current_database_binding_ids
                 ],
                 "telemetry": [
                     {
@@ -1418,6 +1796,21 @@ class AccountStore(CoordinatorStore):
                         ORDER BY host_resource_kind, host_resource_id,
                                  sampled_at DESC, sample_id DESC
                         """
+                    )
+                    if (
+                        row["host_resource_kind"] == "server"
+                        and str(row["host_resource_id"])
+                        in current_server_resource_ids
+                    )
+                    or (
+                        row["host_resource_kind"] in {"docker", "container"}
+                        and str(row["host_resource_id"])
+                        in active_docker_resource_ids
+                    )
+                    or (
+                        row["host_resource_kind"] == "database"
+                        and str(row["host_resource_id"])
+                        in current_database_binding_ids
                     )
                 ],
                 "snapshots": [
@@ -1463,14 +1856,14 @@ class AccountStore(CoordinatorStore):
                 LEFT JOIN resource_retirements rr
                   ON rr.resource_kind = 'server'
                  AND rr.host_resource_id = d.server_definition_id
-                WHERE i.status != 'disabled'
-                   OR (
-                       o.lifecycle IN ('running', 'starting', 'unhealthy')
-                       AND (i.status = 'disabled' OR rr.status = 'retired')
-                   )
                 ORDER BY r.canonical_root, d.name
                 """
             ):
+                if (
+                    str(row["server_definition_id"])
+                    not in current_server_resource_ids
+                ):
+                    continue
                 violation = lifecycle_violation_by_key.get(
                     ("server", str(row["server_definition_id"]))
                 )
@@ -1627,8 +2020,11 @@ class AccountStore(CoordinatorStore):
                     JOIN repository_installations i USING(repo_id)
                     LEFT JOIN server_definitions d USING(server_definition_id)
                     WHERE i.status != 'disabled' AND l.status = 'active'
+                      AND (l.expires_at IS NULL OR l.expires_at > ?)
                     ORDER BY l.port, l.lease_id
                     """
+                    ,
+                    (inventory_time,),
                 )
             ]
             compatibility_assignments = [
@@ -1656,13 +2052,15 @@ class AccountStore(CoordinatorStore):
             unassigned_by_resource = {
                 str(row["resource_id"]): row for row in unassigned if row.get("resource_kind") == "container"
             }
-            for row in connection.execute(
+            compatibility_container_rows = list(connection.execute(
                 """
-                SELECT d.docker_resource_id, d.full_container_id,
+                SELECT d.docker_resource_id, d.engine_id, e.host_id,
+                       d.full_container_id,
                        d.current_name AS name, d.image, r.canonical_root AS project,
                        o.lifecycle AS status, o.health, o.restart_policy, o.sampled_at,
                        cb.provenance AS metadata_source
                 FROM docker_resources d
+                JOIN docker_engines e USING(engine_id)
                 LEFT JOIN docker_observations o USING(docker_resource_id)
                 LEFT JOIN repository_memberships m
                   ON m.resource_kind = 'container' AND m.host_resource_id = d.docker_resource_id
@@ -1680,8 +2078,58 @@ class AccountStore(CoordinatorStore):
                 )
                 ORDER BY d.current_name, d.full_container_id
                 """
-            ):
+            ))
+            compatibility_container_rows = [
+                row
+                for row in compatibility_container_rows
+                if str(row["docker_resource_id"]) in active_docker_resource_ids
+            ]
+            suppressed_alias_ids: set[str] = set()
+            rows_by_engine: dict[str, list[sqlite3.Row]] = {}
+            for row in compatibility_container_rows:
+                rows_by_engine.setdefault(str(row["engine_id"]), []).append(row)
+            for rows in rows_by_engine.values():
+                for alias in rows:
+                    alias_id = str(alias["full_container_id"] or "").lower()
+                    if len(alias_id) != 12 or any(character not in "0123456789abcdef" for character in alias_id):
+                        continue
+                    candidates = [
+                        candidate
+                        for candidate in rows
+                        if len(str(candidate["full_container_id"] or "")) == 64
+                        and all(
+                            character in "0123456789abcdef"
+                            for character in str(candidate["full_container_id"] or "").lower()
+                        )
+                        and str(candidate["full_container_id"] or "").lower().startswith(alias_id)
+                    ]
+                    # A Docker short ID is safe to suppress only when it has
+                    # one strict full-ID expansion on the same engine. Keep
+                    # ambiguous prefixes and any attribution mismatch visible;
+                    # pure inventory never transfers or invents ownership.
+                    if len(candidates) != 1:
+                        continue
+                    canonical = candidates[0]
+                    alias_project = alias["project"]
+                    canonical_project = canonical["project"]
+                    if alias_project and not canonical_project:
+                        continue
+                    if alias_project and canonical_project and alias_project != canonical_project:
+                        continue
+                    alias_running = str(alias["status"] or "") in {"running", "starting", "unhealthy"}
+                    canonical_running = str(canonical["status"] or "") in {"running", "starting", "unhealthy"}
+                    if alias_running and not canonical_running:
+                        continue
+                    alias_sampled = str(alias["sampled_at"] or "")
+                    canonical_sampled = str(canonical["sampled_at"] or "")
+                    if alias_sampled and canonical_sampled and canonical_sampled < alias_sampled:
+                        continue
+                    suppressed_alias_ids.add(str(alias["docker_resource_id"]))
+
+            for row in compatibility_container_rows:
                 resource_id = str(row["docker_resource_id"])
+                if resource_id in suppressed_alias_ids:
+                    continue
                 violation = lifecycle_violation_by_key.get(("container", resource_id))
                 port_rows = connection.execute(
                     """
@@ -1801,21 +2249,62 @@ class AccountStore(CoordinatorStore):
                 server_ids = [
                     str(row[0])
                     for row in connection.execute(
-                        "SELECT server_definition_id FROM server_definitions WHERE repo_id = ? ORDER BY name",
-                        (repo_id,),
-                    )
-                ]
-                container_names = [
-                    str(row[0])
-                    for row in connection.execute(
                         """
-                        SELECT d.current_name FROM repository_memberships m
-                        JOIN docker_resources d ON d.docker_resource_id = m.host_resource_id
-                        WHERE m.repo_id = ? AND m.resource_kind = 'container'
-                        ORDER BY d.current_name
+                        SELECT d.server_definition_id
+                        FROM server_definitions d
+                        WHERE d.repo_id = ?
+                          AND NOT EXISTS (
+                            SELECT 1 FROM resource_retirements retirement
+                            WHERE retirement.resource_kind = 'server'
+                              AND retirement.host_resource_id = d.server_definition_id
+                              AND retirement.status = 'retired'
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM cleanup_tombstones t
+                            WHERE t.target_kind = 'server'
+                              AND t.target_id = d.server_definition_id
+                          )
+                        ORDER BY d.name
                         """,
                         (repo_id,),
                     )
+                    if str(row[0]) in current_server_resource_ids
+                ]
+                container_memberships = list(
+                    connection.execute(
+                        """
+                        SELECT d.docker_resource_id, d.current_name, e.host_id
+                        FROM repository_memberships m
+                        JOIN docker_resources d ON d.docker_resource_id = m.host_resource_id
+                        JOIN docker_engines e USING(engine_id)
+                        WHERE m.repo_id = ? AND m.resource_kind = 'container'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM resource_retirements retirement
+                            WHERE retirement.resource_kind = 'container'
+                              AND retirement.host_resource_id = m.host_resource_id
+                              AND retirement.status = 'retired'
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM cleanup_tombstones tombstone
+                            WHERE (tombstone.target_kind = 'project'
+                                   AND tombstone.target_id = m.repo_id)
+                               OR (tombstone.target_kind = 'container'
+                                   AND tombstone.target_id = m.host_resource_id)
+                          )
+                        ORDER BY d.current_name, d.docker_resource_id
+                        """,
+                        (repo_id,),
+                    )
+                )
+                container_memberships = [
+                    row
+                    for row in container_memberships
+                    if str(row["docker_resource_id"])
+                    in active_docker_resource_ids
+                ]
+                container_names = [str(row["current_name"]) for row in container_memberships]
+                container_resource_ids = [
+                    str(row["docker_resource_id"]) for row in container_memberships
                 ]
                 usage_rows = list(
                     connection.execute(
@@ -1828,6 +2317,19 @@ class AccountStore(CoordinatorStore):
                          AND t.host_resource_id = d.server_definition_id
                         WHERE d.repo_id = ?
                           AND o.lifecycle IN ('running', 'starting', 'unhealthy')
+                          AND NOT EXISTS (
+                              SELECT 1 FROM resource_retirements retirement
+                              WHERE retirement.resource_kind = 'server'
+                                AND retirement.host_resource_id = d.server_definition_id
+                                AND retirement.status = 'retired'
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM cleanup_tombstones tombstone
+                              WHERE (tombstone.target_kind = 'project'
+                                     AND tombstone.target_id = d.repo_id)
+                                 OR (tombstone.target_kind = 'server'
+                                     AND tombstone.target_id = d.server_definition_id)
+                          )
                           AND t.sampled_at >= d.updated_at
                           AND t.sample_id = (
                               SELECT newer.sample_id
@@ -1842,18 +2344,36 @@ class AccountStore(CoordinatorStore):
                         (repo_id,),
                     )
                 )
-                usage_rows.extend(
+                container_usage_rows = list(
                     connection.execute(
                         """
-                        SELECT t.cpu_percent, t.memory_bytes
+                        SELECT t.cpu_percent, t.memory_bytes,
+                               m.host_resource_id AS docker_resource_id,
+                               e.host_id
                         FROM repository_memberships m
                         JOIN docker_observations o
                           ON o.docker_resource_id = m.host_resource_id
+                        JOIN docker_resources d
+                          ON d.docker_resource_id = m.host_resource_id
+                        JOIN docker_engines e USING(engine_id)
                         JOIN telemetry_samples t
                           ON t.host_resource_kind = 'docker'
                          AND t.host_resource_id = m.host_resource_id
                         WHERE m.repo_id = ? AND m.resource_kind = 'container'
                           AND o.lifecycle = 'running'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM resource_retirements retirement
+                              WHERE retirement.resource_kind = 'container'
+                                AND retirement.host_resource_id = m.host_resource_id
+                                AND retirement.status = 'retired'
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM cleanup_tombstones tombstone
+                              WHERE (tombstone.target_kind = 'project'
+                                     AND tombstone.target_id = m.repo_id)
+                                 OR (tombstone.target_kind = 'container'
+                                     AND tombstone.target_id = m.host_resource_id)
+                          )
                           AND t.sample_id = (
                               SELECT newer.sample_id
                               FROM telemetry_samples newer
@@ -1865,6 +2385,12 @@ class AccountStore(CoordinatorStore):
                         """,
                         (repo_id,),
                     )
+                )
+                usage_rows.extend(
+                    row
+                    for row in container_usage_rows
+                    if str(row["docker_resource_id"])
+                    in active_docker_resource_ids
                 )
                 cpu_samples = [
                     float(row["cpu_percent"])
@@ -1883,6 +2409,7 @@ class AccountStore(CoordinatorStore):
                         "display_name": repository["display_name"],
                         "server_ids": server_ids,
                         "container_names": container_names,
+                        "container_resource_ids": container_resource_ids,
                         "process_count": None,
                         "cpu_percent": sum(cpu_samples) if cpu_samples else None,
                         "memory_bytes": sum(memory_samples) if memory_samples else None,
@@ -1943,14 +2470,14 @@ class AccountStore(CoordinatorStore):
                 LEFT JOIN resource_retirements rr
                   ON rr.resource_kind = 'server'
                  AND rr.host_resource_id = d.server_definition_id
-                WHERE i.status != 'disabled'
-                   OR (
-                       o.lifecycle IN ('running', 'starting', 'unhealthy')
-                       AND (i.status = 'disabled' OR rr.status = 'retired')
-                   )
                 ORDER BY d.repo_id, d.name
                 """
             ):
+                if (
+                    str(row["server_definition_id"])
+                    not in current_server_resource_ids
+                ):
+                    continue
                 server = dict(row)
                 server["arguments"] = [
                     str(argument[0])
@@ -1968,24 +2495,11 @@ class AccountStore(CoordinatorStore):
                 for row in connection.execute(
                     """
                     SELECT d.* FROM docker_resources d
-                    LEFT JOIN repository_memberships m
-                      ON m.resource_kind = 'container'
-                     AND m.host_resource_id = d.docker_resource_id
-                    LEFT JOIN repository_installations i ON i.repo_id = m.repo_id
-                    LEFT JOIN resource_retirements rr
-                      ON rr.resource_kind = 'container'
-                     AND rr.host_resource_id = d.docker_resource_id
-                    LEFT JOIN docker_observations o USING(docker_resource_id)
-                    WHERE (
-                        (m.repo_id IS NULL OR i.status != 'disabled')
-                        AND (rr.host_resource_id IS NULL OR rr.status != 'retired')
-                    ) OR (
-                        o.lifecycle = 'running'
-                        AND (i.status = 'disabled' OR rr.status = 'retired')
-                    )
                     ORDER BY d.current_name, d.full_container_id
                     """
                 )
+                if str(row["docker_resource_id"])
+                in active_docker_resource_ids
             ]
             visible_docker_ids = {
                 str(resource["docker_resource_id"]) for resource in docker_resources

@@ -3,6 +3,7 @@ Description=DevCoordinator server-wide authority broker
 Documentation=file:///home/DevCoordinator/README.md
 After=network-online.target docker.service
 Wants=network-online.target
+SurviveFinalKillSignal=no
 
 [Service]
 Type=simple
@@ -10,19 +11,34 @@ User=root
 Group=devcoordinator-clients
 WorkingDirectory=/home/DevCoordinator
 Environment=DEVCOORDINATOR_AUTHORITY=service
+Environment=DOCKER_CONFIG=/var/lib/devcoordinator/docker
 RuntimeDirectory=devcoordinator
 RuntimeDirectoryMode=0750
 StateDirectory=devcoordinator
 StateDirectoryMode=0700
 UMask=0077
-ExecStart=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py broker serve --database /var/lib/devcoordinator/coordinator.sqlite3 --socket /run/devcoordinator/broker.sock --access-group devcoordinator-clients
+ExecStartPre=/usr/bin/python3 -I /home/DevCoordinator/skills/codex-dev-coordinator/scripts/validate_runtime_dependencies.py
+ExecStart=/usr/bin/python3 -I /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py broker serve --database /var/lib/devcoordinator/coordinator.sqlite3 --socket /run/devcoordinator/broker.sock --access-group devcoordinator-clients
 Restart=on-failure
 RestartSec=2
-TimeoutStopSec=15
+# This 65-minute stop boundary is the broker-side graceful-wait budget plus an
+# outer margin. SIGTERM reaches only the broker main process so it can fence
+# later mutations and wait within that budget for admitted handlers. This
+# configuration alone is not proof that nested Docker or database work has
+# reached a terminal state.
+KillMode=mixed
+KillSignal=SIGTERM
+RestartKillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+TimeoutStopSec=65min
+TimeoutStopFailureMode=terminate
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+# The installer atomically replaces one generated drop-in that adds only the
+# exact canonical homes of the complete explicit --client-user set.
 ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator
 
 [Install]

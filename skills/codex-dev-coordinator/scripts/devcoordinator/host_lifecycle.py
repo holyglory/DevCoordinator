@@ -36,8 +36,10 @@ from .repository_lifecycle import (
 
 _RESTORABLE_SYSTEMD_UNIT_FILE_STATES = frozenset(
     {
+        "disabled",
         "enabled",
         "enabled-runtime",
+        "masked-runtime",
         "static",
         "indirect",
         "generated",
@@ -268,12 +270,22 @@ class CoordinatorHostLifecycleAdapter:
                 disabled = observable and value == policy.disabled_value
             elif policy.kind is PolicyKind.SUPERVISOR:
                 observable = supervisor is not None and supervisor.observable
-                value = None
-                if supervisor is not None and supervisor.enabled is False:
-                    value = policy.disabled_value
-                elif supervisor is not None and supervisor.enabled is True:
-                    value = supervisor.unit_file_state or "enabled"
-                disabled = observable and supervisor is not None and supervisor.enabled is False
+                value = supervisor.unit_file_state if supervisor is not None else None
+                disabled = False
+                if observable and supervisor is not None:
+                    if supervisor.manager == "systemd":
+                        # A persistent mask is the required decommission
+                        # boundary. `disabled` is only the first half of the
+                        # disable->mask sequence, and a runtime-only mask would
+                        # disappear on reboot.
+                        disabled = (
+                            supervisor.enabled is False
+                            and supervisor.unit_file_state == "masked"
+                        )
+                    elif supervisor.manager == "launchd":
+                        disabled = supervisor.enabled is False
+                    if disabled:
+                        value = policy.disabled_value
             else:
                 # These are enforced by the durable repository/resource fence,
                 # which always precedes host observation.
@@ -583,7 +595,14 @@ class LocalHostLifecycleBackend:
         else:
             raise LifecycleError(f"unsupported supervisor manager {manager}")
         observed = self.observe_supervisor(identity)
-        if not observed.observable or observed.enabled is not False:
+        if (
+            not observed.observable
+            or observed.enabled is not False
+            or (
+                manager == "systemd"
+                and observed.unit_file_state != "masked"
+            )
+        ):
             raise LifecycleError("supervisor policy did not become disabled")
         return {"manager": manager, "unit": unit, "enabled": False}
 
@@ -596,8 +615,6 @@ class LocalHostLifecycleBackend:
         unit = _require_native(identity, "unit")
         if captured.supervisor_manager != manager:
             raise PlanDriftError("captured supervisor manager changed")
-        if captured.supervisor_enabled is not True:
-            raise LifecycleError("supervisor restore was not captured as enabled")
         host_may_have_started = False
         if manager == "systemd":
             expected = captured.supervisor_unit_file_state
@@ -605,27 +622,46 @@ class LocalHostLifecycleBackend:
                 raise LifecycleError(
                     f"captured systemd unit state {expected!r} cannot be restored exactly"
                 )
+            if captured.captured_value != expected:
+                raise LifecycleError(
+                    "captured systemd policy value does not match its unit-file state"
+                )
+            if (
+                expected in {"disabled", "masked-runtime"}
+                and captured.supervisor_enabled is not False
+            ):
+                raise LifecycleError(
+                    "captured disabled systemd policy has inconsistent enabled state"
+                )
+            if (
+                expected not in {"disabled", "masked-runtime"}
+                and captured.supervisor_enabled is not True
+            ):
+                raise LifecycleError("supervisor restore was not captured as enabled")
             prefix = ["systemctl"]
             if identity.get("scope") == "user":
                 prefix.append("--user")
             self._run(tuple([*prefix, "unmask", unit]), allow=(0, 1))
-            if expected == "enabled":
+            if expected == "disabled":
+                pass
+            elif expected == "masked-runtime":
+                self._run(tuple([*prefix, "mask", "--runtime", unit]))
+            elif expected == "enabled":
                 self._run(tuple([*prefix, "enable", unit]))
             elif expected == "enabled-runtime":
                 self._run(tuple([*prefix, "enable", "--runtime", unit]))
         elif manager == "launchd":
+            if (
+                captured.supervisor_enabled is not True
+                or captured.supervisor_unit_file_state != "enabled"
+                or captured.captured_value != "enabled"
+                or type(captured.supervisor_loaded) is not bool
+            ):
+                raise LifecycleError(
+                    "captured launchd policy state is incomplete or inconsistent"
+                )
             target = _launchd_target(identity)
             self._run(("launchctl", "enable", target))
-            before = self.observe_supervisor(identity)
-            if captured.supervisor_loaded is True and before.loaded is False:
-                plist_path = self._verified_launchd_plist(identity)
-                domain = _require_native(identity, "domain")
-                self._run(("launchctl", "bootstrap", domain, plist_path))
-                host_may_have_started = True
-            elif captured.supervisor_loaded is False and before.loaded is True:
-                raise LifecycleError(
-                    "launchd loaded state changed; refusing to unload during start restoration"
-                )
         else:
             raise LifecycleError(f"unsupported supervisor manager {manager}")
         observed = self.observe_supervisor(identity)
@@ -634,10 +670,6 @@ class LocalHostLifecycleBackend:
             or not observed.identity_matches
             or observed.enabled is not captured.supervisor_enabled
             or observed.unit_file_state != captured.supervisor_unit_file_state
-            or (
-                manager == "launchd"
-                and observed.loaded is not captured.supervisor_loaded
-            )
         ):
             raise LifecycleError("supervisor policy did not match exact captured state")
         return {

@@ -19,7 +19,9 @@ async function fixture({ routes = ['app', 'echo'], admins = ['owner@gmail.com'] 
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-access-'));
   const file = path.join(dir, 'access-control.json');
   const currentRoutes = new Set(routes);
-  const routeStore = { get: (slug) => currentRoutes.has(slug) ? { slug } : null };
+  const routeStore = {
+    get: (slug) => currentRoutes.has(slug) ? { slug, instanceId: `instance-${slug}` } : null,
+  };
   const store = createAccessStore({ file, adminEmails: admins, routeStore, log: null });
   await store.load();
   return { dir, file, currentRoutes, routeStore, store };
@@ -59,6 +61,51 @@ describe('access policy store', () => {
     await reloaded.removeUser('viewer@gmail.com');
     assert.equal(reloaded.isKnown('viewer@gmail.com'), false, 'existing sessions are revoked by membership lookup');
     await assert.rejects(() => reloaded.removeUser('owner@gmail.com'), /only be changed in ALLOWED_EMAILS/);
+  });
+
+  it('rejects unsafe access-policy ownership, permissions, and symlinks before loading identities', async () => {
+    const { file, routeStore, store } = await fixture();
+    await store.addUser({ email: 'viewer@gmail.com', grants: [routeGrant('app')] });
+    const makeReload = () => createAccessStore({
+      file,
+      adminEmails: ['owner@gmail.com'],
+      routeStore,
+      log: null,
+    });
+
+    await fsp.chmod(file, 0o644);
+    await assert.rejects(
+      makeReload().load(),
+      (error) => error instanceof AccessError
+        && error.status === 500
+        && /group\/world/.test(error.message),
+    );
+
+    await fsp.chmod(file, 0o600);
+    const originalGetuid = process.getuid;
+    const fileOwner = (await fsp.stat(file)).uid;
+    try {
+      process.getuid = () => fileOwner + 1;
+      await assert.rejects(
+        makeReload().load(),
+        (error) => error instanceof AccessError
+          && error.status === 500
+          && /owned by the Console account/.test(error.message),
+      );
+    } finally {
+      process.getuid = originalGetuid;
+    }
+
+    const outside = `${file}.outside`;
+    await fsp.rename(file, outside);
+    await fsp.symlink(outside, file);
+    await assert.rejects(
+      makeReload().load(),
+      (error) => error instanceof AccessError
+        && error.status === 500
+        && /symlink/.test(error.message),
+    );
+    assert.equal((await fsp.lstat(file)).isSymbolicLink(), true);
   });
 
   it('rejects invalid users, duplicates, owners, malformed grants, and nonexistent resources', async () => {
@@ -134,7 +181,7 @@ describe('access policy store', () => {
   it('backs up corrupt policy and fails closed to configured owners only', async () => {
     const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-access-corrupt-'));
     const file = path.join(dir, 'access-control.json');
-    await fsp.writeFile(file, '{not json', 'utf8');
+    await fsp.writeFile(file, '{not json', { encoding: 'utf8', mode: 0o600 });
     const store = createAccessStore({
       file,
       adminEmails: ['owner@gmail.com'],
@@ -163,5 +210,119 @@ describe('access policy store', () => {
     assert.deepEqual(store.list().find((user) => !user.owner).grants, ['console']);
     const onDisk = JSON.parse(await fsp.readFile(file, 'utf8'));
     assert.deepEqual(onDisk.users['viewer@gmail.com'].grants, ['console']);
+  });
+
+  it('migrates schema v1 to v2 without changing users or grants', async () => {
+    const { file, routeStore } = await fixture();
+    await fsp.writeFile(file, `${JSON.stringify({
+      version: 1,
+      users: { 'viewer@gmail.com': { grants: ['route:app'] } },
+    })}\n`, { encoding: 'utf8', mode: 0o600 });
+    const store = createAccessStore({ file, adminEmails: ['owner@gmail.com'], routeStore, log: null });
+    await store.load();
+
+    assert.equal(store.canAccess('viewer@gmail.com', 'route:app'), true);
+    const migrated = JSON.parse(await fsp.readFile(file, 'utf8'));
+    assert.equal(migrated.version, 2);
+    assert.deepEqual(migrated.requests, {});
+    assert.deepEqual(migrated.users['viewer@gmail.com'].grants, ['route:app']);
+  });
+
+  it('deduplicates exact requests and atomically approves a new user plus grant', async () => {
+    const { file, routeStore, store } = await fixture();
+    const descriptor = {
+      email: 'requester@gmail.com',
+      subject: 'issuer\0google-subject-1',
+      resource: 'route:app',
+      resourceInstance: store.resourceInstance('route:app'),
+      host: 'app.vr.ae',
+      title: 'App',
+      target: 'web · /repo/app',
+    };
+
+    const first = await store.requestAccess(descriptor);
+    const duplicate = await store.requestAccess(descriptor);
+    assert.equal(duplicate.id, first.id);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(store.pendingRequestCount(), 1);
+    assert.equal(store.listRequests()[0].subjectHash, undefined, 'private subject hash is never exposed');
+
+    const approved = await store.decideRequest(first.id, 'approve', 'owner@gmail.com');
+    assert.equal(approved.status, 'approved');
+    assert.equal(store.canAccess('requester@gmail.com', 'route:app'), true);
+    assert.equal(store.pendingRequestCount(), 0);
+    assert.equal((await store.decideRequest(first.id, 'approve', 'owner@gmail.com')).status, 'approved');
+    await assert.rejects(
+      () => store.decideRequest(first.id, 'deny', 'owner@gmail.com'),
+      (error) => error instanceof AccessError && error.status === 409,
+    );
+
+    const persisted = JSON.parse(await fsp.readFile(file, 'utf8'));
+    assert.deepEqual(persisted.users['requester@gmail.com'].grants, ['route:app']);
+    assert.equal(persisted.requests[first.id].status, 'approved');
+
+    const reloaded = createAccessStore({
+      file, adminEmails: ['owner@gmail.com'], routeStore, log: null,
+    });
+    await reloaded.load();
+    assert.equal(reloaded.canAccess('requester@gmail.com', 'route:app'), true);
+    assert.equal(reloaded.listRequests({ status: 'approved' })[0].id, first.id);
+  });
+
+  it('denies without granting, applies a retry cooldown, and stales pending requests on resource removal', async () => {
+    let clock = Date.parse('2026-07-18T00:00:00.000Z');
+    const { file, routeStore } = await fixture();
+    const store = createAccessStore({
+      file, adminEmails: ['owner@gmail.com'], routeStore, log: null, now: () => clock,
+    });
+    await store.load();
+    const base = {
+      email: 'requester@gmail.com',
+      subject: 'issuer\0google-subject-2',
+      resource: 'route:app',
+      resourceInstance: store.resourceInstance('route:app'),
+      host: 'app.vr.ae',
+      title: 'App',
+      target: 'web · /repo/app',
+    };
+    const denied = await store.requestAccess(base);
+    await store.decideRequest(denied.id, 'deny', 'owner@gmail.com');
+    assert.equal(store.canAccess(base.email, base.resource), false);
+    await assert.rejects(
+      () => store.requestAccess(base),
+      (error) => error instanceof AccessError && error.status === 429 && error.retryAfter > 0,
+    );
+
+    clock += 24 * 60 * 60 * 1000 + 1;
+    const pending = await store.requestAccess(base);
+    await store.clearResource('route:app');
+    assert.equal(store.listRequests({ status: 'stale' }).some((row) => row.id === pending.id), true);
+    await assert.rejects(
+      () => store.decideRequest(pending.id, 'approve', 'owner@gmail.com'),
+      (error) => error instanceof AccessError && error.status === 409,
+    );
+  });
+
+  it('rolls back both request and grant when request persistence fails', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'devops-console-request-fail-'));
+    const blocker = path.join(dir, 'not-a-directory');
+    await fsp.writeFile(blocker, 'block');
+    const store = createAccessStore({
+      file: path.join(blocker, 'access-control.json'),
+      adminEmails: ['owner@gmail.com'],
+      routeStore: { get: (slug) => slug === 'app' ? { slug, instanceId: 'instance-app' } : null },
+      log: null,
+    });
+    await assert.rejects(() => store.requestAccess({
+      email: 'requester@gmail.com',
+      subject: 'issuer\0google-subject-3',
+      resource: 'route:app',
+      resourceInstance: 'instance-app',
+      host: 'app.vr.ae',
+      title: 'App',
+      target: 'web · /repo/app',
+    }), (error) => error instanceof AccessError && error.status === 500);
+    assert.equal(store.pendingRequestCount(), 0);
+    assert.equal(store.isKnown('requester@gmail.com'), false);
   });
 });

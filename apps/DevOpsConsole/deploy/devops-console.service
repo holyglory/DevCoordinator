@@ -1,9 +1,12 @@
 [Unit]
 Description=DevOps Console - TLS edge, subdomain proxy, and control panel for vr.ae
 Documentation=file:///home/DevCoordinator/apps/DevOpsConsole/README.md
-Requires=dev-coordinator.service
 After=network-online.target dev-coordinator.service
-Wants=network-online.target
+# The TLS edge is an independent availability boundary. Ask systemd to start
+# the control API first, but do not tear down ports 80/443 when that API is
+# stopped for broker maintenance. ExecStartPost still fails closed until the
+# exact coordinator registration graph converges on a Console start/restart.
+Wants=network-online.target dev-coordinator.service
 
 [Service]
 Type=simple
@@ -20,10 +23,22 @@ ExecStartPost=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_regist
 TimeoutStartSec=90
 # SIGHUP reloads the TLS certificate from disk (after certbot renewal).
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
+# Supervise both failed exits and unexpected clean daemon exits. An explicit
+# `systemctl stop devops-console.service` remains a deliberate maintenance stop
+# and is not counteracted by systemd.
+Restart=always
 RestartSec=3
 KillMode=control-group
 UMask=0077
+
+# Journald is the sole durable service log. Pin the sink and identity instead
+# of relying on manager defaults, and retain a generous bounded burst so an
+# outage keeps its startup, fatal, cleanup, and restart evidence.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devops-console
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10000
 
 # Bind 80/443 without root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE

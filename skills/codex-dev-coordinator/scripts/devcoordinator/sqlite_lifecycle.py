@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import uuid
 from typing import Any, Mapping, Sequence
 
 from .repository_lifecycle import (
@@ -49,8 +50,10 @@ REPOSITORY_TARGET_KIND = "repository"
 REPOSITORY_TARGET_ACTION = "fence_and_decommission"
 _RESTORABLE_SYSTEMD_STATES = frozenset(
     {
+        "disabled",
         "enabled",
         "enabled-runtime",
+        "masked-runtime",
         "static",
         "indirect",
         "generated",
@@ -128,6 +131,118 @@ class SQLiteLifecyclePersistence:
                 native_identity=native_identity,
                 control_contract_fingerprint=_binding_control_contract(binding),
             )
+
+    def resolve_resource(
+        self,
+        resource_kind: ResourceKind,
+        resource_id: str,
+        control_binding_id: str,
+        *,
+        include_archived: bool = False,
+    ) -> tuple[ExactResourceRef, str | None]:
+        """Resolve one opaque normalized resource identity without name lookup.
+
+        The returned repository identity is set for attached resources.  An
+        archived standalone resource is reconstructed from its immutable
+        durable archive plan; current host observation must still revalidate
+        it before any mutation.
+        """
+
+        with self.store.read_transaction() as connection:
+            membership = connection.execute(
+                """
+                SELECT repo_id FROM repository_memberships
+                WHERE resource_kind = ? AND host_resource_id = ?
+                """,
+                (resource_kind.value, resource_id),
+            ).fetchone()
+            if membership is not None:
+                repo_id = str(membership["repo_id"])
+                snapshot = self._repository_snapshot(connection, repo_id)
+                matches = [
+                    target
+                    for target in snapshot.targets
+                    if target.kind is resource_kind
+                    and target.resource_id == resource_id
+                    and target.control_binding_id == control_binding_id
+                ]
+                if len(matches) != 1:
+                    raise OwnershipError("attached resource has no exact repository target")
+                if not include_archived:
+                    retirement = connection.execute(
+                        """
+                        SELECT 1 FROM resource_retirements
+                        WHERE resource_kind = ? AND host_resource_id = ?
+                        """,
+                        (resource_kind.value, resource_id),
+                    ).fetchone()
+                    if retirement is not None:
+                        raise ActionFencedError("resource archive fence is active")
+                return matches[0], repo_id
+
+            if include_archived:
+                retirement = connection.execute(
+                    """
+                    SELECT operation_id FROM resource_retirements
+                    WHERE resource_kind = ? AND host_resource_id = ?
+                    """,
+                    (resource_kind.value, resource_id),
+                ).fetchone()
+                if retirement is not None and retirement["operation_id"] is not None:
+                    plan = self._load_plan(connection, str(retirement["operation_id"]))
+                    if (
+                        isinstance(plan, StandaloneRetirementPlan)
+                        and plan.target.kind is resource_kind
+                        and plan.target.resource_id == resource_id
+                        and plan.target.control_binding_id == control_binding_id
+                    ):
+                        return plan.target, plan.repo_id
+
+        return (
+            self.resolve_standalone_resource(
+                resource_kind, resource_id, control_binding_id
+            ),
+            None,
+        )
+
+    def describe_resource(
+        self, resource: ExactResourceRef, repo_id: str | None
+    ) -> dict[str, Any]:
+        """Return bounded human labels while keeping IDs as separate fields."""
+
+        with self.store.read_transaction() as connection:
+            if resource.kind is ResourceKind.SERVER:
+                row = connection.execute(
+                    "SELECT name FROM server_definitions WHERE server_definition_id = ?",
+                    (resource.resource_id,),
+                ).fetchone()
+            elif resource.kind is ResourceKind.CONTAINER:
+                row = connection.execute(
+                    "SELECT current_name AS name FROM docker_resources WHERE docker_resource_id = ?",
+                    (resource.resource_id,),
+                ).fetchone()
+            else:
+                row = None
+            project = (
+                connection.execute(
+                    "SELECT display_name FROM repositories WHERE repo_id = ?", (repo_id,)
+                ).fetchone()
+                if repo_id is not None
+                else None
+            )
+            return {
+                "target_kind": resource.kind.value,
+                "target_id": resource.resource_id,
+                "display_name": (
+                    str(row["name"])
+                    if row is not None and row["name"] is not None
+                    else f"{resource.kind.value.title()} resource"
+                ),
+                "project_id": repo_id,
+                "project_display_name": (
+                    str(project["display_name"]) if project is not None else None
+                ),
+            }
 
     def save_repository_plan(
         self, plan: RepositoryDecommissionPlan
@@ -229,13 +344,14 @@ class SQLiteLifecyclePersistence:
             connection.execute(
                 """
                 INSERT INTO operations(
-                    operation_id, kind, status, phase, generation,
+                    operation_id, repo_id, kind, status, phase, generation,
                     request_fingerprint, owner_uid, actor, created_at, updated_at
-                ) VALUES (?, 'standalone_resource_retirement', 'planned', 'planned', 0,
+                ) VALUES (?, ?, 'standalone_resource_retirement', 'planned', 'planned', 0,
                           ?, ?, ?, ?, ?)
                 """,
                 (
                     plan.plan_id,
+                    plan.repo_id,
                     plan.fingerprint,
                     os.geteuid(),
                     plan.actor,
@@ -517,11 +633,11 @@ class SQLiteLifecyclePersistence:
             elif operation["status"] == "planned":
                 current = self._standalone_snapshot(connection, plan.target)
                 if current.resource != plan.target:
-                    raise PlanDriftError("standalone resource changed after planning")
-                if current.attached_repo_id is not None:
-                    raise OwnershipError("standalone resource became repository-owned")
+                    raise PlanDriftError("resource changed after archive planning")
+                if current.attached_repo_id != plan.repo_id:
+                    raise OwnershipError("resource repository attachment changed after planning")
                 if current.authority_state != "authoritative":
-                    raise OwnershipError("standalone resource controller is not authoritative")
+                    raise OwnershipError("resource controller is not authoritative")
                 active_guard = connection.execute(
                     """
                     SELECT o.operation_id FROM operations o
@@ -711,7 +827,23 @@ class SQLiteLifecyclePersistence:
                         f"startup policy {policy.policy_id} drifted after capture"
                     )
                 if retained.status == "not_required":
-                    if observation.value == policy.disabled_value:
+                    still_same_disabled_state = (
+                        observation.disabled is True
+                        and observation.value == policy.disabled_value
+                    )
+                    if policy.kind is PolicyKind.SUPERVISOR:
+                        still_same_disabled_state = (
+                            still_same_disabled_state
+                            and observation.supervisor_manager
+                            == retained.supervisor_manager
+                            and observation.supervisor_unit_file_state
+                            == retained.supervisor_unit_file_state
+                            and observation.supervisor_loaded
+                            is retained.supervisor_loaded
+                            and observation.supervisor_enabled
+                            is retained.supervisor_enabled
+                        )
+                    if still_same_disabled_state:
                         return retained
                     if str(existing["captured_operation_id"]) == operation_id:
                         raise PlanDriftError(
@@ -761,7 +893,11 @@ class SQLiteLifecyclePersistence:
                 # a host observation correctly reports disabled and cannot be
                 # used to reconstruct the value that preceded the fence.
                 captured_value = str(policy_row["current_value"])
-            restore_required = captured_value != policy.disabled_value
+            restore_required = (
+                observation.disabled is not True
+                if policy.kind is PolicyKind.SUPERVISOR
+                else captured_value != policy.disabled_value
+            )
             timestamp = utc_timestamp()
             status = "captured" if restore_required else "not_required"
             connection.execute(
@@ -1082,20 +1218,47 @@ class SQLiteLifecyclePersistence:
                 ).rowcount
                 if changed != 1:
                     raise PlanDriftError("resource retirement fence changed")
-                connection.execute(
-                    """
-                    UPDATE control_bindings SET authority_state = 'retired',
-                        generation = generation + 1, updated_at = ?
-                    WHERE binding_id = ? AND authority_state = 'authoritative'
-                    """,
-                    (timestamp, plan.target.control_binding_id),
-                )
+                # Archive is reversible.  Keep the authoritative controller
+                # and repository membership; the retirement row is the start
+                # fence and active inventory projection.  Standalone rows are
+                # hidden until an explicit restore clears that fence.
                 connection.execute(
                     """
                     UPDATE unassigned_resources SET status = 'retired', updated_at = ?
                     WHERE resource_kind = ? AND resource_id = ? AND status = 'active'
                     """,
                     (timestamp, plan.target.kind.value, plan.target.resource_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO resource_lifecycle_history(
+                        history_id, repo_id, resource_kind, resource_id,
+                        immutable_fingerprint, action, operation_id, actor,
+                        reason, evidence_json, occurred_at
+                    ) VALUES (?, ?, ?, ?, ?, 'archived', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        deterministic_id(
+                            "resource-lifecycle-history",
+                            plan.plan_id,
+                            "archived",
+                        ),
+                        plan.repo_id,
+                        plan.target.kind.value,
+                        plan.target.resource_id,
+                        plan.target.immutable_fingerprint,
+                        plan.plan_id,
+                        str(operation["actor"]),
+                        plan.reason,
+                        canonical_json(
+                            {
+                                "control_binding_id": plan.target.control_binding_id,
+                                "attached": plan.repo_id is not None,
+                                "retained": True,
+                            }
+                        ),
+                        timestamp,
+                    ),
                 )
                 connection.execute(
                     """
@@ -1115,6 +1278,372 @@ class SQLiteLifecyclePersistence:
                     ),
                 )
         return self.operation_progress(plan.plan_id)
+
+    def begin_resource_archive_restore(
+        self,
+        resource: ExactResourceRef,
+        *,
+        actor: str,
+        reason: str,
+    ) -> str:
+        """Reserve a replayable policy-restore operation while keeping the fence."""
+
+        with self.store.immediate_transaction() as connection:
+            retirement = connection.execute(
+                """
+                SELECT * FROM resource_retirements
+                WHERE resource_kind = ? AND host_resource_id = ?
+                """,
+                (resource.kind.value, resource.resource_id),
+            ).fetchone()
+            if retirement is None or str(retirement["status"]) != "retired":
+                raise ActionFencedError("resource is not archived")
+            if str(retirement["immutable_fingerprint"]) != resource.immutable_fingerprint:
+                raise PlanDriftError("archived resource immutable identity changed")
+            archive_operation_id = str(retirement["operation_id"] or "")
+            archive_operation = _operation_row(connection, archive_operation_id)
+            if archive_operation["status"] != "succeeded":
+                raise ConcurrentLifecycleError("resource archive has not completed")
+            request_fingerprint = _sha(
+                {
+                    "kind": "resource_restore",
+                    "resource_kind": resource.kind.value,
+                    "resource_id": resource.resource_id,
+                    "immutable_fingerprint": resource.immutable_fingerprint,
+                    "archive_operation_id": archive_operation_id,
+                    "actor": actor,
+                    "reason": reason,
+                }
+            )
+            existing = connection.execute(
+                """
+                SELECT o.operation_id FROM operations o
+                JOIN operation_targets t USING(operation_id)
+                WHERE o.kind = 'resource_restore'
+                  AND o.request_fingerprint = ?
+                  AND o.status IN ('running','needs_attention')
+                  AND t.target_kind = ? AND t.target_id = ?
+                ORDER BY o.created_at DESC LIMIT 1
+                """,
+                (request_fingerprint, resource.kind.value, resource.resource_id),
+            ).fetchone()
+            timestamp = utc_timestamp()
+            if existing is not None:
+                operation_id = str(existing["operation_id"])
+                connection.execute(
+                    """
+                    UPDATE operations SET status = 'running', phase = 'restoring_policies',
+                        error_code = NULL, error_message = NULL, updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (timestamp, operation_id),
+                )
+                return operation_id
+            operation_id = str(uuid.uuid4())
+            repo_id = archive_operation["repo_id"]
+            connection.execute(
+                """
+                INSERT INTO operations(
+                    operation_id, repo_id, kind, status, phase, generation,
+                    request_fingerprint, owner_uid, actor, result_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'resource_restore', 'running', 'restoring_policies', 0,
+                          ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    repo_id,
+                    request_fingerprint,
+                    os.geteuid(),
+                    actor,
+                    canonical_json(
+                        {
+                            "archive_operation_id": archive_operation_id,
+                            "reason": reason,
+                            "started": False,
+                        }
+                    ),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self._insert_resource_target(
+                connection, operation_id, 0, resource, action="restore_archive"
+            )
+            _insert_parameters(
+                connection,
+                operation_id,
+                0,
+                {"archive_operation_id": archive_operation_id, "reason": reason},
+            )
+            return operation_id
+
+    def resource_archive_restoration_plan(
+        self,
+        operation_id: str,
+        resource: ExactResourceRef,
+    ) -> Sequence[tuple[StartupPolicyRef, CapturedStartupPolicyState]]:
+        with self.store.read_transaction() as connection:
+            operation = _operation_row(connection, operation_id)
+            if operation["kind"] != "resource_restore" or operation["status"] not in {
+                "running",
+                "needs_attention",
+            }:
+                raise ConcurrentLifecycleError("resource restore operation is not active")
+            _require_target_row(connection, operation_id, resource)
+            retirement = connection.execute(
+                """
+                SELECT 1 FROM resource_retirements
+                WHERE resource_kind = ? AND host_resource_id = ?
+                  AND immutable_fingerprint = ? AND status = 'retired'
+                """,
+                (
+                    resource.kind.value,
+                    resource.resource_id,
+                    resource.immutable_fingerprint,
+                ),
+            ).fetchone()
+            if retirement is None:
+                raise ActionFencedError("resource archive fence is not complete")
+            policies = self._policies_by_resource(
+                connection,
+                resource_kind=resource.kind.value,
+                resource_id=resource.resource_id,
+            ).get((resource.kind.value, resource.resource_id), ())
+            work: list[tuple[StartupPolicyRef, CapturedStartupPolicyState]] = []
+            for policy in policies:
+                capture_row = connection.execute(
+                    "SELECT * FROM startup_policy_restore_states WHERE policy_id = ?",
+                    (policy.policy_id,),
+                ).fetchone()
+                if capture_row is None:
+                    raise LifecycleError(
+                        f"archived startup policy {policy.policy_id} has no captured state"
+                    )
+                captured = _captured_policy_state(capture_row)
+                _verify_capture_identity(
+                    captured,
+                    str(operation["repo_id"]) if operation["repo_id"] is not None else None,
+                    resource,
+                    policy,
+                    _sha(dict(resource.native_identity)),
+                )
+                if captured.status == "captured":
+                    policy_row = connection.execute(
+                        "SELECT current_value FROM startup_policies WHERE policy_id = ?",
+                        (policy.policy_id,),
+                    ).fetchone()
+                    if policy_row is None or str(policy_row["current_value"]) != policy.disabled_value:
+                        raise PlanDriftError(
+                            f"archived startup policy {policy.policy_id} is no longer disabled"
+                        )
+                work.append((policy, captured))
+            return tuple(work)
+
+    def mark_resource_archive_policy_restored(
+        self,
+        operation_id: str,
+        resource: ExactResourceRef,
+        policy: StartupPolicyRef,
+        captured: CapturedStartupPolicyState,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        with self.store.immediate_transaction() as connection:
+            operation = _operation_row(connection, operation_id)
+            if operation["kind"] != "resource_restore" or operation["status"] not in {
+                "running",
+                "needs_attention",
+            }:
+                raise ConcurrentLifecycleError("resource restore operation is not active")
+            _require_target_row(connection, operation_id, resource)
+            capture_row = connection.execute(
+                "SELECT * FROM startup_policy_restore_states WHERE policy_id = ?",
+                (policy.policy_id,),
+            ).fetchone()
+            if capture_row is None or _captured_policy_state(capture_row) != captured:
+                raise PlanDriftError("resource startup-policy capture changed during restore")
+            if captured.status == "restored" or not captured.restore_required:
+                return
+            timestamp = utc_timestamp()
+            changed = connection.execute(
+                """
+                UPDATE startup_policies
+                SET current_value = ?, generation = generation + 1, updated_at = ?
+                WHERE policy_id = ? AND resource_kind = ? AND resource_id = ?
+                  AND immutable_fingerprint = ?
+                  AND current_value = desired_disabled_value
+                """,
+                (
+                    captured.captured_value,
+                    timestamp,
+                    policy.policy_id,
+                    resource.kind.value,
+                    resource.resource_id,
+                    policy.immutable_fingerprint,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise PlanDriftError("resource startup policy changed during restore")
+            connection.execute(
+                """
+                UPDATE startup_policy_restore_states
+                SET status = 'restored', last_restore_permit_id = ?,
+                    restored_at = ?, updated_at = ?
+                WHERE policy_id = ? AND status = 'captured'
+                """,
+                (operation_id, timestamp, timestamp, policy.policy_id),
+            )
+            result = _json_mapping(operation["result_json"])
+            restorations = list(result.get("startup_policy_restorations", []))
+            restorations.append(
+                {"policy_id": policy.policy_id, "evidence": dict(evidence)}
+            )
+            result["startup_policy_restorations"] = restorations
+            connection.execute(
+                "UPDATE operations SET result_json = ?, updated_at = ? WHERE operation_id = ?",
+                (canonical_json(result), timestamp, operation_id),
+            )
+
+    def complete_resource_archive_restore(
+        self,
+        operation_id: str,
+        resource: ExactResourceRef,
+        *,
+        actor: str,
+        reason: str,
+    ) -> Mapping[str, Any]:
+        """Clear the archive fence last after every policy restore is durable."""
+
+        with self.store.immediate_transaction() as connection:
+            operation = _operation_row(connection, operation_id)
+            if operation["kind"] != "resource_restore":
+                raise LifecycleError("operation is not a resource archive restore")
+            if operation["status"] == "succeeded":
+                result = _json_mapping(operation["result_json"])
+                result.update({"status": "succeeded", "ok": True, "errors": []})
+                return result
+            _require_target_row(connection, operation_id, resource)
+            pending = connection.execute(
+                """
+                SELECT p.policy_id FROM startup_policies p
+                LEFT JOIN startup_policy_restore_states s USING(policy_id)
+                WHERE p.resource_kind = ? AND p.resource_id = ?
+                  AND (
+                    s.policy_id IS NULL
+                    OR (s.restore_required = 1 AND s.status != 'restored')
+                    OR (s.restore_required = 1 AND p.current_value != s.captured_value)
+                  ) LIMIT 1
+                """,
+                (resource.kind.value, resource.resource_id),
+            ).fetchone()
+            if pending is not None:
+                raise LifecycleError(
+                    f"startup policy {pending['policy_id']} is not durably restored"
+                )
+            retirement = connection.execute(
+                """
+                SELECT * FROM resource_retirements
+                WHERE resource_kind = ? AND host_resource_id = ?
+                """,
+                (resource.kind.value, resource.resource_id),
+            ).fetchone()
+            if retirement is None or retirement["status"] != "retired":
+                raise ActionFencedError("resource is not archived")
+            if retirement["immutable_fingerprint"] != resource.immutable_fingerprint:
+                raise PlanDriftError("archived resource immutable identity changed")
+            archive_operation_id = str(retirement["operation_id"] or "")
+            archive_operation = _operation_row(connection, archive_operation_id)
+            if archive_operation["status"] != "succeeded":
+                raise ConcurrentLifecycleError("resource archive has not completed")
+            repo_id = (
+                str(archive_operation["repo_id"])
+                if archive_operation["repo_id"] is not None
+                else None
+            )
+            timestamp = utc_timestamp()
+            deleted = connection.execute(
+                """
+                DELETE FROM resource_retirements
+                WHERE resource_kind = ? AND host_resource_id = ?
+                  AND immutable_fingerprint = ? AND operation_id = ?
+                  AND status = 'retired'
+                """,
+                (
+                    resource.kind.value,
+                    resource.resource_id,
+                    resource.immutable_fingerprint,
+                    archive_operation_id,
+                ),
+            ).rowcount
+            if deleted != 1:
+                raise PlanDriftError("resource archive fence changed during restore")
+            connection.execute(
+                """
+                UPDATE unassigned_resources SET status = 'active', updated_at = ?
+                WHERE resource_kind = ? AND resource_id = ? AND status = 'retired'
+                """,
+                (timestamp, resource.kind.value, resource.resource_id),
+            )
+            result = {
+                "schema_version": 3,
+                "operation_id": operation_id,
+                "status": "succeeded",
+                "resource_kind": resource.kind.value,
+                "resource_id": resource.resource_id,
+                "repo_id": repo_id,
+                "hidden": False,
+                "started": False,
+                "partial": False,
+                "needs_attention": False,
+                "ok": True,
+                "errors": [],
+            }
+            connection.execute(
+                """
+                UPDATE operations SET status = 'succeeded', phase = 'complete',
+                    result_json = ?, error_code = NULL, error_message = NULL,
+                    updated_at = ? WHERE operation_id = ?
+                """,
+                (canonical_json(result), timestamp, operation_id),
+            )
+            connection.execute(
+                """
+                UPDATE operation_targets SET status = 'succeeded', phase = 'complete',
+                    finished_at = COALESCE(finished_at, ?), result_json = ?
+                WHERE operation_id = ? AND ordinal = 0
+                """,
+                (
+                    timestamp,
+                    canonical_json({"archive_fence_cleared": True, "started": False}),
+                    operation_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO resource_lifecycle_history(
+                    history_id, repo_id, resource_kind, resource_id,
+                    immutable_fingerprint, action, operation_id, actor,
+                    reason, evidence_json, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, 'restored', ?, ?, ?, ?, ?)
+                """,
+                (
+                    deterministic_id(
+                        "resource-lifecycle-history", operation_id, "restored"
+                    ),
+                    repo_id,
+                    resource.kind.value,
+                    resource.resource_id,
+                    resource.immutable_fingerprint,
+                    operation_id,
+                    actor,
+                    reason,
+                    canonical_json(
+                        {"archive_operation_id": archive_operation_id, "started": False}
+                    ),
+                    timestamp,
+                ),
+            )
+            return result
 
     def _record_verified_stopped(
         self,
@@ -2039,6 +2568,11 @@ class SQLiteLifecyclePersistence:
                 actor=str(operation["actor"]),
                 reason=str(target_params["reason"]),
                 target=self._decode_target(row, target_params),
+                repo_id=(
+                    str(operation["repo_id"])
+                    if operation["repo_id"] is not None
+                    else None
+                ),
             )
         raise LifecycleError(f"operation {plan_id} is not a lifecycle plan")
 

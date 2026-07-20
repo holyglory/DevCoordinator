@@ -2,6 +2,7 @@
 // (schema v1) with atomic tmp+rename writes, and resolves routes to loopback
 // ports via the coordinator's raw server records.
 
+import crypto from 'node:crypto';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 
@@ -101,7 +102,7 @@ export class RouteError extends Error {
   }
 }
 
-export function createRouteStore({ file, config, log }) {
+export function createRouteStore({ file, config, log, randomUUID = () => crypto.randomUUID() }) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'routes' }) : log;
 
   const reserved = new Set(BASE_RESERVED);
@@ -246,6 +247,7 @@ export function createRouteStore({ file, config, log }) {
       return;
     }
     const next = new Map();
+    let migrated = false;
     for (const [slug, route] of Object.entries(parsed.routes)) {
       if (!route || typeof route !== 'object' || Array.isArray(route)) continue;
       // Security invariant #1: a persisted kind:'port' route pointing at the
@@ -256,9 +258,15 @@ export function createRouteStore({ file, config, log }) {
         clog?.error?.('dropping route that targets the coordinator API port', { slug, port: route.port });
         continue;
       }
-      next.set(slug, { ...route, slug });
+      let instanceId = route.instanceId;
+      if (typeof instanceId !== 'string' || !/^[0-9a-f-]{16,64}$/i.test(instanceId)) {
+        instanceId = randomUUID();
+        migrated = true;
+      }
+      next.set(slug, { ...route, slug, instanceId });
     }
     routes = next;
+    if (migrated) await persist();
   }
 
   function persist() {
@@ -302,6 +310,7 @@ export function createRouteStore({ file, config, log }) {
       kind: def.kind,
       // Default-deny: routes are login-protected unless explicitly public.
       auth: def.auth === undefined || def.auth === null ? 'google' : validateAuth(def.auth),
+      instanceId: randomUUID(),
       createdAt: now,
       updatedAt: now,
     };

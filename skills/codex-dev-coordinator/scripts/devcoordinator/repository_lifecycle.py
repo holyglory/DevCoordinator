@@ -265,6 +265,10 @@ class StandaloneRetirementPlan:
     actor: str
     reason: str
     target: ExactResourceRef
+    # Canonical archive plans may target an exact resource that remains
+    # attached to its repository.  Legacy standalone retirement plans keep
+    # this unset and retain their historical rejection of attached resources.
+    repo_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -276,6 +280,7 @@ class StandaloneRetirementPlan:
             "created_at": self.created_at,
             "actor": self.actor,
             "reason": self.reason,
+            "repo_id": self.repo_id,
             "retained_data": list(RETAINED_DATA),
             "targets": [self.target.to_dict()],
         }
@@ -439,7 +444,7 @@ class LifecycleResult:
     progress: OperationProgress
 
     def to_dict(self) -> dict[str, Any]:
-        repo_id = self.plan.repo_id if isinstance(self.plan, RepositoryDecommissionPlan) else None
+        repo_id = self.plan.repo_id
         resource_id = (
             self.plan.target.resource_id if isinstance(self.plan, StandaloneRetirementPlan) else None
         )
@@ -607,6 +612,42 @@ class LifecyclePersistence(Protocol):
     def complete_resource_retirement(
         self, plan: StandaloneRetirementPlan
     ) -> OperationProgress:
+        ...
+
+    def begin_resource_archive_restore(
+        self,
+        resource: ExactResourceRef,
+        *,
+        actor: str,
+        reason: str,
+    ) -> str:
+        ...
+
+    def resource_archive_restoration_plan(
+        self,
+        operation_id: str,
+        resource: ExactResourceRef,
+    ) -> Sequence[tuple[StartupPolicyRef, CapturedStartupPolicyState]]:
+        ...
+
+    def mark_resource_archive_policy_restored(
+        self,
+        operation_id: str,
+        resource: ExactResourceRef,
+        policy: StartupPolicyRef,
+        captured: CapturedStartupPolicyState,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        ...
+
+    def complete_resource_archive_restore(
+        self,
+        operation_id: str,
+        resource: ExactResourceRef,
+        *,
+        actor: str,
+        reason: str,
+    ) -> Mapping[str, Any]:
         ...
 
     def install_repository(
@@ -784,6 +825,44 @@ class RepositoryLifecycle:
         )
         return self._persistence.save_retirement_plan(plan)
 
+    def plan_resource_archive(
+        self,
+        resource: ExactResourceRef,
+        *,
+        actor: str,
+        reason: str,
+        repo_id: str | None = None,
+    ) -> StandaloneRetirementPlan:
+        """Plan a reversible archive for one exact attached or standalone resource."""
+
+        _require_exact_target(resource)
+        snapshot = self._persistence.standalone_snapshot(resource)
+        if snapshot.attached_repo_id != repo_id:
+            raise OwnershipError("resource repository attachment changed before archive planning")
+        if snapshot.authority_state != "authoritative":
+            raise OwnershipError("resource has no unique authoritative controller")
+        if snapshot.retirement_status in {"disabling", "retired"}:
+            raise ActionFencedError("resource is already archived or archive is in progress")
+        fingerprint = _fingerprint(
+            {
+                "kind": "resource_archive",
+                "repo_id": repo_id,
+                "target": resource.to_dict(),
+                "retained_data": list(RETAINED_DATA),
+            }
+        )
+        return self._persistence.save_retirement_plan(
+            StandaloneRetirementPlan(
+                plan_id=self._id_factory(),
+                fingerprint=fingerprint,
+                created_at=self._now(),
+                actor=actor,
+                reason=reason,
+                target=resource,
+                repo_id=repo_id,
+            )
+        )
+
     def apply_standalone_retirement(
         self, plan_id: str, fingerprint: str, *, actor: str
     ) -> LifecycleResult:
@@ -799,6 +878,94 @@ class RepositoryLifecycle:
             return self._result(plan, progress)
         progress = self._persistence.complete_resource_retirement(plan)
         return self._result(plan, progress)
+
+    def restore_resource_archive(
+        self,
+        resource: ExactResourceRef,
+        *,
+        actor: str,
+        reason: str,
+    ) -> Mapping[str, Any]:
+        """Restore exact captured policies, then clear the archive fence last."""
+
+        _require_exact_target(resource)
+        observation = self._adapter.observe_exact(resource)
+        self._verify_exact_identity(resource, observation)
+        if observation.running_state not in {RunningState.STOPPED, RunningState.ZOMBIE}:
+            raise LifecycleError("an archived resource must remain stopped before restore")
+        if resource.kind is ResourceKind.SERVER and observation.listener_active is not False:
+            raise LifecycleError(
+                "an archived server listener must be proved absent before restore"
+            )
+        operation_id = self._persistence.begin_resource_archive_restore(
+            resource, actor=actor, reason=reason
+        )
+        for policy, captured in self._persistence.resource_archive_restoration_plan(
+            operation_id, resource
+        ):
+            if captured.status == "restored" or not captured.restore_required:
+                continue
+            before = self._adapter.observe_exact(resource)
+            self._verify_exact_identity(resource, before)
+            if before.running_state not in {RunningState.STOPPED, RunningState.ZOMBIE}:
+                raise LifecycleError("resource started during archive policy restoration")
+            if resource.kind is ResourceKind.SERVER and before.listener_active is not False:
+                raise LifecycleError("server listener activated during archive policy restoration")
+            if policy.kind not in {PolicyKind.COORDINATOR, PolicyKind.COMPOSE}:
+                try:
+                    self._verify_policy_restored(
+                        policy, captured, before.policies.get(policy.policy_id)
+                    )
+                except LifecycleError:
+                    pass
+                else:
+                    self._persistence.mark_resource_archive_policy_restored(
+                        operation_id,
+                        resource,
+                        policy,
+                        captured,
+                        {"restore": "already_applied_and_verified"},
+                    )
+                    continue
+            self._verify_policy_restore_precondition(
+                policy, captured, before.policies.get(policy.policy_id)
+            )
+            effect = self._adapter.restore_startup_policy(resource, policy, captured)
+            if effect.get("host_may_have_started"):
+                raise LifecycleError("startup-policy restoration may have started the resource")
+            after = self._adapter.observe_exact(resource)
+            self._verify_exact_identity(resource, after)
+            if after.running_state not in {RunningState.STOPPED, RunningState.ZOMBIE}:
+                raise LifecycleError("resource started during archive policy restoration")
+            if resource.kind is ResourceKind.SERVER and after.listener_active is not False:
+                raise LifecycleError("server listener activated during archive policy restoration")
+            if policy.kind not in {PolicyKind.COORDINATOR, PolicyKind.COMPOSE}:
+                self._verify_policy_restored(
+                    policy, captured, after.policies.get(policy.policy_id)
+                )
+            self._persistence.mark_resource_archive_policy_restored(
+                operation_id, resource, policy, captured, effect
+            )
+        final_observation = self._adapter.observe_exact(resource)
+        self._verify_exact_identity(resource, final_observation)
+        if final_observation.running_state not in {RunningState.STOPPED, RunningState.ZOMBIE}:
+            raise LifecycleError("resource must remain stopped until restore commits")
+        if (
+            resource.kind is ResourceKind.SERVER
+            and final_observation.listener_active is not False
+        ):
+            raise LifecycleError("server listener must remain absent until restore commits")
+        result = dict(
+            self._persistence.complete_resource_archive_restore(
+                operation_id,
+                resource,
+                actor=actor,
+                reason=reason,
+            )
+        )
+        if result.get("started"):
+            raise LifecycleError("resource restore must never start the runtime")
+        return result
 
     def install_repository(
         self, repo_id: str, *, actor: str, reason: str, explicit: bool
@@ -929,8 +1096,8 @@ class RepositoryLifecycle:
                     )
                     restored.append(policy.policy_id)
                     continue
-            self._verify_policy_disabled(
-                policy, before.policies.get(policy.policy_id)
+            self._verify_policy_restore_precondition(
+                policy, captured, before.policies.get(policy.policy_id)
             )
             effect = self._adapter.restore_startup_policy(
                 target, policy, captured
@@ -1125,6 +1292,36 @@ class RepositoryLifecycle:
                 f"expected {policy.disabled_value!r}"
             )
 
+    @classmethod
+    def _verify_policy_restore_precondition(
+        cls,
+        policy: StartupPolicyRef,
+        captured: CapturedStartupPolicyState,
+        observation: PolicyObservation | None,
+    ) -> None:
+        """Accept only the disabled boundary or a proved composite restore prefix."""
+
+        try:
+            cls._verify_policy_disabled(policy, observation)
+            return
+        except LifecycleError as disabled_error:
+            cls._verify_policy_identity(policy, observation)
+            if observation is None or policy.kind is not PolicyKind.SUPERVISOR:
+                raise disabled_error
+            if (
+                captured.supervisor_manager == "systemd"
+                and observation.supervisor_manager == "systemd"
+                and observation.supervisor_unit_file_state == "disabled"
+                and observation.supervisor_enabled is False
+                and captured.supervisor_unit_file_state
+                in {"enabled", "enabled-runtime", "masked-runtime"}
+            ):
+                # `unmask` completed but the exact enable/runtime-mask step did
+                # not. Replaying LocalHostLifecycleBackend.restore_supervisor
+                # is idempotent and re-verifies the captured final state.
+                return
+            raise disabled_error
+
     @staticmethod
     def _verify_policy_restored(
         policy: StartupPolicyRef,
@@ -1156,9 +1353,6 @@ class RepositoryLifecycle:
                 captured.supervisor_unit_file_state,
                 captured.supervisor_enabled,
             ]
-            if captured.supervisor_manager == "launchd":
-                observed_state.append(observation.supervisor_loaded)
-                captured_state.append(captured.supervisor_loaded)
             if observed_state != captured_state:
                 raise LifecycleError("supervisor policy restore verification failed")
 

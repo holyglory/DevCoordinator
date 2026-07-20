@@ -15,7 +15,7 @@ import uuid
 from unittest import mock
 
 import dev_coordinator
-from devcoordinator.broker import BrokerOperation
+from devcoordinator.broker import BrokerError, BrokerOperation
 from devcoordinator.broker_links import BrokerLinkStore
 from devcoordinator.broker_profile import (
     BrokerClientProfile,
@@ -572,6 +572,202 @@ class BrokerProfileTrustTests(unittest.TestCase):
             publish.assert_called_once()
             self.assertEqual(result["broker"]["publication"]["status"], "published")
 
+    def test_system_stop_rejects_host_visible_unenrolled_server_before_client_state(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-stop-access-") as root:
+            enrolled_root = root / "prtzn-vpn"
+            visible_root = root / "DevCoordinator"
+            for repository_root in (enrolled_root, visible_root):
+                repository_root.mkdir(mode=0o700)
+                (repository_root / ".git").mkdir(mode=0o700)
+
+            repository_denied = parsed_profile(enrolled_root)
+            server_denied_document = profile_document(visible_root)
+            server_denied_document["clients"][str(UID)]["repositories"][0][
+                "servers"
+            ] = {"other-server": "server-other"}
+            server_denied = profile_from_document(
+                server_denied_document, effective_uid=UID
+            )
+
+            for profile, expected in (
+                (repository_denied, "repository.*not enrolled"),
+                (server_denied, "server 'devops-console'.*not enrolled"),
+            ):
+                with self.subTest(expected=expected):
+                    with (
+                        mock.patch.object(
+                            dev_coordinator, "authority_mode", return_value="system"
+                        ),
+                        mock.patch.object(
+                            dev_coordinator,
+                            "load_broker_profile",
+                            return_value=profile,
+                        ) as load_profile,
+                        mock.patch.object(
+                            dev_coordinator,
+                            "state_backend",
+                            return_value="sqlite",
+                        ),
+                        mock.patch.object(
+                            dev_coordinator,
+                            "_normalized_server_from_options",
+                            side_effect=AssertionError(
+                                "unenrolled stop opened the client journal"
+                            ),
+                        ) as journal_lookup,
+                        mock.patch.object(
+                            AccountStore,
+                            "open_default",
+                            side_effect=AssertionError(
+                                "unenrolled stop opened mutable client state"
+                            ),
+                        ) as client_store,
+                        mock.patch.object(
+                            dev_coordinator.NormalizedServerLifecycle,
+                            "reserve_stop",
+                            side_effect=AssertionError(
+                                "unenrolled stop reserved a local lifecycle operation"
+                            ),
+                        ) as reserve_stop,
+                        mock.patch.object(
+                            dev_coordinator,
+                            "stop_pid",
+                            side_effect=AssertionError(
+                                "unenrolled stop signaled a process"
+                            ),
+                        ) as stop_pid,
+                    ):
+                        with self.assertRaisesRegex(BrokerProfileError, expected) as raised:
+                            dev_coordinator.coordinated_stop_server(
+                                {
+                                    "agent": "holygloryTT",
+                                    "project": str(visible_root),
+                                    "name": "devops-console",
+                                }
+                            )
+
+                    payload = dev_coordinator.coordinator_exception_payload(
+                        raised.exception
+                    )
+                    self.assertEqual(payload["code"], "broker_profile_invalid")
+                    self.assertEqual(
+                        payload["classification"],
+                        "broker_configuration_required",
+                    )
+                    self.assertNotIn("matching server not found", payload["error"])
+                    load_profile.assert_called_once_with(required=True)
+                    journal_lookup.assert_not_called()
+                    client_store.assert_not_called()
+                    reserve_stop.assert_not_called()
+                    stop_pid.assert_not_called()
+
+    def test_system_stop_allows_exact_enrolled_owner_to_reach_existing_lifecycle(self) -> None:
+        class ExistingLifecycleReached(RuntimeError):
+            pass
+
+        with CanonicalTemporaryDirectory(".broker-stop-owner-") as root:
+            repository_root = root / "DevCoordinator"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            document = profile_document(repository_root)
+            document["clients"][str(UID)]["repositories"][0]["servers"] = {
+                "devops-console": "server-console"
+            }
+            profile = profile_from_document(document, effective_uid=UID)
+            events: list[str] = []
+            snapshot = {
+                "id": "server-console",
+                "name": "devops-console",
+                "project": str(repository_root),
+                "generation": 11,
+                "pid": None,
+                "lease_id": None,
+            }
+            store = mock.MagicMock()
+            store.__enter__.return_value = store
+            store.__exit__.return_value = False
+
+            def load_profile(*, required: bool = False) -> BrokerClientProfile:
+                self.assertTrue(required)
+                events.append("broker_enrollment")
+                return profile
+
+            def journal_lookup(_options: object) -> dict[str, object]:
+                events.append("journal_lookup")
+                return snapshot
+
+            def open_store(_home: object) -> object:
+                events.append("journal_store")
+                return store
+
+            def reserve_stop(*_args: object, **_kwargs: object) -> object:
+                events.append("reservation")
+                raise ExistingLifecycleReached
+
+            with (
+                mock.patch.object(
+                    dev_coordinator, "authority_mode", return_value="system"
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "load_broker_profile",
+                    side_effect=load_profile,
+                ),
+                mock.patch.object(
+                    dev_coordinator, "state_backend", return_value="sqlite"
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "_normalized_server_from_options",
+                    side_effect=journal_lookup,
+                ),
+                mock.patch.object(
+                    dev_coordinator, "prime_git_head_identity"
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "server_health",
+                    return_value={"identity": {"ok": True}},
+                ),
+                mock.patch.object(
+                    dev_coordinator, "require_listener_identity_observable"
+                ),
+                mock.patch.object(
+                    AccountStore, "open_default", side_effect=open_store
+                ),
+                mock.patch.object(
+                    dev_coordinator.NormalizedServerLifecycle,
+                    "reserve_stop",
+                    side_effect=reserve_stop,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "stop_pid",
+                    side_effect=AssertionError(
+                        "fixture should stop at the existing reservation boundary"
+                    ),
+                ) as stop_pid,
+            ):
+                with self.assertRaises(ExistingLifecycleReached):
+                    dev_coordinator.coordinated_stop_server(
+                        {
+                            "agent": "holyglory",
+                            "project": str(repository_root),
+                            "name": "devops-console",
+                        }
+                    )
+
+            self.assertEqual(
+                events,
+                [
+                    "broker_enrollment",
+                    "journal_lookup",
+                    "journal_store",
+                    "reservation",
+                ],
+            )
+            stop_pid.assert_not_called()
+
     def test_server_wide_inventory_uses_broker_without_opening_client_database(self) -> None:
         with CanonicalTemporaryDirectory(".broker-inventory-") as root:
             repository_root = root / "repository"
@@ -622,6 +818,413 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 result["v1_compatibility"]["servers"][0]["name"], "web"
             )
             self.assertEqual(result["authority"]["scope"], "server-wide")
+
+    def test_project_inventory_selects_the_requested_broker_enrollment(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-project-inventory-") as root:
+            repository_root = root / "GlobalFinance"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            payload = {
+                "schema_version": 2,
+                "repositories": [],
+                "docker": {"available": None, "containers": [], "postgres": []},
+                "postgres": [],
+                "v1_compatibility": {
+                    "servers": [],
+                    "leases": [],
+                    "port_assignments": [],
+                    "docker": {
+                        "available": None,
+                        "containers": [],
+                        "postgres": [],
+                    },
+                    "postgres": [],
+                },
+            }
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_profile",
+                    return_value=profile,
+                ),
+                mock.patch.object(
+                    BrokerClientProfile,
+                    "inventory",
+                    return_value=payload,
+                ) as inventory,
+                mock.patch.object(
+                    AccountStore,
+                    "open_default_read_only",
+                    side_effect=AssertionError("client database opened for host inventory"),
+                ),
+            ):
+                result = dev_coordinator.coordinated_build_inventory(
+                    project=str(repository_root)
+                )
+
+            inventory.assert_called_once_with(canonical_root=str(repository_root))
+            self.assertEqual(result["authority"]["scope"], "server-wide")
+
+    def test_registration_inventory_preserves_stopped_health_while_reporting_new_listener(self) -> None:
+        project = "/repos/alpha"
+        stopped_health = {
+            "classification": "stopped",
+            "ok": False,
+            "pid_alive": None,
+        }
+        payload = {
+            "schema_version": 2,
+            "v1_compatibility": {
+                "urls": [],
+                "servers": [
+                    {
+                        "id": "server-web",
+                        "key": f"{project}::web",
+                        "project": project,
+                        "name": "web",
+                        "host": "127.0.0.1",
+                        "port": 443,
+                        "pid": None,
+                        "status": "stopped",
+                        "metadata_source": "normalized-sqlite",
+                        "health": stopped_health,
+                        "url_is_current": False,
+                    }
+                ],
+                "leases": [],
+                "port_assignments": [
+                    {
+                        "id": "assignment-web",
+                        "key": f"{project}::web",
+                        "project": project,
+                        "name": "web",
+                        "port": 443,
+                        "status": "active",
+                    }
+                ],
+                "docker": {"available": None, "containers": [], "postgres": []},
+                "postgres": [],
+            },
+        }
+        live_health = {
+            "classification": "healthy",
+            "ok": True,
+            "pid_alive": None,
+            "identity": {"ok": True},
+        }
+        with (
+            mock.patch.object(
+                dev_coordinator,
+                "pure_normalized_inventory",
+                return_value=payload,
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "server_health",
+                return_value=live_health,
+            ),
+            mock.patch.object(dev_coordinator, "port_open", return_value=True),
+            mock.patch.object(
+                dev_coordinator,
+                "listener_owner_for_port",
+                return_value={
+                    "pid": 4242,
+                    "cwd": project,
+                    "project": project,
+                },
+            ),
+        ):
+            result = dev_coordinator.coordinated_build_registration_inventory(
+                project=project,
+                name="web",
+                port=443,
+            )
+
+        server = result["v1_compatibility"]["servers"][0]
+        self.assertEqual(server["status"], "stopped")
+        self.assertEqual(server["health"], stopped_health)
+        self.assertNotIn("registration_identity", server)
+        self.assertTrue(server["port_reused"])
+        self.assertEqual(
+            server["port_reused_by"],
+            {
+                "type": "process",
+                "pid": 4242,
+                "cwd": project,
+                "project": project,
+            },
+        )
+
+    def test_registration_inventory_keeps_fresh_identity_for_running_server(self) -> None:
+        project = "/repos/alpha"
+        stale_health = {
+            "classification": "unhealthy",
+            "ok": False,
+            "pid_alive": True,
+        }
+        identity = {
+            "ok": True,
+            "observable": True,
+            "pid": 4242,
+            "host": "127.0.0.1",
+            "port": 443,
+            "source": "proc_pid_fd",
+            "listener_inodes": ["12345"],
+        }
+        live_health = {
+            "classification": "healthy",
+            "ok": True,
+            "pid_alive": True,
+            "identity": identity,
+        }
+        payload = {
+            "schema_version": 2,
+            "v1_compatibility": {
+                "urls": [],
+                "servers": [
+                    {
+                        "id": "server-web",
+                        "key": f"{project}::web",
+                        "project": project,
+                        "name": "web",
+                        "host": "127.0.0.1",
+                        "port": 443,
+                        "pid": 4242,
+                        "status": "running",
+                        "metadata_source": "normalized-sqlite",
+                        "health": stale_health,
+                    }
+                ],
+                "leases": [],
+                "port_assignments": [
+                    {
+                        "id": "assignment-web",
+                        "key": f"{project}::web",
+                        "project": project,
+                        "name": "web",
+                        "port": 443,
+                        "status": "active",
+                    }
+                ],
+                "docker": {"available": None, "containers": [], "postgres": []},
+                "postgres": [],
+            },
+        }
+        with (
+            mock.patch.object(
+                dev_coordinator,
+                "pure_normalized_inventory",
+                return_value=payload,
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "server_health",
+                return_value=live_health,
+            ),
+        ):
+            result = dev_coordinator.coordinated_build_registration_inventory(
+                project=project,
+                name="web",
+                port=443,
+            )
+
+        server = result["v1_compatibility"]["servers"][0]
+        self.assertEqual(server["status"], "running")
+        self.assertEqual(server["health"], live_health)
+        self.assertEqual(server["registration_identity"], identity)
+
+    def test_server_wide_observe_uses_broker_without_opening_client_database(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-observe-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            repository = profile.repository(str(repository_root))
+            payload = {
+                "schema_version": 2,
+                "status": "completed",
+                "observed": True,
+                "joined": False,
+                "snapshot_id": "snapshot-service-owned",
+                "host_id": "host-service-owned",
+                "observer_domain": "host-runtime-v2:full-docker",
+                "docker_available": True,
+                "capability_fingerprint": "sha256:" + "2" * 64,
+                "material_fingerprint": "1" * 64,
+                "completed_at": "2026-07-18T12:49:29Z",
+                "observation_revision": 233,
+                "state_revision": 10480,
+            }
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "authority_mode",
+                    return_value="system",
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_profile",
+                    return_value=profile,
+                ),
+                mock.patch.object(
+                    BrokerClientProfile,
+                    "call",
+                    return_value=("observe-operation", payload),
+                ) as broker_call,
+                mock.patch.object(
+                    AccountStore,
+                    "open_default",
+                    side_effect=AssertionError(
+                        "client database opened for server-wide host observation"
+                    ),
+                ),
+            ):
+                result = dev_coordinator.coordinated_observe_host(
+                    {
+                        "agent": "agent-test",
+                        "project": str(repository_root),
+                        "max_age_seconds": 0,
+                        "no_docker": False,
+                        "backup_dir": None,
+                        "legacy_home": [],
+                        "legacy_backup_root": None,
+                    }
+                )
+
+            broker_call.assert_called_once_with(
+                repository=repository,
+                resource_id=REPO_ID,
+                operation=BrokerOperation.HOST_OBSERVE,
+                arguments={},
+            )
+            self.assertEqual(result["snapshot_id"], "snapshot-service-owned")
+            self.assertEqual(result["authority"]["scope"], "server-wide")
+            self.assertEqual(result["request"]["agent"], "agent-test")
+            self.assertEqual(result["request"]["project"], str(repository_root))
+            self.assertEqual(result["max_age_seconds"], 0.0)
+
+    def test_server_wide_observe_rejects_account_scoped_discovery_options(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-observe-options-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "authority_mode",
+                    return_value="system",
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_profile",
+                    return_value=profile,
+                ),
+                mock.patch.object(
+                    BrokerClientProfile,
+                    "call",
+                    side_effect=AssertionError(
+                        "invalid account-scoped observation reached broker"
+                    ),
+                ),
+                mock.patch.object(
+                    AccountStore,
+                    "open_default",
+                    side_effect=AssertionError(
+                        "invalid server-wide observation opened client database"
+                    ),
+                ),
+            ):
+                for override in (
+                    {"max_age_seconds": 300},
+                    {"no_docker": True},
+                    {"backup_dir": [str(root / "backups")]},
+                    {"legacy_home": [str(root / "legacy")]},
+                    {"legacy_backup_root": str(root / "legacy-backups")},
+                ):
+                    options = {
+                        "agent": "agent-test",
+                        "project": str(repository_root),
+                        "max_age_seconds": 0,
+                        "no_docker": False,
+                        "backup_dir": None,
+                        "legacy_home": [],
+                        "legacy_backup_root": None,
+                    }
+                    options.update(override)
+                    with self.assertRaisesRegex(
+                        ValueError, "server-wide observation"
+                    ):
+                        dev_coordinator.coordinated_observe_host(options)
+
+    def test_server_wide_observe_rejects_malformed_service_evidence(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-observe-evidence-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            valid = {
+                "schema_version": 2,
+                "status": "completed",
+                "observed": True,
+                "joined": False,
+                "snapshot_id": "snapshot-service-owned",
+                "host_id": "host-service-owned",
+                "observer_domain": "host-runtime-v2:full-docker",
+                "docker_available": True,
+                "capability_fingerprint": "sha256:" + "2" * 64,
+                "material_fingerprint": "1" * 64,
+                "completed_at": "2026-07-18T12:49:29Z",
+                "observation_revision": 233,
+                "state_revision": 10480,
+            }
+            malformed = (
+                {**valid, "host_id": ""},
+                {**valid, "joined": 1},
+                {**valid, "docker_available": "yes"},
+                {**valid, "capability_fingerprint": ""},
+                {**valid, "material_fingerprint": "sha256:" + "1" * 64},
+                {**valid, "completed_at": ""},
+                {**valid, "observation_revision": -1},
+                {**valid, "state_revision": True},
+            )
+            with (
+                mock.patch.object(
+                    dev_coordinator, "authority_mode", return_value="system"
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_profile",
+                    return_value=profile,
+                ),
+                mock.patch.object(
+                    AccountStore,
+                    "open_default",
+                    side_effect=AssertionError(
+                        "malformed broker evidence opened a client database"
+                    ),
+                ),
+            ):
+                for payload in malformed:
+                    with self.subTest(payload=payload), mock.patch.object(
+                        BrokerClientProfile,
+                        "call",
+                        return_value=("observe-operation", payload),
+                    ):
+                        with self.assertRaises(BrokerError) as raised:
+                            dev_coordinator.coordinated_observe_host(
+                                {
+                                    "agent": "agent-test",
+                                    "project": str(repository_root),
+                                    "max_age_seconds": 0,
+                                    "no_docker": False,
+                                    "backup_dir": None,
+                                    "legacy_home": [],
+                                    "legacy_backup_root": None,
+                                }
+                            )
+                        self.assertEqual(raised.exception.code, "invalid_reply")
 
     def test_product_default_is_required_server_wide_authority(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
@@ -746,6 +1349,87 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 ],
             )
 
+    def test_brokered_compose_maps_stop_restart_and_down_to_distinct_typed_operations(
+        self,
+    ) -> None:
+        with CanonicalTemporaryDirectory(".broker-compose-actions-") as root:
+            repository_root = root / "repository"
+            repository_root.mkdir(mode=0o700)
+            (repository_root / ".git").mkdir(mode=0o700)
+            profile = parsed_profile(repository_root)
+            repository = profile.repository(str(repository_root))
+            calls: list[tuple[str, str, object]] = []
+
+            def call(
+                _profile: BrokerClientProfile,
+                *,
+                repository: BrokerRepositoryProfile,
+                resource_id: str,
+                operation: BrokerOperation,
+                arguments: object = None,
+                operation_id: str | None = None,
+            ) -> tuple[str, dict[str, object]]:
+                del _profile, repository, operation_id
+                calls.append((operation.value, resource_id, arguments))
+                return (
+                    f"operation-{len(calls)}",
+                    {"status": "succeeded", "action": operation.value},
+                )
+
+            def client_state_poison(*_args: object, **_kwargs: object) -> object:
+                raise AssertionError("brokered Compose reached client-local state")
+
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_context",
+                    return_value=(profile, repository),
+                ),
+                mock.patch.object(BrokerClientProfile, "call", new=call),
+                mock.patch.object(
+                    dev_coordinator,
+                    "_open_normalized_action_store",
+                    side_effect=client_state_poison,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "locked_state",
+                    side_effect=client_state_poison,
+                ),
+            ):
+                results = [
+                    dev_coordinator.coordinated_run_docker(
+                        ["docker", "compose", "stop", "client-selected-service"],
+                        cwd=str(repository_root),
+                        project=str(repository_root),
+                        agent="codex-test",
+                    ),
+                    dev_coordinator.coordinated_run_docker(
+                        ["docker", "compose", "restart", "client-selected-service"],
+                        cwd=str(repository_root),
+                        project=str(repository_root),
+                        agent="codex-test",
+                    ),
+                    dev_coordinator.coordinated_run_docker(
+                        ["docker", "compose", "down"],
+                        cwd=str(repository_root),
+                        project=str(repository_root),
+                        agent="codex-test",
+                    ),
+                ]
+
+            self.assertTrue(
+                all(result["broker"]["resource_id"] == "compose-alpha" for result in results)
+            )
+            self.assertEqual(
+                calls,
+                [
+                    ("compose.stop", "compose-alpha", None),
+                    ("compose.restart", "compose-alpha", None),
+                    ("compose.down", "compose-alpha", None),
+                ],
+            )
+
     def test_trusted_file_loads_and_symlink_or_replaceable_ancestor_is_rejected(self) -> None:
         with CanonicalTemporaryDirectory(".broker-profile-trust-") as root:
             repository = root / "repository"
@@ -806,6 +1490,103 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 BrokerProfileError, "authenticated uid.*no valid broker enrollment"
             ):
                 profile_from_document(current, effective_uid=UID + 100_000)
+
+    def test_repository_expiry_is_independent_across_one_uid_profile(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-repository-expiry-") as root:
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            now = int(time.time())
+            document = profile_document(first, valid_until_epoch=now + 7_200)
+            client = document["clients"][str(UID)]
+            repositories = client["repositories"]
+            first_repository = repositories[0]
+            first_repository.update(
+                {
+                    "account_id": "account-alpha",
+                    "enabled": True,
+                    "issued_at": "2026-07-14T00:00:00Z",
+                    "valid_until_epoch": now - 1,
+                }
+            )
+            second_repository = dict(first_repository)
+            second_repository.update(
+                {
+                    "canonical_root": str(second),
+                    "repo_id": "repo-beta",
+                    "valid_until_epoch": now + 7_200,
+                }
+            )
+            repositories.append(second_repository)
+            client["valid_until_epoch"] = now + 7_200
+
+            profile = profile_from_document(document, effective_uid=UID)
+
+            with self.assertRaisesRegex(BrokerProfileError, "repository.*expired"):
+                profile.repository(str(first))
+            self.assertEqual(profile.repository(str(second)).repo_id, "repo-beta")
+
+    def test_inventory_routes_only_through_explicit_enrolled_repository(self) -> None:
+        with CanonicalTemporaryDirectory(".broker-inventory-route-") as root:
+            unrelated = root / "DevCoordinator"
+            requested = root / "GlobalFinance"
+            unrelated.mkdir()
+            requested.mkdir()
+            document = profile_document(unrelated)
+            client = document["clients"][str(UID)]
+            repositories = client["repositories"]
+            requested_repository = dict(repositories[0])
+            requested_repository.update(
+                {
+                    "canonical_root": str(requested),
+                    "repo_id": "repo-globalfinance",
+                    "servers": {},
+                    "containers": {},
+                    "compose_definition_id": None,
+                }
+            )
+            repositories.append(requested_repository)
+            profile = profile_from_document(document, effective_uid=UID)
+            calls: list[tuple[str, str, BrokerOperation, object]] = []
+
+            def call(
+                _profile: BrokerClientProfile,
+                *,
+                repository: BrokerRepositoryProfile,
+                resource_id: str,
+                operation: BrokerOperation,
+                arguments: object = None,
+                operation_id: str | None = None,
+            ) -> tuple[str, dict[str, object]]:
+                del _profile, operation_id
+                calls.append(
+                    (repository.repo_id, resource_id, operation, arguments)
+                )
+                if repository.repo_id != "repo-globalfinance":
+                    raise AssertionError("inventory used an unrelated enrollment")
+                return "operation-inventory", {"routed_via": repository.repo_id}
+
+            with mock.patch.object(BrokerClientProfile, "call", new=call):
+                result = profile.inventory(canonical_root=str(requested))
+
+            self.assertEqual(result, {"routed_via": "repo-globalfinance"})
+            self.assertEqual(
+                calls,
+                [
+                    (
+                        "repo-globalfinance",
+                        "repo-globalfinance",
+                        BrokerOperation.INVENTORY_READ,
+                        {},
+                    )
+                ],
+            )
+
+            with mock.patch.object(BrokerClientProfile, "call") as broker_call:
+                with self.assertRaisesRegex(BrokerProfileError, "not enrolled"):
+                    profile.inventory(canonical_root=str(root / "not-enrolled"))
+            broker_call.assert_not_called()
 
     def test_repository_lookup_and_resource_mappings_are_exact(self) -> None:
         with CanonicalTemporaryDirectory(".broker-profile-map-") as root:
@@ -879,6 +1660,99 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_call_uses_operation_bounded_timeouts(self) -> None:
+        self.assertGreater(
+            broker_profile_module.HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS,
+            dev_coordinator.HOST_OBSERVATION_JOIN_TIMEOUT_SECONDS,
+        )
+        self.assertGreater(
+            dev_coordinator.HOST_OBSERVATION_JOIN_TIMEOUT_SECONDS,
+            dev_coordinator.HOST_OBSERVATION_BUDGET_SECONDS,
+        )
+        self.assertGreater(
+            dev_coordinator.HOST_OBSERVATION_STALE_AFTER_SECONDS,
+            dev_coordinator.HOST_OBSERVATION_BUDGET_SECONDS,
+        )
+        constructor: list[dict[str, object]] = []
+
+        class FakeBrokerClient:
+            def __init__(self, _socket_path: object, **kwargs: object) -> None:
+                constructor.append(dict(kwargs))
+
+            def call(self, request: object) -> dict[str, object]:
+                return {
+                    "ok": True,
+                    "operation_id": request.operation_id,
+                    "result": {"status": "accepted"},
+                }
+
+        service = BrokerServiceProfile(
+            socket_path=Path("/run/devcoordinator/broker.sock"),
+            service_uid=17,
+            socket_gid=62000,
+            socket_mode=0o660,
+            database_generation=DATABASE_GENERATION,
+        )
+        cases = (
+            (BrokerOperation.DOCKER_STOP, 10.0),
+            (BrokerOperation.REPOSITORY_REMOVE, 60.0),
+            (
+                BrokerOperation.HOST_OBSERVE,
+                broker_profile_module.HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS,
+            ),
+            (
+                BrokerOperation.DATABASE_BACKUP,
+                broker_profile_module.DATABASE_BACKUP_CLIENT_TIMEOUT_SECONDS,
+            ),
+            (
+                BrokerOperation.DATABASE_RESTORE,
+                broker_profile_module.DATABASE_RESTORE_CLIENT_TIMEOUT_SECONDS,
+            ),
+        )
+        with mock.patch.object(
+            broker_profile_module, "BrokerClient", FakeBrokerClient
+        ):
+            for operation, expected_timeout in cases:
+                with self.subTest(operation=operation.value):
+                    call_broker(
+                        service=service,
+                        account_id="account-alpha",
+                        repo_id=REPO_ID,
+                        resource_id=(
+                            REPO_ID
+                            if operation
+                            in {
+                                BrokerOperation.REPOSITORY_REMOVE,
+                                BrokerOperation.HOST_OBSERVE,
+                            }
+                            else "container-postgres"
+                        ),
+                        operation=operation,
+                        arguments=(
+                            {"database_name": "app"}
+                            if operation == BrokerOperation.DATABASE_BACKUP
+                            else (
+                                {
+                                    "database_name": "app",
+                                    "database_backup_id": "backup-strong",
+                                    "explicit": True,
+                                }
+                                if operation == BrokerOperation.DATABASE_RESTORE
+                                else (
+                                    {
+                                        "plan_id": str(uuid.uuid4()),
+                                        "plan_fingerprint": "sha256:" + "5" * 64,
+                                    }
+                                    if operation == BrokerOperation.REPOSITORY_REMOVE
+                                    else {}
+                                )
+                            )
+                        ),
+                    )
+                    self.assertEqual(
+                        constructor[-1]["timeout_seconds"], expected_timeout
+                    )
 
 
 class BrokerLinkStoreTests(unittest.TestCase):

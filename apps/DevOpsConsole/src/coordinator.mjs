@@ -58,6 +58,8 @@ function cleanMessage(raw) {
 }
 
 function timeoutFor(apiPath) {
+  if (apiPath === '/v1/lifecycle/apply') return 600_000;
+  if (apiPath.startsWith('/v1/lifecycle/')) return 300_000;
   if (apiPath.startsWith('/v1/projects/')) return 300_000; // compose up can run minutes
   if (apiPath === '/v1/inventory') return 60_000; // shells out to docker
   if (apiPath.startsWith('/v1/docker/')) return 60_000;
@@ -479,6 +481,18 @@ export function createCoordinator({ config, log }) {
     return cachedGet(srvCache, '/v1/servers', maxAgeMs);
   }
 
+  function events({ after = null, limit = 100 } = {}) {
+    if (after !== null && (typeof after !== 'string' || !after || after.length > 1024)) {
+      throw new CoordError('event cursor must be a bounded non-empty string', { status: 400 });
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new CoordError('event limit must be an integer from 1 through 500', { status: 400 });
+    }
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (after !== null) query.set('after', after);
+    return request('GET', `/v1/events?${query.toString()}`);
+  }
+
   async function dockerAction(name, action, body = {}) {
     // Defense in depth for the "fixed endpoint set" invariant: only these
     // three container actions may form a coordinator path.
@@ -510,6 +524,38 @@ export function createCoordinator({ config, log }) {
     return result;
   }
 
+  function lifecycleResult(action, result) {
+    const status = String(result?.status ?? '').toLowerCase();
+    const failedStatus = new Set(['blocked', 'failed', 'needs_attention', 'partial']);
+    if (
+      result?.ok === false
+      || result?.partial === true
+      || result?.needs_attention === true
+      || failedStatus.has(status)
+    ) {
+      const errors = Array.isArray(result?.action_errors)
+        ? result.action_errors
+          .map((item) => item?.error || item?.message || item?.classification || item?.name)
+          .filter(Boolean)
+        : [];
+      if (Array.isArray(result?.errors)) {
+        errors.push(...result.errors
+          .map((item) => typeof item === 'string' ? item : item?.error || item?.message || item?.code)
+          .filter(Boolean));
+      }
+      const blockers = Array.isArray(result?.blockers)
+        ? result.blockers
+          .map((item) => typeof item === 'string' ? item : item?.message || item?.error || item?.code)
+          .filter(Boolean)
+        : [];
+      throw new CoordError(
+        `lifecycle ${action} ${status || 'failed'}: ${[...errors, ...blockers].join('; ') || 'coordinator reported incomplete work'}`,
+        { status: 409, body: result },
+      );
+    }
+    return result;
+  }
+
   function status() {
     return { ok, url: baseUrl, autostarted, lastError, lastOkAt };
   }
@@ -525,6 +571,8 @@ export function createCoordinator({ config, log }) {
     probe,
     inventory,
     serversRaw,
+    events,
+    observeHost: (b = {}) => request('POST', '/v1/observe', b),
     request,
     leasePort: (b = {}) => request('POST', '/v1/ports/lease', b),
     releasePort: (b = {}) => request('POST', '/v1/ports/release', b),
@@ -538,6 +586,14 @@ export function createCoordinator({ config, log }) {
     projectAction,
     projectStatus: (b = {}) => request('POST', '/v1/projects/status', b),
     dockerLogs: (b = {}) => request('POST', '/v1/docker/logs', b),
+    lifecycleArchives: () => request('GET', '/v1/archives'),
+    lifecyclePlan: (b = {}) => request('POST', '/v1/lifecycle/plan', b),
+    lifecycleApply: async (b = {}) => lifecycleResult(
+      'apply', await request('POST', '/v1/lifecycle/apply', b),
+    ),
+    lifecycleRestore: async (b = {}) => lifecycleResult(
+      'restore', await request('POST', '/v1/lifecycle/restore', b),
+    ),
     status,
     close,
   };

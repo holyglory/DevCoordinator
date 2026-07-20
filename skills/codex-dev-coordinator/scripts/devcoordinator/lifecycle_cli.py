@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 from .broker import BrokerOperation
 from .broker_links import BrokerLinkStore
 from .broker_profile import BrokerClientProfile, load_broker_profile
+from .cleanup_lifecycle import CleanupLifecycle
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
 from .repository_lifecycle import ExactResourceRef, RepositoryLifecycle, ResourceKind
 from .repository_lifecycle import (
@@ -23,6 +24,26 @@ from .store import AccountStore
 
 FULL_DOCKER_OBSERVER_DOMAIN = "host-runtime-v2:full-docker"
 
+REPOSITORY_ACTION_ALIASES = {
+    "plan-remove": "plan-remove",
+    "plan-archive": "plan-remove",
+    "remove": "remove",
+    "archive": "remove",
+    "list-removed": "list-removed",
+    "list-archived": "list-removed",
+    "reinstall": "reinstall",
+    "restore": "reinstall",
+}
+
+RESOURCE_ACTION_ALIASES = {
+    "plan-retire": "plan-retire",
+    "plan-archive": "plan-archive",
+    "retire": "retire",
+    "archive": "archive",
+    "restore": "restore",
+    "attach": "attach",
+}
+
 
 def add_lifecycle_parsers(subparsers: Any) -> None:
     repository = subparsers.add_parser(
@@ -30,27 +51,31 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
     )
     repository_sub = repository.add_subparsers(dest="action", required=True)
 
-    plan_remove = repository_sub.add_parser("plan-remove")
-    _repository_identity_arguments(plan_remove)
-    plan_remove.add_argument("--reason", required=True)
+    for action_name in ("plan-remove", "plan-archive"):
+        plan_remove = repository_sub.add_parser(action_name)
+        _repository_identity_arguments(plan_remove)
+        plan_remove.add_argument("--reason", required=True)
 
-    remove = repository_sub.add_parser("remove")
-    _repository_identity_arguments(remove)
-    remove.add_argument("--plan-id", required=True)
-    remove.add_argument("--plan-fingerprint", required=True)
+    for action_name in ("remove", "archive"):
+        remove = repository_sub.add_parser(action_name)
+        _repository_identity_arguments(remove)
+        remove.add_argument("--plan-id", required=True)
+        remove.add_argument("--plan-fingerprint", required=True)
 
-    list_removed = repository_sub.add_parser("list-removed")
-    list_removed.add_argument("--compact-json", action="store_true")
+    for action_name in ("list-removed", "list-archived"):
+        list_removed = repository_sub.add_parser(action_name)
+        list_removed.add_argument("--compact-json", action="store_true")
 
-    reinstall = repository_sub.add_parser("reinstall")
-    _repository_identity_arguments(reinstall)
-    reinstall.add_argument("--reason", required=True)
-    reinstall.add_argument(
-        "--explicit",
-        action="store_true",
-        required=True,
-        help="required acknowledgement; clears the fence but never starts resources",
-    )
+    for action_name in ("reinstall", "restore"):
+        reinstall = repository_sub.add_parser(action_name)
+        _repository_identity_arguments(reinstall)
+        reinstall.add_argument("--reason", required=True)
+        reinstall.add_argument(
+            "--explicit",
+            action="store_true",
+            required=True,
+            help="required acknowledgement; clears the fence but never starts resources",
+        )
 
     resource = subparsers.add_parser(
         "resource", help="attach or retire an exact normalized unassigned host resource"
@@ -76,6 +101,53 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
     retire.add_argument("--plan-id", required=True)
     retire.add_argument("--plan-fingerprint", required=True)
 
+    plan_archive = resource_sub.add_parser("plan-archive")
+    _exact_resource_arguments(plan_archive)
+    plan_archive.add_argument("--request-project", required=True)
+    plan_archive.add_argument("--agent", required=True)
+    plan_archive.add_argument("--reason", required=True)
+
+    archive = resource_sub.add_parser("archive")
+    _exact_resource_arguments(archive)
+    archive.add_argument("--request-project", required=True)
+    archive.add_argument("--agent", required=True)
+    archive.add_argument("--plan-id", required=True)
+    archive.add_argument("--plan-fingerprint", required=True)
+
+    restore_resource = resource_sub.add_parser("restore")
+    _exact_resource_arguments(restore_resource)
+    restore_resource.add_argument("--request-project", required=True)
+    restore_resource.add_argument("--agent", required=True)
+    restore_resource.add_argument("--reason", required=True)
+
+    archives = subparsers.add_parser("archives", help="list durable archived and removed targets")
+    archives_sub = archives.add_subparsers(dest="action", required=True)
+    archive_list = archives_sub.add_parser("list")
+    archive_list.add_argument("--agent", required=True)
+
+    cleanup = subparsers.add_parser("cleanup", help="plan and apply permanent exact-target cleanup")
+    cleanup_sub = cleanup.add_subparsers(dest="action", required=True)
+    cleanup_plan = cleanup_sub.add_parser("plan")
+    cleanup_plan.add_argument(
+        "--action",
+        dest="lifecycle_action",
+        choices=["archive", "purge"],
+        default="purge",
+    )
+    cleanup_plan.add_argument(
+        "--target-kind",
+        choices=["project", "repository", "server", "container", "worktree"],
+        required=True,
+    )
+    cleanup_plan.add_argument("--target-id", required=True)
+    cleanup_plan.add_argument("--agent", required=True)
+    cleanup_plan.add_argument("--reason", required=True)
+    cleanup_apply = cleanup_sub.add_parser("apply")
+    cleanup_apply.add_argument("--plan-id", required=True)
+    cleanup_apply.add_argument("--plan-fingerprint", required=True)
+    cleanup_apply.add_argument("--confirmation-phrase", "--confirm", required=True)
+    cleanup_apply.add_argument("--agent", required=True)
+
 
 def handle_lifecycle_cli(
     args: argparse.Namespace,
@@ -88,6 +160,8 @@ def handle_lifecycle_cli(
     adapter_factory: Callable[[], CoordinatorHostLifecycleAdapter] = CoordinatorHostLifecycleAdapter,
     broker_profile_loader: Callable[[], BrokerClientProfile | None] | None = None,
 ) -> Any:
+    if args.group == "repository":
+        args.action = REPOSITORY_ACTION_ALIASES[str(args.action)]
     # The top-level CLI injects its authority-aware resolver. Keeping the raw
     # profile loader as the default preserves this module's direct contract,
     # while explicit account/test authority cannot be redirected through an
@@ -139,8 +213,60 @@ def handle_lifecycle_cli(
         with AccountStore.open_default(coordinator_home) as store:
             return list(SQLiteLifecyclePersistence(store).list_removed_repositories())
 
-    if args.group not in {"repository", "resource"}:
+    if args.group not in {"repository", "resource", "archives", "cleanup"}:
         raise ValueError("lifecycle CLI received an unrelated command")
+
+    if args.group in {"archives", "cleanup"}:
+        if profile is not None:
+            return _handle_broker_cleanup(args, profile=profile)
+        with AccountStore.open_default(coordinator_home) as store:
+            cleanup = CleanupLifecycle(store)
+            if args.group == "archives":
+                return cleanup.list_archives(actor=str(args.agent))
+            if args.action == "plan":
+                project_root = _local_cleanup_project_root(
+                    store,
+                    target_kind=str(args.target_kind),
+                    target_id=str(args.target_id),
+                )
+                if observe_before_plan is None:
+                    raise RuntimeError(
+                        "cleanup planning requires a current bounded host observation"
+                    )
+                observe_before_plan(project_root, str(args.agent))
+                if str(args.lifecycle_action) == "archive":
+                    return _local_archive_plan(
+                        store,
+                        target_kind=str(args.target_kind),
+                        target_id=str(args.target_id),
+                        actor=str(args.agent),
+                        reason=str(args.reason),
+                        adapter_factory=adapter_factory,
+                    )
+                return cleanup.plan(
+                    target_kind=str(args.target_kind),
+                    target_id=str(args.target_id),
+                    actor=str(args.agent),
+                    reason=str(args.reason),
+                ).to_dict()
+            project_root = _local_cleanup_plan_project_root(
+                store, plan_id=str(args.plan_id)
+            )
+            require_fresh_lifecycle_observation(
+                store,
+                observe_before_apply,
+                project=project_root,
+                agent=str(args.agent),
+            )
+            return _local_generic_apply(
+                store,
+                cleanup=cleanup,
+                plan_id=str(args.plan_id),
+                plan_fingerprint=str(args.plan_fingerprint),
+                confirmation_phrase=str(args.confirmation_phrase),
+                actor=str(args.agent),
+                adapter_factory=adapter_factory,
+            )
 
     if profile is not None:
         return _handle_broker_lifecycle(
@@ -183,6 +309,14 @@ def handle_lifecycle_cli(
                     {
                         "canonical_root": repository["canonical_root"],
                         "display_name": repository["display_name"],
+                        "target_kind": "project",
+                        "target_id": repo_id,
+                        "target": {
+                            "target_kind": "project",
+                            "target_id": repo_id,
+                            "display_name": repository["display_name"],
+                            "project_id": repo_id,
+                        },
                         "blockers": [],
                     }
                 )
@@ -213,7 +347,7 @@ def handle_lifecycle_cli(
                     before_bindings = _control_binding_contract(
                         store, before.targets
                     )
-                    observation = _observe_for_apply(
+                    observation = require_fresh_lifecycle_observation(
                         store,
                         observe_before_apply,
                         project=str(repository["canonical_root"]),
@@ -248,7 +382,7 @@ def handle_lifecycle_cli(
                     before_bindings=before_bindings,
                     current_bindings=before_bindings,
                 )
-                observation = _observe_for_apply(
+                observation = require_fresh_lifecycle_observation(
                     store,
                     observe_before_apply,
                     project=str(repository["canonical_root"]),
@@ -290,7 +424,7 @@ def handle_lifecycle_cli(
         request_project = canonical_project(
             str(args.request_project if hasattr(args, "request_project") else args.project)
         )
-        if args.action == "retire":
+        if args.action in {"retire", "archive"}:
             confirmed = _confirmed_retirement_plan(
                 persistence,
                 plan_id=str(args.plan_id),
@@ -312,28 +446,34 @@ def handle_lifecycle_cli(
                     result.to_dict(), confirmed=confirmed, observation=None
                 )
             if progress.status is not OperationStatus.PLANNED:
-                current_before = persistence.resolve_standalone_resource(
+                current_before, current_before_repo_id = persistence.resolve_resource(
                     execution.target.kind,
                     execution.target.resource_id,
                     execution.target.control_binding_id,
+                    include_archived=True,
                 )
+                if current_before_repo_id != execution.repo_id:
+                    raise PlanDriftError("resource repository attachment changed")
                 _require_target_semantically_unchanged(
                     execution.target, current_before
                 )
                 before_bindings = _control_binding_contract(
                     store, (current_before,)
                 )
-                observation = _observe_for_apply(
+                observation = require_fresh_lifecycle_observation(
                     store,
                     observe_before_apply,
                     project=request_project,
                     agent=str(args.agent),
                 )
-                current = persistence.resolve_standalone_resource(
+                current, current_repo_id = persistence.resolve_resource(
                     execution.target.kind,
                     execution.target.resource_id,
                     execution.target.control_binding_id,
+                    include_archived=True,
                 )
+                if current_repo_id != execution.repo_id:
+                    raise PlanDriftError("resource repository attachment changed")
                 _require_target_semantically_unchanged(execution.target, current)
                 if before_bindings != _control_binding_contract(store, (current,)):
                     raise PlanDriftError(
@@ -350,34 +490,48 @@ def handle_lifecycle_cli(
                     observation=observation,
                 )
 
-            current_before = persistence.resolve_standalone_resource(
+            current_before, current_before_repo_id = persistence.resolve_resource(
                 execution.target.kind,
                 execution.target.resource_id,
                 execution.target.control_binding_id,
+                include_archived=True,
             )
+            if current_before_repo_id != execution.repo_id:
+                raise PlanDriftError("resource repository attachment changed")
             _require_target_semantically_unchanged(execution.target, current_before)
             before_bindings = _control_binding_contract(store, (current_before,))
-            observation = _observe_for_apply(
+            observation = require_fresh_lifecycle_observation(
                 store,
                 observe_before_apply,
                 project=request_project,
                 agent=str(args.agent),
             )
-            current = persistence.resolve_standalone_resource(
+            current, current_repo_id = persistence.resolve_resource(
                 execution.target.kind,
                 execution.target.resource_id,
                 execution.target.control_binding_id,
+                include_archived=True,
             )
+            if current_repo_id != execution.repo_id:
+                raise PlanDriftError("resource repository attachment changed")
             _require_target_semantically_unchanged(execution.target, current)
             if before_bindings != _control_binding_contract(store, (current,)):
                 raise PlanDriftError(
                     "standalone resource controller changed during current observation"
                 )
-            refreshed = lifecycle.plan_standalone_retirement(
-                current,
-                actor=str(args.agent),
-                reason=confirmed.reason,
-            )
+            if confirmed.repo_id is not None or args.action == "archive":
+                refreshed = lifecycle.plan_resource_archive(
+                    current,
+                    actor=str(args.agent),
+                    reason=confirmed.reason,
+                    repo_id=confirmed.repo_id,
+                )
+            else:
+                refreshed = lifecycle.plan_standalone_retirement(
+                    current,
+                    actor=str(args.agent),
+                    reason=confirmed.reason,
+                )
             _require_retirement_refresh_matches(execution, refreshed)
             persistence.bind_lifecycle_plan_successor(execution, refreshed)
             result = lifecycle.apply_standalone_retirement(
@@ -391,23 +545,43 @@ def handle_lifecycle_cli(
                 observation=observation,
             )
 
-        exact = persistence.resolve_standalone_resource(
-            ResourceKind(str(args.resource_kind)),
-            str(args.resource_id),
-            str(args.control_binding_id),
-        )
+        if args.action in {"plan-archive", "restore"}:
+            exact, attached_repo_id = persistence.resolve_resource(
+                ResourceKind(str(args.resource_kind)),
+                str(args.resource_id),
+                str(args.control_binding_id),
+                include_archived=args.action == "restore",
+            )
+        else:
+            exact = persistence.resolve_standalone_resource(
+                ResourceKind(str(args.resource_kind)),
+                str(args.resource_id),
+                str(args.control_binding_id),
+            )
+            attached_repo_id = None
         _verify_cli_exact_identity(args, exact)
-        if args.action == "plan-retire":
+        if args.action in {"plan-retire", "plan-archive"}:
             if observe_before_plan is None:
                 raise RuntimeError(
                     "standalone retirement planning requires a current bounded host observation"
                 )
             observe_before_plan(request_project, str(args.agent))
-            observed_exact = persistence.resolve_standalone_resource(
-                ResourceKind(str(args.resource_kind)),
-                str(args.resource_id),
-                str(args.control_binding_id),
-            )
+            if args.action == "plan-archive":
+                observed_exact, observed_repo_id = persistence.resolve_resource(
+                    ResourceKind(str(args.resource_kind)),
+                    str(args.resource_id),
+                    str(args.control_binding_id),
+                )
+                if observed_repo_id != attached_repo_id:
+                    raise PlanDriftError(
+                        "resource repository attachment changed during observation"
+                    )
+            else:
+                observed_exact = persistence.resolve_standalone_resource(
+                    ResourceKind(str(args.resource_kind)),
+                    str(args.resource_id),
+                    str(args.control_binding_id),
+                )
             _require_plan_target_identity_unchanged(exact, observed_exact)
             exact = observed_exact
         if args.action == "attach":
@@ -421,11 +595,30 @@ def handle_lifecycle_cli(
                 reason=str(args.reason),
             ).to_dict()
         if args.action == "plan-retire":
-            return lifecycle.plan_standalone_retirement(
+            plan = lifecycle.plan_standalone_retirement(
                 exact,
                 actor=str(args.agent),
                 reason=str(args.reason),
-            ).to_dict()
+            )
+            payload = plan.to_dict()
+            payload["target"] = persistence.describe_resource(exact, None)
+            return payload
+        if args.action == "plan-archive":
+            plan = lifecycle.plan_resource_archive(
+                exact,
+                actor=str(args.agent),
+                reason=str(args.reason),
+                repo_id=attached_repo_id,
+            )
+            payload = plan.to_dict()
+            payload["target"] = persistence.describe_resource(exact, attached_repo_id)
+            return payload
+        if args.action == "restore":
+            return lifecycle.restore_resource_archive(
+                exact,
+                actor=str(args.agent),
+                reason=str(args.reason),
+            )
         raise ValueError("unsupported resource lifecycle action")
 
 
@@ -478,10 +671,20 @@ def _handle_broker_lifecycle(
         elif args.action == "plan-retire":
             operation = BrokerOperation.RESOURCE_PLAN_RETIRE
             arguments["reason"] = str(args.reason)
+        elif args.action == "plan-archive":
+            operation = BrokerOperation.RESOURCE_PLAN_ARCHIVE
+            arguments["reason"] = str(args.reason)
         elif args.action == "retire":
             operation = BrokerOperation.RESOURCE_RETIRE
             arguments["plan_id"] = str(args.plan_id)
             arguments["plan_fingerprint"] = str(args.plan_fingerprint)
+        elif args.action == "archive":
+            operation = BrokerOperation.RESOURCE_ARCHIVE
+            arguments["plan_id"] = str(args.plan_id)
+            arguments["plan_fingerprint"] = str(args.plan_fingerprint)
+        elif args.action == "restore":
+            operation = BrokerOperation.RESOURCE_RESTORE
+            arguments["reason"] = str(args.reason)
         else:
             raise ValueError("unsupported broker resource lifecycle action")
 
@@ -507,7 +710,16 @@ def _handle_broker_lifecycle(
             }
         )
         return payload
-    if operation == BrokerOperation.RESOURCE_PLAN_RETIRE:
+    if operation in {
+        BrokerOperation.RESOURCE_PLAN_RETIRE,
+        BrokerOperation.RESOURCE_PLAN_ARCHIVE,
+    }:
+        return payload
+
+    if operation in {
+        BrokerOperation.RESOURCE_ARCHIVE,
+        BrokerOperation.RESOURCE_RESTORE,
+    }:
         return payload
 
     with AccountStore.open_default(coordinator_home) as store:
@@ -521,6 +733,272 @@ def _handle_broker_lifecycle(
             result=result,
         )
     payload["broker"]["local_mirror"] = mirror
+    return payload
+
+
+def _local_cleanup_project_root(
+    store: AccountStore, *, target_kind: str, target_id: str
+) -> str:
+    kind = "project" if target_kind == "repository" else target_kind
+    with store.read_transaction() as connection:
+        if kind in {"project", "worktree"}:
+            row = connection.execute(
+                "SELECT canonical_root FROM repositories WHERE repo_id = ?",
+                (target_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT r.canonical_root
+                FROM repository_memberships m
+                JOIN repositories r USING(repo_id)
+                WHERE m.resource_kind = ? AND m.host_resource_id = ?
+                """,
+                (kind, target_id),
+            ).fetchone()
+    if row is None:
+        raise RuntimeError("cleanup target has no observable project boundary")
+    return str(row["canonical_root"])
+
+
+def _local_cleanup_plan_project_root(store: AccountStore, *, plan_id: str) -> str:
+    with store.read_transaction() as connection:
+        row = connection.execute(
+            """
+            SELECT r.canonical_root
+            FROM operations o JOIN repositories r USING(repo_id)
+            WHERE o.operation_id = ?
+            """,
+            (plan_id,),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("cleanup plan has no observable project boundary")
+    return str(row["canonical_root"])
+
+
+def _common_archive_plan_payload(
+    plan: RepositoryDecommissionPlan | StandaloneRetirementPlan,
+    target: Mapping[str, Any],
+) -> dict[str, Any]:
+    target_kind = "project" if isinstance(plan, RepositoryDecommissionPlan) else plan.target.kind.value
+    payload = plan.to_dict()
+    payload.update(
+        {
+            "plan_fingerprint": plan.fingerprint,
+            "action": "archive",
+            "confirmation_phrase": "",
+            "target": dict(target),
+            "target_kind": target_kind,
+            "target_id": str(target["target_id"]),
+            "effects": [
+                "disable_captured_startup_policies",
+                "stop_exact_resource" if target_kind != "project" else "stop_exact_project_resources",
+                "deactivate_port_allocations",
+                "hide_from_active_inventory",
+            ],
+            "retained": list(payload.get("retained_data") or []),
+            "deleted": [],
+            "blockers": [],
+            "status": "planned",
+        }
+    )
+    return payload
+
+
+def _local_archive_plan(
+    store: AccountStore,
+    *,
+    target_kind: str,
+    target_id: str,
+    actor: str,
+    reason: str,
+    adapter_factory: Callable[[], CoordinatorHostLifecycleAdapter],
+) -> dict[str, Any]:
+    kind = "project" if target_kind == "repository" else target_kind
+    persistence = SQLiteLifecyclePersistence(store)
+    lifecycle = RepositoryLifecycle(persistence, adapter_factory())
+    if kind == "project":
+        plan = lifecycle.plan_repository_decommission(
+            target_id, actor=actor, reason=reason
+        )
+        with store.read_transaction() as connection:
+            row = connection.execute(
+                "SELECT display_name FROM repositories WHERE repo_id = ?", (target_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("archive target disappeared during planning")
+        return _common_archive_plan_payload(
+            plan,
+            {
+                "target_kind": "project",
+                "target_id": target_id,
+                "display_name": str(row["display_name"]),
+                "project_id": target_id,
+            },
+        )
+    if kind not in {"server", "container"}:
+        raise ValueError("linked worktrees cannot be archived")
+    with store.read_transaction() as connection:
+        binding = connection.execute(
+            """
+            SELECT binding_id FROM control_bindings
+            WHERE resource_kind = ? AND resource_id = ?
+              AND authority_state = 'authoritative'
+            ORDER BY priority DESC, binding_id LIMIT 1
+            """,
+            (kind, target_id),
+        ).fetchone()
+    if binding is None:
+        raise RuntimeError("archive target has no authoritative exact controller")
+    exact, repo_id = persistence.resolve_resource(
+        ResourceKind(kind), target_id, str(binding["binding_id"])
+    )
+    plan = lifecycle.plan_resource_archive(
+        exact, actor=actor, reason=reason, repo_id=repo_id
+    )
+    return _common_archive_plan_payload(plan, persistence.describe_resource(exact, repo_id))
+
+
+def _local_generic_apply(
+    store: AccountStore,
+    *,
+    cleanup: CleanupLifecycle,
+    plan_id: str,
+    plan_fingerprint: str,
+    confirmation_phrase: str,
+    actor: str,
+    adapter_factory: Callable[[], CoordinatorHostLifecycleAdapter],
+) -> dict[str, Any]:
+    with store.read_transaction() as connection:
+        is_purge = connection.execute(
+            "SELECT 1 FROM cleanup_plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone() is not None
+    if is_purge:
+        return cleanup.apply(
+            plan_id=plan_id,
+            plan_fingerprint=plan_fingerprint,
+            confirmation_phrase=confirmation_phrase,
+            actor=actor,
+        )
+    if confirmation_phrase:
+        raise ValueError("archive apply requires an empty confirmation phrase")
+    persistence = SQLiteLifecyclePersistence(store)
+    plan = persistence.load_plan(plan_id)
+    lifecycle = RepositoryLifecycle(persistence, adapter_factory())
+    if isinstance(plan, RepositoryDecommissionPlan):
+        payload = lifecycle.apply_repository_decommission(
+            plan_id, plan_fingerprint, actor=actor
+        ).to_dict()
+    elif isinstance(plan, StandaloneRetirementPlan) and plan.repo_id is not None:
+        payload = lifecycle.apply_standalone_retirement(
+            plan_id, plan_fingerprint, actor=actor
+        ).to_dict()
+    else:
+        raise ValueError("plan is not an archive or purge plan")
+    status = str(payload.get("status") or "")
+    payload.update(
+        {
+            "action": "archive",
+            "partial": status == "needs_attention",
+            "needs_attention": status == "needs_attention",
+            "ok": status in {"succeeded", "already_complete"},
+        }
+    )
+    return payload
+
+
+def _handle_broker_cleanup(
+    args: argparse.Namespace,
+    *,
+    profile: BrokerClientProfile,
+) -> dict[str, Any]:
+    """Route cleanup only through enrolled service authority; never open its DB."""
+
+    repositories = tuple(
+        profile.repository(item.canonical_root)
+        for item in sorted(
+            profile.repositories.values(), key=lambda item: item.canonical_root
+        )
+    )
+    if not repositories:
+        raise RuntimeError("cleanup requires at least one enrolled broker repository")
+    if args.group == "archives":
+        archives: dict[tuple[str, str], dict[str, Any]] = {}
+        for repository in repositories:
+            _operation_id, result = profile.call(
+                repository=repository,
+                resource_id=repository.repo_id,
+                operation=BrokerOperation.ARCHIVES_READ,
+                arguments={},
+            )
+            rows = result.get("archives")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise RuntimeError("host broker returned an invalid archive listing")
+            for row in rows:
+                project_id = str(row.get("project_id") or row.get("target_id") or "")
+                if project_id != repository.repo_id:
+                    raise RuntimeError("host broker returned an archive outside enrolled authority")
+                key = (str(row.get("target_kind") or ""), str(row.get("target_id") or ""))
+                archives[key] = dict(row)
+        return {
+            "archives": sorted(
+                archives.values(),
+                key=lambda item: (
+                    str(item.get("archived_at") or ""),
+                    str(item.get("display_name") or "").lower(),
+                ),
+                reverse=True,
+            )
+        }
+
+    if args.action == "plan":
+        kind = "project" if str(args.target_kind) == "repository" else str(args.target_kind)
+        target_id = str(args.target_id)
+        matches = []
+        for repository in repositories:
+            if kind in {"project", "worktree"} and repository.repo_id == target_id:
+                matches.append(repository)
+            elif kind == "server" and target_id in set(repository.server_ids.values()):
+                matches.append(repository)
+            elif kind == "container" and target_id in set(repository.container_ids.values()):
+                matches.append(repository)
+        if len(matches) != 1:
+            raise RuntimeError(
+                "cleanup target is not uniquely enrolled; refresh the root-issued broker profile"
+            )
+        repository = matches[0]
+        operation = BrokerOperation.CLEANUP_PLAN
+        arguments = {
+            "action": str(args.lifecycle_action),
+            "target_kind": kind,
+            "target_id": target_id,
+            "reason": str(args.reason),
+        }
+        resource_id = target_id
+    else:
+        # The service resolves the durable plan to its exact repository and
+        # rechecks that repository's live cleanup grant.  The anchor only
+        # authenticates the installed profile; no client DB lookup is used.
+        repository = repositories[0]
+        operation = BrokerOperation.CLEANUP_APPLY
+        arguments = {
+            "plan_id": str(args.plan_id),
+            "plan_fingerprint": str(args.plan_fingerprint),
+            "confirmation_phrase": str(args.confirmation_phrase),
+        }
+        resource_id = repository.repo_id
+    operation_id, result = profile.call(
+        repository=repository,
+        resource_id=resource_id,
+        operation=operation,
+        arguments=arguments,
+    )
+    payload = dict(result)
+    payload["broker"] = {
+        "operation_id": operation_id,
+        "operation": operation.value,
+        "authority": "host_broker",
+    }
     return payload
 
 
@@ -628,7 +1106,7 @@ def _retirement_execution_plan(
     return execution
 
 
-def _observe_for_apply(
+def require_fresh_lifecycle_observation(
     store: AccountStore,
     callback: Callable[[str, str], Mapping[str, Any]] | None,
     *,

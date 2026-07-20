@@ -5,17 +5,25 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import http.client
 import json
+import math
 import os
+import pwd
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 
-from linux_proc_identity import ProcIdentityError, read_stable_process_identity
+from linux_proc_identity import (
+    ProcIdentityError,
+    parse_start_ticks,
+    read_stable_process_identity,
+)
 from secure_cutover_io import SecureIOError, read_private_regular
 from verify_post_cutover_registration import (
     RegistrationGraphError,
@@ -36,6 +44,14 @@ class InventoryTransportPending(ConsoleRegistrationError):
     """The loopback API transport is in one explicitly temporary state."""
 
 
+IN_FLIGHT_LEASE_FRESHNESS_SECONDS = 120.0
+MAX_BROKER_LEASE_TTL_SECONDS = 7 * 24 * 60 * 60
+TIMESTAMP_FUTURE_SKEW_SECONDS = 1.0
+BROKER_IDENTIFIER_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:@-"
+)
+
+
 def _rows(inventory: dict[str, Any], key: str) -> list[dict[str, Any]]:
     value = inventory.get(key)
     if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
@@ -47,6 +63,411 @@ def _integer(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _timestamp_epoch(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    result = parsed.timestamp()
+    return result if math.isfinite(result) else None
+
+
+def console_account_identity(
+    uid: int,
+    *,
+    account_lookup: Callable[[int], Any] = pwd.getpwuid,
+) -> str:
+    """Resolve the stable MainPID UID through the host's authoritative NSS map."""
+
+    if _integer(uid) is None or uid < 0:
+        raise ConsoleRegistrationError("Console MainPID UID is invalid")
+    try:
+        record = account_lookup(uid)
+    except (KeyError, OSError) as error:
+        raise ConsoleRegistrationError(
+            f"Console MainPID UID {uid} has no authoritative NSS account mapping"
+        ) from error
+    account_id = getattr(record, "pw_name", None)
+    record_uid = getattr(record, "pw_uid", None)
+    if (
+        record_uid != uid
+        or not isinstance(account_id, str)
+        or not account_id
+        or any(character not in BROKER_IDENTIFIER_CHARS for character in account_id)
+    ):
+        raise ConsoleRegistrationError(
+            "Console MainPID NSS account mapping is invalid or mismatched"
+        )
+    return account_id
+
+
+def _broker_listener_fingerprint(
+    *,
+    main_pid: int,
+    main_uid: int,
+    main_start_ticks: str,
+    main_cwd: str,
+    project: str,
+    port: int,
+) -> str:
+    """Reproduce the broker's exact Linux listener-evidence fingerprint."""
+
+    evidence = {
+        "pid": main_pid,
+        "owner_uid": main_uid,
+        "process_identity": f"linux:{main_pid}:{main_start_ticks}",
+        "cwd": main_cwd,
+        "canonical_root": project,
+        "port": port,
+        "protocol": "tcp",
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            evidence,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _require_broker_stopped_baseline(
+    raw: dict[str, Any],
+    *,
+    server: dict[str, Any],
+    assignment: dict[str, Any],
+    project: str,
+    name: str,
+    port: int,
+    main_pid: int,
+    main_uid: int | None,
+    main_account_id: str | None,
+    main_start_ticks: str | None,
+    main_cwd: str | None,
+    observed_at_epoch: float | None,
+) -> str | None:
+    """Require service-authority evidence for a process-free stopped row."""
+
+    def reject(detail: str) -> None:
+        raise ConsoleRegistrationError(
+            "unsafe registration baseline: null PID stopped row lacks exact "
+            f"broker/server-wide proof ({detail})"
+        )
+
+    def rows(container: Any, key: str, label: str) -> list[dict[str, Any]]:
+        if not isinstance(container, dict):
+            reject(f"{label} is not an object")
+        value = container.get(key)
+        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+            reject(f"{label}.{key} is not a list of objects")
+        return value
+
+    authority = raw.get("authority")
+    store = raw.get("store")
+    if raw.get("schema_version") != 2 or not isinstance(authority, dict) or not isinstance(store, dict):
+        reject("normalized authority envelope is missing")
+    if (
+        authority.get("scope") != "server-wide"
+        or authority.get("transport") != "authenticated-unix-socket"
+        or not isinstance(authority.get("socket"), str)
+        or not Path(authority["socket"]).is_absolute()
+        or _integer(authority.get("service_uid")) is None
+        or _integer(authority.get("service_uid")) < 0
+    ):
+        reject("authority is not the authenticated system broker")
+    generation = authority.get("database_generation")
+    if not isinstance(generation, str) or not generation or store.get("database_generation") != generation:
+        reject("broker profile is not bound to the projected database generation")
+
+    server_id = server.get("id")
+    if not isinstance(server_id, str) or not server_id.strip():
+        reject("compatibility server id is missing")
+    repositories = [
+        row for row in rows(raw, "repositories", "inventory")
+        if row.get("canonical_root") == project
+    ]
+    if len(repositories) != 1:
+        reject("canonical repository is missing or ambiguous")
+    repository = repositories[0]
+    repo_id = repository.get("repo_id")
+    if (
+        not isinstance(repo_id, str)
+        or not repo_id
+        or repository.get("state") != "active"
+        or repository.get("installation_status") == "disabled"
+    ):
+        reject("canonical repository is not one active installed broker resource")
+
+    resources = raw.get("resources")
+    definitions = [
+        row for row in rows(resources, "servers", "resources")
+        if row.get("server_definition_id") == server_id
+    ]
+    if len(definitions) != 1:
+        reject("normalized server definition is missing or ambiguous")
+    definition = definitions[0]
+    if (
+        definition.get("repo_id") != repo_id
+        or definition.get("name") != name
+        or not isinstance(definition.get("cwd"), str)
+        or not (
+            definition["cwd"] == project
+            or definition["cwd"].startswith(project.rstrip("/") + "/")
+        )
+    ):
+        reject("normalized server definition does not bind the exact repository target")
+
+    observations = raw.get("observations")
+    stopped = [
+        row for row in rows(observations, "servers", "observations")
+        if row.get("server_definition_id") == server_id
+    ]
+    if len(stopped) != 1:
+        reject("normalized stopped observation is missing or ambiguous")
+    observation = stopped[0]
+    fingerprint = observation.get("observation_fingerprint")
+    if (
+        observation.get("lifecycle") != "stopped"
+        or "pid" not in observation
+        or observation.get("pid") is not None
+        or observation.get("process_start_time") is not None
+        or observation.get("process_fingerprint") is not None
+        or observation.get("listener_host") != "127.0.0.1"
+        or _integer(observation.get("listener_port")) != port
+        or observation.get("listener_observable") not in {True, 1}
+        or observation.get("health_classification") not in {"stopped", "unhealthy"}
+        or observation.get("health_ok") not in {False, 0}
+        or not isinstance(observation.get("stopped_at"), str)
+        or not observation.get("stopped_at")
+        or not isinstance(observation.get("stopped_reason"), str)
+        or not observation.get("stopped_reason")
+        or not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        reject("normalized observation is not an exact broker-published stop")
+
+    normalized_assignments = [
+        row for row in rows(raw, "port_assignments", "inventory")
+        if _integer(row.get("port")) == port
+        or (row.get("repo_id") == repo_id and row.get("server_name") == name)
+    ]
+    if len(normalized_assignments) != 1:
+        reject("normalized durable assignment is missing or ambiguous")
+    normalized_assignment = normalized_assignments[0]
+    expected_normalized_assignment = {
+        "repo_id": repo_id,
+        "server_name": name,
+        "port": port,
+        "status": "active",
+    }
+    mismatched_normalized_assignment = [
+        f"{key}={normalized_assignment.get(key)!r} (expected {expected!r})"
+        for key, expected in expected_normalized_assignment.items()
+        if normalized_assignment.get(key) != expected
+    ]
+    if mismatched_normalized_assignment:
+        reject(
+            "normalized assignment mismatch: "
+            + ", ".join(mismatched_normalized_assignment)
+        )
+    normalized_assignment_id = normalized_assignment.get("assignment_id")
+    if (
+        not isinstance(normalized_assignment_id, str)
+        or not normalized_assignment_id
+        or assignment.get("id") != normalized_assignment_id
+        or assignment.get("status") != "active"
+    ):
+        reject(
+            "compatibility assignment is not the exact active normalized assignment"
+        )
+
+    all_normalized_leases = rows(raw, "leases", "inventory")
+    relevant_normalized_leases = [
+        row for row in all_normalized_leases
+        if _integer(row.get("port")) == port
+        or row.get("server_definition_id") == server_id
+    ]
+    compatibility = raw.get("v1_compatibility")
+    all_compatibility_leases = rows(
+        compatibility,
+        "leases",
+        "inventory.v1_compatibility",
+    )
+    relevant_compatibility_leases = [
+        row for row in all_compatibility_leases
+        if _integer(row.get("port")) == port
+        or row.get("server_id") == server_id
+        or row.get("assignment_key") == f"{project}::{name}"
+    ]
+    active_normalized_leases = [
+        row for row in relevant_normalized_leases if row.get("status") == "active"
+    ]
+    active_compatibility_leases = [
+        row for row in relevant_compatibility_leases if row.get("status") == "active"
+    ]
+    active_registration_lease_id: str | None = None
+    if active_normalized_leases or active_compatibility_leases:
+        if (
+            len(active_normalized_leases) != 1
+            or len(active_compatibility_leases) != 1
+            or len(relevant_compatibility_leases) != 1
+        ):
+            reject("active lease mapping is missing or ambiguous")
+        normalized_lease = active_normalized_leases[0]
+        compatibility_lease = active_compatibility_leases[0]
+        lease_id = normalized_lease.get("lease_id")
+        fingerprint = normalized_lease.get("process_fingerprint")
+        owner = normalized_lease.get("owner")
+        agent = normalized_lease.get("agent")
+        created_at_epoch = _timestamp_epoch(normalized_lease.get("created_at"))
+        updated_at_epoch = _timestamp_epoch(normalized_lease.get("updated_at"))
+        expires_at_epoch = _timestamp_epoch(normalized_lease.get("expires_at"))
+        if (
+            _integer(main_uid) is None
+            or main_uid < 0
+            or not isinstance(main_account_id, str)
+            or not main_account_id
+            or not isinstance(main_start_ticks, str)
+            or not main_start_ticks.isdigit()
+            or not isinstance(main_cwd, str)
+            or not (
+                main_cwd == project
+                or main_cwd.startswith(project.rstrip("/") + "/")
+            )
+            or not isinstance(observed_at_epoch, (int, float))
+            or isinstance(observed_at_epoch, bool)
+            or not math.isfinite(float(observed_at_epoch))
+        ):
+            reject("stable systemd MainPID identity is incomplete")
+        expected_fingerprint = _broker_listener_fingerprint(
+            main_pid=main_pid,
+            main_uid=main_uid,
+            main_start_ticks=main_start_ticks,
+            main_cwd=main_cwd,
+            project=project,
+            port=port,
+        )
+        observed_at = float(observed_at_epoch)
+        if (
+            not isinstance(lease_id, str)
+            or not lease_id
+            or normalized_lease.get("repo_id") != repo_id
+            or normalized_lease.get("server_definition_id") != server_id
+            or _integer(normalized_lease.get("port")) != port
+            or normalized_lease.get("purpose") != "broker"
+            or normalized_lease.get("status") != "active"
+            or normalized_lease.get("deactivated_at") is not None
+            or owner != f"uid:{main_uid}"
+            or agent != main_account_id
+            or fingerprint != expected_fingerprint
+            or created_at_epoch is None
+            or updated_at_epoch is None
+            or expires_at_epoch is None
+            or created_at_epoch > updated_at_epoch
+            or updated_at_epoch > observed_at + TIMESTAMP_FUTURE_SKEW_SECONDS
+            or observed_at - updated_at_epoch > IN_FLIGHT_LEASE_FRESHNESS_SECONDS
+            or expires_at_epoch <= observed_at
+            or expires_at_epoch <= updated_at_epoch
+            or expires_at_epoch - updated_at_epoch > MAX_BROKER_LEASE_TTL_SECONDS
+        ):
+            reject("active lease is not the exact broker registration reservation")
+        expected_compatibility_lease = {
+            "id": lease_id,
+            "project": project,
+            "port": port,
+            "owner": owner,
+            "agent": agent,
+            "purpose": "broker",
+            "status": "active",
+            "expires_at": normalized_lease.get("expires_at"),
+            "process_fingerprint": fingerprint,
+            "deactivated_at": None,
+            "created_at": normalized_lease.get("created_at"),
+            "updated_at": normalized_lease.get("updated_at"),
+            "server_id": server_id,
+            "owner_pid": None,
+            "assignment_key": f"{project}::{name}",
+        }
+        mismatched_compatibility_lease = [
+            f"{key}={compatibility_lease.get(key)!r} (expected {expected!r})"
+            for key, expected in expected_compatibility_lease.items()
+            if compatibility_lease.get(key) != expected
+        ]
+        if mismatched_compatibility_lease:
+            reject(
+                "active lease compatibility mapping mismatch: "
+                + ", ".join(mismatched_compatibility_lease)
+            )
+        reused_by = server.get("port_reused_by")
+        if (
+            server.get("lease_id") != lease_id
+            or server.get("port_reused") is not True
+            or server.get("url_is_current") is not False
+            or not isinstance(reused_by, dict)
+            or reused_by.get("type") != "process"
+            or _integer(reused_by.get("pid")) != main_pid
+            or reused_by.get("project") != project
+            or not isinstance(reused_by.get("cwd"), str)
+            or not (
+                reused_by["cwd"] == project
+                or reused_by["cwd"].startswith(project.rstrip("/") + "/")
+            )
+        ):
+            reject("active lease lacks the exact current systemd MainPID listener claim")
+        active_registration_lease_id = lease_id
+
+    target_normalized_leases = [
+        row for row in all_normalized_leases
+        if row.get("server_definition_id") == server_id
+    ]
+    lease_id = server.get("lease_id")
+    if active_registration_lease_id is not None:
+        if lease_id != active_registration_lease_id:
+            reject("compatibility server does not reference the active broker lease")
+    elif lease_id is None:
+        if target_normalized_leases:
+            reject("pruned compatibility lease conflicts with retained normalized history")
+    else:
+        exact = [row for row in target_normalized_leases if row.get("lease_id") == lease_id]
+        if len(exact) != 1:
+            reject("released compatibility lease is missing or ambiguous")
+        lease = exact[0]
+        if (
+            lease.get("repo_id") != repo_id
+            or lease.get("server_definition_id") != server_id
+            or _integer(lease.get("port")) != port
+            or lease.get("status") not in {"released", "stale_released"}
+            or not isinstance(lease.get("deactivated_at"), str)
+            or not lease.get("deactivated_at")
+        ):
+            reject("normalized lease is not the exact inactive broker lease")
+
+    health = server.get("health")
+    if (
+        server.get("metadata_source") != "normalized-sqlite"
+        or server.get("identity_observable") is not True
+        or server.get("process_start_time") is not None
+        or server.get("process_fingerprint") is not None
+        or server.get("stopped_at") != observation.get("stopped_at")
+        or server.get("stopped_reason") != observation.get("stopped_reason")
+        or server.get("url_is_current") is not False
+        or "registration_identity" in server
+        or not isinstance(health, dict)
+        or health.get("classification") != observation.get("health_classification")
+        or health.get("ok") is not False
+        or health.get("pid_alive") is not None
+    ):
+        reject("compatibility stopped row is not exact")
+    return active_registration_lease_id
+
+
 def classify_registration_snapshot(
     inventory: dict[str, Any],
     *,
@@ -54,9 +475,15 @@ def classify_registration_snapshot(
     name: str,
     port: int,
     main_pid: int,
+    main_uid: int | None = None,
+    main_account_id: str | None = None,
+    main_start_ticks: str | None = None,
+    main_cwd: str | None = None,
+    observed_at_epoch: float | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Return ``ready`` or an exact retryable baseline; reject everything else."""
 
+    raw_inventory = inventory
     try:
         inventory = current_registration_inventory_view(inventory)
     except RegistrationGraphError as error:
@@ -105,6 +532,7 @@ def classify_registration_snapshot(
         and row.get("project") == project
         and row.get("purpose") == f"server:{name}"
     ]
+    active_claim_present = bool(active_port_leases or active_target_leases)
 
     if current_port_servers:
         if len(current_port_servers) != 1 or len(target_servers) != 1:
@@ -388,12 +816,11 @@ def classify_registration_snapshot(
                 "active_stale_lease_count": 0,
             }
 
-    if active_port_leases or active_target_leases:
-        raise ConsoleRegistrationError(
-            "unsafe registration baseline: an active lease still claims the Console port"
-        )
-
     if not relevant_assignments and not target_servers:
+        if active_claim_present:
+            raise ConsoleRegistrationError(
+                "unsafe registration baseline: an active lease still claims the Console port"
+            )
         return "pending-clean-absence", {"reason": "registration graph is cleanly absent"}
 
     if len(relevant_assignments) != 1:
@@ -417,8 +844,13 @@ def classify_registration_snapshot(
             "unsafe registration baseline: assignment status is "
             f"{assignment.get('server_status')!r}, expected {expected_assignment_status!r}"
         )
+    if not target_servers and active_claim_present:
+        raise ConsoleRegistrationError(
+            "unsafe registration baseline: an active lease still claims the Console port"
+        )
 
     server: dict[str, Any] | None = None
+    active_registration_lease_id: str | None = None
     if target_servers:
         if len(target_servers) != 1:
             raise ConsoleRegistrationError(
@@ -457,8 +889,13 @@ def classify_registration_snapshot(
                 raise ConsoleRegistrationError(
                     "unsafe registration baseline: raw port listener is not the systemd MainPID"
                 )
-        relocated = server.get("pid") is None and server.get("lease_id") is None
+        process_free = server.get("pid") is None
+        relocated = process_free and server.get("lease_id") is None and server.get("metadata_source") == "port_relocate"
         if relocated:
+            if active_claim_present:
+                raise ConsoleRegistrationError(
+                    "unsafe registration baseline: an active lease still claims the Console port"
+                )
             if (
                 "pid" not in server
                 or "lease_id" not in server
@@ -474,7 +911,26 @@ def classify_registration_snapshot(
                 raise ConsoleRegistrationError(
                     "unsafe registration baseline: null PID/lease row is not exact relocation evidence"
                 )
+        elif process_free:
+            active_registration_lease_id = _require_broker_stopped_baseline(
+                raw_inventory,
+                server=server,
+                assignment=assignment,
+                project=project,
+                name=name,
+                port=port,
+                main_pid=main_pid,
+                main_uid=main_uid,
+                main_account_id=main_account_id,
+                main_start_ticks=main_start_ticks,
+                main_cwd=main_cwd,
+                observed_at_epoch=observed_at_epoch,
+            )
         else:
+            if active_claim_present:
+                raise ConsoleRegistrationError(
+                    "unsafe registration baseline: an active lease still claims the Console port"
+                )
             health = server.get("health")
             if (
                 not isinstance(health, dict)
@@ -498,7 +954,11 @@ def classify_registration_snapshot(
         server_id = None
 
     referenced: list[dict[str, Any]] = []
-    if server is not None and server.get("lease_id") is not None:
+    if (
+        server is not None
+        and server.get("lease_id") is not None
+        and active_registration_lease_id is None
+    ):
         referenced = [row for row in leases if row.get("id") == server.get("lease_id")]
         if len(referenced) > 1:
             raise ConsoleRegistrationError(
@@ -526,12 +986,20 @@ def classify_registration_snapshot(
                         f"unsafe registration baseline: referenced lease {key} is {lease.get(key)!r}, expected {expected!r}"
                     )
 
-    return "pending-stopped-baseline", {
+    report = {
         "reason": "exact relocated or stale stopped registration baseline",
         "server_id": server_id,
         "inactive_lease_count": len(referenced),
         "active_stale_lease_count": 0,
     }
+    if active_registration_lease_id is not None:
+        report.update(
+            {
+                "reason": "exact in-flight broker registration reservation",
+                "active_registration_lease_id": active_registration_lease_id,
+            }
+        )
+    return "pending-stopped-baseline", report
 
 
 def systemd_unit_probe(unit: str, *, systemctl: str, timeout: float) -> dict[str, Any]:
@@ -580,22 +1048,73 @@ def _process_cgroups(path: Path) -> set[str]:
     return result
 
 
-def process_identity_probe(pid: int, *, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+def _process_uid(path: Path) -> int:
     try:
-        start_ticks, argv = read_stable_process_identity(proc_root / str(pid))
+        uid_rows = [
+            line.split()[1:]
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.startswith("Uid:")
+        ]
+    except OSError as error:
+        raise ConsoleRegistrationError(
+            f"cannot observe Console process UID: {error}"
+        ) from error
+    if (
+        len(uid_rows) != 1
+        or len(uid_rows[0]) != 4
+        or any(not value.isdigit() for value in uid_rows[0])
+    ):
+        raise ConsoleRegistrationError("Console process UID evidence is malformed")
+    values = {int(value) for value in uid_rows[0]}
+    if len(values) != 1:
+        raise ConsoleRegistrationError(
+            "Console process real/effective/saved/filesystem UIDs differ"
+        )
+    return values.pop()
+
+
+def process_identity_probe(pid: int, *, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    process = proc_root / str(pid)
+    try:
+        start_ticks, argv = read_stable_process_identity(process)
     except (OSError, ProcIdentityError) as error:
         raise ConsoleRegistrationError(f"cannot observe Console process identity: {error}") from error
     if not argv:
         raise ConsoleRegistrationError("Console process argv is empty")
     try:
-        cwd = os.readlink(proc_root / str(pid) / "cwd")
+        cwd = os.readlink(process / "cwd")
     except OSError as error:
         raise ConsoleRegistrationError(f"cannot observe Console process cwd: {error}") from error
+    uid = _process_uid(process / "status")
+    try:
+        proc_owner_uid = int(os.stat(process, follow_symlinks=False).st_uid)
+    except OSError as error:
+        raise ConsoleRegistrationError(
+            f"cannot observe Console process directory owner: {error}"
+        ) from error
+    if proc_owner_uid != uid:
+        raise ConsoleRegistrationError(
+            "Console process directory owner differs from its stable UID evidence"
+        )
+    cgroups = _process_cgroups(process / "cgroup")
+    try:
+        final_start_ticks = parse_start_ticks(
+            (process / "stat").read_text(encoding="utf-8")
+        )
+    except (OSError, ProcIdentityError) as error:
+        raise ConsoleRegistrationError(
+            f"cannot revalidate Console process identity: {error}"
+        ) from error
+    if final_start_ticks != start_ticks:
+        raise ConsoleRegistrationError(
+            "Console process identity changed while reading UID/cwd/cgroup evidence"
+        )
     return {
         "start_ticks": start_ticks,
+        "uid": uid,
         "argv": argv,
         "cwd": cwd,
-        "cgroups": _process_cgroups(proc_root / str(pid) / "cgroup"),
+        "cgroups": cgroups,
     }
 
 
@@ -667,7 +1186,11 @@ def inventory_probe(
     docker = projected.get("docker")
     if docker != {"available": None, "containers": [], "postgres": []}:
         raise ConsoleRegistrationError("inventory endpoint did not prove the no-Docker contract")
-    return projected
+    # Keep the authoritative schema-v2 envelope intact. The classifier needs
+    # both its normalized rows and its explicit v1 compatibility projection;
+    # returning only the projected aliases while retaining schema_version=2
+    # makes compatibility assignments masquerade as normalized assignments.
+    return value
 
 
 def _require_unit(state: dict[str, Any], *, main_pid: int, cgroup: str | None = None) -> str:
@@ -695,6 +1218,11 @@ def _require_process(
     expected_argv: list[str],
     expected_working_directory: str,
 ) -> None:
+    uid = _integer(identity.get("uid"))
+    if uid is None or uid < 0:
+        raise ConsoleRegistrationError("Console MainPID UID is invalid")
+    if identity.get("uid") != baseline.get("uid"):
+        raise ConsoleRegistrationError("Console process UID changed during readiness")
     if identity.get("start_ticks") != baseline.get("start_ticks"):
         raise ConsoleRegistrationError("Console process start identity changed during readiness")
     if identity.get("argv") != baseline.get("argv"):
@@ -705,6 +1233,33 @@ def _require_process(
         raise ConsoleRegistrationError("Console MainPID cwd does not match the production contract")
     if cgroup not in identity.get("cgroups", set()):
         raise ConsoleRegistrationError("Console MainPID is outside its systemd cgroup")
+
+
+def _require_account(
+    probe: Callable[[int], str],
+    *,
+    uid: int,
+    baseline: str | None = None,
+) -> str:
+    try:
+        observed = probe(uid)
+    except ConsoleRegistrationError:
+        raise
+    except BaseException as error:
+        raise ConsoleRegistrationError(
+            f"cannot resolve Console MainPID broker account: {type(error).__name__}"
+        ) from error
+    if (
+        not isinstance(observed, str)
+        or not observed
+        or any(character not in BROKER_IDENTIFIER_CHARS for character in observed)
+    ):
+        raise ConsoleRegistrationError("Console MainPID broker account is invalid")
+    if baseline is not None and observed != baseline:
+        raise ConsoleRegistrationError(
+            "Console MainPID broker account mapping changed during readiness"
+        )
+    return observed
 
 
 def wait_for_console_registration(
@@ -726,7 +1281,9 @@ def wait_for_console_registration(
     unit_probe_fn: Callable[[], dict[str, Any]] | None = None,
     process_probe_fn: Callable[[], dict[str, Any]] | None = None,
     inventory_probe_fn: Callable[[float], dict[str, Any]] | None = None,
+    account_probe_fn: Callable[[int], str] | None = None,
     clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     if main_pid <= 1:
@@ -753,6 +1310,7 @@ def wait_for_console_registration(
             server_port=port,
         )
     )
+    account_probe_fn = account_probe_fn or console_account_identity
     first_unit = unit_probe_fn()
     cgroup = _require_unit(first_unit, main_pid=main_pid)
     baseline = process_probe_fn()
@@ -763,6 +1321,10 @@ def wait_for_console_registration(
         expected_argv=expected_argv,
         expected_working_directory=expected_working_directory,
     )
+    main_uid = _integer(baseline.get("uid"))
+    if main_uid is None or main_uid < 0:
+        raise ConsoleRegistrationError("Console MainPID UID is invalid")
+    main_account_id = _require_account(account_probe_fn, uid=main_uid)
     last_pending = "none"
     attempts = 0
     while True:
@@ -780,6 +1342,11 @@ def wait_for_console_registration(
             expected_argv=expected_argv,
             expected_working_directory=expected_working_directory,
         )
+        _require_account(
+            account_probe_fn,
+            uid=main_uid,
+            baseline=main_account_id,
+        )
         try:
             snapshot = inventory_probe_fn(remaining)
         except InventoryTransportPending:
@@ -790,6 +1357,11 @@ def wait_for_console_registration(
                 cgroup=cgroup,
                 expected_argv=expected_argv,
                 expected_working_directory=expected_working_directory,
+            )
+            _require_account(
+                account_probe_fn,
+                uid=main_uid,
+                baseline=main_account_id,
             )
             last_pending = "pending-api-transport"
             remaining = deadline - clock()
@@ -804,6 +1376,11 @@ def wait_for_console_registration(
             expected_argv=expected_argv,
             expected_working_directory=expected_working_directory,
         )
+        _require_account(
+            account_probe_fn,
+            uid=main_uid,
+            baseline=main_account_id,
+        )
         if clock() >= deadline:
             raise ConsoleRegistrationTimeout(
                 "Console registration observation crossed the readiness deadline"
@@ -814,6 +1391,11 @@ def wait_for_console_registration(
             name=name,
             port=port,
             main_pid=main_pid,
+            main_uid=main_uid,
+            main_account_id=main_account_id,
+            main_start_ticks=str(baseline["start_ticks"]),
+            main_cwd=str(baseline["cwd"]),
+            observed_at_epoch=wall_clock(),
         )
         if state == "ready":
             return {**report, "attempts": attempts, "unit": unit}

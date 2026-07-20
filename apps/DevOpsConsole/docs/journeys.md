@@ -8,10 +8,13 @@ and review; no external audit-skill checkout is required.
 
 - Product promise: **One private page where the VPS owner sees every dev
   server, container, port lease and public subdomain on `vr.ae`, can expose,
-  restart, inspect or retract them, and can grant exact domains to invited
-  Google accounts.**
+  restart, inspect or retract them, can grant exact domains through reviewed
+  Google invite requests, and can route project events to approved Telegram
+  subscribers.**
 - Primary users: configured owners; invited Google users may be domain-only
-  viewers or Console operators. Only configured owners administer access.
+  viewers or Console operators. Only configured owners administer Google
+  access. Every Console-authorized account may own Telegram bots; configured
+  owners may administer all bots.
 - Primary value: replaces SSH + `dev_coordinator.py` CLI + editing proxy
   config with a phone-friendly control panel; makes "share this dev build at
   a URL" a 15-second task instead of a config change.
@@ -33,10 +36,15 @@ and review; no external audit-skill checkout is required.
 | VPS operator (phone) | Same person, reduced attention | Few times/week | Mobile, one-handed, flaky network | Medium–high (usually reacting to "the link you sent me is down") | Same as above, plus mistaps — destructive actions need confirmation |
 | Invited domain viewer (client/teammate) | Non-technical | Rare | Opens one granted `<slug>.vr.ae` link | Low | Low — an absent grant must deny without exposing other domains |
 | Invited Console operator | Technical | Occasional | Uses the Console to operate servers | Medium | High — Console access is full operational control, but never access administration |
+| Verified requester | Non-technical or technical | Rare | Reaches a protected Console/route without its grant | Low | High if the wrong host/email is requested or granted |
+| Telegram subscriber | Technical or stakeholder | Event-driven | Private chat with an assigned bot | Medium–high | Medium — missed crash/failure notices delay response; unauthorized fan-out leaks operational metadata |
 
 Domain-only viewers never use the Console page. They sign in through the same
-Google flow and can open only assigned private hosts. A Console grant is a
-separate, explicit high-privilege destination.
+Google flow and can open only assigned private hosts. A verified identity is
+not a grant: denied accounts may request only the exact current host, then wait
+for a configured owner. A Console grant is a separate, explicit high-privilege
+destination. Telegram subscriber authorization is another independent queue;
+it never implies Google, domain, or Console access.
 
 ## Journey Inventory
 
@@ -53,6 +61,9 @@ Prioritized: top rows are the most frequent and most important.
 | J7 Watch performance: who is eating CPU/RAM? | Operator | Weekly | 7 | Low–medium | CPU/mem cells on rows; Performance page | Hog identified with numbers + history; act via restart/stop |
 | J8 Run a whole project; keep the console tidy | Operator | Daily | 2 | Medium | Projects page (default) | A repo's full stack up/down in one action; idle noise hidden but self-revealing |
 | J9 Grant a Google user exact domains | Owner | Monthly+ | 2 | High | Access page | User can open only selected domains; revocation is immediate |
+| J10 Archive, restore, or permanently remove a host resource | Owner | Monthly | 2 | High | Active/Archived filter on Projects, Servers, or Docker | Exact resource is durably fenced, restored without starting, or removed only from a reviewed archived plan |
+| J11 Request and decide exact Google access | Requester / owner | Monthly+ | 2 | High | Protected-host denial / Incoming invites | One exact host-derived request is approved or denied; replacement routes cannot inherit it |
+| J12 Register a Telegram bot and authorize project notifications | Console operator / bot owner | Monthly setup, continuous delivery | 3 | High | Telegram page / private bot chat | Exact projects and approved chats receive durable server/Docker lifecycle, failure, and crash events |
 
 ## Journey Detail
 
@@ -70,7 +81,9 @@ Prioritized: top rows are the most frequent and most important.
   `#/servers`, `#/routes`, `#/docker`, `#/ports`, `#/performance`) behind
   one sticky single-row header (brand + section nav with live counts +
   needs-attention badge + account; nav collapses into a hamburger drawer on
-  narrow screens while the header stays one row); the badge popover →
+  narrow screens while the header stays one row). Console-authorized accounts
+  also see `#/telegram`; configured owners additionally see `#/access` and
+  `#/invites`; the badge popover →
   whichever page a problem implicates.
 - Primary decisions: *act now, drill in, or close the tab*; if acting —
   *which section and which row*.
@@ -197,7 +210,8 @@ Prioritized: top rows are the most frequent and most important.
 - Entry point: the failing route's status dot, or the Servers section badge.
 - Route/screen sequence: route dot popover (names the reason: `server
   stopped` / `server not found` / nothing on fixed port) → Servers section →
-  expand the server row (whole row is the click target) → read log tail →
+  expand the relevant project header → expand the server row (whole row is
+  the click target) → read log tail →
   Restart (or Stop) → watch badge return to `running` on the next poll →
   re-check the route dot.
 - Primary decisions: *is it the server, the route target, or the machine?*;
@@ -212,16 +226,18 @@ Prioritized: top rows are the most frequent and most important.
   `missing_command` (registered without a command — Restart is disabled with
   the reason in its tooltip); action 400s from the coordinator (verbatim in
   banner, retryable).
-- Primary actions: expand row; refresh logs; Restart.
+- Primary actions: expand the project group and row; refresh logs; Restart.
 - Secondary/rare actions: Stop (leaving it down deliberately); deleting the
   route instead; consulting the docker section when the failure is a
   dependency (database container down).
 - Conditional or rare details: full `cwd`, `log_path`, health-check detail —
   in the expanded panel / badge popover only.
-- Interaction targets and feedback: whole row toggles expansion
-  (`cursor: pointer`), chevron mirrors state (`aria-expanded`); buttons show
-  busy text ("Working…") and disable during the action; logs auto-fetch on
-  first expand and keep scroll position across the 6s refresh.
+- Interaction targets and feedback: every project header is a full-width
+  disclosure button with `aria-expanded`/`aria-controls`; only one project is
+  open at a time. Whole server row toggles detail expansion (`cursor:
+  pointer`), its chevron mirrors state (`aria-expanded`); buttons show busy
+  text ("Working…") and disable during the action; logs auto-fetch on first
+  expand and keep scroll position across the 6s refresh.
 - Message metadata relevance: leading timestamps in log lines are dimmed
   secondary metadata; the log *message* is the content. "fetched HH:MM:SS"
   next to the Refresh button is passive (unselectable).
@@ -443,11 +459,12 @@ Prioritized: top rows are the most frequent and most important.
   the lists have accumulated stopped one-offs.
 - Preconditions: session; coordinator reachable (page degrades otherwise).
 - Entry point: `#/projects` (default page).
-- Route/screen sequence: tree of repos, each node: header (name, n of m
-  running, project CPU/mem numbers + sparkline, Start/Restart/Stop for the
-  whole project, collapse) → children (kind-tagged server / database /
-  container rows with status, CPU/mem + sparkline, per-item
-  Start/Stop/Restart, hide).
+- Route/screen sequence: compact tree of repo headers, collapsed by default;
+  each header shows name, n of m running, project CPU/mem numbers +
+  sparkline, and Start/Restart/Stop for the whole project. Expanding one repo
+  discloses its losslessly paged, kind-tagged server / database / container
+  members with status, CPU/mem + sparkline, per-item Start/Stop/Restart and
+  hide controls.
 - Primary decisions: act on one item or the whole repo; hide an idle item or
   project; drill into Servers/Docker pages for logs and details.
 - Required information per step: grouping must be the coordinator's own
@@ -458,8 +475,8 @@ Prioritized: top rows are the most frequent and most important.
   runtime declaration, compose policy) surface verbatim.
 - Primary actions: whole-project start/restart/stop (stop/restart confirmed —
   the confirm names the blast radius); per-item start/stop/restart; hide.
-- Secondary/rare actions: collapse a project node; reveal hidden items;
-  unhide manually.
+- Secondary/rare actions: expand or collapse one project node; page through
+  large member collections; reveal hidden items; unhide manually.
 - Hiding contract (also on Servers/Docker pages): only non-running items and
   idle projects can be hidden; hidden state persists server-side across
   devices; **anything the coordinator reports as running is auto-unhidden on
@@ -471,12 +488,17 @@ Prioritized: top rows are the most frequent and most important.
 - Failure/recovery: hide/unhide failures show the banner with Retry; prefs
   unreachable at boot degrades to session-only hiding.
 - Device/context constraints: tree indents collapse on phones; project
-  actions wrap under the header; no horizontal scroll at 390px.
+  actions wrap under the header; no horizontal scroll at 390px. Only the
+  active hash page keeps a dynamic body mounted; Servers, Docker and an
+  expanded project's members render at most 75 resource rows at once so
+  ordinary page work remains bounded even with retained host-wide history.
 - Accessibility expectations: hide/unhide buttons carry explicit labels
   ("Hide X until it runs again"); collapse chevrons are buttons with
   aria-expanded; kind tags are text, not color-only.
 - Acceptance criteria: a repo with a declared runtime starts fully from the
-  project Start button and every member shows running with live CPU/mem; a
+  project Start button and, after expansion, every member is reachable and
+  shows running with live CPU/mem; pagination never loses or duplicates a
+  member; a
   hidden stopped server reappears automatically after `server start` from any
   agent; hiding is reflected on both the Projects and Servers pages; the
   reveal toggle shows hidden rows dimmed with working unhide buttons.
@@ -502,10 +524,11 @@ Prioritized: top rows are the most frequent and most important.
   public routes are marked Public and explain that a saved grant matters only
   if the route becomes private; Console says it grants full server/route
   control, not access administration.
-- Warning/flag conditions: removing a user confirms that existing sessions are
-  revoked immediately; removing a single grant does not require a destructive
-  confirm but announces the exact host; attempts to edit owners or unknown
-  resources surface the server error.
+- Warning/flag conditions: removing a user confirms that the account becomes
+  unauthorized immediately even though its verified Google identity cookie
+  remains valid; removing a single grant does not require a destructive confirm
+  but announces the exact host; attempts to edit owners or unknown resources
+  surface the server error.
 - Empty/loading/error states: owners remain visible even with zero invitees;
   the list then says “No invited users yet.” Loading uses list skeletons;
   load/save failures stay honest in the banner and never claim a disk write.
@@ -526,11 +549,176 @@ Prioritized: top rows are the most frequent and most important.
   - Granting Console access makes the existing session work immediately but
     `/api/access` remains owner-only.
   - Removing a domain grant denies the next request without re-login; removing
-    the user makes the existing cookie unauthenticated on the next request.
+    the user retains the verified Google identity but denies the next request
+    with the 403 invite flow.
   - Deleting and later reusing a slug never revives its old grants; renaming a
     server/container subdomain moves its grants to the new hostname.
   - Populated, empty, long-list, add, cancel, save, remove, desktop, and phone
     states keep the collection first and every control visible/reachable.
+
+### J10 — Archive, restore, or permanently remove a host resource
+
+- User: configured owner. Invited Console operators can operate active
+  resources but cannot view archive history or run durable lifecycle actions.
+- Goal: keep server-wide coordinator state clean without losing data by
+  accident, and later restore or deliberately purge an exact project, server,
+  container, or advertised worktree.
+- Entry point: owner-only Active/Archived filters on Projects, Servers, and
+  Docker. Active is the default. Cosmetic Hide remains a distinct preference.
+- Archive sequence: Active collection → Archive on the exact row → focused
+  dialog with human name/type and optional reason → server-authored plan shows
+  Effects, Retained data/history, Deleted items, and Blockers → Archive → UI
+  switches to Archived, expands the containing group, and focuses the row.
+- Restore sequence: Archived row with `restorable:true` → Restore dialog →
+  reason → Restore. Success switches to Active and reveals/focuses the row;
+  messaging states that restoring clears the fence but does not start it.
+- Permanent-remove sequence: Archived row with `removable:true` → Remove
+  permanently → fresh server plan → type the exact server-issued phrase →
+  apply. There is no generic browser confirm and no active-row purge path.
+- Required information: display name, resource type, archive time/reason/
+  actor/status, effects and retained evidence. Opaque coordinator IDs stay in
+  hidden exact request payloads, never ordinary interface content. `project`
+  is canonical; `repository` is accepted only at the compatibility boundary.
+- Conditional behavior: worktree cleanup appears only as a
+  `removable:true` child of its project tombstone, after the separately
+  confirmed project-catalog purge has removed the parent's Restore promise;
+  the physical worktree is never removed first. Buttons appear only for
+  capabilities the archived row advertises. Blockers disable apply and
+  partial/needs-attention results remain visible failures even when the
+  coordinator answered HTTP 200.
+- Empty/loading/error states: counts are omitted until the owner-only archive
+  list loads; Archived shows skeletons while unknown and an honest empty state
+  only after a successful empty response. Every failure stays in the dialog or
+  retry banner and never claims completion.
+- Device/accessibility constraints: the single labelled modal owns focus,
+  stays within the current viewport, and renders 44px mobile actions without
+  horizontal overflow. Groups are collapsed by default, only one expands, and
+  at most 75 rows are mounted at once.
+- Acceptance criteria:
+  - Non-owners cannot read archives, see filters/buttons, or cause any
+    coordinator lifecycle read/mutation.
+  - Archiving a running resource first shows the exact stop/fence/retention
+    plan, then places it in the matching canonical Archived collection.
+  - Restore never says or implies the resource started; its active row is
+    revealed after the refreshed inventory contains it.
+  - Purge cannot be invoked on Active, on an unadvertised row, with a stale
+    plan fingerprint, or until the exact phrase matches.
+  - Refreshing the page preserves archived truth from the coordinator rather
+    than local browser state.
+
+### J11 — Request and decide exact Google access
+
+- Users: a Google-verified requester on the denied host, followed by a
+  configured owner on desktop or phone.
+- Goal: let someone ask for the destination they actually reached without
+  weakening default-deny or letting the browser forge an email/resource; let
+  an owner approve or deny with enough exact context.
+- Preconditions: Google OIDC verified the requester's email/subject; the
+  protected Console or route exists; requester lacks that exact current grant.
+- Request sequence: protected host → Google sign-in → 403 denial naming the
+  account/resource → **Request invite** → same-origin POST carrying a
+  short-lived signed host/resource-instance claim → submitted/already-pending
+  result. The identity cookie remains authorization-neutral while the request
+  waits.
+- Owner sequence: owner-only `#/invites` → pending collection first → inspect
+  email, exact host, title, target, request time, and Console-control warning
+  when applicable → Approve or Deny → row moves to Recent decisions and the
+  pending nav count changes. Approval makes the exact current grant usable on
+  the next HTTP/WebSocket request without another login.
+- Primary decisions: is this verified account expected; does it need this
+  exact private route or the high-privilege Console destination?
+- Trust boundaries: email and Google subject come from verified OIDC; resource,
+  host, target, and immutable route instance come from the server. Form input
+  cannot choose them. One pending request for the same identity/resource
+  instance is idempotent; rate limits, denial cooldown, and bounded queues are
+  honest failure states.
+- Warning/flag conditions: Console approval explicitly states that it grants
+  full server/Docker/route/port control but not access administration. A route
+  removed, renamed, or replaced while waiting becomes `stale` and cannot be
+  approved for a later route that reuses its slug.
+- Empty/loading/error states: Incoming invites first shows skeletons, then
+  “No access requests are waiting” plus explanatory empty text or real rows.
+  Save/rate/conflict failures remain visible and preserve the pending row;
+  unknown slugs never reveal or offer a request action.
+- Accessibility/device constraints: denial form and result page work without
+  JavaScript; queue actions are labelled buttons with status text, busy state,
+  live announcement, and single-column phone layout with no horizontal scroll.
+- Recovery/undo: denial can be requested again only after its cooldown;
+  approval is revoked through the ordinary Access grant/user controls. A stale
+  request requires opening and requesting the new exact route instance.
+- Acceptance criteria:
+  - A verified unknown account receives an identity cookie but remains denied
+    from Console/API/proxy/WebSocket until an exact grant exists.
+  - A forged email/resource/host, expired/tampered claim, cross-origin POST,
+    duplicate pending request, and unknown route cannot create a different
+    request or grant.
+  - Non-owners cannot list or decide the queue. An owner approval atomically
+    creates/merges only the requested grant; denial creates none.
+  - Pending, empty, resolved, stale, error, desktop, and 390px states keep the
+    real incoming collection first and actions reachable.
+
+### J12 — Register a Telegram bot and authorize project notifications
+
+- Users: any account with a current Console grant as bot owner; configured
+  owners as server-wide bot administrators; a Telegram user in a private chat.
+- Goal: receive continuous server/Docker lifecycle, failure, crash, and
+  recovery events for selected exact projects without sharing a bot token or
+  granting Telegram users Console access.
+- Console sequence: `#/telegram` → owned bot collection first → **Register
+  bot** opens an in-viewport dialog → optional label + BotFather token →
+  registration validates bot identity. If Telegram reports a webhook, the
+  dialog exposes an explicit **Replace the bot's existing webhook** checkbox;
+  resubmission takes it over while preserving pending updates. The new bot card
+  appears without ever redisplaying the token.
+- Assignment sequence: on the bot card, select projects from fresh coordinator
+  inventory. Each checkbox persists the exact immutable `repo_id`; display
+  name/path merely explain it. An assignment that no longer matches current
+  inventory is flagged and receives no new events.
+- Subscriber sequence: Telegram user opens that bot in a private chat and sends
+  `/start` → bot-specific authorization row appears → bot owner or configured
+  owner Approves or Denies. Approval starts after the durable current event
+  cursor, so a new subscriber does not receive old backlog; denial grants
+  nothing. Google/Console access is unaffected.
+- Continuous delivery: the Console long-polls each enabled bot with a durable
+  update offset, periodically triggers explicit coordinator host observation,
+  and pages the durable journal with an opaque cursor. For each assigned
+  `repo_id`, approved recipient deliveries enter the durable outbox before the
+  cursor advances; `sendMessage` retries transient/rate-limited failures across
+  restart. Thus Console, CLI, Codex, Claude, and other-agent lifecycle actions,
+  plus observed crashes/failures, share the same notification source.
+- Ownership and security: a caller sees/mutates only bots it registered;
+  configured owners may administer all. Token state is server-only mode `0600`
+  and API/log/error views stay redacted. Only private `/start` messages enter
+  the queue; Telegram IDs are stored as integer-safe decimal strings.
+- Primary decisions: which bot, which exact projects, and which private-chat
+  users should receive operational metadata; whether replacing an existing
+  webhook is intentional.
+- Warning/destructive conditions: webhook takeover is never implicit. Removing
+  a bot confirms that its token, assignments, authorization queue, and pending
+  notifications will be deleted. Poll/delivery errors remain visible on its
+  card; permanent Telegram rejection disables the affected bot or subscriber
+  rather than pretending delivery succeeded.
+- Empty/loading/error states: the real bot collection or honest loading/error
+  state leads the page. Empty state repeats Register bot. A bot with no project
+  or no waiting user says so and explains `/start`; project-inventory failure
+  never invents assignments.
+- Accessibility/device constraints: registration dialog traps/returns focus,
+  token uses a password input, project controls name the project and action,
+  queue decisions and destructive remove are distinct, and cards stack at
+  390px without clipping or horizontal document scroll.
+- Acceptance criteria:
+  - Non-admin Console users cannot see or mutate another user's bot, queue, or
+    projects; configured owners can administer all through the same controls.
+  - Token validation, active-webhook refusal/explicit takeover, private
+    `/start`, duplicate updates, approval/denial, exact project fan-out,
+    restart-safe offsets, retry-after, permanent rejection, and outbox replay
+    are verified with a deterministic fake Telegram API.
+  - Starting/stopping/restarting a server or Docker resource from any enrolled
+    actor emits one matching project notification; unchanged or unobservable
+    host observations invent no crash/stop event.
+  - Empty, populated, long project list, webhook conflict, polling error,
+    pending/recent authorization, remove confirm, desktop, and 390px states are
+    usable and never reveal a token.
 
 ## Journey Decision Model
 
@@ -544,6 +732,9 @@ Prioritized: top rows are the most frequent and most important.
 | Port leases page | Keep the port pool clean | Lease, release, or leave a lease | Port, purpose, project, countdown; lease-form validity | Countdown amber <15m; expired; "no free port" errors verbatim | Lease a port; release (confirmed) | Pick preferred port/TTL/project | Lease attribution is the console user |
 | Pinned ports card | Know each server's permanent port | Keep or unassign a pin | Port, server name, project, live server status ("not registered" = record pruned, pin still holds) | Unassign confirm explains the port may change on next start | Read; unassign (confirmed) | Cross-check on Servers page (dotted pin marker on the port) | Pins are coordinator-wide policy, not console state |
 | Access page | Grant exact private destinations | Which user gets which host | Google email; real host + target; owner/public state; Console privilege consequence | User removal revokes live sessions; owners immutable | Add user; toggle a host grant | Remove user | Ownership transfer remains environment-only |
+| Protected-host denial / Incoming invites | Request and decide exact access | Is this verified account entitled to this exact current destination? | Verified email; server-derived host/title/target; request/status/time | Console-control consequence; stale instance; denial cooldown/rate limit | Request invite; Approve/Deny | Review recent decisions | Only configured owners decide |
+| Telegram page | Deliver project events to approved chats | Which owned bot, exact projects, and private-chat users? | Redacted bot identity/owner/status; current repo names/paths backed by exact `repo_id`; queue/status/error | Existing webhook takeover; vanished assignment; destructive bot removal; delivery error | Register; assign project; approve/deny `/start` | Remove bot; inspect recent decisions | Bot owner isolation; configured-owner override |
+| Projects/Servers/Docker lifecycle views | Clean durable host state safely | Archive, restore, purge, or leave intact | Human target, active/archive state, exact effects/retained/deleted/blockers, capability flags | Blockers; partial/needs-attention result; exact purge phrase mismatch | Archive; inspect archived; restore | Permanent remove; advertised worktree remove | None |
 | Servers/Docker usage cells | Spot a hog in place | Is this row's load normal? | Live CPU % + memory numbers; sparkline shape | Sampling failure note | Click for history charts | — | CPU normalized to observed peak, numbers absolute |
 | Performance page | Find resource hogs with history | Which entity/project to act on | Per-entity CPU/mem charts (current, peak, window); per-project bars | Sampler error note; stale (not running) cards dimmed | Read; navigate to the row to act | Cross-reference project bars | History is in-process, resets with console |
 
@@ -578,6 +769,15 @@ Prioritized: top rows are the most frequent and most important.
 | J9 | Access user collection | Google email + owner state | critical-always | Identifies the authorization subject and recovery boundary | Always | User card heading; locked Owner badge |
 | J9 | Access resource control | Host + target + current grant | critical-always | The exact authorization decision | Every invited user/resource pair | Labelled checkbox; Public badge and consequence text |
 | J9 | Add-user dialog | Email + initial grants | primary-on-invocation | Creates real access state | Only after Add user | Focused viewport modal; collection remains behind it |
+| J11 | Denied host | Verified email + exact destination + Request invite | critical-on-denial | Makes identity-vs-authorization and the one requestable target clear | Existing protected destination without grant | Self-contained denial page; server-bound form |
+| J11 | Incoming invites collection | Email, exact host/title/target, status/time | critical-always-for-owner | The complete authorization decision | Pending first; history on demand | Inline request card; Console warning before actions |
+| J12 | Telegram bot collection | Bot identity, owner, enabled/error state, assignment count | critical-always | Identifies credential owner and whether delivery can operate without exposing token | Every visible owned/admin bot | Bot card heading and text status; `hasToken` stays server/API metadata |
+| J12 | Project assignment | Current name/path backed by exact `repo_id` | critical-on-change | Prevents name/path heuristics from sending another project's events | Every current coordinator project | Labelled checkbox on the exact bot card |
+| J12 | Bot authorization queue | Telegram user identity, private `/start` time and decision status | critical-always-per-bot | Prevents operational event disclosure before explicit approval | Pending first; recent decisions on demand | Inline row with Approve/Deny and text badge |
+| J12 | Register-bot dialog | Optional label, secret token, explicit webhook takeover | critical-on-invocation | Establishes bot identity without leaking or silently disrupting an existing integration | Token entry; takeover only after conflict | Focused password input; conditional labelled checkbox |
+| J10 | Active/Archived filter | Authoritative counts and selected lifecycle state | critical-always-for-owner | Prevents Hide from being mistaken for durable archive | Projects, Servers, Docker | Inline; unknown counts omitted |
+| J10 | Lifecycle plan dialog | Effects, retained, deleted, blockers, reason | critical-on-invocation | Operator must understand the exact host mutation | Archive/purge | Focused modal; server wording preserved |
+| J10 | Purge phrase field | Exact coordinator-issued confirmation phrase | critical-destructive | Prevents generic or stale permanent removal | Removable archived row only | Inline labelled input; apply disabled until exact match |
 | All | Error banner | Server error message verbatim | conditional | Exact failure text is the fix hint | On any failed fetch | Banner, dismissible, with Retry |
 
 ## Interaction And Metadata Model
@@ -608,6 +808,8 @@ Binding affordance rules, made concrete for this app:
 | Port leases | J6 | Screenshots: form + populated table incl. countdown warning; lease→release round trip | empty, degraded, ticking countdown, form error, release confirm | none | Attribution = console user |
 | Performance | J7 | Screenshots: populated chart cards (running + dimmed stale), usage bars; row sparkline popover | collecting (no history yet), populated, sampler-error note, degraded | none | CPU normalized to observed peak |
 | Access | J9 | Browser evidence: owner-only nav, owners + invitees, exact grant toggles, add dialog at 1440×900 and 390×844 | loading, owner-only/zero invitees, populated, long domains, add open, invalid email, save failure | none | Configured ownership is intentionally not transferable in UI |
+| Incoming invites | J11 | Denied-page Request invite round trip plus owner-only queue screenshots at 1440×900 and 390×844; prove exact host/email and post-decision grant | anonymous redirect, verified denial, pending, duplicate, empty, approved/denied/stale history, conflict/rate/save error | none | Request target is wholly server-derived |
+| Telegram | J12 | Owned/admin bot isolation, register dialog, exact project assignment, private `/start` queue decision, and redacted network/UI evidence at 1440×900 and 390×844 | loading, empty, populated, long projects, webhook conflict/takeover, no projects, pending/recent queue, poll/delivery error, remove confirm | none | Real tokens are excluded from browser fixtures; fake Bot API proves the contract |
 | Nav | All | Screenshots: desktop tabs with counts + active state; mobile drawer open/closed | drawer open/closed, active page marked, counts hidden when unknown | none | None |
 | Global | All | Deterministic browser verification at 1440px and 390px per page: no horizontal document scroll, no clipped text, visible scrollbar inventory (expected: document vertical + log boxes + popover when open); the ten labels above each marked pass with evidence | error banner, 401 reload, reduced-motion, focus-visible pass | none | None |
 
@@ -618,20 +820,22 @@ is supported and every relevance tier keeps its documented access path
 
 ## Screen Requirements
 
-Seven hash-routed pages behind one sticky header (summary bar + nav; the
+Nine hash-routed pages behind one sticky header (summary bar + nav; the
 header is identical on every page):
 
 | Screen area | Journey | Critical info | Primary actions | Secondary actions | Rare details | Device/context constraints |
 | --- | --- | --- | --- | --- | --- | --- |
-| Projects page (`#/projects`, default) | J8, J7 | Repo tree: per-node running counts, project + item CPU/mem, kind tags; subdomain chip on web-serving containers | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain. Every row (project header, server, container) renders the SAME three color-coded slots — Start (green) / Restart (blue) / Stop (red), inapplicable ones disabled, never hidden — so buttons align into columns | Collapse nodes; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap |
+| Projects page (`#/projects`, default) | J8, J7 | Collapsed-by-default repo tree: per-node running counts and project CPU/mem; expanding one repo shows losslessly paged members with item CPU/mem, kind tags and subdomain chip on web-serving containers | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain. Every row (project header, server, container) renders the SAME three color-coded slots — Start (green) / Restart (blue) / Stop (red), inapplicable ones disabled, never hidden — so buttons align into columns | Expand/collapse one node; page members; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap; at most 75 members mounted |
 | Sticky header (single row) | J1 | Brand; needs-attention badge (only when something is wrong); account button | Open badge popover (facts, instructions, actions per problem) | Sign out via account popover | Coordinator error text; cert dates; renew command | ONE row on every viewport; domain label hidden <480px; sticky top |
 | Section nav | All | Page names, live counts, active page | Switch page | Hamburger open/close (≤1023px) | — | Tabs inline in the header row ≥1024px; drawer with ≥40px targets below |
-| Servers page (`#/servers`, default) | J2, J3, J7 | Health badge, name, port, subdomain, CPU/mem numbers; docker-hosted web servers as first-class rows (kind tag, container status, published host ports) | Expand; restart; refresh logs; assign/edit subdomain (containers too, with a port picker when several are published); open history charts | Stop; start (stopped containers) | pid/cmd/cwd/health detail; container image/ports detail | Log box height-capped, own scrollbar; sparkline fixed-width |
+| Servers page (`#/servers`, default) | J2, J3, J7 | Every nonempty repo/resource-group header, collapsed by default, with running count and project CPU/mem; opening one shows its losslessly paged health badge, name, port, subdomain and CPU/mem rows; Docker-hosted web servers remain first-class rows | Expand one project then a server; restart; refresh logs; assign/edit subdomain (containers too, with a port picker when several are published); open history charts | Collapse/switch project; Stop; start (stopped containers); page through the open project's servers | pid/cmd/cwd/health detail; container image/ports detail | Full-width accessible project targets; compact two-line headers at 390px; log box height-capped; at most 75 server rows mounted |
 | Routes page (`#/routes`) | J2, J4 | URL, resolved dot, access mode; targets: fixed port, managed server, docker container | Create; copy; toggle access | Delete; title; "view server" link | Timestamps | Form stacks at 390px; table rows become labelled cards |
-| Docker page (`#/docker`) | J5, J7 | Status, name, image, ports, CPU/mem numbers; subdomain chip on web-serving containers | Logs; restart; start; open history charts; assign/edit subdomain | Stop | stats/labels | Same card pattern |
+| Docker page (`#/docker`) | J5, J7 | Losslessly paged status, name, image, ports, CPU/mem numbers; subdomain chip on web-serving containers | Logs; restart; start; open history charts; assign/edit subdomain | Stop; page through all containers | stats/labels | Same card pattern; at most 75 containers mounted |
 | Port leases page (`#/ports`) | J6 | Port, purpose, countdown; lease form; pinned ports (port permanently owned per server, with server status) | Lease; release (confirmed); unassign pin (confirmed) | Preferred port/TTL/project | Lease id, ISO expiry, agent, pin provenance (title) | Form stacks at 390px |
 | Performance page (`#/performance`) | J7 | Machine panel first: whole-box CPU (cores + load), memory used/available, per-disk storage, uptime — with meters, >90% alarm tint and CPU/mem history charts; then per-entity CPU/mem charts; per-project bars | Read; jump to rows to act | — | Sampling cadence note | Tiles and chart grid single-column on phone |
 | Access page (`#/access`, owners only) | J9 | Real owner/invited-user collection first; exact Console/domain grants; real hosts/targets; owner and public state | Add user in focused dialog; change grant immediately | Remove user with live-revocation confirm | Configured-owner recovery note | Cards and grant list single-column on phone; dialog viewport-bounded |
+| Incoming invites page (`#/invites`, owners only) | J11 | Pending verified requests first: email, exact server-derived host/title/target, request time, status; recent resolved/stale history disclosed below | Approve or Deny exact request; Refresh | Review recent decisions | Resolver identity and immutable instance remain private | Queue cards stack; actions remain distinct and reachable on phone |
+| Telegram page (`#/telegram`, every Console-authorized account) | J12 | Caller-owned bots first (all bots for configured owners); bot identity/owner/status/error, exact project choices, pending `/start` queue; token never shown | Register bot in focused dialog; assign projects; Approve/Deny Telegram user | Remove bot with destructive confirm; review recent decisions | Exact `repo_id` stays transport identity while current name/path explain it | Bot cards and project/queue controls single-column at 390px; dialog viewport-bounded |
 
 ## QA And Acceptance
 
@@ -649,7 +853,10 @@ header is identical on every page):
   preferred port → row appears → release → row gone, countdown ticks; J7
   history grows and identifies a running process; J8 whole-project start/stop
   plus hide/auto-reveal; J9 add user → grant one domain → verify exact access
-  → grant Console without admin rights → revoke grant/user immediately.
+  → grant Console without admin rights → revoke grant/user immediately; J11
+  verified denial → Request invite → owner approval/denial → exact next-request
+  result; J12 register bot → assign exact project → private `/start` → approve
+  → lifecycle event delivered from the durable journal/outbox.
   A running server shows live CPU/mem numbers, sparkline, and popover charts;
   page switching works via tabs and the mobile hamburger drawer.
 - Edge cases: reserved/duplicate/invalid slugs; server without command
@@ -660,20 +867,32 @@ header is identical on every page):
   restart; coordinator error strings with quotes
   (`"'matching server not found'"`) shown verbatim; invited user with no
   grants; public route with a saved dormant grant; deleted/reused slug;
-  deep link to Access as a non-owner (falls back to Projects).
+  deep link to Access/Incoming invites as a non-owner (falls back to Projects);
+  forged/expired invite claim, duplicate request, denied cooldown, stale route
+  instance; Telegram webhook conflict without/with explicit takeover, another
+  user's bot ID, group-chat `/start`, duplicate update, vanished `repo_id`,
+  restarted poller/outbox, Telegram `retry_after` and permanent rejection.
 - Failure/recovery scenarios: coordinator killed mid-session (degraded panels
-  + needs-attention badge, Routes and Access still usable); overview fetch failing (banner
+  + needs-attention badge, Routes, Access, and Incoming invites still usable);
+  overview/project fetch failing (banner
   + stale note, Retry works); mutation 400/409/502 (verbatim banner, state
-  reverts on refetch); 401 (silent reload into login).
+  reverts on refetch); Telegram polling/delivery failures remain on the bot
+  card and retry durably; 401 (silent reload into login).
 - Mobile scenarios: 390px — no horizontal document scroll, rows read as
   labelled cards, touch targets ≥34px on coarse pointers, copy buttons
-  always visible, confirms still native dialogs.
+  always visible, denied invite action and queue decisions remain reachable,
+  bot project lists stack, and confirms/dialogs remain viewport-bounded.
 - Accessibility checks: keyboard-only pass over every control (chevrons,
-  switches, popovers, log regions); focus-visible outlines; popover Escape +
-  focus return; icons labelled; status never color-only;
+  switches, popovers, log regions, invite decisions, bot registration,
+  project checkboxes, Telegram decisions); focus-visible outlines; popover or
+  dialog Escape + focus return; icons labelled; status never color-only;
   `prefers-reduced-motion` disables shimmer/transitions.
 - Test data or fixture mode: run the real stack per `docs/architecture.md`
   test fixtures — real coordinator on an ephemeral home
   (`CODEX_AGENT_COORDINATOR_HOME=<tmp>`), fixture upstream/WS servers, dev
   certs from `certs/dev/`, `DEV_HTTP=1` for browser-driver runs. No mocked
-  API layer: the UI must be exercised against the actual `/api/*` surface.
+  Console API layer: the UI must be exercised against the actual `/api/*`
+  surface. Telegram transport is the deliberate exception at the external
+  boundary: inject the deterministic fake Bot API while retaining the real
+  Telegram service, mode-`0600` state, Console API, UI, coordinator event
+  journal, cursor, and outbox.

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import sqlite3
 from typing import Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 MINIMUM_MIGRATABLE_SCHEMA_VERSION = 1
+
+
+_SHA256_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 DDL = r"""
@@ -475,6 +479,87 @@ CREATE TABLE IF NOT EXISTS resource_retirements (
     updated_at TEXT NOT NULL
 );
 
+-- Schema v3 separates reversible archive state from permanent cleanup
+-- evidence.  Existing resource_retirements rows are the active archive fence
+-- for backwards compatibility; these tables retain every archive/restore and
+-- purge decision without making old rows writable history.
+CREATE TABLE IF NOT EXISTS resource_lifecycle_history (
+    history_id TEXT PRIMARY KEY,
+    repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL CHECK(resource_kind IN ('server', 'container', 'supervisor')),
+    resource_id TEXT NOT NULL,
+    immutable_fingerprint TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('archived', 'restored', 'purged')),
+    operation_id TEXT REFERENCES operations(operation_id) ON DELETE SET NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS resource_lifecycle_history_by_resource
+ON resource_lifecycle_history(resource_kind, resource_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS cleanup_plans (
+    plan_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
+    repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('project', 'server', 'container', 'worktree')),
+    target_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('purge', 'forget')),
+    target_fingerprint TEXT NOT NULL,
+    plan_fingerprint TEXT NOT NULL,
+    confirmation_phrase TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('planned', 'running', 'needs_attention', 'succeeded')),
+    phase TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(target_kind, target_id, plan_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS cleanup_phase_evidence (
+    plan_id TEXT NOT NULL REFERENCES cleanup_plans(plan_id) ON DELETE CASCADE,
+    phase TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'failed')),
+    evidence_json TEXT,
+    error_json TEXT,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    PRIMARY KEY(plan_id, phase)
+);
+
+CREATE TABLE IF NOT EXISTS cleanup_tombstones (
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('project', 'server', 'container', 'worktree')),
+    target_id TEXT NOT NULL,
+    repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    immutable_fingerprint TEXT NOT NULL,
+    operation_id TEXT NOT NULL REFERENCES operations(operation_id) ON DELETE RESTRICT,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    removed_at TEXT NOT NULL,
+    PRIMARY KEY(target_kind, target_id)
+);
+
+CREATE TABLE IF NOT EXISTS worktree_cleanup_identities (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    canonical_root TEXT NOT NULL,
+    git_dir TEXT NOT NULL,
+    common_dir TEXT NOT NULL,
+    primary_root TEXT NOT NULL,
+    root_device INTEGER NOT NULL,
+    root_inode INTEGER NOT NULL,
+    marker_device INTEGER NOT NULL,
+    marker_inode INTEGER NOT NULL,
+    head_oid TEXT,
+    identity_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('planned', 'removed')),
+    operation_id TEXT REFERENCES operations(operation_id) ON DELETE SET NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS docker_engines (
     engine_id TEXT PRIMARY KEY,
     host_id TEXT NOT NULL REFERENCES hosts(host_id) ON DELETE RESTRICT,
@@ -735,6 +820,18 @@ CREATE TABLE IF NOT EXISTS events (
     occurred_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS event_journal_sequences (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE
+        REFERENCES events(event_id) ON DELETE CASCADE
+);
+
+CREATE TRIGGER IF NOT EXISTS assign_event_journal_sequence
+AFTER INSERT ON events
+BEGIN
+    INSERT OR IGNORE INTO event_journal_sequences(event_id) VALUES (NEW.event_id);
+END;
+
 CREATE INDEX IF NOT EXISTS repositories_by_state ON repositories(state, display_name);
 CREATE INDEX IF NOT EXISTS sources_by_status ON coordinator_sources(status, canonical_home);
 CREATE INDEX IF NOT EXISTS source_resources_by_repo ON source_resources(repo_id, resource_kind);
@@ -756,6 +853,38 @@ class InvariantViolation:
     detail: str
 
 
+def _upgrade_sha256_fingerprints_to_v4(connection: sqlite3.Connection) -> None:
+    """Normalize the exact current resource identities used by lifecycle ACLs.
+
+    Schema v3 observations accidentally persisted the canonical digest without
+    its algorithm tag in repository memberships and startup policies.  Only an
+    exact lowercase 64-hex legacy value is safe to reinterpret.  Anything else
+    is ambiguous evidence and must abort the surrounding store-open
+    transaction instead of being guessed into a lifecycle identity.
+    """
+
+    for table in ("repository_memberships", "startup_policies"):
+        connection.execute(
+            f"""
+            UPDATE {table}
+            SET immutable_fingerprint = 'sha256:' || immutable_fingerprint
+            WHERE length(immutable_fingerprint) = 64
+              AND immutable_fingerprint NOT GLOB '*[^0-9a-f]*'
+            """
+        )
+        identifier = (
+            "membership_id" if table == "repository_memberships" else "policy_id"
+        )
+        for row in connection.execute(
+            f"SELECT {identifier}, immutable_fingerprint FROM {table}"
+        ):
+            if not _SHA256_FINGERPRINT.fullmatch(str(row[1])):
+                raise RuntimeError(
+                    "coordinator schema v4 migration rejected malformed "
+                    f"{table}.immutable_fingerprint for {row[0]}"
+                )
+
+
 def initialize_schema(
     connection: sqlite3.Connection,
     *,
@@ -774,6 +903,16 @@ def initialize_schema(
                 connection.execute(sql)
     if statement.strip():
         raise RuntimeError("coordinator schema contains an incomplete SQL statement")
+    # Existing stores predate the insertion-order journal. Backfill once in a
+    # deterministic order; the trigger assigns every later event atomically in
+    # its originating transaction. AUTOINCREMENT prevents cursor reuse after
+    # deletions, logical import, or VACUUM.
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO event_journal_sequences(event_id)
+        SELECT event_id FROM events ORDER BY occurred_at, event_id
+        """
+    )
     row = connection.execute(
         "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
     ).fetchone()
@@ -786,18 +925,20 @@ def initialize_schema(
             """,
             (SCHEMA_VERSION, database_generation, timestamp, timestamp),
         )
-    elif int(row[0]) == MINIMUM_MIGRATABLE_SCHEMA_VERSION:
-        # Version 2 adds only the authoritative startup-policy restoration
-        # ledger.  DDL above creates that empty table before this metadata
-        # flip, in the same BEGIN IMMEDIATE transaction.  Existing disabled
-        # repositories therefore remain safe: a later start fails closed
-        # because no pre-disable capture can be invented for them.
+    elif MINIMUM_MIGRATABLE_SCHEMA_VERSION <= int(row[0]) < SCHEMA_VERSION:
+        # Versions 2 and 3 add only additive ledgers. Version 4 additionally
+        # tags exact legacy membership/policy digests before the metadata flip.
+        # The caller owns one BEGIN IMMEDIATE transaction around this entire
+        # function, so a malformed leftover rolls back both DDL and every
+        # successfully converted fingerprint.
+        previous = int(row[0])
+        _upgrade_sha256_fingerprints_to_v4(connection)
         connection.execute(
             """
             UPDATE schema_metadata SET schema_version = ?, updated_at = ?
             WHERE singleton = 1 AND schema_version = ?
             """,
-            (SCHEMA_VERSION, timestamp, MINIMUM_MIGRATABLE_SCHEMA_VERSION),
+            (SCHEMA_VERSION, timestamp, previous),
         )
     elif int(row[0]) != SCHEMA_VERSION:
         raise RuntimeError(
@@ -904,6 +1045,15 @@ def invariant_violations(connection: sqlite3.Connection) -> list[InvariantViolat
             WHERE o.status = 'succeeded' AND t.status != 'succeeded'
             """,
             "successful operation contains a non-successful target",
+        ),
+        (
+            "event_missing_journal_sequence",
+            """
+            SELECT e.event_id FROM events e
+            LEFT JOIN event_journal_sequences s USING(event_id)
+            WHERE s.event_id IS NULL
+            """,
+            "durable event lacks a monotonic journal sequence",
         ),
     )
     for code, sql, prefix in checks:

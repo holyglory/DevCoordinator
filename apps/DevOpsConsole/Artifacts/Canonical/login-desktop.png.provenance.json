@@ -6,16 +6,16 @@
   "generator": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
   "width": 1440,
   "height": 900,
-  "sha256": "9e197b3fb6bd100a4d23a84a09847341bb06f85e064e0df510cbcaf4c521e25d",
+  "sha256": "be8fe76b8db31717fc9786f76cb15ce54a610b1afaa8dc8ff80a9175845c3b95",
   "viewport": {
     "width": 1440,
     "height": 900
   },
-  "source_sha256": "846bed6444efbc1df120ceeebc602fab80be279b83c1adc158f2810e05f4bc34",
+  "source_sha256": "9d078478216022baa9c18cd0b1c15224f5941c7d9d73f5274a26705d736c19e6",
   "source_files": [
     {
       "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
-      "sha256": "737abcf867757b1537795ac60a489c04752c2ec7eb4f56e4aaf670c65fd27d4a"
+      "sha256": "d5af37028fedf9af534c13f34b7a23bbe9e72a36e3c517f563a65cd1df428410"
     },
     {
       "path": "apps/DevOpsConsole/Tools/canonical-artifacts.mjs",
@@ -23,27 +23,27 @@
     },
     {
       "path": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
-      "sha256": "e59651d1b8e7b27abe0ecfe270ba45935043daea765f3b3ee4085f94d9bcad10"
+      "sha256": "daaed3271b057bc2855c818e8cdd900d8b97e00f4eba6c18e68202b5e2c64ad1"
     },
     {
       "path": "apps/DevOpsConsole/src/auth/pages.mjs",
-      "sha256": "253bae1480ef4f13cb78aa9971e341101a7a761b11e7cd5f1e6b783495631d50"
+      "sha256": "418d78ba17d550e53d1dd377f7caf8bb24fd399615dda7427d1424422644418a"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.css",
-      "sha256": "efc629a1a5c8da83358f63a92ff331ba477b3b680b8c1e2607148761bc7aae18"
+      "sha256": "f1a60b8a2d60f614248a1127cdceac87d48505c53a7fb5ab83763159544ab438"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.js",
-      "sha256": "8928ee13b8456dc63914156223a6c93d045578a4e9fc0c129fb004f92f26991a"
+      "sha256": "68b5ad4456655bd445fc0cad441a5375aa9bac012758cd2de2795643840381e0"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/index.html",
-      "sha256": "7729b518070a62521e0686b27d0100c23f4b5b5bac29958ccb62a10b7290a419"
+      "sha256": "2c4350027c71700887e4f4cb3d587266f9b6feff80135e99abaad674333908ff"
     },
     {
       "path": "apps/DevOpsConsole/test/helpers/stack.mjs",
-      "sha256": "08e2a485d55f08d068664022b72591fefce2b1a6d65133f6652cbbc3de04049e"
+      "sha256": "555cfdc781ed3fb0e44e4a11dc23a7932929d3c51d61f1d70fc494caba48db28"
     },
     {
       "path": "ci/playwright/package-lock.json",

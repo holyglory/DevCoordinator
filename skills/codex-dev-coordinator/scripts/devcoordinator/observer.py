@@ -8,13 +8,15 @@ callback writes normalized observations in the owner's short final transaction.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import sqlite3
 import time
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Generator, Mapping, Protocol
 import uuid
 
 
@@ -26,7 +28,12 @@ class ObservationStore(Protocol):
     def read_transaction(self):
         ...
 
-    def immediate_transaction(self, *, max_seconds: float | None = None):
+    def immediate_transaction(
+        self,
+        *,
+        max_seconds: float | None = None,
+        revision_kind: str | None = "state",
+    ):
         ...
 
 
@@ -46,6 +53,43 @@ class ObservationOutcome:
     joined: bool
     material_fingerprint: str
     completed_at: str
+
+
+@dataclass(frozen=True)
+class ObservationOwnerContext:
+    """Trusted broker-process ownership for one observation callback.
+
+    Account-mode observers do not install this context.  The service broker
+    uses it to bind only tickets physically owned by its current process to a
+    durable shutdown-cleanup row.  Joiners never acquire ownership of another
+    process's ticket.
+    """
+
+    owner_id: str
+    cancelled: Callable[[], bool]
+
+
+_OWNER_CONTEXT: ContextVar[ObservationOwnerContext | None] = ContextVar(
+    "devcoordinator_observation_owner", default=None
+)
+
+
+@contextmanager
+def observation_owner_scope(
+    *, owner_id: str, cancelled: Callable[[], bool]
+) -> Generator[None, None, None]:
+    """Bind broker ownership/cancellation to nested SingleFlight observers."""
+
+    _require_key("owner_id", owner_id)
+    if not callable(cancelled):
+        raise TypeError("cancelled must be callable")
+    token = _OWNER_CONTEXT.set(
+        ObservationOwnerContext(owner_id=owner_id, cancelled=cancelled)
+    )
+    try:
+        yield
+    finally:
+        _OWNER_CONTEXT.reset(token)
 
 
 class SingleFlightObserver:
@@ -87,7 +131,10 @@ class SingleFlightObserver:
                 raise ObservationError("host sampler returned a non-mapping result")
             fingerprint = _material_fingerprint(sample)
             completed_at = _timestamp(self._clock())
-            with self._store.immediate_transaction(max_seconds=5.0) as connection:
+            with self._store.immediate_transaction(
+                max_seconds=5.0,
+                revision_kind="observation",
+            ) as connection:
                 status = connection.execute(
                     "SELECT status FROM observation_snapshots WHERE snapshot_id = ?",
                     (ticket.snapshot_id,),
@@ -120,7 +167,20 @@ class SingleFlightObserver:
         snapshot_id = self._id_factory()
         started_at = _timestamp(self._clock())
         stale_before = self._clock().astimezone(timezone.utc) - self._stale_after
-        with self._store.immediate_transaction(max_seconds=5.0) as connection:
+        owner = _OWNER_CONTEXT.get()
+        with self._store.immediate_transaction(
+            max_seconds=5.0,
+            revision_kind=None,
+        ) as connection:
+            # This check occurs after BEGIN IMMEDIATE.  Shutdown sets the
+            # cancellation flag before taking its own write transaction, so
+            # either this claim commits its ownership first and shutdown marks
+            # it failed, or shutdown wins and this claim is refused.  There is
+            # no gap in which a new broker-owned ticket can appear afterward.
+            if owner is not None and owner.cancelled():
+                raise ObservationError(
+                    "broker shutdown began before the host observation ticket was claimed"
+                )
             running = connection.execute(
                 """
                 SELECT snapshot_id, started_at
@@ -153,6 +213,15 @@ class SingleFlightObserver:
                     """,
                     (snapshot_id, host_id, observer_domain, started_at),
                 )
+                if owner is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO broker_host_observation_owners(
+                            snapshot_id, broker_instance_id, claimed_at
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (snapshot_id, owner.owner_id, started_at),
+                    )
             except sqlite3.IntegrityError:
                 # The partial unique index is the final cross-process arbiter.
                 winner = connection.execute(
@@ -206,7 +275,10 @@ class SingleFlightObserver:
     def _record_failure(self, ticket: ObservationTicket, error: BaseException) -> None:
         try:
             completed_at = _timestamp(self._clock())
-            with self._store.immediate_transaction(max_seconds=5.0) as connection:
+            with self._store.immediate_transaction(
+                max_seconds=5.0,
+                revision_kind=None,
+            ) as connection:
                 connection.execute(
                     """
                     UPDATE observation_snapshots
@@ -235,7 +307,10 @@ def _material_fingerprint(sample: Mapping[str, Any]) -> str:
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
         raise ObservationError(f"host sampler returned non-serializable evidence: {error}") from error
-    return "sha256:" + hashlib.sha256(payload).hexdigest()
+    # Normalized lifecycle persistence stores material fingerprints as the
+    # canonical 64-hex digest. Capability fingerprints use the tagged
+    # `sha256:` transport form and are intentionally a separate contract.
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _timestamp(value: datetime) -> str:
@@ -269,6 +344,8 @@ def _error_code(error: BaseException) -> str:
 __all__ = [
     "ObservationError",
     "ObservationOutcome",
+    "ObservationOwnerContext",
     "ObservationTicket",
     "SingleFlightObserver",
+    "observation_owner_scope",
 ]

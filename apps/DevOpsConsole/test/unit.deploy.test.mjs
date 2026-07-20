@@ -37,12 +37,32 @@ test('production units split coordinator ownership and keep runtime data outside
     ['TimeoutStartSec=20'],
     'coordinator startup must have one exact bounded deadline',
   );
-  assert.match(coordinator, /^Requires=devcoordinator-broker\.service$/m);
+  assert.doesNotMatch(
+    coordinator,
+    /^Requires=.*devcoordinator-broker\.service/m,
+    'a broker maintenance stop must not tear down the authenticated API listener',
+  );
+  assert.match(
+    coordinator,
+    /^Wants=.*devcoordinator-broker\.service/m,
+    'API boot should still request the server-wide broker',
+  );
   assert.match(coordinator, /^Environment=DEVCOORDINATOR_AUTHORITY=system$/m);
   assert.match(coordinator, /CODEX_AGENT_COORDINATOR_HOME=\/var\/lib\/devcoordinator-clients\/1000/);
   assert.match(coordinator, /^AmbientCapabilities=CAP_NET_BIND_SERVICE$/m);
   assert.doesNotMatch(coordinator, /^CapabilityBoundingSet=/m);
   assert.match(coordinator, /^KillMode=process$/m);
+  assert.deepEqual(
+    coordinator.split('\n').filter((line) => line.startsWith('Restart=')),
+    ['Restart=always'],
+    'unexpected clean and failed API exits must both be supervised',
+  );
+  assert.match(coordinator, /^RestartSec=3$/m);
+  assert.match(coordinator, /^StandardOutput=journal$/m);
+  assert.match(coordinator, /^StandardError=journal$/m);
+  assert.match(coordinator, /^SyslogIdentifier=dev-coordinator$/m);
+  assert.match(coordinator, /^LogRateLimitIntervalSec=30s$/m);
+  assert.match(coordinator, /^LogRateLimitBurst=10000$/m);
   assert.doesNotMatch(coordinator, /^KillMode=(?:control-group|mixed)$/m);
   assert.doesNotMatch(
     coordinator,
@@ -51,7 +71,16 @@ test('production units split coordinator ownership and keep runtime data outside
   );
   assert.doesNotMatch(coordinator, /0\.0\.0\.0|holyskills/i);
 
-  assert.match(consoleUnit, /Requires=dev-coordinator\.service/);
+  assert.doesNotMatch(
+    consoleUnit,
+    /^Requires=.*dev-coordinator\.service/m,
+    'the public TLS edge must survive a coordinator API maintenance stop',
+  );
+  assert.match(
+    consoleUnit,
+    /^Wants=.*dev-coordinator\.service/m,
+    'Console boot should still request the coordinator API',
+  );
   assert.deepEqual(consoleUnit.split('\n').filter((line) => line.startsWith('Type=')), ['Type=simple']);
   assert.match(consoleUnit, /After=.*dev-coordinator\.service/);
   assert.match(consoleUnit, /^User=holyglory$/m);
@@ -97,6 +126,17 @@ test('production units split coordinator ownership and keep runtime data outside
   assert.match(consoleUnit, /ReadWritePaths=\/home\/holyglory\/\.local\/state\/devops-console/);
   assert.match(consoleUnit, /UMask=0077/);
   assert.match(consoleUnit, /^KillMode=control-group$/m);
+  assert.deepEqual(
+    consoleUnit.split('\n').filter((line) => line.startsWith('Restart=')),
+    ['Restart=always'],
+    'unexpected clean and failed Console exits must both be supervised',
+  );
+  assert.match(consoleUnit, /^RestartSec=3$/m);
+  assert.match(consoleUnit, /^StandardOutput=journal$/m);
+  assert.match(consoleUnit, /^StandardError=journal$/m);
+  assert.match(consoleUnit, /^SyslogIdentifier=devops-console$/m);
+  assert.match(consoleUnit, /^LogRateLimitIntervalSec=30s$/m);
+  assert.match(consoleUnit, /^LogRateLimitBurst=10000$/m);
   assert.match(consoleUnit, /^PrivateTmp=true$/m);
   assert.match(consoleUnit, /^ProtectSystem=full$/m);
   assert.match(consoleUnit, /^ProtectHome=read-only$/m);

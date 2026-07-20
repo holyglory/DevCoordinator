@@ -128,6 +128,34 @@ sudo python3 scripts/install_server_wide_coordinator.py apply \
   --transaction-dir /var/lib/devcoordinator-install/$(date +%Y%m%d-%H%M%S)
 ```
 
+The production broker keeps `ProtectSystem=strict`,
+`ProtectHome=read-only`, `PrivateTmp=true`, `NoNewPrivileges=true`, and the
+system manager's capability ceiling with no ambient capabilities. Its exact
+writable base exceptions are `/var/lib/devcoordinator` and
+`/run/devcoordinator`. The installer transaction also replaces one generated
+drop-in with only the canonical, real, directly-under-`/home` home paths of the
+complete explicit `--client-user` set. This is required because one
+server-wide broker may remove an explicitly planned clean linked worktree owned
+by any enrolled user. Reapply with the complete current client list when
+enrollment changes; omitted homes are removed from the writable set instead of
+accumulating in the configured unit. A running broker retains its existing
+mount namespace until it is safely drained and restarted, so do not treat the
+omission as live revocation before that restart. `/home` itself, `/root`,
+`/etc`, other users' homes, and the rest of the host remain read-only, while
+the broker's peer ACL, cleanup plan, immutable target identity, and safety
+checks remain the authorization boundary. After installation and the safe
+restart, run
+`scripts/check_broker_shutdown_unit.py` against the loaded unit before enabling
+new cleanup operations.
+
+Before apply mutates the host, it verifies `/usr/bin/python3` has PyYAML 6.x
+and that the service's exact Docker CLI provides a stable Compose plugin in
+`>=2.17,<3` or `>=5,<6`. The same systemd preflight runs before every broker
+start. Its Docker proof is non-mutating: a throwaway
+`docker compose config --format json` must honor two ordered explicit
+environment files, the second-file override, and implicit `.env` suppression;
+it does not contact the daemon or start containers.
+
 Then enroll each exact UID/repository before enabling the broker. Repeated
 `--server` flags form that account's server allowlist; re-enrollment atomically
 revokes omitted server grants. Omitting both `--server` and the explicit
@@ -159,6 +187,37 @@ enrollment; publication succeeds only after the service proves its exact UID,
 PID, repository cwd, port, and listener. Keep the old account store until the
 server appears in the shared inventory and DevOps Console. The installer
 transaction can roll back system configuration and canonical skill links.
+
+#### Authorization-schema upgrade recovery
+
+Run the server-wide installer `plan` with the complete client list before a
+broker restart. `profile_database_enrollment_drift` blocks restart. After a
+verified private service-store backup and an orderly stop of Console, API, and
+broker, reconcile only explicitly reported generation drift:
+
+```bash
+sudo python3 /absolute/path/to/dev_coordinator.py broker reconcile-profile-repository-generation \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --profile /etc/devcoordinator/client-profiles.json \
+  --client-uid NUMERIC_CLIENT_UID \
+  --account-id EXACT_CLIENT_ACCOUNT_ID \
+  --repo-id EXACT_REPOSITORY_ID \
+  --canonical-root /absolute/canonical/repository \
+  --rollback-root /var/lib/devcoordinator-install/PRIVATE-TRANSACTION \
+  --from-generation OLD_GENERATION \
+  --to-generation CURRENT_GENERATION
+
+sudo python3 /absolute/path/to/dev_coordinator.py broker migrate-profile-enrollments \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --profile /etc/devcoordinator/client-profiles.json
+```
+
+The first command creates private rollback evidence and changes exactly one
+proved generation scalar without rebuilding grants. The second inserts only
+missing rows backed by the current protected profile and existing exact ACL
+evidence. Prove the migration is idempotent, rerun installer `plan` and
+`verify`, then restart and verify every UID/repository plus the Console's exact
+registered listener, assignment, lease, and public login path.
 
 ### Coordinator-store backup and recovery
 
@@ -275,9 +334,15 @@ HTTP/WebSocket requests and from every upstream response; unrelated application
 cookies remain end-to-end. Routed projects therefore cannot read or overwrite
 Console authentication cookies.
 Production uses separate `dev-coordinator.service` and
-`devops-console.service` units; the Console unit requires the coordinator and
-does not spawn a duplicate. Private configuration and mutable state stay
-outside the checkout:
+`devops-console.service` units. Each unit requests and starts after its control
+dependency without making listener availability cascade through `Requires=`:
+broker maintenance therefore leaves the authenticated API listener and public
+TLS edge running, with broker-backed actions failing closed until recovery.
+Both API and Console restart after failed or unexpected clean process exits,
+while an explicit systemd stop remains a deliberate maintenance stop. Their
+stdout and stderr use persistent journald identities. The Console never spawns
+a duplicate coordinator. Private configuration and mutable state stay outside
+the checkout:
 
 - `$HOME/.config/devops-console/console.env` — mode `0600`
 - `$HOME/.local/state/devops-console` — mode `0700`

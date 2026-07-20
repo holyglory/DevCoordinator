@@ -24,7 +24,9 @@
       "/v1/state",
       "/v1/ports",
       "/v1/ports/assignments",
-      "/v1/servers"
+      "/v1/servers",
+      "/v1/archives",
+      "/v1/events"
     ],
     "POST": [
       "/v1/ports/lease",
@@ -50,7 +52,11 @@
       "/v1/docker/register",
       "/v1/docker/start",
       "/v1/docker/stop",
-      "/v1/docker/restart"
+      "/v1/docker/restart",
+      "/v1/lifecycle/plan",
+      "/v1/lifecycle/apply",
+      "/v1/lifecycle/restore",
+      "/v1/observe"
     ]
   },
   "request_rules": {
@@ -58,7 +64,22 @@
     "port_release": "lease_id or port plus acting agent and owning project",
     "server_launch": "structured argv is preferred; legacy cmd is parsed without a shell and rejects shell operators",
     "exact_lease_start": "lease_id requires structured argv and an active unbound manual lease owned by the same agent/project",
-    "docker": "real commands resolve an absolute Docker entry point and are bounded by observation/lifecycle timeouts"
+    "docker": "real commands resolve an absolute Docker entry point and are bounded by observation/lifecycle timeouts",
+    "durable_lifecycle": "target_kind is project, server, container, or worktree; repository is accepted only as compatibility input and is normalized to project; archive/purge always require a fresh plan and apply is bound to plan_id plus plan_fingerprint; restore requires explicit=true"
+  },
+  "event_contract": {
+    "observe": "POST /v1/observe accepts exactly {agent,project} and commits one explicit full-Docker host observation; repeated unchanged samples append no transition events and unavailable or unobservable capabilities never invent stopped resources",
+    "read": "GET /v1/events returns schema_version, events, next_cursor, and has_more in durable insertion-sequence order; after is the opaque high-watermark cursor from the prior page and limit is 1 through 500. occurred_at is event information, not the pagination key, so a slow operation committed later cannot fall behind the cursor merely because its event time is earlier",
+    "event_fields": [
+      "event_id",
+      "repo_id",
+      "event_kind",
+      "code",
+      "message",
+      "occurred_at"
+    ],
+    "privacy": "diagnostic_json and other private operation evidence are never returned by the event feed",
+    "catch_up": "persist next_cursor only after the consumer durably handles every returned event; when has_more is true, request the next page immediately before polling again"
   },
   "state": {
     "version": 2,
@@ -102,14 +123,23 @@
     "compatibility_projection": "v1_compatibility",
     "compatibility_policy": "legacy Console rows are nested under v1_compatibility; non-colliding legacy aliases may also appear at top level, but top-level leases and port_assignments always retain normalized lease_id/assignment_id and repo_id identities",
     "no_docker": "GET /v1/inventory/no-docker returns the authenticated committed normalized snapshot without a Docker CLI/daemon probe; when the systemd readiness client supplies exactly one project, name, and port query target, only compatibility rows that can affect that registration graph receive bounded current process, listener, and health observation on an in-memory copy; the route excludes unrelated services, process-usage sampling, and backup discovery and never persists derived lifecycle or lease changes",
-    "project_usage": "rows include stable usage_key plus authoritative server_ids and container_names",
+    "project_usage": "rows include stable usage_key plus authoritative server_ids and exact container_resource_ids; container_names remain legacy display data and are not ownership keys",
     "docker_ownership": "Compose labels and verified coordinator sidecars are mutation authority; name similarity is read-only evidence",
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"
+  },
+  "lifecycle_contract": {
+    "archives": "GET /v1/archives returns {archives:[...]}; rows carry target_kind, target_id, display_name, archived_at, reason, actor and may include project_id/parent, restorable, removable, status, retained, effects, and blockers",
+    "plan": "POST /v1/lifecycle/plan accepts {target_kind,target_id,action:'archive'|'purge',reason,agent}; the response binds plan_id and plan_fingerprint (fingerprint is a compatibility alias) to target/effects/retained/deleted/blockers and supplies the exact purge confirmation_phrase",
+    "apply": "POST /v1/lifecycle/apply accepts exactly {plan_id,plan_fingerprint,confirmation_phrase}; confirmation_phrase is the empty string for archive and the exact server-issued phrase for purge",
+    "restore": "POST /v1/lifecycle/restore accepts {target_kind,target_id,reason,agent,explicit:true}; restore clears the durable fence and never implies that the resource started",
+    "result_truth": "apply and restore return ok, status, partial, needs_attention, and errors; ok=false, partial=true, needs_attention=true, or blocked/failed/partial status is failure even with HTTP 200",
+    "retention": "archive stops and fences the exact resource while retaining declared data/history; permanent removal is available only for an archived row that advertises removable=true; worktree removal is shown only as an advertised removable child of an archived project"
   },
   "errors": {
     "401": "missing or incorrect bearer credential",
     "400": "invalid request, ownership mismatch, capability failure, or refused mutation",
     "413": "request body exceeds 64 KiB",
+    "409": "fresh lifecycle evidence blocks the action, the archived capability is unavailable, or an apply/restore result is incomplete",
     "415": "POST content type is not application/json",
     "500": "defensive read-side failure"
   }

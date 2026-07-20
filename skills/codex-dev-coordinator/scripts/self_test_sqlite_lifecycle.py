@@ -35,6 +35,10 @@ CONTAINER_ID = "a" * 64
 DOCKER_RESOURCE_ID = "docker-repo"
 
 
+class SimulatedCrash(BaseException):
+    pass
+
+
 def expect(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -98,6 +102,88 @@ class ExactStateAdapter:
     def stop_exact(self, target: ExactResourceRef) -> Mapping[str, Any]:
         self.calls.append(f"stop:{target.resource_id}")
         self.running[target.resource_id] = False
+        return {"stopped": True}
+
+
+class CompositeSupervisorStateAdapter:
+    def __init__(
+        self,
+        manager: str,
+        *,
+        state: str = "enabled",
+        loaded: bool = True,
+        running: bool = True,
+        crash_after_first_restore_effect: bool = True,
+    ) -> None:
+        self.manager = manager
+        self.state = state
+        self.loaded = loaded
+        self.running = running
+        self.restore_calls = 0
+        self.crash_after_first_restore_effect = crash_after_first_restore_effect
+
+    def observe_exact(self, target: ExactResourceRef) -> ResourceObservation:
+        policy = target.policies[0]
+        if self.manager == "systemd":
+            fully_disabled = self.state == "masked"
+            enabled = self.state not in {"disabled", "masked", "masked-runtime"}
+            value = policy.disabled_value if fully_disabled else self.state
+        else:
+            enabled = self.state == "enabled"
+            fully_disabled = not enabled
+            value = policy.disabled_value if fully_disabled else "enabled"
+        policy_observation = PolicyObservation(
+            policy.policy_id,
+            policy.immutable_fingerprint,
+            True,
+            fully_disabled,
+            value,
+            supervisor_manager=self.manager,
+            supervisor_unit_file_state=self.state,
+            supervisor_loaded=self.loaded,
+            supervisor_enabled=enabled,
+        )
+        return ResourceObservation(
+            target.resource_id,
+            target.kind,
+            True,
+            target.immutable_fingerprint,
+            True,
+            target.ownership_fingerprint,
+            RunningState.RUNNING if self.running else RunningState.STOPPED,
+            supervisor_active=self.running,
+            policies={policy.policy_id: policy_observation},
+        )
+
+    def disable_startup_policy(
+        self, target: ExactResourceRef, policy: Any
+    ) -> Mapping[str, Any]:
+        del target, policy
+        self.state = "masked" if self.manager == "systemd" else "disabled"
+        return {"disabled": True}
+
+    def restore_startup_policy(
+        self, target: ExactResourceRef, policy: Any, captured: Any
+    ) -> Mapping[str, Any]:
+        del target, policy
+        self.restore_calls += 1
+        if self.manager == "systemd":
+            self.state = "disabled"
+        else:
+            self.state = "enabled"
+            self.loaded = False
+        if self.crash_after_first_restore_effect:
+            self.crash_after_first_restore_effect = False
+            raise SimulatedCrash(f"after partial {self.manager} restore")
+        self.state = str(captured.supervisor_unit_file_state)
+        self.loaded = bool(captured.supervisor_loaded)
+        return {"restored": True, "host_may_have_started": False}
+
+    def stop_exact(self, target: ExactResourceRef) -> Mapping[str, Any]:
+        del target
+        self.running = False
+        if self.manager == "launchd":
+            self.loaded = False
         return {"stopped": True}
 
 
@@ -242,6 +328,99 @@ def seed_container(
                 now,
             ),
         )
+
+
+def seed_supervisor(connection: Any, *, manager: str) -> str:
+    now = utc_timestamp()
+    resource_id = f"supervisor-{manager}"
+    source_resource_id = f"source-resource:{resource_id}"
+    binding_id = f"binding:{resource_id}"
+    provenance = (
+        "systemd-system-test"
+        if manager == "systemd"
+        else "launchd,domain=gui/501,plist_path=/exact/app.plist,plist_sha256="
+        + "f" * 64
+    )
+    connection.execute(
+        """
+        INSERT INTO source_resources(
+            source_resource_id, source_id, resource_kind, native_id,
+            repo_id, payload_sha256, created_at
+        ) VALUES (?, ?, 'supervisor', ?, ?, ?, ?)
+        """,
+        (
+            source_resource_id,
+            SOURCE_ID,
+            resource_id,
+            REPO_ID,
+            f"payload:{resource_id}",
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO control_bindings(
+            binding_id, repo_id, source_resource_id, resource_kind,
+            resource_id, source_id, capability, provenance,
+            authority_state, priority, generation, created_at, updated_at
+        ) VALUES (?, ?, ?, 'supervisor', ?, ?, ?, ?,
+                  'authoritative', 10, 0, ?, ?)
+        """,
+        (
+            binding_id,
+            REPO_ID,
+            source_resource_id,
+            resource_id,
+            SOURCE_ID,
+            manager,
+            provenance,
+            now,
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO startup_policies(
+            policy_id, repo_id, resource_kind, resource_id, policy_kind,
+            current_value, desired_disabled_value, immutable_fingerprint,
+            generation, updated_at
+        ) VALUES (?, ?, 'supervisor', ?, 'supervisor',
+                  'enabled', 'disabled', ?, 0, ?)
+        """,
+        (
+            f"policy:{resource_id}",
+            REPO_ID,
+            resource_id,
+            f"policy-fp:{resource_id}",
+            now,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO repository_memberships(
+            membership_id, repo_id, resource_kind, host_resource_id,
+            immutable_fingerprint, control_binding_id, created_at
+        ) VALUES (?, ?, 'supervisor', ?, ?, ?, ?)
+        """,
+        (
+            f"membership:{resource_id}",
+            REPO_ID,
+            resource_id,
+            f"membership-fp:{resource_id}",
+            binding_id,
+            now,
+        ),
+    )
+    return resource_id
+
+
+def open_seeded_supervisor_store(root: Path, *, manager: str) -> tuple[AccountStore, str]:
+    root.mkdir(mode=0o700)
+    store = AccountStore.open(root / "coordinator.sqlite3")
+    with store.immediate_transaction() as connection:
+        seed_base(connection)
+        resource_id = seed_supervisor(connection, manager=manager)
+    return store, resource_id
 
 
 def open_seeded_store(root: Path) -> AccountStore:
@@ -694,6 +873,266 @@ def test_reinstall_defers_exact_policy_restore_until_guarded_explicit_start() ->
             expect(not owner_result.restored_policy_ids, owner_result.to_dict())
             expect(len(adapter.calls) == call_count, "historical capture overwrote owner policy")
             lifecycle.release_action_permit(owner_changed, outcome="succeeded")
+        finally:
+            store.close()
+
+
+def test_supervisor_capture_distinguishes_masked_from_preexisting_disabled() -> None:
+    cases = (
+        ("disabled", False, "disabled", True, "captured"),
+        ("masked", True, "disabled", False, "not_required"),
+        ("masked-runtime", False, "masked-runtime", True, "captured"),
+    )
+    for (
+        unit_state,
+        fully_disabled,
+        observed_value,
+        restore_required,
+        expected_status,
+    ) in cases:
+        with tempfile.TemporaryDirectory(
+            prefix=".sqlite-supervisor-capture-", dir=Path.home()
+        ) as raw:
+            store, resource_id = open_seeded_supervisor_store(
+                Path(raw).resolve() / "state", manager="systemd"
+            )
+            try:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE startup_policies
+                        SET policy_kind = 'supervisor', current_value = 'disabled',
+                            desired_disabled_value = 'disabled'
+                        WHERE policy_id = ?
+                        """,
+                        (f"policy:{resource_id}",),
+                    )
+                persistence = SQLiteLifecyclePersistence(store)
+                lifecycle = RepositoryLifecycle(
+                    persistence, ExactStateAdapter(), id_factory=lambda: f"plan-{unit_state}"
+                )
+                plan = lifecycle.plan_repository_decommission(
+                    REPO_ID, actor="tester", reason=f"capture {unit_state}"
+                )
+                persistence.fence_repository(plan, actor="tester")
+                target = plan.targets[0]
+                policy = target.policies[0]
+                captured = persistence.capture_startup_policy_state(
+                    plan.plan_id,
+                    target,
+                    policy,
+                    PolicyObservation(
+                        policy.policy_id,
+                        policy.immutable_fingerprint,
+                        True,
+                        fully_disabled,
+                        observed_value,
+                        supervisor_manager="systemd",
+                        supervisor_unit_file_state=unit_state,
+                        supervisor_loaded=True,
+                        supervisor_enabled=False,
+                    ),
+                )
+                expect(
+                    captured.restore_required is restore_required,
+                    f"{unit_state} restore_required={captured.restore_required}",
+                )
+                expect(captured.status == expected_status, captured.status)
+                expect(captured.captured_value == observed_value, str(captured))
+                expect(
+                    captured.supervisor_unit_file_state == unit_state,
+                    str(captured),
+                )
+            finally:
+                store.close()
+
+
+def test_composite_supervisor_restore_retry_commits_only_after_full_effect() -> None:
+    for manager in ("systemd", "launchd"):
+        with tempfile.TemporaryDirectory(
+            prefix=f".sqlite-{manager}-restore-", dir=Path.home()
+        ) as raw:
+            store, resource_id = open_seeded_supervisor_store(
+                Path(raw).resolve() / "state", manager=manager
+            )
+            try:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE startup_policies
+                        SET policy_kind = 'supervisor', current_value = 'enabled',
+                            desired_disabled_value = 'disabled'
+                        WHERE policy_id = ?
+                        """,
+                        (f"policy:{resource_id}",),
+                    )
+                persistence = SQLiteLifecyclePersistence(store)
+                target = persistence.repository_snapshot(REPO_ID).targets[0]
+                policy = target.policies[0]
+                adapter = CompositeSupervisorStateAdapter(manager)
+                lifecycle = RepositoryLifecycle(
+                    persistence,
+                    adapter,
+                    id_factory=lambda: f"restore-plan-{manager}",
+                )
+                plan = lifecycle.plan_repository_decommission(
+                    REPO_ID, actor="tester", reason=f"checkpoint {manager} restore"
+                )
+                removed = lifecycle.apply_repository_decommission(
+                    plan.plan_id, plan.fingerprint, actor="tester"
+                )
+                expect(removed.status == "succeeded", str(removed.to_dict()))
+                lifecycle.reinstall_repository(
+                    REPO_ID,
+                    actor="tester",
+                    reason=f"resume {manager} restore",
+                    explicit=True,
+                )
+                permit = lifecycle.reserve_repository_action(
+                    REPO_ID,
+                    RepositoryAction.START,
+                    request_id=f"start-{manager}",
+                    actor="tester",
+                )
+                try:
+                    lifecycle.restore_startup_policies_for_start(permit)
+                except SimulatedCrash:
+                    pass
+                else:
+                    raise AssertionError(f"{manager} restore did not interrupt")
+                with store.read_transaction() as connection:
+                    partial = connection.execute(
+                        """
+                        SELECT p.current_value, r.status
+                        FROM startup_policies p
+                        JOIN startup_policy_restore_states r USING(policy_id)
+                        WHERE p.policy_id = ?
+                        """,
+                        (policy.policy_id,),
+                    ).fetchone()
+                expect(
+                    tuple(partial) == (policy.disabled_value, "captured"),
+                    f"{manager} partial restore committed early: {tuple(partial)}",
+                )
+                restored = lifecycle.restore_startup_policies_for_start(permit)
+                expect(
+                    restored.restored_policy_ids == (policy.policy_id,),
+                    str(restored.to_dict()),
+                )
+                expect(
+                    adapter.state == "enabled",
+                    f"{manager} startup policy restore remained partial",
+                )
+                if manager == "systemd":
+                    expect(adapter.loaded, "systemd exact state was not restored")
+                    expect(adapter.restore_calls == 2, "systemd restore was not retried")
+                else:
+                    expect(
+                        not adapter.loaded,
+                        "launchd policy restoration unexpectedly loaded the service",
+                    )
+                    expect(
+                        adapter.restore_calls == 1,
+                        "launchd retry repeated an already-applied enable effect",
+                    )
+                with store.read_transaction() as connection:
+                    committed = connection.execute(
+                        """
+                        SELECT p.current_value, r.status, r.last_restore_permit_id
+                        FROM startup_policies p
+                        JOIN startup_policy_restore_states r USING(policy_id)
+                        WHERE p.policy_id = ?
+                        """,
+                        (policy.policy_id,),
+                    ).fetchone()
+                expect(
+                    tuple(committed) == ("enabled", "restored", permit.permit_id),
+                    f"{manager} restore did not commit exactly: {tuple(committed)}",
+                )
+            finally:
+                store.close()
+
+
+def test_repeated_remove_recaptures_preexisting_unmasked_disabled_state() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix=".sqlite-systemd-remove-cycle-", dir=Path.home()
+    ) as raw:
+        store, resource_id = open_seeded_supervisor_store(
+            Path(raw).resolve() / "state", manager="systemd"
+        )
+        try:
+            persistence = SQLiteLifecyclePersistence(store)
+            adapter = CompositeSupervisorStateAdapter(
+                "systemd",
+                state="masked",
+                loaded=False,
+                running=False,
+                crash_after_first_restore_effect=False,
+            )
+            plan_ids = iter(("masked-plan", "disabled-plan"))
+            lifecycle = RepositoryLifecycle(
+                persistence, adapter, id_factory=lambda: next(plan_ids)
+            )
+            first = lifecycle.plan_repository_decommission(
+                REPO_ID, actor="tester", reason="already persistently masked"
+            )
+            first_result = lifecycle.apply_repository_decommission(
+                first.plan_id, first.fingerprint, actor="tester"
+            )
+            expect(first_result.status == "succeeded", str(first_result.to_dict()))
+            with store.read_transaction() as connection:
+                first_capture = connection.execute(
+                    "SELECT status, restore_required FROM startup_policy_restore_states WHERE policy_id = ?",
+                    (f"policy:{resource_id}",),
+                ).fetchone()
+            expect(tuple(first_capture) == ("not_required", 0), str(tuple(first_capture)))
+            lifecycle.reinstall_repository(
+                REPO_ID, actor="tester", reason="first reinstall", explicit=True
+            )
+
+            # Model an operator unmasking the still-disabled unit between two
+            # removal cycles. The next removal must capture this exact state,
+            # mask it for the removal boundary, then restore disabled/unmasked
+            # on the later explicit start.
+            adapter.state = "disabled"
+            adapter.loaded = True
+            second = lifecycle.plan_repository_decommission(
+                REPO_ID, actor="tester", reason="capture disabled unmasked state"
+            )
+            second_result = lifecycle.apply_repository_decommission(
+                second.plan_id, second.fingerprint, actor="tester"
+            )
+            expect(second_result.status == "succeeded", str(second_result.to_dict()))
+            with store.read_transaction() as connection:
+                second_capture = connection.execute(
+                    """
+                    SELECT status, restore_required, supervisor_unit_file_state,
+                           supervisor_enabled, captured_operation_id
+                    FROM startup_policy_restore_states WHERE policy_id = ?
+                    """,
+                    (f"policy:{resource_id}",),
+                ).fetchone()
+            expect(
+                tuple(second_capture)
+                == ("captured", 1, "disabled", 0, second.plan_id),
+                str(tuple(second_capture)),
+            )
+            expect(adapter.state == "masked", adapter.state)
+            lifecycle.reinstall_repository(
+                REPO_ID, actor="tester", reason="second reinstall", explicit=True
+            )
+            permit = lifecycle.reserve_repository_action(
+                REPO_ID,
+                RepositoryAction.START,
+                request_id="restore-disabled-systemd",
+                actor="tester",
+            )
+            restored = lifecycle.restore_startup_policies_for_start(permit)
+            expect(
+                restored.restored_policy_ids == (f"policy:{resource_id}",),
+                str(restored.to_dict()),
+            )
+            expect(adapter.state == "disabled", adapter.state)
         finally:
             store.close()
 

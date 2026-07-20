@@ -1,7 +1,7 @@
 /* DevOps Console control panel.
  * Vanilla JS, no dependencies. Talks only to same-origin /api/*.
  * Hash-routed pages (#/projects, #/servers, #/routes, #/docker, #/ports,
- * #/performance, #/access)
+ * #/performance, #/access, #/invites, #/telegram)
  * share one sticky status bar. Polls GET /api/overview every 6s and
  * GET /api/metrics/history every 10s (both paused while the tab is hidden),
  * and refetches immediately after every mutation. All user data goes through
@@ -13,6 +13,7 @@
   const METRICS_POLL_MS = 10_000;
   const METRICS_LIMIT_SPARK = 90; // row sparkline window (~15 min at 10s sampling)
   const METRICS_LIMIT_FULL = 360; // performance-page window (~1 h at 10s)
+  const RESOURCE_PAGE_SIZE = 75;  // bound selectable DOM for host-wide inventories
   const RESERVED_SLUGS = new Set(['console', 'www', 'api', 'auth', 'static', 'healthz']);
   const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
@@ -28,6 +29,9 @@
     metricsAt: 0,
     prefs: null,         // GET /api/prefs payload ({ hidden: { servers, docker, projects } })
     access: null,        // owner-only GET /api/access payload ({ users, resources })
+    invites: null,       // owner-only GET /api/access/requests payload
+    telegram: null,      // GET /api/telegram payload for bots manageable by this account
+    archives: null,      // owner-only GET /api/lifecycle/list ({ archives })
   };
 
   const ui = {
@@ -36,7 +40,13 @@
     logs: new Map(),       // 'srv:<id>' | 'dock:<name>' -> {loading,text,error,at}
     busy: new Set(),       // action keys currently in flight
     reveal: new Set(),     // pages currently showing their hidden items
-    treeCollapsed: new Set(), // project usage_keys collapsed on the Projects page
+    treeExpanded: new Set(), // project usage_keys explicitly expanded on the Projects page
+    serverGroupsExpanded: new Set(), // transient Servers-page project disclosure (at most one)
+    resourcePages: { projects: 0, servers: 0, docker: 0 }, // zero-based page per large collection
+    lifecycleViews: { projects: 'active', servers: 'active', docker: 'active' },
+    archiveGroupsExpanded: { projects: new Set(), servers: new Set(), docker: new Set() },
+    lifecycleDialog: null, // { action, target, stage, plan, returnFocusKey }
+    lifecycleFocus: null,  // target revealed after a successful archive/restore/purge
     version: 0,            // bumped on any ui-state change to invalidate sigs
   };
   const bump = () => { ui.version += 1; };
@@ -81,6 +91,7 @@
     plus: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M8 3.5v9M3.5 8h9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
     eyeoff: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M2 8s2.2-3.8 6-3.8S14 8 14 8s-2.2 3.8-6 3.8S2 8 2 8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 13 13 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
     eye: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M2 8s2.2-3.8 6-3.8S14 8 14 8s-2.2 3.8-6 3.8S2 8 2 8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="1.7" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>',
+    archive: '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M2.5 4.5h11v8.2a.8.8 0 0 1-.8.8H3.3a.8.8 0 0 1-.8-.8Z" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M2 2.5h12v2H2zM6 7.5h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
   };
 
   function icon(name) {
@@ -147,7 +158,12 @@
   // ---------------------------------------------------------------- API client
 
   class ApiError extends Error {
-    constructor(message, status) { super(message); this.status = status; }
+    constructor(message, status, data = null) {
+      super(message);
+      this.status = status;
+      this.data = data;
+      this.code = data && typeof data.code === 'string' ? data.code : null;
+    }
   }
 
   async function api(path, { method = 'GET', body } = {}) {
@@ -173,7 +189,7 @@
       const msg = data && typeof data.error === 'string' && data.error
         ? data.error
         : `HTTP ${res.status} ${res.statusText}`;
-      throw new ApiError(msg, res.status);
+      throw new ApiError(msg, res.status, data);
     }
     return data;
   }
@@ -303,13 +319,15 @@
     { id: 'ports', title: 'Port leases' },
     { id: 'performance', title: 'Performance' },
     { id: 'access', title: 'Access' },
+    { id: 'invites', title: 'Invites' },
+    { id: 'telegram', title: 'Telegram' },
   ];
 
   function currentPage() {
     const m = /^#\/([a-z-]+)/.exec(location.hash || '');
     const id = m ? m[1] : '';
     if (!PAGES.some((p) => p.id === id)) return 'projects';
-    if (id === 'access' && state.session?.accessAdmin !== true) return 'projects';
+    if ((id === 'access' || id === 'invites') && state.session?.accessAdmin !== true) return 'projects';
     return id;
   }
 
@@ -334,9 +352,15 @@
     document.title = `${PAGES.find((p) => p.id === page).title} — DevOps Console`;
     setNavOpen(false);
     popover.close();
+    // Hash navigation changes which dynamic body is allowed to stay mounted.
+    // Rebuild immediately from the latest overview instead of waiting for the
+    // next six-second poll.
+    if (state.overview) renderAll(true);
     // The performance page charts use a longer history window than sparklines.
     if (page === 'performance') refreshMetrics();
     if (page === 'access' && state.session?.accessAdmin === true) loadAccess();
+    if (page === 'invites' && state.session?.accessAdmin === true) loadInvites();
+    if (page === 'telegram' && state.session?.email) loadTelegram();
   }
 
   function wireNav() {
@@ -360,8 +384,14 @@
   function syncAccessVisibility() {
     const admin = state.session?.accessAdmin === true;
     $('#nav-access').hidden = !admin;
+    $('#nav-invites').hidden = !admin;
+    $('#nav-telegram').hidden = !state.session?.email;
     $('#access-add').hidden = !admin;
-    if (!admin) state.access = null;
+    if (!admin) {
+      state.access = null;
+      state.invites = null;
+    }
+    syncLifecycleVisibility();
     applyPage();
   }
 
@@ -462,7 +492,7 @@
   }
 
   function renderAccess() {
-    if (state.session?.accessAdmin !== true) return;
+    if (state.session?.accessAdmin !== true || currentPage() !== 'access') return;
     setSection('access-body', sig(state.access), buildAccess, true);
     const count = state.access?.users?.length;
     setCount('access-count', count);
@@ -552,6 +582,852 @@
         submit.disabled = false;
         submit.textContent = 'Add user';
       }
+    });
+  }
+
+  // ---------------------------------------------------------------- incoming Google access requests
+
+  let invitesFetching = false;
+
+  function inviteRows() {
+    if (Array.isArray(state.invites)) return state.invites;
+    return Array.isArray(state.invites?.requests) ? state.invites.requests : [];
+  }
+
+  function requestStatus(request) {
+    return String(request?.status || 'pending').toLowerCase();
+  }
+
+  function queueStatusBadge(status) {
+    const normalized = String(status || 'pending').toLowerCase();
+    return h('span', { class: `queue-status ${normalized}` }, normalized.replaceAll('_', ' '));
+  }
+
+  function requestDisplay(request) {
+    const resource = request.resource || request.grant || '';
+    const fallbackHost = resource === 'console'
+      ? state.overview?.console?.host || 'DevOps Console'
+      : resource.startsWith('route:')
+        ? `${resource.slice('route:'.length)}.${state.overview?.console?.domain || ''}`
+        : resource || 'Requested destination';
+    return {
+      host: request.host || request.resourceHost || fallbackHost,
+      title: request.title || (resource === 'console' ? 'DevOps Console' : 'Private domain'),
+      target: request.target || request.resourceTarget || resource,
+      requestedAt: request.requestedAt || request.requested_at,
+      resolvedAt: request.resolvedAt || request.resolved_at,
+      resolvedBy: request.resolvedBy || request.resolved_by,
+      resource,
+    };
+  }
+
+  function inviteRequestRow(request, { terminal = false } = {}) {
+    const view = requestDisplay(request);
+    const status = requestStatus(request);
+    const id = String(request.id || request.requestId || request.request_id || '');
+    const busyKey = `invite:${id}`;
+    const busy = ui.busy.has(busyKey);
+    const actions = terminal ? null : h('div', { class: 'queue-actions' },
+      h('button', {
+        class: 'btn small', type: 'button', 'data-fk': `${busyKey}:approve`,
+        disabled: busy || undefined,
+        onclick: () => decideInvite(request, 'approve'),
+      }, busy ? 'Working…' : 'Approve'),
+      h('button', {
+        class: 'btn small danger', type: 'button', 'data-fk': `${busyKey}:deny`,
+        disabled: busy || undefined,
+        onclick: () => decideInvite(request, 'deny'),
+      }, 'Deny'));
+    return h('article', { class: 'item queue-row', 'data-invite-id': id, tabindex: '-1' },
+      h('div', { class: 'queue-row-head' },
+        h('div', { class: 'queue-row-main' },
+          h('div', { class: 'queue-title' },
+            h('strong', { class: 'access-email' }, request.email || 'Verified Google account'),
+            queueStatusBadge(status)),
+          h('p', { class: 'queue-meta' }, `${view.title} · ${view.host}`),
+          h('p', { class: 'queue-meta' }, view.target || 'Exact requested destination'),
+          h('p', { class: 'queue-meta' }, terminal
+            ? `Requested ${fmtWhen(view.requestedAt)} · resolved ${fmtWhen(view.resolvedAt)}${view.resolvedBy ? ` by ${view.resolvedBy}` : ''}`
+            : `Requested ${fmtWhen(view.requestedAt)}`)),
+        actions),
+      !terminal && view.resource === 'console'
+        ? h('p', { class: 'queue-warning' },
+            'Approving Console access grants full server, Docker, route and port control. It does not grant access administration.')
+        : null);
+  }
+
+  function buildInvites() {
+    if (!state.invites) return [
+      h('div', { class: 'skel', 'aria-hidden': 'true' }),
+      h('div', { class: 'skel', 'aria-hidden': 'true' }),
+    ];
+    const rows = inviteRows();
+    const pending = rows.filter((row) => requestStatus(row) === 'pending');
+    const resolved = rows.filter((row) => requestStatus(row) !== 'pending').slice(0, RESOURCE_PAGE_SIZE);
+    const out = [h('p', { class: 'queue-summary' },
+      pending.length
+        ? `${pending.length} verified request${sfx(pending.length)} waiting for a decision.`
+        : 'No access requests are waiting.')];
+    if (pending.length) out.push(...pending.slice(0, RESOURCE_PAGE_SIZE).map((row) => inviteRequestRow(row)));
+    else out.push(h('p', { class: 'empty' },
+      'When a verified Google account requests this Console or a private domain, it appears here.'));
+    if (resolved.length) {
+      out.push(h('details', { class: 'queue-history' },
+        h('summary', null, `Recent decisions (${resolved.length})`),
+        ...resolved.map((row) => inviteRequestRow(row, { terminal: true }))));
+    }
+    return out;
+  }
+
+  function renderInvites() {
+    if (state.session?.accessAdmin !== true) return;
+    const pending = inviteRows().filter((row) => requestStatus(row) === 'pending').length;
+    setNavCount('invites', pending);
+    if (currentPage() !== 'invites') return;
+    setSection('invites-body', sig(state.invites), buildInvites, true);
+    setCount('invites-count', pending);
+  }
+
+  async function loadInvites({ force = false } = {}) {
+    if (state.session?.accessAdmin !== true || invitesFetching) return;
+    if (!force && state.invites) return renderInvites();
+    invitesFetching = true;
+    $('#invites-refresh').disabled = true;
+    try {
+      state.invites = await api('/api/access/requests?status=all');
+      clearBanner('invites');
+      renderInvites();
+    } catch (err) {
+      if (err.status !== 401) {
+        $('#invites-body').replaceChildren(
+          h('p', { class: 'empty err' }, 'Could not load incoming invites.'));
+        showBanner(err.message, () => loadInvites({ force: true }), 'invites');
+      }
+    } finally {
+      invitesFetching = false;
+      $('#invites-refresh').disabled = false;
+    }
+  }
+
+  async function decideInvite(request, decision) {
+    const id = String(request.id || request.requestId || request.request_id || '');
+    if (!id || !['approve', 'deny'].includes(decision)) return;
+    const busyKey = `invite:${id}`;
+    if (ui.busy.has(busyKey)) return;
+    ui.busy.add(busyKey);
+    bump();
+    renderInvites();
+    try {
+      const result = await api(`/api/access/requests/${encodeURIComponent(id)}/decision`, {
+        method: 'POST', body: { decision },
+      });
+      if (result?.access) state.access = result.access;
+      await loadInvites({ force: true });
+      announce(`Access request ${decision === 'approve' ? 'approved' : 'denied'}`);
+      if (decision === 'approve' && !result?.access) loadAccess({ force: true });
+    } catch (err) {
+      if (err.status !== 401) showBanner(err.message, () => decideInvite(request, decision), 'invites');
+    } finally {
+      ui.busy.delete(busyKey);
+      bump();
+      renderInvites();
+    }
+  }
+
+  // ---------------------------------------------------------------- Telegram bots + per-bot authorization
+
+  let telegramFetching = false;
+
+  const telegramBots = () => Array.isArray(state.telegram?.bots) ? state.telegram.bots : [];
+  const telegramProjects = () => Array.isArray(state.telegram?.projects) ? state.telegram.projects : [];
+  const telegramBotId = (bot) => String(bot.id || bot.botId || bot.bot_id || '');
+  const telegramAssignments = (bot) => new Set(
+    (bot.projectIds || bot.project_ids || bot.projects || []).map(String),
+  );
+  const telegramAuthorizations = (bot) => (
+    Array.isArray(bot.authorizations) ? bot.authorizations
+      : Array.isArray(bot.authorizationQueue) ? bot.authorizationQueue
+        : []
+  );
+
+  function telegramAuthorizationId(row) {
+    return String(row.id || row.authorizationId || row.authorization_id || row.telegramUserId || row.user_id || '');
+  }
+
+  function telegramPerson(row) {
+    const name = [row.firstName || row.first_name, row.lastName || row.last_name].filter(Boolean).join(' ');
+    const username = row.username ? `@${String(row.username).replace(/^@/, '')}` : '';
+    return {
+      name: name || username || `Telegram user ${row.telegramUserId || row.user_id || row.chatId || row.chat_id || ''}`,
+      detail: [username, row.telegramUserId || row.user_id ? `user ${row.telegramUserId || row.user_id}` : '',
+        row.requestedAt || row.requested_at ? `requested ${fmtWhen(row.requestedAt || row.requested_at)}` : '']
+        .filter(Boolean).join(' · '),
+    };
+  }
+
+  function telegramAuthRow(bot, row, { terminal = false } = {}) {
+    const botId = telegramBotId(bot);
+    const authId = telegramAuthorizationId(row);
+    const person = telegramPerson(row);
+    const status = String(row.status || 'pending').toLowerCase();
+    const busyKey = `telegram-auth:${botId}:${authId}`;
+    const busy = ui.busy.has(busyKey);
+    return h('div', { class: 'telegram-auth' },
+      h('div', { class: 'telegram-auth-main' },
+        h('strong', null, person.name),
+        h('span', null, person.detail || 'Private Telegram chat')),
+      queueStatusBadge(status),
+      terminal ? null : h('div', { class: 'queue-actions' },
+        h('button', {
+          class: 'btn small', type: 'button', 'data-fk': `${busyKey}:approve`,
+          disabled: busy || undefined,
+          onclick: () => decideTelegramAuthorization(bot, row, 'approve'),
+        }, busy ? 'Working…' : 'Approve'),
+        h('button', {
+          class: 'btn small danger', type: 'button', 'data-fk': `${busyKey}:deny`,
+          disabled: busy || undefined,
+          onclick: () => decideTelegramAuthorization(bot, row, 'deny'),
+        }, 'Deny')));
+  }
+
+  function telegramProjectControl(bot, project) {
+    const botId = telegramBotId(bot);
+    const projectId = String(project.id || project.repoId || project.repo_id || '');
+    const assigned = telegramAssignments(bot).has(projectId);
+    const busyKey = `telegram-projects:${botId}`;
+    const input = h('input', {
+      type: 'checkbox', checked: assigned || undefined,
+      disabled: ui.busy.has(busyKey) || undefined,
+      'data-project-id': projectId,
+      'aria-label': `${assigned ? 'Stop' : 'Start'} notifications for ${project.name || project.displayName || projectId}`,
+    });
+    input.addEventListener('change', () => changeTelegramProject(bot, projectId, input.checked));
+    return h('label', { class: 'telegram-project' }, input,
+      h('span', null,
+        h('strong', null, project.name || project.displayName || project.display_name || projectId),
+        h('span', null, project.path || project.canonicalRoot || project.canonical_root || projectId)));
+  }
+
+  function telegramBotCard(bot) {
+    const botId = telegramBotId(bot);
+    const username = String(bot.username || '').replace(/^@/, '');
+    const owner = bot.ownerEmail || bot.owner_email;
+    const enabled = bot.enabled !== false;
+    const pollingError = bot.lastError || bot.last_error || bot.polling?.lastError;
+    const auth = telegramAuthorizations(bot);
+    const pending = auth.filter((row) => String(row.status || 'pending').toLowerCase() === 'pending');
+    const resolved = auth.filter((row) => String(row.status || '').toLowerCase() !== 'pending').slice(0, 20);
+    const assignments = telegramAssignments(bot);
+    const missingProjects = [...assignments].filter(
+      (id) => !telegramProjects().some((project) => String(project.id || project.repoId || project.repo_id) === id),
+    );
+    return h('article', { class: 'item telegram-bot', 'data-telegram-bot': botId, tabindex: '-1' },
+      h('div', { class: 'telegram-bot-head' },
+        h('div', { class: 'telegram-bot-main' },
+          h('div', { class: 'telegram-bot-title' },
+            h('strong', null, bot.label || (username ? `@${username}` : 'Telegram bot')),
+            queueStatusBadge(enabled ? 'active' : 'paused')),
+          h('p', { class: 'telegram-bot-meta' },
+            username
+              ? h('a', { href: `https://t.me/${username}`, target: '_blank', rel: 'noreferrer' }, `@${username}`)
+              : 'Telegram identity unavailable',
+            owner ? ` · owned by ${owner}` : '',
+            ` · ${assignments.size} assigned project${sfx(assignments.size)}`),
+          pollingError ? h('p', { class: 'telegram-bot-meta telegram-error' }, String(pollingError)) : null),
+        h('div', { class: 'telegram-bot-actions' },
+          h('button', {
+            class: 'btn small danger', type: 'button', 'data-fk': `telegram-remove:${botId}`,
+            onclick: () => removeTelegramBot(bot),
+          }, icon('trash'), 'Remove'))),
+      h('section', { class: 'telegram-section' },
+        h('h3', null, 'Assigned projects'),
+        telegramProjects().length
+          ? h('div', { class: 'telegram-project-list' },
+              ...telegramProjects().map((project) => telegramProjectControl(bot, project)))
+          : h('p', { class: 'queue-meta' }, 'No active coordinator projects are available.'),
+        missingProjects.length
+          ? h('p', { class: 'queue-warning' },
+              `${missingProjects.length} assignment${sfx(missingProjects.length)} no longer matches an active project and receives no events.`)
+          : null),
+      h('section', { class: 'telegram-section' },
+        h('h3', null, `Bot authorization queue${pending.length ? ` (${pending.length})` : ''}`),
+        pending.length
+          ? h('div', { class: 'telegram-auth-list' }, ...pending.map((row) => telegramAuthRow(bot, row)))
+          : h('p', { class: 'queue-meta' },
+              username ? `No one is waiting. Ask the user to open @${username} and send /start.` : 'No one is waiting.'),
+        resolved.length
+          ? h('details', { class: 'queue-history' },
+              h('summary', null, `Recent decisions (${resolved.length})`),
+              h('div', { class: 'telegram-auth-list' },
+                ...resolved.map((row) => telegramAuthRow(bot, row, { terminal: true }))))
+          : null));
+  }
+
+  function buildTelegram() {
+    if (!state.telegram) return [
+      h('div', { class: 'skel', 'aria-hidden': 'true' }),
+      h('div', { class: 'skel', 'aria-hidden': 'true' }),
+    ];
+    const bots = telegramBots();
+    if (!bots.length) return [h('div', { class: 'empty telegram-empty' },
+      h('p', null, 'No Telegram bots are registered for this account.'),
+      h('button', { class: 'btn primary', type: 'button', onclick: openTelegramDialog }, 'Register bot'))];
+    return bots.map(telegramBotCard);
+  }
+
+  function telegramPendingCount() {
+    return telegramBots().reduce(
+      (count, bot) => count + telegramAuthorizations(bot)
+        .filter((row) => String(row.status || 'pending').toLowerCase() === 'pending').length,
+      0,
+    );
+  }
+
+  function renderTelegram() {
+    if (!state.session?.email) return;
+    setNavCount('telegram', state.telegram ? telegramPendingCount() : null);
+    if (currentPage() !== 'telegram') return;
+    setSection('telegram-body', sig(state.telegram), buildTelegram, true);
+    setCount('telegram-count', state.telegram ? telegramBots().length : null);
+  }
+
+  async function loadTelegram({ force = false } = {}) {
+    if (!state.session?.email || telegramFetching) return;
+    if (!force && state.telegram) return renderTelegram();
+    telegramFetching = true;
+    try {
+      state.telegram = await api('/api/telegram');
+      clearBanner('telegram');
+      renderTelegram();
+    } catch (err) {
+      if (err.status !== 401) {
+        $('#telegram-body').replaceChildren(h('p', { class: 'empty err' }, 'Could not load Telegram bots.'));
+        showBanner(err.message, () => loadTelegram({ force: true }), 'telegram');
+      }
+    } finally {
+      telegramFetching = false;
+    }
+  }
+
+  async function changeTelegramProject(bot, projectId, allowed) {
+    const botId = telegramBotId(bot);
+    const busyKey = `telegram-projects:${botId}`;
+    if (ui.busy.has(busyKey)) return;
+    const selected = telegramAssignments(bot);
+    if (allowed) selected.add(projectId); else selected.delete(projectId);
+    ui.busy.add(busyKey);
+    bump();
+    renderTelegram();
+    try {
+      state.telegram = await api(`/api/telegram/bots/${encodeURIComponent(botId)}/projects`, {
+        method: 'PATCH', body: { projectIds: [...selected] },
+      });
+      announce('Telegram project assignments updated');
+    } catch (err) {
+      if (err.status !== 401) showBanner(err.message, () => changeTelegramProject(bot, projectId, allowed), 'telegram');
+    } finally {
+      ui.busy.delete(busyKey);
+      bump();
+      renderTelegram();
+    }
+  }
+
+  async function decideTelegramAuthorization(bot, row, decision) {
+    const botId = telegramBotId(bot);
+    const authId = telegramAuthorizationId(row);
+    const busyKey = `telegram-auth:${botId}:${authId}`;
+    if (!botId || !authId || ui.busy.has(busyKey)) return;
+    ui.busy.add(busyKey);
+    bump();
+    renderTelegram();
+    try {
+      state.telegram = await api(
+        `/api/telegram/bots/${encodeURIComponent(botId)}/authorizations/${encodeURIComponent(authId)}/decision`,
+        { method: 'POST', body: { decision } },
+      );
+      announce(`Telegram user ${decision === 'approve' ? 'approved' : 'denied'}`);
+    } catch (err) {
+      if (err.status !== 401) showBanner(
+        err.message, () => decideTelegramAuthorization(bot, row, decision), 'telegram',
+      );
+    } finally {
+      ui.busy.delete(busyKey);
+      bump();
+      renderTelegram();
+    }
+  }
+
+  async function removeTelegramBot(bot) {
+    const botId = telegramBotId(bot);
+    const label = bot.label || (bot.username ? `@${String(bot.username).replace(/^@/, '')}` : 'this bot');
+    if (!window.confirm(
+      `Remove ${label}?\n\nIts token, project assignments, authorization queue and pending notifications will be deleted from this Console.`,
+    )) return;
+    try {
+      state.telegram = await api(`/api/telegram/bots/${encodeURIComponent(botId)}`, { method: 'DELETE' });
+      announce(`${label} removed`);
+      renderTelegram();
+      $('#telegram-add').focus({ preventScroll: true });
+    } catch (err) {
+      if (err.status !== 401) showBanner(err.message, () => removeTelegramBot(bot), 'telegram');
+    }
+  }
+
+  function openTelegramDialog() {
+    const form = $('#telegram-form');
+    form.reset();
+    $('#telegram-form-error').hidden = true;
+    $('#telegram-takeover-wrap').hidden = true;
+    $('#telegram-dialog').showModal();
+    queueMicrotask(() => $('#telegram-label').focus());
+  }
+
+  function closeTelegramDialog() {
+    const dialog = $('#telegram-dialog');
+    if (dialog.open) dialog.close();
+    $('#telegram-token').value = '';
+  }
+
+  function wireTelegramDialog() {
+    $('#telegram-add').addEventListener('click', openTelegramDialog);
+    $('#telegram-dialog-close').append(icon('x'));
+    $('#telegram-dialog-close').addEventListener('click', closeTelegramDialog);
+    $('#telegram-cancel').addEventListener('click', closeTelegramDialog);
+    $('#telegram-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const token = $('#telegram-token');
+      const label = $('#telegram-label');
+      const takeover = $('#telegram-takeover');
+      const error = $('#telegram-form-error');
+      if (!token.reportValidity()) return;
+      const submit = $('#telegram-submit');
+      submit.disabled = true;
+      submit.textContent = 'Registering…';
+      error.hidden = true;
+      try {
+        state.telegram = await api('/api/telegram/bots', {
+          method: 'POST',
+          body: { token: token.value, label: label.value, takeOver: takeover.checked },
+        });
+        const registeredId = String(state.telegram?.registeredBotId || '');
+        const registered = telegramBots().find((bot) => telegramBotId(bot) === registeredId)
+          || telegramBots()[telegramBots().length - 1];
+        closeTelegramDialog();
+        renderTelegram();
+        announce('Telegram bot registered');
+        const row = registered ? document.querySelector(
+          `[data-telegram-bot="${CSS.escape(telegramBotId(registered))}"]`,
+        ) : null;
+        row?.scrollIntoView({ block: 'nearest' });
+        row?.focus({ preventScroll: true });
+      } catch (err) {
+        const webhookActive = err.code === 'telegram_webhook_active'
+          || (err.status === 409 && /webhook/i.test(err.message));
+        if (webhookActive) {
+          $('#telegram-takeover-wrap').hidden = false;
+          error.textContent = 'This bot already sends updates to another webhook. Check the takeover box only if this Console should replace it.';
+          error.hidden = false;
+          takeover.focus();
+        } else {
+          error.textContent = err.message;
+          error.hidden = false;
+        }
+      } finally {
+        submit.disabled = false;
+        submit.textContent = 'Register bot';
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- durable lifecycle archive / restore / remove
+
+  let archivesFetching = false;
+  let archivesFetchPromise = null;
+  let archivesRequestedGeneration = 0;
+  let archivesCompletedGeneration = 0;
+  let archivesCurrent = false;
+  let lifecycleRefreshInFlight = false;
+
+  function syncLifecycleVisibility() {
+    const admin = state.session?.accessAdmin === true;
+    for (const filter of document.querySelectorAll('[data-lifecycle-filter]')) {
+      filter.hidden = !admin;
+    }
+    if (!admin) {
+      state.archives = null;
+      archivesCurrent = false;
+      for (const page of ['projects', 'servers', 'docker']) ui.lifecycleViews[page] = 'active';
+      const dialog = $('#lifecycle-dialog');
+      if (dialog?.open) dialog.close();
+    }
+    syncLifecycleFilters();
+  }
+
+  function archivesForPage(page) {
+    const rows = state.archives || [];
+    if (page === 'projects') return rows.filter((row) => row?.target_kind === 'project');
+    if (page === 'servers') return rows.filter((row) => row?.target_kind === 'server');
+    if (page === 'docker') return rows.filter((row) => row?.target_kind === 'container');
+    return [];
+  }
+
+  function syncLifecycleFilters() {
+    for (const page of ['projects', 'servers', 'docker']) {
+      const filter = document.querySelector(`[data-lifecycle-filter="${page}"]`);
+      if (!filter) continue;
+      const view = ui.lifecycleViews[page];
+      for (const button of filter.querySelectorAll('[data-lifecycle-view]')) {
+        const selected = button.dataset.lifecycleView === view;
+        button.classList.toggle('is-selected', selected);
+        button.setAttribute('aria-pressed', String(selected));
+      }
+      // Until the owner-only archive endpoint answers, omit the badge instead
+      // of presenting an invented zero as durable host state.
+      setCount(`${page}-archived-count`, archivesCurrent && Array.isArray(state.archives)
+        ? archivesForPage(page).length : null);
+    }
+  }
+
+  async function loadArchives({ force = false } = {}) {
+    if (state.session?.accessAdmin !== true) return;
+    if (!force && state.archives && archivesCurrent) {
+      syncLifecycleFilters();
+      return;
+    }
+    const requestedGeneration = ++archivesRequestedGeneration;
+    while (archivesCompletedGeneration < requestedGeneration) {
+      if (!archivesFetchPromise) {
+        const fetchGeneration = archivesRequestedGeneration;
+        archivesFetching = true;
+        archivesFetchPromise = (async () => {
+          try {
+            const result = await api('/api/lifecycle/list');
+            if (!Array.isArray(result?.archives)) throw new ApiError('Archive list is malformed', 502);
+            state.archives = result.archives;
+            archivesCurrent = true;
+            clearBanner('lifecycle');
+            bump();
+            syncLifecycleFilters();
+            renderAll(true);
+          } catch (err) {
+            archivesCurrent = false;
+            syncLifecycleFilters();
+            renderAll(true);
+            if (err.status !== 401 && ['projects', 'servers', 'docker'].some(
+              (page) => currentPage() === page && ui.lifecycleViews[page] === 'archived',
+            )) {
+              showBanner(err.message, () => loadArchives({ force: true }), 'lifecycle');
+            }
+          } finally {
+            archivesCompletedGeneration = Math.max(
+              archivesCompletedGeneration, fetchGeneration,
+            );
+          }
+        })();
+      }
+      const pending = archivesFetchPromise;
+      await pending;
+      if (archivesFetchPromise === pending) {
+        archivesFetchPromise = null;
+        archivesFetching = false;
+      }
+    }
+  }
+
+  function setLifecycleView(page, view) {
+    if (state.session?.accessAdmin !== true || !['active', 'archived'].includes(view)) return;
+    ui.lifecycleViews[page] = view;
+    ui.resourcePages[page] = 0;
+    ui.archiveGroupsExpanded[page].clear();
+    bump();
+    syncLifecycleFilters();
+    if (view === 'archived') loadArchives();
+    renderAll(true);
+    queueMicrotask(() => {
+      document.querySelector(
+        `[data-lifecycle-filter="${page}"] [data-lifecycle-view="${view}"]`,
+      )?.focus({ preventScroll: true });
+    });
+  }
+
+  function lifecycleTarget(kind, id, displayName, page, extras = {}) {
+    if (!id) return null;
+    return {
+      target_kind: kind,
+      target_id: String(id),
+      display_name: displayName || lifecycleKindLabel(kind),
+      page,
+      ...extras,
+    };
+  }
+
+  function lifecycleIdentityMatches(target, kind, id) {
+    return !!target
+      && target.target_kind === kind
+      && String(target.target_id) === String(id);
+  }
+
+  function lifecycleKindLabel(kind) {
+    if (kind === 'project') return 'Project';
+    if (kind === 'server') return 'Server';
+    if (kind === 'container') return 'Docker container';
+    if (kind === 'worktree') return 'Git worktree';
+    return 'Coordinator resource';
+  }
+
+  function archiveButton(target, { compact = false } = {}) {
+    if (state.session?.accessAdmin !== true || !target) return compact ? ghostIconSlot() : null;
+    return h('button', {
+      class: compact ? 'iconbtn' : 'btn small', type: 'button',
+      'data-fk': `archive:${target.target_kind}:${target.target_id}`,
+      'aria-label': `Archive ${target.display_name}`,
+      title: 'Archive — stop and fence this resource while retaining its data and history',
+      onclick: (event) => openLifecycleDialog('archive', target, event.currentTarget),
+    }, icon('archive'), compact ? null : 'Archive');
+  }
+
+  function lifecycleList(value) {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => {
+      if (typeof item === 'string') return item;
+      if (!item || typeof item !== 'object') return String(item);
+      return item.description || item.message || item.effect || item.name || item.path || item.code
+        || JSON.stringify(item);
+    });
+  }
+
+  function lifecyclePlanSection(title, values, blocked = false) {
+    const items = lifecycleList(values);
+    return h('section', { class: `lifecycle-plan-section${blocked ? ' is-blocked' : ''}` },
+      h('h3', null, title),
+      items.length
+        ? h('ul', null, items.map((item) => h('li', null, item)))
+        : h('p', { class: 'meta-passive' }, 'None'));
+  }
+
+  function renderLifecycleDialog() {
+    const model = ui.lifecycleDialog;
+    if (!model) return;
+    const { action, target, stage, plan } = model;
+    const isArchive = action === 'archive';
+    const isPurge = action === 'purge';
+    const isRestore = action === 'restore';
+    const busy = stage === 'planning' || stage === 'applying';
+    const title = isArchive ? 'Archive resource' : isPurge ? 'Remove permanently' : 'Restore resource';
+    const summary = isArchive
+      ? 'Archiving stops and fences this exact coordinator resource. Its data and history are retained and it remains discoverable here.'
+      : isPurge
+        ? 'Permanent removal is available only after archival. Review the coordinator plan and type its exact confirmation phrase.'
+        : 'Restoring clears the exact lifecycle fence. It does not start the resource.';
+    $('#lifecycle-dialog-h').textContent = title;
+    $('#lifecycle-dialog-summary').textContent = summary;
+    $('#lifecycle-target').replaceChildren(
+      h('strong', null, target.display_name),
+      h('span', { class: 'meta-passive' },
+        `${lifecycleKindLabel(target.target_kind)} managed by the server-wide coordinator`));
+    const reason = $('#lifecycle-reason');
+    reason.disabled = busy || stage === 'planned';
+
+    const planHost = $('#lifecycle-plan');
+    if (stage === 'planning') {
+      planHost.replaceChildren(h('p', { class: 'inline-note' }, 'Refreshing host evidence and preparing an exact plan…'));
+    } else if (stage === 'applying') {
+      planHost.replaceChildren(h('p', { class: 'inline-note' }, isRestore
+        ? 'Restoring the lifecycle fence…'
+        : 'Applying the exact reviewed plan…'));
+    } else if (plan) {
+      planHost.replaceChildren(...[
+        lifecyclePlanSection('Effects', plan.effects),
+        lifecyclePlanSection('Retained', plan.retained),
+        lifecyclePlanSection('Deleted permanently', plan.deleted),
+        lifecyclePlanSection('Blockers', plan.blockers, true),
+      ]);
+    } else {
+      planHost.replaceChildren();
+    }
+
+    const phrase = isPurge && plan ? String(plan.confirmation_phrase || '') : '';
+    const confirmWrap = $('#lifecycle-confirm-wrap');
+    confirmWrap.hidden = !phrase;
+    $('#lifecycle-confirm-phrase').textContent = phrase;
+    if (!phrase) $('#lifecycle-confirm').value = '';
+
+    const submit = $('#lifecycle-submit');
+    submit.classList.toggle('lifecycle-danger', isPurge && stage === 'planned');
+    submit.textContent = busy
+      ? (stage === 'planning' ? 'Reviewing…' : isRestore ? 'Restoring…' : 'Applying…')
+      : isRestore ? 'Restore'
+        : stage === 'planned' ? (isPurge ? 'Remove permanently' : 'Archive')
+          : (isPurge ? 'Review removal' : 'Review archive');
+    const blocked = lifecycleList(plan?.blockers).length > 0;
+    const phraseMismatch = !!phrase && $('#lifecycle-confirm').value !== phrase;
+    submit.disabled = busy || blocked || phraseMismatch;
+  }
+
+  function openLifecycleDialog(action, target, trigger) {
+    if (state.session?.accessAdmin !== true || !target) return;
+    ui.lifecycleDialog = {
+      action,
+      target,
+      stage: 'intro',
+      plan: null,
+      returnFocusKey: trigger?.dataset?.fk || null,
+    };
+    $('#lifecycle-form').reset();
+    $('#lifecycle-form-error').hidden = true;
+    renderLifecycleDialog();
+    const dialog = $('#lifecycle-dialog');
+    dialog.showModal();
+    queueMicrotask(() => $('#lifecycle-reason').focus());
+  }
+
+  function closeLifecycleDialog({ restoreFocus = true } = {}) {
+    const model = ui.lifecycleDialog;
+    const dialog = $('#lifecycle-dialog');
+    if (dialog.open) dialog.close();
+    ui.lifecycleDialog = null;
+    if (restoreFocus && model?.returnFocusKey) {
+      queueMicrotask(() => document.querySelector(
+        `[data-fk="${CSS.escape(model.returnFocusKey)}"]`,
+      )?.focus({ preventScroll: true }));
+    }
+  }
+
+  async function lifecycleSucceeded(model) {
+    const archived = model.action === 'archive' || model.action === 'purge';
+    const view = archived ? 'archived' : 'active';
+    ui.lifecycleViews[model.target.page] = view;
+    ui.lifecycleFocus = model.action === 'purge' ? null : {
+      ...model.target,
+      view,
+      // A poll already in flight can finish before the post-action refresh.
+      // Preserve reveal intent across that race; worktrees have no active row
+      // on Projects, so they may fall back to the selected filter immediately.
+      fallbackAfter: model.target.target_kind === 'worktree'
+        ? Date.now() : Date.now() + (POLL_MS * 2),
+    };
+    closeLifecycleDialog({ restoreFocus: false });
+    // A server/container can also be acted on from the Projects tree. Its
+    // durable record belongs to Servers/Docker, so move to that canonical
+    // collection before refreshing and revealing the post-action target.
+    lifecycleRefreshInFlight = true;
+    const refreshes = Promise.all([
+      refreshOverview({ force: true }),
+      loadArchives({ force: true }),
+    ]);
+    if (currentPage() !== model.target.page) location.hash = `#/${model.target.page}`;
+    try {
+      await refreshes;
+    } finally {
+      lifecycleRefreshInFlight = false;
+    }
+    syncLifecycleFilters();
+    renderAll(true);
+    if (model.action === 'purge') {
+      queueMicrotask(() => document.querySelector(
+        `[data-lifecycle-filter="${model.target.page}"] [data-lifecycle-view="archived"]`,
+      )?.focus({ preventScroll: true }));
+    }
+    announce(model.action === 'archive'
+      ? `${model.target.display_name} archived`
+      : model.action === 'purge'
+        ? `${model.target.display_name} removed permanently`
+        : `${model.target.display_name} restored; it remains stopped`);
+  }
+
+  async function submitLifecycleDialog() {
+    const model = ui.lifecycleDialog;
+    if (!model || ['planning', 'applying'].includes(model.stage)) return;
+    const error = $('#lifecycle-form-error');
+    error.hidden = true;
+    try {
+      if (model.action === 'restore') {
+        model.stage = 'applying';
+        renderLifecycleDialog();
+        await api('/api/lifecycle/restore', {
+          method: 'POST',
+          body: {
+            target_kind: model.target.target_kind,
+            target_id: model.target.target_id,
+            reason: $('#lifecycle-reason').value,
+          },
+        });
+        await lifecycleSucceeded(model);
+        return;
+      }
+      if (model.stage === 'intro') {
+        model.stage = 'planning';
+        renderLifecycleDialog();
+        const result = await api('/api/lifecycle/plan', {
+          method: 'POST',
+          body: {
+            target_kind: model.target.target_kind,
+            target_id: model.target.target_id,
+            action: model.action,
+            reason: $('#lifecycle-reason').value,
+          },
+        });
+        if (!result?.plan?.plan_id || !(result.plan.plan_fingerprint || result.plan.fingerprint)) {
+          throw new ApiError('Coordinator returned an incomplete lifecycle plan', 502);
+        }
+        if (!['effects', 'retained', 'deleted', 'blockers'].every(
+          (field) => Array.isArray(result.plan[field]),
+        )) {
+          throw new ApiError('Coordinator returned incomplete lifecycle plan details', 502);
+        }
+        model.plan = result.plan;
+        model.stage = 'planned';
+        renderLifecycleDialog();
+        queueMicrotask(() => {
+          if (model.action === 'purge' && model.plan.confirmation_phrase) $('#lifecycle-confirm').focus();
+          else $('#lifecycle-submit').focus();
+        });
+        return;
+      }
+      const phrase = String(model.plan?.confirmation_phrase || '');
+      if (model.action === 'purge' && (!phrase || $('#lifecycle-confirm').value !== phrase)) {
+        throw new ApiError('Type the exact confirmation phrase before permanent removal', 400);
+      }
+      model.stage = 'applying';
+      renderLifecycleDialog();
+      await api('/api/lifecycle/apply', {
+        method: 'POST',
+        body: {
+          plan_id: model.plan.plan_id,
+          plan_fingerprint: model.plan.plan_fingerprint || model.plan.fingerprint,
+          confirmation_phrase: phrase ? $('#lifecycle-confirm').value : '',
+        },
+      });
+      await lifecycleSucceeded(model);
+    } catch (err) {
+      if (!ui.lifecycleDialog || err.status === 401) return;
+      model.stage = model.plan ? 'planned' : 'intro';
+      error.textContent = err.message;
+      error.hidden = false;
+      renderLifecycleDialog();
+    }
+  }
+
+  function wireLifecycle() {
+    for (const filter of document.querySelectorAll('[data-lifecycle-filter]')) {
+      for (const button of filter.querySelectorAll('[data-lifecycle-view]')) {
+        button.addEventListener('click', () => setLifecycleView(
+          filter.dataset.lifecycleFilter,
+          button.dataset.lifecycleView,
+        ));
+      }
+    }
+    $('#lifecycle-dialog-close').append(icon('x'));
+    $('#lifecycle-dialog-close').addEventListener('click', () => closeLifecycleDialog());
+    $('#lifecycle-cancel').addEventListener('click', () => closeLifecycleDialog());
+    $('#lifecycle-dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeLifecycleDialog();
+    });
+    $('#lifecycle-confirm').addEventListener('input', renderLifecycleDialog);
+    $('#lifecycle-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      submitLifecycleDialog();
     });
   }
 
@@ -784,11 +1660,70 @@
         revealing ? 'Conceal hidden items' : `Show ${hiddenCount} hidden item${sfx(hiddenCount)}`));
   }
 
+  // Large host-wide inventories are losslessly paged rather than appended to
+  // one document. Besides keeping ordinary rendering responsive, this bounds
+  // the element-candidate set inspected by the Codex in-app annotation layer.
+  function pageSlice(items, requestedPage) {
+    const total = items.length;
+    const pageCount = Math.max(1, Math.ceil(total / RESOURCE_PAGE_SIZE));
+    const requested = Number.isInteger(requestedPage) ? requestedPage : 0;
+    const page = Math.min(Math.max(0, requested), pageCount - 1);
+    const offset = page * RESOURCE_PAGE_SIZE;
+    const pagedItems = items.slice(offset, offset + RESOURCE_PAGE_SIZE);
+    return {
+      items: pagedItems,
+      total,
+      page,
+      pageCount,
+      start: total ? offset + 1 : 0,
+      end: offset + pagedItems.length,
+    };
+  }
+
+  function resourcePager(kind, label, info) {
+    if (info.pageCount <= 1) return null;
+    const go = (page) => {
+      ui.resourcePages[kind] = page;
+      bump();
+      renderAll(true);
+    };
+    return h('nav', { class: 'resource-pager', 'aria-label': `${label} pages` },
+      h('span', { class: 'resource-page-status', 'aria-live': 'polite' },
+        `Showing ${info.start}–${info.end} of ${info.total} visible ${label.toLowerCase()}`),
+      h('span', { class: 'resource-page-actions' },
+        h('button', {
+          class: 'btn small', type: 'button',
+          'data-fk': `pager:${kind}:prev`,
+          disabled: info.page === 0 || undefined,
+          'aria-label': `Previous ${label.toLowerCase()} page`,
+          'data-disabled-focus-fallback': `pager:${kind}:next`,
+          onclick: () => go(info.page - 1),
+        }, 'Previous'),
+        h('span', { class: 'meta-passive' }, `Page ${info.page + 1} of ${info.pageCount}`),
+        h('button', {
+          class: 'btn small', type: 'button',
+          'data-fk': `pager:${kind}:next`,
+          disabled: info.page + 1 >= info.pageCount || undefined,
+          'aria-label': `Next ${label.toLowerCase()} page`,
+          'data-disabled-focus-fallback': `pager:${kind}:prev`,
+          onclick: () => go(info.page + 1),
+        }, 'Next')));
+  }
+
+  // One disclosed project at a time keeps long operational collections
+  // scannable and preserves the bounded mounted-resource contract.
+  function setExclusiveExpansion(expandedKeys, key) {
+    const wasExpanded = expandedKeys.has(key);
+    expandedKeys.clear();
+    if (!wasExpanded) expandedKeys.add(key);
+  }
+
   // ---------------------------------------------------------------- project grouping
 
-  // Groups come straight from the coordinator's project_usage rows, which
-  // carry authoritative membership (server_ids / container_names) — the UI
-  // never re-implements the repo-identity heuristics.
+  // Groups come straight from the coordinator's project_usage rows. Immutable
+  // container resource IDs are authoritative when supplied; container names
+  // remain only as compatibility for older rows that omit the ID field. The
+  // UI never re-implements repo-identity heuristics.
   function projectGroupsOf(o) {
     const inv = o?.inventory;
     if (!inv) return [];
@@ -798,16 +1733,27 @@
     const servers = inv.servers || [];
     const containers = inv.docker?.available ? (inv.docker.containers || []) : [];
     const dbNames = new Set((inv.docker?.postgres || []).map((c) => c.name));
+    const repositoriesByRoot = new Map(
+      (inv.repositories || [])
+        .filter((repository) => repository?.canonical_root && repository?.repo_id)
+        .map((repository) => [repository.canonical_root, repository]),
+    );
 
     for (const row of inv.project_usage || []) {
       const serverIds = new Set(row.server_ids || []);
-      const containerNames = new Set(row.container_names || []);
+      const hasContainerResourceIds = Array.isArray(row.container_resource_ids);
+      const containerResourceIds = new Set(hasContainerResourceIds ? row.container_resource_ids : []);
+      const containerNames = new Set(hasContainerResourceIds ? [] : (row.container_names || []));
       const members = {
         servers: servers.filter((s) => serverIds.has(s.id)),
-        containers: containers.filter((c) => containerNames.has(c.name)),
+        containers: containers.filter((c) => (hasContainerResourceIds
+          ? containerResourceIds.has(c.host_resource_id)
+          : containerNames.has(c.name))),
       };
       members.servers.forEach((s) => claimedServers.add(s.id));
-      members.containers.forEach((c) => claimedContainers.add(c.name));
+      // Object identity distinguishes retained same-name Docker records in
+      // this exact inventory without inventing another browser-side key.
+      members.containers.forEach((c) => claimedContainers.add(c));
       const runningCount = members.servers.filter(isServerRunning).length
         + members.containers.filter(isContainerActive).length;
       groups.push({
@@ -817,6 +1763,7 @@
         metricsKey: `proj:${row.usage_key ?? row.project_key ?? row.project ?? row.name}`,
         name: row.name || projectTail(row.project),
         project: row.project || null,
+        repoId: row.repo_id || repositoriesByRoot.get(row.project)?.repo_id || null,
         row,
         members,
         dbNames,
@@ -826,13 +1773,14 @@
 
     // Safety net: anything the rollup did not claim still gets displayed.
     const strayServers = servers.filter((s) => !claimedServers.has(s.id));
-    const strayContainers = containers.filter((c) => !claimedContainers.has(c.name));
+    const strayContainers = containers.filter((c) => !claimedContainers.has(c));
     if (strayServers.length || strayContainers.length) {
       groups.push({
         key: 'other',
         metricsKey: null,
-        name: 'other',
+        name: 'Unassigned Resources',
         project: null,
+        repoId: null,
         row: null,
         members: { servers: strayServers, containers: strayContainers },
         dbNames,
@@ -1043,6 +1991,12 @@
       if (!prefsLoaded) loadPrefs();
       // Anything running must never stay hidden (fire-and-forget PATCH).
       autoUnhide(data);
+      // A lifecycle mutation owns one generation-ordered archive refresh and
+      // awaits it before revealing the result. Starting another unawaited
+      // archive read here can replace the newly focused result row.
+      if (state.session?.accessAdmin === true && !lifecycleRefreshInFlight) {
+        loadArchives({ force: true });
+      }
     } catch (err) {
       if (err.status === 401) return;
       state.stale = true;
@@ -1061,7 +2015,10 @@
   }
 
   function renderFirstLoadError() {
-    for (const id of ['projects-body', 'routes-body', 'servers-body', 'docker-body', 'leases-body', 'assignments-body', 'usage-body', 'perf-body']) {
+    const page = currentPage();
+    unmountInactiveSections(page);
+    for (const [id, ownerPage] of Object.entries(SECTION_BODY_PAGES)) {
+      if (ownerPage !== page || id === 'access-body') continue;
       document.getElementById(id).replaceChildren(
         h('p', { class: 'empty err' }, 'Could not load — use Retry in the error banner above.'));
     }
@@ -1094,7 +2051,32 @@
 
   // ---------------------------------------------------------------- render root
 
+  const SECTION_BODY_PAGES = Object.freeze({
+    'projects-body': 'projects',
+    'routes-body': 'routes',
+    'servers-body': 'servers',
+    'docker-body': 'docker',
+    'leases-body': 'ports',
+    'assignments-body': 'ports',
+    'perf-body': 'performance',
+    'usage-body': 'performance',
+    'access-body': 'access',
+    'invites-body': 'invites',
+    'telegram-body': 'telegram',
+  });
+
+  function unmountInactiveSections(page) {
+    for (const [id, ownerPage] of Object.entries(SECTION_BODY_PAGES)) {
+      if (ownerPage === page) continue;
+      const host = document.getElementById(id);
+      if (host.childNodes.length) host.replaceChildren();
+      delete sigs[id];
+    }
+  }
+
   function renderAll(force = false) {
+    const page = currentPage();
+    unmountInactiveSections(page);
     const o = state.overview;
     if (!o) return;
     if (popover.key !== null) {
@@ -1103,28 +2085,48 @@
       popover.close();
     }
     renderHeader();
-    updateServerOptions(o);
-    updateContainerOptions(o);
+    if (page === 'routes') {
+      updateServerOptions(o);
+      updateContainerOptions(o);
+    }
 
     // Only render-relevant coordinator facts belong in section signatures:
     // lastOkAt changes on every poll and would defeat the memoization,
     // rebuilding every card each 6s even when nothing visible changed.
     const coordSig = o.coordinator ? [o.coordinator.ok, o.coordinator.lastError] : null;
 
-    setSection('projects-body',
-      sig(o.inventory?.servers ?? null, o.inventory?.docker ?? null, o.inventory?.project_usage ?? null,
-        o.routes ?? null, coordSig),
-      () => buildProjects(o), force);
-    setSection('routes-body', sig(o.routes), () => buildRoutes(o), force);
-    setSection('servers-body',
-      sig(o.inventory?.servers ?? null, o.inventory?.port_assignments ?? null,
-        o.inventory?.docker ?? null, o.routes ?? null, coordSig),
-      () => buildServers(o), force);
-    setSection('docker-body', sig(o.inventory?.docker ?? null, o.routes ?? null, coordSig), () => buildDocker(o), force);
-    setSection('leases-body', sig(o.inventory?.leases ?? null, coordSig), () => buildLeases(o), force);
-    setSection('assignments-body', sig(o.inventory?.port_assignments ?? null, coordSig), () => buildAssignments(o), force);
-    setSection('usage-body', sig(o.inventory?.project_usage ?? null, coordSig), () => buildUsage(o), force);
-    setSection('perf-body', sig(state.metricsAt, o.inventory ? 1 : 0, coordSig), () => buildPerf(o), force);
+    if (page === 'projects') {
+      setSection('projects-body',
+        sig(o.inventory?.servers ?? null, o.inventory?.docker ?? null, o.inventory?.project_usage ?? null,
+          o.inventory?.repositories ?? null, o.routes ?? null, state.archives, ui.lifecycleViews.projects,
+          coordSig),
+        () => ui.lifecycleViews.projects === 'archived'
+          ? buildArchivedCollection('projects') : buildProjects(o), force);
+    } else if (page === 'routes') {
+      setSection('routes-body', sig(o.routes), () => buildRoutes(o), force);
+    } else if (page === 'servers') {
+      setSection('servers-body',
+        sig(o.inventory?.servers ?? null, o.inventory?.port_assignments ?? null,
+          o.inventory?.docker ?? null, o.routes ?? null, state.archives, ui.lifecycleViews.servers,
+          coordSig),
+        () => ui.lifecycleViews.servers === 'archived'
+          ? buildArchivedCollection('servers') : buildServers(o), force);
+    } else if (page === 'docker') {
+      setSection('docker-body',
+        sig(o.inventory?.docker ?? null, o.routes ?? null, state.archives, ui.lifecycleViews.docker, coordSig),
+        () => ui.lifecycleViews.docker === 'archived'
+          ? buildArchivedCollection('docker') : buildDocker(o), force);
+    } else if (page === 'ports') {
+      setSection('leases-body', sig(o.inventory?.leases ?? null, coordSig), () => buildLeases(o), force);
+      setSection('assignments-body', sig(o.inventory?.port_assignments ?? null, coordSig), () => buildAssignments(o), force);
+    } else if (page === 'performance') {
+      setSection('usage-body', sig(o.inventory?.project_usage ?? null, coordSig), () => buildUsage(o), force);
+      setSection('perf-body', sig(state.metricsAt, o.inventory ? 1 : 0, coordSig), () => buildPerf(o), force);
+    } else if (page === 'invites') {
+      renderInvites();
+    } else if (page === 'telegram') {
+      renderTelegram();
+    }
 
     const perfEntities = state.metrics
       ? (state.metrics.entities || []).filter((e) => e.kind === 'server' || e.kind === 'docker').length
@@ -1136,14 +2138,23 @@
       ? projectGroupsOf(o).reduce(
           (n, g) => n + g.members.containers.filter((c) => isWebServerContainer(o, g, c)).length, 0)
       : 0;
-    setCount('projects-count', projectGroups);
+    setCount('projects-count', ui.lifecycleViews.projects === 'archived'
+      ? (archivesCurrent ? archivesForPage('projects').length : null) : projectGroups);
     setCount('routes-count', (o.routes || []).length);
-    setCount('servers-count', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
-    setCount('docker-count', o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
+    setCount('servers-count', ui.lifecycleViews.servers === 'archived'
+      ? (archivesCurrent ? archivesForPage('servers').length : null)
+      : o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
+    setCount('docker-count', ui.lifecycleViews.docker === 'archived'
+      ? (archivesCurrent ? archivesForPage('docker').length : null)
+      : o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
     setCount('leases-count', o.inventory ? (o.inventory.leases || []).length : null);
     setCount('assignments-count', o.inventory ? (o.inventory.port_assignments || []).length : null);
     setCount('usage-count', o.inventory ? (o.inventory.project_usage || []).length : null);
     setCount('perf-count', perfEntities);
+    setCount('projects-active-count', projectGroups);
+    setCount('servers-active-count', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
+    setCount('docker-active-count', o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
+    syncLifecycleFilters();
 
     setNavCount('projects', projectGroups);
     setNavCount('servers', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
@@ -1153,6 +2164,35 @@
       ? (o.inventory.leases || []).length + (o.inventory.port_assignments || []).length
       : null);
     setNavCount('performance', perfEntities);
+    focusLifecycleTarget();
+  }
+
+  function focusLifecycleTarget() {
+    const focus = ui.lifecycleFocus;
+    if (!focus || focus.page !== currentPage()) return;
+    // Mutation refreshes can rebuild the same collection more than once.
+    // Focus only after both inventory and archive truth are settled so the
+    // focused node is not immediately replaced and focus lost to <body>.
+    if (lifecycleRefreshInFlight) return;
+    queueMicrotask(() => {
+      const target = document.querySelector(
+        `#sec-${focus.page} [data-lifecycle-target="${CSS.escape(`${focus.target_kind}:${focus.target_id}`)}"]`,
+      );
+      // The archive list may still be catching up with the inventory refresh;
+      // keep the pending focus until its authoritative fetch renders the row.
+      if (!target && (lifecycleRefreshInFlight || (focus.view === 'archived' && archivesFetching))) return;
+      if (!target && Date.now() < (focus.fallbackAfter || 0)) return;
+      if (!target) {
+        ui.lifecycleFocus = null;
+        document.querySelector(
+          `[data-lifecycle-filter="${focus.page}"] [data-lifecycle-view="${focus.view}"]`,
+        )?.focus({ preventScroll: true });
+        return;
+      }
+      ui.lifecycleFocus = null;
+      target.scrollIntoView({ block: 'nearest' });
+      target.focus({ preventScroll: true });
+    });
   }
 
   function sig(...slices) {
@@ -1177,7 +2217,15 @@
     }
     if (fk) {
       const again = host.querySelector(`[data-fk="${CSS.escape(fk)}"]`);
-      again?.focus({ preventScroll: true });
+      let focusTarget = again;
+      if (again?.matches(':disabled') && again.dataset.disabledFocusFallback) {
+        focusTarget = host.querySelector(
+          `[data-fk="${CSS.escape(again.dataset.disabledFocusFallback)}"]`,
+        );
+      }
+      if (focusTarget && !focusTarget.matches(':disabled')) {
+        focusTarget.focus({ preventScroll: true });
+      }
     }
   }
 
@@ -1786,6 +2834,177 @@
     }
   }
 
+  // ---------------------------------------------------------------- archived lifecycle collections
+
+  function archivedParentId(row) {
+    if (row?.project_id) return String(row.project_id);
+    if (typeof row?.parent === 'string') return row.parent;
+    if (row?.parent?.target_id) return String(row.parent.target_id);
+    if (row?.parent_id) return String(row.parent_id);
+    return null;
+  }
+
+  function archiveDisplayName(row) {
+    return row?.display_name || row?.name || `Archived ${lifecycleKindLabel(row?.target_kind).toLowerCase()}`;
+  }
+
+  function archivedGroups(page) {
+    const all = state.archives || [];
+    const groups = [];
+    if (page === 'projects') {
+      const projects = all.filter((row) => row?.target_kind === 'project');
+      const worktrees = all.filter(
+        (row) => row?.target_kind === 'worktree' && row?.removable === true,
+      );
+      for (const project of projects) {
+        groups.push({
+          key: `archive-project:${project.target_id}`,
+          name: archiveDisplayName(project),
+          entries: [project, ...worktrees.filter((row) => archivedParentId(row) === String(project.target_id))],
+        });
+      }
+    } else {
+      const kind = page === 'servers' ? 'server' : 'container';
+      const byParent = new Map();
+      for (const row of all.filter((item) => item?.target_kind === kind)) {
+        const parent = archivedParentId(row) || 'unassigned';
+        if (!byParent.has(parent)) {
+          byParent.set(parent, {
+            key: `archive-${page}:${parent}`,
+            name: row.project_display_name || row.project_name || row.parent?.display_name
+              || (parent === 'unassigned' ? 'Archived resources' : 'Archived project resources'),
+            entries: [],
+          });
+        }
+        byParent.get(parent).entries.push(row);
+      }
+      groups.push(...byParent.values());
+    }
+    for (const group of groups) {
+      group.entries.sort((a, b) => archiveDisplayName(a).localeCompare(archiveDisplayName(b))
+        || String(a.target_id).localeCompare(String(b.target_id)));
+    }
+    groups.sort((a, b) => String(a.name).localeCompare(String(b.name))
+      || String(a.key).localeCompare(String(b.key)));
+    return groups;
+  }
+
+  function archivedResourceRow(page, row) {
+    const name = archiveDisplayName(row);
+    const target = lifecycleTarget(row.target_kind, row.target_id, name, page, {
+      parentId: archivedParentId(row),
+    });
+    const archivedAt = row.archived_at ? fmtWhen(row.archived_at) : 'Archived';
+    const actor = row.actor ? ` · by ${row.actor}` : '';
+    const reason = row.reason ? ` · ${row.reason}` : '';
+    const effects = lifecycleList(row.effects);
+    const retained = lifecycleList(row.retained);
+    const details = `${archivedAt}${actor}${reason}`;
+    return h('div', {
+      class: 'archive-row', tabindex: '-1',
+      'data-fk': `archive-row:${row.target_kind}:${row.target_id}`,
+      'data-lifecycle-target': `${row.target_kind}:${row.target_id}`,
+    },
+      h('div', { class: 'archive-main' },
+        h('span', { class: 'archive-name' },
+          h('span', { class: `kind-tag ${row.target_kind === 'container' ? 'k-dock' : row.target_kind === 'server' ? 'k-srv' : ''}` },
+            lifecycleKindLabel(row.target_kind)),
+          h('strong', null, name),
+          h('span', { class: 'badge dim static-badge' },
+            h('span', { class: 'dot', 'aria-hidden': 'true' }), row.status || 'archived')),
+        h('span', { class: 'archive-detail' }, details),
+        effects.length ? h('span', { class: 'archive-detail' }, `Effects: ${effects.join('; ')}`) : null,
+        retained.length ? h('span', { class: 'archive-detail' }, `Retained: ${retained.join('; ')}`) : null),
+      h('span', { class: 'archive-actions' },
+        row.restorable === true ? h('button', {
+          class: 'btn small act-start', type: 'button',
+          'data-fk': `restore:${row.target_kind}:${row.target_id}`,
+          title: 'Clear the lifecycle fence; this does not start the resource',
+          onclick: (event) => openLifecycleDialog('restore', target, event.currentTarget),
+        }, icon('refresh'), 'Restore') : null,
+        row.removable === true ? h('button', {
+          class: 'btn small lifecycle-danger', type: 'button',
+          'data-fk': `purge:${row.target_kind}:${row.target_id}`,
+          title: 'Review permanent removal of this exact archived target',
+          onclick: (event) => openLifecycleDialog('purge', target, event.currentTarget),
+        }, icon('trash'), 'Remove permanently') : null));
+  }
+
+  function archivedGroupBlock(page, group) {
+    const expandedSet = ui.archiveGroupsExpanded[page];
+    const focus = ui.lifecycleFocus;
+    if (
+      focus?.view === 'archived'
+      && focus.page === page
+      && group.entries.some((row) => row.target_kind === focus.target_kind && row.target_id === focus.target_id)
+    ) {
+      expandedSet.clear();
+      expandedSet.add(group.key);
+    }
+    const expanded = expandedSet.has(group.key);
+    const panelId = `archive-group-${page}-${encodeURIComponent(group.key)}`;
+    const toggle = h('button', {
+      class: 'server-project-toggle', type: 'button',
+      'data-fk': `archive-group:${page}:${group.key}`,
+      'aria-expanded': String(expanded),
+      'aria-controls': panelId,
+      'aria-label': `${expanded ? 'Collapse' : 'Expand'} ${group.name}, ${group.entries.length} archived item${sfx(group.entries.length)}`,
+      onclick: () => {
+        setExclusiveExpansion(expandedSet, group.key);
+        ui.resourcePages[page] = 0;
+        bump();
+        renderAll(true);
+      },
+    },
+      h('span', { class: `chev${expanded ? ' open' : ''}`, 'aria-hidden': 'true' }, icon('chevron')),
+      h('strong', { class: 'proj-name' }, group.name),
+      h('span', { class: 'meta-passive server-group-count' },
+        `${group.entries.length} archived item${sfx(group.entries.length)}`));
+
+    const children = [];
+    if (expanded) {
+      let requestedPage = ui.resourcePages[page];
+      const focusIndex = focus?.view === 'archived' && focus.page === page
+        ? group.entries.findIndex(
+            (row) => row.target_kind === focus.target_kind && row.target_id === focus.target_id,
+          )
+        : -1;
+      if (focusIndex >= 0) requestedPage = Math.floor(focusIndex / RESOURCE_PAGE_SIZE);
+      const paged = pageSlice(group.entries, requestedPage);
+      ui.resourcePages[page] = paged.page;
+      children.push(...paged.items.map((row) => archivedResourceRow(page, row)));
+      const pager = resourcePager(page, 'Archived resources', paged);
+      if (pager) children.push(pager);
+    }
+    return h('div', { class: 'server-project-block' },
+      h('h3', { class: `proj-head${expanded ? ' is-open' : ''}` }, toggle),
+      h('div', {
+        class: 'archive-group-items', id: panelId,
+        hidden: expanded ? undefined : true,
+      }, children));
+  }
+
+  function buildArchivedCollection(page) {
+    if (state.session?.accessAdmin !== true) {
+      return [emptyState('Only configured Console owners can manage archived host resources.')];
+    }
+    if (!state.archives) {
+      return [
+        h('div', { class: 'skel', 'aria-hidden': 'true' }),
+        h('div', { class: 'skel', 'aria-hidden': 'true' }),
+      ];
+    }
+    const groups = archivedGroups(page);
+    if (!groups.length) {
+      return [emptyState(`No archived ${page === 'docker' ? 'containers' : page} yet.`)];
+    }
+    return [
+      h('p', { class: 'archive-note' },
+        'Archived resources are stopped and fenced. Restore clears the fence but never starts anything.'),
+      ...groups.map((group) => archivedGroupBlock(page, group)),
+    ];
+  }
+
   // ---------------------------------------------------------------- servers
 
   function serverStatusMeta(s) {
@@ -1807,10 +3026,14 @@
     if (!o.inventory) return [degradedPanel(o)];
     const hidden = hiddenSet('servers');
     const hiddenDocker = hiddenSet('docker');
+    const focus = ui.lifecycleFocus?.view === 'active' && ui.lifecycleFocus.page === 'servers'
+      ? ui.lifecycleFocus : null;
+    if (focus) ui.reveal.add('servers');
     const revealing = ui.reveal.has('servers');
     const rank = (s) => (s.status === 'running' ? 0 : s.status === 'stopped' ? 2 : 1);
     let total = 0;
     let hiddenCount = 0;
+    const groups = [];
 
     const out = [
       h('div', { class: 'grid-head srv-grid', 'aria-hidden': 'true' },
@@ -1829,33 +3052,108 @@
           || String(a.name).localeCompare(String(b.name)));
       if (!servers.length && !webContainers.length) continue;
       total += servers.length + webContainers.length;
-      const visible = [];
+      const running = servers.filter(isServerRunning).length
+        + webContainers.filter(isContainerRunning).length;
+      const memberCount = servers.length + webContainers.length;
+      const extraText = `${running} of ${memberCount} running`;
+      const entries = [];
       for (const s of servers) {
         const isHidden = hidden.has(s.key);
         if (isHidden) hiddenCount += 1;
         if (isHidden && !revealing) continue;
-        visible.push(serverItem(o, s, isHidden));
+        entries.push({ group, extraText, kind: 'server', item: s, isHidden });
       }
       for (const c of webContainers) {
         const isHidden = hiddenDocker.has(c.name);
         if (isHidden) hiddenCount += 1;
         if (isHidden && !revealing) continue;
-        visible.push(dockerServerItem(o, c, isHidden));
+        entries.push({ group, extraText, kind: 'docker', item: c, isHidden });
       }
-      if (!visible.length) continue;
-      const running = servers.filter(isServerRunning).length
-        + webContainers.filter(isContainerRunning).length;
-      const memberCount = servers.length + webContainers.length;
-      out.push(groupHeader(group, `${running} of ${memberCount} running`));
-      out.push(...visible);
+      groups.push({ group, extraText, memberCount, entries });
+    }
+
+    if (focus) {
+      for (const entry of groups) {
+        const index = entry.entries.findIndex((member) => (
+          member.kind === 'server'
+            ? lifecycleIdentityMatches(focus, 'server', member.item.id)
+            : lifecycleIdentityMatches(focus, 'container', member.item.host_resource_id)
+        ));
+        if (index < 0) continue;
+        ui.serverGroupsExpanded.clear();
+        ui.serverGroupsExpanded.add(entry.group.key);
+        ui.resourcePages.servers = Math.floor(index / RESOURCE_PAGE_SIZE);
+        break;
+      }
     }
 
     if (total === 0) {
       return [emptyState('No dev servers registered with the coordinator yet — start one with "server start" and it appears here.')];
     }
+    for (const entry of groups) out.push(serverProjectBlock(o, entry));
     const toggle = revealToggle('servers', hiddenCount);
     if (toggle) out.push(toggle);
     return out;
+  }
+
+  // All project headers stay visible so the collection remains scannable.
+  // Only the explicitly opened project's bounded member page is mounted.
+  function serverProjectBlock(o, entry) {
+    const expanded = ui.serverGroupsExpanded.has(entry.group.key);
+    const panelId = `srv-group-panel-${encodeURIComponent(entry.group.key)}`;
+    const usage = entry.group.row
+      ? h('span', { class: 'proj-usage mono' },
+          h('span', { class: 'u-cpu' }, fmtCpu(entry.group.row.cpu_percent)),
+          ' · ',
+          h('span', { class: 'u-mem' }, fmtBytes(entry.group.row.memory_bytes || 0)))
+      : null;
+    const usageLabel = entry.group.row
+      ? `, CPU ${fmtCpu(entry.group.row.cpu_percent)}, memory ${fmtBytes(entry.group.row.memory_bytes || 0)}`
+      : '';
+    const toggle = h('button', {
+      class: 'server-project-toggle', type: 'button',
+      'data-fk': `srv-group:${entry.group.key}`,
+      'aria-expanded': String(expanded),
+      'aria-controls': panelId,
+      'aria-label': `${expanded ? 'Collapse' : 'Expand'} ${entry.group.name}, ${entry.extraText}${usageLabel}`,
+      title: expanded ? 'Collapse resource group' : 'Expand resource group',
+      onclick: () => {
+        setExclusiveExpansion(ui.serverGroupsExpanded, entry.group.key);
+        ui.resourcePages.servers = 0;
+        bump();
+        renderAll(true);
+      },
+    },
+      h('span', { class: `chev${expanded ? ' open' : ''}`, 'aria-hidden': 'true' }, icon('chevron')),
+      h('strong', { class: 'proj-name' }, entry.group.name),
+      h('span', { class: 'meta-passive server-group-count' }, entry.extraText),
+      entry.group.metricsKey ? sparkline(metricsEntity(entry.group.metricsKey)) : null,
+      usage);
+
+    const children = [];
+    if (expanded) {
+      if (entry.entries.length) {
+        const paged = pageSlice(entry.entries, ui.resourcePages.servers);
+        ui.resourcePages.servers = paged.page;
+        for (const member of paged.items) {
+          children.push(member.kind === 'server'
+            ? serverItem(o, member.item, member.isHidden)
+            : dockerServerItem(o, member.item, member.isHidden));
+        }
+        const pager = resourcePager('servers', 'Project servers', paged);
+        if (pager) children.push(pager);
+      } else if (entry.memberCount > 0) {
+        children.push(h('p', { class: 'inline-note' },
+          'All servers in this resource group are hidden. Use the control below to reveal them.'));
+      }
+    }
+
+    return h('div', { class: 'server-project-block' },
+      h('h3', { class: `proj-head${expanded ? ' is-open' : ''}`, title: entry.group.project || '' }, toggle),
+      h('div', {
+        class: 'server-group-items', id: panelId,
+        hidden: expanded ? undefined : true,
+      }, children));
   }
 
   // A docker-hosted web server rendered as a first-class Servers row: same
@@ -1868,6 +3166,9 @@
     const busy = ui.busy.has(`docker:${name}`);
     const meta = containerStatusMeta(c);
     const panelId = `srv-dock-panel-${name}`;
+    const archiveTarget = lifecycleTarget('container', c.host_resource_id, name, 'docker', {
+      projectId: c.repo_id || null,
+    });
 
     const chev = h('button', {
       class: `chev${open ? ' open' : ''}`, type: 'button',
@@ -1916,6 +3217,9 @@
 
     const row = h('div', {
       class: `row srv-grid expandable${hiddenRow ? ' is-hidden' : ''}`,
+      tabindex: '-1',
+      'data-lifecycle-target': archiveTarget
+        ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
       onclick: (e) => {
         if (e.target.closest('button, a, input, select')) return;
         toggleDocker(name);
@@ -1948,7 +3252,8 @@
           : act('start', 'Start', 'play'),
         hiddenRow
           ? unhideButton('docker', name, name)
-          : (!isContainerActive(c) ? hideButton('docker', name, name) : ghostIconSlot())));
+          : (!isContainerActive(c) ? hideButton('docker', name, name) : ghostIconSlot()),
+        archiveButton(archiveTarget, { compact: true })));
 
     return h('div', { class: 'item' }, row, open ? dockerPanel(c, panelId) : null);
   }
@@ -1959,6 +3264,7 @@
     const busy = ui.busy.has(`server:${id}`);
     const meta = serverStatusMeta(s);
     const panelId = `srv-panel-${id}`;
+    const archiveTarget = lifecycleTarget('server', id, s.name || 'Unnamed server', 'servers');
 
     const chev = h('button', {
       class: `chev${open ? ' open' : ''}`, type: 'button',
@@ -2010,10 +3316,13 @@
       }, icon('stop'), busy ? 'Working…' : 'Stop'),
       hiddenRow
         ? unhideButton('servers', s.key, s.name || 'server')
-        : (s.status === 'stopped' ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot()));
+        : (s.status === 'stopped' ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot()),
+      archiveButton(archiveTarget, { compact: true }));
 
     const row = h('div', {
       class: `row srv-grid expandable${hiddenRow ? ' is-hidden' : ''}`,
+      tabindex: '-1',
+      'data-lifecycle-target': `${archiveTarget.target_kind}:${archiveTarget.target_id}`,
       onclick: (e) => {
         if (e.target.closest('button, a, input, select')) return;
         toggleServer(id);
@@ -2425,12 +3734,16 @@
           h('p', { class: 'deg-msg' }, docker?.error ? String(docker.error) : 'Docker did not respond on this machine.')))];
     }
     const hidden = hiddenSet('docker');
+    const focus = ui.lifecycleFocus?.view === 'active' && ui.lifecycleFocus.page === 'docker'
+      ? ui.lifecycleFocus : null;
+    if (focus) ui.reveal.add('docker');
     const revealing = ui.reveal.has('docker');
     const sortContainers = (list) => list.slice().sort((a, b) =>
       (isContainerRunning(b) ? 1 : 0) - (isContainerRunning(a) ? 1 : 0)
       || String(a.name).localeCompare(String(b.name)));
     let total = 0;
     let hiddenCount = 0;
+    const entries = [];
 
     const out = [
       h('div', { class: 'grid-head dock-grid', 'aria-hidden': 'true' },
@@ -2442,21 +3755,47 @@
       const containers = sortContainers(group.members.containers);
       if (!containers.length) continue;
       total += containers.length;
-      const visible = [];
+      const up = containers.filter(isContainerRunning).length;
+      const extraText = `${up} of ${containers.length} up`;
       for (const c of containers) {
         const isHidden = hidden.has(c.name);
         if (isHidden) hiddenCount += 1;
         if (isHidden && !revealing) continue;
-        visible.push(dockerItem(o, c, isHidden, isWebServerContainer(o, group, c)));
+        entries.push({
+          group,
+          extraText,
+          item: c,
+          isHidden,
+          webish: isWebServerContainer(o, group, c),
+        });
       }
-      if (!visible.length) continue;
-      const up = containers.filter(isContainerRunning).length;
-      out.push(groupHeader(group, `${up} of ${containers.length} up`));
-      out.push(...visible);
     }
 
     if (total === 0) {
       return [emptyState('No containers found — anything started with docker run or compose shows up here.')];
+    }
+    if (entries.length) {
+      const focusIndex = focus
+        ? entries.findIndex((entry) => lifecycleIdentityMatches(
+            focus, 'container', entry.item.host_resource_id,
+          ))
+        : -1;
+      const requestedPage = focusIndex >= 0
+        ? Math.floor(focusIndex / RESOURCE_PAGE_SIZE) : ui.resourcePages.docker;
+      const paged = pageSlice(entries, requestedPage);
+      ui.resourcePages.docker = paged.page;
+      let lastGroupKey = null;
+      for (const entry of paged.items) {
+        if (entry.group.key !== lastGroupKey) {
+          out.push(groupHeader(entry.group, entry.extraText));
+          lastGroupKey = entry.group.key;
+        }
+        out.push(dockerItem(o, entry.item, entry.isHidden, entry.webish));
+      }
+      const pager = resourcePager('docker', 'Containers', paged);
+      if (pager) out.push(pager);
+    } else {
+      out.push(h('p', { class: 'inline-note' }, 'Every container is hidden right now. Use the control below to reveal them.'));
     }
     if (docker.stats_error) {
       out.push(h('p', { class: 'inline-note' }, `Stats unavailable: ${docker.stats_error}`));
@@ -2472,6 +3811,9 @@
     const open = ui.dockerOpen.has(name);
     const busy = ui.busy.has(`docker:${name}`);
     const panelId = `dock-panel-${name}`;
+    const archiveTarget = lifecycleTarget('container', c.host_resource_id, name, 'docker', {
+      projectId: c.repo_id || null,
+    });
 
     const dotKey = `dock-dot:${name}`;
     const dot = h('button', {
@@ -2506,6 +3848,9 @@
 
     const row = h('div', {
       class: `row dock-grid expandable${hiddenRow ? ' is-hidden' : ''}`,
+      tabindex: '-1',
+      'data-lifecycle-target': archiveTarget
+        ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
       onclick: (e) => {
         if (e.target.closest('button, a, input, select')) return;
         toggleDocker(name);
@@ -2541,7 +3886,8 @@
         }, icon('chevron'), 'Logs'),
         hiddenRow
           ? unhideButton('docker', name, name)
-          : (!isContainerActive(c) ? hideButton('docker', name, name) : ghostIconSlot())));
+          : (!isContainerActive(c) ? hideButton('docker', name, name) : ghostIconSlot()),
+        archiveButton(archiveTarget, { compact: true })));
 
     return h('div', { class: 'item' }, row, open ? dockerPanel(c, panelId) : null);
   }
@@ -2880,6 +4226,7 @@
     const busy = ui.busy.has(`server:${s.id}`);
     const meta = serverStatusMeta(s);
     const stopped = s.status === 'stopped';
+    const archiveTarget = lifecycleTarget('server', s.id, s.name || 'Unnamed server', 'servers');
     const slot = (action, label, iconName, disabled, title) => ({
       fk: `tree-srv-${action}-${label}:${s.id}`,
       label,
@@ -2890,7 +4237,11 @@
       onclick: () => runAction(`server:${s.id}`,
         () => api('/api/servers/action', { method: 'POST', body: { id: s.id, action } })),
     });
-    return h('div', { class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}` },
+    return h('div', {
+      class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}`,
+      tabindex: '-1',
+      'data-lifecycle-target': `${archiveTarget.target_kind}:${archiveTarget.target_id}`,
+    },
       h('span', { class: 'cell c-kind' }, h('span', { class: 'kind-tag k-srv' }, 'server')),
       h('span', { class: 'cell c-primary' },
         h('strong', null, s.name || '—'),
@@ -2919,12 +4270,14 @@
         }),
         hiddenRow
           ? unhideButton('servers', s.key, s.name || 'server')
-          : (stopped ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot())));
+          : (stopped ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot()),
+        archiveButton(archiveTarget, { compact: true })));
   }
 
   function treeContainerRow(o, c, isDb, hiddenRow, webish = false) {
     const busy = ui.busy.has(`docker:${c.name}`);
     const running = isContainerRunning(c);
+    const archiveTarget = lifecycleTarget('container', c.host_resource_id, c.name, 'docker');
     const slot = (action, label, iconName, disabled, title, confirmText) => ({
       fk: `tree-dock-${action}:${c.name}`,
       label,
@@ -2936,7 +4289,12 @@
         () => api('/api/docker/action', { method: 'POST', body: { name: c.name, action } }),
         confirmText ? { confirmText } : undefined),
     });
-    return h('div', { class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}` },
+    return h('div', {
+      class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}`,
+      tabindex: '-1',
+      'data-lifecycle-target': archiveTarget
+        ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
+    },
       h('span', { class: 'cell c-kind' },
         h('span', { class: `kind-tag ${isDb ? 'k-db' : 'k-dock'}` }, isDb ? 'database' : 'container')),
       h('span', { class: 'cell c-primary' },
@@ -2969,12 +4327,14 @@
         }),
         hiddenRow
           ? unhideButton('docker', c.name, c.name)
-          : (!isContainerActive(c) ? hideButton('docker', c.name, c.name) : ghostIconSlot())));
+          : (!isContainerActive(c) ? hideButton('docker', c.name, c.name) : ghostIconSlot()),
+        archiveButton(archiveTarget, { compact: true })));
   }
 
   function projectNode(o, group, hiddenProject, revealing, hiddenServers, hiddenDocker) {
-    const collapsed = ui.treeCollapsed.has(group.key);
+    const collapsed = !ui.treeExpanded.has(group.key);
     const memberCount = group.members.servers.length + group.members.containers.length;
+    const archiveTarget = lifecycleTarget('project', group.repoId, group.name, 'projects');
     const chev = h('button', {
       class: `chev${collapsed ? '' : ' open'}`, type: 'button',
       'data-fk': `tree-x:${group.key}`,
@@ -2982,13 +4342,25 @@
       'aria-label': `${collapsed ? 'Expand' : 'Collapse'} project ${group.name}`,
       title: collapsed ? 'Expand project' : 'Collapse project',
       onclick: () => {
-        if (collapsed) ui.treeCollapsed.delete(group.key); else ui.treeCollapsed.add(group.key);
+        if (collapsed) {
+          ui.treeExpanded.clear();
+          ui.treeExpanded.add(group.key);
+        } else {
+          ui.treeExpanded.delete(group.key);
+        }
+        ui.resourcePages.projects = 0;
         bump();
         renderAll(true);
       },
     }, icon('chevron'));
 
-    const header = h('div', { class: `row tree-grid tree-head${hiddenProject ? ' is-hidden' : ''}`, title: group.project || '' },
+    const header = h('div', {
+      class: `row tree-grid tree-head${hiddenProject ? ' is-hidden' : ''}`,
+      title: group.project || '',
+      tabindex: '-1',
+      'data-lifecycle-target': archiveTarget
+        ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
+    },
       h('span', { class: 'cell c-kind' }, chev),
       h('span', { class: 'cell c-primary' },
         h('strong', { class: 'proj-name' }, group.name)),
@@ -3008,21 +4380,34 @@
         projectActionButtons(group),
         hiddenProject
           ? unhideButton('projects', group.key, group.name)
-          : (group.runningCount === 0 ? hideButton('projects', group.key, group.name) : ghostIconSlot())));
+          : (group.runningCount === 0 ? hideButton('projects', group.key, group.name) : ghostIconSlot()),
+        archiveButton(archiveTarget, { compact: true })));
 
     const children = [];
     if (!collapsed) {
+      const entries = [];
       for (const s of group.members.servers.slice().sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
         const isHidden = hiddenServers.has(s.key);
         if (isHidden && !revealing) continue;
-        children.push(treeServerRow(o, s, isHidden));
+        entries.push({ kind: 'server', item: s, isHidden });
       }
       const containers = group.members.containers.slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
       for (const c of containers) {
         const isHidden = hiddenDocker.has(c.name);
         if (isHidden && !revealing) continue;
-        children.push(treeContainerRow(o, c, group.dbNames.has(c.name), isHidden,
-          isWebServerContainer(o, group, c)));
+        entries.push({ kind: 'docker', item: c, isHidden });
+      }
+      if (entries.length) {
+        const paged = pageSlice(entries, ui.resourcePages.projects);
+        ui.resourcePages.projects = paged.page;
+        for (const entry of paged.items) {
+          children.push(entry.kind === 'server'
+            ? treeServerRow(o, entry.item, entry.isHidden)
+            : treeContainerRow(o, entry.item, group.dbNames.has(entry.item.name), entry.isHidden,
+                isWebServerContainer(o, group, entry.item)));
+        }
+        const pager = resourcePager('projects', 'Project items', paged);
+        if (pager) children.push(pager);
       }
       if (!children.length && memberCount > 0) {
         children.push(h('p', { class: 'inline-note' }, 'All items in this project are hidden.'));
@@ -3043,6 +4428,9 @@
     const hiddenProjects = hiddenSet('projects');
     const hiddenServers = hiddenSet('servers');
     const hiddenDocker = hiddenSet('docker');
+    const focus = ui.lifecycleFocus?.view === 'active' && ui.lifecycleFocus.page === 'projects'
+      ? ui.lifecycleFocus : null;
+    if (focus) ui.reveal.add('projects');
     const revealing = ui.reveal.has('projects');
 
     let hiddenCount = 0;
@@ -3211,7 +4599,15 @@
 
   function startPolling() {
     setInterval(() => {
-      if (!document.hidden) refreshOverview();
+      if (!document.hidden) {
+        refreshOverview();
+        if (currentPage() === 'invites' && state.session?.accessAdmin === true) {
+          loadInvites({ force: true });
+        }
+        if (currentPage() === 'telegram' && state.session?.email) {
+          loadTelegram({ force: true });
+        }
+      }
     }, POLL_MS);
     setInterval(() => {
       if (!document.hidden) refreshMetrics();
@@ -3223,6 +4619,9 @@
         // Pick up hides made on another device while this tab slept.
         loadPrefs();
         if (state.session?.accessAdmin === true) loadAccess({ force: true });
+        if (state.session?.accessAdmin === true) loadInvites({ force: true });
+        if (state.session?.email) loadTelegram({ force: true });
+        if (state.session?.accessAdmin === true) loadArchives({ force: true });
       }
     });
   }
@@ -3248,6 +4647,9 @@
     wireLeaseForm();
     wireNav();
     wireAccessDialog();
+    wireTelegramDialog();
+    wireLifecycle();
+    $('#invites-refresh').addEventListener('click', () => loadInvites({ force: true }));
     applyPage();
 
     loadPrefs();
@@ -3257,7 +4659,12 @@
         state.session = s;
         syncAccessVisibility();
         renderHeader();
-        if (s.accessAdmin === true) loadAccess();
+        if (s.accessAdmin === true) {
+          loadAccess();
+          loadInvites();
+          loadArchives();
+        }
+        loadTelegram();
       })
       .catch((err) => {
         if (err.status !== 401) {
@@ -3265,7 +4672,12 @@
             state.session = s;
             syncAccessVisibility();
             renderHeader();
-            if (s.accessAdmin === true) loadAccess();
+            if (s.accessAdmin === true) {
+              loadAccess();
+              loadInvites();
+              loadArchives();
+            }
+            loadTelegram();
           }).catch(() => {}));
         }
       });

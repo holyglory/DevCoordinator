@@ -2,11 +2,75 @@
 
 ## Direction
 
-Confirmed user intent: one canonical local worktree is one project; removal is a reversible, data-retaining decommission rather than cosmetic hiding; coordinator state and actions must be real, attributable, and fail closed; ports remain stable; background UI work stays bounded; and protected Console access is explicit per account and domain. See [DC-2026-07-14-STATE-01](DecisionDetails/DC-2026-07-14-STATE-01.md), [DC-2026-07-13-01](DecisionDetails/DC-2026-07-13-01.md), [DC-2026-07-10-03](DecisionDetails/DC-2026-07-10-03.md), [DC-2026-07-06-01](DecisionDetails/DC-2026-07-06-01.md), [DC-2026-07-13-05](DecisionDetails/DC-2026-07-13-05.md), and [DC-2026-07-14-ACCESS-01](DecisionDetails/DC-2026-07-14-ACCESS-01.md).
+Confirmed user intent: one canonical local worktree is one project; immutable coordinator identity—not UI name resemblance—determines resource membership; project collections stay compact through accessible bounded disclosure; Archive is a reversible, data-retaining decommission while permanent removal is a separate exact-target cleanup; coordinator state and actions must be real, attributable, and fail closed; ports remain stable; protected Console access is explicit per account and domain, with exact-resource invite requests rather than silent denial; project-scoped operational events can reach separately approved Telegram users through user-owned bots; and Codex annotations must remain usable without enabling inline page scripts. The authenticated annotation boundary uses explicitly approved split inline-style permissions while broad styles and inline scripts remain blocked. See [DC-2026-07-18-INVITES-01](DecisionDetails/DC-2026-07-18-INVITES-01.md), [DC-2026-07-18-LIFECYCLE-01](DecisionDetails/DC-2026-07-18-LIFECYCLE-01.md), [DC-2026-07-18-SERVERS-01](DecisionDetails/DC-2026-07-18-SERVERS-01.md), [DC-2026-07-14-STATE-01](DecisionDetails/DC-2026-07-14-STATE-01.md), [DC-2026-07-13-01](DecisionDetails/DC-2026-07-13-01.md), [DC-2026-07-10-03](DecisionDetails/DC-2026-07-10-03.md), [DC-2026-07-06-01](DecisionDetails/DC-2026-07-06-01.md), [DC-2026-07-13-05](DecisionDetails/DC-2026-07-13-05.md), [DC-2026-07-14-ACCESS-01](DecisionDetails/DC-2026-07-14-ACCESS-01.md), [DC-2026-07-16-ANNOTATION-01](DecisionDetails/DC-2026-07-16-ANNOTATION-01.md), and [DC-2026-07-17-ANNOTATION-03](DecisionDetails/DC-2026-07-17-ANNOTATION-03.md).
 
-Confirmed operational direction: all enrolled users and agents on one host use one service-owned Coordinator authority through peer-authenticated authorization; clients do not open the authority database; Docker routes survive container replacement without discarding retained history; a Google-protected route may translate the approved identity into a private route-scoped backend credential without exposing a second browser login; native work follows the Build macOS Apps workflow; and releases require remote-fresh, production-shaped evidence. See [DC-2026-07-15-HOST-01](DecisionDetails/DC-2026-07-15-HOST-01.md), [DC-2026-07-16-ROUTES-01](DecisionDetails/DC-2026-07-16-ROUTES-01.md), [DC-2026-07-16-AUTH-01](DecisionDetails/DC-2026-07-16-AUTH-01.md), [DC-2026-07-10-07](DecisionDetails/DC-2026-07-10-07.md), and [DC-2026-07-11-19](DecisionDetails/DC-2026-07-11-19.md).
+Confirmed operational direction: all enrolled users and agents on one host use one service-owned Coordinator authority through peer-authenticated authorization; clients do not open the authority database; public and authenticated listeners remain independent availability boundaries during control-dependency maintenance, with supervised exits and durable journal evidence; authorization-schema upgrades migrate and reconcile protected profiles before a production restart; Docker routes survive container replacement without discarding retained history; a Google-protected route may translate the approved identity into a private route-scoped backend credential without exposing a second browser login; native work follows the Build macOS Apps workflow; and releases require remote-fresh, production-shaped evidence. See [DC-2026-07-20-CONSOLE-RESILIENCE-01](DecisionDetails/DC-2026-07-20-CONSOLE-RESILIENCE-01.md), [DC-2026-07-19-ENROLLMENT-01](DecisionDetails/DC-2026-07-19-ENROLLMENT-01.md), [DC-2026-07-15-HOST-01](DecisionDetails/DC-2026-07-15-HOST-01.md), [DC-2026-07-16-ROUTES-01](DecisionDetails/DC-2026-07-16-ROUTES-01.md), [DC-2026-07-16-AUTH-01](DecisionDetails/DC-2026-07-16-AUTH-01.md), [DC-2026-07-10-07](DecisionDetails/DC-2026-07-10-07.md), and [DC-2026-07-11-19](DecisionDetails/DC-2026-07-11-19.md).
 
 Inferred direction: the owner prefers compact, actionable status over persistent generic warnings and favors durable safety boundaries over UI-only or denormalized shortcuts. See [DC-2026-07-13-08](DecisionDetails/DC-2026-07-13-08.md), [DC-2026-07-07-01](DecisionDetails/DC-2026-07-07-01.md), and [DC-2026-07-14-STATE-01](DecisionDetails/DC-2026-07-14-STATE-01.md); revisit this inference if later explicit direction conflicts.
+
+## DC-2026-07-20-CONSOLE-RESILIENCE-01 — Listener availability does not cascade through control dependencies
+
+ID: DC-2026-07-20-CONSOLE-RESILIENCE-01 · Details: [supporting record](DecisionDetails/DC-2026-07-20-CONSOLE-RESILIENCE-01.md)
+
+Decision: Keep the public Console, authenticated loopback API, and server-wide broker as separately supervised availability boundaries. The Console softly wants and starts after the API, and the API softly wants and starts after the broker; both listener units fail closed at startup, restart after unexpected failed or clean process exits, and write structured lifecycle evidence to persistent journald identities, while an explicit systemd stop remains authoritative.
+
+Why: The prior `Requires=` chain plus a manual dependency-order recovery was tried and failed: stopping the API for an offline enrollment cleanly stopped the public TLS edge, and later starting broker plus API did not start the reverse-dependent Console. `Restart=always` alone cannot override a systemd stop job, while an always-up `Upholds=` supervisor would counter intentional independent maintenance. Soft `Wants=`/`After=` relationships preserve listener availability and automatic crash recovery without weakening authenticated registration/readiness checks or making an explicit operator stop dishonest.
+
+## DC-2026-07-19-ENROLLMENT-01 — Authorization upgrades migrate before restart
+
+ID: DC-2026-07-19-ENROLLMENT-01 · Details: [supporting record](DecisionDetails/DC-2026-07-19-ENROLLMENT-01.md)
+
+Decision: Treat protected client profiles and service-database enrollment rows as one versioned authorization contract. A newly required enrollment invariant must provide an offline, exact, profile-backed migration that preserves existing grants, and installation must reject profile/database drift before restarting the broker. Arbitrary generation drift fails closed; the sole repair is an explicit offline generation-forward reconciliation that proves the same UID, account, repository ID/root, active installation, and unchanged ACL digest, then atomically changes only the protected profile's generation scalar before migration. Deployment readiness requires the broker, authenticated loopback inventory, and the Console's exact registered MainPID, listener, assignment, and lease to converge.
+
+Why: Silently creating a mandatory table empty caused valid pre-upgrade profiles to fail closed only after the restart had already stopped the API and Console; weakening authorization, inferring grants from names, deleting stale profile entries, normal re-enrollment from changed manifests, or relying on post-start retries would either broaden or rebuild access, discard intended access, or repeat the outage. Exact trusted-profile migration, narrowly proved metadata reconciliation, and two-way pre-restart consistency validation preserve least privilege and keep failure on the safe side of the production stop boundary.
+
+## DC-2026-07-18-INVITES-01 — Exact invite approval and user-owned Telegram notification bots
+
+ID: DC-2026-07-18-INVITES-01 · Details: [supporting record](DecisionDetails/DC-2026-07-18-INVITES-01.md)
+
+Decision: Retain a verified Google identity session even when it has no grant, while continuing to deny every protected HTTP and WebSocket resource until an owner atomically approves that exact Console or route request. Let each Console-authorized account register and manage only its own Telegram bots, let configured owners administer all bots, bind bot subscriptions to immutable coordinator repository IDs, and require a separate per-bot approval of private-chat `/start` users before notifications. Consume the coordinator's durable lifecycle and explicit host-observation transitions through a restart-safe delivery cursor and outbox; validate bot tokens server-side, keep them only in private server state, use long polling, and require explicit takeover before removing an existing webhook.
+
+Why: Discarding the verified Google identity makes a trustworthy request impossible, while granting on request or accepting a client-supplied email/resource would bypass the established owner boundary; one global bot or display-name subscriptions would mix owners and projects; Console-action hooks would miss other accounts, agents, and crashes; and best-effort sends would lose events during Telegram or Console outages. Exact server-derived requests, per-bot ownership and authorization, immutable project bindings, coordinator-wide durable events, and a replay-safe outbox satisfy the access and continuous-notification journeys better than automatic grants, shared tokens, name matching, webhooks requiring another public ingress, or UI-only event capture.
+
+## DC-2026-07-18-LIFECYCLE-01 — Archive is reversible decommission; removal is exact typed cleanup
+
+ID: DC-2026-07-18-LIFECYCLE-01 · Details: [supporting record](DecisionDetails/DC-2026-07-18-LIFECYCLE-01.md)
+
+Decision: Present the existing reversible repository decommission as Archive while retaining `repository remove` as a compatibility alias; add exact, separately planned archive, restore, and permanent-removal lifecycles for projects, managed servers, Docker containers, and local worktrees. Every permanent removal requires a completed archive, a fresh immutable-identity plan, live authorization at apply time, exact plan ID and SHA-256 fingerprint, an exact target confirmation phrase, crash-resumable phases, and a durable audit tombstone. Project removal affects only the Coordinator catalog; worktree removal follows that project tombstone and never targets a primary clone or remote repository; Docker removal never removes volumes or images; and logs, databases, volumes, images, networks, credentials, routes, and remote repositories are never implicit deletion side effects.
+
+Why: Reusing the established `repository remove` name for destructive deletion would silently reverse its recorded data-retention contract, while cosmetic Hide leaves runtimes and restart policies active; unplanned recursive project cleanup can cross Git common directories, Compose ownership, persistent data, and account boundaries. A distinct Archive/Restore journey plus independently planned exact-target removal is more explicit, reversible where possible, auditable, and safer than name-based deletion, cascades, raw filesystem deletion, forced Docker removal, or relabeling the existing UI-only Hide control.
+
+## DC-2026-07-18-SERVERS-01 — Server groups disclose immutable canonical membership
+
+ID: DC-2026-07-18-SERVERS-01 · Details: [supporting record](DecisionDetails/DC-2026-07-18-SERVERS-01.md)
+
+Decision: Define current Docker presence by the latest completed Docker-available observation, retain but exclude absent history from current projections, resolve authoritative Compose working directories to their nearest enrolled canonical Git worktree, require exact Docker immutable identities, carry exact container resource IDs through project membership, suppress only uniquely proved retained short-ID aliases in compatibility views, and present every nonempty Servers group as a collapsed-by-default accessible disclosure with one bounded group open at a time; residual current evidence is named Unassigned Resources.
+
+Why: UI prefix guessing and bulk manual attachment would make ownership brittle and unsafe after Compose replacement; projecting absent rows as current invented a 102-row fallback group, while deleting history would violate retention; flat or multiply expanded groups recreate an unbounded stacked list; and persisted disclosure state can hide newly relevant resources across sessions. Snapshot presence, canonical path, and immutable-ID evidence plus transient one-group disclosure preserve truthful current state, attribution, history, discoverability, and the 75-row browser boundary.
+
+## DC-2026-07-17-ANNOTATION-03 — Split inline styles for annotation compatibility
+
+ID: DC-2026-07-17-ANNOTATION-03 · Details: [supporting record](DecisionDetails/DC-2026-07-17-ANNOTATION-03.md)
+
+Decision: Permit inline style attributes and inline style elements through separate `style-src-attr 'unsafe-inline'` and `style-src-elem 'self' 'unsafe-inline'` directives while retaining strict `style-src 'self'` and `script-src 'self'` fallbacks and adding no speculative frame or resource sources.
+
+Why: The attr-only policy was tried and failed the authenticated in-app annotation path because inherited annotation documents still blocked renderer style elements. Removing CSP, broad `style-src 'unsafe-inline'`, inline scripts, nonces/hashes unavailable to the injected renderer, and speculative blob/data sources were either materially broader or did not satisfy the observed renderer boundary. The user explicitly approved the narrow element directive on 2026-07-17 after its CSS-injection risk and bounded Chromium evidence were explained.
+
+## DC-2026-07-16-ANNOTATION-02 — Attr-only annotation compatibility was invalidated
+
+ID: DC-2026-07-16-ANNOTATION-02 · Details: [supporting record](DecisionDetails/DC-2026-07-16-ANNOTATION-02.md)
+
+Decision: Treat the deployed `style-src-attr 'unsafe-inline'` exception as invalidated rather than annotation compatible; it was retained only while the split style-element permission awaited explicit approval and is superseded by DC-2026-07-17-ANNOTATION-03.
+
+Why: The user's authenticated retest still showed an unstyled white renderer square and no selection. The previous detector modeled only outer attributes and incorrectly rejected renderer style elements; the corrected parent plus inherited-child fixture catches `style-src-elem` violations and proves the split directive without enabling scripts. Its CSS-injection risk was not part of the earlier approval, and the user later approved it explicitly under DC-2026-07-17-ANNOTATION-03.
+
+## DC-2026-07-16-ANNOTATION-01 — Console collections keep a bounded mounted surface
+
+ID: DC-2026-07-16-ANNOTATION-01 · Details: [supporting record](DecisionDetails/DC-2026-07-16-ANNOTATION-01.md)
+
+Decision: Mount dynamic content only for the active Console hash page, show Projects as collapsed repo headers with one expanded repo at a time, and losslessly page Servers, Docker containers, and expanded project members at 75 rows as a browser-performance boundary, not as annotation compatibility evidence.
+
+Why: Eager mounting imposed exceptional DOM and geometry-scan cost; discarding stopped history would violate retention, virtualization added unnecessary focus and measurement complexity, and unbounded expansion would move the cost. The first annotation diagnosis was disproved by the user's live retest and is superseded by DC-2026-07-16-ANNOTATION-02, while bounded pagination remains valuable independently.
 
 ## DC-2026-07-16-AUTH-01 — Google-protected routes translate private upstream credentials
 
@@ -28,9 +92,9 @@ Why: First-match lookup routed production traffic to an older stopped SkydiveLiv
 
 ID: DC-2026-07-15-HOST-01 · Details: [supporting record](DecisionDetails/DC-2026-07-15-HOST-01.md)
 
-Decision: Make the service-owned database at `/var/lib/devcoordinator/coordinator.sqlite3` and peer-authenticated socket at `/run/devcoordinator/broker.sock` the default, single host authority for every enrolled OS account and agent. Keep per-user files only as non-authoritative migration, launch-log, or reconciliation evidence; use direct canonical symlinks for code discovery, never as a permission bypass.
+Decision: Make the service-owned database at `/var/lib/devcoordinator/coordinator.sqlite3` and peer-authenticated socket at `/run/devcoordinator/broker.sock` the default, single host authority for every enrolled OS account and agent. Perform host and Docker sampling through an authorized, owner-fenced `HOST_OBSERVE` broker operation whose production snapshot callback uses the service `AccountStore`; keep per-user files only as non-authoritative migration, launch-log, or reconciliation evidence; use direct canonical symlinks for code discovery, never as a permission bypass; and retain `ProtectHome=read-only` while a transactional generated drop-in exposes only the complete current set of enrolled canonical home directories as writable for separately authorized host-file lifecycle work.
 
-Why: The private-account default let `holygloryTT` start a healthy `prtzn-vpn` server that the `holyglory` Console authority could not see. Cross-user writable SQLite through symlinks loses ownership and authentication, while UI-side inventory merging retains conflicting writers. One system broker uniquely provides one inventory and reservation authority without recurring elevation prompts.
+Why: The private-account default let `holygloryTT` start a healthy `prtzn-vpn` server that the `holyglory` Console authority could not see. Cross-user writable SQLite through symlinks loses ownership and authentication, while UI-side inventory merging retains conflicting writers and client-side observation would recreate multiple authorities; a broad writable `/home` weakens isolation, while a permanently read-only home namespace makes exact worktree cleanup impossible. One system broker plus a replacement-scoped enrolled-home allowlist uniquely provides one inventory, observation, reservation, and plan-bound filesystem authority without recurring elevation prompts or exposing unrelated users' homes.
 
 ## DC-2026-07-14-ACCESS-01 — Per-account domain grants with configured owners
 
@@ -44,9 +108,9 @@ Why: A global allowlist cannot express per-domain access, while letting every Co
 
 ID: DC-2026-07-14-STATE-01 · Details: [supporting record](DecisionDetails/DC-2026-07-14-STATE-01.md)
 
-Decision: Use a private normalized SQLite/WAL authority per effective account, transactional same-UID legacy import, one observer per host-resource domain, and a peer-authenticated broker for cross-UID ports and Docker. Repository removal fences starts, disables captured auto-start policy, stops and verifies exact resources, releases leases and assignments, then hides the repository while retaining data and history.
+Decision: Preserve the normalized SQLite/WAL data model, transactional legacy import, one observer per host-resource domain, and reversible repository decommission semantics. The former private-authority-per-effective-account placement is superseded by DC-2026-07-15-HOST-01: managed hosts use one peer-authenticated service authority. Repository removal fences starts, disables captured auto-start policy, stops and verifies exact resources, releases leases and assignments, then hides the repository while retaining data and history.
 
-Why: Board-only hiding plus Stop could lie when another source or restart policy revived a project, while per-home JSON tombstones still allowed authorities to disagree. The normalized store and broker cost more but uniquely provide one repository identity, durable decommission, controlled reinstall, and honest host-wide arbitration.
+Why: Board-only hiding plus Stop could lie when another source or restart policy revived a project, while per-home JSON tombstones and later per-account authorities still allowed authorities to disagree. The normalized domain model plus the superseding single host broker cost more but uniquely provide one repository identity, durable decommission, controlled reinstall, and honest host-wide arbitration.
 
 ## DC-2026-07-13-01 — DevOps Board project identity is one canonical worktree, never one coordinator source
 
@@ -60,9 +124,9 @@ Why: Source-scoped grouping tripled Nevod and name-derived grouping invented pro
 
 ID: DC-2026-07-13-02 · Details: [supporting record](DecisionDetails/DC-2026-07-13-02.md)
 
-Decision: Resolve the default coordinator home from the effective POSIX login account rather than a host application's remapped HOME. Same-UID applications share one authority; different UIDs retain private stores and use either disjoint ranges or the authenticated host broker.
+Decision: Resolve per-account launch, log, migration, and reconciliation files from the effective POSIX login account rather than a host application's remapped HOME. The former separate-authority-per-UID placement is superseded by DC-2026-07-15-HOST-01: enrolled UIDs share the service authority, while an explicit isolated mode remains deliberately non-host-global.
 
-Why: Parall remapped HOME and made the Board select a valid but empty store. A cross-UID writable store would weaken isolation, while independent homes cannot guarantee host-wide uniqueness; account ownership plus a broker preserves both boundaries.
+Why: Parall remapped HOME and made the Board select a valid but empty store. A cross-UID writable database would weaken isolation, while independent authorities cannot guarantee host-wide uniqueness; login-owned private evidence plus the single peer-authenticated broker preserves both boundaries.
 
 ## DC-2026-07-11-01 — The final legacy-cgroup gate is a handoff, not a second quiescence window
 

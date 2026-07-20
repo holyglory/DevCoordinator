@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import sys
 import tempfile
 import unittest
@@ -29,6 +30,32 @@ def private_directory(path: Path) -> Path:
     path.mkdir(parents=True, mode=0o700)
     path.chmod(0o700)
     return path
+
+
+def test_temp_base() -> Path:
+    """Select a writable canonical base outside host/user Git worktrees."""
+
+    candidates = (
+        os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT"),
+        pwd.getpwuid(os.geteuid()).pw_dir,
+        tempfile.gettempdir(),
+    )
+    for raw in dict.fromkeys(value for value in candidates if value):
+        base = Path(str(raw)).resolve()
+        if not base.is_dir() or not os.access(base, os.W_OK | os.X_OK):
+            continue
+        cursor = base
+        inside_git = False
+        while True:
+            if (cursor / ".git").exists() or (cursor / ".git").is_symlink():
+                inside_git = True
+                break
+            if cursor.parent == cursor:
+                break
+            cursor = cursor.parent
+        if not inside_git:
+            return base
+    raise RuntimeError("no writable test temp root exists outside every Git worktree")
 
 
 def git_repository(path: Path) -> Path:
@@ -71,7 +98,9 @@ def legacy_state(repository: Path, *, revision: int = 1) -> dict:
 
 class LifecycleActionGuardTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix=".lifecycle-action-guard-", dir=test_temp_base()
+        )
         self.root = Path(self.temporary.name).resolve()
         self.home = self.root / "coordinator"
         self.repository = git_repository(self.root / "repo")
@@ -898,6 +927,39 @@ class LifecycleActionGuardTests(unittest.TestCase):
             [(row["kind"], row["status"]) for row in operations],
             [("guard:start", "failed")],
         )
+
+    def test_explicit_start_owns_loading_after_policy_restore_preflight(self) -> None:
+        self.install_repository()
+        events: list[str] = []
+
+        def record_restore(*_args: object, **_kwargs: object) -> None:
+            events.append("policy-restore")
+
+        def record_explicit_start(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("explicit-start")
+            return {"action": "start", "ok": True}
+
+        with mock.patch.object(
+            coordinator.RepositoryLifecycle,
+            "restore_startup_policies_for_start",
+            side_effect=record_restore,
+        ) as restore, mock.patch.object(
+            coordinator,
+            "execute_project_start",
+            side_effect=record_explicit_start,
+        ) as explicit_start:
+            result = coordinator.coordinated_project_runtime_start(
+                {
+                    "agent": "guard-test",
+                    "project": str(self.repository),
+                    "dry_run": True,
+                }
+            )
+
+        self.assertEqual(result["action"], "start")
+        self.assertEqual(events, ["policy-restore", "explicit-start"])
+        restore.assert_called_once()
+        explicit_start.assert_called_once()
 
     def test_direct_lease_before_observe_imports_legacy_truth_first(self) -> None:
         source = private_directory(self.root / "legacy-source")

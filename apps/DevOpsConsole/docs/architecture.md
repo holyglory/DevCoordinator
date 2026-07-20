@@ -16,16 +16,19 @@ A single Node process that is the public edge of the VPS `vr.ae`:
 2. **Host routing**: `console.vr.ae` → control-panel app (auth + API + UI).
    `<slug>.vr.ae` → reverse proxy to `127.0.0.1:<port>` (HTTP + WebSocket/HMR).
    Apex `vr.ae` and `www.vr.ae` → redirect to the console. Foreign hosts → 421.
-3. **Google auth (OIDC)**: authorization-code flow + PKCE against
+3. **Google identity (OIDC)**: authorization-code flow + PKCE against
    `https://accounts.google.com`, verified Google email identity, and one
-   HMAC-signed session cookie on `Domain=.vr.ae` so a login can cover every
-   granted subdomain.
+   HMAC-signed identity cookie on `Domain=.vr.ae` so a login can cover every
+   granted subdomain. A valid identity is not itself an authorization grant.
 4. **Per-account access control**: `ALLOWED_EMAILS` is the configured owner
    set (full access + access administration). Invited Google accounts and
    exact `console` / `route:<slug>` grants live in private Console state. Each
    route is `google` (default) or `public`; public bypasses identity, while a
    protected route requires its exact grant. **Unknown slugs behave exactly
    like protected ones for anonymous users** so names cannot be enumerated.
+   A verified identity denied at an existing protected destination may submit
+   one host-derived exact-resource invite request; configured owners alone
+   review the Incoming invites queue and approve or deny it.
 5. **Protected upstream credential translation**: after Google identity and
    an exact route grant pass, a route may replace caller `Authorization` with
    a private route-scoped Bearer or Basic credential. The credential never
@@ -36,6 +39,11 @@ A single Node process that is the public edge of the VPS `vr.ae`:
    (`docs/coordinator-http-api.json` is the authoritative endpoint map). The
    production `dev-coordinator.service` owns that process. Optional local
    autostart is available only when `COORDINATOR_AUTOSTART=1`.
+7. **Telegram notifications**: any Console-authorized account may register and
+   own bots, while configured owners may administer all of them. Exact
+   coordinator `repo_id` assignments select events. Private `/start` messages
+   enter a per-bot approval queue; approved chats receive coordinator journal
+   events through long polling plus a durable cursor/outbox delivery path.
 
 ## Files and ownership (one implementation agent each)
 
@@ -43,7 +51,7 @@ A single Node process that is the public edge of the VPS `vr.ae`:
 |---|---|
 | A core | `package.json`, `bin/devops-console.mjs`, `bin/devops-console-upstream-auth.mjs`, `src/config.mjs`, `src/log.mjs`, `src/certs.mjs`, `src/server.mjs`, `src/router.mjs`, `src/proxy.mjs`, `src/upstream-auth.mjs` |
 | B auth | `src/auth/session.mjs`, `src/auth/oidc.mjs`, `src/auth/guard.mjs`, `src/auth/pages.mjs` |
-| C control | `src/coordinator.mjs`, `src/routes.mjs`, `src/access.mjs`, `src/api.mjs`, `src/metrics.mjs`, `src/prefs.mjs` |
+| C control | `src/coordinator.mjs`, `src/routes.mjs`, `src/access.mjs`, `src/telegram.mjs`, `src/api.mjs`, `src/metrics.mjs`, `src/prefs.mjs` |
 | D ui | `src/static.mjs`, `src/ui/index.html`, `src/ui/app.css`, `src/ui/app.js`, `docs/journeys.md` |
 
 Nobody else touches another agent's files; the integrator reconciles.
@@ -141,7 +149,7 @@ export async function startServers({ config, log, certManager, router })
 
 ```js
 export function createRouter(deps) // → { handleRequest(req,res), handleUpgrade(req,socket,head) }
-// deps: { config, log, guard, oidc, sessions, pages, consoleApi, staticServer, routeStore, upstreamAuthStore, coordinator, proxy }
+// deps: { config, log, guard, oidc, sessions, pages, consoleApi, staticServer, routeStore, accessStore, upstreamAuthStore, coordinator, proxy }
 ```
 
 Dispatch (both request and upgrade paths):
@@ -151,9 +159,10 @@ Dispatch (both request and upgrade paths):
 3. apex / `www.` → 301 `config.consoleOrigin + '/'`.
 4. `host === consoleHost` → console app:
    - `/auth/*` → auth endpoints (below), no session required.
-   - everything else requires a current known session plus the `console`
-     grant (owners always pass). Missing sessions redirect browser GETs to
-     login or return JSON 401; known accounts without the grant receive 403.
+   - everything else requires a verified identity plus current known-account
+     membership and the `console` grant (owners always pass). Missing identity
+     redirects browser GETs to login or returns JSON 401; any verified identity
+     without the grant receives a 403 page with a host-bound invite action.
    - `/api/*` → `consoleApi.handle(req, res, session)`.
    - else `staticServer.handle(req, res)` (UI).
    - upgrades on consoleHost: destroy (no WS on console in v1).
@@ -163,8 +172,10 @@ Dispatch (both request and upgrade paths):
    - `needAuth` and no valid session → browser GET/HEAD: 302 to
      `${consoleOrigin}/auth/login?rt=${encodeURIComponent(fullUrl)}`;
      non-browser or upgrade: 401 / socket destroy.
-   - a known signed-in account without `route:<slug>` → 403 for both HTTP and
-     WebSocket. Owners always pass. Public routes bypass this check.
+   - a verified account without current `route:<slug>` authorization → 403 for
+     both HTTP and WebSocket. The HTTP denial page can request that exact route
+     instance; WebSocket denial remains non-interactive. Owners always pass.
+     Public routes bypass this check.
    - no route (after auth) → `pages.renderNotFound` 404.
    - `target = await routeStore.resolve(slug, coordinator)`;
      unresolvable (linked server stopped) → `pages.renderUpstreamError` 502
@@ -175,15 +186,22 @@ Dispatch (both request and upgrade paths):
    - `proxy.forward(req, res, target)` / `proxy.forwardUpgrade(req, socket, head, target)`.
 6. anything else → 421 `pages.renderError`.
 
-Auth endpoints (console host only):
-- `GET /auth/login?rt=` — login page (authed → 302 rt-or-`/`). Shows Google
+Auth endpoints (Console host except the host-local invite POST):
+- `GET /auth/login?rt=` — login page (identity present → 302 rt-or-`/`). Shows Google
   button → `/auth/start?rt=`; degraded mode → setup banner instead.
 - `GET /auth/start?rt=` — 302 to Google authorize URL; sets flow cookie.
 - `GET /auth/callback` — validates flow, exchanges code, verifies ID token,
-  current owner/invited-user membership check → session cookie
-  (`Domain=.vr.ae`) → 302 validated `rt` or `/`. Unknown email → 403
-  `pages.renderDenied` (no cookie). A known account may then receive a
-  resource-specific 403 at its return host. OIDC errors → 400 login page.
+  issues the signed identity cookie (`Domain=.vr.ae`) for every verified
+  Google account, then redirects to validated `rt` or `/`. Current membership
+  and resource authorization are evaluated only at the returned destination;
+  unknown or ungranted accounts receive its exact 403 invite journey. OIDC
+  errors → 400 login page.
+- `POST /auth/request-invite` — same-origin-only form endpoint on the current
+  Console or protected route host. Requires a verified identity and a
+  short-lived signed claim bound to Google subject/email, request host,
+  server-derived resource, and immutable resource instance. It never accepts
+  a browser-selected email/resource. Duplicate pending requests are
+  idempotent; bounded rate/cooldown errors return an honest result page.
 - `GET|POST /auth/logout` — expire cookie, 302 `/auth/login`.
 
 `rt` validation (in guard): absolute URL, scheme matches deployment
@@ -276,28 +294,37 @@ export class OidcError extends Error {} // .code: 'state_mismatch'|'exchange_fai
 
 ```js
 export function createGuard({ sessions, access, config, log })
-// → { sessionFrom(req): session|null,          // parse + live membership re-check
+// → { identityFrom(req): session|null,         // verified signed identity; grants nothing
+//     sessionFrom(req): session|null,          // identity + live membership re-check
 //     isKnownEmail(email): boolean,
 //     isAdmin(sessionOrEmail): boolean,
 //     hasAccess(sessionOrEmail, resource): boolean,
 //     wantsHtml(req): boolean,
 //     loginRedirectUrl(req): string,           // console /auth/login?rt=<abs url of req>
 //     validateRt(rt): string,                  // safe return URL or '/'
-//     checkOrigin(req): boolean }              // mutation CSRF: Origin/Referer must match consoleOrigin
+//     checkOrigin(req): boolean,               // API mutation CSRF vs consoleOrigin
+//     checkOriginFor(req, origin): boolean }   // invite POST CSRF vs the current host origin
 ```
-Every mutating console-API request must pass `checkOrigin` (403 otherwise).
+`identityFrom` is deliberately authorization-neutral; router checks current
+membership and the exact grant independently. Every mutating console-API
+request must pass `checkOrigin` (403 otherwise), and a host-local invite form
+must pass `checkOriginFor` against that host's origin.
 
 ## Pages (`src/auth/pages.mjs`)
 
 ```js
 export function createPages({ config })
-// → { renderLogin({ rt, error, degraded }), renderDenied({ email, resource, sessionSet }),
+// → { renderLogin({ rt, error, degraded }),
+//     renderDenied({ email, resource, sessionSet, requestToken }),
+//     renderInviteResult({ status, duplicate, error, retryAfter }),
 //     renderNotFound({ slug }), renderUpstreamError({ slug, kind, detail, consoleUrl }),
 //     renderError({ status, title, detail }) } // each → { status, html }
 ```
 Self-contained dark-theme HTML (inline CSS, no external assets), consistent
 branding "DevOps Console — vr.ae". Never echo user input unescaped
-(`escapeHtml` mandatory).
+(`escapeHtml` mandatory). A denied existing protected resource displays the
+exact **Request invite** submit action only when the router supplies a valid
+short-lived claim; unknown slugs remain unrequestable.
 
 ## Coordinator client (`src/coordinator.mjs`)
 
@@ -307,16 +334,22 @@ export function createCoordinator({ config, log })
 //     probe(): Promise<boolean>,                       // anonymous GET /healthz, 2s timeout
 //     inventory({ maxAgeMs = 5000 } = {}): Promise<Inventory>,   // cached + coalesced
 //     serversRaw({ maxAgeMs = 3000 } = {}): Promise<Server[]>,   // GET /v1/servers cached
+//     events({ after = null, limit = 100 } = {}): Promise<EventPage>,
+//     observeHost(b): Promise<ObservationResult>,
 //     request(method, path, body, { timeoutMs }): Promise<any>,  // throws CoordError
 //     leasePort(b), releasePort(b), serverStart(b), serverStop(b), serverRestart(b),
 //     serverLogs(b), serverRegister(b), dockerAction(name, action, b), dockerLogs(b),
+//     lifecycleArchives(), lifecyclePlan(b), lifecycleApply(b), lifecycleRestore(b),
 //     status(): { ok, url, autostarted, lastError, lastOkAt },
 //     close() }
 export class CoordError extends Error {} // .status (http), .body
 ```
 - Requests may run concurrently; the coordinator serializes only short state
   reservation/commit phases and rejects conflicting lifecycle targets. Per-path timeouts:
-  `/v1/projects/*` 300s, `/v1/inventory` 60s, docker 60s, rest 15s. The
+  `/v1/lifecycle/apply` 600s, other `/v1/lifecycle/*` and `/v1/projects/*`
+  300s, `/v1/inventory` 60s, docker 60s, rest 15s. Apply/restore reports with
+  `ok:false`, `partial:true`, `needs_attention:true`, or an incomplete status
+  remain `CoordError` failures even when the HTTP response is 200. The
   systemd-only readiness gate uses authenticated `GET /v1/inventory/no-docker`
   so exact server/assignment/lease observation is not coupled to Docker CLI or
   daemon availability.
@@ -324,6 +357,13 @@ export class CoordError extends Error {} // .status (http), .body
   (`"'agent'"`) — surface `.message` trimmed of surrounding quotes.
 - Every `/v1/*` request reads the private `COORDINATOR_TOKEN_FILE` server-side
   and sends `Authorization: Bearer …`; `/healthz` is the only anonymous route.
+- `observeHost` is an explicit `POST /v1/observe` with mutation attribution.
+  It commits real server/Docker observation transitions; repeated unchanged
+  samples emit nothing, and unavailable/unobservable state never invents a
+  stopped resource. `events` reads `GET /v1/events` in durable insertion order.
+  `after`/`next_cursor` are bounded opaque coordinator cursors (never parsed as
+  timestamps or IDs), and `limit` is 1–500 so the Telegram consumer can page
+  without skipping a later-committed event.
 - `ensureRunning()`: probe; if down and `coordinatorAutostart`, spawn
   `python3 <coordinatorScript> api serve --host 127.0.0.1 --port <from url>`
   with `--token-file <coordinatorTokenFile>` detached (`stdio` → append
@@ -372,12 +412,16 @@ Schema on disk: `{ "version": 1, "routes": { "<slug>": Route } }`, atomic
 write (`.tmp` + `rename`). `Route`:
 ```js
 { slug, kind: 'port'|'server'|'docker',
+  instanceId,              // immutable UUID; generated when old rows migrate
   port?,                    // kind=port: 1-65535
   project?, serverName?,    // kind=server: coordinator identity key parts
   containerName?, containerPort?, // kind=docker: container + its CONTAINER-side port
   auth: 'google'|'public',  // DEFAULT 'google' — public must be explicit
   title?, createdAt, updatedAt }
 ```
+The slug is a human route name; `instanceId` is its authorization-request
+identity. Deleting and recreating the same slug creates a different instance,
+so a pending request cannot authorize a replacement route accidentally.
 Slug rules: regex above, single label, NOT in reserved set
 `{ console, www, api, auth, static, healthz }` ∪ `{config.consoleHost label}`.
 409 on duplicate. `resolve`: `kind=port` → that port; `kind=server` → find in
@@ -419,17 +463,26 @@ export function createAccessStore({ file, adminEmails, routeStore, log })
 // file: <stateDir>/access-control.json
 // → { load(), isAdmin(email), isKnown(email), canAccess(email, resource), list(),
 //     addUser({email,grants}), setGrant(email,resource,allowed), removeUser(email),
+//     resourceInstance(resource), listRequests({status}), pendingRequestCount(),
+//     requestAccess({email,subject,resource,resourceInstance,host,title,target}),
+//     decideRequest(id,decision,actor),
 //     clearResource(resource), moveResource(fromResource,toResource) }
 export const CONSOLE_GRANT = 'console'
 export const routeGrant = (slug) => `route:${slug}`
-export class AccessError extends Error {} // .status 400|404|409|500
+export class AccessError extends Error {} // .status 400|403|404|409|429|500|503
 ```
 
 Configured `adminEmails` (the normalized `ALLOWED_EMAILS` set) are immutable
 owners and are not written to state. Owners are always known, may administer
-access, and bypass every resource grant. Invited accounts are stored as
-`{version:1,users:{"email":{"grants":[...]}}}` and written atomically at mode
-`0600`. Email/grant mutations are serialized as server-side deltas so
+access, and bypass every resource grant. Invited accounts and access requests
+are stored as schema v2 `{version:2,users:{...},requests:{...}}`; a v1
+user-only policy migrates on load. Requests retain the verified email, a
+private Google-subject hash, exact resource and immutable resource-instance
+identity, server-derived display facts, status
+(`pending|approved|denied|stale`), and resolution audit fields. They are
+written atomically with grants at mode `0600`, so approval creates or merges
+the exact grant and resolves the request in one write. Email/grant and request
+mutations are serialized as server-side deltas so
 concurrent changes merge. A failed write leaves memory unchanged. Invalid
 policy is renamed to `.corrupt-<epoch>` and fails closed to owners only.
 Successful invitation, grant, and removal mutations are logged with the acting
@@ -442,15 +495,77 @@ sessions/grants. Loading prunes grants for absent routes. Route deletion clears
 the resource, new slug creation clears stale grants before the route appears,
 and server/container slug renames move grants to the new host.
 
+`requestAccess` accepts only the descriptor and immutable instance already
+derived and signed by the router. One pending subject/email/resource/instance
+request is idempotent; per-subject rate limits, denial cooldown, pending/total
+caps, and bounded resolved-history retention prevent queue abuse.
+`decideRequest` accepts only `approve|deny` and requires a configured owner.
+Removing or renaming a route marks its pending requests stale; reusing the slug
+cannot make them applicable to the new route instance.
+
+## Telegram service (`src/telegram.mjs`)
+
+```js
+export function createTelegramService({ file, log, fetchImpl, coordinator, isAdmin, ...timing })
+// → { load(), start(), stop(), status(), listBots({email}),
+//     registerBot({email,token,label,takeoverWebhook}),
+//     rotateBotToken({email,botId,token,takeoverWebhook}), removeBot({email,botId}),
+//     setBotEnabled({email,botId,enabled}), setBotLabel({email,botId,label}),
+//     assignProject({email,botId,repoId,assigned}), setProjects({email,botId,repoIds}),
+//     listAuthorizationQueue({email,botId,status}),
+//     decideAuthorization({email,requestId,decision}), revokeAuthorization({email,requestId}),
+//     processBotUpdates(botId), ingestEvents(), deliverDue() }
+export class TelegramServiceError extends Error {} // .status, .code, .retryAfter?
+```
+
+The private `<stateDir>/telegram-control.json` envelope contains registered
+bots, bot ownership, tokens, exact project assignments, durable Telegram
+update offsets, authorization decisions, the opaque coordinator event cursor,
+and recipient outbox deliveries. It must be a real non-symlink file owned by
+the Console account with no group/world permissions. Writes use an exclusive
+mode-`0600` temporary file, fsync, atomic rename, final chmod, and directory
+fsync. Invalid state is left untouched and fails startup. Bot tokens are
+redacted from exceptions/logs and omitted from every public view (`hasToken`
+is the only presence signal).
+
+Registration validates a token with Telegram `getMe`, inspects
+`getWebhookInfo`, and refuses an active webhook with code
+`telegram_webhook_active`. Only an explicit `takeoverWebhook` removes it with
+`deleteWebhook({drop_pending_updates:false})`; long polling then calls
+`getUpdates` and commits `update_id + 1` after idempotent processing. A bot is
+owned by the registering Console email. Non-admin callers can list and mutate
+only their bots; configured owners can administer all.
+
+Only a `/start` command from a private chat creates or refreshes a bot-specific
+authorization request. Telegram IDs are integer-safe decimal strings. The bot
+owner or configured owner alone decides `approve|deny`; this queue does not
+grant Google or Console access. Assignment accepts only current coordinator
+`repo_id` values and stores the exact IDs, while names and paths remain current
+inventory presentation.
+
+The dispatcher periodically invokes explicit coordinator host observation,
+then reads journal pages through `readEvents({after,limit})`. It validates each
+opaque `next_cursor`, atomically enqueues every eligible
+event/bot/approved-recipient delivery, and only then advances the cursor.
+`sendMessage` delivery survives restart via the outbox, observes Telegram
+`retry_after`, uses bounded exponential retry for transient failures, and
+disables/revokes only on explicit permanent Telegram rejection. This journal
+path covers lifecycle actions from the Console, CLI, Codex, Claude, or another
+agent as well as crashes/failures discovered by host observation.
+
 ## Console API (`src/api.mjs`)
 
 ```js
-export function createConsoleApi({ config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs })
+export function createConsoleApi({ config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram })
 // → { handle(req, res, session): Promise<void> }   // only called for /api/*
 ```
-JSON in/out; errors `{ "error": "<message>" }` with 400/401/403/404/409/502.
+JSON in/out; errors `{ "error": "<message>" }` with
+400/401/403/404/409/429/502/503. Telegram failures also expose a safe
+machine-readable `code` and, only for rate limiting, `retryAfter`; no token is
+ever serialized.
 A `CoordError` with a 4xx status (the coordinator answered, the request was
-bad — e.g. "matching lease not found") passes through as 400; transport
+bad — e.g. "matching lease not found") passes through as 400, except durable
+lifecycle conflicts/incomplete reports preserve 409; transport
 failures and 5xx surface as 502 with the coordinator's message. Mutations
 (POST/PATCH/DELETE) require `guard.checkOrigin` → else 403. Body limit 64KB.
 
@@ -458,9 +573,20 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 |---|---|
 | `GET /api/overview` | `{ console: { version, domain, consoleHost, now, tls: certManager.info(), devInsecureHttp }, coordinator: coordinator.status(), inventory: Inventory\|null, routes: RouteView[] }`. Inventory from `coordinator.inventory()`; on CoordError → `inventory: null` and `coordinator.ok:false` with error (HTTP still 200 — UI shows degraded state). `RouteView = Route + { url: 'https://<slug>.<domain>', upstreamAuth: { configured, scheme? }, resolved: { port, reason?, serverStatus?, containerStatus? } }` (kind=server resolves via `serversRaw`; kind=docker via the cached `inventory()` — both shared/coalesced). No upstream secret is returned. |
 | `GET /api/access` | Owner-only `{ version, users: [{ email, owner, grants }], resources: [{ id, kind, host, title, auth, target }], invitedCount }`. Configured owners appear locked; only owners may read the full email list. |
+| `GET /api/access/requests?status=pending\|approved\|denied\|stale\|all` | Owner-only `{ version, pendingCount, requests }`. Each request view carries its email, exact resource/host/target, status and decision metadata; private Google-subject hash and immutable resource-instance value remain server-only. Default status is `pending`. |
+| `POST /api/access/requests/:id/decision` | Owner-only `{ decision:'approve'\|'deny' }` → `{ request, pendingCount, access }`. Approval atomically merges the exact current resource grant; stale or already-conflicting decisions fail honestly. |
 | `POST /api/access/users` | Owner-only `{ email, grants? }` → 201 full access view. Invites an email identity; the invitation becomes usable only when verified Google OIDC returns that exact address. An empty grant list is allowed. |
 | `PATCH /api/access/users/:email` | Owner-only delta `{ resource, allowed: boolean }` → full access view. Configured owners are immutable. |
 | `DELETE /api/access/users/:email` | Owner-only removal → full access view; current sessions become unknown immediately. |
+| `GET /api/telegram` | Any Console-authorized account → `{ version, bots, projects }`. Non-owners see only bots they registered; configured owners see all. Bot views include identity/owner/status, exact assigned `projects`, redacted `hasToken`, and their Telegram authorization records. `projects` comes from fresh coordinator inventory as `{ id:repo_id, name, path }`. |
+| `POST /api/telegram/bots` | `{ token, label?, takeOver?:boolean }` → 201 full caller-visible Telegram view. Token is validated, never returned, and an active webhook yields code `telegram_webhook_active` unless `takeOver:true` was explicit. |
+| `DELETE /api/telegram/bots/:botId` | Bot owner or configured owner removes the bot and its queue/outbox state → full caller-visible Telegram view. |
+| `PATCH /api/telegram/bots/:botId/projects` | Bot owner or configured owner `{ projectIds:[repo_id,…] }` → full view. Every ID must exactly match current coordinator inventory; display names/paths are never assignment identity. |
+| `POST /api/telegram/bots/:botId/authorizations/:requestId/decision` | Bot owner or configured owner `{ decision:'approve'\|'deny' }` → full view. Request must belong to that exact bot; approval applies only to Telegram event delivery. |
+| `GET /api/lifecycle/list` | Owner-only normalized `{ archives }` from `GET /v1/archives`. Compatibility `repository` rows are emitted to the UI as canonical `project` targets. Counts remain unknown until this request succeeds. |
+| `POST /api/lifecycle/plan` | Owner-only `{ target_kind, target_id, action:'archive'\|'purge', reason? }`. `repository` input is normalized to `project`; archive must match a fresh active inventory identity, while purge must match an archived row with `removable:true`. Adds `agent:'devops-console:'+session.email` and returns the exact coordinator `{ plan }`. |
+| `POST /api/lifecycle/apply` | Owner-only `{ plan_id, plan_fingerprint, confirmation_phrase? }`; forwards exactly three coordinator fields: the immutable reviewed plan identity plus a string `confirmation_phrase` (`''` for archive, the exact server-issued phrase for purge) → `{ result }`. It never accepts a substitute target from the browser. |
+| `POST /api/lifecycle/restore` | Owner-only `{ target_kind, target_id, reason? }`; exact row must be archived with `restorable:true`. Adds operator attribution and `explicit:true` → `{ result }`. Success means the fence was cleared, never that the resource started. |
 | `POST /api/routes` | body `{ slug, kind, port?, project?, serverName?, containerName?, containerPort?, auth?, title? }` → 201 RouteView |
 | `PATCH /api/routes/:slug` | any of `{ auth, title, port, project, serverName, containerName, containerPort, kind }` → RouteView |
 | `DELETE /api/routes/:slug` | → `{ ok: true }` |
@@ -550,7 +676,29 @@ charts for every sampled server/container + per-project usage bars with
 sparklines), **Access** (the real owner/invited-user collection first; each
 invited user has exact Console/domain checkboxes; configured owners are locked;
 Add user opens a focused in-viewport dialog; remove names the account and
-immediate revocation consequence). Docker/Ports lists are grouped by repo with project subheaders.
+immediate revocation consequence), owner-only **Incoming invites** (the pending
+request collection first, with exact account/host/target and Approve/Deny), and
+**Telegram** for every Console-authorized account (owned bot collection first;
+Register bot opens a focused token dialog; exact project checkboxes and the
+bot-specific `/start` authorization queue stay with each bot). Bot tokens never
+render, and the optional existing-webhook takeover is a separate explicit
+checkbox shown by the registration journey. Docker/Ports lists are grouped by
+repo with project subheaders.
+Configured owners see compact **Active / Archived** filters with authoritative
+counts on Projects, Servers, and Docker; other Console operators see only the
+active collections. Active rows expose Archive separately from cosmetic Hide.
+Archived collections are grouped and collapsed by default, disclose at most
+75 rows, and show Restore/Remove only when the archive row advertises
+`restorable:true`/`removable:true`. One focused accessible lifecycle dialog
+collects the reason, renders the server-authored effects/retained/deleted/
+blockers plan, and requires exact typing of the purge confirmation phrase.
+Opaque coordinator IDs remain hidden request identity rather than ordinary UI
+content. Project is the canonical kind; `repository` exists only at the API
+compatibility boundary. Worktree cleanup appears only as a removable child of
+its project tombstone, after a separately confirmed project-catalog purge has
+replaced the parent's Restore promise. Successful actions switch to and reveal
+the canonical collection; restore messaging explicitly says it remains
+stopped.
 **Hiding:** stopped servers/containers and idle projects can be hidden
 (persisted server-side via `/api/prefs`, shared across devices); anything the
 coordinator reports as running is auto-unhidden on the next poll, and every
@@ -578,9 +726,10 @@ prints redacted config and exits 0) → logger → certManager (skip in
 devInsecureHttp) → sessions → oidc → guard → pages → coordinator
 (`ensureRunning()` non-fatal) → metrics (`createMetricsStore` + `start()`) →
 routeStore (`load()`) → upstreamAuthStore (`load()`) → accessStore (`load()`)
-→ consoleApi → static → proxy → router → `startServers`. SIGHUP → cert
-reload; SIGTERM/SIGINT →
-graceful close (also `metrics.stop()` and `coordinator.close()`). On listen success, log every
+→ Telegram service (`load()`) → consoleApi → static → proxy → router →
+`startServers` → Telegram service (`start()`). SIGHUP → cert reload;
+SIGTERM/SIGINT → graceful close (also `telegram.stop()`, `metrics.stop()` and
+`coordinator.close()`). On listen success, log every
 public URL. Production listeners bind the explicit IPv4 wildcard `0.0.0.0`;
 development listeners bind IPv4 loopback. If `process.env.PORT` is set for an optional coordinator-spawned
 dev instance, skip self-registration; required production registration ignores
@@ -605,6 +754,9 @@ active lease.
   frame parse/serialize for text ≤125B is enough) on `net`/`http` upgrade.
 - `upstream.mjs`: HTTP upstream echoing method/path/headers/body + an SSE
   endpoint and an operator-credential challenge path.
+- Telegram tests inject a deterministic fake Bot API into `telegram.mjs` and
+  exercise real persistence/ownership/cursor/outbox behavior without a live
+  credential; source tests must not call Telegram's public network.
 - Tests run the real stack: real coordinator (`api serve`, ephemeral port,
   `CODEX_AGENT_COORDINATOR_HOME=<tmp>`), real console (spawned or in-process),
   ephemeral ports, dev certs from `certs/dev/` (`rejectUnauthorized:false`,
@@ -621,9 +773,12 @@ active lease.
 4. `rt` open-redirect guard; flow cookie signed; `state`+`nonce`+PKCE all
    enforced; ID-token signature verified against Google JWKS.
 5. Cookies: HttpOnly, Secure (prod), SameSite=Lax, HMAC-SHA256, timing-safe
-   compare. Session parse re-checks current policy membership on every request;
-   protected HTTP and WebSocket traffic then checks its exact resource grant.
-   Only configured owners may inspect or mutate the access list. The edge
+   compare. Identity parsing grants nothing; protected HTTP and WebSocket
+   traffic separately rechecks current policy membership and its exact resource
+   grant. Invite requests bind a verified subject/email to the current
+   server-derived host/resource/immutable instance with a short-lived signed
+   claim. Only configured owners may inspect or mutate the access list or
+   decide incoming requests. The edge
    consumes `cookieName` and `dc_flow` for authentication but never forwards
    them to routed HTTP/WebSocket projects or accepts those names from upstream
    `Set-Cookie`; unrelated project cookies remain end-to-end.
@@ -633,3 +788,9 @@ active lease.
    credential and preserve ordinary HTTP-auth headers. Only configured owners
    may change the credential; route/API/CLI views never expose it.
 7. No secrets in logs; no directory traversal; HTML escaping in every page.
+8. Telegram bot tokens exist only in the Console-owned private mode-`0600`
+   state and outbound Telegram requests. API views/logs/errors redact them.
+   Bot ownership or configured-owner override gates every bot, assignment, and
+   Telegram authorization mutation. Exact `repo_id` assignment and the
+   coordinator's durable opaque cursor—not display-name matching or local UI
+   diffs—govern notification fan-out.

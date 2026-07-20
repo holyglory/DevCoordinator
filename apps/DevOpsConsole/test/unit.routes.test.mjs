@@ -51,6 +51,7 @@ test('slug validation: valid slugs are accepted and default to auth=google', asy
     assert.equal(route.kind, 'port');
     assert.equal(route.port, 5000 + i);
     assert.equal(route.auth, 'google', 'default-deny: new routes must default to google auth');
+    assert.match(route.instanceId, /^[0-9a-f-]{16,64}$/i);
     assert.ok(route.createdAt && route.updatedAt);
   }
   assert.equal(store.list().length, valid.length);
@@ -165,6 +166,32 @@ test('persistence is atomic and survives a reload', async (t) => {
   assert.equal(web.auth, 'public'); // update persisted
   assert.equal(web.title, 'Vite dev'); // trimmed
   assert.equal(reloaded.get('gone'), null); // removal persisted
+});
+
+test('legacy routes gain one durable instance identity and delete/recreate gets a new identity', async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'dc-routes-instance-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'routes.json');
+  await fsp.writeFile(file, `${JSON.stringify({
+    version: 1,
+    routes: {
+      app: {
+        slug: 'app', kind: 'port', port: 5173, auth: 'google',
+        createdAt: '2026-07-18T00:00:00.000Z', updatedAt: '2026-07-18T00:00:00.000Z',
+      },
+    },
+  })}\n`, 'utf8');
+  const store = createRouteStore({ file, config: CONFIG });
+  await store.load();
+  const migratedId = store.get('app').instanceId;
+  assert.match(migratedId, /^[0-9a-f-]{16,64}$/i);
+  assert.equal(JSON.parse(await fsp.readFile(file, 'utf8')).routes.app.instanceId, migratedId);
+
+  await store.update('app', { title: 'Same resource' });
+  assert.equal(store.get('app').instanceId, migratedId, 'ordinary route updates preserve request binding');
+  await store.remove('app');
+  const recreated = await store.create({ slug: 'app', kind: 'port', port: 5173 });
+  assert.notEqual(recreated.instanceId, migratedId, 'slug reuse must not inherit an old request binding');
 });
 
 test('corrupt store file: preserved as backup, store starts empty', async (t) => {

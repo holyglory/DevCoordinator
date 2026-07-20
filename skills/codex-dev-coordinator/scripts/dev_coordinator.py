@@ -36,9 +36,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
@@ -48,13 +48,22 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 from devcoordinator.observer import ObservationOutcome, SingleFlightObserver
 from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.host_lifecycle import CoordinatorHostLifecycleAdapter
+from devcoordinator.cleanup_lifecycle import CleanupLifecycle
+from devcoordinator.events import (
+    DEFAULT_EVENT_PAGE_SIZE,
+    MAX_EVENT_PAGE_SIZE,
+    decode_event_cursor,
+    list_event_page,
+)
 from devcoordinator.broker_cli import (
     add_broker_parser,
+    exclusive_broker_service_lock,
     handle_broker_cli,
     serve_broker,
 )
 from devcoordinator.broker import BrokerError, BrokerOperation
 from devcoordinator.broker_enrollment import enroll_repository
+from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.broker_links import BrokerLink, BrokerLinkStore
 from devcoordinator.broker_profile import (
     BrokerClientProfile,
@@ -68,6 +77,7 @@ from devcoordinator.broker_profile import (
 from devcoordinator.lifecycle_cli import (
     add_lifecycle_parsers,
     handle_lifecycle_cli,
+    require_fresh_lifecycle_observation,
 )
 from devcoordinator.normalized_server_lifecycle import (
     NormalizedLifecycleConflict,
@@ -80,8 +90,11 @@ from devcoordinator.normalized_server_lifecycle import (
 from devcoordinator.repository_lifecycle import (
     ActionFencedError,
     ConcurrentLifecycleError,
+    RepositoryDecommissionPlan,
     RepositoryAction,
     RepositoryLifecycle,
+    ResourceKind,
+    StandaloneRetirementPlan,
 )
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
 from devcoordinator.store import (
@@ -89,6 +102,11 @@ from devcoordinator.store import (
     deterministic_id,
     fingerprint,
     utc_timestamp,
+)
+from devcoordinator.observation_freshness import (
+    ObservationFreshnessError,
+    capture_observation_freshness_fence,
+    require_exact_fresh_observation,
 )
 
 
@@ -134,6 +152,13 @@ STOPPED_SERVER_LIMIT = 100
 DOCKER_STATS_HISTORY_LIMIT = 120
 DOCKER_OBSERVATION_TIMEOUT_SECONDS = 8.0
 DOCKER_LIFECYCLE_TIMEOUT_SECONDS = 45.0
+# One monotonic budget bounds sequential Docker sampling, including real
+# database catalog probes, for the service-owned host refresh. The join/stale
+# windows intentionally exceed that owner budget so a live Docker sampler
+# cannot be abandoned merely because it outlasts 30 seconds.
+HOST_OBSERVATION_BUDGET_SECONDS = 10 * 60.0
+HOST_OBSERVATION_JOIN_TIMEOUT_SECONDS = HOST_OBSERVATION_BUDGET_SECONDS + 30.0
+HOST_OBSERVATION_STALE_AFTER_SECONDS = HOST_OBSERVATION_BUDGET_SECONDS + 120.0
 DOCKER_STANDARD_LOCATIONS = (
     "/usr/local/bin/docker",
     "/opt/homebrew/bin/docker",
@@ -149,6 +174,7 @@ _STATE_LOCK_CONTEXT = threading.local()
 _PROJECT_OPERATION_CONTEXT = threading.local()
 _SERVER_RESTART_CONTEXT = threading.local()
 _NORMALIZED_ACTION_CONTEXT = threading.local()
+_HOST_OBSERVATION_CONTEXT = threading.local()
 _PROCESS_INSTANCE_ID = uuid.uuid4().hex
 _PROCESS_INSTANCE_PID = os.getpid()
 _PROCESS_OWNER_MARKERS: dict[str, tuple[Path, int]] = {}
@@ -161,6 +187,7 @@ PROJECT_RUNTIME_FILES = (
 
 class ListenerIdentityUnobservable(RuntimeError):
     """The caller lacks evidence access; this is not proof of wrong ownership."""
+
 
 SERVICE_ROLE_TOKENS = {
     "api",
@@ -251,7 +278,11 @@ def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
             "classification": "broker_configuration_required",
             "action_required": "Rerun Coordinator skill installation as the host administrator.",
         }
-    return {"error": str(exc), "code": "internal_error", "classification": "unhealthy_process"}
+    return {
+        "error": str(exc),
+        "code": "internal_error",
+        "classification": "unhealthy_process",
+    }
 
 
 def executable_file(path: Path) -> bool:
@@ -319,7 +350,9 @@ def resolve_docker_executable(
         if executable_file(on_path_value):
             return str(on_path_value.absolute())
 
-    candidates = DOCKER_STANDARD_LOCATIONS if standard_locations is None else standard_locations
+    candidates = (
+        DOCKER_STANDARD_LOCATIONS if standard_locations is None else standard_locations
+    )
     for raw_candidate in candidates:
         candidate = Path(raw_candidate).expanduser()
         candidate_text = str(candidate)
@@ -344,8 +377,16 @@ def resolve_docker_executable(
 
 
 def configured_docker_timeout(*, lifecycle: bool) -> float:
-    default = DOCKER_LIFECYCLE_TIMEOUT_SECONDS if lifecycle else DOCKER_OBSERVATION_TIMEOUT_SECONDS
-    variable = "CODEX_DOCKER_LIFECYCLE_TIMEOUT_SECONDS" if lifecycle else "CODEX_DOCKER_OBSERVATION_TIMEOUT_SECONDS"
+    default = (
+        DOCKER_LIFECYCLE_TIMEOUT_SECONDS
+        if lifecycle
+        else DOCKER_OBSERVATION_TIMEOUT_SECONDS
+    )
+    variable = (
+        "CODEX_DOCKER_LIFECYCLE_TIMEOUT_SECONDS"
+        if lifecycle
+        else "CODEX_DOCKER_OBSERVATION_TIMEOUT_SECONDS"
+    )
     raw = os.environ.get(variable)
     if not raw:
         return default
@@ -356,6 +397,32 @@ def configured_docker_timeout(*, lifecycle: bool) -> float:
     return max(0.1, min(value, 600.0))
 
 
+@contextlib.contextmanager
+def bounded_host_observation() -> Any:
+    """Apply one monotonic deadline to sequential Docker observation calls."""
+
+    previous = getattr(_HOST_OBSERVATION_CONTEXT, "deadline", None)
+    proposed = time.monotonic() + HOST_OBSERVATION_BUDGET_SECONDS
+    _HOST_OBSERVATION_CONTEXT.deadline = (
+        min(float(previous), proposed) if previous is not None else proposed
+    )
+    try:
+        yield
+    finally:
+        if previous is None:
+            with contextlib.suppress(AttributeError):
+                del _HOST_OBSERVATION_CONTEXT.deadline
+        else:
+            _HOST_OBSERVATION_CONTEXT.deadline = previous
+
+
+def remaining_host_observation_seconds() -> float | None:
+    deadline = getattr(_HOST_OBSERVATION_CONTEXT, "deadline", None)
+    if deadline is None:
+        return None
+    return float(deadline) - time.monotonic()
+
+
 def execute_docker_subprocess(
     command: list[str],
     *,
@@ -364,10 +431,26 @@ def execute_docker_subprocess(
     executable: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], str, float]:
     if not command or command[0] != "docker":
-        raise ValueError("Docker commands must begin with the semantic 'docker' executable")
+        raise ValueError(
+            "Docker commands must begin with the semantic 'docker' executable"
+        )
     executable = executable or resolve_docker_executable()
     resolved_command = [executable, *command[1:]]
     timeout_seconds = configured_docker_timeout(lifecycle=lifecycle)
+    remaining = None if lifecycle else remaining_host_observation_seconds()
+    if remaining is not None:
+        if remaining <= 0:
+            raise DockerCommandTimeoutError(
+                "The bounded host observation deadline expired before the next Docker command.",
+                {
+                    "code": "host_observation_timeout",
+                    "classification": "timeout",
+                    "command": command,
+                    "docker_executable": executable,
+                    "timeout_seconds": 0,
+                },
+            )
+        timeout_seconds = min(timeout_seconds, remaining)
     try:
         completed = subprocess.run(
             resolved_command,
@@ -404,6 +487,7 @@ def execute_docker_subprocess(
             },
         ) from exc
     return completed, executable, timeout_seconds
+
 
 DEPLOYMENT_QUALIFIER_TOKENS = {
     "copy",
@@ -473,9 +557,7 @@ def authority_mode() -> str:
         # normal installation has no per-app HOME-dependent authority.
         return "account" if os.environ.get("CODEX_AGENT_COORDINATOR_HOME") else "system"
     if raw not in {"system", "account", "service"}:
-        raise ValueError(
-            f"{AUTHORITY_ENV} must be 'system', 'account', or 'service'"
-        )
+        raise ValueError(f"{AUTHORITY_ENV} must be 'system', 'account', or 'service'")
     if raw == "service" and os.geteuid() == 0:
         # The broker may be root-owned on a small host, but it must never use
         # the API path to launch managed user processes.  Service mode itself
@@ -608,16 +690,24 @@ def read_private_api_token(token_file: Path) -> str:
         fd = os.open(token_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         if exc.errno == errno.ELOOP or token_file.is_symlink():
-            raise PermissionError(f"API token file must not be a symbolic link: {token_file}") from exc
+            raise PermissionError(
+                f"API token file must not be a symbolic link: {token_file}"
+            ) from exc
         raise
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
-            raise PermissionError(f"API token file must be a regular file: {token_file}")
+            raise PermissionError(
+                f"API token file must be a regular file: {token_file}"
+            )
         if stat.S_IMODE(metadata.st_mode) & 0o077:
-            raise PermissionError(f"API token file must not be accessible by group or others: {token_file}")
+            raise PermissionError(
+                f"API token file must not be accessible by group or others: {token_file}"
+            )
         if metadata.st_size > API_TOKEN_MAX_BYTES:
-            raise ValueError(f"API token file exceeds {API_TOKEN_MAX_BYTES} bytes: {token_file}")
+            raise ValueError(
+                f"API token file exceeds {API_TOKEN_MAX_BYTES} bytes: {token_file}"
+            )
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             fd = -1
             token = handle.read(API_TOKEN_MAX_BYTES + 1).strip()
@@ -641,12 +731,16 @@ def open_api_token_initialization_lock(token_file: Path) -> int:
         )
     except OSError as exc:
         if exc.errno == errno.ELOOP or lock_file.is_symlink():
-            raise PermissionError(f"API token initialization lock must not be a symbolic link: {lock_file}") from exc
+            raise PermissionError(
+                f"API token initialization lock must not be a symbolic link: {lock_file}"
+            ) from exc
         raise
     metadata = os.fstat(fd)
     if not stat.S_ISREG(metadata.st_mode):
         os.close(fd)
-        raise PermissionError(f"API token initialization lock must be a regular file: {lock_file}")
+        raise PermissionError(
+            f"API token initialization lock must be a regular file: {lock_file}"
+        )
     os.fchmod(fd, 0o600)
     return fd
 
@@ -687,7 +781,9 @@ def load_or_create_api_token(path: Path | None = None) -> str:
                 return read_private_api_token(token_file)
             except OSError as exc:
                 if exc.errno == errno.ELOOP or token_file.is_symlink():
-                    raise PermissionError(f"API token file must not be a symbolic link: {token_file}") from exc
+                    raise PermissionError(
+                        f"API token file must not be a symbolic link: {token_file}"
+                    ) from exc
                 raise
             try:
                 os.fchmod(fd, 0o600)
@@ -784,7 +880,9 @@ def write_legacy_json_state(state: dict[str, Any]) -> None:
     state["version"] = VERSION
     state["revision"] = int(state.get("revision") or 0) + 1
     state["updated_at"] = iso_timestamp()
-    atomic_write_private(legacy_state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n")
+    atomic_write_private(
+        legacy_state_path(), json.dumps(state, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def write_state(state: dict[str, Any], *, expected_revision: int | None = None) -> None:
@@ -832,7 +930,9 @@ def restore_legacy_pending_operation_statuses(
                 result = json.loads(str(encoded.get(str(operation.get("id"))) or "{}"))
             except json.JSONDecodeError:
                 result = {}
-            reservation = result.get("_legacy_reservation") if isinstance(result, dict) else None
+            reservation = (
+                result.get("_legacy_reservation") if isinstance(result, dict) else None
+            )
             if not isinstance(reservation, dict):
                 # Pre-cutover rows lack the process-instance evidence required
                 # to decide whether the owner is alive. Keep them normalized
@@ -888,7 +988,9 @@ def _non_zombie_process_observation(pid: int) -> bool | None:
 
     if sys.platform.startswith("linux"):
         try:
-            stat_text = (Path("/proc") / str(int(pid)) / "stat").read_text(encoding="utf-8")
+            stat_text = (Path("/proc") / str(int(pid)) / "stat").read_text(
+                encoding="utf-8"
+            )
         except (FileNotFoundError, ProcessLookupError):
             return False
         except OSError:
@@ -939,7 +1041,9 @@ def port_open(host: str, port: int) -> bool:
 def _decode_proc_tcp_address(raw: str, *, ipv6: bool) -> str:
     payload = bytes.fromhex(raw)
     if ipv6:
-        payload = b"".join(payload[offset : offset + 4][::-1] for offset in range(0, 16, 4))
+        payload = b"".join(
+            payload[offset : offset + 4][::-1] for offset in range(0, 16, 4)
+        )
         return socket.inet_ntop(socket.AF_INET6, payload)
     return socket.inet_ntop(socket.AF_INET, payload[::-1])
 
@@ -960,7 +1064,9 @@ def _proc_listening_sockets(port: int) -> list[dict[str, str]]:
                         raw_address = fields[1].rsplit(":", 1)[0]
                         listeners.append(
                             {
-                                "address": _decode_proc_tcp_address(raw_address, ipv6=ipv6),
+                                "address": _decode_proc_tcp_address(
+                                    raw_address, ipv6=ipv6
+                                ),
                                 "inode": fields[9],
                             }
                         )
@@ -986,7 +1092,10 @@ def _listener_address_matches(host: str, listener_address: str) -> bool:
         return False
     listener = ipaddress.ip_address(listener_address)
     if listener.is_unspecified:
-        return any(ipaddress.ip_address(address).version == listener.version for address in requested)
+        return any(
+            ipaddress.ip_address(address).version == listener.version
+            for address in requested
+        )
     return str(listener) in requested
 
 
@@ -1103,7 +1212,9 @@ def _lsof_listener_observation(
         return False, None
 
 
-def _lsof_listener_pid_for_endpoint(host: str, port: int, *, expected_pid: int | None = None) -> int | None:
+def _lsof_listener_pid_for_endpoint(
+    host: str, port: int, *, expected_pid: int | None = None
+) -> int | None:
     _observable, pid = _lsof_listener_observation(host, port, expected_pid=expected_pid)
     return pid
 
@@ -1115,7 +1226,9 @@ def listening_pid_for_endpoint(host: str, port: int) -> int | None:
     return _lsof_listener_pid_for_endpoint(host, port)
 
 
-def registration_pid_identity(*, pid: int, host: str, port: int, project: str) -> dict[str, Any]:
+def registration_pid_identity(
+    *, pid: int, host: str, port: int, project: str
+) -> dict[str, Any]:
     """Prove that an explicit registration PID owns this project's listener.
 
     A live PID is not sufficient evidence.  On Linux, bind the claim to the
@@ -1140,7 +1253,9 @@ def registration_pid_identity(*, pid: int, host: str, port: int, project: str) -
         )
     cwd = cwd_observation.get("cwd")
     if not cwd:
-        raise RuntimeError(f"registration PID {pid} working directory could not be identified")
+        raise RuntimeError(
+            f"registration PID {pid} working directory could not be identified"
+        )
     owner_project = canonical_project(cwd)
     if owner_project != resolved_project and not path_inside(cwd, resolved_project):
         raise RuntimeError(
@@ -1182,7 +1297,9 @@ def registration_pid_identity(*, pid: int, host: str, port: int, project: str) -
                 raise ListenerIdentityUnobservable(
                     f"registration PID {pid} listener ownership is not observable for {host}:{port}"
                 )
-            raise RuntimeError(f"registration PID {pid} does not own a LISTEN socket on port {port}")
+            raise RuntimeError(
+                f"registration PID {pid} does not own a LISTEN socket on port {port}"
+            )
         return {
             "ok": True,
             "pid": pid,
@@ -1215,18 +1332,26 @@ def registration_pid_identity(*, pid: int, host: str, port: int, project: str) -
     }
 
 
-def resolve_registration_pid(options: dict[str, Any], *, host: str, port: int, project: str) -> tuple[int | None, dict[str, Any] | None]:
+def resolve_registration_pid(
+    options: dict[str, Any], *, host: str, port: int, project: str
+) -> tuple[int | None, dict[str, Any] | None]:
     explicit = options.get("pid")
     if explicit is not None:
-        identity = registration_pid_identity(pid=int(explicit), host=host, port=port, project=project)
+        identity = registration_pid_identity(
+            pid=int(explicit), host=host, port=port, project=project
+        )
         return int(explicit), identity
     discovered = listening_pid_for_endpoint(host, port)
     if discovered is not None:
-        identity = registration_pid_identity(pid=int(discovered), host=host, port=port, project=project)
+        identity = registration_pid_identity(
+            pid=int(discovered), host=host, port=port, project=project
+        )
         return int(discovered), identity
     probe_host = "127.0.0.1" if host == "0.0.0.0" else host
     if port_open(probe_host, int(port)):
-        raise RuntimeError(f"endpoint {host}:{port} is open but no listener PID could be identified")
+        raise RuntimeError(
+            f"endpoint {host}:{port} is open but no listener PID could be identified"
+        )
     return None, None
 
 
@@ -1318,7 +1443,9 @@ def process_cwd_observation(pid: int | None) -> dict[str, Any]:
     return {
         "observable": observable,
         "cwd": cwd,
-        "reason": None if observable else f"PID {pid} working directory is not observable by this process",
+        "reason": None
+        if observable
+        else f"PID {pid} working directory is not observable by this process",
     }
 
 
@@ -1335,7 +1462,9 @@ def path_inside(child: str | None, parent: str | None) -> bool:
 
 
 def listener_owner_for_port(port: int, *, host: str | None = None) -> dict[str, Any]:
-    pid = listening_pid_for_endpoint(host, port) if host else listening_pid_for_port(port)
+    pid = (
+        listening_pid_for_endpoint(host, port) if host else listening_pid_for_port(port)
+    )
     cwd_observation = process_cwd_observation(pid)
     cwd = cwd_observation.get("cwd")
     owner_project = canonical_project(cwd) if cwd else None
@@ -1348,7 +1477,9 @@ def listener_owner_for_port(port: int, *, host: str | None = None) -> dict[str, 
     }
 
 
-def listener_belongs_to_project(port: int, project: str, *, host: str | None = None) -> tuple[bool, dict[str, Any]]:
+def listener_belongs_to_project(
+    port: int, project: str, *, host: str | None = None
+) -> tuple[bool, dict[str, Any]]:
     owner = listener_owner_for_port(port, host=host)
     resolved_project = canonical_project(project)
     owner_project = owner.get("project")
@@ -1362,7 +1493,9 @@ def listener_belongs_to_project(port: int, project: str, *, host: str | None = N
             f"port {port} is owned by PID {owner['pid']}, but its working directory could not be identified"
         )
         return False, owner
-    if owner_project != resolved_project and not path_inside(str(owner.get("cwd")), resolved_project):
+    if owner_project != resolved_project and not path_inside(
+        str(owner.get("cwd")), resolved_project
+    ):
         owner["observable"] = True
         owner["reason"] = (
             f"port {port} is owned by PID {owner['pid']} in {owner.get('cwd')}, "
@@ -1432,14 +1565,20 @@ def read_process_table() -> dict[int, dict[str, Any]]:
     return {}
 
 
-def children_by_parent(process_table: dict[int, dict[str, Any]]) -> dict[int, list[int]]:
+def children_by_parent(
+    process_table: dict[int, dict[str, Any]],
+) -> dict[int, list[int]]:
     children: dict[int, list[int]] = {}
     for pid, row in process_table.items():
         children.setdefault(int(row.get("ppid") or 0), []).append(pid)
     return children
 
 
-def process_tree_pids(root_pids: set[int], process_table: dict[int, dict[str, Any]], children: dict[int, list[int]]) -> set[int]:
+def process_tree_pids(
+    root_pids: set[int],
+    process_table: dict[int, dict[str, Any]],
+    children: dict[int, list[int]],
+) -> set[int]:
     seen: set[int] = set()
     stack = [pid for pid in root_pids if pid in process_table]
     while stack:
@@ -1474,14 +1613,19 @@ def summarize_process_usage(
     processes = [process_usage_entry(process_table[pid]) for pid in live_pids]
     hot_processes = sorted(
         processes,
-        key=lambda item: (float(item.get("cpu_percent") or 0), int(item.get("rss_bytes") or 0)),
+        key=lambda item: (
+            float(item.get("cpu_percent") or 0),
+            int(item.get("rss_bytes") or 0),
+        ),
         reverse=True,
     )
     cpu_percent = sum(float(item.get("cpu_percent") or 0) for item in processes)
     rss_bytes = sum(int(item.get("rss_bytes") or 0) for item in processes)
     return {
         "source": source,
-        "root_pids": sorted(pid for pid in (root_pids or set()) if pid in process_table),
+        "root_pids": sorted(
+            pid for pid in (root_pids or set()) if pid in process_table
+        ),
         "pids": live_pids,
         "process_count": len(live_pids),
         "cpu_percent": round(cpu_percent, 2),
@@ -1504,7 +1648,8 @@ def server_process_identity(server: dict[str, Any]) -> dict[str, Any]:
             "pid": pid,
             "cwd": None,
             "project": None,
-            "reason": cwd_observation.get("reason") or f"PID {pid} working directory is not observable",
+            "reason": cwd_observation.get("reason")
+            or f"PID {pid} working directory is not observable",
         }
     cwd = cwd_observation.get("cwd")
     if not cwd:
@@ -1713,16 +1858,24 @@ def prune_expired_leases(state: dict[str, Any]) -> None:
             # rolls back; another lock holder must not expire it mid-operation.
             continue
         if server_id:
-            if str(lease.get("attachment_status") or "").startswith("failed_after_launch") or lease.get(
-                "attachment_status"
-            ) == "launch_outcome_unknown":
+            if (
+                str(lease.get("attachment_status") or "").startswith(
+                    "failed_after_launch"
+                )
+                or lease.get("attachment_status") == "launch_outcome_unknown"
+            ):
                 # A manual lease that reached process launch is quarantined
                 # until an attributed server stop or port release explicitly
                 # clears it.  Stale-process pruning must not make a port look
                 # reusable merely because cleanup observed that process exit.
                 continue
             if lease_has_stale_server(state, lease):
-                mark_lease_stale_released(state, lease_id, lease, "linked server is stopped, missing, or no longer alive")
+                mark_lease_stale_released(
+                    state,
+                    lease_id,
+                    lease,
+                    "linked server is stopped, missing, or no longer alive",
+                )
                 continue
             if state["servers"].get(server_id):
                 continue
@@ -1745,7 +1898,9 @@ def lease_has_stale_server(state: dict[str, Any], lease: dict[str, Any]) -> bool
     return bool(pid) and not pid_alive(int(pid))
 
 
-def mark_lease_stale_released(state: dict[str, Any], lease_id: str, lease: dict[str, Any], reason: str) -> dict[str, Any]:
+def mark_lease_stale_released(
+    state: dict[str, Any], lease_id: str, lease: dict[str, Any], reason: str
+) -> dict[str, Any]:
     state["leases"].pop(lease_id, None)
     lease["status"] = "stale_released"
     lease["released_at"] = iso_timestamp()
@@ -1768,7 +1923,10 @@ def reclaim_stale_leases_for_port(
         if lease.get("status") != "active" or int(lease.get("port") or 0) != int(port):
             continue
         lease_project = lease.get("project")
-        if not lease_project or canonical_project(str(lease_project)) != resolved_project:
+        if (
+            not lease_project
+            or canonical_project(str(lease_project)) != resolved_project
+        ):
             continue
         if lease_has_stale_server(state, lease):
             released.append(mark_lease_stale_released(state, lease_id, lease, reason))
@@ -1784,13 +1942,17 @@ def reclaim_stale_leases_for_port(
     return released
 
 
-def record_event(state: dict[str, Any], event_type: str, payload: dict[str, Any]) -> None:
+def record_event(
+    state: dict[str, Any], event_type: str, payload: dict[str, Any]
+) -> None:
     history = state.setdefault("history", [])
     history.append({"at": iso_timestamp(), "type": event_type, "payload": payload})
     del history[:-200]
 
 
-def pending_operation_for_target(state: dict[str, Any], target: str) -> dict[str, Any] | None:
+def pending_operation_for_target(
+    state: dict[str, Any], target: str
+) -> dict[str, Any] | None:
     for operation in state.setdefault("operations", {}).values():
         if operation.get("target") == target and operation.get("status") == "pending":
             return operation
@@ -1968,7 +2130,9 @@ def pending_conflicting_operation(
             if str(operation.get("project") or "") != project or not (
                 project_child_allowed or restart_child_allowed
             ):
-                raise RuntimeError("delegated child operation does not match its pending parent capability")
+                raise RuntimeError(
+                    "delegated child operation does not match its pending parent capability"
+                )
             continue
         existing_target = str(operation.get("target") or "")
         if existing_target == target:
@@ -1978,7 +2142,9 @@ def pending_conflicting_operation(
         existing_kind = operation_target_kind(existing_target)
         existing_is_project = existing_kind == "project"
         existing_is_child = existing_kind in {"server", "docker", "docker-metadata"}
-        if (candidate_is_project and existing_is_child) or (candidate_is_child and existing_is_project):
+        if (candidate_is_project and existing_is_child) or (
+            candidate_is_child and existing_is_project
+        ):
             return operation
     return None
 
@@ -2026,7 +2192,9 @@ def begin_operation(
         None,
     )
     if delegated_parent_id and str(context_project or "") != project:
-        raise RuntimeError("delegated child operation project does not match its parent capability")
+        raise RuntimeError(
+            "delegated child operation project does not match its parent capability"
+        )
     require_operation_slot(
         state,
         target=target,
@@ -2083,7 +2251,12 @@ def begin_operation(
 
 
 def finish_operation(
-    state: dict[str, Any], operation_id: str, *, status: str, phase: str, error: str | None = None
+    state: dict[str, Any],
+    operation_id: str,
+    *,
+    status: str,
+    phase: str,
+    error: str | None = None,
 ) -> dict[str, Any] | None:
     operation = state.setdefault("operations", {}).get(operation_id)
     if not operation:
@@ -2097,7 +2270,11 @@ def finish_operation(
     record_event(state, f"operation.{status}", {**operation})
     # Keep a bounded amount of completed operation evidence.
     completed = sorted(
-        (item for item in state["operations"].values() if item.get("status") != "pending"),
+        (
+            item
+            for item in state["operations"].values()
+            if item.get("status") != "pending"
+        ),
         key=lambda item: str(item.get("finished_at") or item.get("updated_at") or ""),
     )
     for stale in completed[:-100]:
@@ -2154,7 +2331,9 @@ def reconcile_operations(state: dict[str, Any]) -> None:
             lease["last_attachment_failure"] = {
                 "at": iso_timestamp(),
                 "operation_id": operation.get("id"),
-                "process_launched": bool(live_reserved_process or launch_outcome_uncertain),
+                "process_launched": bool(
+                    live_reserved_process or launch_outcome_uncertain
+                ),
                 "reason": "coordinator operation owner exited before completion",
             }
             if live_reserved_process or launch_outcome_uncertain:
@@ -2168,7 +2347,9 @@ def reconcile_operations(state: dict[str, Any]) -> None:
                 lease["server_id"] = None
                 lease["attachment_status"] = "rolled_back_before_launch"
                 lease["reconciliation_required"] = False
-        if live_reserved_process or (manual_lease_attachment and launch_outcome_uncertain):
+        if live_reserved_process or (
+            manual_lease_attachment and launch_outcome_uncertain
+        ):
             if not server:
                 # The operation evidence is still sufficient to quarantine the
                 # lease even if a corrupt state lost the reserved server row.
@@ -2194,7 +2375,11 @@ def reconcile_operations(state: dict[str, Any]) -> None:
                 with contextlib.suppress(KeyError):
                     release_port(state, lease_id=str(lease_id))
             if server and server.get("operation_id") == operation.get("id"):
-                mark_server_stopped(state, server, reason="Coordinator operation owner exited before launch completed")
+                mark_server_stopped(
+                    state,
+                    server,
+                    reason="Coordinator operation owner exited before launch completed",
+                )
         finish_operation(
             state,
             str(operation["id"]),
@@ -2205,7 +2390,11 @@ def reconcile_operations(state: dict[str, Any]) -> None:
 
 
 def active_lease_ports(state: dict[str, Any]) -> set[int]:
-    return {int(lease["port"]) for lease in state["leases"].values() if lease.get("status") == "active"}
+    return {
+        int(lease["port"])
+        for lease in state["leases"].values()
+        if lease.get("status") == "active"
+    }
 
 
 def lease_port(
@@ -2249,7 +2438,9 @@ def lease_port(
             "port": port,
             "agent": agent,
             "project": project,
-            "agent_metadata": agent_metadata(agent=agent, project=project, source="port_lease"),
+            "agent_metadata": agent_metadata(
+                agent=agent, project=project, source="port_lease"
+            ),
             "purpose": purpose,
             "server_id": server_id,
             "status": "active",
@@ -2278,12 +2469,25 @@ def release_mismatched_leases_for_existing_listener(
     for lease_id, lease in list(state["leases"].items()):
         if lease.get("status") != "active" or int(lease.get("port") or 0) != int(port):
             continue
-        server = state["servers"].get(lease.get("server_id")) if lease.get("server_id") else None
-        lease_project = canonical_project(str(lease.get("project") or "")) if lease.get("project") else None
+        server = (
+            state["servers"].get(lease.get("server_id"))
+            if lease.get("server_id")
+            else None
+        )
+        lease_project = (
+            canonical_project(str(lease.get("project") or ""))
+            if lease.get("project")
+            else None
+        )
         if lease_has_stale_server(state, lease):
             mark_lease_stale_released(state, lease_id, lease, reason)
             continue
-        if server and owner_pid and int(server.get("pid") or 0) == int(owner_pid) and lease_project != resolved_owner_project:
+        if (
+            server
+            and owner_pid
+            and int(server.get("pid") or 0) == int(owner_pid)
+            and lease_project != resolved_owner_project
+        ):
             mark_lease_stale_released(state, lease_id, lease, reason)
 
 
@@ -2316,7 +2520,10 @@ def lease_existing_server_port(
     for lease_id, lease in list(state["leases"].items()):
         if lease.get("status") != "active" or int(lease.get("port") or 0) != int(port):
             continue
-        if lease.get("server_id") == server_id and canonical_project(str(lease.get("project") or "")) == project:
+        if (
+            lease.get("server_id") == server_id
+            and canonical_project(str(lease.get("project") or "")) == project
+        ):
             same_owner = int(lease.get("owner_pid") or 0) == int(owner_pid or 0)
             same_purpose = str(lease.get("purpose") or "") == str(purpose)
             if not same_owner or not same_purpose:
@@ -2330,7 +2537,9 @@ def lease_existing_server_port(
             if assignment_key:
                 lease["assignment_key"] = assignment_key
             lease["expires_at"] = now() + ttl if ttl > 0 else None
-            lease["expires_at_iso"] = iso_timestamp(lease["expires_at"]) if lease["expires_at"] else None
+            lease["expires_at_iso"] = (
+                iso_timestamp(lease["expires_at"]) if lease["expires_at"] else None
+            )
             return lease
         raise RuntimeError(
             f"port {port} already has an active lease for {lease.get('project') or 'unknown project'}"
@@ -2341,7 +2550,9 @@ def lease_existing_server_port(
         "port": port,
         "agent": agent,
         "project": project,
-        "agent_metadata": agent_metadata(agent=agent, project=project, source="port_lease_existing"),
+        "agent_metadata": agent_metadata(
+            agent=agent, project=project, source="port_lease_existing"
+        ),
         "purpose": purpose,
         "server_id": server_id,
         "status": "active",
@@ -2368,7 +2579,9 @@ def release_port(
     acting_project: str | None = None,
 ) -> dict[str, Any]:
     for existing_id, lease in list(state["leases"].items()):
-        if (lease_id and existing_id == lease_id) or (port is not None and int(lease["port"]) == port):
+        if (lease_id and existing_id == lease_id) or (
+            port is not None and int(lease["port"]) == port
+        ):
             state["leases"].pop(existing_id, None)
             lease["status"] = "released"
             lease["released_at"] = iso_timestamp()
@@ -2394,7 +2607,9 @@ def release_port_for_identity(
     agent = str(agent or "").strip()
     project = str(project or "").strip()
     if not agent:
-        raise ValueError("port release requires --agent so the coordinator can attribute the action")
+        raise ValueError(
+            "port release requires --agent so the coordinator can attribute the action"
+        )
     if not project:
         raise ValueError("port release requires --project with the canonical repo path")
     project = canonical_project(project)
@@ -2413,7 +2628,9 @@ def release_port_for_identity(
         )
     lease_project = matching.get("project")
     if not lease_project or canonical_project(str(lease_project)) != project:
-        raise PermissionError("port release project does not match the lease owner project")
+        raise PermissionError(
+            "port release project does not match the lease owner project"
+        )
     return release_port(
         state,
         lease_id=lease_id,
@@ -2427,7 +2644,7 @@ def server_key(project: str, name: str) -> str:
     return f"{canonical_project(project)}::{name}"
 
 
-def canonical_project(project: str) -> str:
+def canonical_project(project: str, *, refresh: bool = False) -> str:
     """Resolve a project root without invoking Git.
 
     This helper is used by state mutations, including mutations performed while
@@ -2440,13 +2657,13 @@ def canonical_project(project: str) -> str:
     raw = Path(project or os.getcwd()).expanduser().resolve()
     cache_key = str(raw)
     cached = _PROJECT_ROOT_CACHE.get(cache_key)
-    if cached:
+    if cached and not refresh:
         return cached
     if int(getattr(_STATE_LOCK_CONTEXT, "depth", 0)):
         # Routed commands resolve project roots before acquiring state.lock. A
         # legacy in-process caller that did not do so gets the resolved path,
         # never a Git-marker walk from inside the critical section.
-        return cache_key
+        return cached or cache_key
     candidate = raw if raw.is_dir() else raw.parent
     for directory in (candidate, *candidate.parents):
         if (directory / ".git").exists():
@@ -2461,7 +2678,9 @@ def canonical_project(project: str) -> str:
 class RepositoryActionGuardReleaseError(RuntimeError):
     """A guarded mutation and its permit release both failed."""
 
-    def __init__(self, primary_error: BaseException, release_error: BaseException) -> None:
+    def __init__(
+        self, primary_error: BaseException, release_error: BaseException
+    ) -> None:
         super().__init__(
             "repository action failed and its normalized permit could not be released: "
             f"{type(primary_error).__name__}: {primary_error}; release failure: "
@@ -2475,7 +2694,9 @@ class _GuardOnlyLifecycleAdapter:
     """Sentinel adapter: action reservation must never perform host work."""
 
     def __getattr__(self, name: str) -> Any:
-        raise RuntimeError(f"repository action guard unexpectedly requested host adapter method {name}")
+        raise RuntimeError(
+            f"repository action guard unexpectedly requested host adapter method {name}"
+        )
 
 
 _GUARD_ONLY_LIFECYCLE_ADAPTER = _GuardOnlyLifecycleAdapter()
@@ -2612,7 +2833,9 @@ def resolve_or_install_repository_for_action(store: AccountStore, project: str) 
 
     ensured_host_id = ensure_observation_host(store)
     if ensured_host_id != host_id:
-        raise RuntimeError("normalized local host identity changed during repository installation")
+        raise RuntimeError(
+            "normalized local host identity changed during repository installation"
+        )
     timestamp = utc_timestamp()
     repo_id = deterministic_id("repository", host_id, str(root))
     with store.immediate_transaction() as connection:
@@ -2693,9 +2916,8 @@ def _precheck_normalized_repository_action(
         ).fetchone()
         if repository is None:
             return None
-        if (
-            str(repository["status"]) != "installed"
-            or bool(repository["startup_fenced"])
+        if str(repository["status"]) != "installed" or bool(
+            repository["startup_fenced"]
         ):
             raise ActionFencedError("repository start fence is active")
         pending_restore = connection.execute(
@@ -2823,7 +3045,9 @@ def normalized_repository_action_guard(
                 # Reinstallation only clears the normalized fence. The first
                 # explicit start restores the exact captured native policies
                 # under this permit, before any compatibility or host start
-                # path is entered. This preflight is deliberately not a
+                # path is entered. Policy restoration does not load or start
+                # a supervisor; the explicit action after this guard owns
+                # that effect. This preflight is deliberately not a
                 # cross-host-work state lock; a later observation remains the
                 # durable detector for the residual post-preflight race.
                 lifecycle.restore_startup_policies_for_start(permit)
@@ -2835,7 +3059,11 @@ def normalized_repository_action_guard(
                     primary_error, release_error
                 ) from primary_error
             raise
-        active = {"project": canonical, "repo_id": repo_id, "permit_id": permit.permit_id}
+        active = {
+            "project": canonical,
+            "repo_id": repo_id,
+            "permit_id": permit.permit_id,
+        }
         stack.append(active)
         try:
             yield repo_id
@@ -2857,9 +3085,7 @@ def normalized_repository_action_guard(
                     stack.remove(active)
 
 
-def _local_normalized_repository_id(
-    store: AccountStore, *, project: str
-) -> str | None:
+def _local_normalized_repository_id(store: AccountStore, *, project: str) -> str | None:
     with store.read_transaction() as connection:
         row = connection.execute(
             """
@@ -2921,9 +3147,7 @@ def _normalized_fixed_server_port(
     if raw_range is not None:
         port_start, port_end = parse_range(str(raw_range))
         return (
-            port_start
-            if port_start == port_end and 1 <= port_start <= 65535
-            else None
+            port_start if port_start == port_end and 1 <= port_start <= 65535 else None
         )
 
     preferred = options.get("preferred")
@@ -2959,15 +3183,12 @@ def _require_fixed_listener_identity_observable(
 ) -> None:
     if port is None or not port_open(host, int(port)):
         return
-    belongs, owner = listener_belongs_to_project(
-        int(port), project, host=host
-    )
+    belongs, owner = listener_belongs_to_project(int(port), project, host=host)
     if belongs or owner.get("observable") is not False:
         return
     reason = str(owner.get("reason") or "listener ownership cannot be observed")
     raise ListenerIdentityUnobservable(
-        f"refusing to {action} {name}: "
-        f"listener identity is unobservable; {reason}"
+        f"refusing to {action} {name}: listener identity is unobservable; {reason}"
     )
 
 
@@ -3034,7 +3255,9 @@ def preflight_normalized_listener_identity(
                 project=project,
                 name=name,
                 action=command.removeprefix("server "),
-                host=str(options.get("host") or (server or {}).get("host") or "127.0.0.1"),
+                host=str(
+                    options.get("host") or (server or {}).get("host") or "127.0.0.1"
+                ),
                 port=fixed_port,
             )
         return
@@ -3137,12 +3360,16 @@ def normalized_guarded_action(
 # removed only by explicit unassignment (or `state reset`).
 
 
-def find_port_assignment(state: dict[str, Any], *, project: str, name: str) -> tuple[str, dict[str, Any] | None]:
+def find_port_assignment(
+    state: dict[str, Any], *, project: str, name: str
+) -> tuple[str, dict[str, Any] | None]:
     key = server_key(project, name)
     return key, state.setdefault("port_assignments", {}).get(key)
 
 
-def foreign_assigned_ports(state: dict[str, Any], *, owner_key: str | None = None) -> dict[int, dict[str, Any]]:
+def foreign_assigned_ports(
+    state: dict[str, Any], *, owner_key: str | None = None
+) -> dict[int, dict[str, Any]]:
     """Map of durably assigned ports -> assignment, excluding owner_key's own."""
     out: dict[int, dict[str, Any]] = {}
     for key, assignment in state.setdefault("port_assignments", {}).items():
@@ -3201,11 +3428,15 @@ def assign_port(
 ) -> dict[str, Any]:
     agent = str(agent or "").strip()
     if not agent:
-        raise ValueError("port assign requires --agent so the coordinator can attribute the action")
+        raise ValueError(
+            "port assign requires --agent so the coordinator can attribute the action"
+        )
     if not str(project or "").strip():
         raise ValueError("port assign requires --project with the canonical repo path")
     if not str(name or "").strip():
-        raise ValueError("port assign requires --name of the server the port belongs to")
+        raise ValueError(
+            "port assign requires --name of the server the port belongs to"
+        )
     port = int(port)
     if port < 1 or port > 65535:
         raise ValueError(f"port {port} is outside 1-65535")
@@ -3220,12 +3451,18 @@ def assign_port(
         for lease in state["leases"].values():
             if lease.get("status") != "active" or int(lease.get("port") or 0) != port:
                 continue
-            lease_project = canonical_project(str(lease.get("project"))) if lease.get("project") else None
+            lease_project = (
+                canonical_project(str(lease.get("project")))
+                if lease.get("project")
+                else None
+            )
             if lease_project != project:
                 raise RuntimeError(
                     f"port {port} already has an active lease for {lease.get('project') or 'unknown project'}"
                 )
-    return record_port_assignment(state, agent=agent, project=project, name=name, port=port, source="port_assign")
+    return record_port_assignment(
+        state, agent=agent, project=project, name=name, port=port, source="port_assign"
+    )
 
 
 def unassign_port(
@@ -3239,9 +3476,13 @@ def unassign_port(
 ) -> dict[str, Any]:
     agent = str(agent or "").strip()
     if not agent:
-        raise ValueError("port unassign requires --agent so the coordinator can attribute the action")
+        raise ValueError(
+            "port unassign requires --agent so the coordinator can attribute the action"
+        )
     if name is not None and not str(project or "").strip():
-        raise ValueError("port unassign by --name requires --project naming the owning repo")
+        raise ValueError(
+            "port unassign by --name requires --project naming the owning repo"
+        )
     if name is None and port is None:
         raise ValueError("port unassign requires --name or --port")
     resolved = canonical_project(project) if project else None
@@ -3251,7 +3492,10 @@ def unassign_port(
         if name is not None:
             if assignment.get("name") != name or assignment.get("project") != resolved:
                 continue
-            if resolved_port is not None and int(assignment.get("port") or 0) != resolved_port:
+            if (
+                resolved_port is not None
+                and int(assignment.get("port") or 0) != resolved_port
+            ):
                 continue
         else:
             if int(assignment.get("port") or 0) != resolved_port:
@@ -3264,7 +3508,12 @@ def unassign_port(
                     "pass --force to remove another project's assignment"
                 )
         assignments.pop(key, None)
-        removed = {**assignment, "status": "unassigned", "unassigned_at": iso_timestamp(), "unassigned_by": agent}
+        removed = {
+            **assignment,
+            "status": "unassigned",
+            "unassigned_at": iso_timestamp(),
+            "unassigned_by": agent,
+        }
         record_event(state, "port.unassigned", removed)
         return removed
     raise KeyError("matching port assignment not found")
@@ -3296,10 +3545,14 @@ def _stale_release_evidence(
         if str(payload.get("id") or "") != lease_id:
             continue
         if int(payload.get("port") or 0) != port:
-            raise RuntimeError(f"lease {lease_id} stale-release evidence names the wrong port")
+            raise RuntimeError(
+                f"lease {lease_id} stale-release evidence names the wrong port"
+            )
         lease_project = str(payload.get("project") or "")
         if not lease_project or canonical_project(lease_project) != old_project:
-            raise RuntimeError(f"lease {lease_id} stale-release evidence names the wrong project")
+            raise RuntimeError(
+                f"lease {lease_id} stale-release evidence names the wrong project"
+            )
         return payload
     return None
 
@@ -3331,7 +3584,9 @@ def relocate_port_assignment(
     if not name:
         raise ValueError("port relocate requires --name")
     if not lease_id:
-        raise ValueError("port relocate requires --lease-id from the pre-cutover inventory")
+        raise ValueError(
+            "port relocate requires --lease-id from the pre-cutover inventory"
+        )
     port = int(port)
     if port < 1 or port > 65535:
         raise ValueError(f"port {port} is outside 1-65535")
@@ -3353,9 +3608,13 @@ def relocate_port_assignment(
         or str(assignment.get("name") or "") != name
         or int(assignment.get("port") or 0) != port
     ):
-        raise RuntimeError("old durable assignment does not match the exact project/name/port precondition")
+        raise RuntimeError(
+            "old durable assignment does not match the exact project/name/port precondition"
+        )
     if new_key in assignments:
-        raise RuntimeError(f"destination already has a durable assignment for {new_project}::{name}")
+        raise RuntimeError(
+            f"destination already has a durable assignment for {new_project}::{name}"
+        )
     for key, candidate in assignments.items():
         if key != old_key and int(candidate.get("port") or 0) == port:
             raise RuntimeError(
@@ -3366,9 +3625,14 @@ def relocate_port_assignment(
     active_on_port = [
         (candidate_id, candidate)
         for candidate_id, candidate in state.setdefault("leases", {}).items()
-        if candidate.get("status") == "active" and int(candidate.get("port") or 0) == port
+        if candidate.get("status") == "active"
+        and int(candidate.get("port") or 0) == port
     ]
-    foreign_leases = [(candidate_id, candidate) for candidate_id, candidate in active_on_port if candidate_id != lease_id]
+    foreign_leases = [
+        (candidate_id, candidate)
+        for candidate_id, candidate in active_on_port
+        if candidate_id != lease_id
+    ]
     if foreign_leases:
         candidate_id, candidate = foreign_leases[0]
         raise RuntimeError(
@@ -3402,9 +3666,13 @@ def relocate_port_assignment(
             port=port,
         )
         if stale_evidence is None:
-            raise KeyError(f"expected old lease {lease_id} is missing without stale-release evidence")
+            raise KeyError(
+                f"expected old lease {lease_id} is missing without stale-release evidence"
+            )
         if str(stale_evidence.get("purpose") or "") != f"server:{name}":
-            raise RuntimeError(f"lease {lease_id} stale-release evidence is not for server:{name}")
+            raise RuntimeError(
+                f"lease {lease_id} stale-release evidence is not for server:{name}"
+            )
 
     old_servers: list[tuple[str, dict[str, Any]]] = []
     new_servers: list[tuple[str, dict[str, Any]]] = []
@@ -3418,15 +3686,23 @@ def relocate_port_assignment(
         elif resolved == new_project:
             new_servers.append((server_id, server))
     if len(old_servers) > 1:
-        raise RuntimeError(f"ambiguous old server identity: found {len(old_servers)} {name!r} records")
+        raise RuntimeError(
+            f"ambiguous old server identity: found {len(old_servers)} {name!r} records"
+        )
     if new_servers:
-        raise RuntimeError(f"destination already has {len(new_servers)} {name!r} server record(s)")
+        raise RuntimeError(
+            f"destination already has {len(new_servers)} {name!r} server record(s)"
+        )
     matching_server = old_servers[0] if old_servers else None
     if matching_server and int(matching_server[1].get("port") or 0) != port:
         raise RuntimeError("old server record names the wrong port")
     if matching_lease and matching_lease.get("server_id"):
-        if not matching_server or str(matching_server[0]) != str(matching_lease.get("server_id")):
-            raise RuntimeError("old lease is linked to an ambiguous or different server record")
+        if not matching_server or str(matching_server[0]) != str(
+            matching_lease.get("server_id")
+        ):
+            raise RuntimeError(
+                "old lease is linked to an ambiguous or different server record"
+            )
     if matching_server:
         recorded_pid = int(matching_server[1].get("pid") or 0)
         if recorded_pid and pid_alive(recorded_pid):
@@ -3441,7 +3717,10 @@ def relocate_port_assignment(
         targets_relocation = (
             str(operation.get("target") or "") in pending_targets
             or str(operation.get("lease_id") or "") == lease_id
-            or bool(matching_server and str(operation.get("server_id") or "") == str(matching_server[0]))
+            or bool(
+                matching_server
+                and str(operation.get("server_id") or "") == str(matching_server[0])
+            )
         )
         if targets_relocation:
             raise RuntimeError(
@@ -3489,13 +3768,20 @@ def relocate_port_assignment(
         server_id, server = matching_server
         server["key"] = new_key
         server["project"] = new_project
-        server["cwd"] = _relocated_path(server.get("cwd"), old_project=old_project, new_project=new_project) or new_project
+        server["cwd"] = (
+            _relocated_path(
+                server.get("cwd"), old_project=old_project, new_project=new_project
+            )
+            or new_project
+        )
         server["pid"] = None
         server["lease_id"] = None
         server["status"] = "stopped"
         server["stopped_at"] = relocated_at
         server["stopped_ts"] = now()
-        server["stopped_reason"] = "Checkout ownership relocated; awaiting exact listener registration"
+        server["stopped_reason"] = (
+            "Checkout ownership relocated; awaiting exact listener registration"
+        )
         server["health"] = {
             "ok": False,
             "pid_alive": False,
@@ -3529,7 +3815,9 @@ def relocate_port_assignment(
 
     event_payload = {
         "agent": agent,
-        "agent_metadata": agent_metadata(agent=agent, project=new_project, source="port_relocate"),
+        "agent_metadata": agent_metadata(
+            agent=agent, project=new_project, source="port_relocate"
+        ),
         "old_project": old_project,
         "new_project": new_project,
         "name": name,
@@ -3537,7 +3825,9 @@ def relocate_port_assignment(
         "old_key": old_key,
         "new_key": new_key,
         "lease_id": lease_id,
-        "lease_status": "stale_released" if (relocated_lease or stale_evidence) else "missing",
+        "lease_status": "stale_released"
+        if (relocated_lease or stale_evidence)
+        else "missing",
         "server_id": matching_server[0] if matching_server else None,
         "listener_evidence": listener,
     }
@@ -3551,7 +3841,9 @@ def relocate_port_assignment(
     }
 
 
-def list_port_assignments(state: dict[str, Any], *, project: str | None = None) -> list[dict[str, Any]]:
+def list_port_assignments(
+    state: dict[str, Any], *, project: str | None = None
+) -> list[dict[str, Any]]:
     resolved = canonical_project(project) if project else None
     out = [
         dict(assignment)
@@ -3570,7 +3862,10 @@ def seed_port_assignments(state: dict[str, Any]) -> None:
     servers = [
         server
         for server in state.get("servers", {}).values()
-        if isinstance(server, dict) and server.get("port") and server.get("name") and server.get("key")
+        if isinstance(server, dict)
+        and server.get("port")
+        and server.get("name")
+        and server.get("key")
     ]
 
     def rank(server: dict[str, Any]) -> tuple[int, float]:
@@ -3613,7 +3908,11 @@ def git_directory(project: str) -> Path | None:
         return marker
     if marker.is_file():
         with contextlib.suppress(OSError):
-            prefix, _, value = marker.read_text(encoding="utf-8", errors="replace").strip().partition(":")
+            prefix, _, value = (
+                marker.read_text(encoding="utf-8", errors="replace")
+                .strip()
+                .partition(":")
+            )
             if prefix.strip().lower() == "gitdir" and value.strip():
                 path = Path(value.strip()).expanduser()
                 if not path.is_absolute():
@@ -3629,19 +3928,25 @@ def read_git_head_identity(project: str) -> tuple[str | None, str | None]:
     if not directory:
         return None, None
     with contextlib.suppress(OSError):
-        head = (directory / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        head = (
+            (directory / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+        )
         if head.startswith("ref:"):
             reference = head.split(":", 1)[1].strip()
             branch = reference.removeprefix("refs/heads/")
             commit = None
             reference_path = directory / reference
             with contextlib.suppress(OSError):
-                commit = reference_path.read_text(encoding="utf-8", errors="replace").strip()
+                commit = reference_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip()
             if not commit:
                 with contextlib.suppress(OSError):
-                    for line in (directory / "packed-refs").read_text(
-                        encoding="utf-8", errors="replace"
-                    ).splitlines():
+                    for line in (
+                        (directory / "packed-refs")
+                        .read_text(encoding="utf-8", errors="replace")
+                        .splitlines()
+                    ):
                         value, separator, name = line.partition(" ")
                         if separator and name == reference:
                             commit = value
@@ -3672,7 +3977,9 @@ def git_head_identity(project: str) -> tuple[str | None, str | None]:
     return read_git_head_identity(resolved_project)
 
 
-def agent_metadata(*, agent: str, project: str, source: str, cwd: str | None = None) -> dict[str, Any]:
+def agent_metadata(
+    *, agent: str, project: str, source: str, cwd: str | None = None
+) -> dict[str, Any]:
     resolved_project = canonical_project(project)
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else resolved_project
     git_branch, git_commit = git_head_identity(resolved_project)
@@ -3692,7 +3999,9 @@ def require_identity(options: dict[str, Any], command: str) -> tuple[str, str]:
     agent = str(options.get("agent") or "").strip()
     project = str(options.get("project") or "").strip()
     if not agent:
-        raise ValueError(f"{command} requires --agent so the coordinator can attribute the action")
+        raise ValueError(
+            f"{command} requires --agent so the coordinator can attribute the action"
+        )
     if not project:
         raise ValueError(f"{command} requires --project with the canonical repo path")
     resolved_project = canonical_project(project)
@@ -3734,7 +4043,9 @@ def project_key_from_path(project: str | None) -> str:
     return project_key_from_resource_name(Path(project).expanduser().resolve().name)
 
 
-def find_server(state: dict[str, Any], *, project: str, name: str) -> tuple[str, dict[str, Any]] | tuple[None, None]:
+def find_server(
+    state: dict[str, Any], *, project: str, name: str
+) -> tuple[str, dict[str, Any]] | tuple[None, None]:
     key = server_key(project, name)
     resolved_project = canonical_project(project)
     matches: list[tuple[str, dict[str, Any]]] = []
@@ -3743,7 +4054,9 @@ def find_server(state: dict[str, Any], *, project: str, name: str) -> tuple[str,
         same_project = False
         if server_project:
             with contextlib.suppress(Exception):
-                same_project = canonical_project(str(server_project)) == resolved_project
+                same_project = (
+                    canonical_project(str(server_project)) == resolved_project
+                )
         if server.get("key") == key or (server.get("name") == name and same_project):
             matches.append((server_id, server))
     for server_id, server in reversed(matches):
@@ -3778,13 +4091,20 @@ def server_record_rank(server: dict[str, Any]) -> tuple[int, str, str, str]:
         state_rank = 1
     else:
         state_rank = 0
-    timestamp = str(server.get("updated_at") or server.get("stopped_at") or server.get("created_at") or "")
+    timestamp = str(
+        server.get("updated_at")
+        or server.get("stopped_at")
+        or server.get("created_at")
+        or ""
+    )
     created_at = str(server.get("created_at") or "")
     server_id = str(server.get("id") or "")
     return (state_rank, timestamp, created_at, server_id)
 
 
-def preferred_server_record(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+def preferred_server_record(
+    left: dict[str, Any], right: dict[str, Any]
+) -> dict[str, Any]:
     return right if server_record_rank(right) >= server_record_rank(left) else left
 
 
@@ -3795,7 +4115,9 @@ def deduplicate_server_records(servers: list[dict[str, Any]]) -> list[dict[str, 
         key = server_record_key(server)
         duplicate_ids.setdefault(key, []).append(str(server.get("id") or ""))
         current = preferred.get(key)
-        preferred[key] = server if current is None else preferred_server_record(current, server)
+        preferred[key] = (
+            server if current is None else preferred_server_record(current, server)
+        )
 
     result: list[dict[str, Any]] = []
     emitted: set[str] = set()
@@ -3809,7 +4131,9 @@ def deduplicate_server_records(servers: list[dict[str, Any]]) -> list[dict[str, 
         duplicate_count = len(duplicate_ids.get(key, []))
         if duplicate_count > 1:
             server["duplicate_count"] = duplicate_count
-            server["duplicate_server_ids"] = [item for item in duplicate_ids[key] if item and item != winner_id]
+            server["duplicate_server_ids"] = [
+                item for item in duplicate_ids[key] if item and item != winner_id
+            ]
         result.append(server)
     return result
 
@@ -3857,7 +4181,9 @@ def annotate_server_url_currency(servers: list[dict[str, Any]]) -> None:
             }
 
 
-def resource_project_identity(project: str | None, fallback_name: str | None = None) -> dict[str, str | None]:
+def resource_project_identity(
+    project: str | None, fallback_name: str | None = None
+) -> dict[str, str | None]:
     if project:
         resolved = canonical_project(str(project))
         return {
@@ -3902,7 +4228,9 @@ def known_project_paths(
     return paths
 
 
-def container_project_attribution(container: dict[str, Any], known_projects: set[str]) -> dict[str, Any]:
+def container_project_attribution(
+    container: dict[str, Any], known_projects: set[str]
+) -> dict[str, Any]:
     """Single authority for which project group a Docker container belongs to.
 
     Display grouping (`build_project_usage`) and whole-project actions
@@ -3921,7 +4249,9 @@ def container_project_attribution(container: dict[str, Any], known_projects: set
         identity["attribution"] = "explicit"
         return identity
     name_key = project_key_from_resource_name(fallback_name)
-    claimants = sorted(path for path in known_projects if project_key_from_path(path) == name_key)
+    claimants = sorted(
+        path for path in known_projects if project_key_from_path(path) == name_key
+    )
     identity = resource_project_identity(None, fallback_name)
     identity["attribution"] = (
         "name_match_read_only"
@@ -3947,7 +4277,9 @@ def process_owner_matches_project(pid: int, project: str | None) -> bool:
     return owner_project == resolved_project or path_inside(cwd, resolved_project)
 
 
-def annotate_server_process_usage(servers: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+def annotate_server_process_usage(
+    servers: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
     process_table = read_process_table()
     if not process_table:
         for server in servers:
@@ -3965,11 +4297,16 @@ def annotate_server_process_usage(servers: list[dict[str, Any]]) -> dict[int, di
         pid = int(server.get("pid") or 0)
         if pid in process_table:
             identity = (server.get("health") or {}).get("identity") or {}
-            if identity.get("ok") is not False and identity.get("observable") is not False:
+            if (
+                identity.get("ok") is not False
+                and identity.get("observable") is not False
+            ):
                 roots.add(pid)
 
         port = int(server.get("port") or 0)
-        if port and (server.get("status") != "stopped" or server.get("url_is_current") or roots):
+        if port and (
+            server.get("status") != "stopped" or server.get("url_is_current") or roots
+        ):
             owner = listener_cache.get(port)
             if owner is None:
                 owner = listener_owner_for_port(port)
@@ -3979,13 +4316,17 @@ def annotate_server_process_usage(servers: list[dict[str, Any]]) -> dict[int, di
                 cache_key = (owner_pid, str(project) if project else None)
                 matches = cwd_match_cache.get(cache_key)
                 if matches is None:
-                    matches = process_owner_matches_project(owner_pid, str(project) if project else None)
+                    matches = process_owner_matches_project(
+                        owner_pid, str(project) if project else None
+                    )
                     cwd_match_cache[cache_key] = matches
                 if matches:
                     roots.add(owner_pid)
 
         pids = process_tree_pids(roots, process_table, children)
-        usage = summarize_process_usage(pids, process_table, root_pids=roots, source="process_tree")
+        usage = summarize_process_usage(
+            pids, process_table, root_pids=roots, source="process_tree"
+        )
         if usage:
             usage["sampled_at"] = sampled_at
             usage["project"] = project
@@ -4010,7 +4351,9 @@ def build_project_usage(
     # Same claim set as matching_project_containers: membership shown here is
     # exactly the membership whole-project actions act on.
     claimant_paths = known_project_paths(
-        state, containers, extra=[str(s["project"]) for s in servers if s.get("project")]
+        state,
+        containers,
+        extra=[str(s["project"]) for s in servers if s.get("project")],
     )
 
     def ensure(identity: dict[str, str | None]) -> dict[str, Any]:
@@ -4050,13 +4393,17 @@ def build_project_usage(
         usage = server.get("process_usage") or {}
         for pid in usage.get("pids") or []:
             with contextlib.suppress(TypeError, ValueError):
-                pids_by_project.setdefault(str(identity["usage_key"]), set()).add(int(pid))
+                pids_by_project.setdefault(str(identity["usage_key"]), set()).add(
+                    int(pid)
+                )
 
     for usage_key, pids in pids_by_project.items():
         row = projects.get(usage_key)
         if not row:
             continue
-        summary = summarize_process_usage(pids, process_table, source="project_processes")
+        summary = summarize_process_usage(
+            pids, process_table, source="project_processes"
+        )
         if not summary:
             continue
         row["process_count"] = summary["process_count"]
@@ -4082,13 +4429,23 @@ def build_project_usage(
             row["docker_memory_bytes"] += int(memory)
 
     for row in projects.values():
-        row["cpu_percent"] = round(float(row.get("process_cpu_percent") or 0) + float(row.get("docker_cpu_percent") or 0), 2)
-        row["memory_bytes"] = int(row.get("process_memory_bytes") or 0) + int(row.get("docker_memory_bytes") or 0)
+        row["cpu_percent"] = round(
+            float(row.get("process_cpu_percent") or 0)
+            + float(row.get("docker_cpu_percent") or 0),
+            2,
+        )
+        row["memory_bytes"] = int(row.get("process_memory_bytes") or 0) + int(
+            row.get("docker_memory_bytes") or 0
+        )
         row["docker_cpu_percent"] = round(float(row.get("docker_cpu_percent") or 0), 2)
 
     return sorted(
         projects.values(),
-        key=lambda item: (float(item.get("cpu_percent") or 0), int(item.get("memory_bytes") or 0), str(item.get("name") or "")),
+        key=lambda item: (
+            float(item.get("cpu_percent") or 0),
+            int(item.get("memory_bytes") or 0),
+            str(item.get("name") or ""),
+        ),
         reverse=True,
     )
 
@@ -4181,7 +4538,9 @@ def parse_legacy_command(command: str) -> list[str]:
     dangerous = {";", "&", "&&", "|", "||", "<", ">", ">>", "<<", "(", ")"}
     for token in argv:
         if token in dangerous or (token and all(char in ";&|<>()" for char in token)):
-            raise ValueError(f"unsafe shell syntax in server command: {token!r}; use structured argv")
+            raise ValueError(
+                f"unsafe shell syntax in server command: {token!r}; use structured argv"
+            )
     if not argv:
         raise ValueError("server command must not be empty")
     return argv
@@ -4199,7 +4558,9 @@ def command_argv(options: dict[str, Any]) -> list[str]:
     return parse_legacy_command(str(command or ""))
 
 
-def format_argv(argv: list[str] | tuple[str, ...], *, port: int, host: str) -> list[str]:
+def format_argv(
+    argv: list[str] | tuple[str, ...], *, port: int, host: str
+) -> list[str]:
     return [item.replace("{port}", str(port)).replace("{host}", host) for item in argv]
 
 
@@ -4279,10 +4640,18 @@ def http_health(url: str, timeout: float = 2.0) -> dict[str, Any]:
             if not chunk:
                 break
             response += chunk
-        status_line = response.splitlines()[0].decode("iso-8859-1", errors="replace") if response else ""
+        status_line = (
+            response.splitlines()[0].decode("iso-8859-1", errors="replace")
+            if response
+            else ""
+        )
         parts = status_line.split(None, 2)
         if len(parts) < 2 or not parts[1].isdigit():
-            return {"ok": False, "error": "invalid HTTP response", "response": status_line}
+            return {
+                "ok": False,
+                "error": "invalid HTTP response",
+                "response": status_line,
+            }
         status = int(parts[1])
         reason = parts[2] if len(parts) > 2 else ""
         return {"ok": 200 <= status < 400, "status": status, "reason": reason}
@@ -4319,7 +4688,10 @@ def server_health(
             "ok": False,
             "pid_alive": False,
             "check": {"ok": False, "skipped": "recorded process is not alive"},
-            "identity": {"ok": True, "skipped": "not checked because recorded process is not alive"},
+            "identity": {
+                "ok": True,
+                "skipped": "not checked because recorded process is not alive",
+            },
             "classification": "stopped",
         }
     raw_health_url = server.get("health_url")
@@ -4381,7 +4753,11 @@ def server_health(
         ok: bool | None = None
         classification = "unverified-listener"
     else:
-        ok = alive is not False and bool(check.get("ok")) and identity.get("ok") is not False
+        ok = (
+            alive is not False
+            and bool(check.get("ok"))
+            and identity.get("ok") is not False
+        )
     if ok is True:
         classification = "healthy"
     elif identity.get("ok") is False:
@@ -4465,7 +4841,11 @@ def require_project_server_identities_observable(
             project=str(server_def["project"]),
             name=str(server_def["name"]),
         )
-        fixed_port = server_def.get("port") or (assignment or {}).get("port") or (server or {}).get("port")
+        fixed_port = (
+            server_def.get("port")
+            or (assignment or {}).get("port")
+            or (server or {}).get("port")
+        )
         if fixed_port is None:
             continue
         host = str(server_def.get("host") or (server or {}).get("host") or "127.0.0.1")
@@ -4482,10 +4862,14 @@ def require_project_server_identities_observable(
     return fingerprints
 
 
-def docker_available_command(args: list[str], *, cwd: str | None = None) -> dict[str, Any]:
+def docker_available_command(
+    args: list[str], *, cwd: str | None = None
+) -> dict[str, Any]:
     command = ["docker", *args]
     try:
-        completed, executable, timeout_seconds = execute_docker_subprocess(command, cwd=cwd)
+        completed, executable, timeout_seconds = execute_docker_subprocess(
+            command, cwd=cwd
+        )
     except Exception as exc:
         return {"ok": False, "command": command, **coordinator_exception_payload(exc)}
     return {
@@ -4530,7 +4914,9 @@ def docker_container_operation_identity(
     normalized = normalize_container_name(container)
     if not normalized:
         return None
-    evidence = inspected if inspected is not None else inspect_docker_container(normalized)
+    evidence = (
+        inspected if inspected is not None else inspect_docker_container(normalized)
+    )
     immutable_id = str((evidence or {}).get("Id") or "").strip().lower()
     if re.fullmatch(r"[0-9a-f]{12,64}", immutable_id):
         return f"container-id:{immutable_id}"
@@ -4540,10 +4926,27 @@ def docker_container_operation_identity(
 def compose_project_from_inspection(inspected: dict[str, Any] | None) -> str | None:
     labels = ((inspected or {}).get("Config") or {}).get("Labels") or {}
     working_dir = labels.get("com.docker.compose.project.working_dir")
-    return str(Path(working_dir).expanduser().resolve()) if working_dir else None
+    # Compose records the directory from which it was invoked, which may be a
+    # deploy/infra subdirectory rather than the owning Git worktree root. Keep
+    # project identity aligned with every other coordinator path by walking to
+    # the nearest .git marker. A genuinely nested worktree has its own marker
+    # and therefore remains a distinct project.
+    # Docker observations are repeated within one long-lived coordinator
+    # process. Re-walk Compose's working directory each time so a nested Git
+    # worktree created after an earlier observation is attributed to its new
+    # repository instead of a process-lifetime cached outer repository.
+    return canonical_project(str(working_dir), refresh=True) if working_dir else None
 
 
-def sidecar_metadata_for_container(state: dict[str, Any], container: dict[str, Any]) -> dict[str, Any] | None:
+def is_full_docker_container_id(value: Any) -> bool:
+    """Return whether *value* is Docker's exact immutable container ID."""
+
+    return re.fullmatch(r"[0-9a-f]{64}", str(value or "").strip().lower()) is not None
+
+
+def sidecar_metadata_for_container(
+    state: dict[str, Any], container: dict[str, Any]
+) -> dict[str, Any] | None:
     metadata = docker_metadata_store(state)
     keys = [
         normalize_container_name(container.get("name")),
@@ -4555,7 +4958,9 @@ def sidecar_metadata_for_container(state: dict[str, Any], container: dict[str, A
     return None
 
 
-def register_docker_metadata(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+def register_docker_metadata(
+    state: dict[str, Any], options: dict[str, Any]
+) -> dict[str, Any]:
     agent, project = require_identity(options, "docker register")
     container = normalize_container_name(options.get("container"))
     if not container:
@@ -4577,7 +4982,12 @@ def register_docker_metadata(state: dict[str, Any], options: dict[str, Any]) -> 
             "adopted": False,
             "skipped": True,
             "message": "container already has Docker Compose project metadata",
-            "agent_metadata": agent_metadata(agent=agent, project=project, cwd=options.get("cwd"), source="docker_register_skipped"),
+            "agent_metadata": agent_metadata(
+                agent=agent,
+                project=project,
+                cwd=options.get("cwd"),
+                source="docker_register_skipped",
+            ),
             "updated_at": iso_timestamp(),
         }
         record_event(state, "docker.register.skipped", payload)
@@ -4593,7 +5003,12 @@ def register_docker_metadata(state: dict[str, Any], options: dict[str, Any]) -> 
         "role": options.get("role"),
         "metadata_source": "coordinator_sidecar",
         "adopted": True,
-        "agent_metadata": agent_metadata(agent=agent, project=project, cwd=options.get("cwd"), source="docker_register"),
+        "agent_metadata": agent_metadata(
+            agent=agent,
+            project=project,
+            cwd=options.get("cwd"),
+            source="docker_register",
+        ),
         "updated_at": iso_timestamp(),
     }
     metadata = docker_metadata_store(state)
@@ -4666,7 +5081,9 @@ def parse_int(raw: Any) -> int | None:
     return None
 
 
-def positive_rate(current: float | None, previous: float | None, elapsed: float) -> float | None:
+def positive_rate(
+    current: float | None, previous: float | None, elapsed: float
+) -> float | None:
     if current is None or previous is None or elapsed <= 0:
         return None
     delta = current - previous
@@ -4698,10 +5115,14 @@ def normalize_docker_stats(item: dict[str, Any], *, timestamp: float) -> dict[st
     }
 
 
-def attach_docker_rates(sample: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
+def attach_docker_rates(
+    sample: dict[str, Any], previous: dict[str, Any] | None
+) -> dict[str, Any]:
     if not previous:
         return sample
-    elapsed = float(sample.get("timestamp_ts") or 0) - float(previous.get("timestamp_ts") or 0)
+    elapsed = float(sample.get("timestamp_ts") or 0) - float(
+        previous.get("timestamp_ts") or 0
+    )
     sample["network_rx_rate_bytes_per_second"] = positive_rate(
         sample.get("network_rx_bytes"), previous.get("network_rx_bytes"), elapsed
     )
@@ -4727,14 +5148,23 @@ def docker_stats_sample_sort_key(sample: Any) -> tuple[float, str, str]:
     return timestamp, str(sample.get("id") or ""), str(sample.get("name") or "")
 
 
-def sample_docker_stats(state: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
-    command = ["docker", "stats", "--no-stream", "--format", "{{json .}}"]
+def sample_docker_stats(
+    state: dict[str, Any], *, dry_run: bool = False
+) -> dict[str, Any]:
+    # Telemetry keys must use the same immutable identity as docker ps. Without
+    # --no-trunc the stats samples are keyed by a 12-character alias and stop
+    # joining inventory as soon as ps correctly returns the full ID.
+    command = ["docker", "stats", "--no-stream", "--no-trunc", "--format", "{{json .}}"]
     if dry_run:
         return {"dry_run": True, "command": command}
 
     result = docker_available_command(command[1:])
     if not result.get("ok"):
-        return {"available": False, "error": result.get("error") or result.get("stderr"), "stats": []}
+        return {
+            "available": False,
+            "error": result.get("error") or result.get("stderr"),
+            "stats": [],
+        }
 
     timestamp = now()
     history_by_id = state.setdefault("docker", {}).setdefault("stats_history", {})
@@ -4767,7 +5197,9 @@ def docker_ps_inventory(
     state: dict[str, Any] | None = None,
     stats_history_limit: int = DOCKER_STATS_HISTORY_LIMIT,
 ) -> dict[str, Any]:
-    if not isinstance(stats_history_limit, int) or isinstance(stats_history_limit, bool):
+    if not isinstance(stats_history_limit, int) or isinstance(
+        stats_history_limit, bool
+    ):
         raise ValueError("Docker stats history limit must be an integer")
     if not 0 <= stats_history_limit <= DOCKER_STATS_HISTORY_LIMIT:
         raise ValueError(
@@ -4776,10 +5208,22 @@ def docker_ps_inventory(
     args = ["ps"]
     if all_containers:
         args.append("--all")
+    # The ps row is the primary identity observation. Inspect enriches that
+    # row, but a single container disappearing during bulk inspect must never
+    # downgrade every other resource to a new 12-character pseudo-identity.
+    args.append("--no-trunc")
     args.extend(["--format", "{{json .}}"])
     result = docker_available_command(args)
     if not result.get("ok"):
-        return {"available": False, "error": result.get("error") or result.get("stderr"), "containers": [], "postgres": []}
+        return {
+            "available": False,
+            "error": result.get("error") or result.get("stderr"),
+            "containers": [],
+            "postgres": [],
+            "container_inspection_available": False,
+            "compose_assets_available": False,
+            "compose_assets": [],
+        }
     stats_by_id: dict[str, dict[str, Any]] = {}
     history_by_id: dict[str, list[dict[str, Any]]] = {}
     stats_error = None
@@ -4800,14 +5244,49 @@ def docker_ps_inventory(
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            return {
+                "available": False,
+                "error": "Docker container listing returned malformed evidence",
+                "containers": [],
+                "postgres": [],
+                "container_inspection_available": False,
+                "compose_assets_available": False,
+                "compose_assets": [],
+            }
+        if not isinstance(item, dict):
+            return {
+                "available": False,
+                "error": "Docker container listing returned malformed evidence",
+                "containers": [],
+                "postgres": [],
+                "container_inspection_available": False,
+                "compose_assets_available": False,
+                "compose_assets": [],
+            }
+        observed_id = str(item.get("ID") or "").strip().lower()
+        if not is_full_docker_container_id(observed_id):
+            return {
+                "available": False,
+                "error": (
+                    "Docker container listing returned malformed identity evidence: "
+                    "immutable identity unavailable because --no-trunc did not "
+                    "return one exact 64-hex identity"
+                ),
+                "containers": [],
+                "postgres": [],
+                "container_inspection_available": False,
+                "compose_assets_available": False,
+                "compose_assets": [],
+            }
         container = {
-            "id": item.get("ID"),
+            "id": observed_id,
             "name": item.get("Names"),
             "image": item.get("Image"),
             "status": item.get("Status"),
             "ports": item.get("Ports"),
         }
+        if is_full_docker_container_id(observed_id):
+            container["full_id"] = observed_id
         container_id = str(container.get("id") or "")
         if container_id:
             if container_id in stats_by_id:
@@ -4816,33 +5295,161 @@ def docker_ps_inventory(
                 history_by_id.get(container_id, []),
                 key=docker_stats_sample_sort_key,
             )
-            container["stats_history"] = history[-stats_history_limit:] if stats_history_limit else []
+            container["stats_history"] = (
+                history[-stats_history_limit:] if stats_history_limit else []
+            )
         containers.append(container)
     inspect_by_id: dict[str, dict[str, Any]] = {}
-    inspect_ids = [str(container.get("id")) for container in containers if container.get("id")]
+    inspect_ids = [
+        str(container.get("id")) for container in containers if container.get("id")
+    ]
+    if len(set(inspect_ids)) != len(inspect_ids):
+        return {
+            "available": False,
+            "error": "Docker container listing returned duplicate identities",
+            "containers": [],
+            "postgres": [],
+            "container_inspection_available": False,
+            "compose_assets_available": False,
+            "compose_assets": [],
+        }
+    inspect_error = None
+    inspection_complete = not inspect_ids
     if inspect_ids:
-        inspect_result = docker_available_command(["inspect", "--format", "{{json .}}", *inspect_ids])
-        if inspect_result.get("ok"):
-            for line in str(inspect_result.get("stdout") or "").splitlines():
-                with contextlib.suppress(json.JSONDecodeError):
-                    inspected = json.loads(line)
-                    short_id = str(inspected.get("Id") or "")[:12]
-                    inspect_by_id[short_id] = inspected
+        inspect_result = docker_available_command(
+            ["inspect", "--format", "{{json .}}", *inspect_ids]
+        )
+        # Docker can return useful objects on stdout even when one member of a
+        # bulk inspect raced away and the overall command exits non-zero. Such
+        # partial rows enrich ordinary inventory, but they never satisfy the
+        # exhaustive Compose-enrollment observation boundary.
+        for line in str(inspect_result.get("stdout") or "").splitlines():
+            if not line.strip():
+                continue
+            try:
+                inspected = json.loads(line)
+            except json.JSONDecodeError:
+                if not inspect_result.get("ok"):
+                    continue
+                return {
+                    "available": False,
+                    "error": "Docker container inspection returned malformed evidence",
+                    "containers": [],
+                    "postgres": [],
+                    "container_inspection_available": False,
+                    "compose_assets_available": False,
+                    "compose_assets": [],
+                }
+            if not isinstance(inspected, dict):
+                if not inspect_result.get("ok"):
+                    continue
+                return {
+                    "available": False,
+                    "error": "Docker container inspection returned invalid evidence",
+                    "containers": [],
+                    "postgres": [],
+                    "container_inspection_available": False,
+                    "compose_assets_available": False,
+                    "compose_assets": [],
+                }
+            full_id = str(inspected.get("Id") or "").strip().lower()
+            if not is_full_docker_container_id(full_id):
+                if not inspect_result.get("ok"):
+                    continue
+                return {
+                    "available": False,
+                    "error": (
+                        "Docker container inspection returned malformed immutable "
+                        "identity evidence"
+                    ),
+                    "containers": [],
+                    "postgres": [],
+                    "container_inspection_available": False,
+                    "compose_assets_available": False,
+                    "compose_assets": [],
+                }
+            if full_id not in inspect_ids or full_id in inspect_by_id:
+                if not inspect_result.get("ok"):
+                    continue
+                return {
+                    "available": False,
+                    "error": "Docker container inspection identity is incomplete or ambiguous",
+                    "containers": [],
+                    "postgres": [],
+                    "container_inspection_available": False,
+                    "compose_assets_available": False,
+                    "compose_assets": [],
+                }
+            inspect_by_id[full_id] = inspected
+        if inspect_result.get("ok") and set(inspect_by_id) != set(inspect_ids):
+            return {
+                "available": False,
+                "error": "Docker container inspection omitted listed containers",
+                "containers": [],
+                "postgres": [],
+                "container_inspection_available": False,
+                "compose_assets_available": False,
+                "compose_assets": [],
+            }
+        inspection_complete = bool(inspect_result.get("ok"))
+        if not inspect_result.get("ok"):
+            detail = (
+                inspect_result.get("error")
+                or inspect_result.get("stderr")
+                or "unknown error"
+            )
+            inspect_error = f"docker inspect failed: {detail}"
+    identity_errors: list[str] = []
     for container in containers:
         inspected = inspect_by_id.get(str(container.get("id") or ""))
+        container["inspection_observable"] = inspected is not None
         if inspected:
-            full_id = str(inspected.get("Id") or "").strip()
-            if full_id:
+            full_id = str(inspected.get("Id") or "").strip().lower()
+            if is_full_docker_container_id(full_id):
                 container["full_id"] = full_id
-            state_payload = inspected.get("State") if isinstance(inspected.get("State"), dict) else {}
-            health_payload = state_payload.get("Health") if isinstance(state_payload.get("Health"), dict) else {}
+                container["id"] = full_id
+            raw_state_payload = inspected.get("State")
+            if (
+                not isinstance(raw_state_payload, dict)
+                or type(raw_state_payload.get("Running")) is not bool
+            ):
+                return {
+                    "available": False,
+                    "error": "Docker container inspection returned malformed lifecycle evidence",
+                    "containers": [],
+                    "postgres": [],
+                    "container_inspection_available": False,
+                    "compose_assets_available": False,
+                    "compose_assets": [],
+                }
+            state_payload = raw_state_payload
+            container["running"] = state_payload["Running"]
+            health_payload = (
+                state_payload.get("Health")
+                if isinstance(state_payload.get("Health"), dict)
+                else {}
+            )
             container["container_health"] = health_payload.get("Status")
-            host_config = inspected.get("HostConfig") if isinstance(inspected.get("HostConfig"), dict) else {}
-            restart = host_config.get("RestartPolicy") if isinstance(host_config.get("RestartPolicy"), dict) else {}
+            host_config = (
+                inspected.get("HostConfig")
+                if isinstance(inspected.get("HostConfig"), dict)
+                else {}
+            )
+            restart = (
+                host_config.get("RestartPolicy")
+                if isinstance(host_config.get("RestartPolicy"), dict)
+                else {}
+            )
             container["restart_policy"] = restart.get("Name") or "no"
             port_bindings: list[dict[str, Any]] = []
-            network = inspected.get("NetworkSettings") if isinstance(inspected.get("NetworkSettings"), dict) else {}
-            published = network.get("Ports") if isinstance(network.get("Ports"), dict) else {}
+            network = (
+                inspected.get("NetworkSettings")
+                if isinstance(inspected.get("NetworkSettings"), dict)
+                else {}
+            )
+            published = (
+                network.get("Ports") if isinstance(network.get("Ports"), dict) else {}
+            )
             for destination, bindings in sorted(published.items()):
                 raw_port, _separator, protocol = str(destination).partition("/")
                 with contextlib.suppress(ValueError):
@@ -4867,39 +5474,244 @@ def docker_ps_inventory(
                             }
                         )
             container["port_bindings"] = port_bindings
+        if not container.get("full_id"):
+            identity_errors.append(
+                str(container.get("name") or container.get("id") or "unknown")
+            )
         labels = ((inspected or {}).get("Config") or {}).get("Labels") or {}
         if labels:
             container["labels"] = labels
             container["compose_project"] = labels.get("com.docker.compose.project")
-            compose_working_dir = labels.get("com.docker.compose.project.working_dir")
-            if compose_working_dir:
-                container["project"] = str(Path(compose_working_dir).expanduser().resolve())
+            compose_project = compose_project_from_inspection(inspected)
+            if compose_project:
+                container["compose_working_dir"] = labels.get(
+                    "com.docker.compose.project.working_dir"
+                )
+                container["project"] = compose_project
                 container["metadata_source"] = "docker_labels"
-        sidecar = sidecar_metadata_for_container(state, container) if state is not None else None
+        sidecar = (
+            sidecar_metadata_for_container(state, container)
+            if state is not None
+            else None
+        )
         if sidecar and not container.get("project"):
             container["project"] = sidecar.get("project")
             container["agent"] = sidecar.get("agent")
             container["role"] = sidecar.get("role")
-            container["metadata_source"] = sidecar.get("metadata_source") or "coordinator_sidecar"
+            container["metadata_source"] = (
+                sidecar.get("metadata_source") or "coordinator_sidecar"
+            )
             container["adopted"] = sidecar.get("adopted", True)
             container["agent_metadata"] = sidecar.get("agent_metadata")
         elif not container.get("metadata_source"):
-            container["metadata_source"] = "none"
-        haystack = " ".join(str(container.get(key) or "").lower() for key in ("name", "image", "ports"))
+            container["metadata_source"] = (
+                "inspection_unavailable" if inspected is None else "none"
+            )
+        haystack = " ".join(
+            str(container.get(key) or "").lower() for key in ("name", "image", "ports")
+        )
         if "postgres" in haystack or "5432" in haystack:
             postgres.append(container)
-    payload: dict[str, Any] = {"available": True, "containers": containers, "postgres": postgres}
+    if identity_errors:
+        return {
+            "available": False,
+            "error": (
+                "Docker container identity unavailable after full-ID ps and inspect for: "
+                + ", ".join(identity_errors[:8])
+            ),
+            "containers": [],
+            "postgres": [],
+            "container_inspection_available": False,
+            "compose_assets_available": False,
+            "compose_assets": [],
+        }
+    compose_assets_result = docker_compose_asset_inventory()
+    payload: dict[str, Any] = {
+        "available": True,
+        "containers": containers,
+        "postgres": postgres,
+        "container_inspection_available": inspection_complete,
+        "compose_assets_available": bool(compose_assets_result["available"]),
+        "compose_assets": list(compose_assets_result["assets"]),
+    }
+    if inspect_error:
+        payload["inspection_error"] = inspect_error
+    if compose_assets_result.get("error"):
+        payload["compose_assets_error"] = compose_assets_result["error"]
     if stats_error:
         payload["stats_error"] = stats_error
     return payload
 
 
-def discover_postgres_databases(container: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+def docker_compose_asset_inventory() -> dict[str, Any]:
+    """Observe all Compose-labeled networks and volumes without mutation."""
+
+    assets: list[dict[str, Any]] = []
+    for kind in ("network", "volume"):
+        listed = docker_available_command(
+            [kind, "ls", "--filter", "label=com.docker.compose.project", "--quiet"]
+        )
+        if not listed.get("ok"):
+            return {
+                "available": False,
+                "assets": [],
+                "error": f"Docker {kind} inventory is unavailable",
+            }
+        raw_identities = [
+            line for line in str(listed.get("stdout") or "").splitlines() if line
+        ]
+        identities = tuple(raw_identities)
+        malformed_identity = any(
+            item != item.strip()
+            or not item
+            or len(item) > 512
+            or (kind == "network" and not re.fullmatch(r"[0-9a-f]{12,64}", item))
+            or (kind == "volume" and any(character.isspace() for character in item))
+            for item in identities
+        )
+        if len(identities) > 4096 or malformed_identity:
+            return {
+                "available": False,
+                "assets": [],
+                "error": f"Docker {kind} inventory returned malformed or out-of-bounds identities",
+            }
+        if len(set(identities)) != len(identities):
+            return {
+                "available": False,
+                "assets": [],
+                "error": f"Docker {kind} inventory returned duplicate identities",
+            }
+        sorted_identities = sorted(identities)
+        if kind == "network" and any(
+            right.startswith(left)
+            for left, right in zip(sorted_identities, sorted_identities[1:])
+        ):
+            return {
+                "available": False,
+                "assets": [],
+                "error": "Docker network inventory returned ambiguous identity prefixes",
+            }
+        observed: dict[str, dict[str, Any]] = {}
+        for offset in range(0, len(identities), 64):
+            batch = identities[offset : offset + 64]
+            inspected = docker_available_command(
+                [kind, "inspect", "--format", "{{json .}}", *batch]
+            )
+            if not inspected.get("ok"):
+                return {
+                    "available": False,
+                    "assets": [],
+                    "error": f"Docker {kind} inspection is unavailable",
+                }
+            for line in str(inspected.get("stdout") or "").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    return {
+                        "available": False,
+                        "assets": [],
+                        "error": f"Docker {kind} inspection returned malformed evidence",
+                    }
+                if not isinstance(item, dict):
+                    return {
+                        "available": False,
+                        "assets": [],
+                        "error": f"Docker {kind} inspection returned non-mapping evidence",
+                    }
+                labels = item.get("Labels")
+                if not isinstance(labels, dict):
+                    return {
+                        "available": False,
+                        "assets": [],
+                        "error": f"Docker {kind} inspection returned malformed labels",
+                    }
+                project_name = labels.get("com.docker.compose.project")
+                if not isinstance(project_name, str) or not project_name.strip():
+                    return {
+                        "available": False,
+                        "assets": [],
+                        "error": f"Docker {kind} inspection omitted Compose project evidence",
+                    }
+                working_dir = labels.get("com.docker.compose.project.working_dir")
+                if working_dir is not None and not isinstance(working_dir, str):
+                    return {
+                        "available": False,
+                        "assets": [],
+                        "error": f"Docker {kind} inspection returned malformed working-directory evidence",
+                    }
+                if kind == "volume":
+                    raw_identity = item.get("Name")
+                    if not isinstance(raw_identity, str) or raw_identity not in batch:
+                        return {
+                            "available": False,
+                            "assets": [],
+                            "error": "Docker volume inspection returned substituted identity evidence",
+                        }
+                    requested_identity = raw_identity
+                    immutable_identity = raw_identity
+                else:
+                    raw_identity = item.get("Id")
+                    if not isinstance(raw_identity, str) or not re.fullmatch(
+                        r"[0-9a-f]{64}", raw_identity
+                    ):
+                        return {
+                            "available": False,
+                            "assets": [],
+                            "error": "Docker network inspection returned malformed immutable identity evidence",
+                        }
+                    matches = [
+                        candidate
+                        for candidate in identities
+                        if raw_identity.startswith(candidate)
+                    ]
+                    if len(matches) != 1 or matches[0] not in batch:
+                        return {
+                            "available": False,
+                            "assets": [],
+                            "error": "Docker network inspection returned substituted or ambiguous identity evidence",
+                        }
+                    requested_identity = matches[0]
+                    immutable_identity = raw_identity
+                if requested_identity in observed:
+                    return {
+                        "available": False,
+                        "assets": [],
+                        "error": f"Docker {kind} inspection returned duplicate identity evidence",
+                    }
+                observed[requested_identity] = {
+                    "kind": kind,
+                    "id": immutable_identity,
+                    "project_name": project_name,
+                    "working_dir": working_dir,
+                }
+            if not set(batch).issubset(observed):
+                return {
+                    "available": False,
+                    "assets": [],
+                    "error": f"Docker {kind} inspection omitted requested identities",
+                }
+        if len(observed) != len(identities):
+            return {
+                "available": False,
+                "assets": [],
+                "error": f"Docker {kind} inventory was not inspected completely",
+            }
+        assets.extend(observed[item] for item in sorted(observed))
+    return {"available": True, "assets": assets}
+
+
+def discover_postgres_databases(
+    container: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str | None]:
     """Read a running container's real PostgreSQL catalog once per observation."""
 
     if not str(container.get("status") or "").lower().startswith("up"):
         return [], "container is not running"
-    target = str(container.get("full_id") or container.get("id") or container.get("name") or "")
+    target = str(
+        container.get("full_id") or container.get("id") or container.get("name") or ""
+    )
     if not target:
         return [], "container identity is unavailable"
     identity = docker_available_command(
@@ -4908,11 +5720,15 @@ def discover_postgres_databases(container: dict[str, Any]) -> tuple[list[dict[st
             target,
             "sh",
             "-c",
-            "printf '%s\\n%s\\n' \"${POSTGRES_USER:-postgres}\" \"${POSTGRES_DB:-postgres}\"",
+            'printf \'%s\\n%s\\n\' "${POSTGRES_USER:-postgres}" "${POSTGRES_DB:-postgres}"',
         ]
     )
     if not identity.get("ok"):
-        return [], str(identity.get("stderr") or identity.get("error") or "PostgreSQL identity query failed").strip()
+        return [], str(
+            identity.get("stderr")
+            or identity.get("error")
+            or "PostgreSQL identity query failed"
+        ).strip()
     lines = str(identity.get("stdout") or "").splitlines()
     user = lines[0].strip() if lines and lines[0].strip() else "postgres"
     database = lines[1].strip() if len(lines) > 1 and lines[1].strip() else "postgres"
@@ -4921,10 +5737,27 @@ def discover_postgres_databases(container: dict[str, Any]) -> tuple[list[dict[st
         "WHERE datallowconn AND NOT datistemplate ORDER BY datname"
     )
     catalog = docker_available_command(
-        ["exec", target, "psql", "-U", user, "-d", database, "-At", "-F", "\t", "-c", query]
+        [
+            "exec",
+            target,
+            "psql",
+            "-U",
+            user,
+            "-d",
+            database,
+            "-At",
+            "-F",
+            "\t",
+            "-c",
+            query,
+        ]
     )
     if not catalog.get("ok"):
-        return [], str(catalog.get("stderr") or catalog.get("error") or "PostgreSQL catalog query failed").strip()
+        return [], str(
+            catalog.get("stderr")
+            or catalog.get("error")
+            or "PostgreSQL catalog query failed"
+        ).strip()
     databases: list[dict[str, Any]] = []
     for line in str(catalog.get("stdout") or "").splitlines():
         fields = line.split("\t")
@@ -4938,7 +5771,9 @@ def discover_postgres_databases(container: dict[str, Any]) -> tuple[list[dict[st
     return databases, None
 
 
-def backup_inventory(project: str | None, backup_dirs: list[str] | None = None) -> list[dict[str, Any]]:
+def backup_inventory(
+    project: str | None, backup_dirs: list[str] | None = None
+) -> list[dict[str, Any]]:
     roots = []
     if backup_dirs:
         roots.extend(Path(item).expanduser() for item in backup_dirs)
@@ -4984,14 +5819,18 @@ def runtime_config_candidates(project: str, explicit: str | None = None) -> list
     return [resolved / item for item in PROJECT_RUNTIME_FILES]
 
 
-def load_project_runtime_config(project: str, explicit: str | None = None) -> tuple[dict[str, Any], str | None]:
+def load_project_runtime_config(
+    project: str, explicit: str | None = None
+) -> tuple[dict[str, Any], str | None]:
     for candidate in runtime_config_candidates(project, explicit):
         if not candidate.exists():
             continue
         try:
             return json.loads(candidate.read_text(encoding="utf-8")), str(candidate)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Invalid project runtime JSON at {candidate}: {exc}") from exc
+            raise RuntimeError(
+                f"Invalid project runtime JSON at {candidate}: {exc}"
+            ) from exc
     return {}, None
 
 
@@ -5003,13 +5842,38 @@ def runtime_list(value: Any) -> list[Any]:
     return [value]
 
 
-def resolve_runtime_path(project: str, raw: str | None) -> str:
+def runtime_string_list(value: Any, *, field: str, maximum: int) -> list[str]:
+    """Return one bounded ordered declaration list without option-like empties."""
+
+    values = runtime_list(value)
+    if len(values) > maximum:
+        raise ValueError(f"{field} must contain at most {maximum} entries")
+    normalized: list[str] = []
+    for item in values:
+        if not isinstance(item, str) or not item.strip() or "\x00" in item:
+            raise ValueError(f"{field} entries must be non-empty strings")
+        normalized.append(item.strip())
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{field} must not contain duplicates")
+    return normalized
+
+
+def resolve_runtime_path(
+    project: str,
+    raw: str | None,
+    *,
+    reject_symlinks: bool = False,
+) -> str:
     if not raw:
         return project
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = Path(project) / path
-    return str(path.resolve())
+    absolute = Path(os.path.abspath(path))
+    resolved = path.resolve()
+    if reject_symlinks and absolute != resolved:
+        raise ValueError("Runtime path must not contain symbolic-link components")
+    return str(resolved)
 
 
 def discover_compose_files(project: str) -> list[str]:
@@ -5139,16 +6003,25 @@ def matching_project_containers(
         if container_project and canonical_project(str(container_project)) == resolved:
             matches.append(container)
             continue
-        if project_key_from_resource_name(container.get("name") or container.get("image")) == project_key:
+        if (
+            project_key_from_resource_name(
+                container.get("name") or container.get("image")
+            )
+            == project_key
+        ):
             matches.append(container)
     return matches
 
 
-def container_has_authorized_project_provenance(container: dict[str, Any], project: str) -> bool:
+def container_has_authorized_project_provenance(
+    container: dict[str, Any], project: str
+) -> bool:
     """Return whether Docker/coordinator evidence—not a name—owns this container."""
 
     container_project = container.get("project")
-    if not container_project or canonical_project(str(container_project)) != canonical_project(project):
+    if not container_project or canonical_project(
+        str(container_project)
+    ) != canonical_project(project):
         return False
     source = container.get("metadata_source")
     if source == "docker_labels":
@@ -5172,7 +6045,11 @@ def build_project_runtime_spec(
 ) -> dict[str, Any]:
     resolved_project = canonical_project(project)
     config, config_path = load_project_runtime_config(resolved_project, runtime_file)
-    docker = docker_ps_inventory(state=state) if include_docker else {"available": None, "containers": [], "postgres": []}
+    docker = (
+        docker_ps_inventory(state=state)
+        if include_docker
+        else {"available": None, "containers": [], "postgres": []}
+    )
     servers_by_name = {
         server.get("name"): dict(server)
         for server in state.get("servers", {}).values()
@@ -5200,7 +6077,8 @@ def build_project_runtime_spec(
                     "cmd": server.get("cmd_template") or server.get("cmd"),
                     "port": server.get("port"),
                     "host": server.get("host") or "127.0.0.1",
-                    "health_url": server.get("health_url_template") or server.get("health_url"),
+                    "health_url": server.get("health_url_template")
+                    or server.get("health_url"),
                     "readiness_url": None,
                     "health_timeout": 10,
                     "env": [],
@@ -5221,7 +6099,9 @@ def build_project_runtime_spec(
                 "cmd": "npm run dev -- --host 127.0.0.1 --port {port}",
                 "port": inferred_port,
                 "host": "127.0.0.1",
-                "health_url": f"http://127.0.0.1:{inferred_port}/" if inferred_port else None,
+                "health_url": f"http://127.0.0.1:{inferred_port}/"
+                if inferred_port
+                else None,
                 "readiness_url": None,
                 "health_timeout": 10,
                 "env": [],
@@ -5229,32 +6109,75 @@ def build_project_runtime_spec(
             }
         )
 
-    docker_config = config.get("docker") if isinstance(config.get("docker"), dict) else {}
-    compose_files = runtime_list(docker_config.get("compose_files") or docker_config.get("files"))
+    docker_config = (
+        config.get("docker") if isinstance(config.get("docker"), dict) else {}
+    )
+    compose_files = runtime_string_list(
+        docker_config.get("compose_files") or docker_config.get("files"),
+        field="docker.compose_files",
+        maximum=16,
+    )
     compose_declared = bool(compose_files)
     if not compose_files and docker_config.get("services"):
+        if config_path:
+            raise ValueError(
+                "docker.services requires explicit docker.compose_files; discovered legacy files are observation-only"
+            )
         compose_files = discover_compose_files(resolved_project)
-        compose_declared = bool(compose_files)
+        compose_declared = False
     elif not compose_files and not config_path:
         compose_files = discover_compose_files(resolved_project)
         compose_declared = False
-    compose_services = [str(item) for item in runtime_list(docker_config.get("services")) if item]
-    compose = {
-        "type": "compose",
-        "name": "docker-compose",
-        "required": compose_declared,
-        "declared": compose_declared,
-        "discovered": bool(compose_files) and not compose_declared,
-        "autostart": compose_declared,
-        "cwd": resolved_project,
-        "files": [str(item) for item in compose_files],
-        "services": compose_services,
-        "project_name": (
-            None
-            if docker_config.get("project_name") is None
-            else str(docker_config["project_name"])
-        ),
-    } if compose_files else None
+    compose_services = runtime_string_list(
+        docker_config.get("services"), field="docker.services", maximum=128
+    )
+    if compose_declared and not compose_services:
+        raise ValueError(
+            "declared Compose runtime requires at least one exact docker.services entry"
+        )
+    compose_env_files = [
+        resolve_runtime_path(resolved_project, item, reject_symlinks=True)
+        for item in runtime_string_list(
+            docker_config.get("env_files") or docker_config.get("env_file"),
+            field="docker.env_files",
+            maximum=16,
+        )
+    ]
+    compose_profiles = runtime_string_list(
+        docker_config.get("profiles") or docker_config.get("profile"),
+        field="docker.profiles",
+        maximum=64,
+    )
+    if not compose_files and (
+        compose_env_files
+        or compose_profiles
+        or docker_config.get("project_name") is not None
+    ):
+        raise ValueError(
+            "Compose env_files, profiles, and project_name require declared compose_files"
+        )
+    compose = (
+        {
+            "type": "compose",
+            "name": "docker-compose",
+            "required": compose_declared,
+            "declared": compose_declared,
+            "discovered": bool(compose_files) and not compose_declared,
+            "autostart": compose_declared,
+            "cwd": resolved_project,
+            "files": [str(item) for item in compose_files],
+            "env_files": compose_env_files,
+            "profiles": compose_profiles,
+            "services": compose_services,
+            "project_name": (
+                None
+                if docker_config.get("project_name") is None
+                else str(docker_config["project_name"])
+            ),
+        }
+        if compose_files
+        else None
+    )
 
     docker_dependencies: list[dict[str, Any]] = []
     docker_evidence: list[dict[str, Any]] = []
@@ -5265,11 +6188,17 @@ def build_project_runtime_spec(
         if isinstance(item, dict) and (item.get("type") or "docker") == "docker":
             docker_dependencies.append(normalize_docker_dependency(item))
 
-    known_containers = {item.get("container") or item.get("name") for item in docker_dependencies}
-    for container in matching_project_containers(resolved_project, docker.get("containers", []), state=state):
+    known_containers = {
+        item.get("container") or item.get("name") for item in docker_dependencies
+    }
+    for container in matching_project_containers(
+        resolved_project, docker.get("containers", []), state=state
+    ):
         name = container.get("name")
         if name and name not in known_containers:
-            authorized = container_has_authorized_project_provenance(container, resolved_project)
+            authorized = container_has_authorized_project_provenance(
+                container, resolved_project
+            )
             discovered = {
                 "type": "docker",
                 "name": name,
@@ -5281,7 +6210,9 @@ def build_project_runtime_spec(
                 "declared": False,
                 "discovered": True,
                 "mutation_authorized": authorized,
-                "ownership_source": container.get("metadata_source") if authorized else "name_heuristic",
+                "ownership_source": container.get("metadata_source")
+                if authorized
+                else "name_heuristic",
                 "read_only_evidence": not authorized,
             }
             if authorized:
@@ -5310,7 +6241,9 @@ def build_project_runtime_spec(
     }
 
 
-def docker_container_by_name(containers: list[dict[str, Any]], name: str | None) -> dict[str, Any] | None:
+def docker_container_by_name(
+    containers: list[dict[str, Any]], name: str | None
+) -> dict[str, Any] | None:
     if not name:
         return None
     for container in containers:
@@ -5322,7 +6255,9 @@ def docker_container_by_name(containers: list[dict[str, Any]], name: str | None)
 def docker_inspect_state(container: str | None) -> dict[str, Any] | None:
     if not container:
         return None
-    result = docker_available_command(["inspect", "--format", "{{json .State}}", container])
+    result = docker_available_command(
+        ["inspect", "--format", "{{json .State}}", container]
+    )
     if not result.get("ok"):
         return None
     with contextlib.suppress(json.JSONDecodeError):
@@ -5339,7 +6274,9 @@ def docker_log_tail(container: str | None, tail: int = 40) -> str:
     return str(result.get("stdout") or result.get("stderr") or "")
 
 
-def classify_docker_dependency(dep: dict[str, Any], container: dict[str, Any] | None) -> str | None:
+def classify_docker_dependency(
+    dep: dict[str, Any], container: dict[str, Any] | None
+) -> str | None:
     if not container:
         return "missing_dependency"
     status = str(container.get("status") or "").lower()
@@ -5355,14 +6292,28 @@ def classify_docker_dependency(dep: dict[str, Any], container: dict[str, Any] | 
 
 def is_stopped_container_status(status: str) -> bool:
     value = status.lower()
-    return "exited" in value or "created" in value or "dead" in value or "stopped" in value
+    return (
+        "exited" in value or "created" in value or "dead" in value or "stopped" in value
+    )
 
 
-def docker_dependency_status(dep: dict[str, Any], containers: list[dict[str, Any]]) -> dict[str, Any]:
-    container = docker_container_by_name(containers, dep.get("container") or dep.get("name"))
-    state = docker_inspect_state(container.get("name") if container else dep.get("container"))
+def docker_dependency_status(
+    dep: dict[str, Any], containers: list[dict[str, Any]]
+) -> dict[str, Any]:
+    container = docker_container_by_name(
+        containers, dep.get("container") or dep.get("name")
+    )
+    state = docker_inspect_state(
+        container.get("name") if container else dep.get("container")
+    )
     classification = classify_docker_dependency(dep, container)
-    logs = docker_log_tail(container.get("name") if container else dep.get("container"), 30) if classification else ""
+    logs = (
+        docker_log_tail(
+            container.get("name") if container else dep.get("container"), 30
+        )
+        if classification
+        else ""
+    )
     exit_reason = None
     if state:
         exit_reason = state.get("Error") or (
@@ -5395,8 +6346,12 @@ def docker_dependency_status(dep: dict[str, Any], containers: list[dict[str, Any
     }
 
 
-def server_status_for_runtime(state: dict[str, Any], server_def: dict[str, Any]) -> dict[str, Any]:
-    server_id, server = find_server(state, project=server_def["project"], name=server_def["name"])
+def server_status_for_runtime(
+    state: dict[str, Any], server_def: dict[str, Any]
+) -> dict[str, Any]:
+    server_id, server = find_server(
+        state, project=server_def["project"], name=server_def["name"]
+    )
     if not server:
         return {
             "type": "server",
@@ -5412,17 +6367,29 @@ def server_status_for_runtime(state: dict[str, Any], server_def: dict[str, Any])
             "previous_exit_reason": None,
             "recent_logs": "",
         }
-    status_server(state, {"server_id": server_id, "project": server["project"], "name": server["name"]})
+    status_server(
+        state,
+        {"server_id": server_id, "project": server["project"], "name": server["name"]},
+    )
     classification = None
     if listener_identity_unobservable(server.get("health")):
         classification = "unverified-listener"
     elif server.get("status") == "stopped":
-        classification = "crashed_process" if server.get("stopped_reason") else "unhealthy_process"
+        classification = (
+            "crashed_process" if server.get("stopped_reason") else "unhealthy_process"
+        )
     elif server.get("status") == "unhealthy":
         classification = "unhealthy_process"
-    elif not server.get("health", {}).get("pid_alive") and server.get("status") != "stopped":
+    elif (
+        not server.get("health", {}).get("pid_alive")
+        and server.get("status") != "stopped"
+    ):
         classification = "stale_coordinator_metadata"
-    logs = tail_text(Path(server.get("log_path") or ""), 30) if classification and server.get("log_path") else ""
+    logs = (
+        tail_text(Path(server.get("log_path") or ""), 30)
+        if classification and server.get("log_path")
+        else ""
+    )
     return {
         "type": "server",
         "name": server.get("name"),
@@ -5462,12 +6429,18 @@ def run_health_check(check: dict[str, Any]) -> dict[str, Any]:
         return {**check, "ok": ok, "classification": classification}
 
     parsed = urlparse(str(check["url"]))
-    connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    connection_class = (
+        http.client.HTTPSConnection
+        if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
     path = parsed.path or "/"
     if parsed.query:
         path += f"?{parsed.query}"
     try:
-        conn = connection_class(parsed.hostname, parsed.port, timeout=float(check.get("timeout") or 3))
+        conn = connection_class(
+            parsed.hostname, parsed.port, timeout=float(check.get("timeout") or 3)
+        )
         conn.request("GET", path)
         response = conn.getresponse()
         body = response.read(4096).decode("utf-8", errors="replace")
@@ -5486,28 +6459,48 @@ def run_health_check(check: dict[str, Any]) -> dict[str, Any]:
     except TimeoutError:
         classification = "timeout"
     except OSError as exc:
-        classification = "timeout" if "timed out" in str(exc).lower() else "unhealthy_process"
-        return {**check, "ok": False, "classification": classification, "error": str(exc)}
+        classification = (
+            "timeout" if "timed out" in str(exc).lower() else "unhealthy_process"
+        )
+        return {
+            **check,
+            "ok": False,
+            "classification": classification,
+            "error": str(exc),
+        }
     finally:
         with contextlib.suppress(Exception):
             conn.close()  # type: ignore[name-defined]
     return {**check, "ok": False, "classification": classification}
 
 
-def project_runtime_report(state: dict[str, Any], spec: dict[str, Any], *, action: str) -> dict[str, Any]:
+def project_runtime_report(
+    state: dict[str, Any], spec: dict[str, Any], *, action: str
+) -> dict[str, Any]:
     containers = spec.get("docker", {}).get("containers", [])
     services: list[dict[str, Any]] = []
     concrete_services: list[dict[str, Any]] = []
     if spec.get("compose"):
         compose = dict(spec["compose"])
-        compose["status"] = "configured" if compose.get("declared") else "discovered_only"
+        compose["status"] = (
+            "configured" if compose.get("declared") else "discovered_only"
+        )
         compose["ok"] = True
         services.append(compose)
         if compose.get("declared"):
             concrete_services.append(compose)
-    docker_services = [docker_dependency_status(dep, containers) for dep in spec.get("docker_dependencies", [])]
-    docker_evidence = [docker_dependency_status(dep, containers) for dep in spec.get("docker_evidence", [])]
-    server_services = [server_status_for_runtime(state, server_def) for server_def in spec.get("servers", [])]
+    docker_services = [
+        docker_dependency_status(dep, containers)
+        for dep in spec.get("docker_dependencies", [])
+    ]
+    docker_evidence = [
+        docker_dependency_status(dep, containers)
+        for dep in spec.get("docker_evidence", [])
+    ]
+    server_services = [
+        server_status_for_runtime(state, server_def)
+        for server_def in spec.get("servers", [])
+    ]
     services.extend(docker_services)
     services.extend(docker_evidence)
     services.extend(server_services)
@@ -5531,19 +6524,38 @@ def project_runtime_report(state: dict[str, Any], spec: dict[str, Any], *, actio
         for item in [*services, *checks]
         if item.get("required", True) and not item.get("ok", True)
     ]
-    classifications = sorted({item.get("classification") for item in required_failures if item.get("classification")})
+    classifications = sorted(
+        {
+            item.get("classification")
+            for item in required_failures
+            if item.get("classification")
+        }
+    )
     urls = [
-        {"name": item.get("name"), "url": item.get("url"), "health_url": item.get("health_url")}
+        {
+            "name": item.get("name"),
+            "url": item.get("url"),
+            "health_url": item.get("health_url"),
+        }
         for item in services
         if item.get("url")
     ]
     ports = [
-        {"name": item.get("name"), "port": item.get("port"), "fixed_port": item.get("fixed_port"), "ports": item.get("ports")}
+        {
+            "name": item.get("name"),
+            "port": item.get("port"),
+            "fixed_port": item.get("fixed_port"),
+            "ports": item.get("ports"),
+        }
         for item in services
         if item.get("port") or item.get("ports")
     ]
     previous_exit_reasons = [
-        {"name": item.get("name"), "reason": item.get("previous_exit_reason"), "stopped_at": item.get("stopped_at")}
+        {
+            "name": item.get("name"),
+            "reason": item.get("previous_exit_reason"),
+            "stopped_at": item.get("stopped_at"),
+        }
         for item in services
         if item.get("previous_exit_reason")
     ]
@@ -5571,18 +6583,32 @@ def project_runtime_report(state: dict[str, Any], spec: dict[str, Any], *, actio
     }
 
 
-def start_runtime_server(state: dict[str, Any], server_def: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+def start_runtime_server(
+    state: dict[str, Any], server_def: dict[str, Any], options: dict[str, Any]
+) -> dict[str, Any]:
     require_identity(options, "project start")
     if server_def.get("missing_fixed_port") and not options.get("allow_port_change"):
-        raise RuntimeError(f"project server {server_def['name']} has no fixed port declaration")
-    server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
-    _, runtime_assignment = find_port_assignment(state, project=server_def["project"], name=server_def["name"])
+        raise RuntimeError(
+            f"project server {server_def['name']} has no fixed port declaration"
+        )
+    server_id, existing = find_server(
+        state, project=server_def["project"], name=server_def["name"]
+    )
+    _, runtime_assignment = find_port_assignment(
+        state, project=server_def["project"], name=server_def["name"]
+    )
     # Precedence must match restart_server: an explicit runtime declaration
     # wins, then the durable pin, and only then the (possibly stale) record —
     # otherwise `project start` silently reverts an explicit `port assign`.
-    fixed_port = server_def.get("port") or (runtime_assignment or {}).get("port") or (existing or {}).get("port")
+    fixed_port = (
+        server_def.get("port")
+        or (runtime_assignment or {}).get("port")
+        or (existing or {}).get("port")
+    )
     if fixed_port is None and not options.get("allow_port_change"):
-        raise RuntimeError(f"project server {server_def['name']} has no fixed port; add .codex/dev-runtime.json")
+        raise RuntimeError(
+            f"project server {server_def['name']} has no fixed port; add .codex/dev-runtime.json"
+        )
     if fixed_port is not None:
         existing_health = server_health(existing) if existing else {"ok": False}
         if existing:
@@ -5592,7 +6618,9 @@ def start_runtime_server(state: dict[str, Any], server_def: dict[str, Any], opti
                 server=existing,
             )
         if not existing_health.get("ok"):
-            adopted = adopt_runtime_server_if_running(state, {**server_def, "port": fixed_port}, options)
+            adopted = adopt_runtime_server_if_running(
+                state, {**server_def, "port": fixed_port}, options
+            )
             if adopted:
                 return adopted
         reclaim_stale_leases_for_port(
@@ -5613,32 +6641,57 @@ def start_runtime_server(state: dict[str, Any], server_def: dict[str, Any], opti
         command = (existing or {}).get("cmd_template")
         argv_template = (existing or {}).get("argv_template")
     if not command and not argv_template:
-        raise RuntimeError(f"project server {server_def['name']} has no command declaration")
+        raise RuntimeError(
+            f"project server {server_def['name']} has no command declaration"
+        )
     start_options = {
         "agent": options.get("agent") or os.environ.get("USER") or "codex-agent",
         "project": server_def["project"],
         "name": server_def["name"],
-        "cwd": server_def.get("cwd") or (existing or {}).get("cwd") or server_def["project"],
+        "cwd": server_def.get("cwd")
+        or (existing or {}).get("cwd")
+        or server_def["project"],
         "cmd": command,
         "argv": argv_template,
-        "range": f"{fixed_port}-{fixed_port}" if fixed_port else options.get("range") or DEFAULT_RANGE,
+        "range": f"{fixed_port}-{fixed_port}"
+        if fixed_port
+        else options.get("range") or DEFAULT_RANGE,
         "preferred": int(fixed_port) if fixed_port else options.get("preferred"),
         "host": server_def.get("host") or (existing or {}).get("host") or "127.0.0.1",
-        "health_url": server_def.get("health_url") or (existing or {}).get("health_url_template") or (existing or {}).get("health_url"),
-        "health_timeout": server_def.get("health_timeout") or options.get("health_timeout") or 10,
+        "health_url": server_def.get("health_url")
+        or (existing or {}).get("health_url_template")
+        or (existing or {}).get("health_url"),
+        "health_timeout": server_def.get("health_timeout")
+        or options.get("health_timeout")
+        or 10,
         "env": server_def.get("env") or [],
     }
     if existing and options.get("force_restart"):
-        stop_server(state, {"server_id": server_id, "project": existing["project"], "name": existing["name"], "release_port": True, "reason": "Restarted by project runtime"})
+        stop_server(
+            state,
+            {
+                "server_id": server_id,
+                "project": existing["project"],
+                "name": existing["name"],
+                "release_port": True,
+                "reason": "Restarted by project runtime",
+            },
+        )
     return start_server(state, start_options)
 
 
-def project_runtime_status(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
-    spec = build_project_runtime_spec(state, project=options["project"], runtime_file=options.get("runtime_file"))
+def project_runtime_status(
+    state: dict[str, Any], options: dict[str, Any]
+) -> dict[str, Any]:
+    spec = build_project_runtime_spec(
+        state, project=options["project"], runtime_file=options.get("runtime_file")
+    )
     return project_runtime_report(state, spec, action="status")
 
 
-def ensure_runtime_docker_metadata(state: dict[str, Any], spec: dict[str, Any], options: dict[str, Any]) -> list[dict[str, Any]]:
+def ensure_runtime_docker_metadata(
+    state: dict[str, Any], spec: dict[str, Any], options: dict[str, Any]
+) -> list[dict[str, Any]]:
     if not options.get("agent"):
         return []
     actions = []
@@ -5656,15 +6709,25 @@ def ensure_runtime_docker_metadata(state: dict[str, Any], spec: dict[str, Any], 
             "role": dep.get("role") or dep.get("name") or "docker",
         }
         if options.get("dry_run"):
-            actions.append({**payload, "dry_run": True, "metadata_source": "planned_coordinator_sidecar"})
+            actions.append(
+                {
+                    **payload,
+                    "dry_run": True,
+                    "metadata_source": "planned_coordinator_sidecar",
+                }
+            )
         else:
             actions.append(register_docker_metadata(state, payload))
     return actions
 
 
-def project_runtime_start(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+def project_runtime_start(
+    state: dict[str, Any], options: dict[str, Any]
+) -> dict[str, Any]:
     agent, _project = require_identity(options, "project start")
-    spec = build_project_runtime_spec(state, project=options["project"], runtime_file=options.get("runtime_file"))
+    spec = build_project_runtime_spec(
+        state, project=options["project"], runtime_file=options.get("runtime_file")
+    )
     dry_run = bool(options.get("dry_run"))
     if not dry_run:
         require_project_server_identities_observable(state, spec, action="start")
@@ -5679,9 +6742,24 @@ def project_runtime_start(state: dict[str, Any], options: dict[str, Any]) -> dic
         command.extend(["up", "-d"])
         command.extend(compose.get("services") or [])
         try:
-            actions.append(run_docker(state, command, cwd=compose["cwd"], dry_run=dry_run, project=spec["project"], agent=agent))
+            actions.append(
+                run_docker(
+                    state,
+                    command,
+                    cwd=compose["cwd"],
+                    dry_run=dry_run,
+                    project=spec["project"],
+                    agent=agent,
+                )
+            )
         except Exception as exc:
-            action_errors.append({"name": compose.get("name"), "classification": "unhealthy_process", "error": str(exc)})
+            action_errors.append(
+                {
+                    "name": compose.get("name"),
+                    "classification": "unhealthy_process",
+                    "error": str(exc),
+                }
+            )
     elif compose and compose.get("discovered"):
         actions.append(
             {
@@ -5699,71 +6777,153 @@ def project_runtime_start(state: dict[str, Any], options: dict[str, Any]) -> dic
         if status.get("ok"):
             continue
         container_name = dep.get("container") or dep.get("name")
-        action = "restart" if status.get("classification") == "unhealthy_process" else "start"
+        action = (
+            "restart"
+            if status.get("classification") == "unhealthy_process"
+            else "start"
+        )
         try:
-            actions.append(run_docker(state, ["docker", action, container_name], dry_run=dry_run, project=spec["project"], agent=agent, container=container_name))
+            actions.append(
+                run_docker(
+                    state,
+                    ["docker", action, container_name],
+                    dry_run=dry_run,
+                    project=spec["project"],
+                    agent=agent,
+                    container=container_name,
+                )
+            )
         except Exception as exc:
-            action_errors.append({"name": dep.get("name"), "classification": status.get("classification") or "unhealthy_process", "error": str(exc)})
-    for server_def in [item for item in spec.get("servers", []) if str(item.get("role")).lower() not in {"web", "frontend"}]:
+            action_errors.append(
+                {
+                    "name": dep.get("name"),
+                    "classification": status.get("classification")
+                    or "unhealthy_process",
+                    "error": str(exc),
+                }
+            )
+    for server_def in [
+        item
+        for item in spec.get("servers", [])
+        if str(item.get("role")).lower() not in {"web", "frontend"}
+    ]:
         try:
             actions.append(start_runtime_server(state, server_def, options))
         except Exception as exc:
-            action_errors.append({"name": server_def.get("name"), "classification": "missing_dependency", "error": str(exc)})
-    for server_def in [item for item in spec.get("servers", []) if str(item.get("role")).lower() in {"web", "frontend"}]:
+            action_errors.append(
+                {
+                    "name": server_def.get("name"),
+                    "classification": "missing_dependency",
+                    "error": str(exc),
+                }
+            )
+    for server_def in [
+        item
+        for item in spec.get("servers", [])
+        if str(item.get("role")).lower() in {"web", "frontend"}
+    ]:
         try:
             actions.append(start_runtime_server(state, server_def, options))
         except Exception as exc:
-            action_errors.append({"name": server_def.get("name"), "classification": "missing_dependency", "error": str(exc)})
-    refreshed = build_project_runtime_spec(state, project=spec["project"], runtime_file=options.get("runtime_file"))
+            action_errors.append(
+                {
+                    "name": server_def.get("name"),
+                    "classification": "missing_dependency",
+                    "error": str(exc),
+                }
+            )
+    refreshed = build_project_runtime_spec(
+        state, project=spec["project"], runtime_file=options.get("runtime_file")
+    )
     after = project_runtime_report(state, refreshed, action="start")
     after["before"] = before
     after["actions"] = actions
     after["action_errors"] = action_errors
     if action_errors:
         after["ok"] = False
-        after["classifications"] = sorted(set(after.get("classifications", []) + [item["classification"] for item in action_errors]))
+        after["classifications"] = sorted(
+            set(
+                after.get("classifications", [])
+                + [item["classification"] for item in action_errors]
+            )
+        )
         after["classification"] = after["classifications"][0]
     return after
 
 
-def project_runtime_restart(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+def project_runtime_restart(
+    state: dict[str, Any], options: dict[str, Any]
+) -> dict[str, Any]:
     agent, _project = require_identity(options, "project restart")
     options = dict(options)
     options["force_restart"] = True
-    spec = build_project_runtime_spec(state, project=options["project"], runtime_file=options.get("runtime_file"))
+    spec = build_project_runtime_spec(
+        state, project=options["project"], runtime_file=options.get("runtime_file")
+    )
     dry_run = bool(options.get("dry_run"))
     if not dry_run:
         require_project_server_identities_observable(state, spec, action="restart")
     before = project_runtime_report(state, spec, action="pre-restart")
     actions: list[dict[str, Any]] = []
     for server_def in reversed(spec.get("servers", [])):
-        server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
+        server_id, existing = find_server(
+            state, project=server_def["project"], name=server_def["name"]
+        )
         if existing:
-            actions.append(stop_server(state, {"server_id": server_id, "agent": agent, "project": existing["project"], "name": existing["name"], "release_port": True, "reason": "Restarted by project runtime"}))
+            actions.append(
+                stop_server(
+                    state,
+                    {
+                        "server_id": server_id,
+                        "agent": agent,
+                        "project": existing["project"],
+                        "name": existing["name"],
+                        "release_port": True,
+                        "reason": "Restarted by project runtime",
+                    },
+                )
+            )
     action_errors: list[str] = []
     for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
         container_name = dep.get("container") or dep.get("name")
-        current = docker_dependency_status(dep, spec.get("docker", {}).get("containers", []))
+        current = docker_dependency_status(
+            dep, spec.get("docker", {}).get("containers", [])
+        )
         if current.get("status") == "missing":
             # A declared-but-absent container must not abort the restart after
             # the servers were already stopped; project start reports it.
             continue
         try:
-            actions.append(run_docker(state, ["docker", "restart", container_name], dry_run=dry_run, project=spec["project"], agent=agent, container=container_name))
+            actions.append(
+                run_docker(
+                    state,
+                    ["docker", "restart", container_name],
+                    dry_run=dry_run,
+                    project=spec["project"],
+                    agent=agent,
+                    container=container_name,
+                )
+            )
         except RuntimeError as exc:
             action_errors.append(f"docker restart {container_name}: {exc}")
     started = project_runtime_start(state, options)
     if action_errors:
-        started["action_errors"] = action_errors + list(started.get("action_errors") or [])
+        started["action_errors"] = action_errors + list(
+            started.get("action_errors") or []
+        )
     started["action"] = "restart"
     started["before"] = before
     started["actions"] = actions + started.get("actions", [])
     return started
 
 
-def project_runtime_stop(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+def project_runtime_stop(
+    state: dict[str, Any], options: dict[str, Any]
+) -> dict[str, Any]:
     agent, _project = require_identity(options, "project stop")
-    spec = build_project_runtime_spec(state, project=options["project"], runtime_file=options.get("runtime_file"))
+    spec = build_project_runtime_spec(
+        state, project=options["project"], runtime_file=options.get("runtime_file")
+    )
     dry_run = bool(options.get("dry_run"))
     if not dry_run:
         require_project_server_identities_observable(state, spec, action="stop")
@@ -5774,14 +6934,40 @@ def project_runtime_stop(state: dict[str, Any], options: dict[str, Any]) -> dict
     # any whole-project action.
     actions.extend(ensure_runtime_docker_metadata(state, spec, options))
     for server_def in reversed(spec.get("servers", [])):
-        server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
+        server_id, existing = find_server(
+            state, project=server_def["project"], name=server_def["name"]
+        )
         if existing and existing.get("status") != "stopped":
-            actions.append(stop_server(state, {"server_id": server_id, "agent": agent, "project": existing["project"], "name": existing["name"], "reason": "Stopped by project runtime"}))
+            actions.append(
+                stop_server(
+                    state,
+                    {
+                        "server_id": server_id,
+                        "agent": agent,
+                        "project": existing["project"],
+                        "name": existing["name"],
+                        "reason": "Stopped by project runtime",
+                    },
+                )
+            )
     for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
         container_name = dep.get("container") or dep.get("name")
-        current = docker_dependency_status(dep, spec.get("docker", {}).get("containers", []))
-        if current.get("status") != "missing" and not is_stopped_container_status(str(current.get("status") or "")):
-            actions.append(run_docker(state, ["docker", "stop", container_name], dry_run=dry_run, project=spec["project"], agent=agent, container=container_name))
+        current = docker_dependency_status(
+            dep, spec.get("docker", {}).get("containers", [])
+        )
+        if current.get("status") != "missing" and not is_stopped_container_status(
+            str(current.get("status") or "")
+        ):
+            actions.append(
+                run_docker(
+                    state,
+                    ["docker", "stop", container_name],
+                    dry_run=dry_run,
+                    project=spec["project"],
+                    agent=agent,
+                    container=container_name,
+                )
+            )
     compose = spec.get("compose")
     if compose and compose.get("autostart"):
         command = ["docker", "compose"]
@@ -5789,8 +6975,19 @@ def project_runtime_stop(state: dict[str, Any], options: dict[str, Any]) -> dict
             command.extend(["-f", file_name])
         command.append("stop")
         command.extend(compose.get("services") or [])
-        actions.append(run_docker(state, command, cwd=compose["cwd"], dry_run=dry_run, project=spec["project"], agent=agent))
-    refreshed = build_project_runtime_spec(state, project=spec["project"], runtime_file=options.get("runtime_file"))
+        actions.append(
+            run_docker(
+                state,
+                command,
+                cwd=compose["cwd"],
+                dry_run=dry_run,
+                project=spec["project"],
+                agent=agent,
+            )
+        )
+    refreshed = build_project_runtime_spec(
+        state, project=spec["project"], runtime_file=options.get("runtime_file")
+    )
     after = project_runtime_report(state, refreshed, action="stop")
     after["ok"] = True
     after["classification"] = None
@@ -5814,7 +7011,10 @@ def build_inventory(
     servers = []
     for server in state["servers"].values():
         server_project = server.get("project")
-        if resolved_project and (not server_project or canonical_project(str(server_project)) != resolved_project):
+        if resolved_project and (
+            not server_project
+            or canonical_project(str(server_project)) != resolved_project
+        ):
             continue
         health = server_health(server)
         if server.get("status") == "stopped":
@@ -5829,7 +7029,9 @@ def build_inventory(
             server["status"] = "running"
         elif (health.get("identity") or {}).get("ok") is False:
             server["health"] = health
-            mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
+            mark_server_stopped(
+                state, server, reason=stop_reason_from_health(server, health)
+            )
             lease_id = server.get("lease_id")
             if lease_id and lease_id in state["leases"]:
                 mark_lease_stale_released(
@@ -5840,7 +7042,9 @@ def build_inventory(
                 )
         elif not health.get("pid_alive"):
             server["health"] = health
-            mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
+            mark_server_stopped(
+                state, server, reason=stop_reason_from_health(server, health)
+            )
         else:
             server["health"] = health
             server["status"] = "unhealthy"
@@ -5850,12 +7054,18 @@ def build_inventory(
     leases = [
         lease
         for lease in state["leases"].values()
-        if not resolved_project or (lease.get("project") and canonical_project(str(lease.get("project"))) == resolved_project)
+        if not resolved_project
+        or (
+            lease.get("project")
+            and canonical_project(str(lease.get("project"))) == resolved_project
+        )
     ]
     # Durable port assignments, annotated with the owning server's live status
     # (via the record's identity key — no per-assignment subprocess calls).
     servers_by_key = {
-        str(server.get("key")): server for server in state["servers"].values() if server.get("key")
+        str(server.get("key")): server
+        for server in state["servers"].values()
+        if server.get("key")
     }
     port_assignments = []
     for assignment in state.setdefault("port_assignments", {}).values():
@@ -5868,7 +7078,9 @@ def build_inventory(
     port_assignments.sort(key=lambda item: int(item.get("port") or 0))
     servers = deduplicate_server_records(servers)
     annotate_server_url_currency(servers)
-    process_table = annotate_server_process_usage(servers) if include_process_usage else {}
+    process_table = (
+        annotate_server_process_usage(servers) if include_process_usage else {}
+    )
     urls = [
         {
             "name": server.get("name"),
@@ -5907,7 +7119,9 @@ def build_inventory(
         "recent_events": recent_events[-40:],
         "docker": docker,
         "postgres": docker.get("postgres", []),
-        "backups": backup_inventory(resolved_project, backup_dirs) if include_backups else [],
+        "backups": backup_inventory(resolved_project, backup_dirs)
+        if include_backups
+        else [],
         "project_usage": project_usage,
     }
 
@@ -5926,7 +7140,9 @@ def wait_for_health(server: dict[str, Any], timeout: float) -> dict[str, Any]:
 def parse_server_endpoint(options: dict[str, Any]) -> tuple[str, int, str]:
     raw_url = options.get("url")
     parsed = urlparse(str(raw_url)) if raw_url else None
-    host = str(options.get("host") or (parsed.hostname if parsed else None) or "127.0.0.1")
+    host = str(
+        options.get("host") or (parsed.hostname if parsed else None) or "127.0.0.1"
+    )
     port = options.get("port") or (parsed.port if parsed else None)
     if port is None:
         raise ValueError("server register requires --port or --url with a port")
@@ -5943,12 +7159,20 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
     host, port, url = parse_server_endpoint(options)
     cwd = str(Path(options.get("cwd") or project).expanduser().resolve())
     command_template = options.get("cmd") or options.get("command")
-    argv_template = command_argv(options) if command_template or options.get("argv") else None
+    argv_template = (
+        command_argv(options) if command_template or options.get("argv") else None
+    )
     argv = format_argv(argv_template, port=port, host=host) if argv_template else None
     command = shlex.join(argv) if argv else None
     health_url_template = options.get("health_url") or url
-    health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
-    pid, registration_identity = resolve_registration_pid(options, host=host, port=port, project=project)
+    health_url = (
+        format_command(health_url_template, port=port, host=host)
+        if health_url_template
+        else None
+    )
+    pid, registration_identity = resolve_registration_pid(
+        options, host=host, port=port, project=project
+    )
     server_id, existing = find_server(state, project=project, name=name)
     server_id = server_id or str(uuid.uuid4())
     previous = existing or {}
@@ -5980,9 +7204,18 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
         "registration_identity": registration_identity,
         "log_path": previous.get("log_path"),
         "adopted": True,
-        "missing_command": not bool(argv_template or previous.get("argv_template") or previous.get("cmd_template")),
+        "missing_command": not bool(
+            argv_template
+            or previous.get("argv_template")
+            or previous.get("cmd_template")
+        ),
         "metadata_source": options.get("metadata_source") or "server_register",
-        "agent_metadata": agent_metadata(agent=agent, project=project, cwd=cwd, source=options.get("metadata_source") or "server_register"),
+        "agent_metadata": agent_metadata(
+            agent=agent,
+            project=project,
+            cwd=cwd,
+            source=options.get("metadata_source") or "server_register",
+        ),
         "created_at": previous.get("created_at") or iso_timestamp(),
         "updated_at": iso_timestamp(),
     }
@@ -6016,13 +7249,22 @@ def register_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str,
         server["lease_id"] = lease["id"]
     # Registration pins the port even when the server is unhealthy or pid-less:
     # the record's port is the operator's declared home for this server.
-    record_port_assignment(state, agent=agent, project=project, name=name, port=int(port), source="server_register")
+    record_port_assignment(
+        state,
+        agent=agent,
+        project=project,
+        name=name,
+        port=int(port),
+        source="server_register",
+    )
     state["servers"][server_id] = server
     record_event(state, "server.registered", server)
     return server
 
 
-def adopt_runtime_server_if_running(state: dict[str, Any], server_def: dict[str, Any], options: dict[str, Any]) -> dict[str, Any] | None:
+def adopt_runtime_server_if_running(
+    state: dict[str, Any], server_def: dict[str, Any], options: dict[str, Any]
+) -> dict[str, Any] | None:
     fixed_port = server_def.get("port")
     if fixed_port is None:
         return None
@@ -6030,16 +7272,28 @@ def adopt_runtime_server_if_running(state: dict[str, Any], server_def: dict[str,
     host = server_def.get("host") or "127.0.0.1"
     if not port_open(host, port):
         return None
-    belongs, owner = listener_belongs_to_project(port, server_def["project"], host=str(host))
+    belongs, owner = listener_belongs_to_project(
+        port, server_def["project"], host=str(host)
+    )
     if not belongs:
-        error_type = ListenerIdentityUnobservable if owner.get("observable") is False else RuntimeError
+        error_type = (
+            ListenerIdentityUnobservable
+            if owner.get("observable") is False
+            else RuntimeError
+        )
         raise error_type(
             f"refusing to adopt {server_def['name']} on port {port}: "
             f"{owner.get('reason') or 'listener does not belong to project'}"
         )
     health_url_template = server_def.get("health_url")
-    health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
-    if health_url and not http_health(health_url, timeout=float(server_def.get("health_timeout") or 3)).get("ok"):
+    health_url = (
+        format_command(health_url_template, port=port, host=host)
+        if health_url_template
+        else None
+    )
+    if health_url and not http_health(
+        health_url, timeout=float(server_def.get("health_timeout") or 3)
+    ).get("ok"):
         return None
     return register_server(
         state,
@@ -6055,7 +7309,9 @@ def adopt_runtime_server_if_running(state: dict[str, Any], server_def: dict[str,
             "url": f"http://{host}:{port}",
             "health_url": health_url_template or f"http://{host}:{port}",
             "metadata_source": "project_adoption",
-            "health_timeout": server_def.get("health_timeout") or options.get("health_timeout") or 3,
+            "health_timeout": server_def.get("health_timeout")
+            or options.get("health_timeout")
+            or 3,
         },
     )
 
@@ -6102,7 +7358,9 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
     existing_id, existing = find_server(state, project=project, name=name)
     existing_health = server_health(existing) if existing else None
     if existing and existing_health is not None:
-        require_listener_identity_observable(existing_health, action="start", server=existing)
+        require_listener_identity_observable(
+            existing_health, action="start", server=existing
+        )
     if existing and existing_health and existing_health.get("ok"):
         existing["status"] = "running"
         existing["health"] = existing_health
@@ -6112,13 +7370,23 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
             # nor collide with a port pinned to another server.
             heal_key, heal_pin = find_port_assignment(state, project=project, name=name)
             heal_port = int(existing["port"])
-            if heal_pin is None and heal_port not in foreign_assigned_ports(state, owner_key=heal_key):
+            if heal_pin is None and heal_port not in foreign_assigned_ports(
+                state, owner_key=heal_key
+            ):
                 record_port_assignment(
-                    state, agent=agent, project=project, name=name, port=heal_port, source="server_start"
+                    state,
+                    agent=agent,
+                    project=project,
+                    name=name,
+                    port=heal_port,
+                    source="server_start",
                 )
         return existing
     if existing:
-        stop_server(state, {"agent": agent, "project": project, "name": name, "release_port": True})
+        stop_server(
+            state,
+            {"agent": agent, "project": project, "name": name, "release_port": True},
+        )
 
     server_id = existing_id or str(uuid.uuid4())
     key, assignment = find_port_assignment(state, project=project, name=name)
@@ -6137,7 +7405,12 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
             # squatter produces a loud error instead of a silent port change.
             port_range = f"{assigned_port}-{assigned_port}"
             preferred = assigned_port
-    elif assignment and preferred is not None and int(preferred) == int(assignment["port"]) and not port_range:
+    elif (
+        assignment
+        and preferred is not None
+        and int(preferred) == int(assignment["port"])
+        and not port_range
+    ):
         # The owner explicitly asked for its own pin without a range: the pin
         # is the range (it may lie outside DEFAULT_RANGE, which would otherwise
         # reject the request with a misleading "outside 3000-3999" error).
@@ -6172,13 +7445,19 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
             ) from exc
         raise
     port = int(lease["port"])
-    record_port_assignment(state, agent=agent, project=project, name=name, port=port, source="server_start")
+    record_port_assignment(
+        state, agent=agent, project=project, name=name, port=port, source="server_start"
+    )
     host = options.get("host") or "127.0.0.1"
     argv = format_argv(argv_template, port=port, host=host)
     command = shlex.join(argv)
     cwd = str(Path(options.get("cwd") or project).expanduser().resolve())
     health_url_template = options.get("health_url")
-    health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
+    health_url = (
+        format_command(health_url_template, port=port, host=host)
+        if health_url_template
+        else None
+    )
     env_extra = normalize_env(options.get("env") or [])
     env_extra.setdefault("PORT", str(port))
     env_extra.setdefault("HOST", host)
@@ -6208,7 +7487,9 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
         "adopted": False,
         "missing_command": False,
         "metadata_source": "server_start",
-        "agent_metadata": agent_metadata(agent=agent, project=project, cwd=cwd, source="server_start"),
+        "agent_metadata": agent_metadata(
+            agent=agent, project=project, cwd=cwd, source="server_start"
+        ),
         "status": "starting",
         "created_at": iso_timestamp(),
         "created_ts": now(),
@@ -6226,23 +7507,33 @@ def start_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, An
 def stop_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
     agent = str(options.get("agent") or "").strip()
     if not agent:
-        raise ValueError("server stop requires --agent so the coordinator can attribute the action")
+        raise ValueError(
+            "server stop requires --agent so the coordinator can attribute the action"
+        )
     server_id = options.get("server_id")
     server = state["servers"].get(server_id) if server_id else None
     if not server:
         if not options.get("project") or not options.get("name"):
             raise KeyError("server-id or project/name is required")
-        server_id, server = find_server(state, project=options["project"], name=options["name"])
+        server_id, server = find_server(
+            state, project=options["project"], name=options["name"]
+        )
     if not server or not server_id:
         raise KeyError("matching server not found")
-    project = canonical_project(str(options.get("project") or server.get("project") or ""))
+    project = canonical_project(
+        str(options.get("project") or server.get("project") or "")
+    )
     if canonical_project(str(server.get("project") or "")) != project:
-        raise ValueError("server stop project does not match the registered server project")
+        raise ValueError(
+            "server stop project does not match the registered server project"
+        )
     health = server_health(server)
     require_listener_identity_observable(health, action="stop", server=server)
     server["health"] = health
     if (health.get("identity") or {}).get("ok") is False:
-        mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
+        mark_server_stopped(
+            state, server, reason=stop_reason_from_health(server, health)
+        )
         if server.get("lease_id") and server["lease_id"] in state["leases"]:
             mark_lease_stale_released(
                 state,
@@ -6254,8 +7545,12 @@ def stop_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any
     stop_pid(int(server.get("pid") or 0))
     server["health"] = server_health(server)
     server["agent"] = agent
-    server["agent_metadata"] = agent_metadata(agent=agent, project=project, cwd=server.get("cwd"), source="server_stop")
-    mark_server_stopped(state, server, reason=options.get("reason") or "Stopped by coordinator")
+    server["agent_metadata"] = agent_metadata(
+        agent=agent, project=project, cwd=server.get("cwd"), source="server_stop"
+    )
+    mark_server_stopped(
+        state, server, reason=options.get("reason") or "Stopped by coordinator"
+    )
     if options.get("release_port", True) and server.get("lease_id"):
         with contextlib.suppress(KeyError):
             release_port(state, lease_id=server["lease_id"])
@@ -6268,13 +7563,17 @@ def restart_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, 
     if not server:
         raise KeyError("matching server not found")
     if not server.get("argv_template") and not server.get("cmd_template"):
-        raise RuntimeError(f"server {server.get('name')} is registered without a command; missing_command=true")
+        raise RuntimeError(
+            f"server {server.get('name')} is registered without a command; missing_command=true"
+        )
     require_listener_identity_observable(
         server_health(server),
         action="restart",
         server=server,
     )
-    _, assignment = find_port_assignment(state, project=project, name=str(options["name"]))
+    _, assignment = find_port_assignment(
+        state, project=project, name=str(options["name"])
+    )
     fixed_port = int(assignment["port"]) if assignment else int(server["port"])
     restart_options = {
         "agent": agent,
@@ -6288,9 +7587,22 @@ def restart_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, 
         "host": server.get("host") or "127.0.0.1",
         "health_url": server.get("health_url_template") or server.get("health_url"),
         "health_timeout": options.get("health_timeout") or 10,
-        "env": [f"{key}={value}" for key, value in (server.get("env") or {}).items() if key not in {"PORT", "HOST"}],
+        "env": [
+            f"{key}={value}"
+            for key, value in (server.get("env") or {}).items()
+            if key not in {"PORT", "HOST"}
+        ],
     }
-    stop_server(state, {"server_id": server_id, "agent": agent, "project": server["project"], "name": server["name"], "release_port": True})
+    stop_server(
+        state,
+        {
+            "server_id": server_id,
+            "agent": agent,
+            "project": server["project"],
+            "name": server["name"],
+            "release_port": True,
+        },
+    )
     return start_server(state, restart_options)
 
 
@@ -6329,8 +7641,7 @@ def finalize_manual_lease_start_failure(
         }
         lease_reservation_owner = str((lease or {}).get("pending_operation_id") or "")
         may_finalize_lease = bool(
-            lease
-            and lease_reservation_owner in {"", operation_id}
+            lease and lease_reservation_owner in {"", operation_id}
         )
         if may_finalize_lease and lease:
             lease.pop("pending_operation_id", None)
@@ -6375,7 +7686,9 @@ def finalize_manual_lease_start_failure(
                 state,
                 operation_id,
                 status="failed",
-                phase="failed-after-launch" if process_launched else "rolled-back-before-launch",
+                phase="failed-after-launch"
+                if process_launched
+                else "rolled-back-before-launch",
                 error=reason,
             )
         record_event(
@@ -6401,11 +7714,15 @@ def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, An
     if not lease_id:
         raise ValueError("server start --lease-id requires a lease id")
     if prepared.get("argv") is None or prepared.get("cmd") or prepared.get("command"):
-        raise ValueError("server start --lease-id requires structured --argv and does not accept --cmd")
+        raise ValueError(
+            "server start --lease-id requires structured --argv and does not accept --cmd"
+        )
     argv_template = command_argv(prepared)
     cwd = str(Path(prepared.get("cwd") or project).expanduser().resolve())
     if not Path(cwd).is_dir():
-        raise FileNotFoundError(f"server cwd does not exist or is not a directory: {cwd}")
+        raise FileNotFoundError(
+            f"server cwd does not exist or is not a directory: {cwd}"
+        )
     target = f"server:{server_key(project, name)}"
     host = str(prepared.get("host") or "127.0.0.1")
 
@@ -6421,16 +7738,26 @@ def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, An
         if expires_at is not None and now() > float(expires_at):
             raise ValueError(f"manual lease {lease_id} expired")
         if str(lease.get("agent") or "") != agent:
-            raise ValueError(f"manual lease {lease_id} agent does not match server start agent")
+            raise ValueError(
+                f"manual lease {lease_id} agent does not match server start agent"
+            )
         lease_project = canonical_project(str(lease.get("project") or ""))
         if lease_project != project:
-            raise ValueError(f"manual lease {lease_id} project does not match server start project")
+            raise ValueError(
+                f"manual lease {lease_id} project does not match server start project"
+            )
         if lease.get("server_id") or lease.get("pending_operation_id"):
-            raise ValueError(f"manual lease {lease_id} is already bound or being attached")
+            raise ValueError(
+                f"manual lease {lease_id} is already bound or being attached"
+            )
         if str(lease.get("purpose") or "") != "manual":
-            raise ValueError(f"server start --lease-id requires a manual lease, got {lease.get('purpose')!r}")
+            raise ValueError(
+                f"server start --lease-id requires a manual lease, got {lease.get('purpose')!r}"
+            )
         port = int(lease["port"])
-        assignment_key, _assignment = find_port_assignment(state, project=project, name=name)
+        assignment_key, _assignment = find_port_assignment(
+            state, project=project, name=name
+        )
         foreign_assignments = foreign_assigned_ports(state, owner_key=assignment_key)
         if port in foreign_assignments:
             raise RuntimeError(
@@ -6439,13 +7766,17 @@ def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, An
             )
         preferred = prepared.get("preferred")
         if preferred is not None and int(preferred) != port:
-            raise ValueError(f"manual lease {lease_id} owns port {port}, not preferred port {preferred}")
+            raise ValueError(
+                f"manual lease {lease_id} owns port {port}, not preferred port {preferred}"
+            )
         existing_id, existing = find_server(state, project=project, name=name)
         if existing and (
             existing.get("status") != "stopped"
             or pid_alive(int(existing.get("pid") or 0))
         ):
-            raise RuntimeError(f"server {name} already exists and must be stopped before exact-lease start")
+            raise RuntimeError(
+                f"server {name} already exists and must be stopped before exact-lease start"
+            )
         server_id = existing_id or str(uuid.uuid4())
         generation = int((existing or {}).get("generation") or 0) + 1
         operation = begin_operation(
@@ -6480,7 +7811,9 @@ def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, An
         env_extra = normalize_env(prepared.get("env") or [])
         env_extra.setdefault("PORT", str(port))
         env_extra.setdefault("HOST", host)
-        launch = LaunchSpec(tuple(argv), cwd, env_extra, agent, project, "manual_lease_start")
+        launch = LaunchSpec(
+            tuple(argv), cwd, env_extra, agent, project, "manual_lease_start"
+        )
         previous = existing or {}
         server = {
             "id": server_id,
@@ -6624,7 +7957,9 @@ def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, An
         )
         raise RuntimeError(reason)
 
-    health = wait_for_health(server_for_health, float(prepared.get("health_timeout") or 10))
+    health = wait_for_health(
+        server_for_health, float(prepared.get("health_timeout") or 10)
+    )
     if not health.get("ok"):
         stop_pid(pid)
         process_active = pid_alive(pid) or not port_available(port, host)
@@ -6692,7 +8027,9 @@ def coordinated_start_server_with_lease(options: dict[str, Any]) -> dict[str, An
                     "operation_id": operation["id"],
                 },
             )
-            finish_operation(state, operation["id"], status="completed", phase="committed")
+            finish_operation(
+                state, operation["id"], status="completed", phase="committed"
+            )
             committed = copy.deepcopy(current)
     if committed is None:
         stop_pid(pid)
@@ -6727,7 +8064,9 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
     argv_template = command_argv(options)  # Validate before reserving any state.
     cwd = str(Path(options.get("cwd") or project).expanduser().resolve())
     if not Path(cwd).is_dir():
-        raise FileNotFoundError(f"server cwd does not exist or is not a directory: {cwd}")
+        raise FileNotFoundError(
+            f"server cwd does not exist or is not a directory: {cwd}"
+        )
     target = f"server:{server_key(project, name)}"
 
     with locked_state() as state:
@@ -6743,16 +8082,18 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
         if existing_health.get("ok"):
             with locked_state() as state:
                 current = state["servers"].get(existing_id)
-                if not current or server_lifecycle_fingerprint(current) != server_lifecycle_fingerprint(
-                    existing_snapshot
-                ):
+                if not current or server_lifecycle_fingerprint(
+                    current
+                ) != server_lifecycle_fingerprint(existing_snapshot):
                     raise RuntimeError(
                         f"server {name} changed while its existing health was checked; retry start"
                     )
                 current["health"] = existing_health
                 current["status"] = "running"
                 current["updated_at"] = iso_timestamp()
-                _key, current_assignment = find_port_assignment(state, project=project, name=name)
+                _key, current_assignment = find_port_assignment(
+                    state, project=project, name=name
+                )
                 if current_assignment is None:
                     record_port_assignment(
                         state,
@@ -6763,7 +8104,9 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
                         source="server_start_heal",
                     )
                 return copy.deepcopy(current)
-        if existing_snapshot.get("status") != "stopped" or pid_alive(int(existing_snapshot.get("pid") or 0)):
+        if existing_snapshot.get("status") != "stopped" or pid_alive(
+            int(existing_snapshot.get("pid") or 0)
+        ):
             coordinated_stop_server(
                 {
                     "server_id": existing_id,
@@ -6779,7 +8122,9 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
         existing_id, existing = find_server(state, project=project, name=name)
         server_id = existing_id or str(uuid.uuid4())
         generation = int((existing or {}).get("generation") or 0) + 1
-        assignment_key, assignment = find_port_assignment(state, project=project, name=name)
+        assignment_key, assignment = find_port_assignment(
+            state, project=project, name=name
+        )
         explicit_range = options.get("range") is not None
         preferred = options.get("preferred")
         port_range = options.get("range") or DEFAULT_RANGE
@@ -6787,7 +8132,9 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
             assigned_port = int(assignment["port"])
             port_range = f"{assigned_port}-{assigned_port}"
             preferred = assigned_port
-            if not port_available(assigned_port, str(options.get("host") or "127.0.0.1")):
+            if not port_available(
+                assigned_port, str(options.get("host") or "127.0.0.1")
+            ):
                 raise RuntimeError(
                     f"server {name} is pinned to port {assigned_port}, but that port is occupied"
                 )
@@ -6816,7 +8163,11 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
         host = str(options.get("host") or "127.0.0.1")
         argv = format_argv(argv_template, port=port, host=host)
         health_url_template = options.get("health_url")
-        health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
+        health_url = (
+            format_command(health_url_template, port=port, host=host)
+            if health_url_template
+            else None
+        )
         env_extra = normalize_env(options.get("env") or [])
         env_extra.setdefault("PORT", str(port))
         env_extra.setdefault("HOST", host)
@@ -6846,7 +8197,9 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
             "adopted": False,
             "missing_command": False,
             "metadata_source": "server_start",
-            "agent_metadata": agent_metadata(agent=agent, project=project, cwd=cwd, source="server_start"),
+            "agent_metadata": agent_metadata(
+                agent=agent, project=project, cwd=cwd, source="server_start"
+            ),
             "status": "starting",
             "operation_id": operation["id"],
             "generation": generation,
@@ -6863,17 +8216,26 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
             current = state["servers"].get(server_id)
             if current and current.get("operation_id") == operation["id"]:
                 current["log_path"] = str(logs_dir() / f"{server_id}.log")
-                mark_server_stopped(state, current, reason=f"Process launch failed: {exc}")
+                mark_server_stopped(
+                    state, current, reason=f"Process launch failed: {exc}"
+                )
             if lease["id"] in state["leases"]:
                 with contextlib.suppress(KeyError):
                     release_port(state, lease_id=str(lease["id"]))
-            finish_operation(state, operation["id"], status="failed", phase="launch", error=str(exc))
+            finish_operation(
+                state, operation["id"], status="failed", phase="launch", error=str(exc)
+            )
         raise
 
     with locked_state() as state:
         current = state["servers"].get(server_id)
         current_operation = state["operations"].get(operation["id"])
-        if not current or current.get("generation") != generation or not current_operation or current_operation.get("status") != "pending":
+        if (
+            not current
+            or current.get("generation") != generation
+            or not current_operation
+            or current_operation.get("status") != "pending"
+        ):
             commit_allowed = False
         else:
             commit_allowed = True
@@ -6886,12 +8248,20 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
             server_for_health = copy.deepcopy(current)
     if not commit_allowed:
         stop_pid(pid)
-        raise RuntimeError("server start reservation was superseded before launch commit")
+        raise RuntimeError(
+            "server start reservation was superseded before launch commit"
+        )
 
-    health = wait_for_health(server_for_health, float(options.get("health_timeout") or 10))
+    health = wait_for_health(
+        server_for_health, float(options.get("health_timeout") or 10)
+    )
     with locked_state() as state:
         current = state["servers"].get(server_id)
-        if not current or current.get("generation") != generation or current.get("operation_id") != operation["id"]:
+        if (
+            not current
+            or current.get("generation") != generation
+            or current.get("operation_id") != operation["id"]
+        ):
             finish_operation(
                 state,
                 operation["id"],
@@ -6914,7 +8284,9 @@ def _coordinated_start_server_local(options: dict[str, Any]) -> dict[str, Any]:
                 source="server_start",
             )
             record_event(state, "server.started", current)
-            finish_operation(state, operation["id"], status="completed", phase="committed")
+            finish_operation(
+                state, operation["id"], status="completed", phase="committed"
+            )
             committed = copy.deepcopy(current)
     if committed is None:
         stop_pid(pid)
@@ -6943,8 +8315,13 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
             raise BrokerProfileError(
                 "a host broker is configured, but the supplied local lease has no exact broker linkage"
             )
-        if link.repo_id != repository.repo_id or link.server_definition_id != repository.server_id(name):
-            raise BrokerProfileError("the supplied broker lease belongs to another enrolled server")
+        if (
+            link.repo_id != repository.repo_id
+            or link.server_definition_id != repository.server_id(name)
+        ):
+            raise BrokerProfileError(
+                "the supplied broker lease belongs to another enrolled server"
+            )
         result = _coordinated_start_server_local(options)
         publication = publish_broker_server(
             profile=profile,
@@ -6977,9 +8354,7 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
         with AccountStore.open_default(coordinator_home()) as store:
             servers = NormalizedServerLifecycle(store)
             try:
-                existing_snapshot = servers.server(
-                    canonical_project=project, name=name
-                )
+                existing_snapshot = servers.server(canonical_project=project, name=name)
             except KeyError:
                 existing_snapshot = None
             assignment = next(
@@ -7040,7 +8415,9 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
         result = _coordinated_start_server_local(prepared)
         local_lease_id = str(result.get("lease_id") or "")
         if not local_lease_id:
-            raise RuntimeError("broker-backed server start returned no local lease identity")
+            raise RuntimeError(
+                "broker-backed server start returned no local lease identity"
+            )
         bound = bind_broker_lease_link(link.link_id, local_lease_id)
         if state_backend() == LEGACY_JSON_BACKEND:
             with locked_state() as state:
@@ -7125,9 +8502,7 @@ def coordinated_start_server(options: dict[str, Any]) -> dict[str, Any]:
         try:
             release_broker_lease_link(link, rollback=True)
         except BaseException as rollback_error:
-            rollback_errors.append(
-                f"{type(rollback_error).__name__}: {rollback_error}"
-            )
+            rollback_errors.append(f"{type(rollback_error).__name__}: {rollback_error}")
         if rollback_errors:
             raise StructuredCoordinatorError(
                 "broker-backed server start failed and lease rollback requires reconciliation",
@@ -7159,7 +8534,9 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
     prepared = dict(options)
     agent = str(prepared.get("agent") or "").strip()
     if not agent:
-        raise ValueError("server stop requires --agent so the coordinator can attribute the action")
+        raise ValueError(
+            "server stop requires --agent so the coordinator can attribute the action"
+        )
     if prepared.get("project"):
         project_hint = canonical_project(str(prepared["project"]))
     elif prepared.get("server_id"):
@@ -7178,12 +8555,16 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
         if not server:
             if not prepared.get("project") or not prepared.get("name"):
                 raise KeyError("server-id or project/name is required")
-            server_id, server = find_server(state, project=prepared["project"], name=prepared["name"])
+            server_id, server = find_server(
+                state, project=prepared["project"], name=prepared["name"]
+            )
         if not server or not server_id:
             raise KeyError("matching server not found")
         project = project_hint
         if str(server.get("project") or "") != project:
-            raise ValueError("server stop project does not match the registered server project")
+            raise ValueError(
+                "server stop project does not match the registered server project"
+            )
         observed_snapshot = copy.deepcopy(server)
     requested_release = bool(prepared.get("release_port", True))
     broker_link = (
@@ -7207,10 +8588,12 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
     # cannot create an operation, change status/generation, signal, or release.
     with locked_state() as state:
         current = state["servers"].get(server_id)
-        if not current or server_lifecycle_fingerprint(current) != server_lifecycle_fingerprint(
-            observed_snapshot
-        ):
-            raise RuntimeError("server changed while listener identity was checked; retry stop")
+        if not current or server_lifecycle_fingerprint(
+            current
+        ) != server_lifecycle_fingerprint(observed_snapshot):
+            raise RuntimeError(
+                "server changed while listener identity was checked; retry stop"
+            )
         target = f"server:{server_key(project, str(current.get('name') or ''))}"
         generation = int(current.get("generation") or 0) + 1
         operation = begin_operation(
@@ -7236,7 +8619,11 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
 
     with locked_state() as state:
         current = state["servers"].get(server_id)
-        if not current or current.get("generation") != generation or current.get("operation_id") != operation["id"]:
+        if (
+            not current
+            or current.get("generation") != generation
+            or current.get("operation_id") != operation["id"]
+        ):
             finish_operation(
                 state,
                 operation["id"],
@@ -7247,10 +8634,20 @@ def coordinated_stop_server(options: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("server stop was superseded before state commit")
         current["health"] = final_health
         current["agent"] = agent
-        current["agent_metadata"] = agent_metadata(agent=agent, project=project, cwd=current.get("cwd"), source="server_stop")
-        reason = stop_reason_from_health(current, health) if identity_wrong else prepared.get("reason") or "Stopped by coordinator"
+        current["agent_metadata"] = agent_metadata(
+            agent=agent, project=project, cwd=current.get("cwd"), source="server_stop"
+        )
+        reason = (
+            stop_reason_from_health(current, health)
+            if identity_wrong
+            else prepared.get("reason") or "Stopped by coordinator"
+        )
         mark_server_stopped(state, current, reason=reason)
-        if prepared.get("release_port", True) and current.get("lease_id") and current["lease_id"] in state["leases"]:
+        if (
+            prepared.get("release_port", True)
+            and current.get("lease_id")
+            and current["lease_id"] in state["leases"]
+        ):
             with contextlib.suppress(KeyError):
                 release_port(state, lease_id=str(current["lease_id"]))
         finish_operation(state, operation["id"], status="completed", phase="committed")
@@ -7329,9 +8726,13 @@ def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
         if not server:
             raise KeyError("matching server not found")
         if not server.get("argv_template") and not server.get("cmd_template"):
-            raise RuntimeError(f"server {server.get('name')} is registered without a command; missing_command=true")
+            raise RuntimeError(
+                f"server {server.get('name')} is registered without a command; missing_command=true"
+            )
         snapshot = copy.deepcopy(server)
-        _assignment_key, assignment = find_port_assignment(state, project=project, name=options["name"])
+        _assignment_key, assignment = find_port_assignment(
+            state, project=project, name=options["name"]
+        )
     health = server_health(snapshot)
     require_listener_identity_observable(
         health,
@@ -7340,8 +8741,12 @@ def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
     )
     with locked_state() as state:
         current = state["servers"].get(server_id)
-        if not current or server_lifecycle_fingerprint(current) != server_lifecycle_fingerprint(snapshot):
-            raise RuntimeError("server changed while listener identity was checked; retry restart")
+        if not current or server_lifecycle_fingerprint(
+            current
+        ) != server_lifecycle_fingerprint(snapshot):
+            raise RuntimeError(
+                "server changed while listener identity was checked; retry restart"
+            )
         operation = begin_operation(
             state,
             action="server.restart",
@@ -7364,7 +8769,11 @@ def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
         "host": snapshot.get("host") or "127.0.0.1",
         "health_url": snapshot.get("health_url_template") or snapshot.get("health_url"),
         "health_timeout": options.get("health_timeout") or 10,
-        "env": [f"{key}={value}" for key, value in (snapshot.get("env") or {}).items() if key not in {"PORT", "HOST"}],
+        "env": [
+            f"{key}={value}"
+            for key, value in (snapshot.get("env") or {}).items()
+            if key not in {"PORT", "HOST"}
+        ],
     }
     try:
         with delegated_server_restart_operation(operation):
@@ -7392,7 +8801,9 @@ def coordinated_restart_server(options: dict[str, Any]) -> dict[str, Any]:
     with locked_state() as state:
         current_operation = state.get("operations", {}).get(operation["id"])
         if not current_operation or current_operation.get("status") != "pending":
-            raise RuntimeError("server restart reservation was superseded before commit")
+            raise RuntimeError(
+                "server restart reservation was superseded before commit"
+            )
         current_operation["result"] = {
             "server_id": result.get("id"),
             "status": result.get("status"),
@@ -7441,12 +8852,10 @@ def normalized_control_snapshot_from_store(store: AccountStore) -> dict[str, Any
         "created_at": None,
         "updated_at": graph["store"]["updated_at"],
         "servers": {
-            str(item["id"]): copy.deepcopy(item)
-            for item in compatibility["servers"]
+            str(item["id"]): copy.deepcopy(item) for item in compatibility["servers"]
         },
         "leases": {
-            str(item["id"]): copy.deepcopy(item)
-            for item in compatibility["leases"]
+            str(item["id"]): copy.deepcopy(item) for item in compatibility["leases"]
         },
         "port_assignments": {
             f"{item['project']}::{item['name']}": copy.deepcopy(item)
@@ -7529,25 +8938,19 @@ def _normalized_start_candidates(
     if preferred is not None:
         candidates.append(int(preferred))
     candidates.extend(
-        port
-        for port in range(int(port_start), int(port_end) + 1)
-        if port != preferred
+        port for port in range(int(port_start), int(port_end) + 1) if port != preferred
     )
     return candidates
 
 
-def _coordinated_start_server_normalized(
-    options: dict[str, Any]
-) -> dict[str, Any]:
+def _coordinated_start_server_normalized(options: dict[str, Any]) -> dict[str, Any]:
     prepared = dict(options)
     agent, project = require_identity(prepared, "server start")
     name = str(prepared.get("name") or "").strip()
     if not name:
         raise ValueError("server start requires --name")
     if prepared.get("lease_id") and (
-        prepared.get("argv") is None
-        or prepared.get("cmd")
-        or prepared.get("command")
+        prepared.get("argv") is None or prepared.get("cmd") or prepared.get("command")
     ):
         raise ValueError(
             "server start --lease-id requires structured --argv and does not accept --cmd"
@@ -7639,7 +9042,11 @@ def _coordinated_start_server_normalized(
     observed_available = [
         candidate for candidate in candidates if port_available(candidate, host)
     ]
-    if assignment is not None and not explicit_range and prepared.get("preferred") is None:
+    if (
+        assignment is not None
+        and not explicit_range
+        and prepared.get("preferred") is None
+    ):
         assigned_port = int(assignment["port"])
         if assigned_port not in observed_available:
             raise RuntimeError(
@@ -7708,9 +9115,7 @@ def _coordinated_start_server_normalized(
     pid: int | None = None
     log_path: str | None = None
     try:
-        pid, log_path = start_process(
-            launch=launch, server_id=str(reservation["id"])
-        )
+        pid, log_path = start_process(launch=launch, server_id=str(reservation["id"]))
     except BaseException as launch_error:
         with AccountStore.open_default(coordinator_home()) as store:
             NormalizedServerLifecycle(store).fail_start(
@@ -7743,9 +9148,7 @@ def _coordinated_start_server_normalized(
         try:
             stop_pid(int(pid))
         except BaseException as cleanup_error:
-            cleanup_errors.append(
-                f"{type(cleanup_error).__name__}: {cleanup_error}"
-            )
+            cleanup_errors.append(f"{type(cleanup_error).__name__}: {cleanup_error}")
         process_active = pid_alive(int(pid)) or not port_available(reserved_port, host)
         with AccountStore.open_default(coordinator_home()) as store:
             failed = NormalizedServerLifecycle(store).fail_start(
@@ -7772,9 +9175,7 @@ def _coordinated_start_server_normalized(
         raise
 
     launched["created_ts"] = now()
-    health = wait_for_health(
-        launched, float(prepared.get("health_timeout") or 10)
-    )
+    health = wait_for_health(launched, float(prepared.get("health_timeout") or 10))
     health_unobservable = listener_identity_unobservable(health)
     manual_health_failure = bool(manual_lease_id and health.get("ok") is not True)
     if health_unobservable or manual_health_failure:
@@ -7782,9 +9183,7 @@ def _coordinated_start_server_normalized(
         try:
             stop_pid(int(pid))
         except BaseException as cleanup_error:
-            cleanup_errors.append(
-                f"{type(cleanup_error).__name__}: {cleanup_error}"
-            )
+            cleanup_errors.append(f"{type(cleanup_error).__name__}: {cleanup_error}")
         process_active = pid_alive(int(pid)) or not port_available(reserved_port, host)
         reason = (
             "listener identity is unobservable after server launch"
@@ -7827,9 +9226,7 @@ def _coordinated_start_server_normalized(
     return normalized_public_server(committed)
 
 
-def _coordinated_register_server_normalized(
-    options: dict[str, Any]
-) -> dict[str, Any]:
+def _coordinated_register_server_normalized(options: dict[str, Any]) -> dict[str, Any]:
     prepared = dict(options)
     agent, project = require_identity(prepared, "server register")
     name = str(prepared.get("name") or "").strip()
@@ -7874,12 +9271,8 @@ def _coordinated_register_server_normalized(
         "registration_identity": registration_identity,
         "created_ts": now(),
     }
-    health = wait_for_health(
-        candidate, float(prepared.get("health_timeout") or 3)
-    )
-    require_listener_identity_observable(
-        health, action="register", server=candidate
-    )
+    health = wait_for_health(candidate, float(prepared.get("health_timeout") or 3))
+    require_listener_identity_observable(health, action="register", server=candidate)
     process_start_time = None
     process_fingerprint = None
     if pid:
@@ -7925,9 +9318,7 @@ def _coordinated_register_server_normalized(
 
 def _normalized_server_from_options(options: dict[str, Any]) -> dict[str, Any]:
     project = (
-        canonical_project(str(options["project"]))
-        if options.get("project")
-        else None
+        canonical_project(str(options["project"])) if options.get("project") else None
     )
     with AccountStore.open_default(coordinator_home()) as store:
         return NormalizedServerLifecycle(store).server(
@@ -7939,9 +9330,7 @@ def _normalized_server_from_options(options: dict[str, Any]) -> dict[str, Any]:
         )
 
 
-def _coordinated_status_server_normalized(
-    options: dict[str, Any]
-) -> dict[str, Any]:
+def _coordinated_status_server_normalized(options: dict[str, Any]) -> dict[str, Any]:
     # A concurrent explicit host observation may commit the same server after
     # this status call samples it. Re-read and re-observe a bounded number of
     # times instead of surfacing that ordinary optimistic-CAS race to either
@@ -7994,9 +9383,7 @@ def _coordinated_status_server_normalized(
     raise AssertionError("bounded normalized status retry did not return or raise")
 
 
-def _coordinated_server_logs_normalized(
-    options: dict[str, Any]
-) -> dict[str, Any]:
+def _coordinated_server_logs_normalized(options: dict[str, Any]) -> dict[str, Any]:
     server = _normalized_server_from_options(options)
     tail = int(options.get("tail") or 200)
     log_path = Path(str(server.get("log_path") or ""))
@@ -8062,15 +9449,75 @@ def release_normalized_local_lease_if_active(
     )
 
 
-def _coordinated_stop_server_normalized(
-    options: dict[str, Any]
-) -> dict[str, Any]:
+def _system_broker_server_enrollment(
+    options: Mapping[str, Any],
+) -> tuple[BrokerClientProfile, BrokerRepositoryProfile, str, str] | None:
+    """Resolve one exact enrolled server before consulting a client journal.
+
+    Server-wide inventory is intentionally host-wide, while mutation authority
+    is repository/server scoped.  A per-UID journal is only reconciliation
+    evidence, so its missing rows must never decide whether a host-visible
+    server is authorized.  Resolve the protected broker profile first and let
+    ``BrokerProfileError`` produce the typed installation/access failure.
+    """
+
+    if authority_mode() != "system":
+        return None
+    project_value = str(options.get("project") or "").strip()
+    name_value = str(options.get("name") or "").strip()
+    server_id_value = str(options.get("server_id") or "").strip()
+    profile = configured_broker_profile()
+    if profile is None:  # Defensive: system mode requires a protected profile.
+        raise BrokerProfileError("server-wide broker authority is not configured")
+
+    if project_value:
+        repository = profile.repository(canonical_project(project_value))
+        if name_value:
+            enrolled_id = repository.server_id(name_value)
+            if server_id_value and server_id_value != enrolled_id:
+                raise BrokerProfileError(
+                    "server stop target does not match the exact enrolled server identity"
+                )
+            return profile, repository, name_value, enrolled_id
+        if not server_id_value:
+            raise KeyError("server-id or project/name is required")
+        matching_names = sorted(
+            name
+            for name, enrolled_id in repository.server_ids.items()
+            if enrolled_id == server_id_value
+        )
+        if len(matching_names) != 1:
+            raise BrokerProfileError(
+                f"server id {server_id_value!r} is not enrolled for repository "
+                f"{repository.canonical_root}"
+            )
+        return profile, repository, matching_names[0], server_id_value
+
+    if not server_id_value:
+        raise KeyError("server-id or project/name is required")
+    matches = [
+        (repository, name)
+        for repository in profile.repositories.values()
+        for name, enrolled_id in repository.server_ids.items()
+        if enrolled_id == server_id_value
+    ]
+    if len(matches) != 1:
+        raise BrokerProfileError(
+            f"server id {server_id_value!r} is not one exact server enrolled "
+            "for the authenticated account"
+        )
+    repository, enrolled_name = matches[0]
+    return profile, repository, enrolled_name, server_id_value
+
+
+def _coordinated_stop_server_normalized(options: dict[str, Any]) -> dict[str, Any]:
     prepared = dict(options)
     agent = str(prepared.get("agent") or "").strip()
     if not agent:
         raise ValueError(
             "server stop requires --agent so the coordinator can attribute the action"
         )
+    broker_enrollment = _system_broker_server_enrollment(prepared)
     snapshot = _normalized_server_from_options(prepared)
     project = canonical_project(
         str(prepared.get("project") or snapshot.get("project") or "")
@@ -8079,11 +9526,21 @@ def _coordinated_stop_server_normalized(
         raise ValueError(
             "server stop project does not match the registered server project"
         )
+    if broker_enrollment is not None:
+        _profile, repository, enrolled_name, enrolled_id = broker_enrollment
+        if (
+            canonical_project(str(snapshot.get("project") or ""))
+            != repository.canonical_root
+            or str(snapshot.get("name") or "") != enrolled_name
+            or str(snapshot.get("id") or "") != enrolled_id
+        ):
+            raise BrokerProfileError(
+                "client reconciliation journal does not match the exact enrolled "
+                "broker server identity"
+            )
     prime_git_head_identity(project)
     health = server_health(snapshot)
-    require_listener_identity_observable(
-        health, action="stop", server=snapshot
-    )
+    require_listener_identity_observable(health, action="stop", server=snapshot)
     requested_release = bool(prepared.get("release_port", True))
     broker_link = (
         broker_lease_link_for_local(str(snapshot.get("lease_id")))
@@ -8095,18 +9552,18 @@ def _coordinated_stop_server_normalized(
             agent=agent,
             server_definition_id=str(snapshot["id"]),
             expected_definition_generation=int(snapshot["generation"]),
-            expected_observation_fingerprint=snapshot.get(
-                "_observation_fingerprint"
-            ),
+            expected_observation_fingerprint=snapshot.get("_observation_fingerprint"),
         )
     identity_wrong = (health.get("identity") or {}).get("ok") is False
     try:
         if not identity_wrong and snapshot.get("pid"):
             stop_pid(int(snapshot["pid"]))
         final_health = server_health(snapshot)
-        if snapshot.get("pid") and not identity_wrong and final_health.get(
-            "pid_alive"
-        ) is not False:
+        if (
+            snapshot.get("pid")
+            and not identity_wrong
+            and final_health.get("pid_alive") is not False
+        ):
             raise RuntimeError(
                 f"server process {snapshot['pid']} did not reach a proved stopped boundary"
             )
@@ -8117,9 +9574,7 @@ def _coordinated_stop_server_normalized(
     except BaseException as stop_error:
         cleanup_errors: list[str] = []
         try:
-            still_alive = bool(
-                snapshot.get("pid") and pid_alive(int(snapshot["pid"]))
-            )
+            still_alive = bool(snapshot.get("pid") and pid_alive(int(snapshot["pid"])))
         except BaseException as observation_error:
             still_alive = True
             cleanup_errors.append(
@@ -8246,9 +9701,7 @@ def _coordinated_stop_server_normalized(
     return result
 
 
-def _coordinated_restart_server_normalized(
-    options: dict[str, Any]
-) -> dict[str, Any]:
+def _coordinated_restart_server_normalized(options: dict[str, Any]) -> dict[str, Any]:
     prepared = dict(options)
     agent, project = require_identity(prepared, "server restart")
     prepared["project"] = project
@@ -8259,9 +9712,7 @@ def _coordinated_restart_server_normalized(
             "missing_command=true"
         )
     health = server_health(snapshot)
-    require_listener_identity_observable(
-        health, action="restart", server=snapshot
-    )
+    require_listener_identity_observable(health, action="restart", server=snapshot)
     fixed_port = int(snapshot.get("assigned_port") or snapshot["port"])
     restart_options = {
         "agent": agent,
@@ -8312,7 +9763,9 @@ def snapshot_runtime_observation(*, project: str | None = None) -> dict[str, Any
         for server in state.get("servers", {}).values():
             if project and str(server.get("project") or "") != project:
                 continue
-            server["observation_generation"] = int(server.get("observation_generation") or 0) + 1
+            server["observation_generation"] = (
+                int(server.get("observation_generation") or 0) + 1
+            )
         return copy.deepcopy(state)
 
 
@@ -8329,7 +9782,10 @@ def server_lifecycle_fingerprint(server: dict[str, Any] | None) -> tuple[Any, ..
 
 
 def server_observation_fingerprint(server: dict[str, Any] | None) -> tuple[Any, ...]:
-    return (*server_lifecycle_fingerprint(server), (server or {}).get("observation_generation"))
+    return (
+        *server_lifecycle_fingerprint(server),
+        (server or {}).get("observation_generation"),
+    )
 
 
 SERVER_OBSERVATION_FIELDS = (
@@ -8356,7 +9812,11 @@ def merge_docker_stats_history(state: dict[str, Any], observed: dict[str, Any]) 
         for sample in samples:
             if not isinstance(sample, dict):
                 continue
-            identity = (sample.get("timestamp_ts"), sample.get("id"), sample.get("name"))
+            identity = (
+                sample.get("timestamp_ts"),
+                sample.get("id"),
+                sample.get("name"),
+            )
             if identity in known:
                 continue
             current.append(copy.deepcopy(sample))
@@ -8414,9 +9874,7 @@ def persist_normalized_docker_stats(
                 ) VALUES (?, 'docker', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    deterministic_id(
-                        "telemetry", "docker", resource_id, sampled_at
-                    ),
+                    deterministic_id("telemetry", "docker", resource_id, sampled_at),
                     resource_id,
                     sampled_at,
                     sample.get("cpu_percent"),
@@ -8431,7 +9889,9 @@ def persist_normalized_docker_stats(
     return inserted
 
 
-def commit_runtime_observations(baseline: dict[str, Any], observed: dict[str, Any]) -> None:
+def commit_runtime_observations(
+    baseline: dict[str, Any], observed: dict[str, Any]
+) -> None:
     """Commit health/stat observations only when the observed server is current.
 
     Slow process, HTTP, Docker, and filesystem checks run against ``observed``
@@ -8483,7 +9943,9 @@ def commit_runtime_observations(baseline: dict[str, Any], observed: dict[str, An
             current = state.get("servers", {}).get(server_id)
             if not baseline_server or not current:
                 continue
-            if server_observation_fingerprint(current) != server_observation_fingerprint(baseline_server):
+            if server_observation_fingerprint(
+                current
+            ) != server_observation_fingerprint(baseline_server):
                 continue
             previous_status = current.get("status")
             for field in SERVER_OBSERVATION_FIELDS:
@@ -8501,7 +9963,9 @@ def commit_runtime_observations(baseline: dict[str, Any], observed: dict[str, An
             if not current_lease or current_lease != baseline_lease:
                 continue
             server = observed.get("servers", {}).get(baseline_lease.get("server_id"))
-            reason = (server or {}).get("stopped_reason") or "health observation marked linked server stale"
+            reason = (server or {}).get(
+                "stopped_reason"
+            ) or "health observation marked linked server stale"
             mark_lease_stale_released(state, str(lease_id), current_lease, str(reason))
         merge_docker_stats_history(state, observed)
 
@@ -8541,16 +10005,26 @@ def _coordinated_register_server_local(options: dict[str, Any]) -> dict[str, Any
     host, port, url = parse_server_endpoint(prepared)
     cwd = str(Path(prepared.get("cwd") or project).expanduser().resolve())
     command_template = prepared.get("cmd") or prepared.get("command")
-    argv_template = command_argv(prepared) if command_template or prepared.get("argv") else None
+    argv_template = (
+        command_argv(prepared) if command_template or prepared.get("argv") else None
+    )
     argv = format_argv(argv_template, port=port, host=host) if argv_template else None
     command = shlex.join(argv) if argv else None
     health_url_template = prepared.get("health_url") or url
-    health_url = format_command(health_url_template, port=port, host=host) if health_url_template else None
-    pid, registration_identity = resolve_registration_pid(prepared, host=host, port=port, project=project)
+    health_url = (
+        format_command(health_url_template, port=port, host=host)
+        if health_url_template
+        else None
+    )
+    pid, registration_identity = resolve_registration_pid(
+        prepared, host=host, port=port, project=project
+    )
 
     target = f"server:{server_key(project, name)}"
     with locked_state() as state:
-        assignment_key, _assignment = find_port_assignment(state, project=project, name=name)
+        assignment_key, _assignment = find_port_assignment(
+            state, project=project, name=name
+        )
         foreign_assignments = foreign_assigned_ports(state, owner_key=assignment_key)
         if int(port) in foreign_assignments:
             raise RuntimeError(
@@ -8592,7 +10066,9 @@ def _coordinated_register_server_local(options: dict[str, Any]) -> dict[str, Any
         "log_path": previous.get("log_path"),
         "adopted": True,
         "missing_command": not bool(
-            argv_template or previous.get("argv_template") or previous.get("cmd_template")
+            argv_template
+            or previous.get("argv_template")
+            or previous.get("cmd_template")
         ),
         "metadata_source": prepared.get("metadata_source") or "server_register",
         "agent_metadata": agent_metadata(
@@ -8621,13 +10097,17 @@ def _coordinated_register_server_local(options: dict[str, Any]) -> dict[str, Any
             )
     except Exception as exc:
         with locked_state() as state:
-            finish_operation(state, operation["id"], status="failed", phase="observe", error=str(exc))
+            finish_operation(
+                state, operation["id"], status="failed", phase="observe", error=str(exc)
+            )
         raise
 
     with locked_state() as state:
         current_operation = state.get("operations", {}).get(operation["id"])
         if not current_operation or current_operation.get("status") != "pending":
-            raise RuntimeError("server registration reservation was superseded before commit")
+            raise RuntimeError(
+                "server registration reservation was superseded before commit"
+            )
         try:
             reclaim_stale_leases_for_port(
                 state,
@@ -8660,9 +10140,13 @@ def _coordinated_register_server_local(options: dict[str, Any]) -> dict[str, Any
                 source="server_register",
             )
             record_event(state, "server.registered", candidate)
-            finish_operation(state, operation["id"], status="completed", phase="committed")
+            finish_operation(
+                state, operation["id"], status="completed", phase="committed"
+            )
         except Exception as exc:
-            finish_operation(state, operation["id"], status="failed", phase="commit", error=str(exc))
+            finish_operation(
+                state, operation["id"], status="failed", phase="commit", error=str(exc)
+            )
             raise
     return candidate
 
@@ -8856,8 +10340,7 @@ def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, A
             candidates = [
                 item
                 for item in docker.get("containers", [])
-                if str(item.get("full_id") or "").lower()
-                == immutable_id.lower()
+                if str(item.get("full_id") or "").lower() == immutable_id.lower()
             ]
             if len(candidates) != 1:
                 raise RuntimeError(
@@ -8924,9 +10407,7 @@ def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, A
             "project": compose_project if skipped else project,
             "agent": agent,
             "role": prepared.get("role"),
-            "metadata_source": (
-                "docker_labels" if skipped else "coordinator_sidecar"
-            ),
+            "metadata_source": ("docker_labels" if skipped else "coordinator_sidecar"),
             "adopted": not skipped,
             "skipped": skipped,
             "message": (
@@ -8958,13 +10439,17 @@ def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, A
         result = register_docker_metadata(observed, prepared)
     except Exception as exc:
         with locked_state() as state:
-            finish_operation(state, operation["id"], status="failed", phase="observe", error=str(exc))
+            finish_operation(
+                state, operation["id"], status="failed", phase="observe", error=str(exc)
+            )
         raise
     observed_metadata = observed.get("docker", {}).get("metadata", {})
     with locked_state() as state:
         current_operation = state.get("operations", {}).get(operation["id"])
         if not current_operation or current_operation.get("status") != "pending":
-            raise RuntimeError("Docker metadata registration was superseded before commit")
+            raise RuntimeError(
+                "Docker metadata registration was superseded before commit"
+            )
         try:
             metadata = docker_metadata_store(state)
             for key, value in observed_metadata.items():
@@ -8972,12 +10457,18 @@ def coordinated_register_docker_metadata(options: dict[str, Any]) -> dict[str, A
                     metadata[key] = copy.deepcopy(value)
             record_event(
                 state,
-                "docker.register.skipped" if result.get("skipped") else "docker.registered",
+                "docker.register.skipped"
+                if result.get("skipped")
+                else "docker.registered",
                 result,
             )
-            finish_operation(state, operation["id"], status="completed", phase="committed")
+            finish_operation(
+                state, operation["id"], status="completed", phase="committed"
+            )
         except Exception as exc:
-            finish_operation(state, operation["id"], status="failed", phase="commit", error=str(exc))
+            finish_operation(
+                state, operation["id"], status="failed", phase="commit", error=str(exc)
+            )
             raise
     return result
 
@@ -8990,9 +10481,7 @@ def coordinated_sample_docker_stats(*, dry_run: bool = False) -> dict[str, Any]:
             state = normalized_control_snapshot_from_store(store)
             result = sample_docker_stats(state)
             samples = [
-                item
-                for item in result.get("stats", [])
-                if isinstance(item, dict)
+                item for item in result.get("stats", []) if isinstance(item, dict)
             ]
             if samples:
                 result["persisted_samples"] = persist_normalized_docker_stats(
@@ -9044,6 +10533,86 @@ def coordinated_build_inventory(
     return result
 
 
+def coordinated_list_events(
+    *, after: str | None = None, limit: int = DEFAULT_EVENT_PAGE_SIZE
+) -> dict[str, Any]:
+    """Read a durable ascending event page without sampling or mutation."""
+
+    if state_backend() == LEGACY_JSON_BACKEND:
+        raise RuntimeError("durable event pagination requires normalized SQLite state")
+    if type(limit) is not int or not 1 <= limit <= MAX_EVENT_PAGE_SIZE:
+        raise ValueError(
+            f"event page limit must be an integer from 1 through {MAX_EVENT_PAGE_SIZE}"
+        )
+    if after is not None:
+        decode_event_cursor(after)
+    profile = configured_broker_profile()
+    if profile is not None:
+        result = profile.events(after=after, limit=limit)
+        authority = {
+            "scope": "server-wide",
+            "transport": "authenticated-unix-socket",
+        }
+    else:
+        database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
+        if not database_path.exists():
+            result = {
+                "schema_version": 1,
+                "events": [],
+                "next_cursor": after,
+                "has_more": False,
+            }
+        else:
+            with AccountStore.open_default_read_only(coordinator_home()) as store:
+                with store.read_transaction() as connection:
+                    result = list_event_page(
+                        connection, after=after, limit=limit
+                    )
+        authority = {
+            "scope": (
+                "service" if authority_mode() == "service" else "isolated-account"
+            ),
+            "transport": "direct-private-store",
+        }
+    events = result.get("events")
+    if (
+        result.get("schema_version") != 1
+        or not isinstance(events, list)
+        or type(result.get("has_more")) is not bool
+        or (
+            result.get("next_cursor") is not None
+            and not isinstance(result.get("next_cursor"), str)
+        )
+    ):
+        raise BrokerError(
+            "invalid_reply", "Coordinator event read returned an invalid page."
+        )
+    allowed = {"event_id", "repo_id", "event_kind", "code", "message", "occurred_at"}
+    for event in events:
+        if (
+            not isinstance(event, dict)
+            or set(event) != allowed
+            or not isinstance(event.get("event_id"), str)
+            or not isinstance(event.get("event_kind"), str)
+            or not isinstance(event.get("message"), str)
+            or not isinstance(event.get("occurred_at"), str)
+            or (
+                event.get("repo_id") is not None
+                and not isinstance(event.get("repo_id"), str)
+            )
+            or (
+                event.get("code") is not None
+                and not isinstance(event.get("code"), str)
+            )
+        ):
+            raise BrokerError(
+                "invalid_reply", "Coordinator event read returned an invalid event."
+            )
+    page = dict(result)
+    page["authority"] = authority
+    return page
+
+
 def coordinated_build_registration_inventory(
     *, project: str, name: str, port: int
 ) -> dict[str, Any]:
@@ -9060,7 +10629,9 @@ def coordinated_build_registration_inventory(
     target_name = str(name).strip()
     target_port = int(port)
     if not Path(project).is_absolute() or not target_name:
-        raise ValueError("registration inventory requires an absolute project and server name")
+        raise ValueError(
+            "registration inventory requires an absolute project and server name"
+        )
     if not 1 <= target_port <= 65535:
         raise ValueError("registration inventory port must be between 1 and 65535")
     if state_backend() == LEGACY_JSON_BACKEND:
@@ -9092,8 +10663,7 @@ def coordinated_build_registration_inventory(
     relevant_assignments = [
         copy.deepcopy(assignment)
         for assignment in source_compatibility["port_assignments"]
-        if assignment.get("port") == target_port
-        or assignment.get("key") == target_key
+        if assignment.get("port") == target_port or assignment.get("key") == target_key
     ]
     compatibility = copy.deepcopy(source_compatibility)
     state = {
@@ -9114,6 +10684,14 @@ def coordinated_build_registration_inventory(
             # A stale persisted observability bit is not proof that the current
             # capability-matched observer can or cannot inspect this listener.
             server["_require_exact_listener_identity"] = True
+    authoritative_stopped_health = {
+        str(server["id"]): copy.deepcopy(server.get("health"))
+        for server in relevant_servers
+        if server.get("status") == "stopped"
+        and server.get("pid") is None
+        and server.get("metadata_source") == "normalized-sqlite"
+        and isinstance(server.get("health"), dict)
+    }
     observed = build_inventory(
         state,
         include_docker=False,
@@ -9122,6 +10700,15 @@ def coordinated_build_registration_inventory(
         include_backups=False,
     )
     for server in observed["servers"]:
+        stopped_health = authoritative_stopped_health.get(str(server.get("id")))
+        if server.get("status") == "stopped" and stopped_health is not None:
+            # The normalized stop observation is the durable lifecycle fact.
+            # A newly bound listener on the retained port is separate current
+            # evidence, exposed by port_reused/port_reused_by. Replacing the
+            # stopped health with that listener's live health makes the
+            # registration baseline internally contradictory.
+            server["health"] = copy.deepcopy(stopped_health)
+            server.pop("registration_identity", None)
         strict_requested = server.pop("_require_exact_listener_identity", False) is True
         health = server.get("health") or {}
         identity = health.get("identity") or {}
@@ -9248,7 +10835,9 @@ def filter_normalized_inventory_project(
     resolved = canonical_project(project)
     result = copy.deepcopy(inventory)
     repositories = [
-        row for row in result.get("repositories", []) if row.get("canonical_root") == resolved
+        row
+        for row in result.get("repositories", [])
+        if row.get("canonical_root") == resolved
     ]
     repo_ids = {str(row.get("repo_id")) for row in repositories if row.get("repo_id")}
     root_matched_violations = [
@@ -9279,10 +10868,14 @@ def filter_normalized_inventory_project(
     }
     result["repositories"] = repositories
     result["memberships"] = [
-        row for row in result.get("memberships", []) if str(row.get("repo_id")) in repo_ids
+        row
+        for row in result.get("memberships", [])
+        if str(row.get("repo_id")) in repo_ids
     ]
     result["control_bindings"] = [
-        row for row in result.get("control_bindings", []) if str(row.get("repo_id")) in repo_ids
+        row
+        for row in result.get("control_bindings", [])
+        if str(row.get("repo_id")) in repo_ids
     ]
     result["leases"] = [
         row for row in result.get("leases", []) if str(row.get("repo_id")) in repo_ids
@@ -9292,7 +10885,9 @@ def filter_normalized_inventory_project(
         for row in result.get("port_assignments", [])
         if str(row.get("repo_id")) in repo_ids
     ]
-    resources = result.get("resources") if isinstance(result.get("resources"), dict) else {}
+    resources = (
+        result.get("resources") if isinstance(result.get("resources"), dict) else {}
+    )
     resources["servers"] = [
         row
         for row in resources.get("servers", [])
@@ -9338,9 +10933,7 @@ def filter_normalized_inventory_project(
         if row.get("docker_resource_id")
     }
     docker_engine_ids = {
-        str(row.get("engine_id"))
-        for row in resources["docker"]
-        if row.get("engine_id")
+        str(row.get("engine_id")) for row in resources["docker"] if row.get("engine_id")
     }
     result["docker_engines"] = [
         row
@@ -9582,7 +11175,9 @@ def pure_normalized_inventory(
     if stats_history_limit < DOCKER_STATS_HISTORY_LIMIT:
         for container in result.get("docker", {}).get("containers", []):
             history = list(container.get("stats_history") or [])
-            container["stats_history"] = history[-stats_history_limit:] if stats_history_limit else []
+            container["stats_history"] = (
+                history[-stats_history_limit:] if stats_history_limit else []
+            )
     return result
 
 
@@ -9647,23 +11242,25 @@ def bootstrap_legacy_import(
                 """
             )
         }
-    pending = [candidate for candidate in candidates if str(candidate) not in imported_homes]
+    pending = [
+        candidate for candidate in candidates if str(candidate) not in imported_homes
+    ]
     if not pending:
         return {
             "attempted": bool(reconciliation.attempted),
             "source_count": int(reconciliation.source_count),
             "committed": bool(reconciliation.committed),
             "conflict_count": int(reconciliation.conflict_count),
-            "blocking_conflict_count": int(
-                reconciliation.blocking_conflict_count
-            ),
-            "reclassified_conflict_count": int(
-                reconciliation.reclassified_count
-            ),
+            "blocking_conflict_count": int(reconciliation.blocking_conflict_count),
+            "reclassified_conflict_count": int(reconciliation.reclassified_count),
             "destination_generation": reconciliation.destination_generation,
             "late_writer_sources": list(store.detect_late_legacy_writers()),
         }
-    root = Path(backup_root).expanduser().absolute() if backup_root else coordinator_home() / "legacy-import-backups"
+    root = (
+        Path(backup_root).expanduser().absolute()
+        if backup_root
+        else coordinator_home() / "legacy-import-backups"
+    )
     report = store.import_legacy_homes(pending, root)
     with store.read_transaction() as connection:
         aggregate_conflicts = [
@@ -9734,7 +11331,9 @@ def latest_fresh_observation(
     if row is None or not row[2]:
         return None
     try:
-        completed = datetime.fromisoformat(str(row[2]).replace("Z", "+00:00")).astimezone(timezone.utc)
+        completed = datetime.fromisoformat(
+            str(row[2]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
     except ValueError:
         return None
     if (datetime.now(timezone.utc) - completed).total_seconds() > max_age_seconds:
@@ -9754,16 +11353,9 @@ def observation_domain_for_scope(
 ) -> str:
     """Return one deterministic single-flight/freshness domain per sample scope."""
 
-    base = (
-        OBSERVER_DOMAIN_FULL_DOCKER
-        if include_docker
-        else OBSERVER_DOMAIN_NO_DOCKER
-    )
+    base = OBSERVER_DOMAIN_FULL_DOCKER if include_docker else OBSERVER_DOMAIN_NO_DOCKER
     canonical_backups = sorted(
-        {
-            str(Path(value).expanduser().resolve())
-            for value in (backup_dirs or [])
-        }
+        {str(Path(value).expanduser().resolve()) for value in (backup_dirs or [])}
     )
     if not canonical_backups:
         return base
@@ -9779,41 +11371,136 @@ def sample_host_inventory_for_normalized_store(
     include_docker: bool,
     backup_dirs: list[str] | None,
 ) -> dict[str, Any]:
-    state = normalized_control_snapshot_from_store(store)
-    state["servers"] = {
-        str(server["id"]): server
-        for server in NormalizedServerLifecycle(store).list_servers()
-    }
-    inventory = build_inventory(
-        state,
-        project=None,
-        include_docker=include_docker,
-        backup_dirs=backup_dirs,
-        stats_history_limit=DOCKER_STATS_HISTORY_LIMIT,
-    )
-    if include_docker:
-        postgres_ids = {
-            str(item.get("full_id") or item.get("id") or "")
-            for item in inventory.get("docker", {}).get("postgres", [])
+    with bounded_host_observation():
+        state = normalized_control_snapshot_from_store(store)
+        state["servers"] = {
+            str(server["id"]): server
+            for server in NormalizedServerLifecycle(store).list_servers()
         }
-        for container in inventory.get("docker", {}).get("containers", []):
-            identity = str(container.get("full_id") or container.get("id") or "")
-            if identity not in postgres_ids:
-                continue
-            databases, error = discover_postgres_databases(container)
-            container["databases"] = databases
-            if error:
-                container["database_discovery_error"] = error
+        inventory = build_inventory(
+            state,
+            project=None,
+            include_docker=include_docker,
+            backup_dirs=backup_dirs,
+            stats_history_limit=DOCKER_STATS_HISTORY_LIMIT,
+        )
+        if include_docker:
+            postgres_ids = {
+                str(item.get("full_id") or item.get("id") or "")
+                for item in inventory.get("docker", {}).get("postgres", [])
+            }
+            for container in inventory.get("docker", {}).get("containers", []):
+                identity = str(container.get("full_id") or container.get("id") or "")
+                if identity not in postgres_ids:
+                    continue
+                remaining = remaining_host_observation_seconds()
+                if remaining is not None and remaining <= 0:
+                    container["databases"] = []
+                    container["database_discovery_error"] = (
+                        "bounded host observation deadline expired before PostgreSQL discovery"
+                    )
+                    continue
+                databases, error = discover_postgres_databases(container)
+                container["databases"] = databases
+                if error:
+                    container["database_discovery_error"] = error
     return {"sampled_at": iso_timestamp(), "inventory": inventory}
 
 
 def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
     if state_backend() == LEGACY_JSON_BACKEND:
-        raise RuntimeError("explicit host observation requires the normalized SQLite backend")
+        raise RuntimeError(
+            "explicit host observation requires the normalized SQLite backend"
+        )
     agent, project = require_identity(options, "observe")
     max_age_seconds = float(options.get("max_age_seconds") or 0)
     if not 0 <= max_age_seconds <= 24 * 60 * 60:
         raise ValueError("--max-age-seconds must be between 0 and 86400")
+    if authority_mode() == "system":
+        if max_age_seconds != 0:
+            raise ValueError(
+                "server-wide observation always requests a new/joined service snapshot; "
+                "--max-age-seconds must be 0"
+            )
+        account_scoped_options = []
+        if bool(options.get("no_docker")):
+            account_scoped_options.append("--no-docker")
+        if options.get("backup_dir"):
+            account_scoped_options.append("--backup-dir")
+        if options.get("legacy_home"):
+            account_scoped_options.append("--legacy-home")
+        if options.get("legacy_backup_root"):
+            account_scoped_options.append("--legacy-backup-root")
+        if account_scoped_options:
+            raise ValueError(
+                "server-wide observation is one full-Docker broker snapshot and "
+                "does not accept account-scoped discovery options: "
+                + ", ".join(account_scoped_options)
+            )
+        profile = configured_broker_profile()
+        if profile is None:
+            raise BrokerProfileError("server-wide broker authority is not configured")
+        repository = profile.repository(project)
+        _operation_id, result = profile.call(
+            repository=repository,
+            resource_id=repository.repo_id,
+            operation=BrokerOperation.HOST_OBSERVE,
+            arguments={},
+        )
+        def bounded_text(key: str, *, maximum: int = 512) -> bool:
+            value = result.get(key)
+            return isinstance(value, str) and 0 < len(value) <= maximum
+
+        def exact_revision(key: str) -> bool:
+            value = result.get(key)
+            return type(value) is int and value >= 0
+
+        fingerprints_valid = (
+            isinstance(result.get("capability_fingerprint"), str)
+            and re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(result["capability_fingerprint"])
+            )
+            is not None
+            and isinstance(result.get("material_fingerprint"), str)
+            and re.fullmatch(
+                r"[0-9a-f]{64}", str(result["material_fingerprint"])
+            )
+            is not None
+        )
+        completed_at_valid = bounded_text("completed_at", maximum=64)
+        if completed_at_valid:
+            try:
+                datetime.fromisoformat(
+                    str(result["completed_at"]).replace("Z", "+00:00")
+                )
+            except ValueError:
+                completed_at_valid = False
+        if (
+            result.get("schema_version") != NORMALIZED_SCHEMA_VERSION
+            or result.get("observer_domain") != OBSERVER_DOMAIN_FULL_DOCKER
+            or result.get("status") != "completed"
+            or result.get("observed") is not True
+            or type(result.get("joined")) is not bool
+            or type(result.get("docker_available")) is not bool
+            or not bounded_text("snapshot_id")
+            or not bounded_text("host_id")
+            or not fingerprints_valid
+            or not completed_at_valid
+            or not exact_revision("observation_revision")
+            or not exact_revision("state_revision")
+        ):
+            raise BrokerError(
+                "invalid_reply",
+                "Broker host observation omitted committed full-Docker evidence.",
+            )
+        response = dict(result)
+        response["request"] = {"agent": agent, "project": project}
+        response["max_age_seconds"] = max_age_seconds
+        response["authority"] = {
+            "scope": "server-wide",
+            "transport": "authenticated-unix-socket",
+        }
+        return response
     with AccountStore.open_default(coordinator_home()) as store:
         imported = bootstrap_legacy_import(
             store,
@@ -9834,7 +11521,13 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
         )
         observed = fresh is None
         if fresh is None:
-            observer = SingleFlightObserver(store)
+            observer = SingleFlightObserver(
+                store,
+                join_timeout=HOST_OBSERVATION_JOIN_TIMEOUT_SECONDS,
+                stale_after=timedelta(
+                    seconds=HOST_OBSERVATION_STALE_AFTER_SECONDS
+                ),
+            )
             outcome = observer.observe(
                 host_id=host_id,
                 observer_domain=observer_domain,
@@ -9843,12 +11536,14 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
                     include_docker=include_docker,
                     backup_dirs=options.get("backup_dir"),
                 ),
-                commit=lambda connection, snapshot_id, sample: commit_host_inventory_observation(
-                    connection,
-                    snapshot_id,
-                    sample,
-                    host_id=host_id,
-                    coordinator_home=str(coordinator_home()),
+                commit=lambda connection, snapshot_id, sample: (
+                    commit_host_inventory_observation(
+                        connection,
+                        snapshot_id,
+                        sample,
+                        host_id=host_id,
+                        coordinator_home=str(coordinator_home()),
+                    )
                 ),
             )
         else:
@@ -9884,7 +11579,11 @@ def observe_broker_service_store_for_enrollment(
     """
 
     host_id = ensure_observation_host(store)
-    observer = SingleFlightObserver(store)
+    observer = SingleFlightObserver(
+        store,
+        join_timeout=HOST_OBSERVATION_JOIN_TIMEOUT_SECONDS,
+        stale_after=timedelta(seconds=HOST_OBSERVATION_STALE_AFTER_SECONDS),
+    )
     outcome = observer.observe(
         host_id=host_id,
         observer_domain=OBSERVER_DOMAIN_FULL_DOCKER,
@@ -9893,12 +11592,14 @@ def observe_broker_service_store_for_enrollment(
             include_docker=True,
             backup_dirs=None,
         ),
-        commit=lambda connection, snapshot_id, sample: commit_host_inventory_observation(
-            connection,
-            snapshot_id,
-            sample,
-            host_id=host_id,
-            coordinator_home=str(store.database_path.parent),
+        commit=lambda connection, snapshot_id, sample: (
+            commit_host_inventory_observation(
+                connection,
+                snapshot_id,
+                sample,
+                host_id=host_id,
+                coordinator_home=str(store.database_path.parent),
+            )
         ),
     )
     with store.read_transaction() as connection:
@@ -9917,6 +11618,7 @@ def observe_broker_service_store_for_enrollment(
     return {
         "observer_domain": OBSERVER_DOMAIN_FULL_DOCKER,
         "snapshot_id": outcome.snapshot_id,
+        "host_id": outcome.host_id,
         "joined": bool(outcome.joined),
         "completed_at": outcome.completed_at,
         "material_fingerprint": outcome.material_fingerprint,
@@ -9954,29 +11656,208 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
     else:
         socket_gid = int(args.access_gid)
     allowed_server_names = None if args.all_servers else tuple(args.server or ())
-    result = enroll_repository(
-        database_path=Path(str(args.database)).expanduser().absolute(),
-        socket_path=Path(str(args.socket)).expanduser().absolute(),
-        socket_gid=socket_gid,
-        client_uid=int(args.client_uid),
-        account_id=str(args.account_id),
-        canonical_root=project,
-        servers=servers,
-        allowed_server_names=allowed_server_names,
-        port_start=start_port,
-        port_end=end_port,
-        profile_path=profile_output.absolute(),
-        compose=compose if isinstance(compose, dict) else None,
-        observe_host=observe_broker_service_store_for_enrollment,
-        explicit_reinstall=bool(args.explicit_reinstall),
-        validity_seconds=int(args.profile_valid_days) * 24 * 60 * 60,
-    )
+    database_path = Path(str(args.database)).expanduser().absolute()
+    with exclusive_broker_service_lock(database_path):
+        result = enroll_repository(
+            database_path=database_path,
+            socket_path=Path(str(args.socket)).expanduser().absolute(),
+            socket_gid=socket_gid,
+            client_uid=int(args.client_uid),
+            account_id=str(args.account_id),
+            canonical_root=project,
+            servers=servers,
+            allowed_server_names=allowed_server_names,
+            port_start=start_port,
+            port_end=end_port,
+            profile_path=profile_output.absolute(),
+            compose=compose if isinstance(compose, dict) else None,
+            approve_compose_host_access=bool(args.approve_compose_host_access),
+            observe_host=observe_broker_service_store_for_enrollment,
+            explicit_reinstall=bool(args.explicit_reinstall),
+            grant_cleanup_capabilities=bool(args.grant_cleanup),
+            validity_seconds=int(args.profile_valid_days) * 24 * 60 * 60,
+        )
     result["observation"] = {
         "scope": OBSERVER_DOMAIN_FULL_DOCKER,
         "completed_before_profile_publish": True,
     }
     result["runtime_file"] = specification.get("runtime_file")
     result["agent"] = str(args.agent)
+    return result
+
+
+def coordinated_broker_compose_reconcile(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Resolve one fenced Compose outcome from a fresh service-owned snapshot."""
+
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "Compose reconciliation must run as the root service administrator"
+        )
+    abandon = bool(args.abandon_as_failed)
+    plan_only = bool(args.plan)
+    confirmation = args.confirm_definition_fingerprint
+    if abandon and not confirmation:
+        raise ValueError(
+            "--abandon-as-failed requires --confirm-definition-fingerprint"
+        )
+    if not abandon and confirmation:
+        raise ValueError(
+            "--confirm-definition-fingerprint is valid only with --abandon-as-failed"
+        )
+    database_path = Path(str(args.database)).expanduser().absolute()
+    if plan_only:
+        candidate = BrokerPersistence.inspect_compose_reconciliation_candidate(
+            database_path,
+            operation_id=str(args.operation_id),
+            expected_uid=0,
+        )
+        return {
+            "status": "reconciliation_plan",
+            **candidate,
+            "required_confirmation_fingerprint": (
+                candidate["target_fingerprint"]
+                if not candidate["scope_recoverable"]
+                else None
+            ),
+            "mutated": False,
+        }
+    service_lock = exclusive_broker_service_lock(database_path)
+    with service_lock:
+        persistence = BrokerPersistence(database_path, expected_uid=0)
+        candidate = persistence.compose_reconciliation_candidate(str(args.operation_id))
+        evidence: Mapping[str, Any] | None = None
+        if not abandon:
+            with AccountStore.open(database_path, expected_uid=0) as store:
+                fence = capture_observation_freshness_fence(
+                    store,
+                    host_id=str(candidate["host_id"]),
+                )
+                observed = observe_broker_service_store_for_enrollment(store)
+                evidence = require_exact_fresh_observation(
+                    store,
+                    evidence=observed,
+                    fence=fence,
+                    allow_joined_ticket=False,
+                )
+        result = persistence.reconcile_compose_operation(
+            str(args.operation_id),
+            evidence=evidence,
+            abandon_as_failed=abandon,
+            confirm_definition_fingerprint=(
+                None if confirmation is None else str(confirmation)
+            ),
+        )
+    result["administrator_uid"] = 0
+    return result
+
+
+def coordinated_broker_docker_reconcile(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Resolve one fenced direct-Docker outcome from fresh host evidence."""
+
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "Docker reconciliation must run as the root service administrator"
+        )
+    plan_only = bool(args.plan)
+    confirmation = args.confirm_container_id
+    if plan_only and confirmation:
+        raise ValueError("--confirm-container-id is valid only when applying")
+    if not plan_only and not confirmation:
+        raise ValueError("Docker reconciliation apply requires --confirm-container-id")
+    database_path = Path(str(args.database)).expanduser().absolute()
+    if plan_only:
+        candidate = BrokerPersistence.inspect_docker_reconciliation_candidate(
+            database_path,
+            operation_id=str(args.operation_id),
+            expected_uid=0,
+        )
+        return {
+            "status": "reconciliation_plan",
+            **candidate,
+            "mutated": False,
+        }
+    with exclusive_broker_service_lock(database_path):
+        persistence = BrokerPersistence(database_path, expected_uid=0)
+        candidate = persistence.docker_reconciliation_candidate(
+            str(args.operation_id)
+        )
+        with AccountStore.open(database_path, expected_uid=0) as store:
+            fence = capture_observation_freshness_fence(
+                store,
+                host_id=str(candidate["host_id"]),
+            )
+            observed = observe_broker_service_store_for_enrollment(store)
+            evidence = require_exact_fresh_observation(
+                store,
+                evidence=observed,
+                fence=fence,
+                allow_joined_ticket=False,
+            )
+        result = persistence.reconcile_docker_operation(
+            str(args.operation_id),
+            evidence=evidence,
+            confirm_container_id=str(confirmation),
+        )
+    result["administrator_uid"] = 0
+    return result
+
+
+def coordinated_broker_compose_project_name_release(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Release one disabled project-name claim from exact fresh host proof."""
+
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "Compose project-name release must run as the root service administrator"
+        )
+    database_path = Path(str(args.database)).expanduser().absolute()
+    definition_id = str(args.compose_definition_id)
+    with exclusive_broker_service_lock(database_path):
+        persistence = BrokerPersistence(database_path, expected_uid=0)
+        candidate = persistence.compose_project_name_release_candidate(
+            compose_definition_id=definition_id
+        )
+        if candidate["enabled"]:
+            raise RuntimeError(
+                "disable the Compose definition before releasing its project name"
+            )
+        if not candidate["claimed"]:
+            raise RuntimeError("Compose project name is already released")
+        evidence: Mapping[str, Any] | None = None
+        with AccountStore.open(database_path, expected_uid=0) as store:
+            for attempt in range(2):
+                fence = capture_observation_freshness_fence(
+                    store,
+                    host_id=str(candidate["host_id"]),
+                )
+                observed = observe_broker_service_store_for_enrollment(store)
+                try:
+                    evidence = require_exact_fresh_observation(
+                        store,
+                        evidence=observed,
+                        fence=fence,
+                        allow_joined_ticket=False,
+                    )
+                    break
+                except ObservationFreshnessError:
+                    if attempt == 0 and bool(observed.get("joined")):
+                        continue
+                    raise
+        if evidence is None:
+            raise ObservationFreshnessError(
+                "project-name release did not obtain a new observation ticket"
+            )
+        result = persistence.release_compose_project_name(
+            compose_definition_id=definition_id,
+            observation_evidence=evidence,
+            actor_uid=0,
+        )
+    result["administrator_uid"] = 0
     return result
 
 
@@ -10005,7 +11886,9 @@ def observe_project_runtime(
     return spec, report
 
 
-def begin_project_operation(options: dict[str, Any], action: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def begin_project_operation(
+    options: dict[str, Any], action: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
     prepared = dict(options)
     agent, project = require_identity(prepared, f"project {action}")
     if not prepared.get("dry_run"):
@@ -10034,11 +11917,7 @@ def begin_project_operation(options: dict[str, Any], action: str) -> tuple[dict[
     if state_backend() != LEGACY_JSON_BACKEND:
         stack = _normalized_guard_stack()
         active = next(
-            (
-                item
-                for item in reversed(stack)
-                if item.get("project") == project
-            ),
+            (item for item in reversed(stack) if item.get("project") == project),
             None,
         )
         if active is None:
@@ -10162,9 +12041,7 @@ def finish_project_operation(
                         "action": result.get("action"),
                         "ok": result.get("ok"),
                         "classification": result.get("classification"),
-                        "action_error_count": len(
-                            result.get("action_errors") or []
-                        ),
+                        "action_error_count": len(result.get("action_errors") or []),
                         "service_count": len(result.get("services") or []),
                         "partial": bool(result.get("partial")),
                         "preflight_failed": bool(result.get("preflight_failed")),
@@ -10187,14 +12064,21 @@ def finish_project_operation(
                         phase,
                         json.dumps(payload, separators=(",", ":"), sort_keys=True),
                         (
-                            str(payload["failure"].get("code") or "project_action_failed")
+                            str(
+                                payload["failure"].get("code")
+                                or "project_action_failed"
+                            )
                             if error is not None
                             else ("project_action_incomplete" if incomplete else None)
                         ),
                         (
                             str(payload["failure"].get("error") or error)
                             if error is not None
-                            else ("project action reported an incomplete result" if incomplete else None)
+                            else (
+                                "project action reported an incomplete result"
+                                if incomplete
+                                else None
+                            )
                         ),
                         utc_timestamp(),
                         operation_id,
@@ -10222,7 +12106,9 @@ def finish_project_operation(
             state,
             operation_id,
             status="failed" if error or incomplete else "completed",
-            phase="failed" if error else ("committed-incomplete" if incomplete else "committed"),
+            phase="failed"
+            if error
+            else ("committed-incomplete" if incomplete else "committed"),
             error=str(error) if error else None,
         )
 
@@ -10257,9 +12143,7 @@ def record_project_status_evidence(report: dict[str, Any]) -> None:
                         str(uuid.uuid4()),
                         str(repository[0]) if repository is not None else None,
                         f"Project runtime status observed for {project}",
-                        json.dumps(
-                            diagnostic, separators=(",", ":"), sort_keys=True
-                        ),
+                        json.dumps(diagnostic, separators=(",", ":"), sort_keys=True),
                         utc_timestamp(),
                     ),
                 )
@@ -10285,7 +12169,9 @@ def coordinated_project_runtime_status(options: dict[str, Any]) -> dict[str, Any
     return report
 
 
-def coordinated_reclaim_runtime_port(*, project: str, port: int, reason: str) -> list[dict[str, Any]]:
+def coordinated_reclaim_runtime_port(
+    *, project: str, port: int, reason: str
+) -> list[dict[str, Any]]:
     """Release only same-project server leases proven stale outside the lock."""
 
     if not port_available(port):
@@ -10329,12 +12215,22 @@ def coordinated_reclaim_runtime_port(*, project: str, port: int, reason: str) ->
         if lease.get("status") != "active" or int(lease.get("port") or 0) != int(port):
             continue
         lease_project = lease.get("project")
-        if not lease_project or canonical_project(str(lease_project)) != canonical_project(project):
+        if not lease_project or canonical_project(
+            str(lease_project)
+        ) != canonical_project(project):
             continue
         if not str(lease.get("purpose") or "").startswith("server:"):
             continue
-        server = baseline.get("servers", {}).get(lease.get("server_id")) if lease.get("server_id") else None
-        if not server or server.get("status") == "stopped" or not pid_alive(int(server.get("pid") or 0)):
+        server = (
+            baseline.get("servers", {}).get(lease.get("server_id"))
+            if lease.get("server_id")
+            else None
+        )
+        if (
+            not server
+            or server.get("status") == "stopped"
+            or not pid_alive(int(server.get("pid") or 0))
+        ):
             candidates.append(str(lease_id))
     released: list[dict[str, Any]] = []
     with locked_state() as state:
@@ -10350,15 +12246,29 @@ def coordinated_reclaim_runtime_port(*, project: str, port: int, reason: str) ->
 def runtime_server_start_options(
     state: dict[str, Any], server_def: dict[str, Any], options: dict[str, Any]
 ) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
-    server_id, existing = find_server(state, project=server_def["project"], name=server_def["name"])
+    server_id, existing = find_server(
+        state, project=server_def["project"], name=server_def["name"]
+    )
     _assignment_key, assignment = find_port_assignment(
         state, project=server_def["project"], name=server_def["name"]
     )
-    fixed_port = server_def.get("port") or (assignment or {}).get("port") or (existing or {}).get("port")
-    if server_def.get("missing_fixed_port") and fixed_port is None and not options.get("allow_port_change"):
-        raise RuntimeError(f"project server {server_def['name']} has no fixed port declaration")
+    fixed_port = (
+        server_def.get("port")
+        or (assignment or {}).get("port")
+        or (existing or {}).get("port")
+    )
+    if (
+        server_def.get("missing_fixed_port")
+        and fixed_port is None
+        and not options.get("allow_port_change")
+    ):
+        raise RuntimeError(
+            f"project server {server_def['name']} has no fixed port declaration"
+        )
     if fixed_port is None and not options.get("allow_port_change"):
-        raise RuntimeError(f"project server {server_def['name']} has no fixed port; add .codex/dev-runtime.json")
+        raise RuntimeError(
+            f"project server {server_def['name']} has no fixed port; add .codex/dev-runtime.json"
+        )
     declared_command = server_def.get("cmd")
     declared_argv = server_def.get("argv")
     if declared_argv is not None:
@@ -10371,31 +12281,43 @@ def runtime_server_start_options(
         command = (existing or {}).get("cmd_template")
         argv_template = (existing or {}).get("argv_template")
     if not command and not argv_template:
-        raise RuntimeError(f"project server {server_def['name']} has no command declaration")
+        raise RuntimeError(
+            f"project server {server_def['name']} has no command declaration"
+        )
     start_options = {
         "agent": options.get("agent") or os.environ.get("USER") or "codex-agent",
         "project": server_def["project"],
         "name": server_def["name"],
-        "cwd": server_def.get("cwd") or (existing or {}).get("cwd") or server_def["project"],
+        "cwd": server_def.get("cwd")
+        or (existing or {}).get("cwd")
+        or server_def["project"],
         "cmd": command,
         "argv": argv_template,
-        "range": f"{fixed_port}-{fixed_port}" if fixed_port else options.get("range") or DEFAULT_RANGE,
+        "range": f"{fixed_port}-{fixed_port}"
+        if fixed_port
+        else options.get("range") or DEFAULT_RANGE,
         "preferred": int(fixed_port) if fixed_port else options.get("preferred"),
         "host": server_def.get("host") or (existing or {}).get("host") or "127.0.0.1",
         "health_url": server_def.get("health_url")
         or (existing or {}).get("health_url_template")
         or (existing or {}).get("health_url"),
-        "health_timeout": server_def.get("health_timeout") or options.get("health_timeout") or 10,
+        "health_timeout": server_def.get("health_timeout")
+        or options.get("health_timeout")
+        or 10,
         "env": server_def.get("env") or [],
     }
     return start_options, server_id, copy.deepcopy(existing) if existing else None
 
 
-def coordinated_start_runtime_server(server_def: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+def coordinated_start_runtime_server(
+    server_def: dict[str, Any], options: dict[str, Any]
+) -> dict[str, Any]:
     prepared = dict(options)
     require_identity(prepared, "project start")
     snapshot = snapshot_coordinator_state()
-    start_options, server_id, existing = runtime_server_start_options(snapshot, server_def, prepared)
+    start_options, server_id, existing = runtime_server_start_options(
+        snapshot, server_def, prepared
+    )
     fixed_port = start_options.get("preferred")
     if existing:
         existing_health = server_health(existing)
@@ -10406,22 +12328,38 @@ def coordinated_start_runtime_server(server_def: dict[str, Any], options: dict[s
         )
         if existing_health.get("ok"):
             return coordinated_status_server(
-                {"server_id": server_id, "project": server_def["project"], "name": server_def["name"]}
+                {
+                    "server_id": server_id,
+                    "project": server_def["project"],
+                    "name": server_def["name"],
+                }
             )
 
-    if fixed_port is not None and port_open(str(start_options["host"]), int(fixed_port)):
+    if fixed_port is not None and port_open(
+        str(start_options["host"]), int(fixed_port)
+    ):
         belongs, owner = listener_belongs_to_project(
-            int(fixed_port), server_def["project"], host=str(server_def.get("host") or "127.0.0.1")
+            int(fixed_port),
+            server_def["project"],
+            host=str(server_def.get("host") or "127.0.0.1"),
         )
         if not belongs:
-            error_type = ListenerIdentityUnobservable if owner.get("observable") is False else RuntimeError
+            error_type = (
+                ListenerIdentityUnobservable
+                if owner.get("observable") is False
+                else RuntimeError
+            )
             raise error_type(
                 f"refusing to adopt {server_def['name']} on port {fixed_port}: "
                 f"{owner.get('reason') or 'listener does not belong to project'}"
             )
         health_url_template = server_def.get("health_url")
         health_url = (
-            format_command(health_url_template, port=int(fixed_port), host=str(start_options["host"]))
+            format_command(
+                health_url_template,
+                port=int(fixed_port),
+                host=str(start_options["host"]),
+            )
             if health_url_template
             else None
         )
@@ -10441,9 +12379,12 @@ def coordinated_start_runtime_server(server_def: dict[str, Any], options: dict[s
                     "pid": owner.get("pid"),
                     "host": start_options["host"],
                     "url": f"http://{start_options['host']}:{fixed_port}",
-                    "health_url": health_url_template or f"http://{start_options['host']}:{fixed_port}",
+                    "health_url": health_url_template
+                    or f"http://{start_options['host']}:{fixed_port}",
                     "metadata_source": "project_adoption",
-                    "health_timeout": server_def.get("health_timeout") or prepared.get("health_timeout") or 3,
+                    "health_timeout": server_def.get("health_timeout")
+                    or prepared.get("health_timeout")
+                    or 3,
                 }
             )
 
@@ -10467,7 +12408,9 @@ def coordinated_start_runtime_server(server_def: dict[str, Any], options: dict[s
     return coordinated_start_server(start_options)
 
 
-def planned_runtime_server_action(server_def: dict[str, Any], action: str) -> dict[str, Any]:
+def planned_runtime_server_action(
+    server_def: dict[str, Any], action: str
+) -> dict[str, Any]:
     return {
         "dry_run": True,
         "action": f"server.{action}",
@@ -10498,13 +12441,21 @@ def ensure_runtime_docker_metadata_coordinated(
             "role": dep.get("role") or dep.get("name") or "docker",
         }
         if options.get("dry_run"):
-            actions.append({**payload, "dry_run": True, "metadata_source": "planned_coordinator_sidecar"})
+            actions.append(
+                {
+                    **payload,
+                    "dry_run": True,
+                    "metadata_source": "planned_coordinator_sidecar",
+                }
+            )
         else:
             actions.append(coordinated_register_docker_metadata(payload))
     return actions
 
 
-def dependency_owned_by_compose(spec: dict[str, Any], dependency: dict[str, Any]) -> bool:
+def dependency_owned_by_compose(
+    spec: dict[str, Any], dependency: dict[str, Any]
+) -> bool:
     """Return whether declared Compose owns this dependency's lifecycle.
 
     The dependency remains in `docker_dependencies` for health, readiness, and
@@ -10535,7 +12486,9 @@ def mutable_runtime_docker_dependencies(
         if dep.get("mutation_authorized") is True
     ]
     if exclude_compose_owned:
-        dependencies = [dep for dep in dependencies if not dependency_owned_by_compose(spec, dep)]
+        dependencies = [
+            dep for dep in dependencies if not dependency_owned_by_compose(spec, dep)
+        ]
     return dependencies
 
 
@@ -10587,6 +12540,14 @@ def require_docker_capability_probe(
 
 def compose_command_prefix(compose: dict[str, Any]) -> list[str]:
     command = ["compose"]
+    if compose.get("cwd"):
+        command.extend(["--project-directory", str(compose["cwd"])])
+    if compose.get("project_name"):
+        command.extend(["--project-name", str(compose["project_name"])])
+    for env_file in compose.get("env_files") or []:
+        command.extend(["--env-file", str(env_file)])
+    for profile in compose.get("profiles") or []:
+        command.extend(["--profile", str(profile)])
     for file_name in compose.get("files") or []:
         command.extend(["-f", str(file_name)])
     return command
@@ -10617,7 +12578,11 @@ def require_compose_service_query(
                 },
             },
         )
-    return [line.strip() for line in str(result.get("stdout") or "").splitlines() if line.strip()]
+    return [
+        line.strip()
+        for line in str(result.get("stdout") or "").splitlines()
+        if line.strip()
+    ]
 
 
 def compose_restart_service_plan(
@@ -10667,7 +12632,10 @@ def compose_restart_service_plan(
                 (
                     item
                     for item in containers
-                    if str((item.get("labels") or {}).get("com.docker.compose.service") or "")
+                    if str(
+                        (item.get("labels") or {}).get("com.docker.compose.service")
+                        or ""
+                    )
                     == service
                 ),
                 None,
@@ -10729,9 +12697,7 @@ def preflight_project_docker(
         for dependency in mutable_runtime_docker_dependencies(
             spec, exclude_compose_owned=True
         ):
-            identity = str(
-                dependency.get("container") or dependency.get("name") or ""
-            )
+            identity = str(dependency.get("container") or dependency.get("name") or "")
             if not identity:
                 raise BrokerProfileError(
                     "declared Docker dependency has no exact broker enrollment identity"
@@ -10741,13 +12707,13 @@ def preflight_project_docker(
         compose_restart_plan = None
         if action == "restart" and compose_id is not None:
             # The broker owns the complete Compose definition. The later typed
-            # restart is one service-owned down/up sequence; the client does
+            # restart is one service-owned stop/up operation; the client does
             # not query Docker or select paths/services.
             compose_restart_plan = {
                 "restart_services": declared_services,
                 "start_services": [],
                 "declared_services": declared_services,
-                "all_services_action": "service_owned_down_up",
+                "all_services_action": "restart",
             }
         return {
             "required": True,
@@ -10765,7 +12731,9 @@ def preflight_project_docker(
         compose = spec.get("compose") or {}
         compose_restart_plan = None
         if action == "restart" and compose.get("declared") and compose.get("autostart"):
-            compose_restart_plan = compose_restart_service_plan(spec, allow_queries=False)
+            compose_restart_plan = compose_restart_service_plan(
+                spec, allow_queries=False
+            )
         return {
             "required": True,
             "capability": "docker_cli",
@@ -10812,7 +12780,10 @@ def preflight_project_docker(
 
 
 def project_action_error_from_exception(
-    exc: BaseException, *, name: str = "docker", fallback_classification: str = "unhealthy_process"
+    exc: BaseException,
+    *,
+    name: str = "docker",
+    fallback_classification: str = "unhealthy_process",
 ) -> dict[str, Any]:
     payload = coordinator_exception_payload(exc)
     classification = str(payload.get("classification") or fallback_classification)
@@ -10840,7 +12811,12 @@ def project_preflight_failure_report(
     result["ok"] = False
     result["classification"] = classification
     result["classifications"] = sorted(
-        set([classification, *[str(item) for item in before.get("classifications") or [] if item]])
+        set(
+            [
+                classification,
+                *[str(item) for item in before.get("classifications") or [] if item],
+            ]
+        )
     )
     result["before"] = copy.deepcopy(before)
     result["actions"] = []
@@ -10863,9 +12839,7 @@ def execute_project_start(
     action_errors: list[dict[str, Any]] = []
     compose = spec.get("compose")
     if compose and compose.get("autostart") and not skip_compose_lifecycle:
-        command = ["docker", "compose"]
-        for file_name in compose.get("files") or []:
-            command.extend(["-f", file_name])
+        command = ["docker", *compose_command_prefix(compose)]
         command.extend(["up", "-d"])
         command.extend(compose.get("services") or [])
         try:
@@ -10913,7 +12887,11 @@ def execute_project_start(
         if status.get("ok"):
             continue
         container_name = dep.get("container") or dep.get("name")
-        action = "restart" if status.get("classification") == "unhealthy_process" else "start"
+        action = (
+            "restart"
+            if status.get("classification") == "unhealthy_process"
+            else "start"
+        )
         try:
             actions.append(
                 coordinated_run_docker(
@@ -10960,7 +12938,10 @@ def execute_project_start(
     if action_errors:
         after["ok"] = False
         after["classifications"] = sorted(
-            set(after.get("classifications", []) + [item["classification"] for item in action_errors])
+            set(
+                after.get("classifications", [])
+                + [item["classification"] for item in action_errors]
+            )
         )
         after["classification"] = after["classifications"][0]
     return after
@@ -10983,7 +12964,9 @@ def coordinated_project_runtime_start(options: dict[str, Any]) -> dict[str, Any]
                     dry_run=bool(prepared.get("dry_run")),
                 )
             except StructuredCoordinatorError as exc:
-                result = project_preflight_failure_report(before, action="start", exc=exc)
+                result = project_preflight_failure_report(
+                    before, action="start", exc=exc
+                )
             else:
                 result = execute_project_start(prepared, spec, before)
                 result["preflight"] = preflight
@@ -11026,7 +13009,9 @@ def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, An
                     continue
                 try:
                     if dry_run:
-                        actions.append(planned_runtime_server_action(server_def, "stop"))
+                        actions.append(
+                            planned_runtime_server_action(server_def, "stop")
+                        )
                     else:
                         actions.append(
                             coordinated_stop_server(
@@ -11048,7 +13033,9 @@ def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, An
                             fallback_classification="unhealthy_process",
                         )
                     )
-            for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
+            for dep in mutable_runtime_docker_dependencies(
+                spec, exclude_compose_owned=True
+            ):
                 container_name = dep.get("container") or dep.get("name")
                 try:
                     actions.append(
@@ -11076,9 +13063,13 @@ def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, An
                 start_services = list(restart_plan.get("start_services") or [])
                 all_services_action = restart_plan.get("all_services_action")
                 if start_services:
-                    lifecycle_commands.append([*compose_prefix, "up", "-d", *start_services])
+                    lifecycle_commands.append(
+                        [*compose_prefix, "up", "-d", *start_services]
+                    )
                 if restart_services:
-                    lifecycle_commands.append([*compose_prefix, "restart", *restart_services])
+                    lifecycle_commands.append(
+                        [*compose_prefix, "restart", *restart_services]
+                    )
                 if all_services_action == "restart" and not lifecycle_commands:
                     lifecycle_commands.append([*compose_prefix, "restart"])
                 for command in lifecycle_commands:
@@ -11099,7 +13090,9 @@ def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, An
                                 name=str(compose.get("name") or "docker-compose"),
                             )
                         )
-            refreshed_spec, _unused = observe_project_runtime(prepared, action="restart-start")
+            refreshed_spec, _unused = observe_project_runtime(
+                prepared, action="restart-start"
+            )
             started = execute_project_start(
                 prepared,
                 refreshed_spec,
@@ -11115,8 +13108,15 @@ def coordinated_project_runtime_restart(options: dict[str, Any]) -> dict[str, An
                 started["ok"] = False
                 started["classifications"] = sorted(
                     set(
-                        [str(item) for item in started.get("classifications") or [] if item]
-                        + [str(item["classification"]) for item in started["action_errors"]]
+                        [
+                            str(item)
+                            for item in started.get("classifications") or []
+                            if item
+                        ]
+                        + [
+                            str(item["classification"])
+                            for item in started["action_errors"]
+                        ]
                     )
                 )
                 started["classification"] = started["classifications"][0]
@@ -11163,7 +13163,9 @@ def coordinated_project_runtime_stop(options: dict[str, Any]) -> dict[str, Any]:
                     continue
                 try:
                     if dry_run:
-                        actions.append(planned_runtime_server_action(server_def, "stop"))
+                        actions.append(
+                            planned_runtime_server_action(server_def, "stop")
+                        )
                     else:
                         actions.append(
                             coordinated_stop_server(
@@ -11184,9 +13186,13 @@ def coordinated_project_runtime_stop(options: dict[str, Any]) -> dict[str, Any]:
                             fallback_classification="unhealthy_process",
                         )
                     )
-            for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
+            for dep in mutable_runtime_docker_dependencies(
+                spec, exclude_compose_owned=True
+            ):
                 container_name = dep.get("container") or dep.get("name")
-                current = docker_dependency_status(dep, spec.get("docker", {}).get("containers", []))
+                current = docker_dependency_status(
+                    dep, spec.get("docker", {}).get("containers", [])
+                )
                 if current.get("status") == "missing" or is_stopped_container_status(
                     str(current.get("status") or "")
                 ):
@@ -11210,9 +13216,7 @@ def coordinated_project_runtime_stop(options: dict[str, Any]) -> dict[str, Any]:
                     )
             compose = spec.get("compose")
             if compose and compose.get("autostart"):
-                command = ["docker", "compose"]
-                for file_name in compose.get("files") or []:
-                    command.extend(["-f", file_name])
+                command = ["docker", *compose_command_prefix(compose)]
                 command.append("stop")
                 command.extend(compose.get("services") or [])
                 try:
@@ -11242,7 +13246,11 @@ def coordinated_project_runtime_stop(options: dict[str, Any]) -> dict[str, Any]:
             if action_errors:
                 after["classifications"] = sorted(
                     set(
-                        [str(item) for item in after.get("classifications") or [] if item]
+                        [
+                            str(item)
+                            for item in after.get("classifications") or []
+                            if item
+                        ]
                         + [str(item["classification"]) for item in action_errors]
                     )
                 )
@@ -11266,7 +13274,9 @@ def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, A
     if not server:
         if not options.get("project") or not options.get("name"):
             raise KeyError("server-id or project/name is required")
-        server_id, server = find_server(state, project=options["project"], name=options["name"])
+        server_id, server = find_server(
+            state, project=options["project"], name=options["name"]
+        )
     if not server:
         raise KeyError("matching server not found")
     health = server_health(server, attempts=HEALTH_RETRY_ATTEMPTS)
@@ -11281,7 +13291,9 @@ def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, A
         server["status"] = "running"
         server["updated_at"] = iso_timestamp()
     elif (health.get("identity") or {}).get("ok") is False:
-        mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
+        mark_server_stopped(
+            state, server, reason=stop_reason_from_health(server, health)
+        )
         if server.get("lease_id") and server["lease_id"] in state["leases"]:
             mark_lease_stale_released(
                 state,
@@ -11290,12 +13302,16 @@ def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, A
                 "linked server process belongs to a different project",
             )
     elif not health.get("pid_alive"):
-        mark_server_stopped(state, server, reason=stop_reason_from_health(server, health))
+        mark_server_stopped(
+            state, server, reason=stop_reason_from_health(server, health)
+        )
     else:
         # A live, correctly-owned server that fails its health check is only
         # "unhealthy" once it is past its startup grace window; before that it is
         # still "starting" so a slow boot does not read as a failure.
-        server["status"] = "starting" if health.get("classification") == "starting" else "unhealthy"
+        server["status"] = (
+            "starting" if health.get("classification") == "starting" else "unhealthy"
+        )
         server["updated_at"] = iso_timestamp()
     return server
 
@@ -11315,11 +13331,17 @@ def server_logs(state: dict[str, Any], options: dict[str, Any]) -> dict[str, Any
     if not server:
         if not options.get("project") or not options.get("name"):
             raise KeyError("server-id or project/name is required")
-        server_id, server = find_server(state, project=options["project"], name=options["name"])
+        server_id, server = find_server(
+            state, project=options["project"], name=options["name"]
+        )
     if not server:
         raise KeyError("matching server not found")
     log_path = Path(server.get("log_path") or "")
-    text = tail_text(log_path, int(options.get("tail") or 200)) if server.get("log_path") else ""
+    text = (
+        tail_text(log_path, int(options.get("tail") or 200))
+        if server.get("log_path")
+        else ""
+    )
     return {
         "server": {
             "id": server.get("id"),
@@ -11409,20 +13431,21 @@ def coordinated_broker_compose_command(
     compose_id = repository.compose_id()
     try:
         up_operation = BrokerOperation("compose.up")
+        stop_operation = BrokerOperation("compose.stop")
+        restart_operation = BrokerOperation("compose.restart")
         down_operation = BrokerOperation("compose.down")
     except ValueError as error:
         raise BrokerProfileError(
             "the installed coordinator broker does not support typed Compose lifecycle"
         ) from error
-    if subcommand in {"up", "create", "start", "unpause"}:
+    if subcommand in {"up", "start"}:
         sequence = [up_operation]
-    elif subcommand in {"down", "stop", "kill", "pause", "rm"}:
-        sequence = [down_operation]
+    elif subcommand == "stop":
+        sequence = [stop_operation]
     elif subcommand == "restart":
-        # The service owns the complete definition. A full down/up cycle is
-        # explicit and globally serialized; no client-selected services or
-        # file paths cross the trust boundary.
-        sequence = [down_operation, up_operation]
+        sequence = [restart_operation]
+    elif subcommand == "down":
+        sequence = [down_operation]
     else:
         raise BrokerProfileError(
             f"Compose mutation {subcommand!r} has no typed broker operation"
@@ -11547,7 +13570,11 @@ def record_docker_command(
             "cwd": cwd,
             "agent": agent,
             "project": project,
-            "agent_metadata": agent_metadata(agent=agent, project=project, cwd=cwd, source="docker_command") if agent and project else None,
+            "agent_metadata": agent_metadata(
+                agent=agent, project=project, cwd=cwd, source="docker_command"
+            )
+            if agent and project
+            else None,
             "command": command,
             "result": result,
         }
@@ -11681,11 +13708,24 @@ def run_docker(
     elif project:
         project = canonical_project(project)
     if dry_run:
-        result = {"dry_run": True, "command": command, "cwd": cwd, "agent": agent, "project": project}
+        result = {
+            "dry_run": True,
+            "command": command,
+            "cwd": cwd,
+            "agent": agent,
+            "project": project,
+        }
         if container and agent and project:
             result["metadata"] = register_docker_metadata(
                 state,
-                {"container": container, "agent": agent, "project": project, "cwd": cwd, "role": role, "dry_run": True},
+                {
+                    "container": container,
+                    "agent": agent,
+                    "project": project,
+                    "cwd": cwd,
+                    "role": role,
+                    "dry_run": True,
+                },
             )
         record_docker_command(state, command, cwd, result, project, agent)
         return result
@@ -11724,7 +13764,13 @@ def run_docker(
     if container and agent and project:
         result["metadata"] = register_docker_metadata(
             state,
-            {"container": container, "agent": agent, "project": project, "cwd": cwd, "role": role},
+            {
+                "container": container,
+                "agent": agent,
+                "project": project,
+                "cwd": cwd,
+                "role": role,
+            },
         )
     record_docker_command(state, command, cwd, result, project, agent)
     return result
@@ -11952,15 +13998,19 @@ def coordinated_run_docker(
     if completed.returncode == 0 and container and agent and project:
         try:
             result["metadata"] = coordinated_register_docker_metadata(
-                {"container": container, "agent": agent, "project": project, "cwd": cwd, "role": role}
+                {
+                    "container": container,
+                    "agent": agent,
+                    "project": project,
+                    "cwd": cwd,
+                    "role": role,
+                }
             )
         except Exception as exc:
             result["metadata_error"] = str(exc)
             if state_backend() == LEGACY_JSON_BACKEND:
                 with locked_state() as state:
-                    record_docker_command(
-                        state, command, cwd, result, project, agent
-                    )
+                    record_docker_command(state, command, cwd, result, project, agent)
                     if operation_id:
                         finish_operation(
                             state,
@@ -11984,9 +14034,7 @@ def coordinated_run_docker(
                     status="completed" if completed.returncode == 0 else "failed",
                     phase="committed",
                     error=(
-                        completed.stderr.strip()
-                        if completed.returncode != 0
-                        else None
+                        completed.stderr.strip() if completed.returncode != 0 else None
                     ),
                 )
     else:
@@ -12041,7 +14089,10 @@ def broker_authority_inventory(
     profile = configured_broker_profile()
     if profile is None:
         raise BrokerProfileError("server-wide broker authority is not configured")
-    result = profile.inventory()
+    if project is None:
+        result = profile.inventory()
+    else:
+        result = profile.inventory(canonical_root=canonical_project(project))
     if result.get("schema_version") != NORMALIZED_SCHEMA_VERSION:
         raise BrokerError(
             "invalid_reply", "Broker inventory omitted the normalized schema-v2 graph."
@@ -12068,19 +14119,27 @@ def broker_authority_inventory(
     return result
 
 
-def _validated_broker_lease_result(result: dict[str, Any]) -> tuple[str, int, str, str | None]:
+def _validated_broker_lease_result(
+    result: dict[str, Any],
+) -> tuple[str, int, str, str | None]:
     lease_id = str(result.get("lease_id") or "")
     if not lease_id:
         raise BrokerError("invalid_reply", "Broker lease result omitted lease_id.")
     try:
         port = int(result["port"])
     except (KeyError, TypeError, ValueError) as error:
-        raise BrokerError("invalid_reply", "Broker lease result omitted a valid port.") from error
+        raise BrokerError(
+            "invalid_reply", "Broker lease result omitted a valid port."
+        ) from error
     if not 1 <= port <= 65535 or result.get("status") != "active":
-        raise BrokerError("invalid_reply", "Broker lease result is not an active valid port.")
+        raise BrokerError(
+            "invalid_reply", "Broker lease result is not an active valid port."
+        )
     protocol = str(result.get("protocol") or "tcp")
     if protocol not in {"tcp", "udp"}:
-        raise BrokerError("invalid_reply", "Broker lease result has an invalid protocol.")
+        raise BrokerError(
+            "invalid_reply", "Broker lease result has an invalid protocol."
+        )
     expires_at = None if result.get("expires_at") is None else str(result["expires_at"])
     return lease_id, port, protocol, expires_at
 
@@ -12103,17 +14162,14 @@ def publish_broker_server(
     if stopped:
         lifecycle = "stopped"
         health_ok: bool | None = False
-        classification = str(
-            health.get("classification") or "stopped"
-        )
+        classification = str(health.get("classification") or "stopped")
     else:
         health_ok = health.get("ok")
         if health_ok is not None:
             health_ok = bool(health_ok)
         lifecycle = "running" if health_ok is True else "unhealthy"
         classification = str(
-            health.get("classification")
-            or ("healthy" if health_ok else "unhealthy")
+            health.get("classification") or ("healthy" if health_ok else "unhealthy")
         )
     arguments: dict[str, Any] = {
         "lease_id": broker_lease_id,
@@ -12286,7 +14342,8 @@ def _validated_broker_assignment_result(
         or result.get("status") != "active"
     ):
         raise BrokerError(
-            "invalid_reply", "Broker assignment result does not match the requested port."
+            "invalid_reply",
+            "Broker assignment result does not match the requested port.",
         )
     return assignment_id, port
 
@@ -12525,7 +14582,9 @@ def coordinated_release_port(options: dict[str, Any]) -> dict[str, Any]:
                     and item.get("status") == "active"
                 ]
                 if len(matches) != 1:
-                    raise KeyError(f"could not resolve one active lease for port {port}")
+                    raise KeyError(
+                        f"could not resolve one active lease for port {port}"
+                    )
                 lease_id = matches[0].get("id")
             lease = state.get("leases", {}).get(str(lease_id or ""))
             if lease is None:
@@ -12538,9 +14597,7 @@ def coordinated_release_port(options: dict[str, Any]) -> dict[str, Any]:
             leases = NormalizedPortLifecycle(store).list_leases(active_only=True)
         if options.get("lease_id"):
             matches = [
-                item
-                for item in leases
-                if str(item["id"]) == str(options["lease_id"])
+                item for item in leases if str(item["id"]) == str(options["lease_id"])
             ]
         elif options.get("port") is not None:
             matches = [
@@ -12757,9 +14814,7 @@ def coordinated_unassign_port(options: dict[str, Any]) -> dict[str, Any]:
             "another project's assignment"
         )
     name = str(matching["name"])
-    selector_name = (
-        str(options["name"]) if options.get("name") is not None else None
-    )
+    selector_name = str(options["name"]) if options.get("name") is not None else None
     broker_context = configured_broker_context(owner_project)
     broker_result = None
     link = None
@@ -12869,7 +14924,9 @@ def coordinated_relocate_port_assignment(options: dict[str, Any]) -> dict[str, A
             )
 
 
-def print_result(value: Any, *, as_json: bool = True, compact_json: bool = False) -> None:
+def print_result(
+    value: Any, *, as_json: bool = True, compact_json: bool = False
+) -> None:
     if as_json:
         if compact_json:
             print(json.dumps(value, separators=(",", ":"), sort_keys=True))
@@ -12880,7 +14937,9 @@ def print_result(value: Any, *, as_json: bool = True, compact_json: bool = False
 
 
 def add_common_json(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--json", action="store_true", default=True, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--json", action="store_true", default=True, help=argparse.SUPPRESS
+    )
 
 
 def parse_argv_json(raw: str) -> list[str]:
@@ -12888,8 +14947,14 @@ def parse_argv_json(raw: str) -> list[str]:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise argparse.ArgumentTypeError(f"--argv must be a JSON array: {exc}") from exc
-    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
-        raise argparse.ArgumentTypeError("--argv must be a non-empty JSON array of strings")
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) for item in value)
+    ):
+        raise argparse.ArgumentTypeError(
+            "--argv must be a non-empty JSON array of strings"
+        )
     return value
 
 
@@ -12897,7 +14962,9 @@ def parse_stats_history_limit(raw: str) -> int:
     try:
         value = int(raw)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("stats history limit must be an integer") from exc
+        raise argparse.ArgumentTypeError(
+            "stats history limit must be an integer"
+        ) from exc
     if not 0 <= value <= DOCKER_STATS_HISTORY_LIMIT:
         raise argparse.ArgumentTypeError(
             f"stats history limit must be between 0 and {DOCKER_STATS_HISTORY_LIMIT}"
@@ -12906,7 +14973,9 @@ def parse_stats_history_limit(raw: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Coordinate Codex dev ports, servers, and Docker.")
+    parser = argparse.ArgumentParser(
+        description="Coordinate Codex dev ports, servers, and Docker."
+    )
     sub = parser.add_subparsers(dest="group", required=True)
 
     inventory = sub.add_parser("inventory")
@@ -13057,7 +15126,9 @@ def build_parser() -> argparse.ArgumentParser:
         project_action = project_sub.add_parser(action_name)
         project_action.add_argument("--project", required=True)
         project_action.add_argument("--runtime-file")
-        project_action.add_argument("--agent", required=action_name in {"start", "restart", "stop"})
+        project_action.add_argument(
+            "--agent", required=action_name in {"start", "restart", "stop"}
+        )
         project_action.add_argument("--allow-port-change", action="store_true")
         project_action.add_argument("--dry-run", action="store_true")
 
@@ -13113,13 +15184,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def namespace_to_options(args: argparse.Namespace) -> dict[str, Any]:
-    return {key: value for key, value in vars(args).items() if key not in {"group", "action", "json"} and value is not None}
+    return {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"group", "action", "json"} and value is not None
+    }
 
 
 def handle_cli(args: argparse.Namespace) -> Any:
     if authority_mode() == "service":
-        allowed = args.group == "broker" or args.group == "inventory" or (
-            args.group == "state" and args.action == "show"
+        allowed = (
+            args.group == "broker"
+            or args.group == "inventory"
+            or (args.group == "state" and args.action == "show")
         )
         if not allowed:
             raise PermissionError(
@@ -13127,7 +15204,7 @@ def handle_cli(args: argparse.Namespace) -> Any:
                 "read-only inventory/state; it must never use client workload paths "
                 "to launch user-account processes"
             )
-    if args.group in {"repository", "resource"}:
+    if args.group in {"repository", "resource", "archives", "cleanup"}:
         return handle_lifecycle_cli(
             args,
             coordinator_home=coordinator_home(),
@@ -13159,6 +15236,12 @@ def handle_cli(args: argparse.Namespace) -> Any:
         )
     if args.group == "broker" and args.action == "enroll":
         return coordinated_broker_enroll(args)
+    if args.group == "broker" and args.action == "reconcile-compose":
+        return coordinated_broker_compose_reconcile(args)
+    if args.group == "broker" and args.action == "reconcile-docker":
+        return coordinated_broker_docker_reconcile(args)
+    if args.group == "broker" and args.action == "release-compose-project-name":
+        return coordinated_broker_compose_project_name_release(args)
     if args.group == "broker":
         return handle_broker_cli(args)
     if args.group == "observe":
@@ -13251,7 +15334,8 @@ def handle_cli(args: argparse.Namespace) -> Any:
         )
     if args.group == "docker" and args.action == "logs":
         return coordinated_run_docker(
-            ["docker", "logs", "--tail", str(args.tail), args.container], dry_run=args.dry_run
+            ["docker", "logs", "--tail", str(args.tail), args.container],
+            dry_run=args.dry_run,
         )
     if args.group == "docker" and args.action in {"start", "stop", "restart"}:
         return coordinated_run_docker(
@@ -13312,7 +15396,9 @@ def validate_api_bind_host(host: str) -> str:
     try:
         address = ipaddress.ip_address(candidate)
     except ValueError as exc:
-        raise ValueError("coordinator API host must be an explicit loopback address or localhost") from exc
+        raise ValueError(
+            "coordinator API host must be an explicit loopback address or localhost"
+        ) from exc
     if not address.is_loopback:
         raise ValueError("coordinator API refuses non-loopback bind addresses")
     if address.version != 4:
@@ -13340,7 +15426,9 @@ def linux_process_capability_sets(pid: int | str = "self") -> dict[str, int]:
                 if separator and key in labels:
                     values[labels[key]] = int(raw.strip(), 16)
     except OSError as exc:
-        raise RuntimeError(f"cannot inspect Linux capability sets for PID {pid}: {exc}") from exc
+        raise RuntimeError(
+            f"cannot inspect Linux capability sets for PID {pid}: {exc}"
+        ) from exc
     missing = sorted(set(labels.values()) - set(values))
     if missing:
         raise RuntimeError(f"Linux capability status omitted: {', '.join(missing)}")
@@ -13392,9 +15480,16 @@ def clear_exec_capability_inheritance() -> dict[str, Any]:
 
     after = linux_process_capability_sets()
     if after["inheritable"] or after["ambient"]:
-        raise RuntimeError("coordinator failed to clear inheritable/ambient capabilities")
-    if after["permitted"] != before["permitted"] or after["effective"] != before["effective"]:
-        raise RuntimeError("coordinator capability boundary unexpectedly changed observer capabilities")
+        raise RuntimeError(
+            "coordinator failed to clear inheritable/ambient capabilities"
+        )
+    if (
+        after["permitted"] != before["permitted"]
+        or after["effective"] != before["effective"]
+    ):
+        raise RuntimeError(
+            "coordinator capability boundary unexpectedly changed observer capabilities"
+        )
     return {
         "supported": True,
         "cleared": True,
@@ -13424,7 +15519,13 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = API_MAX_CONCURRENT_REQUESTS * 2
 
-    def __init__(self, server_address: tuple[str, int], handler: type[http.server.BaseHTTPRequestHandler], *, token: str):
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler: type[http.server.BaseHTTPRequestHandler],
+        *,
+        token: str,
+    ):
         self.api_token = token
         self._request_slots = threading.BoundedSemaphore(API_MAX_CONCURRENT_REQUESTS)
         super().__init__(server_address, handler)
@@ -13442,7 +15543,9 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
         self.server_name = str(host)
         self.server_port = int(port)
 
-    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+    def process_request(
+        self, request: socket.socket, client_address: tuple[str, int]
+    ) -> None:
         self._request_slots.acquire()
         try:
             super().process_request(request, client_address)
@@ -13450,11 +15553,409 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
             self._request_slots.release()
             raise
 
-    def process_request_thread(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+    def process_request_thread(
+        self, request: socket.socket, client_address: tuple[str, int]
+    ) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
             self._request_slots.release()
+
+
+def _cleanup_profile_repositories(profile: BrokerClientProfile) -> tuple[BrokerRepositoryProfile, ...]:
+    repositories = tuple(
+        profile.repository(item.canonical_root)
+        for item in sorted(
+            profile.repositories.values(), key=lambda item: item.canonical_root
+        )
+    )
+    if not repositories:
+        raise BrokerProfileError("archive lifecycle requires an enrolled repository")
+    return repositories
+
+
+def _cleanup_profile_target_repository(
+    profile: BrokerClientProfile, *, target_kind: str, target_id: str
+) -> BrokerRepositoryProfile:
+    canonical_kind = "project" if target_kind == "repository" else target_kind
+    matches: list[BrokerRepositoryProfile] = []
+    for repository in _cleanup_profile_repositories(profile):
+        if canonical_kind in {"project", "worktree"} and repository.repo_id == target_id:
+            matches.append(repository)
+        elif canonical_kind == "server" and target_id in set(repository.server_ids.values()):
+            matches.append(repository)
+        elif canonical_kind == "container" and target_id in set(repository.container_ids.values()):
+            matches.append(repository)
+    if len(matches) != 1:
+        raise BrokerProfileError(
+            "archive target is not uniquely enrolled; rerun root Coordinator enrollment"
+        )
+    return matches[0]
+
+
+def coordinated_list_archives() -> dict[str, Any]:
+    profile = configured_broker_profile()
+    if profile is not None:
+        archives: dict[tuple[str, str], dict[str, Any]] = {}
+        for repository in _cleanup_profile_repositories(profile):
+            _operation_id, result = profile.call(
+                repository=repository,
+                resource_id=repository.repo_id,
+                operation=BrokerOperation.ARCHIVES_READ,
+                arguments={},
+            )
+            rows = result.get("archives")
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise RuntimeError("host broker returned an invalid archive listing")
+            for row in rows:
+                project_id = str(row.get("project_id") or row.get("target_id") or "")
+                if project_id != repository.repo_id:
+                    raise RuntimeError("host broker archive escaped enrolled repository authority")
+                archives[(str(row.get("target_kind")), str(row.get("target_id")))] = dict(row)
+        return {
+            "archives": sorted(
+                archives.values(),
+                key=lambda item: (
+                    str(item.get("archived_at") or ""),
+                    str(item.get("display_name") or "").lower(),
+                ),
+                reverse=True,
+            )
+        }
+    if authority_mode() == "service":
+        raise PermissionError(
+            "server-wide archive reads require an authenticated broker profile"
+        )
+    with AccountStore.open_default(coordinator_home()) as store:
+        return CleanupLifecycle(store).list_archives(actor="http-api")
+
+
+def _common_archive_plan_payload(
+    plan: RepositoryDecommissionPlan | StandaloneRetirementPlan,
+    target: Mapping[str, Any],
+) -> dict[str, Any]:
+    target_kind = "project" if isinstance(plan, RepositoryDecommissionPlan) else plan.target.kind.value
+    effects = (
+        [
+            "fence_project_startup",
+            "disable_captured_startup_policies",
+            "stop_exact_project_resources",
+            "deactivate_port_allocations",
+            "hide_from_active_inventory",
+        ]
+        if target_kind == "project"
+        else [
+            "disable_captured_startup_policies",
+            "stop_exact_resource",
+            "deactivate_port_allocations",
+            "hide_from_active_inventory",
+        ]
+    )
+    return {
+        **plan.to_dict(),
+        "plan_fingerprint": plan.fingerprint,
+        "action": "archive",
+        "confirmation_phrase": "",
+        "target": dict(target),
+        "target_kind": target_kind,
+        "target_id": str(target["target_id"]),
+        "effects": effects,
+        "retained": list(plan.to_dict().get("retained_data") or []),
+        "deleted": [],
+        "blockers": [],
+        "status": "planned",
+    }
+
+
+def _direct_archive_plan(
+    store: AccountStore,
+    *,
+    target_kind: str,
+    target_id: str,
+    actor: str,
+    reason: str,
+) -> dict[str, Any]:
+    persistence = SQLiteLifecyclePersistence(store)
+    lifecycle = RepositoryLifecycle(persistence, CoordinatorHostLifecycleAdapter())
+    if target_kind == "project":
+        plan = lifecycle.plan_repository_decommission(
+            target_id, actor=actor, reason=reason
+        )
+        with store.read_transaction() as connection:
+            row = connection.execute(
+                "SELECT display_name FROM repositories WHERE repo_id = ?", (target_id,)
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("archive target disappeared during planning")
+        target = {
+            "target_kind": "project",
+            "target_id": target_id,
+            "display_name": str(row["display_name"]),
+            "project_id": target_id,
+        }
+        return _common_archive_plan_payload(plan, target)
+    if target_kind not in {"server", "container"}:
+        raise ValueError("archive target_kind must be project, server, or container")
+    with store.read_transaction() as connection:
+        binding = connection.execute(
+            """
+            SELECT binding_id FROM control_bindings
+            WHERE resource_kind = ? AND resource_id = ?
+              AND authority_state = 'authoritative'
+            ORDER BY priority DESC, binding_id LIMIT 1
+            """,
+            (target_kind, target_id),
+        ).fetchone()
+    if binding is None:
+        raise RuntimeError("archive target has no authoritative exact controller")
+    exact, repo_id = persistence.resolve_resource(
+        ResourceKind(target_kind), target_id, str(binding["binding_id"])
+    )
+    plan = lifecycle.plan_resource_archive(
+        exact, actor=actor, reason=reason, repo_id=repo_id
+    )
+    return _common_archive_plan_payload(plan, persistence.describe_resource(exact, repo_id))
+
+
+def _direct_cleanup_target_project_root(
+    store: AccountStore, *, target_kind: str, target_id: str
+) -> str:
+    with store.read_transaction() as connection:
+        if target_kind in {"project", "worktree"}:
+            row = connection.execute(
+                "SELECT canonical_root FROM repositories WHERE repo_id = ?",
+                (target_id,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT r.canonical_root
+                FROM repository_memberships m
+                JOIN repositories r ON r.repo_id = m.repo_id
+                WHERE m.resource_kind = ? AND m.host_resource_id = ?
+                """,
+                (target_kind, target_id),
+            ).fetchone()
+    if row is None:
+        raise RuntimeError("cleanup target has no local project observation boundary")
+    return str(row["canonical_root"])
+
+
+def _direct_cleanup_plan_project_root(store: AccountStore, *, plan_id: str) -> str:
+    with store.read_transaction() as connection:
+        row = connection.execute(
+            """
+            SELECT r.canonical_root
+            FROM operations o JOIN repositories r ON r.repo_id = o.repo_id
+            WHERE o.operation_id = ?
+            """,
+            (plan_id,),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("cleanup plan has no local project observation boundary")
+    return str(row["canonical_root"])
+
+
+def _direct_cleanup_observe(store: AccountStore, *, project: str) -> dict[str, Any]:
+    return require_fresh_lifecycle_observation(
+        store,
+        lambda observed_project, observed_agent: coordinated_observe_host(
+            {
+                "project": observed_project,
+                "agent": observed_agent,
+                "max_age_seconds": 0,
+            }
+        ),
+        project=project,
+        agent="http-api",
+    )
+
+
+def coordinated_lifecycle_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"action", "target_kind", "target_id", "reason"}
+    if set(payload) != required:
+        raise ValueError("lifecycle plan requires exactly action, target_kind, target_id, and reason")
+    action = str(payload["action"])
+    target_kind = "project" if payload["target_kind"] == "repository" else str(payload["target_kind"])
+    target_id = str(payload["target_id"])
+    if action not in {"archive", "purge"}:
+        raise ValueError("lifecycle plan action must be archive or purge")
+    if action == "archive" and target_kind == "worktree":
+        raise ValueError("linked worktrees can be purged only after their project is archived")
+    reason = str(payload["reason"])
+    profile = configured_broker_profile()
+    if profile is not None:
+        repository = _cleanup_profile_target_repository(
+            profile, target_kind=target_kind, target_id=target_id
+        )
+        _operation_id, result = profile.call(
+            repository=repository,
+            resource_id=target_id,
+            operation=BrokerOperation.CLEANUP_PLAN,
+            arguments={
+                "action": action,
+                "target_kind": target_kind,
+                "target_id": target_id,
+                "reason": reason,
+            },
+        )
+        return result
+    if authority_mode() == "service":
+        raise PermissionError(
+            "server-wide cleanup planning requires an authenticated broker profile"
+        )
+    with AccountStore.open_default(coordinator_home()) as store:
+        project_root = _direct_cleanup_target_project_root(
+            store, target_kind=target_kind, target_id=target_id
+        )
+        observation = _direct_cleanup_observe(store, project=project_root)
+        if action == "purge":
+            result = CleanupLifecycle(store).plan(
+                target_kind=target_kind,
+                target_id=target_id,
+                actor="http-api",
+                reason=reason,
+            ).to_dict()
+        else:
+            result = _direct_archive_plan(
+                store,
+                target_kind=target_kind,
+                target_id=target_id,
+                actor="http-api",
+                reason=reason,
+            )
+        result["broker_observation"] = observation
+        return result
+
+
+def coordinated_lifecycle_apply(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"plan_id", "plan_fingerprint", "confirmation_phrase"}
+    if set(payload) != required:
+        raise ValueError(
+            "lifecycle apply requires exactly plan_id, plan_fingerprint, and confirmation_phrase"
+        )
+    profile = configured_broker_profile()
+    if profile is not None:
+        repository = _cleanup_profile_repositories(profile)[0]
+        _operation_id, result = profile.call(
+            repository=repository,
+            resource_id=repository.repo_id,
+            operation=BrokerOperation.CLEANUP_APPLY,
+            arguments={key: str(payload[key]) for key in required},
+        )
+        return result
+    if authority_mode() == "service":
+        raise PermissionError(
+            "server-wide cleanup apply requires an authenticated broker profile"
+        )
+    with AccountStore.open_default(coordinator_home()) as store:
+        plan_id = str(payload["plan_id"])
+        plan_fingerprint = str(payload["plan_fingerprint"])
+        confirmation_phrase = str(payload["confirmation_phrase"])
+        project_root = _direct_cleanup_plan_project_root(store, plan_id=plan_id)
+        observation = _direct_cleanup_observe(store, project=project_root)
+        with store.read_transaction() as connection:
+            cleanup_row = connection.execute(
+                "SELECT 1 FROM cleanup_plans WHERE plan_id = ?", (plan_id,)
+            ).fetchone()
+        if cleanup_row is not None:
+            result = CleanupLifecycle(store).apply(
+                plan_id=plan_id,
+                plan_fingerprint=plan_fingerprint,
+                confirmation_phrase=confirmation_phrase,
+                actor="http-api",
+            )
+        else:
+            if confirmation_phrase:
+                raise ValueError("archive apply requires an empty confirmation phrase")
+            persistence = SQLiteLifecyclePersistence(store)
+            plan = persistence.load_plan(plan_id)
+            lifecycle = RepositoryLifecycle(
+                persistence, CoordinatorHostLifecycleAdapter()
+            )
+            if isinstance(plan, RepositoryDecommissionPlan):
+                result = lifecycle.apply_repository_decommission(
+                    plan_id, plan_fingerprint, actor="http-api"
+                ).to_dict()
+            elif isinstance(plan, StandaloneRetirementPlan) and plan.repo_id is not None:
+                result = lifecycle.apply_standalone_retirement(
+                    plan_id, plan_fingerprint, actor="http-api"
+                ).to_dict()
+            else:
+                raise ValueError("plan is not an HTTP archive or purge plan")
+            result.update(
+                {
+                    "action": "archive",
+                    "partial": result.get("status") == "needs_attention",
+                    "needs_attention": result.get("status") == "needs_attention",
+                    "ok": result.get("status") in {"succeeded", "already_complete"},
+                }
+            )
+        result["pre_apply_observation"] = observation
+        return result
+
+
+def coordinated_lifecycle_restore(payload: Mapping[str, Any]) -> dict[str, Any]:
+    required = {"target_kind", "target_id", "reason"}
+    if set(payload) != required:
+        raise ValueError("lifecycle restore requires exactly target_kind, target_id, and reason")
+    target_kind = "project" if payload["target_kind"] == "repository" else str(payload["target_kind"])
+    target_id = str(payload["target_id"])
+    reason = str(payload["reason"])
+    if target_kind not in {"project", "server", "container"}:
+        raise ValueError("restore target_kind must be project, server, or container")
+    profile = configured_broker_profile()
+    if profile is not None:
+        repository = _cleanup_profile_target_repository(
+            profile, target_kind=target_kind, target_id=target_id
+        )
+        _operation_id, result = profile.call(
+            repository=repository,
+            resource_id=target_id,
+            operation=BrokerOperation.LIFECYCLE_RESTORE,
+            arguments={
+                "target_kind": target_kind,
+                "target_id": target_id,
+                "reason": reason,
+            },
+        )
+        return result
+    if authority_mode() == "service":
+        raise PermissionError(
+            "server-wide restore requires an authenticated broker profile"
+        )
+    with AccountStore.open_default(coordinator_home()) as store:
+        persistence = SQLiteLifecyclePersistence(store)
+        lifecycle = RepositoryLifecycle(
+            persistence, CoordinatorHostLifecycleAdapter()
+        )
+        if target_kind == "project":
+            return lifecycle.reinstall_repository(
+                target_id,
+                actor="http-api",
+                reason=reason,
+                explicit=True,
+            ).to_dict()
+        with store.read_transaction() as connection:
+            binding = connection.execute(
+                """
+                SELECT binding_id FROM control_bindings
+                WHERE resource_kind = ? AND resource_id = ?
+                  AND authority_state = 'authoritative'
+                ORDER BY priority DESC, binding_id LIMIT 1
+                """,
+                (target_kind, target_id),
+            ).fetchone()
+        if binding is None:
+            raise RuntimeError("archived resource has no authoritative exact controller")
+        exact, _repo_id = persistence.resolve_resource(
+            ResourceKind(target_kind), target_id, str(binding["binding_id"]), include_archived=True
+        )
+        return dict(
+            lifecycle.restore_resource_archive(
+                exact, actor="http-api", reason=reason
+            )
+        )
 
 
 API_GET_ROUTES = frozenset(
@@ -13465,6 +15966,8 @@ API_GET_ROUTES = frozenset(
         "/v1/ports",
         "/v1/ports/assignments",
         "/v1/servers",
+        "/v1/archives",
+        "/v1/events",
     }
 )
 API_POST_ROUTES = frozenset(
@@ -13493,6 +15996,10 @@ API_POST_ROUTES = frozenset(
         "/v1/ports/assign",
         "/v1/ports/unassign",
         "/v1/ports/relocate",
+        "/v1/lifecycle/plan",
+        "/v1/lifecycle/apply",
+        "/v1/lifecycle/restore",
+        "/v1/observe",
     }
 )
 
@@ -13522,10 +16029,41 @@ def parse_registration_inventory_query(raw_query: str) -> dict[str, Any] | None:
     try:
         port = int(values["port"][0])
     except ValueError as exc:
-        raise ValueError("registration inventory query port must be an integer") from exc
+        raise ValueError(
+            "registration inventory query port must be an integer"
+        ) from exc
     if not 1 <= port <= 65535:
-        raise ValueError("registration inventory query port must be between 1 and 65535")
+        raise ValueError(
+            "registration inventory query port must be between 1 and 65535"
+        )
     return {"project": project, "name": name, "port": port}
+
+
+def parse_event_query(raw_query: str) -> dict[str, Any]:
+    if not raw_query:
+        return {"after": None, "limit": DEFAULT_EVENT_PAGE_SIZE}
+    values = parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=True,
+        max_num_fields=2,
+    )
+    if not set(values) <= {"after", "limit"} or any(
+        len(items) != 1 for items in values.values()
+    ):
+        raise ValueError("event query accepts one after cursor and one limit")
+    after = values.get("after", [None])[0]
+    if after == "":
+        raise ValueError("event after cursor must not be empty")
+    raw_limit = values.get("limit", [str(DEFAULT_EVENT_PAGE_SIZE)])[0]
+    if not raw_limit.isdigit():
+        raise ValueError("event page limit must be an integer")
+    limit = int(raw_limit)
+    if not 1 <= limit <= MAX_EVENT_PAGE_SIZE:
+        raise ValueError(
+            f"event page limit must be an integer from 1 through {MAX_EVENT_PAGE_SIZE}"
+        )
+    return {"after": after, "limit": limit}
 
 
 class ApiHandler(http.server.BaseHTTPRequestHandler):
@@ -13535,7 +16073,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(API_REQUEST_TIMEOUT_SECONDS)
 
-    def _send(self, status: int, payload: Any, *, headers: dict[str, str] | None = None) -> None:
+    def _send(
+        self, status: int, payload: Any, *, headers: dict[str, str] | None = None
+    ) -> None:
         body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -13553,12 +16093,16 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _method_not_allowed(self, allowed: tuple[str, ...]) -> None:
-        self._send(405, {"error": "method not allowed"}, headers={"Allow": ", ".join(allowed)})
+        self._send(
+            405, {"error": "method not allowed"}, headers={"Allow": ", ".join(allowed)}
+        )
 
     def _read_json(self) -> dict[str, Any]:
         if self.headers.get("Transfer-Encoding"):
             raise ValueError("transfer encoding is not supported")
-        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        content_type = (
+            (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        )
         if content_type != "application/json":
             raise TypeError("POST requests require Content-Type: application/json")
         raw_length = self.headers.get("Content-Length")
@@ -13588,7 +16132,11 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             parsed = urlparse(origin)
             server_port = int(self.server.server_address[1])
             origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            if parsed.scheme not in {"http", "https"} or not loopback_hostname(parsed.hostname) or origin_port != server_port:
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not loopback_hostname(parsed.hostname)
+                or origin_port != server_port
+            ):
                 self._send(403, {"error": "cross-origin requests are forbidden"})
                 return False
         return True
@@ -13597,7 +16145,11 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         header = self.headers.get("Authorization") or ""
         scheme, _, supplied = header.partition(" ")
         expected = str(getattr(self.server, "api_token", ""))
-        return scheme.lower() == "bearer" and bool(supplied) and hmac.compare_digest(supplied, expected)
+        return (
+            scheme.lower() == "bearer"
+            and bool(supplied)
+            and hmac.compare_digest(supplied, expected)
+        )
 
     def _require_authorization(self) -> bool:
         if self._authorized():
@@ -13612,6 +16164,10 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         try:
             if path == "/v1/inventory":
                 result: Any = coordinated_build_inventory()
+            elif path == "/v1/archives":
+                result = coordinated_list_archives()
+            elif path == "/v1/events":
+                result = coordinated_list_events(**parse_event_query(raw_query))
             elif path == "/v1/inventory/no-docker":
                 target = parse_registration_inventory_query(raw_query)
                 # An ordinary no-Docker inventory remains a pure committed
@@ -13624,7 +16180,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     if target is None
                     else coordinated_build_registration_inventory(**target)
                 )
-            elif path in {"/v1/state", "/v1/ports", "/v1/ports/assignments", "/v1/servers"}:
+            elif path in {
+                "/v1/state",
+                "/v1/ports",
+                "/v1/ports/assignments",
+                "/v1/servers",
+            }:
                 if state_backend() == LEGACY_JSON_BACKEND:
                     snapshot = snapshot_coordinator_state()
                     if path == "/v1/state":
@@ -13673,6 +16234,35 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     def _handle_post(self, path: str) -> None:
         try:
             payload = self._read_json()
+            if path == "/v1/observe":
+                if set(payload) != {"agent", "project"}:
+                    raise ValueError(
+                        "host observation accepts exactly agent and project"
+                    )
+                self._send(
+                    200,
+                    coordinated_observe_host(
+                        {
+                            "agent": payload["agent"],
+                            "project": payload["project"],
+                            "max_age_seconds": 0,
+                            "no_docker": False,
+                            "backup_dir": None,
+                            "legacy_home": [],
+                            "legacy_backup_root": None,
+                        }
+                    ),
+                )
+                return
+            if path == "/v1/lifecycle/plan":
+                self._send(200, coordinated_lifecycle_plan(payload))
+                return
+            if path == "/v1/lifecycle/apply":
+                self._send(200, coordinated_lifecycle_apply(payload))
+                return
+            if path == "/v1/lifecycle/restore":
+                self._send(200, coordinated_lifecycle_restore(payload))
+                return
             if path == "/v1/servers/start":
                 self._send(200, coordinated_start_server(payload))
                 return
@@ -13704,7 +16294,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(200, coordinated_project_runtime_stop(payload))
                 return
             if path == "/v1/docker/stats":
-                self._send(200, coordinated_sample_docker_stats(dry_run=bool(payload.get("dry_run"))))
+                self._send(
+                    200,
+                    coordinated_sample_docker_stats(
+                        dry_run=bool(payload.get("dry_run"))
+                    ),
+                )
                 return
             if path == "/v1/docker/register":
                 self._send(200, coordinated_register_docker_metadata(payload))
@@ -13713,7 +16308,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 command = ["docker", "ps"]
                 if payload.get("all"):
                     command.append("--all")
-                self._send(200, coordinated_run_docker(command, dry_run=bool(payload.get("dry_run"))))
+                self._send(
+                    200,
+                    coordinated_run_docker(
+                        command, dry_run=bool(payload.get("dry_run"))
+                    ),
+                )
                 return
             if path in {"/v1/docker/compose-up", "/v1/docker/compose-down"}:
                 command = ["docker", "compose"]
@@ -13737,7 +16337,13 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(
                     200,
                     coordinated_run_docker(
-                        ["docker", "logs", "--tail", str(payload.get("tail") or "80"), payload["container"]],
+                        [
+                            "docker",
+                            "logs",
+                            "--tail",
+                            str(payload.get("tail") or "80"),
+                            payload["container"],
+                        ],
                         dry_run=bool(payload.get("dry_run")),
                     ),
                 )
@@ -13768,7 +16374,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             elif path in {"/v1/ports/assign", "/v1/ports/unassign"}:
                 assignment_agent = str(payload.get("agent") or "").strip()
                 if not assignment_agent:
-                    raise ValueError("port assignment mutation requires agent attribution")
+                    raise ValueError(
+                        "port assignment mutation requires agent attribution"
+                    )
                 payload["agent"] = assignment_agent
                 if path == "/v1/ports/assign":
                     # The guarded public helper must be the first repository
@@ -13798,7 +16406,14 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         path = parsed_request.path
         if path == "/healthz":
             if method in {"GET", "HEAD"}:
-                self._send(200, {"ok": True, "service": "codex-dev-coordinator", "version": VERSION})
+                self._send(
+                    200,
+                    {
+                        "ok": True,
+                        "service": "codex-dev-coordinator",
+                        "version": VERSION,
+                    },
+                )
             else:
                 self._method_not_allowed(("GET", "HEAD"))
             return
@@ -13861,12 +16476,21 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
 def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
     clear_exec_capability_inheritance()
     host = validate_api_bind_host(host)
-    token_path = Path(token_file).expanduser().absolute() if token_file else api_token_path()
+    token_path = (
+        Path(token_file).expanduser().absolute() if token_file else api_token_path()
+    )
     token = load_or_create_api_token(token_path)
     server = BoundedThreadingHTTPServer((host, port), ApiHandler, token=token)
     actual_port = int(server.server_address[1])
     print(
-        json.dumps({"host": host, "port": actual_port, "url": f"http://{host}:{actual_port}", "token_file": str(token_path)}),
+        json.dumps(
+            {
+                "host": host,
+                "port": actual_port,
+                "url": f"http://{host}:{actual_port}",
+                "token_file": str(token_path),
+            }
+        ),
         flush=True,
     )
     try:
@@ -13883,7 +16507,12 @@ def main(argv: list[str] | None = None) -> int:
             serve_api(args.host, args.port, token_file=args.token_file)
             return 0
         except Exception as exc:
-            print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)
+            print(
+                json.dumps(
+                    coordinator_exception_payload(exc), indent=2, sort_keys=True
+                ),
+                file=sys.stderr,
+            )
             return 1
     if args.group == "broker" and args.action == "serve":
         try:
@@ -13894,13 +16523,23 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         except Exception as exc:
-            print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)
+            print(
+                json.dumps(
+                    coordinator_exception_payload(exc), indent=2, sort_keys=True
+                ),
+                file=sys.stderr,
+            )
             return 1
     try:
-        print_result(handle_cli(args), compact_json=bool(getattr(args, "compact_json", False)))
+        print_result(
+            handle_cli(args), compact_json=bool(getattr(args, "compact_json", False))
+        )
         return 0
     except Exception as exc:
-        print(json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps(coordinator_exception_payload(exc), indent=2, sort_keys=True),
+            file=sys.stderr,
+        )
         return 1
 
 

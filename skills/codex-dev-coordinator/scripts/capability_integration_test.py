@@ -27,6 +27,26 @@ SCRIPT = Path(__file__).with_name("dev_coordinator.py").resolve()
 CAPABILITY = "net_bind_service"
 
 
+def canonical_test_temp_base() -> Path:
+    """Return a writable canonical base outside any host/user Git marker."""
+
+    candidates = (
+        os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT"),
+        pwd.getpwuid(os.geteuid()).pw_dir,
+        tempfile.gettempdir(),
+    )
+    for raw in dict.fromkeys(value for value in candidates if value):
+        base = Path(str(raw)).resolve()
+        if not base.is_dir() or not os.access(base, os.W_OK | os.X_OK):
+            continue
+        cursor = base
+        while not ((cursor / ".git").exists() or (cursor / ".git").is_symlink()):
+            if cursor.parent == cursor:
+                return base
+            cursor = cursor.parent
+    raise RuntimeError("no writable test temp root exists outside every Git worktree")
+
+
 class FastHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -628,7 +648,10 @@ def run_normalized_relocation_preflight() -> int:
     """Exercise the platform-neutral half of the Linux cutover fixture."""
 
     root = Path(
-        tempfile.mkdtemp(prefix="coordinator-relocation-preflight-")
+        tempfile.mkdtemp(
+            prefix="coordinator-relocation-preflight-",
+            dir=canonical_test_temp_base(),
+        )
     ).resolve(strict=True)
     old_project = root / "legacy"
     new_project = root / "DevCoordinator"
@@ -725,7 +748,12 @@ def run_integration() -> int:
     )
     host_default_bounding = int(current_capability_sets()["CapBnd"], 16)
 
-    root = Path(tempfile.mkdtemp(prefix="coordinator-capability-integration-")).resolve(strict=True)
+    root = Path(
+        tempfile.mkdtemp(
+            prefix="coordinator-capability-integration-",
+            dir=canonical_test_temp_base(),
+        )
+    ).resolve(strict=True)
     old_project = root / "legacy"
     project = root / "DevCoordinator"
     for repository in (old_project, project):

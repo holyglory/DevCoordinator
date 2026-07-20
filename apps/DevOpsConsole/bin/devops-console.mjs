@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { loadConfig } from '../src/config.mjs';
 import { createLogger } from '../src/log.mjs';
+import { createProcessLifecycle, runCleanupSteps } from '../src/process-lifecycle.mjs';
 import { createCertManager } from '../src/certs.mjs';
 import { startServers } from '../src/server.mjs';
 import { createRouter } from '../src/router.mjs';
@@ -27,6 +28,7 @@ import { createUpstreamAuthStore } from '../src/upstream-auth.mjs';
 import { createAccessStore } from '../src/access.mjs';
 import { createConsoleApi } from '../src/api.mjs';
 import { createStaticServer } from '../src/static.mjs';
+import { createTelegramService } from '../src/telegram.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -193,6 +195,26 @@ function buildProxy({ log, pages, config }) {
   });
 }
 
+function buildTelegram({ config, log, coordinator, accessStore }) {
+  return createTelegramService({
+    file: path.join(config.stateDir, 'telegram-control.json'),
+    log,
+    isAdmin: (email) => accessStore.isAdmin(email),
+    coordinator: {
+      async hasProject(repoId) {
+        const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+        return Array.isArray(inventory?.repositories)
+          && inventory.repositories.some((repository) => repository?.repo_id === repoId);
+      },
+      observeHost: () => coordinator.observeHost({
+        agent: 'devops-console:telegram',
+        project: config.projectRoot,
+      }),
+      readEvents: ({ after, limit }) => coordinator.events({ after, limit }),
+    },
+  });
+}
+
 /**
  * Boot the whole console in-process (test harness / embedding entry point).
  * Unlike main(): no signal handlers, no process.exit, no self-registration,
@@ -248,6 +270,8 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
   });
   await accessStore.load();
   const guard = createGuard({ sessions, access: accessStore, config, log });
+  const telegram = buildTelegram({ config, log, coordinator, accessStore });
+  await telegram.load();
 
   // Listen first (router attaches afterwards) so OS-assigned ports are known
   // before any consoleOrigin-derived value is captured.
@@ -294,7 +318,7 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
   });
   const prefs = createPrefsStore({ file: path.join(config.stateDir, 'ui-prefs.json'), log });
   const consoleApi = createConsoleApi({
-    config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
+    config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram,
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
   const proxy = buildProxy({ log, pages, config });
@@ -309,16 +333,19 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     consoleApi,
     staticServer,
     routeStore,
+    accessStore,
     upstreamAuthStore,
     coordinator,
     proxy,
   });
+  await telegram.start();
 
   let closed = false;
   async function close() {
     if (closed) return;
     closed = true;
     metrics.stop();
+    await telegram.stop();
     await servers.close();
     try {
       proxy.close();
@@ -346,9 +373,12 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     routeStore,
     upstreamAuthStore,
     accessStore,
+    telegram,
     close,
   };
 }
+
+let directRunLifecycle = null;
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -372,6 +402,26 @@ async function main() {
   }
 
   const log = createLogger(config.logLevel);
+  let certManager = null;
+  let coordinator = null;
+  let metrics = null;
+  let telegram = null;
+  let proxy = null;
+  let servers = null;
+  const lifecycle = createProcessLifecycle({
+    log,
+    cleanup: () => runCleanupSteps([
+      { name: 'metrics', run: () => metrics?.stop() },
+      { name: 'telegram', run: () => telegram?.stop() },
+      { name: 'listeners', run: () => servers?.close() },
+      { name: 'proxy', run: () => proxy?.close() },
+      { name: 'certificate-manager', run: () => certManager?.close() },
+      { name: 'coordinator-client', run: () => coordinator?.close() },
+    ]),
+  });
+  directRunLifecycle = lifecycle;
+  lifecycle.install();
+
   log.info('devops-console starting', {
     version: config.version,
     domain: config.domain,
@@ -380,7 +430,7 @@ async function main() {
   });
 
   // TLS (skipped entirely in DEV_HTTP mode — single plain listener).
-  const certManager = config.devInsecureHttp
+  certManager = config.devInsecureHttp
     ? null
     : await createCertManager({ certFile: config.tlsCertFile, keyFile: config.tlsKeyFile, log });
 
@@ -403,7 +453,7 @@ async function main() {
   const pages = createPages({ config });
 
   // Control engine.
-  const coordinator = createCoordinator({ config, log });
+  coordinator = createCoordinator({ config, log });
   try {
     const result = await coordinator.ensureRunning();
     log.info('coordinator', { ok: result.ok, autostarted: result.autostarted, error: result.error });
@@ -412,7 +462,7 @@ async function main() {
     log.warn('coordinator unavailable at boot', { error: err?.message || String(err) });
   }
 
-  const metrics = createMetricsStore({ config, log, coordinator });
+  metrics = createMetricsStore({ config, log, coordinator });
   metrics.start();
 
   const routeStore = createRouteStore({ file: path.join(config.stateDir, 'routes.json'), config, log });
@@ -430,14 +480,16 @@ async function main() {
   });
   await accessStore.load();
   const guard = createGuard({ sessions, access: accessStore, config, log });
+  telegram = buildTelegram({ config, log, coordinator, accessStore });
+  await telegram.load();
 
   const prefs = createPrefsStore({ file: path.join(config.stateDir, 'ui-prefs.json'), log });
   const consoleApi = createConsoleApi({
-    config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
+    config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs, telegram,
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
 
-  const proxy = buildProxy({ log, pages, config });
+  proxy = buildProxy({ log, pages, config });
 
   const router = createRouter({
     config,
@@ -449,12 +501,14 @@ async function main() {
     consoleApi,
     staticServer,
     routeStore,
+    accessStore,
     upstreamAuthStore,
     coordinator,
     proxy,
   });
 
-  const servers = await startServers({ config, log, certManager, router });
+  servers = await startServers({ config, log, certManager, router });
+  await telegram.start();
 
   const scheme = config.devInsecureHttp ? 'http' : 'https';
   const publicPort = config.devInsecureHttp ? config.httpPort : config.httpsPort;
@@ -474,48 +528,6 @@ async function main() {
     }
   });
 
-  let shuttingDown = false;
-  const shutdown = async (signal) => {
-    if (shuttingDown) {
-      log.warn('forced exit', { signal });
-      process.exit(1);
-    }
-    shuttingDown = true;
-    log.info('shutting down', { signal });
-    metrics.stop();
-    try {
-      await servers.close();
-    } catch (err) {
-      log.warn('listener close failed', { error: err?.message || String(err) });
-    }
-    try {
-      proxy.close();
-    } catch {
-      // ignore
-    }
-    try {
-      certManager?.close();
-    } catch {
-      // ignore
-    }
-    try {
-      coordinator.close();
-    } catch {
-      // ignore
-    }
-    process.exit(0);
-  };
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-
-  process.on('uncaughtException', (err) => {
-    log.error('uncaught exception', { error: err?.stack || String(err) });
-    process.exit(1);
-  });
-  process.on('unhandledRejection', (reason) => {
-    log.error('unhandled rejection', { error: reason?.stack || String(reason) });
-  });
-
   // Required production registration cannot be bypassed by a preserved PORT
   // value in the external environment file. Optional coordinator-spawned dev
   // instances retain the PORT-based skip.
@@ -528,6 +540,14 @@ async function main() {
       required: registrationPlan.required,
     });
   }
+  lifecycle.markReady({
+    version: config.version,
+    httpsPort: servers.addresses.find((entry) => entry.name === 'https')?.port,
+    httpPort: servers.addresses.find((entry) => entry.name === 'http-redirect')?.port,
+    registration: registrationPlan.shouldRegister
+      ? registrationPlan.required ? 'required' : 'optional'
+      : 'skipped',
+  });
 }
 
 // Run main() only when this file is the executed entry script — importing it
@@ -542,7 +562,14 @@ const isDirectRun = (() => {
 
 if (isDirectRun) {
   main().catch((err) => {
-    process.stderr.write(`fatal: ${err?.stack || String(err)}\n`);
+    if (directRunLifecycle) {
+      return directRunLifecycle.fatal('top-level-failure', err);
+    }
+    const fallbackLog = createLogger('info');
+    fallbackLog.error('fatal before process lifecycle initialization', {
+      error: err?.stack || String(err),
+      pid: process.pid,
+    });
     process.exit(1);
   });
 }

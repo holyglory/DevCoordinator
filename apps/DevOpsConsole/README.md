@@ -10,14 +10,17 @@ third-party dependencies) that:
 - gates every subdomain behind **Google sign-in by default**, with a per-route
   *public / login-required* toggle in the control panel,
 - serves the control panel at `https://console.vr.ae` — hash-routed pages
-  (Projects, Servers, Routes, Docker, Port leases, Performance, Access; tab nav on
+  (Projects, Servers, Routes, Docker, Port leases, Performance, Access,
+  Incoming invites, Telegram; tab nav on
   desktop, a hamburger drawer on phones). The default Projects page is a tree
   of repos with their servers, databases and containers: start/stop/restart
   single items or whole projects, live CPU/memory everywhere, and hideable
   idle items that automatically reappear when an agent starts them through
   the coordinator. Other pages cover servers with per-server subdomains
   (grouped by repo), routes, Docker containers, port leases + permanent pins,
-  history charts, and owner-only per-account domain grants, all driven by the
+  history charts, owner-only per-account domain grants and incoming invite
+  decisions, plus user-owned Telegram bots for project event notifications,
+  all driven by the
   [codex-dev-coordinator](../../skills/codex-dev-coordinator/SKILL.md) HTTP API
   on loopback `127.0.0.1:29876`, authenticated with a private token. Production
   runs it as the dedicated `dev-coordinator.service`; optional local autostart
@@ -27,6 +30,14 @@ third-party dependencies) that:
   container row shows CPU %/memory numbers plus a sparkline, and the
   Performance page renders full history charts (history resets when the
   console restarts).
+
+Configured owners also get Active/Archived views on Projects, Servers, and
+Docker. Archive prepares and applies a coordinator-authored stop-and-fence
+plan while retaining the plan's declared data and history. Archived rows can
+be restored (which clears the fence but never starts the resource) or removed
+permanently only when the coordinator advertises that capability; permanent
+removal requires typing the exact phrase returned by the fresh plan. These
+durable lifecycle controls are distinct from the cosmetic Hide preference.
 
 Production binds ports 80/443 on the explicit IPv4 wildcard `0.0.0.0` and
 uses `127.0.0.1` for coordinator registration and health. This deployment has
@@ -74,6 +85,11 @@ ones:
 | `COORDINATOR_AUTOSTART` | Optional local fallback; production sets `0` and uses `dev-coordinator.service`. |
 | `COORDINATOR_REGISTRATION_REQUIRED` | Production-only fail-closed gate. The unit pins `1`; direct/local runs omit it and log a bounded registration failure without exiting. |
 | `METRICS_INTERVAL_MS` | CPU/memory sampling cadence for the history charts (default `10000`, floor `2000`). Each sample reads coordinator inventory, which shells out to `docker stats` when Docker is present. |
+
+Telegram bot tokens are registered from the Console UI, not from
+`console.env`. They remain server-only in private
+`<STATE_DIR>/telegram-control.json` (mode `0600`) and are never returned to the
+browser, logs, URLs, screenshots, or Git.
 
 ## Google OAuth client setup (one-time)
 
@@ -323,6 +339,16 @@ loopback transport startup, clean graph absence, or the exact stopped baseline
 left by relocation/a prior restart; the unit's 90-second timeout bounds the
 whole start. A foreign listener, active lease, wrong PID, malformed response,
 or graph conflict fails immediately.
+
+The API and Console are separate availability boundaries. The API has a soft
+`Wants=`/`After=` relationship to the broker, and the Console has the same
+relationship to the API. Stopping a dependency for offline maintenance does
+not stop ports 29876, 80, or 443; dependency-backed calls fail closed and
+recover when the dependency returns. Both units use `Restart=always` for
+unexpected failed or clean daemon exits, but systemd still honors an explicit
+unit stop. Their stdout/stderr are pinned to journald under stable
+`dev-coordinator` and `devops-console` identifiers; use `journalctl -t` with
+those identifiers for startup, fatal, shutdown, and restart evidence.
 
 ### Existing-host checkout cutover
 
@@ -1030,6 +1056,15 @@ because it owns no managed children when `COORDINATOR_AUTOSTART=0`.
 
 ## Manage Google account access
 
+Google verification and Console authorization are deliberately separate. A
+successful OIDC callback establishes a signed, verified Google identity even
+when that account has no grant. Every protected Console, route, API, proxy,
+and WebSocket request still rechecks current policy. If a verified account
+opens a protected destination it cannot use, the denial page offers **Request
+invite**. The server derives the requested resource from the current host—the
+browser cannot choose another email, Console grant, or route—and records one
+idempotent pending request for that exact Console or route instance.
+
 1. Sign in as a configured owner from `ALLOWED_EMAILS`, then open Console →
    *Access*. The real owner/invited-user collection is the first content.
 2. Choose *Add user*, enter a Gmail or Google Workspace email, and select the
@@ -1039,13 +1074,48 @@ because it owns no managed children when `COORDINATOR_AUTOSTART=0`.
 3. Change a grant from the user card at any time. The next HTTP or WebSocket
    request uses the new policy; no re-login or service restart is required.
    Removing a user invalidates that user's existing signed session immediately.
+4. Open the owner-only *Incoming invites* page to review host-derived requests.
+   Approve creates or merges only the requested exact grant; Deny records the
+   decision without granting access. Route deletion, replacement, or rename
+   makes a request for the former immutable route instance stale rather than
+   granting a later route that reuses the slug.
 
 Configured owners are intentionally not editable in the web UI. Change them in
 the private `console.env` `ALLOWED_EMAILS` value and restart the service. This
 provides a recovery path if invited policy is empty or corrupt. Invited state
-is private `<STATE_DIR>/access-control.json` (atomic writes, mode `0600`).
+and bounded request/decision history are private
+`<STATE_DIR>/access-control.json` (schema version 2, atomic writes, mode
+`0600`; schema version 1 user policy migrates on load).
 Public routes remain public regardless of grants; saved grants become effective
 again if the route returns to login-required mode.
+
+## Telegram project notifications
+
+Any account with a current Console grant can open *Telegram* and register a
+bot token from [BotFather](https://t.me/BotFather). That account owns the bot
+and alone may manage its project assignments and authorization queue;
+configured Console owners can administer every bot. Registration validates
+the token with Telegram. If the bot already has a webhook, registration
+refuses it unless the user explicitly confirms **Replace the bot's existing
+webhook**. Takeover removes the webhook without discarding pending updates
+because this Console uses long polling.
+
+Assign the bot to exact projects from current coordinator inventory. The
+durable assignment is the coordinator's immutable `repo_id`, not a display
+name or path-derived guess. A Telegram user then sends `/start` to that bot in
+a private chat. They appear in the bot-specific authorization queue on the
+Telegram page; the bot owner (or a configured Console owner) approves or
+denies them. Google/Console access and Telegram subscriber approval are
+independent decisions.
+
+Approved subscribers receive events only for the bot's assigned projects:
+server and Docker start/stop/restart activity, failures, and observed crashes.
+The Console periodically asks the coordinator for an explicit host
+observation, reads its durable event journal with an opaque cursor, and writes
+each recipient delivery to a durable outbox before advancing that cursor.
+Telegram rate limits and transient failures are retried across process
+restarts; the token, cursor, subscriber state, and outbox stay only in the
+mode-`0600` server-side state file.
 
 ## Upstreams that require their own HTTP credentials
 
@@ -1115,8 +1185,9 @@ upstream token changes.
   token stays in a private external file and is never returned to browser
   JavaScript, logs, URLs, screenshots, or Git.
 - Sessions: HMAC-SHA256-signed cookie, `Domain=.vr.ae`, `HttpOnly`, `Secure`,
-  `SameSite=Lax`; current owner/invited membership and the exact Console/domain
-  grant are re-checked on every HTTP and WebSocket request.
+  `SameSite=Lax`; the cookie proves a verified Google identity, while current
+  owner/invited membership and the exact Console/domain grant are re-checked
+  separately on every HTTP and WebSocket request.
 - OIDC: authorization code + PKCE, `state`/`nonce` enforced, ID-token
   signature verified against Google's JWKS in-process.
 - Unknown subdomains are indistinguishable from protected ones until you log
@@ -1129,6 +1200,14 @@ upstream token changes.
 - Console API mutations require a same-origin `Origin` header (CSRF). Access
   list and backend-credential endpoints additionally require a configured
   owner.
+- Invite requests are same-origin POSTs carrying a short-lived signed request
+  claim bound to the verified Google subject, email, host-derived resource,
+  and immutable resource instance. Only configured owners may read or decide
+  the incoming queue.
+- Telegram tokens are validated and stored only in the private mode-`0600`
+  Console state. API views expose bot identity and `hasToken`, never the token;
+  bot ownership is enforced server-side and configured owners retain the
+  recovery/administration override.
 
 ## Dev mode
 

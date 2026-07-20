@@ -29,6 +29,7 @@ SPEC.loader.exec_module(coordinator)
 from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.repository_lifecycle import ResourceKind
+from devcoordinator.schema import SCHEMA_VERSION
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence
 import devcoordinator.store as store_module
 from devcoordinator.store import AccountStore, StoreError, deterministic_id, utc_timestamp
@@ -104,6 +105,7 @@ class SQLiteCutoverTests(unittest.TestCase):
             "name": name,
             "image": "postgres:16",
             "status": status,
+            "running": status.lower().startswith("up"),
             "metadata_source": "coordinator_sidecar" if project is not None else "none",
             "labels": {},
             "port_bindings": [],
@@ -328,7 +330,7 @@ class SQLiteCutoverTests(unittest.TestCase):
         # The rejected open must close its SQLite connection and release its
         # shared maintenance descriptor so a subsequent clean open succeeds.
         with AccountStore.open_default_read_only(self.home) as store:
-            self.assertEqual(store.metadata.schema_version, 2)
+            self.assertEqual(store.metadata.schema_version, SCHEMA_VERSION)
 
     def test_read_only_open_reports_journal_and_sidecar_failures_together(self) -> None:
         with AccountStore.open_default(self.home) as store:
@@ -424,7 +426,7 @@ class SQLiteCutoverTests(unittest.TestCase):
         self.assertTrue(state["descriptor_closed"])
 
         with AccountStore.open_default_read_only(self.home) as store:
-            self.assertEqual(store.metadata.schema_version, 2)
+            self.assertEqual(store.metadata.schema_version, SCHEMA_VERSION)
 
     def test_pure_inventory_reads_committed_wal_without_changing_database_files(self) -> None:
         now = "2026-07-15T12:00:00Z"
@@ -1524,6 +1526,7 @@ os._exit(0)
                                     "name": "kosttracking-prod-copy-pg",
                                     "image": "postgres:16",
                                     "status": "Up 5 minutes",
+                                    "running": True,
                                     "metadata_source": "none",
                                     "labels": {},
                                     "port_bindings": [

@@ -326,6 +326,13 @@ a { color: var(--accent); }
 }
 
 .sec-head { margin-bottom: 12px; }
+.collection-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+.collection-head > div:first-child { min-width: 0; }
 .sec-head h2 {
   margin: 0;
   font-size: 15px;
@@ -346,6 +353,26 @@ a { color: var(--accent); }
 }
 
 .sec-body { min-width: 0; }
+
+.lifecycle-filter {
+  display: inline-flex;
+  gap: 4px;
+  flex: none;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg);
+}
+.lifecycle-filter .btn {
+  min-height: 34px;
+  border-color: transparent;
+  background: transparent;
+}
+.lifecycle-filter .btn.is-selected {
+  border-color: var(--line2);
+  background: var(--bg4);
+}
+.lifecycle-filter .count { padding: 0 6px; font-size: 10px; }
 
 /* ---------- create-route form ---------- */
 
@@ -375,7 +402,7 @@ a { color: var(--accent); }
 
 fieldset.field { border: 0; margin: 0; padding: 0; }
 
-input[type="text"], input[type="email"], input[type="number"], select {
+input[type="text"], input[type="email"], input[type="password"], input[type="number"], select, textarea {
   width: 100%;
   background: var(--bg);
   color: var(--text);
@@ -386,7 +413,8 @@ input[type="text"], input[type="email"], input[type="number"], select {
   font-size: 13.5px;
   min-height: 36px;
 }
-input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+textarea { resize: vertical; min-height: 62px; }
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 input::placeholder { color: var(--dim); }
 select:disabled { color: var(--dim); }
 
@@ -474,9 +502,138 @@ select:disabled { color: var(--dim); }
 }
 .access-empty { border-top: 1px solid var(--line); }
 
+/* ---------- approval queues + Telegram bots ---------- */
+
+.queue-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.queue-row, .telegram-bot { padding: 14px 10px; }
+.queue-row-head, .telegram-bot-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.queue-row-main, .telegram-bot-main { flex: 1; min-width: 0; }
+.queue-title, .telegram-bot-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.queue-title strong, .telegram-bot-title strong { overflow-wrap: anywhere; }
+.queue-meta, .telegram-bot-meta {
+  margin: 3px 0 0;
+  color: var(--dim);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.queue-actions, .telegram-bot-actions {
+  display: flex;
+  gap: 7px;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.queue-warning {
+  margin: 9px 0 0;
+  padding: 8px 10px;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border: 1px solid #6d541f;
+  border-radius: 7px;
+  font-size: 12px;
+}
+.queue-history {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 11px;
+}
+.queue-history > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+.queue-history[open] > summary { margin-bottom: 5px; }
+.queue-status {
+  flex: none;
+  border: 1px solid var(--line2);
+  border-radius: 999px;
+  padding: 1px 7px;
+  color: var(--muted);
+  background: var(--bg3);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.queue-status.pending { color: var(--warn); border-color: #6d541f; background: var(--warn-bg); }
+.queue-status.approved, .queue-status.active { color: var(--ok); border-color: #286b49; background: var(--ok-bg); }
+.queue-status.denied, .queue-status.stale, .queue-status.paused { color: var(--err); border-color: #6d2b30; background: var(--err-bg); }
+
+.telegram-bot + .telegram-bot { border-top: 1px solid var(--line); }
+.telegram-bot-title a { font-family: var(--mono); font-size: 13px; }
+.telegram-section { margin-top: 13px; }
+.telegram-section h3 { margin: 0 0 7px; font-size: 12.5px; }
+.telegram-project-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 7px;
+}
+.telegram-project {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+}
+.telegram-project:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+.telegram-project input { width: 24px; height: 24px; margin: 0; accent-color: var(--accent); }
+.telegram-project strong, .telegram-project span { display: block; overflow-wrap: anywhere; }
+.telegram-project span { margin-top: 1px; color: var(--dim); font-size: 11.5px; }
+.telegram-auth-list { display: grid; gap: 7px; }
+.telegram-auth {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.telegram-auth-main { flex: 1; min-width: 0; }
+.telegram-auth-main strong, .telegram-auth-main span { display: block; overflow-wrap: anywhere; }
+.telegram-auth-main span { margin-top: 1px; color: var(--dim); font-size: 11.5px; }
+.telegram-empty { margin: 0; padding: 18px 10px; text-align: center; }
+.telegram-error { color: var(--err); }
+.takeover-check {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 9px;
+  margin-top: 15px;
+  padding: 10px;
+  border: 1px solid #6d541f;
+  border-radius: 8px;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.takeover-check input { width: 24px; height: 24px; margin: 0; accent-color: var(--accent); }
+
 /* The add form is secondary to the user collection and appears in the
    current viewport only after the explicit Add user action. */
-#access-dialog {
+#access-dialog, #telegram-dialog, #lifecycle-dialog {
   width: min(680px, calc(100vw - 28px));
   max-height: min(760px, calc(100vh - 28px));
   overflow: auto;
@@ -487,8 +644,8 @@ select:disabled { color: var(--dim); }
   padding: 0;
   box-shadow: var(--shadow);
 }
-#access-dialog::backdrop { background: rgba(4, 7, 11, .76); backdrop-filter: blur(2px); }
-#access-form { padding: 18px; }
+#access-dialog::backdrop, #telegram-dialog::backdrop, #lifecycle-dialog::backdrop { background: rgba(4, 7, 11, .76); backdrop-filter: blur(2px); }
+#access-form, #telegram-form, #lifecycle-form { padding: 18px; }
 .dialog-head {
   display: flex;
   align-items: flex-start;
@@ -502,6 +659,48 @@ select:disabled { color: var(--dim); }
 .access-picker legend { color: var(--muted); font-size: 12px; font-weight: 650; }
 .picker-hint { margin: 2px 0 9px; color: var(--dim); font-size: 11.5px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+.lifecycle-target {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.lifecycle-target strong { display: block; overflow-wrap: anywhere; }
+.lifecycle-target .meta-passive { display: block; margin-top: 2px; white-space: normal; overflow-wrap: anywhere; }
+.lifecycle-plan { display: grid; gap: 10px; margin-top: 14px; }
+.lifecycle-plan-section {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.lifecycle-plan-section.is-blocked { border-color: #6d541f; background: rgba(232, 178, 62, .06); }
+.lifecycle-plan-section h3 { margin: 0 0 6px; font-size: 12.5px; }
+.lifecycle-plan-section ul { margin: 0; padding-left: 20px; color: var(--muted); font-size: 12.5px; }
+.lifecycle-plan-section li + li { margin-top: 4px; }
+.lifecycle-confirm { margin-top: 14px; }
+.lifecycle-confirm code { color: #ffb3b8; user-select: text; }
+.btn.lifecycle-danger:not(:disabled) { color: #ffb3b8; border-color: #6d2b30; background: var(--err-bg); }
+.btn.lifecycle-danger:not(:disabled):hover { background: rgba(236, 95, 103, .22); }
+
+.archive-note { margin: 0 0 10px; color: var(--dim); font-size: 12.5px; }
+.archive-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 10px;
+  border-top: 1px solid var(--line);
+}
+.archive-row:first-child { border-top: 0; }
+.archive-main { min-width: 0; }
+.archive-name { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.archive-name strong { overflow-wrap: anywhere; }
+.archive-detail { display: block; margin-top: 4px; color: var(--dim); font-size: 11.5px; overflow-wrap: anywhere; }
+.archive-actions { display: inline-flex; gap: 7px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.archive-group-items .archive-row { padding-left: 42px; }
 
 /* Wraps instead of cropping when the column is still too narrow. */
 .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line2); border-radius: 7px; overflow: hidden; width: max-content; max-width: 100%; }
@@ -649,7 +848,7 @@ select:disabled { color: var(--dim); }
    alignment with the rows beneath it. Actions are right-aligned in a fixed
    slot (ghost icon placeholders keep button groups equal width). */
 .srv-grid    { grid-template-columns: 26px minmax(0, 1fr) 70px 210px 118px 22px 206px; }
-.dock-grid   { grid-template-columns: 20px minmax(0, 1fr) minmax(0, 260px) 210px minmax(0, 200px) 250px; }
+.dock-grid   { grid-template-columns: 20px minmax(0, 1fr) minmax(0, 260px) 210px minmax(0, 200px) 300px; }
 .srv-grid > .actions, .dock-grid > .actions,
 .grid-head.srv-grid > span:last-child, .grid-head.dock-grid > span:last-child { justify-self: end; text-align: right; }
 .lease-grid  { grid-template-columns: 74px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, .9fr) max-content; }
@@ -1015,6 +1214,45 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
 .proj-usage { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 .proj-head + .item { border-top: 0; }
 
+/* Servers is an accordion of repository/resource-group headers. Every header
+   remains mounted; only one bounded member region is disclosed at a time. */
+.server-project-block + .server-project-block { margin-top: 6px; }
+.server-project-block .proj-head {
+  display: block;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+}
+.server-project-block .proj-head:not(.is-open) { border-radius: 7px; }
+.server-project-toggle {
+  appearance: none;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto 72px auto;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  padding: 12px 10px 7px;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.server-project-toggle:hover { background: var(--bg3); }
+.server-project-toggle > .chev { grid-column: 1; }
+.server-project-toggle > .proj-name { grid-column: 2; min-width: 0; }
+.server-project-toggle > .server-group-count { grid-column: 3; white-space: nowrap; }
+.server-project-toggle > .spark { grid-column: 4; margin-left: 0; }
+.server-project-toggle > .proj-usage { grid-column: 5; }
+.server-project-toggle:hover .chev { background: var(--bg4); color: var(--text); }
+.server-group-items { min-width: 0; }
+.server-group-items[hidden] { display: none; }
+.server-group-items > .item:first-child { border-top: 0; }
+.server-group-items > .item:nth-child(even of .item) { background: rgba(255, 255, 255, .025); }
+
 .tree-node { border-top: 1px solid var(--line); padding: 4px 0 8px; }
 .tree-node:first-of-type { border-top: 0; }
 
@@ -1022,7 +1260,7 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
    fixed widths for everything except the name — so tags, numbers, badges and
    buttons line up in clean columns on every row. */
 .tree-grid {
-  grid-template-columns: 84px minmax(0, 1fr) 180px 112px 310px;
+  grid-template-columns: 84px minmax(0, 1fr) 180px 112px 352px;
   gap: 8px 12px;
   padding: 5px 8px;
 }
@@ -1118,6 +1356,26 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
 .hidden-note { margin: 10px 0 0; padding: 0 10px; font-size: 12.5px; color: var(--dim); }
 .hidden-note .linklike { color: var(--dim); }
 .hidden-note .linklike:hover { color: var(--text); }
+
+/* Bounded host-wide resource lists: collection rows remain the primary
+   content, with one compact pager after the currently visible slice. */
+.resource-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 10px 2px;
+  border-top: 1px solid var(--line);
+}
+.resource-page-status { margin: 0; color: var(--muted); font-size: 12.5px; }
+.resource-page-actions { display: inline-flex; align-items: center; gap: 9px; }
+
+@media (max-width: 479px) {
+  .resource-pager { align-items: stretch; }
+  .resource-page-status { flex: 1 0 100%; }
+  .resource-page-actions { justify-content: space-between; width: 100%; }
+}
 
 /* ---------- countdowns ---------- */
 
@@ -1225,6 +1483,25 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   #banner-slot { padding: 0 14px; }
   #main { padding: 14px 14px 48px; gap: 14px; }
   .card { padding: 13px 12px 11px; }
+  .collection-head { align-items: stretch; flex-direction: column; gap: 9px; }
+  .lifecycle-filter { align-self: stretch; }
+  .lifecycle-filter .btn { flex: 1; justify-content: center; min-height: 44px; }
+
+  .server-project-toggle {
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    gap: 3px 8px;
+    min-height: 44px;
+    padding: 8px;
+  }
+  .server-project-toggle > .chev { grid-column: 1; grid-row: 1 / span 2; }
+  .server-project-toggle > .proj-name { grid-column: 2; grid-row: 1; }
+  .server-project-toggle > .server-group-count { grid-column: 3; grid-row: 1; }
+  .server-project-toggle .spark { display: none; }
+  .server-project-toggle > .proj-usage {
+    grid-column: 2 / 4;
+    grid-row: 2;
+    justify-self: end;
+  }
 
   .grid-head { display: none; }
 
@@ -1260,14 +1537,29 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   .access-head { align-items: center; }
   .access-resource-list { grid-template-columns: minmax(0, 1fr); }
   .access-user { padding-inline: 4px; }
-  #access-form { padding: 15px; }
-  .dialog-actions .btn { min-height: 42px; }
+  #access-form, #telegram-form, #lifecycle-form { padding: 15px; }
+  .dialog-actions .btn { min-height: 44px; }
+  .queue-row, .telegram-bot { padding-inline: 4px; }
+  .queue-row-head, .telegram-bot-head { flex-direction: column; }
+  .queue-actions, .telegram-bot-actions { width: 100%; justify-content: flex-start; }
+  .queue-actions .btn, .telegram-bot-actions .btn { min-height: 44px; }
+  .telegram-project-list { grid-template-columns: minmax(0, 1fr); }
+  .telegram-auth { align-items: flex-start; flex-wrap: wrap; }
+  .telegram-auth .queue-actions { width: 100%; }
+  .archive-row { grid-template-columns: minmax(0, 1fr); }
+  .archive-actions { justify-content: flex-start; }
+  .archive-actions .btn { min-height: 44px; }
+  .archive-group-items .archive-row { padding-left: 22px; }
 }
 
 /* Bigger touch targets on coarse pointers */
 @media (pointer: coarse) {
   .btn.small { padding: 6px 12px; }
   .iconbtn { width: 34px; height: 34px; }
+  .iconbtn[data-fk^="archive:"], #lifecycle-dialog-close {
+    width: 44px;
+    height: 44px;
+  }
   .chev { width: 32px; height: 32px; }
   .dotbtn { padding: 6px 9px; }
 }

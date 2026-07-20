@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import grp
 import json
 import os
 from pathlib import Path
 import signal
+import stat
 import threading
 from typing import Any, Callable
+from collections.abc import Generator
 
 from .broker import BrokerClient, BrokerError, BrokerOperation, BrokerRequest
 from .broker_backend import build_store_backed_broker_runtime
 from .broker_host import LocalBrokerHostMutations
 from .broker_links import BrokerLinkStore
 from .broker_persistence import BrokerPersistence
+from .broker_profile import SYSTEM_PROFILE_PATH
+from .broker_profile_enrollment_migration import (
+    migrate_protected_profile_enrollments,
+    reconcile_protected_profile_repository_generation,
+)
 from .store import AccountStore
 from .store_backup import (
     create_store_backup,
@@ -24,6 +33,56 @@ from .store_backup import (
     restore_store_backup,
     restore_store_export,
 )
+
+
+BROKER_SERVICE_LOCK_NAME = ".broker-service.lock"
+
+
+@contextmanager
+def exclusive_broker_service_lock(database_path: Path) -> Generator[None, None, None]:
+    """Hold the private lifetime lock that excludes a second broker/abandoner."""
+
+    database = database_path.expanduser().absolute()
+    parent = database.parent
+    if not parent.is_dir() or parent.is_symlink() or parent.resolve() != parent:
+        raise PermissionError("broker service database parent is missing or unsafe")
+    parent_metadata = parent.stat()
+    if (
+        parent_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+    ):
+        raise PermissionError(
+            "broker service database parent must be service-owned and not group/other writable"
+        )
+    lock_path = parent / BROKER_SERVICE_LOCK_NAME
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        after = lock_path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            raise PermissionError("broker service lifetime lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "broker service is active; offline broker administration is refused"
+            ) from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def add_broker_parser(subparsers: Any) -> None:
@@ -85,6 +144,22 @@ def add_broker_parser(subparsers: Any) -> None:
     enroll.add_argument("--profile-output")
     enroll.add_argument("--profile-valid-days", type=int, default=30)
     enroll.add_argument("--explicit-reinstall", action="store_true")
+    enroll.add_argument(
+        "--grant-cleanup",
+        action="store_true",
+        help=(
+            "explicitly grant this UID default-deny archive, restore, and permanent cleanup capabilities for this project"
+        ),
+    )
+    enroll.add_argument(
+        "--approve-compose-host-access",
+        action="store_true",
+        help=(
+            "Explicitly approve the exact rendered Compose definition to use "
+            "host-equivalent capabilities such as bind mounts, devices, host "
+            "namespaces, or added capabilities. Approval is fingerprint-bound."
+        ),
+    )
 
     principal = actions.add_parser("provision-principal")
     _database_argument(principal)
@@ -118,6 +193,54 @@ def add_broker_parser(subparsers: Any) -> None:
     )
     grant_database.add_argument("--disable", action="store_true")
 
+    grant_cleanup = actions.add_parser("grant-cleanup")
+    _database_argument(grant_cleanup)
+    grant_cleanup.add_argument("--uid", type=int, required=True)
+    grant_cleanup.add_argument("--repo-id", required=True)
+    grant_cleanup.add_argument(
+        "--operation",
+        choices=(
+            BrokerOperation.ARCHIVES_READ.value,
+            BrokerOperation.CLEANUP_PLAN.value,
+            BrokerOperation.CLEANUP_APPLY.value,
+            BrokerOperation.LIFECYCLE_RESTORE.value,
+            BrokerOperation.REPOSITORY_PLAN_REMOVE.value,
+            BrokerOperation.REPOSITORY_REMOVE.value,
+            BrokerOperation.REPOSITORY_REINSTALL.value,
+            BrokerOperation.RESOURCE_PLAN_RETIRE.value,
+            BrokerOperation.RESOURCE_RETIRE.value,
+            BrokerOperation.RESOURCE_PLAN_ARCHIVE.value,
+            BrokerOperation.RESOURCE_ARCHIVE.value,
+            BrokerOperation.RESOURCE_RESTORE.value,
+        ),
+        required=True,
+    )
+    grant_cleanup.add_argument("--disable", action="store_true")
+
+    grant_cleanup_resource = actions.add_parser("grant-cleanup-resource")
+    _database_argument(grant_cleanup_resource)
+    grant_cleanup_resource.add_argument("--uid", type=int, required=True)
+    grant_cleanup_resource.add_argument("--repo-id", required=True)
+    grant_cleanup_resource.add_argument(
+        "--resource-kind", choices=("server", "container", "supervisor"), required=True
+    )
+    grant_cleanup_resource.add_argument("--resource-id", required=True)
+    grant_cleanup_resource.add_argument("--control-binding-id", required=True)
+    grant_cleanup_resource.add_argument("--immutable-fingerprint", required=True)
+    grant_cleanup_resource.add_argument("--ownership-fingerprint", required=True)
+    grant_cleanup_resource.add_argument(
+        "--operation",
+        choices=(
+            BrokerOperation.CLEANUP_PLAN.value,
+            BrokerOperation.CLEANUP_APPLY.value,
+            BrokerOperation.RESOURCE_PLAN_ARCHIVE.value,
+            BrokerOperation.RESOURCE_ARCHIVE.value,
+            BrokerOperation.RESOURCE_RESTORE.value,
+        ),
+        required=True,
+    )
+    grant_cleanup_resource.add_argument("--disable", action="store_true")
+
     port_range = actions.add_parser("grant-port-range")
     _database_argument(port_range)
     port_range.add_argument("--uid", type=int, required=True)
@@ -129,12 +252,87 @@ def add_broker_parser(subparsers: Any) -> None:
     port_range.add_argument("--max-ttl-seconds", type=int, default=3600)
     port_range.add_argument("--disable", action="store_true")
 
+    reconcile_profile_generation = actions.add_parser(
+        "reconcile-profile-repository-generation",
+        help=(
+            "offline exact forward reconciliation of one protected-profile repository generation"
+        ),
+    )
+    _database_argument(reconcile_profile_generation)
+    reconcile_profile_generation.add_argument(
+        "--profile",
+        default=str(SYSTEM_PROFILE_PATH),
+        help="protected root-owned broker client profile",
+    )
+    reconcile_profile_generation.add_argument(
+        "--client-uid", type=int, required=True
+    )
+    reconcile_profile_generation.add_argument("--account-id", required=True)
+    reconcile_profile_generation.add_argument("--repo-id", required=True)
+    reconcile_profile_generation.add_argument("--canonical-root", required=True)
+    reconcile_profile_generation.add_argument(
+        "--rollback-root",
+        required=True,
+        help="existing root:root 0700 private transaction directory for rollback evidence",
+    )
+    reconcile_profile_generation.add_argument(
+        "--from-generation", type=int, required=True
+    )
+    reconcile_profile_generation.add_argument(
+        "--to-generation", type=int, required=True
+    )
+
+    migrate_enrollments = actions.add_parser(
+        "migrate-profile-enrollments",
+        help=(
+            "offline backfill of missing repository enrollments from the protected client profile"
+        ),
+    )
+    _database_argument(migrate_enrollments)
+    migrate_enrollments.add_argument(
+        "--profile",
+        default=str(SYSTEM_PROFILE_PATH),
+        help="protected root-owned broker client profile",
+    )
+
     reconcile = actions.add_parser(
         "reconcile-links",
         help="replay exact pending client-side broker lease/assignment releases",
     )
     reconcile.add_argument("--coordinator-home")
     reconcile.add_argument("--limit", type=int, default=100)
+
+    reconcile_compose = actions.add_parser(
+        "reconcile-compose",
+        help="resolve one uncertain Compose outcome from fresh service evidence",
+    )
+    _database_argument(reconcile_compose)
+    reconcile_compose.add_argument("--operation-id", required=True)
+    reconcile_mode = reconcile_compose.add_mutually_exclusive_group()
+    reconcile_mode.add_argument("--plan", action="store_true")
+    reconcile_mode.add_argument("--abandon-as-failed", action="store_true")
+    reconcile_compose.add_argument("--confirm-definition-fingerprint")
+
+    reconcile_docker = actions.add_parser(
+        "reconcile-docker",
+        help="resolve one uncertain direct Docker outcome from fresh service evidence",
+    )
+    _database_argument(reconcile_docker)
+    reconcile_docker.add_argument("--operation-id", required=True)
+    reconcile_docker.add_argument("--plan", action="store_true")
+    reconcile_docker.add_argument("--confirm-container-id")
+
+    release_compose_name = actions.add_parser(
+        "release-compose-project-name",
+        help=(
+            "release one disabled Compose project-name claim after a new "
+            "exhaustive full-Docker empty-host observation"
+        ),
+    )
+    _database_argument(release_compose_name)
+    release_compose_name.add_argument(
+        "--compose-definition-id", required=True
+    )
 
     store_backup = actions.add_parser(
         "store-backup",
@@ -201,7 +399,13 @@ def add_broker_parser(subparsers: Any) -> None:
 
 
 def handle_broker_cli(args: argparse.Namespace) -> Any:
-    if args.group != "broker" or args.action in {"serve", "enroll"}:
+    if args.group != "broker" or args.action in {
+        "serve",
+        "enroll",
+        "reconcile-compose",
+        "reconcile-docker",
+        "release-compose-project-name",
+    }:
         raise ValueError("broker CLI handler received an unsupported command")
     if args.action == "call":
         operation = BrokerOperation(str(args.operation))
@@ -294,6 +498,42 @@ def handle_broker_cli(args: argparse.Namespace) -> Any:
             timeout_seconds=float(args.timeout_seconds),
         )
 
+    if args.action == "migrate-profile-enrollments":
+        if os.geteuid() != 0:
+            raise PermissionError(
+                "broker profile enrollment migration requires the root service administrator"
+            )
+        database_path = Path(args.database).expanduser().absolute()
+        with exclusive_broker_service_lock(database_path):
+            return migrate_protected_profile_enrollments(
+                database_path=database_path,
+                profile_path=Path(args.profile).expanduser(),
+                expected_service_uid=0,
+                trusted_profile_owner_uid=0,
+            )
+
+    if args.action == "reconcile-profile-repository-generation":
+        if os.geteuid() != 0:
+            raise PermissionError(
+                "profile repository generation reconciliation requires the root service administrator"
+            )
+        database_path = Path(args.database).expanduser().absolute()
+        with exclusive_broker_service_lock(database_path):
+            return reconcile_protected_profile_repository_generation(
+                database_path=database_path,
+                profile_path=Path(args.profile).expanduser(),
+                client_uid=int(args.client_uid),
+                account_id=str(args.account_id),
+                repo_id=str(args.repo_id),
+                canonical_root=str(args.canonical_root),
+                from_generation=int(args.from_generation),
+                to_generation=int(args.to_generation),
+                rollback_root=Path(args.rollback_root).expanduser(),
+                expected_service_uid=0,
+                trusted_profile_owner_uid=0,
+                trusted_rollback_owner_gid=0,
+            )
+
     persistence = BrokerPersistence(Path(args.database))
     if args.action == "provision-principal":
         persistence.provision_principal(
@@ -339,6 +579,43 @@ def handle_broker_cli(args: argparse.Namespace) -> Any:
             "uid": int(args.uid),
             "repo_id": str(args.repo_id),
             "database_binding_id": str(args.database_binding_id),
+            "operation": operation.value,
+            "enabled": not bool(args.disable),
+        }
+    if args.action == "grant-cleanup":
+        operation = BrokerOperation(str(args.operation))
+        persistence.grant_cleanup(
+            uid=int(args.uid),
+            repo_id=str(args.repo_id),
+            operation=operation,
+            enabled=not bool(args.disable),
+        )
+        return {
+            "status": "configured",
+            "uid": int(args.uid),
+            "repo_id": str(args.repo_id),
+            "operation": operation.value,
+            "enabled": not bool(args.disable),
+        }
+    if args.action == "grant-cleanup-resource":
+        operation = BrokerOperation(str(args.operation))
+        persistence.grant_cleanup_resource(
+            uid=int(args.uid),
+            repo_id=str(args.repo_id),
+            resource_kind=str(args.resource_kind),
+            resource_id=str(args.resource_id),
+            control_binding_id=str(args.control_binding_id),
+            immutable_fingerprint=str(args.immutable_fingerprint),
+            ownership_fingerprint=str(args.ownership_fingerprint),
+            operation=operation,
+            enabled=not bool(args.disable),
+        )
+        return {
+            "status": "configured",
+            "uid": int(args.uid),
+            "repo_id": str(args.repo_id),
+            "resource_kind": str(args.resource_kind),
+            "resource_id": str(args.resource_id),
             "operation": operation.value,
             "enabled": not bool(args.disable),
         }
@@ -402,45 +679,66 @@ def serve_broker(
             ) from error
     else:
         access_gid = args.access_gid
-    runtime = build_store_backed_broker_runtime(
-        database_path=Path(args.database),
-        socket_path=Path(args.socket),
-        host_mutations=host_mutations_factory(),
-        access_gid=access_gid,
-        max_clients=int(args.max_clients),
-        observe_before_lifecycle_plan=observe_before_lifecycle_plan,
-    )
-    stop = threading.Event()
-    previous: dict[int, Any] = {}
-
-    def request_stop(_signum: int, _frame: Any) -> None:
-        stop.set()
-
-    for signum in (signal.SIGTERM, signal.SIGINT):
-        previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, request_stop)
-    try:
-        runtime.server.start()
-        print(
-            json.dumps(
-                {
-                    "status": "ready",
-                    "service_uid": os.geteuid(),
-                    "access_gid": os.getegid() if access_gid is None else int(access_gid),
-                    "socket": str(Path(args.socket)),
-                    "database": str(Path(args.database)),
-                    "wire_identity": "opaque_normalized_ids_only",
-                },
-                sort_keys=True,
-            ),
-            flush=True,
+    database_path = Path(args.database).expanduser().absolute()
+    with exclusive_broker_service_lock(database_path):
+        runtime = build_store_backed_broker_runtime(
+            database_path=database_path,
+            socket_path=Path(args.socket),
+            host_mutations=host_mutations_factory(),
+            access_gid=access_gid,
+            max_clients=int(args.max_clients),
+            observe_before_lifecycle_plan=observe_before_lifecycle_plan,
         )
-        while not stop.wait(0.5):
-            pass
-    finally:
-        runtime.server.close()
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
+        runtime.persistence.recover_interrupted_docker_operations()
+        runtime.persistence.recover_interrupted_compose_operations()
+        stop = threading.Event()
+        previous: dict[int, Any] = {}
+        shutdown_requested = False
+
+        def request_stop(_signum: int, _frame: Any) -> None:
+            nonlocal shutdown_requested
+            # Fence mutation admission in the signal turn itself. Waiting for
+            # the serve loop would leave a post-SIGTERM reservation window.
+            # The plain main-thread guard also makes repeated signals safe.
+            if shutdown_requested:
+                return
+            shutdown_requested = True
+            try:
+                runtime.begin_shutdown()
+            finally:
+                stop.set()
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_stop)
+        try:
+            runtime.server.start()
+            print(
+                json.dumps(
+                    {
+                        "status": "ready",
+                        "service_uid": os.geteuid(),
+                        "access_gid": (
+                            os.getegid()
+                            if access_gid is None
+                            else int(access_gid)
+                        ),
+                        "socket": str(Path(args.socket)),
+                        "database": str(database_path),
+                        "wire_identity": "opaque_normalized_ids_only",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            while not stop.wait(0.5):
+                pass
+        finally:
+            try:
+                runtime.close()
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
 
 
 def _database_argument(parser: argparse.ArgumentParser) -> None:

@@ -777,7 +777,6 @@ def wait_for_legacy_console_rollback(
         "poll_interval_seconds": poll_interval_seconds,
         "observations": [],
     }
-    writer.write(ledger)
     coordinator_identity: dict[str, object] | None = None
     main_identity: dict[str, object] | None = None
 
@@ -788,6 +787,12 @@ def wait_for_legacy_console_rollback(
         writer.write(ledger)
 
     try:
+        # Publish ``running`` only after entering the same protected
+        # failure-finalization region as every later write. A handled signal
+        # may arrive as soon as readers see that checksum-valid pair; it must
+        # still replace the pair with durable ``interrupted`` evidence before
+        # the process exits.
+        writer.write(ledger)
         main_identity = _read_identity(proc_root, expected_main_pid)
         ledger["main_identity"] = main_identity
         writer.write(ledger)

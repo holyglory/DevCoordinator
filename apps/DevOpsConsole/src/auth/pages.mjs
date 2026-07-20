@@ -132,7 +132,7 @@ ${errorNote}${action}
     return { status: error ? 400 : 200, html: page({ title: 'Sign in', body }) };
   }
 
-  function renderDenied({ email = '', resource = '', sessionSet = false } = {}) {
+  function renderDenied({ email = '', resource = '', sessionSet = false, requestToken = '' } = {}) {
     const who = email
       ? `<code>${escapeHtml(email)}</code> signed in with Google successfully, but that account`
       : 'Your Google account';
@@ -143,12 +143,37 @@ ${errorNote}${action}
       ? 'Your sign-in is still valid for any other domains the owner granted to you.'
       : 'No session cookie was set.';
     const action = sessionSet ? '/auth/logout' : '/auth/login';
+    const requestForm = requestToken
+      ? `<form method="post" action="/auth/request-invite">
+<input type="hidden" name="request_token" value="${escapeHtml(requestToken)}">
+<button class="btn btn-google" type="submit">Request invite</button>
+</form>`
+      : '';
     const body = `<div class="status-code">403</div>
 <h1>Access denied</h1>
 <p>${who}${target}</p>
-<p class="small">Ask the Console owner to add your Google account or grant this domain from the Access page. ${cookieNote}</p>
+<p class="small">Ask the Console owner to add your Google account or grant this domain. ${cookieNote}</p>
+${requestForm}
 <a class="btn btn-ghost" href="${action}">Try a different account</a>`;
     return { status: 403, html: page({ title: 'Access denied', body }) };
+  }
+
+  function renderInviteResult({ status = 202, duplicate = false, error = '', retryAfter = null } = {}) {
+    const ok = !error;
+    const title = ok ? (duplicate ? 'Request already pending' : 'Invite requested') : 'Request not sent';
+    const detail = ok
+      ? (duplicate
+          ? 'The Console owner already has this access request in the incoming queue.'
+          : 'The Console owner can now approve or deny this request from the incoming invites page.')
+      : escapeHtml(error);
+    const retry = retryAfter
+      ? `<p class="small">You can try again in about ${escapeHtml(String(retryAfter))} seconds.</p>`
+      : '';
+    const body = `<div class="status-code">${ok ? '202' : escapeHtml(status)}</div>
+<h1>${escapeHtml(title)}</h1>
+<p>${detail}</p>
+${retry}<a class="btn btn-ghost" href="/">Return to the requested resource</a>`;
+    return { status, html: page({ title, body }) };
   }
 
   function renderNotFound({ slug = '' } = {}) {
@@ -204,5 +229,5 @@ ${consoleButton()}`;
     return { status: safeStatus, html: page({ title: safeTitle, body }) };
   }
 
-  return { renderLogin, renderDenied, renderNotFound, renderUpstreamError, renderError };
+  return { renderLogin, renderDenied, renderInviteResult, renderNotFound, renderUpstreamError, renderError };
 }

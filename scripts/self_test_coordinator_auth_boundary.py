@@ -123,6 +123,141 @@ def main() -> int:
         require(delayed == {"anonymous_health": 200, "anonymous_inventory": 401, "authenticated_inventory": 200}, "delayed coordinator did not converge")
         require(delayed_calls == 4, "startup refusal did not restart the full boundary probe")
 
+        # The HTTP listener and authorization middleware can be ready before
+        # the authenticated inventory backend has finished opening its broker
+        # connection. Preserve the already-proved anonymous boundary while a
+        # bounded authenticated 5xx converges, then require the complete
+        # contract again on every attempt.
+        warming_clock = [0.0]
+        warming_calls: list[tuple[str, str | None]] = []
+        warming_statuses = iter((503, 502, 200))
+
+        def warming_inventory(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
+            warming_calls.append((path, bearer))
+            if path == "/healthz" and bearer is None:
+                return 200
+            if path == "/v1/inventory" and bearer is None:
+                return 401
+            if path == "/v1/inventory" and bearer == "fixture-secret-token":
+                return next(warming_statuses)
+            return 418
+
+        warmed = check_boundary(
+            token_file=token_file,
+            status_fn=warming_inventory,
+            wait_seconds=1,
+            poll_interval_seconds=0.1,
+            monotonic_fn=lambda: warming_clock[0],
+            sleep_fn=lambda duration: warming_clock.__setitem__(0, warming_clock[0] + duration),
+        )
+        require(
+            warmed == {"anonymous_health": 200, "anonymous_inventory": 401, "authenticated_inventory": 200},
+            "authenticated inventory warmup did not converge",
+        )
+        require(len(warming_calls) == 9, "authenticated 5xx did not rerun the full boundary probe")
+        require(warming_clock[0] == 0.2, "authenticated 5xx retry did not respect the poll interval")
+
+        # A backend that never leaves 5xx remains bounded by the one global
+        # readiness deadline; polling does not create a fresh budget.
+        stalled_clock = [0.0]
+        stalled_calls = 0
+
+        def stalled_inventory(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
+            nonlocal stalled_calls
+            stalled_calls += 1
+            if path == "/healthz" and bearer is None:
+                return 200
+            if path == "/v1/inventory" and bearer is None:
+                return 401
+            return 503
+
+        try:
+            check_boundary(
+                token_file=token_file,
+                status_fn=stalled_inventory,
+                wait_seconds=0.25,
+                poll_interval_seconds=0.1,
+                monotonic_fn=lambda: stalled_clock[0],
+                sleep_fn=lambda duration: stalled_clock.__setitem__(0, stalled_clock[0] + duration),
+            )
+        except AuthBoundaryError as error:
+            require("readiness deadline" in str(error), "persistent authenticated 5xx had the wrong failure")
+            require("HTTP 503" in str(error), "persistent authenticated 5xx lost its status evidence")
+            require("fixture-secret-token" not in str(error), "token leaked in authenticated 5xx failure")
+            require(stalled_calls == 9, "authenticated 5xx exceeded the global retry bound")
+            require(0.249 <= stalled_clock[0] <= 0.251, "authenticated 5xx ignored the readiness deadline")
+        else:
+            raise AssertionError("persistent authenticated 5xx was accepted")
+
+        # Only authenticated 5xx behind the exact anonymous contract is a
+        # readiness state. Authenticated 2xx/4xx mismatches fail immediately.
+        for wrong_authenticated_status in (204, 403):
+            mismatch_calls = 0
+            mismatch_sleeps: list[float] = []
+
+            def authenticated_mismatch(
+                _host: str,
+                _port: int,
+                _timeout: float,
+                path: str,
+                bearer: str | None,
+            ) -> int:
+                nonlocal mismatch_calls
+                mismatch_calls += 1
+                if path == "/healthz" and bearer is None:
+                    return 200
+                if path == "/v1/inventory" and bearer is None:
+                    return 401
+                return wrong_authenticated_status
+
+            try:
+                check_boundary(
+                    token_file=token_file,
+                    status_fn=authenticated_mismatch,
+                    wait_seconds=1,
+                    sleep_fn=mismatch_sleeps.append,
+                )
+            except AuthBoundaryError as error:
+                require("boundary mismatch" in str(error), "authenticated mismatch had the wrong failure")
+                require(mismatch_calls == 3, "authenticated 2xx/4xx mismatch was retried")
+                require(mismatch_sleeps == [], "authenticated 2xx/4xx mismatch entered readiness polling")
+            else:
+                raise AssertionError(f"authenticated HTTP {wrong_authenticated_status} was accepted")
+
+        # Even an authenticated 5xx is not retryable when either anonymous
+        # endpoint violates its exact contract.
+        broken_anonymous_calls = 0
+        broken_anonymous_sleeps: list[float] = []
+
+        def broken_anonymous_contract(
+            _host: str,
+            _port: int,
+            _timeout: float,
+            path: str,
+            bearer: str | None,
+        ) -> int:
+            nonlocal broken_anonymous_calls
+            broken_anonymous_calls += 1
+            if path == "/healthz" and bearer is None:
+                return 503
+            if path == "/v1/inventory" and bearer is None:
+                return 401
+            return 503
+
+        try:
+            check_boundary(
+                token_file=token_file,
+                status_fn=broken_anonymous_contract,
+                wait_seconds=1,
+                sleep_fn=broken_anonymous_sleeps.append,
+            )
+        except AuthBoundaryError as error:
+            require("boundary mismatch" in str(error), "anonymous mismatch had the wrong failure")
+            require(broken_anonymous_calls == 3, "anonymous mismatch plus authenticated 5xx was retried")
+            require(broken_anonymous_sleeps == [], "anonymous mismatch entered readiness polling")
+        else:
+            raise AssertionError("broken anonymous contract plus authenticated 5xx was accepted")
+
         # Real-socket/CLI recall fixture for the production failure: invoke the
         # actual coordinator only after a 300 ms delay, while the checker is
         # already receiving kernel-level ECONNREFUSED on the final port.

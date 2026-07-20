@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'">
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-<link rel="stylesheet" href="/app.css?v=1.7.0">
-<script src="/app.js?v=1.7.0" defer></script>
+<link rel="stylesheet" href="/app.css?v=eed0222cc04d">
+<script src="/app.js?v=eed0222cc04d" defer></script>
 </head>
 <body>
 
@@ -32,6 +32,8 @@
       <a href="#/ports" data-nav="ports">Port leases <span class="nav-count" id="nav-count-ports" hidden></span></a>
       <a href="#/performance" data-nav="performance">Performance <span class="nav-count" id="nav-count-performance" hidden></span></a>
       <a href="#/access" data-nav="access" id="nav-access" hidden>Access <span class="nav-count" id="nav-count-access" hidden></span></a>
+      <a href="#/invites" data-nav="invites" id="nav-invites" hidden>Invites <span class="nav-count" id="nav-count-invites" hidden></span></a>
+      <a href="#/telegram" data-nav="telegram" id="nav-telegram" hidden>Telegram <span class="nav-count" id="nav-count-telegram" hidden></span></a>
     </nav>
     <div id="hdr-side" class="hdr-side"></div>
   </div>
@@ -41,9 +43,15 @@
 <main id="main">
 
   <section id="sec-projects" class="card" data-page="projects" aria-labelledby="projects-h">
-    <div class="sec-head">
-      <h2 id="projects-h">Projects <span class="count" id="projects-count" hidden></span></h2>
-      <p class="sec-sub">Every repo with its servers, databases and containers. Start, stop or restart single items or whole projects; hide idle ones — they reappear the moment an agent starts them.</p>
+    <div class="sec-head collection-head">
+      <div>
+        <h2 id="projects-h">Projects <span class="count" id="projects-count" hidden></span></h2>
+        <p class="sec-sub">Every repo with its servers, databases and containers. Start, stop or restart single items or whole projects; hide idle ones — they reappear the moment an agent starts them.</p>
+      </div>
+      <div class="lifecycle-filter" data-lifecycle-filter="projects" role="group" aria-label="Project lifecycle view" hidden>
+        <button class="btn small is-selected" type="button" data-lifecycle-view="active" aria-pressed="true">Active <span class="count" id="projects-active-count" hidden></span></button>
+        <button class="btn small" type="button" data-lifecycle-view="archived" aria-pressed="false">Archived <span class="count" id="projects-archived-count" hidden></span></button>
+      </div>
     </div>
     <div id="projects-body" class="sec-body">
       <div class="skel" aria-hidden="true"></div>
@@ -66,10 +74,44 @@
     </div>
   </section>
 
+  <section id="sec-invites" class="card" data-page="invites" aria-labelledby="invites-h" hidden>
+    <div class="sec-head collection-head">
+      <div>
+        <h2 id="invites-h">Incoming invites <span class="count" id="invites-count" hidden></span></h2>
+        <p class="sec-sub">Verified Google accounts requesting this Console or one exact private domain. Approval grants only the requested destination.</p>
+      </div>
+      <button id="invites-refresh" class="btn" type="button">Refresh</button>
+    </div>
+    <div id="invites-body" class="sec-body" aria-live="polite">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-telegram" class="card" data-page="telegram" aria-labelledby="telegram-h" hidden>
+    <div class="sec-head collection-head telegram-head">
+      <div>
+        <h2 id="telegram-h">Telegram bots <span class="count" id="telegram-count" hidden></span></h2>
+        <p class="sec-sub">Your bots deliver coordinator events for exact assigned projects. A Telegram user must send <code>/start</code> and be approved before receiving anything.</p>
+      </div>
+      <button id="telegram-add" class="btn primary" type="button">Register bot</button>
+    </div>
+    <div id="telegram-body" class="sec-body" aria-live="polite">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
   <section id="sec-servers" class="card" data-page="servers" aria-labelledby="servers-h" hidden>
-    <div class="sec-head">
-      <h2 id="servers-h">Servers <span class="count" id="servers-count" hidden></span></h2>
-      <p class="sec-sub">Dev servers managed by the coordinator and web servers running in Docker containers, grouped by repo. Each one's public subdomain is managed right here; click a row for logs and details.</p>
+    <div class="sec-head collection-head">
+      <div>
+        <h2 id="servers-h">Servers <span class="count" id="servers-count" hidden></span></h2>
+        <p class="sec-sub">Dev servers managed by the coordinator and web servers running in Docker containers, grouped by repo. Each one's public subdomain is managed right here; click a row for logs and details.</p>
+      </div>
+      <div class="lifecycle-filter" data-lifecycle-filter="servers" role="group" aria-label="Server lifecycle view" hidden>
+        <button class="btn small is-selected" type="button" data-lifecycle-view="active" aria-pressed="true">Active <span class="count" id="servers-active-count" hidden></span></button>
+        <button class="btn small" type="button" data-lifecycle-view="archived" aria-pressed="false">Archived <span class="count" id="servers-archived-count" hidden></span></button>
+      </div>
     </div>
     <div id="servers-body" class="sec-body">
       <div class="skel" aria-hidden="true"></div>
@@ -143,9 +185,15 @@
   </section>
 
   <section id="sec-docker" class="card" data-page="docker" aria-labelledby="docker-h" hidden>
-    <div class="sec-head">
-      <h2 id="docker-h">Docker <span class="count" id="docker-count" hidden></span></h2>
-      <p class="sec-sub">Containers on this machine. Click a row for logs.</p>
+    <div class="sec-head collection-head">
+      <div>
+        <h2 id="docker-h">Docker <span class="count" id="docker-count" hidden></span></h2>
+        <p class="sec-sub">Containers on this machine. Click a row for logs.</p>
+      </div>
+      <div class="lifecycle-filter" data-lifecycle-filter="docker" role="group" aria-label="Docker lifecycle view" hidden>
+        <button class="btn small is-selected" type="button" data-lifecycle-view="active" aria-pressed="true">Active <span class="count" id="docker-active-count" hidden></span></button>
+        <button class="btn small" type="button" data-lifecycle-view="archived" aria-pressed="false">Archived <span class="count" id="docker-archived-count" hidden></span></button>
+      </div>
     </div>
     <div id="docker-body" class="sec-body">
       <div class="skel" aria-hidden="true"></div>
@@ -254,6 +302,63 @@
     <div class="dialog-actions">
       <button id="access-cancel" class="btn" type="button">Cancel</button>
       <button id="access-submit" class="btn primary" type="submit">Add user</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="telegram-dialog" aria-labelledby="telegram-dialog-h">
+  <form id="telegram-form" method="dialog" autocomplete="off" novalidate>
+    <div class="dialog-head">
+      <div>
+        <h2 id="telegram-dialog-h">Register Telegram bot</h2>
+        <p>Paste a token created with BotFather. It is validated by Telegram, stored only in private server state, and never shown again.</p>
+      </div>
+      <button id="telegram-dialog-close" class="iconbtn" type="button" aria-label="Close bot registration dialog" title="Close"></button>
+    </div>
+    <div class="field">
+      <label for="telegram-label">Display name <span class="opt">(optional)</span></label>
+      <input id="telegram-label" name="label" type="text" maxlength="80" autocomplete="off" placeholder="e.g. Operations alerts">
+    </div>
+    <div class="field">
+      <label for="telegram-token">Bot token</label>
+      <input id="telegram-token" name="token" type="password" maxlength="256" autocomplete="off"
+             autocapitalize="none" spellcheck="false" placeholder="123456789:AA…" required>
+    </div>
+    <label id="telegram-takeover-wrap" class="takeover-check" hidden>
+      <input id="telegram-takeover" type="checkbox">
+      <span><strong>Replace the bot's existing webhook</strong><br><span class="meta-passive">Telegram cannot use a webhook and long polling at the same time. Pending updates will be preserved.</span></span>
+    </label>
+    <p id="telegram-form-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="telegram-cancel" class="btn" type="button">Cancel</button>
+      <button id="telegram-submit" class="btn primary" type="submit">Register bot</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="lifecycle-dialog" aria-labelledby="lifecycle-dialog-h" aria-describedby="lifecycle-dialog-summary">
+  <form id="lifecycle-form" method="dialog" autocomplete="off" novalidate>
+    <div class="dialog-head">
+      <div>
+        <h2 id="lifecycle-dialog-h">Archive resource</h2>
+        <p id="lifecycle-dialog-summary"></p>
+      </div>
+      <button id="lifecycle-dialog-close" class="iconbtn" type="button" aria-label="Close lifecycle dialog" title="Close"></button>
+    </div>
+    <div id="lifecycle-target" class="lifecycle-target"></div>
+    <div class="field" id="lifecycle-reason-wrap">
+      <label for="lifecycle-reason">Reason <span class="opt">(optional)</span></label>
+      <textarea id="lifecycle-reason" maxlength="300" rows="2" placeholder="Why this resource is being archived, restored or removed"></textarea>
+    </div>
+    <div id="lifecycle-plan" class="lifecycle-plan" aria-live="polite"></div>
+    <div class="field lifecycle-confirm" id="lifecycle-confirm-wrap" hidden>
+      <label for="lifecycle-confirm">Type <code id="lifecycle-confirm-phrase"></code> to confirm permanent removal</label>
+      <input id="lifecycle-confirm" type="text" autocomplete="off" autocapitalize="none" spellcheck="false">
+    </div>
+    <p id="lifecycle-form-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="lifecycle-cancel" class="btn" type="button">Cancel</button>
+      <button id="lifecycle-submit" class="btn primary" type="submit">Review archive</button>
     </div>
   </form>
 </dialog>

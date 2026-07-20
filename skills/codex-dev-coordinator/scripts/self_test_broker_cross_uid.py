@@ -15,8 +15,10 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import stat
 import struct
 import sys
+import threading
 import time
 import unittest
 import uuid
@@ -34,7 +36,10 @@ from devcoordinator.broker import (  # noqa: E402
     BrokerRequest,
 )
 from devcoordinator.broker_backend import build_store_backed_broker_runtime  # noqa: E402
-from devcoordinator.broker_enrollment import enroll_repository  # noqa: E402
+from devcoordinator.broker_enrollment import (  # noqa: E402
+    _merge_profile,
+    enroll_repository,
+)
 from devcoordinator.broker_host import LocalBrokerHostMutations  # noqa: E402
 from devcoordinator.broker_persistence import BrokerPersistence  # noqa: E402
 from devcoordinator.repository_lifecycle import (  # noqa: E402
@@ -64,6 +69,17 @@ UNKNOWN_ACCOUNT_ID = "cross-uid-account-unknown"
 SOURCE_ID = "cross-uid-source"
 ENGINE_ID = "cross-uid-engine"
 MAIN_CONTAINER_ID = "cross-uid-container-main"
+
+
+def _rendered_compose_fixture(**arguments: object) -> bytes:
+    services = tuple(str(item) for item in arguments["declared_services"])
+    profiles = tuple(str(item) for item in arguments["profiles"])
+    model = {name: {"image": f"example.invalid/{name}:test"} for name in services}
+    if profiles:
+        model[services[0]]["profiles"] = list(profiles)
+    return json.dumps({"services": model}).encode("utf-8")
+
+
 ORPHAN_CONTAINER_ID = "cross-uid-container-orphan"
 MAIN_CONTROL_ID = "cross-uid-control-main"
 ORPHAN_CONTROL_ID = "cross-uid-control-orphan"
@@ -132,6 +148,13 @@ def _seed_service_database(database_path: Path, port: int) -> BrokerPersistence:
         (SECOND_UID, SECOND_ACCOUNT_ID, SECOND_SERVER_ID),
     ):
         persistence.provision_principal(uid=uid, account_id=account_id)
+        persistence.provision_repository_enrollment(
+            uid=uid,
+            repo_id=REPO_ID,
+            account_id=account_id,
+            issued_at=utc_timestamp(),
+            valid_until_epoch=int(time.time()) + 3_600,
+        )
         persistence.grant_resource(
             uid=uid,
             repo_id=REPO_ID,
@@ -287,9 +310,9 @@ class CrossUIDRuntimeFixture:
     def observe(self, store: AccountStore) -> Mapping[str, Any]:
         """Commit one full-Docker snapshot and the fixture's exact resources."""
 
-        if not isinstance(store, AccountStore):
+        if not isinstance(store, CoordinatorStore):
             raise RuntimeError(
-                "enrollment observation requires the normalized AccountStore adapter"
+                "service observation requires the normalized CoordinatorStore adapter"
             )
         if store.database_path != store.path:
             raise RuntimeError(
@@ -308,7 +331,9 @@ class CrossUIDRuntimeFixture:
                 "SELECT repo_id FROM repositories ORDER BY repo_id LIMIT 1"
             ).fetchone()
             if host is None or repository is None:
-                raise RuntimeError("cross-UID observation lacks host/repository authority")
+                raise RuntimeError(
+                    "cross-UID observation lacks host/repository authority"
+                )
             host_id = str(host["host_id"])
             repo_id = str(repository["repo_id"])
             connection.execute(
@@ -394,9 +419,15 @@ class CrossUIDRuntimeFixture:
                     membership_id, repo_id, resource_kind, host_resource_id,
                     immutable_fingerprint, control_binding_id, created_at
                 ) VALUES ('cross-uid-membership-main', ?, 'container', ?,
-                          'cross-uid-main-membership', ?, ?)
+                          ?, ?, ?)
                 """,
-                (repo_id, MAIN_CONTAINER_ID, MAIN_CONTROL_ID, now),
+                (
+                    repo_id,
+                    MAIN_CONTAINER_ID,
+                    "sha256:" + "7" * 64,
+                    MAIN_CONTROL_ID,
+                    now,
+                ),
             )
             connection.execute(
                 """
@@ -425,7 +456,8 @@ class CrossUIDRuntimeFixture:
                         policy_id,
                         repo_value,
                         resource_id,
-                        "sha256:" + ("5" if resource_id == MAIN_CONTAINER_ID else "6") * 64,
+                        "sha256:"
+                        + ("5" if resource_id == MAIN_CONTAINER_ID else "6") * 64,
                         now,
                     ),
                 )
@@ -459,9 +491,53 @@ class CrossUIDRuntimeFixture:
                     now,
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO broker_observation_compose_scope(
+                    snapshot_id, assets_complete, observed_asset_count,
+                    evidence_fingerprint, recorded_at
+                ) VALUES (?, 1, 0, 'cross-uid-compose-scope', ?)
+                """,
+                (snapshot_id, now),
+            )
+            for resource_id in (MAIN_CONTAINER_ID, ORPHAN_CONTAINER_ID):
+                lifecycle = "running" if self.running[resource_id] else "stopped"
+                connection.execute(
+                    """
+                    INSERT INTO observation_snapshot_resources(
+                        snapshot_id, resource_kind, resource_id,
+                        observation_fingerprint
+                    ) VALUES (?, 'container', ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        resource_id,
+                        f"cross-uid-{resource_id}-{lifecycle}",
+                    ),
+                )
+            main_lifecycle = "running" if self.running[MAIN_CONTAINER_ID] else "stopped"
+            connection.execute(
+                """
+                INSERT INTO broker_observed_compose_containers(
+                    snapshot_id, docker_resource_id, full_container_id,
+                    project_name, service_name, lifecycle, ownership_state,
+                    authoritative_owner_repo_id, observation_fingerprint
+                ) VALUES (?, ?, ?, 'crossuid', 'app', ?, 'exclusive', ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    MAIN_CONTAINER_ID,
+                    MAIN_FULL_ID,
+                    main_lifecycle,
+                    repo_id,
+                    "sha256:" + "7" * 64,
+                ),
+            )
         return {
             "snapshot_id": snapshot_id,
+            "host_id": host_id,
             "observer_domain": OBSERVER_DOMAIN,
+            "joined": False,
             "docker_available": True,
             "capability_fingerprint": capability_fingerprint,
             "material_fingerprint": material_fingerprint,
@@ -500,21 +576,45 @@ class CrossUIDRuntimeFixture:
 
     def compose_up(self, target: Any) -> Mapping[str, Any]:
         self.host_calls.append(("compose.up", target.compose_definition_id))
-        return {"status": "started", "compose_definition_id": target.compose_definition_id}
+        return {
+            "status": "started",
+            "compose_definition_id": target.compose_definition_id,
+        }
+
+    def compose_stop(self, target: Any) -> Mapping[str, Any]:
+        self.host_calls.append(("compose.stop", target.compose_definition_id))
+        return {
+            "status": "stopped",
+            "compose_definition_id": target.compose_definition_id,
+        }
+
+    def compose_restart(self, target: Any) -> Mapping[str, Any]:
+        self.host_calls.append(("compose.restart", target.compose_definition_id))
+        return {
+            "status": "restarted",
+            "compose_definition_id": target.compose_definition_id,
+        }
 
     def compose_down(self, target: Any) -> Mapping[str, Any]:
         self.host_calls.append(("compose.down", target.compose_definition_id))
-        return {"status": "stopped", "compose_definition_id": target.compose_definition_id}
+        return {
+            "status": "stopped",
+            "compose_definition_id": target.compose_definition_id,
+        }
 
     def postgres_backup(self, target: Any, *, output_root: str) -> Mapping[str, Any]:
         del target, output_root
-        raise AssertionError("cross-UID public routing unexpectedly requested PostgreSQL backup")
+        raise AssertionError(
+            "cross-UID public routing unexpectedly requested PostgreSQL backup"
+        )
 
     def postgres_restore(
         self, target: Any, backup: Any, *, safety_output_root: str
     ) -> Mapping[str, Any]:
         del target, backup, safety_output_root
-        raise AssertionError("cross-UID public routing unexpectedly requested PostgreSQL restore")
+        raise AssertionError(
+            "cross-UID public routing unexpectedly requested PostgreSQL restore"
+        )
 
     def observe_exact(self, target: Any) -> ResourceObservation:
         running = bool(self.running[target.resource_id])
@@ -542,9 +642,7 @@ class CrossUIDRuntimeFixture:
             policies=policies,
         )
 
-    def disable_startup_policy(
-        self, target: Any, policy: Any
-    ) -> Mapping[str, Any]:
+    def disable_startup_policy(self, target: Any, policy: Any) -> Mapping[str, Any]:
         self.restart_policy[target.resource_id] = policy.disabled_value
         self.lifecycle_calls.append(("disable_policy", target.resource_id))
         return {"status": "disabled", "policy_id": policy.policy_id}
@@ -671,7 +769,9 @@ def _seed_local_retirement_mirror(
             resolved.immutable_fingerprint != exact["immutable_fingerprint"]
             or resolved.ownership_fingerprint != exact["ownership_fingerprint"]
         ):
-            raise RuntimeError("client lifecycle mirror identity differs from service authority")
+            raise RuntimeError(
+                "client lifecycle mirror identity differs from service authority"
+            )
         with store.read_transaction() as connection:
             repository = connection.execute(
                 "SELECT repo_id FROM repositories WHERE repo_id = ?", (repo_id,)
@@ -681,7 +781,9 @@ def _seed_local_retirement_mirror(
 
 
 def _run_public_cli(arguments: list[str]) -> Any:
-    return dev_coordinator.handle_cli(dev_coordinator.build_parser().parse_args(arguments))
+    return dev_coordinator.handle_cli(
+        dev_coordinator.build_parser().parse_args(arguments)
+    )
 
 
 def _spawn_public_journey(
@@ -711,6 +813,7 @@ def _spawn_public_journey(
             os.environ.update(
                 {
                     "CODEX_AGENT_COORDINATOR_HOME": str(account_home),
+                    "DEVCOORDINATOR_AUTHORITY": "system",
                     "DEVCOORDINATOR_BROKER_PROFILE": str(profile_path),
                     "DEVCOORDINATOR_STATE_BACKEND": "sqlite",
                     "DEVCOORDINATOR_DOCKER_POISON_SENTINEL": str(poison_sentinel),
@@ -718,6 +821,21 @@ def _spawn_public_journey(
                 }
             )
             _initialize_cross_uid_account_store(account_home)
+            client_database = account_home / "coordinator.sqlite3"
+            client_store_before_observe = client_database.read_bytes()
+            observed = _run_public_cli(
+                [
+                    "observe",
+                    "--agent",
+                    "cross-uid-client",
+                    "--project",
+                    str(project_root),
+                ]
+            )
+            observed_inventory = _run_public_cli(
+                ["inventory", "--project", str(project_root)]
+            )
+            client_store_after_observe = client_database.read_bytes()
             leased = _run_public_cli(
                 [
                     "port",
@@ -757,6 +875,22 @@ def _spawn_public_journey(
                     "--detach",
                 ]
             )
+            broker_profile = dev_coordinator.load_broker_profile(required=True)
+            if broker_profile is None:
+                raise RuntimeError("required cross-UID broker profile was not loaded")
+            broker_repository = broker_profile.repository(str(project_root))
+            compose_lifecycle = [compose]
+            for action in ("stop", "restart", "down"):
+                compose_lifecycle.append(
+                    dev_coordinator.coordinated_broker_compose_command(
+                        profile=broker_profile,
+                        repository=broker_repository,
+                        command=["docker", "compose", action],
+                        cwd=str(project_root),
+                        project=str(project_root),
+                        agent="cross-uid-client",
+                    )
+                )
             identity_arguments = [
                 "--resource-kind",
                 exact["resource_kind"],
@@ -880,10 +1014,20 @@ def _spawn_public_journey(
                 {
                     "status": "success",
                     "uid": os.geteuid(),
+                    "observe_snapshot_id": observed["snapshot_id"],
+                    "observe_revision": observed["observation_revision"],
+                    "inventory_revision": observed_inventory["store"][
+                        "observation_revision"
+                    ],
+                    "observe_client_store_unchanged": (
+                        client_store_before_observe == client_store_after_observe
+                    ),
                     "lease_port": leased["port"],
                     "docker_operation": docker["broker"]["operation"],
                     "compose_operations": [
-                        row["operation"] for row in compose["broker"]["operations"]
+                        row["operation"]
+                        for lifecycle in compose_lifecycle
+                        for row in lifecycle["broker"]["operations"]
                     ],
                     "mirror_failure": mirror_failure,
                     "reconciled": reconciled,
@@ -924,6 +1068,132 @@ def _spawn_public_journey(
     "real cross-UID broker acceptance requires Linux root",
 )
 class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
+    def test_concurrent_root_profile_publication_retains_both_uid_enrollments(
+        self,
+    ) -> None:
+        root = Path("/run") / ("devcoordinator-profile-lock-" + uuid.uuid4().hex)
+        profile_path = root / "profiles" / "client-profiles.json"
+        try:
+            root.mkdir(mode=0o750)
+            os.chown(root, SERVICE_UID, ACCESS_GID)
+            profile_path.parent.mkdir(mode=0o750)
+            os.chown(profile_path.parent, SERVICE_UID, ACCESS_GID)
+            barrier = threading.Barrier(2)
+            failures: list[BaseException] = []
+            service = {
+                "socket": str(root / "broker.sock"),
+                "uid": SERVICE_UID,
+                "gid": ACCESS_GID,
+                "mode": "0660",
+                "database_generation": "cross-uid-profile-generation",
+            }
+
+            def publish(
+                uid: int,
+                account_id: str,
+                repo_id: str,
+                suffix: str,
+            ) -> None:
+                try:
+                    barrier.wait(timeout=5.0)
+                    _merge_profile(
+                        profile_path=profile_path,
+                        service=service,
+                        client_uid=uid,
+                        account_id=account_id,
+                        repository={
+                            "canonical_root": str(root / suffix),
+                            "repo_id": repo_id,
+                            "generation": 0,
+                            "servers": {},
+                            "containers": {},
+                            "compose_definition_id": None,
+                        },
+                        issued_at=utc_timestamp(),
+                        valid_until_epoch=int(time.time()) + 3_600,
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+
+            workers = (
+                threading.Thread(
+                    target=publish,
+                    args=(FIRST_UID, FIRST_ACCOUNT_ID, "repo-first", "first"),
+                ),
+                threading.Thread(
+                    target=publish,
+                    args=(SECOND_UID, SECOND_ACCOUNT_ID, "repo-second", "second"),
+                ),
+            )
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10.0)
+
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual(failures, [])
+            document = json.loads(profile_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(document["clients"]), {str(FIRST_UID), str(SECOND_UID)}
+            )
+            self.assertEqual(
+                document["clients"][str(FIRST_UID)]["account_id"],
+                FIRST_ACCOUNT_ID,
+            )
+            self.assertEqual(
+                document["clients"][str(SECOND_UID)]["account_id"],
+                SECOND_ACCOUNT_ID,
+            )
+            before = profile_path.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "different account"):
+                _merge_profile(
+                    profile_path=profile_path,
+                    service=service,
+                    client_uid=FIRST_UID,
+                    account_id="cross-uid-account-replacement",
+                    repository={
+                        "canonical_root": str(root / "replacement"),
+                        "repo_id": "repo-replacement",
+                        "generation": 0,
+                        "servers": {},
+                        "containers": {},
+                        "compose_definition_id": None,
+                    },
+                    issued_at=utc_timestamp(),
+                    valid_until_epoch=int(time.time()) + 7_200,
+                )
+            self.assertEqual(profile_path.read_bytes(), before)
+            first_expiry = document["clients"][str(FIRST_UID)]["repositories"][0][
+                "valid_until_epoch"
+            ]
+            later_expiry = int(time.time()) + 7_200
+            _merge_profile(
+                profile_path=profile_path,
+                service=service,
+                client_uid=FIRST_UID,
+                account_id=FIRST_ACCOUNT_ID,
+                repository={
+                    "canonical_root": str(root / "first-second-repository"),
+                    "repo_id": "repo-first-second",
+                    "generation": 0,
+                    "servers": {},
+                    "containers": {},
+                    "compose_definition_id": None,
+                },
+                issued_at=utc_timestamp(),
+                valid_until_epoch=later_expiry,
+            )
+            updated = json.loads(profile_path.read_text(encoding="utf-8"))
+            first_repositories = updated["clients"][str(FIRST_UID)]["repositories"]
+            expiries = {
+                item["repo_id"]: item["valid_until_epoch"]
+                for item in first_repositories
+            }
+            self.assertEqual(expiries["repo-first"], first_expiry)
+            self.assertEqual(expiries["repo-first-second"], later_expiry)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_root_enrollment_and_public_cross_uid_lifecycle_journey(self) -> None:
         root = Path("/run") / ("devcoordinator-public-crossuid-" + uuid.uuid4().hex)
         runtime_directory = root / "runtime"
@@ -938,8 +1208,10 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
         child: tuple[int, int, int] | None = None
         try:
             root.mkdir(mode=0o750)
+            root.chmod(0o750)
             os.chown(root, SERVICE_UID, ACCESS_GID)
             runtime_directory.mkdir(mode=0o750)
+            runtime_directory.chmod(0o750)
             os.chown(runtime_directory, SERVICE_UID, ACCESS_GID)
             database_path.parent.mkdir(mode=0o700)
             project_root.mkdir(mode=0o750)
@@ -953,7 +1225,7 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
             poison_directory.mkdir(mode=0o755)
             poison = poison_directory / "docker"
             poison.write_text(
-                "#!/bin/sh\ntouch \"$DEVCOORDINATOR_DOCKER_POISON_SENTINEL\"\nexit 97\n",
+                '#!/bin/sh\ntouch "$DEVCOORDINATOR_DOCKER_POISON_SENTINEL"\nexit 97\n',
                 encoding="utf-8",
             )
             poison.chmod(0o755)
@@ -986,9 +1258,43 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                     "services": ["app"],
                     "project_name": "crossuid",
                 },
+                compose_model_renderer=_rendered_compose_fixture,
                 observe_host=fixture.observe,
                 validity_seconds=3_600,
             )
+            protected_profile_before = profile_path.read_bytes()
+            with self.assertRaises(BrokerError) as account_conflict:
+                enroll_repository(
+                    database_path=database_path,
+                    socket_path=socket_path,
+                    socket_gid=ACCESS_GID,
+                    client_uid=FIRST_UID,
+                    account_id="cross-uid-account-replacement",
+                    canonical_root=str(project_root),
+                    servers=(
+                        {
+                            "name": "server-a",
+                            "cwd": str(project_root),
+                            "argv": ["/usr/bin/false"],
+                        },
+                    ),
+                    port_start=port,
+                    port_end=port,
+                    profile_path=profile_path,
+                    compose={
+                        "declared": True,
+                        "files": [str(compose_file)],
+                        "services": ["app"],
+                        "project_name": "crossuid",
+                    },
+                    compose_model_renderer=_rendered_compose_fixture,
+                    observe_host=fixture.observe,
+                    validity_seconds=3_600,
+                )
+            self.assertEqual(
+                account_conflict.exception.code, "principal_account_conflict"
+            )
+            self.assertEqual(profile_path.read_bytes(), protected_profile_before)
             repo_id = str(enrollment["repo_id"])
             profile_parent = profile_path.parent.stat()
             profile_metadata = profile_path.stat()
@@ -1006,7 +1312,9 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
             with CoordinatorStore.open(
                 database_path, expected_uid=SERVICE_UID
             ) as store:
-                exact_ref = SQLiteLifecyclePersistence(store).resolve_standalone_resource(
+                exact_ref = SQLiteLifecyclePersistence(
+                    store
+                ).resolve_standalone_resource(
                     ResourceKind.CONTAINER,
                     ORPHAN_CONTAINER_ID,
                     ORPHAN_CONTROL_ID,
@@ -1050,9 +1358,22 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "success", result)
             self.assertEqual(result["uid"], FIRST_UID)
+            self.assertTrue(result["observe_snapshot_id"], result)
+            self.assertEqual(
+                result["inventory_revision"], result["observe_revision"], result
+            )
+            self.assertTrue(result["observe_client_store_unchanged"], result)
             self.assertEqual(result["lease_port"], port)
             self.assertEqual(result["docker_operation"], "docker.start")
-            self.assertEqual(result["compose_operations"], ["compose.up"])
+            self.assertEqual(
+                result["compose_operations"],
+                [
+                    "compose.up",
+                    "compose.stop",
+                    "compose.restart",
+                    "compose.down",
+                ],
+            )
             self.assertEqual(result["reconciled"]["resolved"], 1)
             self.assertEqual(result["reconciled"]["pending"], 0)
             self.assertEqual(result["removed_status"], "succeeded")
@@ -1065,6 +1386,15 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                 ("compose.up", str(enrollment["compose_definition_id"])),
                 fixture.host_calls,
             )
+            for operation in (
+                "compose.stop",
+                "compose.restart",
+                "compose.down",
+            ):
+                self.assertIn(
+                    (operation, str(enrollment["compose_definition_id"])),
+                    fixture.host_calls,
+                )
             self.assertEqual(
                 fixture.lifecycle_calls,
                 [

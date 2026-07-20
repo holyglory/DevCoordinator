@@ -42,10 +42,48 @@ export const COORDINATOR_SCRIPT = path.join(
 import { DEV_CERT, DEV_KEY, ensureDevCert } from './dev-cert.mjs';
 
 const execFileAsync = promisify(execFile);
+const INVENTORY_WIRE_SCHEMA_VERSION = 2;
+// Keep the Console's real-stack authority gate pinned to the canonical store
+// schema. Schema v4 adds the durable insertion-ordered event journal consumed
+// by Telegram notifications.
+const COORDINATOR_STORE_SCHEMA_VERSION = 4;
 
-async function canonicalTempDir(prefix) {
-  const created = await fsp.mkdtemp(path.join(os.tmpdir(), prefix));
-  return fsp.realpath(created);
+async function isOutsideGitWorktree(base) {
+  let cursor = path.resolve(base);
+  for (;;) {
+    try {
+      await fsp.lstat(path.join(cursor, '.git'));
+      return false;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return true;
+    cursor = parent;
+  }
+}
+
+export async function canonicalTempDir(prefix) {
+  // The backup guard intentionally rejects any path below a Git marker. Test
+  // roots therefore cannot trust global /tmp: a developer may legitimately
+  // have /tmp/.git. Select and verify one canonical, user-writable base first.
+  const candidates = [
+    process.env.DEVCOORDINATOR_TEST_TMP_ROOT,
+    os.homedir(),
+    os.tmpdir(),
+  ].filter(Boolean);
+  for (const candidate of [...new Set(candidates)]) {
+    let base;
+    try {
+      base = await fsp.realpath(candidate);
+      if (!(await isOutsideGitWorktree(base))) continue;
+      const created = await fsp.mkdtemp(path.join(base, prefix));
+      return fsp.realpath(created);
+    } catch (error) {
+      if (!['EACCES', 'ENOENT', 'EROFS'].includes(error?.code)) throw error;
+    }
+  }
+  throw new Error('no writable test temp root outside every Git worktree');
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +378,7 @@ async function initializeNormalizedCoordinator(home, extraEnv = {}, { expectDock
 
   const imported = observation?.imported;
   if (
-    observation?.schema_version !== 2
+    observation?.schema_version !== INVENTORY_WIRE_SCHEMA_VERSION
     || observation?.status !== 'completed'
     || observation?.observer_domain !== 'host-runtime-v2:full-docker'
     || imported?.committed !== true
@@ -348,7 +386,7 @@ async function initializeNormalizedCoordinator(home, extraEnv = {}, { expectDock
     || imported?.blocking_conflict_count !== 0
   ) {
     throw new Error(
-      `E2E coordinator bootstrap must commit one conflict-free legacy seed into a schema-v2 full-Docker observation: ${JSON.stringify(observation)}`,
+      `E2E coordinator bootstrap must commit one conflict-free legacy seed into a wire-schema-v${INVENTORY_WIRE_SCHEMA_VERSION} full-Docker observation: ${JSON.stringify(observation)}`,
     );
   }
   if (expectDocker && observation?.observed !== true) {
@@ -365,8 +403,8 @@ async function assertNormalizedCoordinatorAuthority(coordinator, initialization,
   );
   if (
     initialization?.observation?.imported?.blocking_conflict_count !== 0
-    || inventory?.schema_version !== 2
-    || inventory?.store?.schema_version !== 2
+    || inventory?.schema_version !== INVENTORY_WIRE_SCHEMA_VERSION
+    || inventory?.store?.schema_version !== COORDINATOR_STORE_SCHEMA_VERSION
     || inventory?.store?.authority_mode !== 'sqlite'
     || inventory?.store?.migration_state !== 'ready'
     || inventory?.coordinator_home !== canonicalHome
@@ -374,7 +412,7 @@ async function assertNormalizedCoordinatorAuthority(coordinator, initialization,
     || !completedFullDockerSnapshot
   ) {
     throw new Error(
-      `E2E coordinator authority guard failed (expected schema v2, sqlite/ready, no blocking migration conflicts, and one committed full-Docker snapshot): ${JSON.stringify({ initialization, inventory })}`,
+      `E2E coordinator authority guard failed (expected inventory wire schema v${INVENTORY_WIRE_SCHEMA_VERSION}, store schema v${COORDINATOR_STORE_SCHEMA_VERSION}, sqlite/ready, no blocking migration conflicts, and one committed full-Docker snapshot): ${JSON.stringify({ initialization, inventory })}`,
     );
   }
   if (expectDocker && inventory?.docker?.available !== true) {
@@ -504,7 +542,7 @@ async function spawnCoordinator(home, extraEnv = {}, { expectDocker = false } = 
       project,
     });
     if (
-      result?.schema_version !== 2
+      result?.schema_version !== INVENTORY_WIRE_SCHEMA_VERSION
       || result?.status !== 'completed'
       || result?.observer_domain !== 'host-runtime-v2:full-docker'
       || (result?.imported?.blocking_conflict_count ?? 0) !== 0

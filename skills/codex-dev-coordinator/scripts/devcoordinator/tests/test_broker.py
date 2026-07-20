@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import hashlib
 import os
@@ -18,13 +19,14 @@ import unittest
 import uuid
 from unittest import mock
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 
 SCRIPTS_ROOT = Path(__file__).resolve().parents[2]
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+import dev_coordinator  # noqa: E402
 from devcoordinator.broker import (  # noqa: E402
     AccountAccessPolicy,
     AuthorizedBrokerRequest,
@@ -42,7 +44,9 @@ from devcoordinator.broker import (  # noqa: E402
     validate_runtime_directory,
 )
 import devcoordinator.broker as broker_module  # noqa: E402
+import devcoordinator.broker_persistence as broker_persistence  # noqa: E402
 from devcoordinator.broker_backend import (  # noqa: E402
+    StoreBackedBrokerRuntime,
     StoreBackedMutationBackend,
     build_store_backed_broker_runtime,
 )
@@ -50,6 +54,7 @@ from devcoordinator.broker_persistence import (  # noqa: E402
     BrokerPersistence,
     StoreBackedAuthorizer,
 )
+from devcoordinator.observer import SingleFlightObserver  # noqa: E402
 from devcoordinator.repository_lifecycle import (  # noqa: E402
     PolicyObservation,
     ResourceObservation,
@@ -57,7 +62,7 @@ from devcoordinator.repository_lifecycle import (  # noqa: E402
     RunningState,
 )
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence  # noqa: E402
-from devcoordinator.store import CoordinatorStore, utc_timestamp  # noqa: E402
+from devcoordinator.store import AccountStore, CoordinatorStore, utc_timestamp  # noqa: E402
 
 
 ACCOUNT_ID = "account-current"
@@ -288,6 +293,41 @@ class RecordingPostgresHostActions(RecordingTypedHostActions):
             ],
             "safety_backup": safety,
         }
+
+
+class BlockingPostgresHostActions(RecordingPostgresHostActions):
+    """Production-shaped database boundary with deterministic release/failure."""
+
+    def __init__(
+        self,
+        entered: threading.Event,
+        release: threading.Event,
+        *,
+        fail_after_release: bool = False,
+    ) -> None:
+        super().__init__()
+        self.entered = entered
+        self.release = release
+        self.fail_after_release = fail_after_release
+
+    def postgres_backup(
+        self, target: Any, *, output_root: str
+    ) -> Mapping[str, Any]:
+        self.postgres_calls.append(
+            ("backup", target.full_container_id, target.database_name)
+        )
+        self.entered.set()
+        if not self.release.wait(timeout=5.0):
+            raise RuntimeError("PostgreSQL shutdown-drain fixture timed out")
+        if self.fail_after_release:
+            raise RuntimeError("injected drained PostgreSQL backup failure")
+        self._published += 1
+        return _publish_strong_postgres_backup(
+            output_root,
+            full_container_id=target.full_container_id,
+            database_name=target.database_name,
+            marker=f"drained-{self._published}",
+        )
 
 
 class BlockingTypedHostActions(RecordingTypedHostActions):
@@ -567,6 +607,13 @@ def seed_store_backed_broker(
                     ),
                 )
     persistence.provision_principal(uid=os.geteuid(), account_id=ACCOUNT_ID)
+    persistence.provision_repository_enrollment(
+        uid=os.geteuid(),
+        repo_id=PROJECT_ID,
+        account_id=ACCOUNT_ID,
+        issued_at=utc_timestamp(),
+        valid_until_epoch=int(time.time()) + 3_600,
+    )
     for resource_id in (CONTAINER_ID, SECOND_CONTAINER_ID):
         for operation in (
             BrokerOperation.DOCKER_START,
@@ -675,11 +722,13 @@ def store_backed_service(
     )
 
 
-def _committed_available_observer(store: CoordinatorStore) -> Mapping[str, Any]:
+def _committed_observer(
+    store: CoordinatorStore, *, docker_available: bool
+) -> Mapping[str, Any]:
     snapshot_id = str(uuid.uuid4())
     completed_at = utc_timestamp()
     material = "1" * 64
-    capability = "sha256:" + "2" * 64
+    capability = "sha256:" + ("2" if docker_available else "3") * 64
     with store.immediate_transaction(revision_kind="observation") as connection:
         host_id = str(
             connection.execute("SELECT host_id FROM hosts ORDER BY host_id LIMIT 1").fetchone()[0]
@@ -698,9 +747,9 @@ def _committed_available_observer(store: CoordinatorStore) -> Mapping[str, Any]:
             INSERT INTO observation_capabilities(
                 snapshot_id, observer_domain, docker_available,
                 capability_fingerprint, committed_at
-            ) VALUES (?, 'host-runtime-v2:full-docker', 1, ?, ?)
+            ) VALUES (?, 'host-runtime-v2:full-docker', ?, ?, ?)
             """,
-            (snapshot_id, capability, completed_at),
+            (snapshot_id, int(docker_available), capability, completed_at),
         )
         pending = connection.execute(
             """
@@ -729,12 +778,18 @@ def _committed_available_observer(store: CoordinatorStore) -> Mapping[str, Any]:
             )
     return {
         "snapshot_id": snapshot_id,
+        "host_id": host_id,
         "observer_domain": "host-runtime-v2:full-docker",
-        "docker_available": True,
+        "docker_available": docker_available,
         "capability_fingerprint": capability,
         "material_fingerprint": material,
+        "started_at": completed_at,
         "completed_at": completed_at,
     }
+
+
+def _committed_available_observer(store: CoordinatorStore) -> Mapping[str, Any]:
+    return _committed_observer(store, docker_available=True)
 
 
 class PeerCredentialTests(unittest.TestCase):
@@ -840,6 +895,61 @@ class AuthorizationAndProtocolTests(unittest.TestCase):
         rejected = bounded_service.reply_for_document(self.peer, request.to_wire())
         self.assertFalse(rejected["ok"], rejected)
         self.assertEqual(rejected["error"]["code"], "backend_result_too_large")
+
+    def test_host_observe_reaches_database_single_flight_without_outer_repo_lock(self) -> None:
+        release = threading.Event()
+        backend = RecordingBackend(release=release)
+        observation_policy = {
+            os.geteuid(): AccountAccessPolicy(
+                account_id=ACCOUNT_ID,
+                grants={
+                    PROJECT_ID: {
+                        PROJECT_ID: frozenset({BrokerOperation.HOST_OBSERVE})
+                    }
+                },
+            )
+        }
+        writer = SerializedMutationWriter(backend)
+        service = BrokerService(StaticPeerAuthorizer(observation_policy), writer)
+        requests = [
+            request_for(BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID),
+            request_for(BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID),
+        ]
+        replies: list[dict[str, Any]] = []
+        failures: list[BaseException] = []
+
+        def invoke(request: BrokerRequest) -> None:
+            try:
+                replies.append(
+                    service.reply_for_document(self.peer, request.to_wire())
+                )
+            except BaseException as error:  # pragma: no cover - diagnostic path
+                failures.append(error)
+
+        workers = [threading.Thread(target=invoke, args=(request,)) for request in requests]
+        for worker in workers:
+            worker.start()
+        deadline = time.monotonic() + 1.0
+        reached_backend_together = False
+        try:
+            while time.monotonic() < deadline:
+                if backend.max_active >= 2:
+                    reached_backend_together = True
+                    break
+                time.sleep(0.01)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(timeout=2.0)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers), failures)
+        self.assertEqual(failures, [])
+        self.assertTrue(
+            reached_backend_together,
+            "same-repository observations were serialized before the durable host-domain single-flight boundary",
+        )
+        self.assertEqual(len(replies), 2)
+        self.assertTrue(all(reply["ok"] for reply in replies), replies)
 
     def test_unknown_peer_and_cross_account_project_resource_operation_are_rejected(self) -> None:
         cases: list[tuple[str, PeerCredentials, dict[str, Any], str]] = []
@@ -1019,6 +1129,38 @@ class AuthorizationAndProtocolTests(unittest.TestCase):
             conflict_reply["error"]["code"], "operation_id_conflict"
         )
 
+    def test_service_shutting_down_error_does_not_poison_operation_replay(self) -> None:
+        class ShuttingDownOnceBackend:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def execute(
+                self, _request: AuthorizedBrokerRequest
+            ) -> Mapping[str, Any]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise BrokerError(
+                        "service_shutting_down",
+                        "The broker is shutting down; retry with its replacement.",
+                    )
+                return {"status": "stopped"}
+
+        backend = ShuttingDownOnceBackend()
+        writer = SerializedMutationWriter(backend)  # type: ignore[arg-type]
+        service = BrokerService(
+            StaticPeerAuthorizer(policy_for(os.geteuid())), writer
+        )
+        request = request_for()
+
+        first = service.reply_for_document(self.peer, request.to_wire())
+        retried = service.reply_for_document(self.peer, request.to_wire())
+
+        self.assertFalse(first["ok"], first)
+        self.assertEqual(first["error"]["code"], "service_shutting_down")
+        self.assertTrue(retried["ok"], retried)
+        self.assertEqual(retried["result"]["status"], "stopped")
+        self.assertEqual(backend.calls, 2)
+
 
 class SingleWriterConcurrencyTests(unittest.TestCase):
     def _run_reply(
@@ -1125,6 +1267,126 @@ class SingleWriterConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(backend.calls), 1)
         self.assertEqual(len(replies), 2)
         self.assertEqual(replies[0], replies[1])
+
+    def test_shutdown_rejects_pre_fence_waiter_before_backend_admission(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        backend = RecordingBackend(entered=entered, release=release)
+        service, writer = service_for(backend)
+        peer = peer_for()
+        replies: list[dict[str, Any]] = []
+        failures: list[BaseException] = []
+        first = threading.Thread(
+            target=self._run_reply,
+            args=(
+                service,
+                peer,
+                request_for(BrokerOperation.DOCKER_STOP),
+                replies,
+                failures,
+            ),
+        )
+        second = threading.Thread(
+            target=self._run_reply,
+            args=(
+                service,
+                peer,
+                request_for(BrokerOperation.DOCKER_START),
+                replies,
+                failures,
+            ),
+        )
+        first.start()
+        self.assertTrue(
+            entered.wait(timeout=1.0),
+            f"first mutation missed backend boundary; failures={failures!r}",
+        )
+        second.start()
+        self.assertTrue(
+            writer.wait_for_queued(1, timeout=1.0),
+            f"second mutation missed keyed wait boundary; failures={failures!r}",
+        )
+        self.assertEqual(writer.begin_shutdown(), 1)
+        release.set()
+        first.join(timeout=2.0)
+        second.join(timeout=2.0)
+
+        self.assertFalse(first.is_alive(), failures)
+        self.assertFalse(second.is_alive(), failures)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(backend.calls), 1)
+        self.assertTrue(writer.wait_for_drain(0.1))
+        self.assertEqual(len(replies), 2)
+        accepted = [reply for reply in replies if reply["ok"]]
+        rejected = [reply for reply in replies if not reply["ok"]]
+        self.assertEqual(len(accepted), 1, replies)
+        self.assertEqual(len(rejected), 1, replies)
+        self.assertEqual(
+            rejected[0]["error"]["code"], "service_shutting_down"
+        )
+
+    def test_busy_host_observation_does_not_poison_operation_replay(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingObservationBackend:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self.calls = 0
+
+            def execute(
+                self, _request: AuthorizedBrokerRequest
+            ) -> Mapping[str, Any]:
+                with self._lock:
+                    self.calls += 1
+                    call_number = self.calls
+                if call_number == 1:
+                    entered.set()
+                    if not release.wait(timeout=2.0):
+                        raise RuntimeError("host observation fixture timed out")
+                return {"observed": True}
+
+        backend = BlockingObservationBackend()
+        writer = SerializedMutationWriter(
+            backend,  # type: ignore[arg-type]
+            max_concurrent_host_observations=1,
+        )
+
+        def authorized_observation() -> AuthorizedBrokerRequest:
+            return AuthorizedBrokerRequest(
+                peer=peer_for(),
+                request=request_for(
+                    BrokerOperation.HOST_OBSERVE,
+                    resource_id=PROJECT_ID,
+                ),
+            )
+
+        first_failures: list[BaseException] = []
+
+        def run_first() -> None:
+            try:
+                writer.execute(authorized_observation())
+            except BaseException as error:
+                first_failures.append(error)
+
+        first = threading.Thread(target=run_first)
+        first.start()
+        self.assertTrue(entered.wait(timeout=1.0))
+        retry_request = authorized_observation()
+
+        with self.assertRaises(BrokerError) as busy:
+            writer.execute(retry_request)
+        self.assertEqual(busy.exception.code, "host_observation_busy")
+        self.assertEqual(backend.calls, 1)
+
+        release.set()
+        first.join(timeout=2.0)
+        self.assertFalse(first.is_alive(), first_failures)
+        self.assertEqual(first_failures, [])
+
+        retried = writer.execute(retry_request)
+        self.assertEqual(retried, {"observed": True})
+        self.assertEqual(backend.calls, 2)
 
     def test_different_operations_on_one_exact_resource_serialize(self) -> None:
         entered = threading.Event()
@@ -1311,7 +1573,7 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
                 socket_path,
                 service,
                 max_clients=1,
-                request_timeout_seconds=30.0,
+                request_timeout_seconds=0.1,
                 shutdown_timeout_seconds=1.0,
             )
             server.start()
@@ -1346,6 +1608,157 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
                 if server._socket_identity is not None:
                     server.close()
             self.assertEqual(backend.calls, [])
+
+    def test_host_observation_saturation_preserves_socket_capacity_for_other_work(
+        self,
+    ) -> None:
+        release = threading.Event()
+        two_observers_entered = threading.Event()
+
+        class HostBlockingBackend:
+            def __init__(self) -> None:
+                self.lock = threading.Lock()
+                self.active_observers = 0
+                self.operations: list[BrokerOperation] = []
+
+            def execute(
+                self, request: AuthorizedBrokerRequest
+            ) -> Mapping[str, Any]:
+                operation = request.request.operation
+                with self.lock:
+                    self.operations.append(operation)
+                    if operation == BrokerOperation.HOST_OBSERVE:
+                        self.active_observers += 1
+                        if self.active_observers == 2:
+                            two_observers_entered.set()
+                try:
+                    if operation == BrokerOperation.HOST_OBSERVE:
+                        if not release.wait(timeout=4.0):
+                            raise RuntimeError(
+                                "host observation capacity fixture timed out"
+                            )
+                    return {"operation": operation.value, "accepted": True}
+                finally:
+                    if operation == BrokerOperation.HOST_OBSERVE:
+                        with self.lock:
+                            self.active_observers -= 1
+
+        backend = HostBlockingBackend()
+        grants = {
+            os.geteuid(): AccountAccessPolicy(
+                account_id=ACCOUNT_ID,
+                grants={
+                    PROJECT_ID: {
+                        PROJECT_ID: frozenset(
+                            {
+                                BrokerOperation.HOST_OBSERVE,
+                                BrokerOperation.INVENTORY_READ,
+                            }
+                        ),
+                        CONTAINER_ID: frozenset({BrokerOperation.DOCKER_STOP}),
+                    }
+                },
+            )
+        }
+        service = BrokerService(
+            StaticPeerAuthorizer(grants),
+            SerializedMutationWriter(
+                backend,  # type: ignore[arg-type]
+                max_concurrent_host_observations=2,
+            ),
+        )
+
+        with CanonicalTemporaryDirectory() as root:
+            runtime_dir = root / "runtime"
+            runtime_dir.mkdir(mode=0o750)
+            os.chmod(runtime_dir, 0o750)
+            socket_path = runtime_dir / "broker.sock"
+            server = UnixBrokerServer(socket_path, service, max_clients=4)
+            server.start()
+            replies: list[dict[str, Any]] = []
+            failures: list[BaseException] = []
+
+            def call_observe() -> None:
+                try:
+                    replies.append(
+                        BrokerClient(
+                            socket_path,
+                            expected_broker_uid=os.geteuid(),
+                            expected_socket_gid=os.getegid(),
+                            timeout_seconds=5.0,
+                        ).call(
+                            request_for(
+                                BrokerOperation.HOST_OBSERVE,
+                                resource_id=PROJECT_ID,
+                            )
+                        )
+                    )
+                except BaseException as error:  # pragma: no cover - diagnostics
+                    failures.append(error)
+
+            workers = [threading.Thread(target=call_observe) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            try:
+                self.assertTrue(
+                    two_observers_entered.wait(timeout=2.0),
+                    "two long observations did not reach the backend boundary",
+                )
+
+                started = time.monotonic()
+                excess = BrokerClient(
+                    socket_path,
+                    expected_broker_uid=os.geteuid(),
+                    expected_socket_gid=os.getegid(),
+                    timeout_seconds=1.0,
+                ).call(
+                    request_for(
+                        BrokerOperation.HOST_OBSERVE,
+                        resource_id=PROJECT_ID,
+                    )
+                )
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertFalse(excess["ok"], excess)
+                self.assertEqual(
+                    excess["error"]["code"], "host_observation_busy"
+                )
+
+                inventory = BrokerClient(
+                    socket_path,
+                    expected_broker_uid=os.geteuid(),
+                    expected_socket_gid=os.getegid(),
+                    timeout_seconds=1.0,
+                ).call(
+                    request_for(
+                        BrokerOperation.INVENTORY_READ,
+                        resource_id=PROJECT_ID,
+                    )
+                )
+                mutation = BrokerClient(
+                    socket_path,
+                    expected_broker_uid=os.geteuid(),
+                    expected_socket_gid=os.getegid(),
+                    timeout_seconds=1.0,
+                ).call(request_for(BrokerOperation.DOCKER_STOP))
+                self.assertTrue(inventory["ok"], inventory)
+                self.assertTrue(mutation["ok"], mutation)
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(timeout=3.0)
+                server.close()
+
+        self.assertFalse(any(worker.is_alive() for worker in workers), failures)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(replies), 2)
+        self.assertTrue(all(reply["ok"] for reply in replies), replies)
+        self.assertEqual(
+            backend.operations.count(BrokerOperation.HOST_OBSERVE),
+            2,
+            "the rejected observation must not consume backend or single-flight work",
+        )
+        self.assertIn(BrokerOperation.INVENTORY_READ, backend.operations)
+        self.assertIn(BrokerOperation.DOCKER_STOP, backend.operations)
 
     def test_client_reads_authenticated_busy_reply_after_send_reports_broken_pipe(
         self,
@@ -1563,6 +1976,1010 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
 
 
 class StoreBackedBrokerTests(unittest.TestCase):
+    def test_host_observe_runtime_supplies_production_snapshot_store_contract(
+        self,
+    ) -> None:
+        callback_store_types: list[type[CoordinatorStore]] = []
+
+        def production_snapshot_observer(
+            store: CoordinatorStore,
+        ) -> Mapping[str, Any]:
+            callback_store_types.append(type(store))
+            return dev_coordinator.observe_broker_service_store_for_enrollment(store)
+
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            persistence.grant_host_observation(
+                uid=os.geteuid(), repo_id=PROJECT_ID
+            )
+            service = BrokerService(
+                StoreBackedAuthorizer(persistence),
+                SerializedMutationWriter(
+                    StoreBackedMutationBackend(
+                        persistence,
+                        actions,
+                        observe_before_lifecycle_plan=production_snapshot_observer,
+                    )
+                ),
+            )
+
+            with mock.patch.object(
+                dev_coordinator,
+                "build_inventory",
+                return_value={
+                    "servers": [],
+                    "docker": {
+                        "available": True,
+                        "containers": [],
+                        "postgres": [],
+                    },
+                    "postgres": [],
+                },
+            ):
+                reply = service.reply_for_document(
+                    peer_for(),
+                    request_for(
+                        BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID
+                    ).to_wire(),
+                )
+
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(callback_store_types, [AccountStore])
+        self.assertEqual(reply["result"]["status"], "completed")
+
+    def test_runtime_close_serializes_every_shutdown_failure_without_private_text(
+        self,
+    ) -> None:
+        class FailingBackend:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def begin_shutdown_host_observations(self) -> int:
+                self.calls += 1
+                raise RuntimeError(f"private cleanup diagnostic {self.calls}")
+
+        class FailingServer:
+            def close(self, *, timeout_seconds: float | None = None) -> None:
+                del timeout_seconds
+                raise BrokerError(
+                    "shutdown_timeout",
+                    "Broker clients did not drain before the shutdown deadline.",
+                )
+
+        class FailingWriter:
+            def begin_shutdown(self) -> int:
+                raise RuntimeError("private mutation-fence diagnostic")
+
+            def wait_for_drain(self, _timeout: float) -> bool:
+                raise RuntimeError("private mutation-drain diagnostic")
+
+        backend = FailingBackend()
+        runtime = StoreBackedBrokerRuntime(
+            persistence=mock.Mock(),
+            backend=backend,  # type: ignore[arg-type]
+            writer=FailingWriter(),  # type: ignore[arg-type]
+            service=mock.Mock(),
+            server=FailingServer(),  # type: ignore[arg-type]
+            shutdown_timeout_seconds=0.1,
+        )
+
+        with self.assertRaises(BrokerError) as raised:
+            runtime.close()
+
+        self.assertEqual(raised.exception.code, "broker_shutdown_failed")
+        message = raised.exception.message
+        self.assertIn("mutation admission fence: RuntimeError", message)
+        self.assertIn("mutation drain: RuntimeError", message)
+        self.assertIn("initial observation cleanup: RuntimeError", message)
+        self.assertIn("server drain: shutdown_timeout", message)
+        self.assertIn("final observation cleanup: RuntimeError", message)
+        self.assertNotIn("private cleanup diagnostic", message)
+        self.assertEqual(backend.calls, 2)
+
+    def test_shutdown_fences_late_database_mutation_and_drains_accepted_result(
+        self,
+    ) -> None:
+        for fail_after_release in (False, True):
+            with self.subTest(fail_after_release=fail_after_release), CanonicalTemporaryDirectory() as root:
+                persistence, _unused = seed_store_backed_broker(root)
+                seed_postgres_database(persistence)
+                entered = threading.Event()
+                release = threading.Event()
+                actions = BlockingPostgresHostActions(
+                    entered,
+                    release,
+                    fail_after_release=fail_after_release,
+                )
+                runtime = build_store_backed_broker_runtime(
+                    database_path=persistence.database_path,
+                    socket_path=root / "runtime/broker.sock",
+                    host_mutations=actions,
+                    service_uid=os.geteuid(),
+                    access_gid=os.getegid(),
+                    shutdown_timeout_seconds=3.0,
+                    observe_before_lifecycle_plan=_committed_available_observer,
+                )
+                first_request = request_for(
+                    BrokerOperation.DATABASE_BACKUP,
+                    arguments={"database_name": DATABASE_NAME},
+                )
+                late_request = request_for(
+                    BrokerOperation.DATABASE_BACKUP,
+                    arguments={"database_name": DATABASE_NAME},
+                )
+                first_replies: list[dict[str, Any]] = []
+                first_failures: list[BaseException] = []
+
+                def run_first() -> None:
+                    try:
+                        first_replies.append(
+                            runtime.service.reply_for_document(
+                                peer_for(), first_request.to_wire()
+                            )
+                        )
+                    except BaseException as error:  # pragma: no cover - diagnostics
+                        first_failures.append(error)
+
+                first_worker = threading.Thread(target=run_first)
+                first_worker.start()
+                self.assertTrue(
+                    entered.wait(timeout=2.0),
+                    f"database mutation never reached host boundary; failures={first_failures!r}",
+                )
+                self.assertEqual(runtime.writer.admitted_mutation_count, 1)
+                with CoordinatorStore.open(
+                    persistence.database_path, expected_uid=os.geteuid()
+                ) as store:
+                    with store.read_transaction() as connection:
+                        running = connection.execute(
+                            "SELECT status FROM operations WHERE operation_id = ?",
+                            (first_request.operation_id,),
+                        ).fetchone()
+                self.assertIsNotNone(running)
+                self.assertEqual(running["status"], "running")
+
+                close_failures: list[BaseException] = []
+
+                def close_runtime() -> None:
+                    try:
+                        runtime.close()
+                    except BaseException as error:  # pragma: no cover - diagnostics
+                        close_failures.append(error)
+
+                closer = threading.Thread(target=close_runtime)
+                closer.start()
+                deadline = time.monotonic() + 2.0
+                while runtime.writer.accepting_mutations and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(runtime.writer.accepting_mutations)
+
+                late = runtime.service.reply_for_document(
+                    peer_for(), late_request.to_wire()
+                )
+                self.assertFalse(late["ok"], late)
+                self.assertEqual(late["error"]["code"], "service_shutting_down")
+                with CoordinatorStore.open(
+                    persistence.database_path, expected_uid=os.geteuid()
+                ) as store:
+                    with store.read_transaction() as connection:
+                        late_operation = connection.execute(
+                            "SELECT 1 FROM operations WHERE operation_id = ?",
+                            (late_request.operation_id,),
+                        ).fetchone()
+                        late_reservation = connection.execute(
+                            "SELECT 1 FROM broker_operation_requests WHERE operation_id = ?",
+                            (late_request.operation_id,),
+                        ).fetchone()
+                self.assertIsNone(late_operation)
+                self.assertIsNone(late_reservation)
+                self.assertTrue(closer.is_alive(), close_failures)
+
+                release.set()
+                first_worker.join(timeout=3.0)
+                closer.join(timeout=3.0)
+                self.assertFalse(first_worker.is_alive(), first_failures)
+                self.assertFalse(closer.is_alive(), close_failures)
+                self.assertEqual(first_failures, [])
+                self.assertEqual(close_failures, [])
+                self.assertEqual(len(first_replies), 1)
+                self.assertEqual(len(actions.postgres_calls), 1)
+                with CoordinatorStore.open(
+                    persistence.database_path, expected_uid=os.geteuid()
+                ) as store:
+                    with store.read_transaction() as connection:
+                        retained_status = connection.execute(
+                            "SELECT status FROM operations WHERE operation_id = ?",
+                            (first_request.operation_id,),
+                        ).fetchone()[0]
+                        backup_count = connection.execute(
+                            "SELECT COUNT(*) FROM database_backups"
+                        ).fetchone()[0]
+                if fail_after_release:
+                    self.assertFalse(first_replies[0]["ok"], first_replies)
+                    self.assertEqual(
+                        first_replies[0]["error"]["code"], "mutation_failed"
+                    )
+                    self.assertEqual(retained_status, "failed")
+                    self.assertEqual(backup_count, 0)
+                else:
+                    self.assertTrue(first_replies[0]["ok"], first_replies)
+                    self.assertEqual(retained_status, "succeeded")
+                    self.assertEqual(backup_count, 1)
+
+                replacement_actions = RecordingPostgresHostActions()
+                replacement = build_store_backed_broker_runtime(
+                    database_path=persistence.database_path,
+                    socket_path=root / "replacement/broker.sock",
+                    host_mutations=replacement_actions,
+                    service_uid=os.geteuid(),
+                    access_gid=os.getegid(),
+                    shutdown_timeout_seconds=1.0,
+                    observe_before_lifecycle_plan=_committed_available_observer,
+                )
+                try:
+                    replayed = replacement.service.reply_for_document(
+                        peer_for(), first_request.to_wire()
+                    )
+                finally:
+                    replacement.close()
+                self.assertEqual(replayed["ok"], not fail_after_release, replayed)
+                if fail_after_release:
+                    self.assertEqual(replayed["error"]["code"], "mutation_failed")
+                else:
+                    self.assertEqual(
+                        replayed["result"], first_replies[0]["result"]
+                    )
+                self.assertEqual(replacement_actions.postgres_calls, [])
+
+    def test_host_observe_commits_service_owned_snapshot_without_client_paths(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            service = store_backed_service(persistence, actions)
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                before = store.metadata.observation_revision
+
+            request = request_for(
+                BrokerOperation.HOST_OBSERVE,
+                resource_id=PROJECT_ID,
+                arguments={},
+            )
+            denied = service.reply_for_document(peer_for(), request.to_wire())
+            self.assertFalse(denied["ok"], denied)
+            self.assertEqual(denied["error"]["code"], "operation_access_denied")
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                self.assertEqual(store.metadata.observation_revision, before)
+
+            persistence.grant_host_observation(
+                uid=os.geteuid(), repo_id=PROJECT_ID
+            )
+            reply = service.reply_for_document(peer_for(), request.to_wire())
+
+            self.assertTrue(reply["ok"], reply)
+            self.assertEqual(
+                reply["result"]["observer_domain"],
+                "host-runtime-v2:full-docker",
+            )
+            self.assertEqual(reply["result"]["observation_revision"], before + 1)
+            self.assertTrue(reply["result"]["observed"])
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    durable_mutation = connection.execute(
+                        "SELECT 1 FROM operations WHERE operation_id = ?",
+                        (request.operation_id,),
+                    ).fetchone()
+                    snapshot = connection.execute(
+                        """
+                        SELECT status, observer_domain FROM observation_snapshots
+                        WHERE snapshot_id = ?
+                        """,
+                        (reply["result"]["snapshot_id"],),
+                    ).fetchone()
+            self.assertIsNone(durable_mutation)
+            self.assertEqual(
+                (snapshot["status"], snapshot["observer_domain"]),
+                ("completed", "host-runtime-v2:full-docker"),
+            )
+
+            invalid = request.to_wire()
+            invalid["operation_id"] = str(uuid.uuid4())
+            invalid["arguments"] = {"path": "/client-controlled"}
+            rejected = service.reply_for_document(peer_for(), invalid)
+            self.assertFalse(rejected["ok"], rejected)
+            self.assertEqual(rejected["error"]["code"], "invalid_arguments")
+
+    def test_host_observe_reports_committed_docker_unavailable_evidence(self) -> None:
+        def unavailable(store: CoordinatorStore) -> Mapping[str, Any]:
+            return _committed_observer(store, docker_available=False)
+
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            persistence.grant_host_observation(
+                uid=os.geteuid(), repo_id=PROJECT_ID
+            )
+            backend = StoreBackedMutationBackend(
+                persistence,
+                actions,
+                observe_before_lifecycle_plan=unavailable,
+            )
+            service = BrokerService(
+                StoreBackedAuthorizer(persistence), SerializedMutationWriter(backend)
+            )
+            reply = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID
+                ).to_wire(),
+            )
+
+            self.assertTrue(reply["ok"], reply)
+            self.assertTrue(reply["result"]["observed"])
+            self.assertFalse(reply["result"]["docker_available"])
+            self.assertEqual(reply["result"]["status"], "completed")
+
+    def test_runtime_shutdown_drains_owned_ticket_and_replacement_is_prompt(
+        self,
+    ) -> None:
+        sampler_entered = threading.Event()
+        release_sampler = threading.Event()
+
+        def observer_callback(*, block: bool) -> Any:
+            def observe(store: CoordinatorStore) -> Mapping[str, Any]:
+                def sample() -> Mapping[str, Any]:
+                    if block:
+                        sampler_entered.set()
+                        if not release_sampler.wait(timeout=5.0):
+                            raise RuntimeError(
+                                "shutdown observation fixture timed out"
+                            )
+                    return {
+                        "sampled_at": utc_timestamp(),
+                        "inventory": {
+                            "servers": [],
+                            "docker": {
+                                "available": True,
+                                "containers": [],
+                                "postgres": [],
+                            },
+                        },
+                    }
+
+                def commit(
+                    connection: sqlite3.Connection,
+                    snapshot_id: str,
+                    measured: Mapping[str, Any],
+                ) -> None:
+                    committed_at = str(measured["sampled_at"])
+                    connection.execute(
+                        """
+                        INSERT INTO observation_capabilities(
+                            snapshot_id, observer_domain, docker_available,
+                            capability_fingerprint, committed_at
+                        ) VALUES (?, 'host-runtime-v2:full-docker', 1, ?, ?)
+                        """,
+                        (snapshot_id, "sha256:" + "6" * 64, committed_at),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE schema_metadata
+                        SET observation_revision = observation_revision + 1,
+                            updated_at = ? WHERE singleton = 1
+                        """,
+                        (committed_at,),
+                    )
+
+                outcome = SingleFlightObserver(
+                    store, join_timeout=1.0
+                ).observe(
+                    host_id=HOST_ID,
+                    observer_domain="host-runtime-v2:full-docker",
+                    sampler=sample,
+                    commit=commit,
+                )
+                return {
+                    "snapshot_id": outcome.snapshot_id,
+                    "host_id": outcome.host_id,
+                    "observer_domain": outcome.observer_domain,
+                    "joined": outcome.joined,
+                    "completed_at": outcome.completed_at,
+                    "material_fingerprint": outcome.material_fingerprint,
+                    "docker_available": True,
+                    "capability_fingerprint": "sha256:" + "6" * 64,
+                }
+
+            return observe
+
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            persistence.grant_host_observation(
+                uid=os.geteuid(), repo_id=PROJECT_ID
+            )
+            unowned_snapshot_id = str(uuid.uuid4())
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO observation_snapshots(
+                            snapshot_id, host_id, observer_domain, status, started_at
+                        ) VALUES (?, ?, 'account-unowned-fixture', 'running', ?)
+                        """,
+                        (unowned_snapshot_id, HOST_ID, utc_timestamp()),
+                    )
+
+            runtime_dir = root / "runtime"
+            runtime_dir.mkdir(mode=0o750)
+            os.chmod(runtime_dir, 0o750)
+            socket_path = runtime_dir / "broker.sock"
+            runtime = build_store_backed_broker_runtime(
+                database_path=persistence.database_path,
+                socket_path=socket_path,
+                host_mutations=actions,
+                service_uid=os.geteuid(),
+                access_gid=os.getegid(),
+                max_clients=4,
+                observe_before_lifecycle_plan=observer_callback(block=True),
+            )
+            runtime.server.start()
+            request_failures: list[BaseException] = []
+            request_replies: list[dict[str, Any]] = []
+
+            def request_observation() -> None:
+                try:
+                    request_replies.append(
+                        BrokerClient(
+                            socket_path,
+                            expected_broker_uid=os.geteuid(),
+                            expected_socket_gid=os.getegid(),
+                            timeout_seconds=5.0,
+                        ).call(
+                            request_for(
+                                BrokerOperation.HOST_OBSERVE,
+                                resource_id=PROJECT_ID,
+                            )
+                        )
+                    )
+                except BaseException as error:
+                    request_failures.append(error)
+
+            request_worker = threading.Thread(target=request_observation)
+            request_worker.start()
+            self.assertTrue(sampler_entered.wait(timeout=2.0))
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    owned = connection.execute(
+                        """
+                        SELECT s.snapshot_id, o.broker_instance_id
+                        FROM observation_snapshots s
+                        JOIN broker_host_observation_owners o USING(snapshot_id)
+                        WHERE s.observer_domain = 'host-runtime-v2:full-docker'
+                          AND s.status = 'running'
+                        """
+                    ).fetchone()
+            self.assertIsNotNone(owned)
+            old_snapshot_id = str(owned["snapshot_id"])
+            self.assertTrue(str(owned["broker_instance_id"]).startswith("broker-"))
+
+            close_failures: list[BaseException] = []
+
+            def close_runtime() -> None:
+                try:
+                    runtime.close()
+                except BaseException as error:  # pragma: no cover - diagnostics
+                    close_failures.append(error)
+
+            closer = threading.Thread(target=close_runtime)
+            closer.start()
+            deadline = time.monotonic() + 2.0
+            while runtime.writer.accepting_mutations and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(runtime.writer.accepting_mutations)
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    old_status = connection.execute(
+                        """
+                        SELECT status, error_code FROM observation_snapshots
+                        WHERE snapshot_id = ?
+                        """,
+                        (old_snapshot_id,),
+                    ).fetchone()
+            self.assertIsNotNone(old_status)
+            self.assertEqual(old_status["status"], "running")
+            self.assertIsNone(old_status["error_code"])
+
+            late = runtime.service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.HOST_OBSERVE,
+                    resource_id=PROJECT_ID,
+                ).to_wire(),
+            )
+            self.assertFalse(late["ok"], late)
+            self.assertEqual(late["error"]["code"], "service_shutting_down")
+
+            release_sampler.set()
+            request_worker.join(timeout=3.0)
+            closer.join(timeout=3.0)
+            self.assertFalse(request_worker.is_alive(), request_failures)
+            self.assertFalse(closer.is_alive(), close_failures)
+            self.assertEqual(request_failures, [])
+            self.assertEqual(close_failures, [])
+            self.assertEqual(len(request_replies), 1)
+            self.assertTrue(request_replies[0]["ok"], request_replies)
+
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    unowned_status = connection.execute(
+                        "SELECT status FROM observation_snapshots WHERE snapshot_id = ?",
+                        (unowned_snapshot_id,),
+                    ).fetchone()[0]
+                    running_owned = connection.execute(
+                        """
+                        SELECT COUNT(*) FROM observation_snapshots s
+                        JOIN broker_host_observation_owners o USING(snapshot_id)
+                        WHERE s.status = 'running'
+                        """
+                    ).fetchone()[0]
+                    completed = connection.execute(
+                        "SELECT status FROM observation_snapshots WHERE snapshot_id = ?",
+                        (old_snapshot_id,),
+                    ).fetchone()[0]
+            self.assertEqual(unowned_status, "running")
+            self.assertEqual(running_owned, 0)
+            self.assertEqual(completed, "completed")
+
+            replacement = build_store_backed_broker_runtime(
+                database_path=persistence.database_path,
+                socket_path=socket_path,
+                host_mutations=actions,
+                service_uid=os.geteuid(),
+                access_gid=os.getegid(),
+                max_clients=4,
+                observe_before_lifecycle_plan=observer_callback(block=False),
+            )
+            replacement.server.start()
+            try:
+                started = time.monotonic()
+                refreshed = BrokerClient(
+                    socket_path,
+                    expected_broker_uid=os.geteuid(),
+                    expected_socket_gid=os.getegid(),
+                    timeout_seconds=2.0,
+                ).call(
+                    request_for(
+                        BrokerOperation.HOST_OBSERVE,
+                        resource_id=PROJECT_ID,
+                    )
+                )
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertTrue(refreshed["ok"], refreshed)
+                self.assertNotEqual(
+                    refreshed["result"]["snapshot_id"], old_snapshot_id
+                )
+            finally:
+                replacement.close()
+
+    def test_host_observe_sampler_exception_returns_redacted_broker_error(self) -> None:
+        def failed_sampler(_store: CoordinatorStore) -> Mapping[str, Any]:
+            raise RuntimeError("private sampler diagnostic")
+
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            persistence.grant_host_observation(
+                uid=os.geteuid(), repo_id=PROJECT_ID
+            )
+            service = BrokerService(
+                StoreBackedAuthorizer(persistence),
+                SerializedMutationWriter(
+                    StoreBackedMutationBackend(
+                        persistence,
+                        actions,
+                        observe_before_lifecycle_plan=failed_sampler,
+                    )
+                ),
+            )
+
+            reply = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID
+                ).to_wire(),
+            )
+
+            self.assertFalse(reply["ok"], reply)
+            self.assertEqual(reply["error"]["code"], "mutation_failed")
+            self.assertNotIn("private sampler diagnostic", reply["error"]["message"])
+
+    def test_host_observe_rejects_callback_host_mismatch(self) -> None:
+        def mismatched_host(store: CoordinatorStore) -> Mapping[str, Any]:
+            evidence = dict(_committed_available_observer(store))
+            evidence["host_id"] = "host-wrong"
+            return evidence
+
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            persistence.grant_host_observation(
+                uid=os.geteuid(), repo_id=PROJECT_ID
+            )
+            service = BrokerService(
+                StoreBackedAuthorizer(persistence),
+                SerializedMutationWriter(
+                    StoreBackedMutationBackend(
+                        persistence,
+                        actions,
+                        observe_before_lifecycle_plan=mismatched_host,
+                    )
+                ),
+            )
+
+            reply = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID
+                ).to_wire(),
+            )
+
+            self.assertFalse(reply["ok"], reply)
+            self.assertEqual(
+                reply["error"]["code"], "lifecycle_observation_incomplete"
+            )
+
+    def test_concurrent_host_observe_requests_join_one_committed_snapshot(self) -> None:
+        sampler_entered = threading.Event()
+        release_sampler = threading.Event()
+        sampler_lock = threading.Lock()
+        observer_barrier = threading.Barrier(2)
+        joiner_entered = threading.Event()
+        sampler_calls = 0
+
+        class InstrumentedObserver(SingleFlightObserver):
+            def _join(self, ticket: Any) -> Any:
+                joiner_entered.set()
+                return super()._join(ticket)
+
+        def observe(store: CoordinatorStore) -> Mapping[str, Any]:
+            def sample() -> Mapping[str, Any]:
+                nonlocal sampler_calls
+                with sampler_lock:
+                    sampler_calls += 1
+                sampler_entered.set()
+                if not release_sampler.wait(timeout=3.0):
+                    raise RuntimeError("test sampler release boundary timed out")
+                return {
+                    "sampled_at": utc_timestamp(),
+                    "inventory": {
+                        "servers": [],
+                        "docker": {
+                            "available": True,
+                            "containers": [],
+                            "postgres": [],
+                        },
+                    },
+                }
+
+            observer_barrier.wait(timeout=2.0)
+            def commit(
+                connection: sqlite3.Connection,
+                snapshot_id: str,
+                measured: Mapping[str, Any],
+            ) -> None:
+                committed_at = str(measured["sampled_at"])
+                connection.execute(
+                    """
+                    INSERT INTO observation_capabilities(
+                        snapshot_id, observer_domain, docker_available,
+                        capability_fingerprint, committed_at
+                    ) VALUES (?, 'host-runtime-v2:full-docker', 1, ?, ?)
+                    """,
+                    (snapshot_id, "sha256:" + "4" * 64, committed_at),
+                )
+
+            outcome = InstrumentedObserver(store, join_timeout=3.0).observe(
+                host_id=HOST_ID,
+                observer_domain="host-runtime-v2:full-docker",
+                sampler=sample,
+                commit=commit,
+            )
+            with store.read_transaction() as connection:
+                capability = connection.execute(
+                    """
+                    SELECT docker_available, capability_fingerprint
+                    FROM observation_capabilities WHERE snapshot_id = ?
+                    """,
+                    (outcome.snapshot_id,),
+                ).fetchone()
+            return {
+                "snapshot_id": outcome.snapshot_id,
+                "host_id": outcome.host_id,
+                "observer_domain": outcome.observer_domain,
+                "joined": outcome.joined,
+                "completed_at": outcome.completed_at,
+                "material_fingerprint": outcome.material_fingerprint,
+                "docker_available": bool(capability["docker_available"]),
+                "capability_fingerprint": str(
+                    capability["capability_fingerprint"]
+                ),
+            }
+
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            persistence.grant_host_observation(
+                uid=os.geteuid(), repo_id=PROJECT_ID
+            )
+            service = BrokerService(
+                StoreBackedAuthorizer(persistence),
+                SerializedMutationWriter(
+                    StoreBackedMutationBackend(
+                        persistence,
+                        actions,
+                        observe_before_lifecycle_plan=observe,
+                    )
+                ),
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                before = store.metadata.observation_revision
+            replies: list[dict[str, Any]] = []
+            failures: list[BaseException] = []
+
+            def invoke() -> None:
+                try:
+                    replies.append(
+                        service.reply_for_document(
+                            peer_for(),
+                            request_for(
+                                BrokerOperation.HOST_OBSERVE,
+                                resource_id=PROJECT_ID,
+                            ).to_wire(),
+                        )
+                    )
+                except BaseException as error:  # pragma: no cover - diagnostics
+                    failures.append(error)
+
+            workers = [threading.Thread(target=invoke) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            self.assertTrue(sampler_entered.wait(timeout=1.0))
+            self.assertTrue(
+                joiner_entered.wait(timeout=1.0),
+                "second request did not join the durable observation ticket",
+            )
+            release_sampler.set()
+            for worker in workers:
+                worker.join(timeout=3.0)
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                after = store.metadata.observation_revision
+
+        self.assertFalse(any(worker.is_alive() for worker in workers), failures)
+        self.assertEqual(failures, [])
+        self.assertEqual(sampler_calls, 1)
+        self.assertEqual(len(replies), 2)
+        self.assertTrue(all(reply["ok"] for reply in replies), replies)
+        self.assertEqual(
+            {reply["result"]["snapshot_id"] for reply in replies},
+            {replies[0]["result"]["snapshot_id"]},
+        )
+        self.assertEqual(
+            sorted(reply["result"]["joined"] for reply in replies),
+            [False, True],
+        )
+        self.assertEqual(after, before + 1)
+
+    def test_host_observe_acl_backfill_survives_fence_and_preserves_revocation(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            persistence.grant_repository_read(
+                uid=os.geteuid(),
+                repo_id=PROJECT_ID,
+                operation=BrokerOperation.REPOSITORY_LIST_REMOVED,
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE repository_installations
+                        SET status = 'disabled', startup_fenced = 1, updated_at = ?
+                        WHERE repo_id = ?
+                        """,
+                        (utc_timestamp(), PROJECT_ID),
+                    )
+
+            migrated = BrokerPersistence(
+                persistence.database_path, expected_uid=os.geteuid()
+            )
+            service = store_backed_service(migrated, actions)
+            fenced = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID
+                ).to_wire(),
+            )
+            self.assertFalse(fenced["ok"], fenced)
+            self.assertEqual(
+                fenced["error"]["code"], "repository_startup_fenced"
+            )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE repository_installations
+                        SET status = 'installed', startup_fenced = 0, updated_at = ?
+                        WHERE repo_id = ?
+                        """,
+                        (utc_timestamp(), PROJECT_ID),
+                    )
+            allowed = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID
+                ).to_wire(),
+            )
+            self.assertTrue(allowed["ok"], allowed)
+
+            migrated.grant_host_observation(
+                uid=os.geteuid(), repo_id=PROJECT_ID, enabled=False
+            )
+            reopened = BrokerPersistence(
+                persistence.database_path, expected_uid=os.geteuid()
+            )
+            denied = store_backed_service(reopened, actions).reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.HOST_OBSERVE, resource_id=PROJECT_ID
+                ).to_wire(),
+            )
+            self.assertFalse(denied["ok"], denied)
+            self.assertEqual(denied["error"]["code"], "operation_access_denied")
+
+    def test_principal_account_change_fails_without_transferring_existing_grants(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _actions = seed_store_backed_broker(root)
+
+            with self.assertRaises(BrokerError) as raised:
+                persistence.provision_principal(
+                    uid=os.geteuid(), account_id="account-other"
+                )
+
+            self.assertEqual(raised.exception.code, "principal_account_conflict")
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    principal = connection.execute(
+                        "SELECT account_id FROM broker_acl_principals WHERE uid = ?",
+                        (os.geteuid(),),
+                    ).fetchone()
+                    enabled_grants = connection.execute(
+                        """
+                        SELECT count(*) FROM broker_resource_acl
+                        WHERE uid = ? AND repo_id = ? AND enabled = 1
+                        """,
+                        (os.geteuid(), PROJECT_ID),
+                    ).fetchone()[0]
+            self.assertEqual(principal["account_id"], ACCOUNT_ID)
+            self.assertGreater(enabled_grants, 0)
+            persistence.provision_principal(
+                uid=os.geteuid(), account_id=ACCOUNT_ID
+            )
+
+    def test_raw_broker_request_fails_after_repository_enrollment_expiry(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE broker_repository_enrollments
+                        SET valid_until_epoch = ?, updated_at = ?
+                        WHERE uid = ? AND repo_id = ?
+                        """,
+                        (
+                            int(time.time()) - 1,
+                            utc_timestamp(),
+                            os.geteuid(),
+                            PROJECT_ID,
+                        ),
+                    )
+
+            runtime = root / "runtime-expired-enrollment"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+            with UnixBrokerServer(
+                socket_path, store_backed_service(persistence, actions)
+            ):
+                reply = BrokerClient(
+                    socket_path,
+                    expected_broker_uid=os.geteuid(),
+                    expected_socket_gid=os.getegid(),
+                ).call(request_for(BrokerOperation.DOCKER_STOP))
+
+            self.assertFalse(reply["ok"], reply)
+            self.assertEqual(
+                reply["error"]["code"], "repository_enrollment_expired"
+            )
+            self.assertEqual(actions.calls, [])
+
+    def test_enrolling_second_repository_does_not_extend_first_repository(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _actions = seed_store_backed_broker(root)
+            now = utc_timestamp()
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    host_id = connection.execute(
+                        "SELECT host_id FROM repositories WHERE repo_id = ?",
+                        (PROJECT_ID,),
+                    ).fetchone()[0]
+                    connection.execute(
+                        """
+                        INSERT INTO repositories(
+                            repo_id, host_id, canonical_root, display_name,
+                            state, generation, created_at, updated_at
+                        ) VALUES ('repo-beta', ?, '/repos/beta', 'Beta',
+                                  'active', 0, ?, ?)
+                        """,
+                        (host_id, now, now),
+                    )
+                with store.read_transaction() as connection:
+                    first_expiry = connection.execute(
+                        """
+                        SELECT valid_until_epoch
+                        FROM broker_repository_enrollments
+                        WHERE uid = ? AND repo_id = ?
+                        """,
+                        (os.geteuid(), PROJECT_ID),
+                    ).fetchone()[0]
+
+            second_expiry = int(time.time()) + 7_200
+            persistence.provision_repository_enrollment(
+                uid=os.geteuid(),
+                repo_id="repo-beta",
+                account_id=ACCOUNT_ID,
+                issued_at=utc_timestamp(),
+                valid_until_epoch=second_expiry,
+            )
+
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    expiries = {
+                        str(row["repo_id"]): int(row["valid_until_epoch"])
+                        for row in connection.execute(
+                            """
+                            SELECT repo_id, valid_until_epoch
+                            FROM broker_repository_enrollments
+                            WHERE uid = ? ORDER BY repo_id
+                            """,
+                            (os.geteuid(),),
+                        )
+                    }
+            self.assertEqual(expiries[PROJECT_ID], first_expiry)
+            self.assertEqual(expiries["repo-beta"], second_expiry)
+
     def test_postgres_backup_restore_registers_strong_safety_evidence(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             persistence, _unused = seed_store_backed_broker(root)
@@ -1804,6 +3221,9 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 persistence.grant_lifecycle(
                     uid=os.geteuid(), repo_id=PROJECT_ID, operation=operation
                 )
+                persistence.grant_cleanup(
+                    uid=os.geteuid(), repo_id=PROJECT_ID, operation=operation
+                )
             service = store_backed_service(persistence, actions)
 
             planned = service.reply_for_document(
@@ -1922,6 +3342,9 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 persistence.grant_lifecycle(
                     uid=os.geteuid(), repo_id=PROJECT_ID, operation=operation
                 )
+                persistence.grant_cleanup(
+                    uid=os.geteuid(), repo_id=PROJECT_ID, operation=operation
+                )
             observations = 0
 
             def observer(store: CoordinatorStore) -> Mapping[str, Any]:
@@ -2028,6 +3451,9 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 BrokerOperation.REPOSITORY_REMOVE,
             ):
                 persistence.grant_lifecycle(
+                    uid=os.geteuid(), repo_id=PROJECT_ID, operation=operation
+                )
+                persistence.grant_cleanup(
                     uid=os.geteuid(), repo_id=PROJECT_ID, operation=operation
                 )
 
@@ -2180,14 +3606,7 @@ class StoreBackedBrokerTests(unittest.TestCase):
 
     def test_lifecycle_plan_refuses_unavailable_timeout_and_malformed_observation(self) -> None:
         def unavailable(store: CoordinatorStore) -> Mapping[str, Any]:
-            evidence = dict(_committed_available_observer(store))
-            with store.immediate_transaction(revision_kind="observation") as connection:
-                connection.execute(
-                    "UPDATE observation_capabilities SET docker_available = 0 WHERE snapshot_id = ?",
-                    (evidence["snapshot_id"],),
-                )
-            evidence["docker_available"] = False
-            return evidence
+            return _committed_observer(store, docker_available=False)
 
         def callback_claims_available_but_database_is_unavailable(
             store: CoordinatorStore,
@@ -2320,6 +3739,9 @@ class StoreBackedBrokerTests(unittest.TestCase):
                 BrokerOperation.RESOURCE_RETIRE,
             ):
                 persistence.grant_lifecycle(
+                    uid=os.geteuid(), repo_id=PROJECT_ID, operation=operation
+                )
+                persistence.grant_cleanup(
                     uid=os.geteuid(), repo_id=PROJECT_ID, operation=operation
                 )
                 persistence.grant_lifecycle_resource(
@@ -3066,6 +4488,13 @@ class StoreBackedBrokerTests(unittest.TestCase):
             persistence.provision_principal(
                 uid=second_uid, account_id="account-console"
             )
+            persistence.provision_repository_enrollment(
+                uid=second_uid,
+                repo_id=PROJECT_ID,
+                account_id="account-console",
+                issued_at=utc_timestamp(),
+                valid_until_epoch=int(time.time()) + 3_600,
+            )
             inventory_request = BrokerRequest.create(
                 account_id="account-console",
                 project_id=PROJECT_ID,
@@ -3474,6 +4903,275 @@ class StoreBackedBrokerTests(unittest.TestCase):
             reply = service.reply_for_document(peer_for(), request.to_wire())
             self.assertFalse(reply["ok"], reply)
             self.assertEqual(reply["error"]["code"], "operation_access_denied")
+            self.assertEqual(actions.calls, [])
+
+
+class DirectDockerReconciliationTests(unittest.TestCase):
+    @staticmethod
+    def _snapshot(
+        persistence: BrokerPersistence,
+        *,
+        present_resource_id: str | None,
+        host_id: str = HOST_ID,
+    ) -> dict[str, Any]:
+        snapshot_id = "docker-reconcile-" + uuid.uuid4().hex
+        completed_at = utc_timestamp()
+        material = "sha256:" + "4" * 64
+        capability = "sha256:" + "5" * 64
+        with CoordinatorStore.open(
+            persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction(revision_kind="observation") as connection:
+                if host_id != HOST_ID:
+                    connection.execute(
+                        """
+                        INSERT INTO hosts(
+                            host_id, machine_fingerprint, platform, hostname,
+                            created_at, updated_at
+                        ) VALUES (?, ?, 'test', 'wrong-host', ?, ?)
+                        """,
+                        (
+                            host_id,
+                            "machine-" + host_id,
+                            completed_at,
+                            completed_at,
+                        ),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO observation_snapshots(
+                        snapshot_id, host_id, observer_domain, status,
+                        material_fingerprint, started_at, completed_at
+                    ) VALUES (?, ?, 'host-runtime-v2:full-docker', 'completed',
+                              ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        host_id,
+                        material,
+                        completed_at,
+                        completed_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO observation_capabilities(
+                        snapshot_id, observer_domain, docker_available,
+                        capability_fingerprint, committed_at
+                    ) VALUES (?, 'host-runtime-v2:full-docker', 1, ?, ?)
+                    """,
+                    (snapshot_id, capability, completed_at),
+                )
+                if present_resource_id is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO observation_snapshot_resources(
+                            snapshot_id, resource_kind, resource_id,
+                            observation_fingerprint
+                        ) VALUES (?, 'container', ?, ?)
+                        """,
+                        (
+                            snapshot_id,
+                            present_resource_id,
+                            "sha256:" + "6" * 64,
+                        ),
+                    )
+        return {
+            "snapshot_id": snapshot_id,
+            "host_id": host_id,
+            "observer_domain": "host-runtime-v2:full-docker",
+            "docker_available": True,
+            "capability_fingerprint": capability,
+            "material_fingerprint": material,
+            "started_at": completed_at,
+            "completed_at": completed_at,
+        }
+
+    @staticmethod
+    @contextmanager
+    def _root_contract(
+        persistence: BrokerPersistence,
+    ) -> Iterator[None]:
+        effective_uid = os.geteuid()
+
+        @contextmanager
+        def open_owned_store() -> Iterator[CoordinatorStore]:
+            with mock.patch.object(
+                broker_persistence.os,
+                "geteuid",
+                return_value=effective_uid,
+            ):
+                with CoordinatorStore.open(
+                    persistence.database_path,
+                    expected_uid=effective_uid,
+                ) as store:
+                    yield store
+
+        with (
+            mock.patch.object(broker_persistence.os, "geteuid", return_value=0),
+            mock.patch.object(persistence, "expected_uid", 0),
+            mock.patch.object(persistence, "_store", side_effect=open_owned_store),
+        ):
+            yield
+
+    def test_startup_recovery_fences_all_direct_docker_actions(self) -> None:
+        for action in (
+            BrokerOperation.DOCKER_START,
+            BrokerOperation.DOCKER_STOP,
+            BrokerOperation.DOCKER_RESTART,
+        ):
+            with self.subTest(action=action.value), CanonicalTemporaryDirectory() as root:
+                persistence, _actions = seed_store_backed_broker(root)
+                request = request_for(action)
+                authorized = persistence.authorize(peer_for(), request)
+                self.assertEqual(
+                    persistence.reserve_operation(authorized).state,
+                    "execute",
+                )
+                recovered = persistence.recover_interrupted_docker_operations()
+                self.assertEqual(recovered["operation_ids"], [request.operation_id])
+                candidate = persistence.docker_reconciliation_candidate(
+                    request.operation_id
+                )
+                self.assertEqual(candidate["action"], action.value.removeprefix("docker."))
+                self.assertEqual(candidate["full_container_id"], "a" * 64)
+                with CoordinatorStore.open(
+                    persistence.database_path, expected_uid=os.geteuid()
+                ) as store:
+                    with store.read_transaction() as connection:
+                        row = connection.execute(
+                            "SELECT status, phase, error_code FROM operations "
+                            "WHERE operation_id = ?",
+                            (request.operation_id,),
+                        ).fetchone()
+                self.assertEqual(
+                    dict(row),
+                    {
+                        "status": "needs_attention",
+                        "phase": "reconciliation_required",
+                        "error_code": "operation_outcome_uncertain",
+                    },
+                )
+
+    def test_unresolved_container_blocks_only_the_same_exact_target(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, _actions = seed_store_backed_broker(root)
+            first = request_for(BrokerOperation.DOCKER_STOP)
+            persistence.reserve_operation(persistence.authorize(peer_for(), first))
+
+            same_target = request_for(
+                BrokerOperation.DOCKER_START,
+                operation_id=str(uuid.uuid4()),
+            )
+            with self.assertRaises(BrokerError) as blocked:
+                persistence.reserve_operation(
+                    persistence.authorize(peer_for(), same_target)
+                )
+            self.assertEqual(blocked.exception.code, "docker_operation_pending")
+
+            unrelated = request_for(
+                BrokerOperation.DOCKER_START,
+                resource_id=SECOND_CONTAINER_ID,
+                operation_id=str(uuid.uuid4()),
+            )
+            self.assertEqual(
+                persistence.reserve_operation(
+                    persistence.authorize(peer_for(), unrelated)
+                ).state,
+                "execute",
+            )
+
+    def test_reconciliation_records_present_and_absent_without_host_action(self) -> None:
+        for present in (True, False):
+            with self.subTest(present=present), CanonicalTemporaryDirectory() as root:
+                persistence, actions = seed_store_backed_broker(root)
+                request = request_for(BrokerOperation.DOCKER_RESTART)
+                persistence.reserve_operation(
+                    persistence.authorize(peer_for(), request)
+                )
+                persistence.recover_interrupted_docker_operations()
+                evidence = self._snapshot(
+                    persistence,
+                    present_resource_id=CONTAINER_ID if present else None,
+                )
+                with self._root_contract(persistence):
+                    result = persistence.reconcile_docker_operation(
+                        request.operation_id,
+                        evidence=evidence,
+                        confirm_container_id="a" * 64,
+                    )
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["phase"], "reconciled")
+                self.assertIs(result["current_container_present"], present)
+                self.assertEqual(actions.calls, [])
+                with CoordinatorStore.open(
+                    persistence.database_path, expected_uid=os.geteuid()
+                ) as store:
+                    with store.read_transaction() as connection:
+                        event_count = connection.execute(
+                            "SELECT COUNT(*) FROM events WHERE operation_id = ? "
+                            "AND event_kind = 'docker.reconciled'",
+                            (request.operation_id,),
+                        ).fetchone()[0]
+                        target = connection.execute(
+                            "SELECT status, phase FROM operation_targets "
+                            "WHERE operation_id = ?",
+                            (request.operation_id,),
+                        ).fetchone()
+                self.assertEqual(event_count, 1)
+                self.assertEqual(
+                    dict(target), {"status": "failed", "phase": "reconciled"}
+                )
+
+    def test_wrong_identity_or_host_snapshot_leaves_uncertain_state_unchanged(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            request = request_for(BrokerOperation.DOCKER_STOP)
+            persistence.reserve_operation(persistence.authorize(peer_for(), request))
+            persistence.recover_interrupted_docker_operations()
+            evidence = self._snapshot(
+                persistence,
+                present_resource_id=None,
+                host_id="wrong-host",
+            )
+            with self._root_contract(persistence):
+                with self.assertRaises(BrokerError) as wrong_identity:
+                    persistence.reconcile_docker_operation(
+                        request.operation_id,
+                        evidence=evidence,
+                        confirm_container_id="b" * 64,
+                    )
+                self.assertEqual(
+                    wrong_identity.exception.code,
+                    "docker_reconciliation_confirmation_required",
+                )
+                with self.assertRaises(BrokerError) as wrong_host:
+                    persistence.reconcile_docker_operation(
+                        request.operation_id,
+                        evidence=evidence,
+                        confirm_container_id="a" * 64,
+                    )
+                self.assertEqual(
+                    wrong_host.exception.code,
+                    "docker_reconciliation_observation_incomplete",
+                )
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.read_transaction() as connection:
+                    row = connection.execute(
+                        "SELECT status, phase FROM operations WHERE operation_id = ?",
+                        (request.operation_id,),
+                    ).fetchone()
+                    event_count = connection.execute(
+                        "SELECT COUNT(*) FROM events WHERE operation_id = ?",
+                        (request.operation_id,),
+                    ).fetchone()[0]
+            self.assertEqual(
+                dict(row),
+                {"status": "needs_attention", "phase": "reconciliation_required"},
+            )
+            self.assertEqual(event_count, 0)
             self.assertEqual(actions.calls, [])
 
 

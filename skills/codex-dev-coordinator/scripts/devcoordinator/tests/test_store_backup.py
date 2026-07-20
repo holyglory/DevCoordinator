@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import hashlib
 import os
 from pathlib import Path
+import pwd
 import tempfile
 import unittest
 from unittest import mock
@@ -24,9 +26,31 @@ from devcoordinator.store_backup import (
 import devcoordinator.store_backup as store_backup_module
 
 
+def canonical_test_temp_base() -> Path:
+    """Return a writable canonical base outside any host/user Git marker."""
+
+    candidates = (
+        os.environ.get("DEVCOORDINATOR_TEST_TMP_ROOT"),
+        pwd.getpwuid(os.geteuid()).pw_dir,
+        tempfile.gettempdir(),
+    )
+    for raw in dict.fromkeys(value for value in candidates if value):
+        base = Path(str(raw)).resolve()
+        if not base.is_dir() or not os.access(base, os.W_OK | os.X_OK):
+            continue
+        cursor = base
+        while not ((cursor / ".git").exists() or (cursor / ".git").is_symlink()):
+            if cursor.parent == cursor:
+                return base
+            cursor = cursor.parent
+    raise RuntimeError("no writable test temp root exists outside every Git worktree")
+
+
 class StoreBackupTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(
+            dir=canonical_test_temp_base()
+        )
         self.root = Path(self.temporary.name).resolve()
         self.home = self.root / "account-store"
         self.database = self.home / "coordinator.sqlite3"
@@ -99,6 +123,22 @@ class StoreBackupTests(unittest.TestCase):
             manifest["schema_fingerprint"] = document["schema_fingerprint"]
         manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
         os.chmod(manifest_path, 0o600)
+
+    def test_output_root_inside_explicit_git_worktree_is_rejected(self) -> None:
+        repository = self.root / "operator-repository"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+
+        with self.assertRaisesRegex(ValueError, "backup root must be outside Git"):
+            create_store_backup(
+                self.database,
+                repository / "backups",
+                store_role="account",
+            )
+        self.assertFalse(
+            (repository / "backups").exists(),
+            "the Git-contained output root must be rejected before it is created",
+        )
 
     def test_verified_backup_restores_normalized_state_and_retains_safety_backup(self) -> None:
         backup = create_store_backup(
@@ -425,7 +465,9 @@ class StoreBackupTests(unittest.TestCase):
         self.assertEqual(restored["status"], "imported")
         self.assertEqual(self._display_name(), "before")
         safety = inspect_store_backup(restored["safety_backup"]["manifest"])
-        with __import__("sqlite3").connect(str(safety["artifact"])) as connection:
+        with closing(
+            __import__("sqlite3").connect(str(safety["artifact"]))
+        ) as connection:
             self.assertEqual(
                 connection.execute(
                     "SELECT display_name FROM repositories WHERE repo_id='repo'"

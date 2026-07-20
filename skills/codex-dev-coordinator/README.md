@@ -101,6 +101,28 @@ operation record, signal, process launch, lease change, Docker action, or
 sidecar metadata write when a target listener is unobservable. Unknown
 ownership is never treated as evidence that the listener is stopped.
 
+## Brokered Compose Safety
+
+The server-wide root broker accepts only enrolled, fingerprinted Compose
+definitions. Enrollment holds the broker lifetime lock, renders the merged JSON
+model from sealed inputs before changing authority, and requires its complete
+service/profile scope to match the declaration. Hidden
+dependencies cannot expand `up`; broker commands use `--no-deps`, disable
+orphan removal, and cap Compose parallelism at four. Host-equivalent features
+such as bind mounts, Docker sockets, external resources, published ports,
+devices/GPUs, host/container namespaces, added capabilities, or privileged mode
+require an explicit fingerprint-bound root approval. Unknown features fail
+closed. Replica counts remain bounded regardless of approval, and each mutation
+re-renders the model before invoking Compose.
+
+Every mutation is followed by a fresh exhaustive observation. Unexpected
+services or uncertain command outcomes remain fenced for administrator
+reconciliation. A disabled definition retains its project name until a
+root-only release command proves, with a strict new full-Docker ticket under
+the service lifetime lock, that no container, network, volume, or unresolved
+operation remains and then revokes the old definition's lifecycle ACLs. Exact commands and recovery modes are documented in
+`SKILL.md`.
+
 ## What It Does Not Provide
 
 - Remote orchestration, multi-host consensus, distributed locks, or a hosted
@@ -145,6 +167,14 @@ Every mutating command must include the acting agent and canonical project
 root. Port release additionally verifies that project owns the lease, and
 destructive state reset records who cleared which prior state. See `SKILL.md`
 for server, Docker, registration, and API examples.
+
+For a server-wide authorization/schema upgrade, installer
+`profile_database_enrollment_drift` is a hard pre-restart stop. Follow the
+canonical `SKILL.md` authorization-upgrade workflow: verified private backup,
+offline exact generation reconciliation when reported, protected-profile
+enrollment backfill, idempotence, two-way installer plan/verify, then the full
+UID/repository and Console registration checks. Never use normal enrollment as
+a migration shortcut because it can rebuild observation-derived grants.
 
 If a workflow leases a port first, pass that active unbound manual lease to
 `server start --lease-id ID --argv '[...]'`. The agent and canonical project

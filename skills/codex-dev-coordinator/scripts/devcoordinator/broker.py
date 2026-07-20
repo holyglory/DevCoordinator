@@ -46,8 +46,37 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_SOCKET_MODE = 0o660
 DEFAULT_MAX_CLIENTS = 32
 DEFAULT_COMPLETED_OPERATION_CACHE = 1024
+# These are broker-side client and graceful-wait budgets for the PostgreSQL
+# helper calls: one dump and one strong-verification allowance, plus a minute
+# for durable result commits and the reply. They do not prove that nested
+# Docker/in-container work reached a terminal state when a helper times out.
+# Repository lifecycle plans can also exceed this budget; their recovery
+# contract is durable per-target phase checkpoints plus idempotent
+# re-observation, rather than completion inside this timeout.
+DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS = 30 * 60.0
+DATABASE_BACKUP_CUMULATIVE_TIMEOUT_SECONDS = (
+    2 * DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS
+)
+DATABASE_RESTORE_CUMULATIVE_TIMEOUT_SECONDS = (
+    DEFAULT_POSTGRES_COMMAND_TIMEOUT_SECONDS
+)
+DATABASE_OPERATION_COMPLETION_GRACE_SECONDS = 60.0
+DATABASE_BACKUP_CLIENT_TIMEOUT_SECONDS = (
+    DATABASE_BACKUP_CUMULATIVE_TIMEOUT_SECONDS
+    + DATABASE_OPERATION_COMPLETION_GRACE_SECONDS
+)
+DATABASE_RESTORE_CLIENT_TIMEOUT_SECONDS = (
+    DATABASE_RESTORE_CUMULATIVE_TIMEOUT_SECONDS
+    + DATABASE_OPERATION_COMPLETION_GRACE_SECONDS
+)
+BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = DATABASE_BACKUP_CLIENT_TIMEOUT_SECONDS
 _NON_TERMINAL_OPERATION_ERRORS = frozenset(
-    {"operation_in_progress", "operation_outcome_uncertain"}
+    {
+        "host_observation_busy",
+        "operation_in_progress",
+        "operation_outcome_uncertain",
+        "service_shutting_down",
+    }
 )
 
 _IDENTIFIER_CHARS = frozenset(
@@ -64,6 +93,8 @@ class BrokerOperation(str, Enum):
     PORT_ASSIGN = "port.assign"
     PORT_UNASSIGN = "port.unassign"
     INVENTORY_READ = "inventory.read"
+    EVENTS_READ = "events.read"
+    HOST_OBSERVE = "host.observe"
     SERVER_PUBLISH = "server.publish"
     DOCKER_START = "docker.start"
     DOCKER_STOP = "docker.stop"
@@ -71,6 +102,8 @@ class BrokerOperation(str, Enum):
     DATABASE_BACKUP = "database.backup"
     DATABASE_RESTORE = "database.restore"
     COMPOSE_UP = "compose.up"
+    COMPOSE_STOP = "compose.stop"
+    COMPOSE_RESTART = "compose.restart"
     COMPOSE_DOWN = "compose.down"
     REPOSITORY_PLAN_REMOVE = "repository.plan_remove"
     REPOSITORY_LIST_REMOVED = "repository.list_removed"
@@ -79,6 +112,13 @@ class BrokerOperation(str, Enum):
     RESOURCE_ATTACH = "resource.attach"
     RESOURCE_PLAN_RETIRE = "resource.plan_retire"
     RESOURCE_RETIRE = "resource.retire"
+    RESOURCE_PLAN_ARCHIVE = "resource.plan_archive"
+    RESOURCE_ARCHIVE = "resource.archive"
+    RESOURCE_RESTORE = "resource.restore"
+    ARCHIVES_READ = "archives.read"
+    CLEANUP_PLAN = "cleanup.plan"
+    CLEANUP_APPLY = "cleanup.apply"
+    LIFECYCLE_RESTORE = "lifecycle.restore"
 
 
 class BrokerError(RuntimeError):
@@ -538,19 +578,38 @@ class SerializedMutationWriter:
         *,
         completed_cache_size: int = DEFAULT_COMPLETED_OPERATION_CACHE,
         max_result_bytes: int = DEFAULT_MAX_MESSAGE_BYTES // 2,
+        max_concurrent_host_observations: int = 4,
     ) -> None:
         if not _is_exact_int(completed_cache_size) or completed_cache_size <= 0:
             raise ValueError("completed_cache_size must be positive")
         if not _is_exact_int(max_result_bytes) or max_result_bytes <= 0:
             raise ValueError("max_result_bytes must be positive")
+        if (
+            not _is_exact_int(max_concurrent_host_observations)
+            or max_concurrent_host_observations < 0
+        ):
+            raise ValueError(
+                "max_concurrent_host_observations must be a non-negative integer"
+            )
         self._backend = backend
         self._completed_cache_size = completed_cache_size
         self._max_result_bytes = max_result_bytes
         self._keyed_locks = _KeyedLockPool()
         self._cache_lock = threading.Lock()
-        self._metrics_condition = threading.Condition()
+        # CPython's default Condition lock is currently reentrant, but make
+        # that shutdown-safety contract explicit: a Python signal handler may
+        # run on the main thread while close() is inside begin_shutdown().
+        self._metrics_condition = threading.Condition(threading.RLock())
         self._waiting_count = 0
         self._active_count = 0
+        self._inflight_mutation_count = 0
+        self._admitted_mutation_count = 0
+        self._accepting_mutations = True
+        self._host_observation_slots = (
+            threading.BoundedSemaphore(max_concurrent_host_observations)
+            if max_concurrent_host_observations > 0
+            else None
+        )
         self._completed: "OrderedDict[str, _CachedOutcome]" = OrderedDict()
 
     @property
@@ -565,6 +624,47 @@ class SerializedMutationWriter:
         with self._metrics_condition:
             return self._active_count > 0
 
+    @property
+    def accepting_mutations(self) -> bool:
+        """Whether a new mutation may cross the admission boundary."""
+
+        with self._metrics_condition:
+            return self._accepting_mutations
+
+    @property
+    def admitted_mutation_count(self) -> int:
+        """Mutations admitted before the shutdown fence and not yet returned."""
+
+        with self._metrics_condition:
+            return self._admitted_mutation_count
+
+    def begin_shutdown(self) -> int:
+        """Atomically fence every later reservation and return the active count.
+
+        Final admission and this state transition use one condition lock. A
+        racing request therefore either increments ``_admitted_mutation_count``
+        immediately before backend execution and is allowed to finish, or sees
+        the fence after any keyed-lock wait and cannot reach the backend's
+        durable reservation boundary.
+        """
+
+        with self._metrics_condition:
+            self._accepting_mutations = False
+            admitted = self._admitted_mutation_count
+            self._metrics_condition.notify_all()
+            return admitted
+
+    def wait_for_drain(self, timeout: float) -> bool:
+        """Wait for admitted work to finish and pre-fence waiters to reject."""
+
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        with self._metrics_condition:
+            return self._metrics_condition.wait_for(
+                lambda: self._inflight_mutation_count == 0,
+                timeout=timeout,
+            )
+
     def wait_for_queued(self, minimum: int, timeout: float) -> bool:
         """Wait for observable writer contention (useful for health/tests)."""
 
@@ -576,13 +676,50 @@ class SerializedMutationWriter:
             )
 
     def execute(self, request: AuthorizedBrokerRequest) -> dict[str, Any]:
-        if request.request.operation == BrokerOperation.INVENTORY_READ:
+        if request.request.operation in {
+            BrokerOperation.INVENTORY_READ,
+            BrokerOperation.EVENTS_READ,
+        }:
             # A query-only snapshot does not need the mutation lock, durable
             # idempotency journal, or completed-result cache.  Avoid retaining
             # up to one full host graph per caller in broker memory.
             return _normalize_backend_result(
                 self._backend.execute(request), max_bytes=self._max_result_bytes
             )
+        operation_id = request.request.operation_id
+        with self._metrics_condition:
+            if not self._accepting_mutations:
+                raise BrokerError(
+                    "service_shutting_down",
+                    "The broker is shutting down; retry with its replacement.",
+                    operation_id=operation_id,
+                )
+            self._inflight_mutation_count += 1
+            self._metrics_condition.notify_all()
+        try:
+            if request.request.operation == BrokerOperation.HOST_OBSERVE:
+                slots = self._host_observation_slots
+                if slots is None or not slots.acquire(blocking=False):
+                    raise BrokerError(
+                        "host_observation_busy",
+                        "The broker already has the maximum number of host observation callers; retry later.",
+                        operation_id=operation_id,
+                    )
+                try:
+                    return self._execute_mutation(request)
+                finally:
+                    slots.release()
+            return self._execute_mutation(request)
+        finally:
+            with self._metrics_condition:
+                self._inflight_mutation_count -= 1
+                if self._inflight_mutation_count < 0:
+                    raise RuntimeError("broker mutation in-flight count underflow")
+                self._metrics_condition.notify_all()
+
+    def _execute_mutation(
+        self, request: AuthorizedBrokerRequest
+    ) -> dict[str, Any]:
         fingerprint = _request_fingerprint(request)
         with self._metrics_condition:
             self._waiting_count += 1
@@ -595,12 +732,26 @@ class SerializedMutationWriter:
                 request.request.resource_id,
             )
         )
-        with self._keyed_locks.hold(
-            ("operation:" + operation_id, "resource:" + resource_key)
-        ):
+        lock_keys = ["operation:" + operation_id]
+        if request.request.operation != BrokerOperation.HOST_OBSERVE:
+            lock_keys.append("resource:" + resource_key)
+        # Host observation is a repeat-safe state measurement. Distinct
+        # requests must reach the database-backed host-domain SingleFlight
+        # boundary together so they can join one durable snapshot. Keep the
+        # operation lock/cache so duplicate operation IDs still replay in
+        # process and sampler exceptions still become redacted broker errors.
+        with self._keyed_locks.hold(lock_keys):
             with self._metrics_condition:
                 self._waiting_count -= 1
+                if not self._accepting_mutations:
+                    self._metrics_condition.notify_all()
+                    raise BrokerError(
+                        "service_shutting_down",
+                        "The broker is shutting down; retry with its replacement.",
+                        operation_id=operation_id,
+                    )
                 self._active_count += 1
+                self._admitted_mutation_count += 1
                 self._metrics_condition.notify_all()
             try:
                 with self._cache_lock:
@@ -665,6 +816,7 @@ class SerializedMutationWriter:
             finally:
                 with self._metrics_condition:
                     self._active_count -= 1
+                    self._admitted_mutation_count -= 1
                     self._metrics_condition.notify_all()
 
     def _remember(self, operation_id: str, outcome: _CachedOutcome) -> None:
@@ -884,7 +1036,7 @@ class UnixBrokerServer:
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_clients: int = DEFAULT_MAX_CLIENTS,
-        shutdown_timeout_seconds: float = 5.0,
+        shutdown_timeout_seconds: float = BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
     ) -> None:
         self.socket_path = Path(socket_path)
         self._service = service
@@ -1009,7 +1161,14 @@ class UnixBrokerServer:
         )
         self._accept_thread.start()
 
-    def close(self) -> None:
+    def close(self, *, timeout_seconds: Optional[float] = None) -> None:
+        timeout = (
+            self._shutdown_timeout_seconds
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        if timeout < 0:
+            raise ValueError("timeout_seconds must be non-negative")
         self._stop.set()
         listener = self._listener
         self._listener = None
@@ -1017,35 +1176,44 @@ class UnixBrokerServer:
             listener.close()
         accept_thread = self._accept_thread
         self._accept_thread = None
+        deadline = time.monotonic() + timeout
         if accept_thread is not None:
-            accept_thread.join(timeout=self._shutdown_timeout_seconds)
-        deadline = time.monotonic() + self._shutdown_timeout_seconds
+            accept_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        drain_error: Optional[BrokerError] = None
         while True:
             with self._clients_lock:
                 clients = list(self._client_threads)
                 connections = list(self._client_connections)
-            for connection in connections:
-                try:
-                    connection.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
             if not clients:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise BrokerError(
+                # The published graceful deadline has expired.  Only now may
+                # transport cleanup interrupt an accepted client.  Backend
+                # mutation threads remain visible to the writer drain proof.
+                for connection in connections:
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                for client in clients:
+                    client.join(timeout=0.1)
+                drain_error = BrokerError(
                     "shutdown_timeout",
                     "Broker could not drain all accepted clients before the shutdown deadline.",
                 )
+                break
             for client in clients:
                 client.join(timeout=min(remaining, 0.1))
         if accept_thread is not None and accept_thread.is_alive():
-            raise BrokerError(
+            drain_error = BrokerError(
                 "shutdown_timeout",
                 "Broker accept loop did not stop before the shutdown deadline.",
             )
         self._remove_created_socket_if_owned()
         self._socket_identity = None
+        if drain_error is not None:
+            raise drain_error
 
     def __enter__(self) -> "UnixBrokerServer":
         self.start()
@@ -1380,6 +1548,45 @@ def _validate_arguments(
             )
         return {}
 
+    if operation == BrokerOperation.EVENTS_READ:
+        unexpected = sorted(set(value) - {"after", "limit"})
+        if unexpected:
+            raise BrokerError(
+                "invalid_arguments",
+                "Event reads contain unsupported arguments: "
+                + ", ".join(unexpected)
+                + ".",
+                operation_id=operation_id,
+            )
+        normalized: dict[str, Any] = {}
+        if "after" in value:
+            after = value["after"]
+            if not isinstance(after, str) or not 1 <= len(after) <= 1024:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "after must be a bounded non-empty event cursor.",
+                    operation_id=operation_id,
+                )
+            normalized["after"] = after
+        limit = value.get("limit", 100)
+        if not _is_exact_int(limit) or not 1 <= limit <= 500:
+            raise BrokerError(
+                "invalid_arguments",
+                "limit must be an integer from 1 through 500.",
+                operation_id=operation_id,
+            )
+        normalized["limit"] = limit
+        return normalized
+
+    if operation == BrokerOperation.HOST_OBSERVE:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Host observation accepts no client-controlled arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
     if operation == BrokerOperation.SERVER_PUBLISH:
         allowed = {
             "lease_id",
@@ -1476,7 +1683,12 @@ def _validate_arguments(
             normalized["pid"] = pid
         return normalized
 
-    if operation in {BrokerOperation.COMPOSE_UP, BrokerOperation.COMPOSE_DOWN}:
+    if operation in {
+        BrokerOperation.COMPOSE_UP,
+        BrokerOperation.COMPOSE_STOP,
+        BrokerOperation.COMPOSE_RESTART,
+        BrokerOperation.COMPOSE_DOWN,
+    }:
         if value:
             raise BrokerError(
                 "invalid_arguments",
@@ -1587,6 +1799,86 @@ def _validate_arguments(
             "explicit": True,
         }
 
+    if operation == BrokerOperation.ARCHIVES_READ:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Archive listing accepts no client-controlled arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
+    if operation == BrokerOperation.CLEANUP_PLAN:
+        if set(value) != {"action", "target_kind", "target_id", "reason"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Lifecycle planning requires an archive or purge action, one opaque target kind, ID, and bounded reason.",
+                operation_id=operation_id,
+            )
+        action = str(value["action"])
+        if action not in {"archive", "purge"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "lifecycle action must be archive or purge.",
+                operation_id=operation_id,
+            )
+        target_kind = str(value["target_kind"])
+        if target_kind == "repository":
+            target_kind = "project"
+        if target_kind not in {"project", "server", "container", "worktree"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "cleanup target_kind must be project, server, container, or worktree.",
+                operation_id=operation_id,
+            )
+        return {
+            "action": action,
+            "target_kind": target_kind,
+            "target_id": _opaque_argument(value["target_id"], "target_id", operation_id),
+            "reason": _bounded_reason(value["reason"], operation_id),
+        }
+
+    if operation == BrokerOperation.CLEANUP_APPLY:
+        if set(value) != {"plan_id", "plan_fingerprint", "confirmation_phrase"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Cleanup apply requires the exact durable plan and confirmation phrase.",
+                operation_id=operation_id,
+            )
+        return {
+            "plan_id": _canonical_uuid_argument(value["plan_id"], "plan_id", operation_id),
+            "plan_fingerprint": _sha256_fingerprint_argument(
+                value["plan_fingerprint"], "plan_fingerprint", operation_id
+            ),
+            "confirmation_phrase": (
+                ""
+                if value["confirmation_phrase"] == ""
+                else _confirmation_phrase_argument(
+                    value["confirmation_phrase"], operation_id
+                )
+            ),
+        }
+
+    if operation == BrokerOperation.LIFECYCLE_RESTORE:
+        if set(value) != {"target_kind", "target_id", "reason"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Lifecycle restore requires one opaque target and bounded reason.",
+                operation_id=operation_id,
+            )
+        target_kind = "project" if value["target_kind"] == "repository" else value["target_kind"]
+        if target_kind not in {"project", "server", "container"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "restore target_kind must be project, server, or container.",
+                operation_id=operation_id,
+            )
+        return {
+            "target_kind": target_kind,
+            "target_id": _opaque_argument(value["target_id"], "target_id", operation_id),
+            "reason": _bounded_reason(value["reason"], operation_id),
+        }
+
     resource_identity_fields = {
         "resource_kind",
         "control_binding_id",
@@ -1597,11 +1889,16 @@ def _validate_arguments(
         BrokerOperation.RESOURCE_ATTACH,
         BrokerOperation.RESOURCE_PLAN_RETIRE,
         BrokerOperation.RESOURCE_RETIRE,
+        BrokerOperation.RESOURCE_PLAN_ARCHIVE,
+        BrokerOperation.RESOURCE_ARCHIVE,
+        BrokerOperation.RESOURCE_RESTORE,
     }:
         expected = set(resource_identity_fields)
         if operation in {
             BrokerOperation.RESOURCE_ATTACH,
             BrokerOperation.RESOURCE_PLAN_RETIRE,
+            BrokerOperation.RESOURCE_PLAN_ARCHIVE,
+            BrokerOperation.RESOURCE_RESTORE,
         }:
             expected.add("reason")
         else:
@@ -1657,6 +1954,21 @@ def _bounded_reason(value: Any, operation_id: str) -> str:
             operation_id=operation_id,
         )
     return value.strip()
+
+
+def _confirmation_phrase_argument(value: Any, operation_id: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 700
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise BrokerError(
+            "invalid_arguments",
+            "confirmation_phrase must be an exact bounded printable phrase.",
+            operation_id=operation_id,
+        )
+    return value
 
 
 def _database_name_argument(value: Any, operation_id: str) -> str:

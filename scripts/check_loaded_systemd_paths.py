@@ -26,6 +26,15 @@ PROPERTIES = (
     "ExecStart",
     "ExecStartPost",
     "TimeoutStartUSec",
+    "Requires",
+    "Wants",
+    "Restart",
+    "RestartUSec",
+    "StandardOutput",
+    "StandardError",
+    "SyslogIdentifier",
+    "LogRateLimitIntervalUSec",
+    "LogRateLimitBurst",
     "ReadWritePaths",
     "AmbientCapabilities",
     "CapabilityBoundingSet",
@@ -178,6 +187,29 @@ def require_command(
         violations.append(f"{unit} {key} does not contain exactly the pinned production command")
 
 
+def require_unit_relationship(
+    violations: list[str],
+    unit: str,
+    properties: dict[str, str],
+    key: str,
+    target: str,
+    *,
+    present: bool,
+) -> None:
+    actual = properties.get(key)
+    if actual is None:
+        violations.append(f"{unit} did not expose {key}")
+        return
+    names = actual.split()
+    if len(names) != len(set(names)):
+        violations.append(f"{unit} {key} contains duplicate unit names")
+        return
+    found = target in names
+    if found != present:
+        expectation = "contain" if present else "exclude"
+        violations.append(f"{unit} {key} must {expectation} {target}")
+
+
 def capability_property_mask(value: str) -> int:
     names = value.split()
     if len(names) != len(set(names)):
@@ -242,6 +274,13 @@ def validate_loaded_unit_outputs(
         "EnvironmentFiles": "",
         "ExecStartPre": "",
         "TimeoutStartUSec": "20s",
+        "Restart": "always",
+        "RestartUSec": "3s",
+        "StandardOutput": "journal",
+        "StandardError": "journal",
+        "SyslogIdentifier": "dev-coordinator",
+        "LogRateLimitIntervalUSec": "30s",
+        "LogRateLimitBurst": "10000",
         "ReadWritePaths": "",
         "AmbientCapabilities": "cap_net_bind_service",
     }.items():
@@ -260,6 +299,22 @@ def validate_loaded_unit_outputs(
         coordinator,
         "ExecStartPost",
         COORDINATOR_POSTSTART_ARGV,
+    )
+    require_unit_relationship(
+        violations,
+        "dev-coordinator.service",
+        coordinator,
+        "Wants",
+        "devcoordinator-broker.service",
+        present=True,
+    )
+    require_unit_relationship(
+        violations,
+        "dev-coordinator.service",
+        coordinator,
+        "Requires",
+        "devcoordinator-broker.service",
+        present=False,
     )
     coordinator_bounding = coordinator.get("CapabilityBoundingSet")
     if coordinator_bounding is None:
@@ -286,6 +341,13 @@ def validate_loaded_unit_outputs(
         "Environment": "",
         "EnvironmentFiles": f"{CONSOLE_ENV} (ignore_errors=no)",
         "TimeoutStartUSec": "1min 30s",
+        "Restart": "always",
+        "RestartUSec": "3s",
+        "StandardOutput": "journal",
+        "StandardError": "journal",
+        "SyslogIdentifier": "devops-console",
+        "LogRateLimitIntervalUSec": "30s",
+        "LogRateLimitBurst": "10000",
         "ReadWritePaths": CONSOLE_STATE,
         "AmbientCapabilities": "cap_net_bind_service",
         "CapabilityBoundingSet": "cap_net_bind_service",
@@ -299,6 +361,22 @@ def validate_loaded_unit_outputs(
         console,
         "ExecStartPost",
         CONSOLE_POSTSTART_ARGV,
+    )
+    require_unit_relationship(
+        violations,
+        "devops-console.service",
+        console,
+        "Wants",
+        "dev-coordinator.service",
+        present=True,
+    )
+    require_unit_relationship(
+        violations,
+        "devops-console.service",
+        console,
+        "Requires",
+        "dev-coordinator.service",
+        present=False,
     )
 
     if violations:

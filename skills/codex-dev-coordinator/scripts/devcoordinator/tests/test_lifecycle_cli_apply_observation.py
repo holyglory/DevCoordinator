@@ -142,6 +142,7 @@ class LifecycleApplyObservationTests(unittest.TestCase):
             "name": f"fixture-{full_id[0]}",
             "image": "postgres:16",
             "status": "Up 1 minute",
+            "running": True,
             "restart_policy": "always",
             "metadata_source": "coordinator_sidecar" if project is not None else "none",
             "labels": {},
@@ -781,7 +782,9 @@ class LifecycleApplyObservationTests(unittest.TestCase):
     def test_standalone_attachment_drift_is_rejected_before_host_effects(self) -> None:
         plan, _sample = self._plan_standalone()
         attached = self._sample(self._container(self.C, project=self.request_repo))
-        with self.assertRaisesRegex(LifecycleError, "active unassigned"):
+        with self.assertRaisesRegex(
+            PlanDriftError, "resource repository attachment changed"
+        ):
             self._handle(
                 self._resource_retire_args(plan),
                 observe_before_apply=self._callback(attached),

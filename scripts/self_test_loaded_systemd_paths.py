@@ -35,6 +35,15 @@ CapabilityBoundingSet=cap_chown cap_net_bind_service cap_sys_admin
 ExecStart={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876 --token-file /home/holyglory/.codex/agent-coordinator/api-token ; ignore_errors=no ; start_time=[n/a] ; }
 ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_coordinator_auth_boundary.py --token-file /home/holyglory/.codex/agent-coordinator/api-token --host 127.0.0.1 --port 29876 --wait-seconds 10 --poll-interval-seconds 0.1 ; ignore_errors=no ; start_time=[n/a] ; }
 TimeoutStartUSec=20s
+Requires=system.slice sysinit.target -.mount
+Wants=network-online.target devcoordinator-broker.service
+Restart=always
+RestartUSec=3s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dev-coordinator
+LogRateLimitIntervalUSec=30s
+LogRateLimitBurst=10000
 ReadWritePaths=
 """
 CONSOLE = """Type=simple
@@ -51,6 +60,15 @@ ExecStartPre={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordina
 ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env DEVCOORDINATOR_ROOT=/home/DevCoordinator DEVCOORDINATOR_AUTHORITY=system COORDINATOR_AUTOSTART=0 COORDINATOR_REGISTRATION_REQUIRED=1 COORDINATOR_URL=http://127.0.0.1:29876 COORDINATOR_SCRIPT=/home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py COORDINATOR_TOKEN_FILE=/home/holyglory/.codex/agent-coordinator/api-token CODEX_AGENT_COORDINATOR_HOME=/var/lib/devcoordinator-clients/1000 STATE_DIR=/home/holyglory/.local/state/devops-console ACME_WEBROOT=/home/holyglory/.local/state/devops-console/acme /usr/bin/node bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env ; ignore_errors=no ; start_time=[n/a] ; }
 ExecStartPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /home/DevCoordinator/scripts/check_console_registration_ready.py --unit devops-console.service --main-pid $MAINPID --token-file /home/holyglory/.codex/agent-coordinator/api-token --project /home/DevCoordinator --name devops-console --port 443 --host 127.0.0.1 --coordinator-port 29876 --expected-executable /usr/bin/node --expected-script bin/devops-console.mjs --env-file /home/holyglory/.config/devops-console/console.env --expected-working-directory /home/DevCoordinator/apps/DevOpsConsole --wait-seconds 80 --poll-interval-seconds 0.1 ; ignore_errors=no ; start_time=[n/a] ; }
 TimeoutStartUSec=1min 30s
+Requires=system.slice sysinit.target -.mount
+Wants=network-online.target dev-coordinator.service tmp.mount -.mount
+Restart=always
+RestartUSec=3s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=devops-console
+LogRateLimitIntervalUSec=30s
+LogRateLimitBurst=10000
 ReadWritePaths=/home/holyglory/.local/state/devops-console
 """
 
@@ -94,6 +112,15 @@ def main() -> int:
     must_fail(COORDINATOR.replace("ExecStartPost=", "MissingExecStartPost=", 1), CONSOLE, "missing coordinator readiness gate")
     must_fail(COORDINATOR.replace("--wait-seconds 10", "--wait-seconds 0", 1), CONSOLE, "disabled coordinator readiness wait")
     must_fail(COORDINATOR.replace("TimeoutStartUSec=20s", "TimeoutStartUSec=infinity", 1), CONSOLE, "unbounded coordinator startup")
+    must_fail(COORDINATOR.replace("Restart=always", "Restart=on-failure", 1), CONSOLE, "clean API exit is not supervised")
+    must_fail(COORDINATOR.replace("RestartUSec=3s", "RestartUSec=100ms", 1), CONSOLE, "API restart backoff drift")
+    must_fail(COORDINATOR.replace("StandardOutput=journal", "StandardOutput=null", 1), CONSOLE, "API stdout not journaled")
+    must_fail(COORDINATOR.replace("StandardError=journal", "StandardError=inherit", 1), CONSOLE, "API stderr not explicitly journaled")
+    must_fail(COORDINATOR.replace("SyslogIdentifier=dev-coordinator", "SyslogIdentifier=", 1), CONSOLE, "API journal identity missing")
+    must_fail(COORDINATOR.replace("LogRateLimitIntervalUSec=30s", "LogRateLimitIntervalUSec=0", 1), CONSOLE, "API journal burst interval drift")
+    must_fail(COORDINATOR.replace("LogRateLimitBurst=10000", "LogRateLimitBurst=0", 1), CONSOLE, "API journal burst limit drift")
+    must_fail(COORDINATOR.replace("Wants=network-online.target devcoordinator-broker.service", "Wants=network-online.target", 1), CONSOLE, "API no longer requests broker startup")
+    must_fail(COORDINATOR.replace("Requires=system.slice", "Requires=devcoordinator-broker.service system.slice", 1), CONSOLE, "broker maintenance cascades into the API listener")
     must_fail(COORDINATOR, CONSOLE.replace(f"{home}/.config", "/root/.config"), "environment file")
     must_fail(COORDINATOR, CONSOLE.replace(f"--home {home}", "--home /root"), "preflight home")
     must_fail(COORDINATOR, CONSOLE.replace(f"--state-dir {home}/.local", "--state-dir /root/.local"), "preflight state")
@@ -114,6 +141,15 @@ def main() -> int:
     must_fail(COORDINATOR, CONSOLE.replace("--wait-seconds 80", "--wait-seconds 60", 1), "Console readiness deadline drift")
     must_fail(COORDINATOR, CONSOLE.replace("/usr/bin/node --expected-script", "/tmp/node --expected-script", 1), "wrong Console runtime executable")
     must_fail(COORDINATOR, CONSOLE.replace("TimeoutStartUSec=1min 30s", "TimeoutStartUSec=infinity", 1), "unbounded Console startup")
+    must_fail(COORDINATOR, CONSOLE.replace("Restart=always", "Restart=on-failure", 1), "clean Console exit is not supervised")
+    must_fail(COORDINATOR, CONSOLE.replace("RestartUSec=3s", "RestartUSec=100ms", 1), "Console restart backoff drift")
+    must_fail(COORDINATOR, CONSOLE.replace("StandardOutput=journal", "StandardOutput=null", 1), "Console stdout not journaled")
+    must_fail(COORDINATOR, CONSOLE.replace("StandardError=journal", "StandardError=inherit", 1), "Console stderr not explicitly journaled")
+    must_fail(COORDINATOR, CONSOLE.replace("SyslogIdentifier=devops-console", "SyslogIdentifier=", 1), "Console journal identity missing")
+    must_fail(COORDINATOR, CONSOLE.replace("LogRateLimitIntervalUSec=30s", "LogRateLimitIntervalUSec=0", 1), "Console journal burst interval drift")
+    must_fail(COORDINATOR, CONSOLE.replace("LogRateLimitBurst=10000", "LogRateLimitBurst=0", 1), "Console journal burst limit drift")
+    must_fail(COORDINATOR, CONSOLE.replace("Wants=network-online.target dev-coordinator.service", "Wants=network-online.target", 1), "Console no longer requests coordinator startup")
+    must_fail(COORDINATOR, CONSOLE.replace("Requires=system.slice", "Requires=dev-coordinator.service system.slice", 1), "coordinator maintenance cascades into the public TLS edge")
     must_fail(COORDINATOR, CONSOLE + "ExecStartPost=" + CONSOLE.split("ExecStartPost=", 1)[1].split("\n", 1)[0] + "\n", "duplicate Console post-start command")
     must_fail(COORDINATOR, CONSOLE.replace("FragmentPath=/etc/systemd/system", "FragmentPath=/tmp"), "wrong Console fragment")
 

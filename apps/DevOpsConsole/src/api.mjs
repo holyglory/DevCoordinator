@@ -7,12 +7,15 @@ import { CoordError } from './coordinator.mjs';
 import { PrefsError } from './prefs.mjs';
 import { RouteError, publishedContainerPorts } from './routes.mjs';
 import { AccessError, CONSOLE_GRANT, routeGrant } from './access.mjs';
+import { TelegramServiceError } from './telegram.mjs';
 import { UpstreamAuthError } from './upstream-auth.mjs';
 
 const BODY_LIMIT = 64 * 1024;
 const SERVER_ACTIONS = new Set(['stop', 'restart']);
 const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
 const PROJECT_ACTIONS = new Set(['start', 'stop', 'restart']);
+const LIFECYCLE_ACTIONS = new Set(['archive', 'purge']);
+const LIFECYCLE_TARGET_KINDS = new Set(['project', 'server', 'container', 'worktree']);
 const CONTAINER_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
 const TAIL_MAX = 5000;
 
@@ -26,6 +29,7 @@ class ApiError extends Error {
 
 export function createConsoleApi({
   config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
+  telegram = null,
 }) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'api' }) : log;
 
@@ -106,8 +110,9 @@ export function createConsoleApi({
   }
 
   function toRouteView(route, resolved) {
+    const { instanceId: _privateInstanceId, ...publicRoute } = route;
     const view = {
-      ...route,
+      ...publicRoute,
       url: publicUrl(route.slug),
       upstreamAuth: upstreamAuthStore?.describe(route.slug) ?? { configured: false },
       resolved: { port: resolved?.port ?? null },
@@ -148,6 +153,149 @@ export function createConsoleApi({
     if (!accessStore?.isAdmin(session?.email)) {
       throw new ApiError(403, 'only configured Console owners can manage access');
     }
+  }
+
+  function requireLifecycleIdentity(body) {
+    const targetKind = requireString(body.target_kind, 'target_kind');
+    const targetId = requireString(body.target_id, 'target_id');
+    const canonicalKind = targetKind === 'repository' ? 'project' : targetKind;
+    if (!LIFECYCLE_TARGET_KINDS.has(canonicalKind)) {
+      throw new ApiError(400, 'target_kind must be project, server, container or worktree');
+    }
+    if (targetId.length > 300 || /[\u0000-\u001f\u007f]/.test(targetId)) {
+      throw new ApiError(400, 'target_id is invalid');
+    }
+    return { target_kind: canonicalKind, target_id: targetId };
+  }
+
+  function lifecycleReason(value, fallback) {
+    if (value === undefined || value === null || value === '') return fallback;
+    if (typeof value !== 'string') throw new ApiError(400, 'reason must be a string');
+    const reason = value.trim();
+    if (!reason) return fallback;
+    if (reason.length > 300) throw new ApiError(400, 'reason must be at most 300 characters');
+    return reason;
+  }
+
+  function archiveRows(value) {
+    const rows = Array.isArray(value) ? value : value?.archives;
+    if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
+      throw new ApiError(502, 'coordinator returned an invalid lifecycle archive collection');
+    }
+    return rows.map((row) => {
+      const normalized = {
+        ...row,
+        target_kind: row.target_kind === 'repository' ? 'project' : row.target_kind,
+      };
+      if (
+        !LIFECYCLE_TARGET_KINDS.has(normalized.target_kind)
+        || typeof normalized.target_id !== 'string'
+        || !normalized.target_id.trim()
+        || normalized.target_id.length > 300
+        || /[\u0000-\u001f\u007f]/.test(normalized.target_id)
+      ) {
+        throw new ApiError(502, 'coordinator returned an invalid lifecycle archive identity');
+      }
+      return normalized;
+    });
+  }
+
+  function activeLifecycleTarget(inventory, identity) {
+    if (identity.target_kind === 'project') {
+      return (inventory?.repositories || []).find((row) => row?.repo_id === identity.target_id) || null;
+    }
+    if (identity.target_kind === 'server') {
+      return (inventory?.servers || []).find((row) => row?.id === identity.target_id) || null;
+    }
+    if (identity.target_kind === 'container') {
+      return (inventory?.docker?.containers || [])
+        .find((row) => row?.host_resource_id === identity.target_id) || null;
+    }
+    return null;
+  }
+
+  async function handleLifecycleList(res, session) {
+    requireAccessAdmin(session);
+    const result = await coordinator.lifecycleArchives();
+    sendJson(res, 200, { archives: archiveRows(result) });
+  }
+
+  async function handleLifecyclePlan(req, res, session) {
+    requireAccessAdmin(session);
+    const body = await readJsonBody(req);
+    const identity = requireLifecycleIdentity(body);
+    if (!LIFECYCLE_ACTIONS.has(body.action)) {
+      throw new ApiError(400, "action must be 'archive' or 'purge'");
+    }
+
+    if (body.action === 'archive') {
+      const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+      if (!activeLifecycleTarget(inventory, identity)) {
+        throw new ApiError(404, 'active lifecycle target not found');
+      }
+    } else {
+      const archives = archiveRows(await coordinator.lifecycleArchives());
+      const archived = archives.find(
+        (row) => row?.target_kind === identity.target_kind && row?.target_id === identity.target_id,
+      );
+      if (!archived) throw new ApiError(404, 'archived lifecycle target not found');
+      if (archived.removable !== true) {
+        throw new ApiError(409, 'archived lifecycle target is not currently removable');
+      }
+    }
+
+    const plan = await coordinator.lifecyclePlan({
+      ...identity,
+      action: body.action,
+      reason: lifecycleReason(
+        body.reason,
+        `${body.action} requested via DevOps Console by ${session.email}`,
+      ),
+      agent: `devops-console:${session.email}`,
+    });
+    sendJson(res, 200, { plan });
+  }
+
+  async function handleLifecycleApply(req, res, session) {
+    requireAccessAdmin(session);
+    const body = await readJsonBody(req);
+    const payload = {
+      plan_id: requireString(body.plan_id, 'plan_id'),
+      plan_fingerprint: requireString(body.plan_fingerprint, 'plan_fingerprint'),
+      confirmation_phrase: '',
+    };
+    if (Object.hasOwn(body, 'confirmation_phrase')) {
+      if (typeof body.confirmation_phrase !== 'string') {
+        throw new ApiError(400, 'confirmation_phrase must be a string');
+      }
+      payload.confirmation_phrase = body.confirmation_phrase;
+    }
+    const result = await coordinator.lifecycleApply(payload);
+    sendJson(res, 200, { result });
+  }
+
+  async function handleLifecycleRestore(req, res, session) {
+    requireAccessAdmin(session);
+    const body = await readJsonBody(req);
+    const identity = requireLifecycleIdentity(body);
+    const archives = archiveRows(await coordinator.lifecycleArchives());
+    const archived = archives.find(
+      (row) => row?.target_kind === identity.target_kind && row?.target_id === identity.target_id,
+    );
+    if (!archived) throw new ApiError(404, 'archived lifecycle target not found');
+    if (archived.restorable !== true) {
+      throw new ApiError(409, 'archived lifecycle target is not currently restorable');
+    }
+    const result = await coordinator.lifecycleRestore({
+      ...identity,
+      reason: lifecycleReason(
+        body.reason,
+        `restore requested via DevOps Console by ${session.email}`,
+      ),
+      agent: `devops-console:${session.email}`,
+      explicit: true,
+    });
+    sendJson(res, 200, { result });
   }
 
   function accessView() {
@@ -195,6 +343,181 @@ export function createConsoleApi({
     const removed = await accessStore.removeUser(email);
     clog?.info?.('access user removed', { admin: session.email, email: removed.email });
     sendJson(res, 200, accessView());
+  }
+
+  function handleAccessRequestsGet(res, session, searchParams) {
+    requireAccessAdmin(session);
+    const status = searchParams.get('status') || 'pending';
+    sendJson(res, 200, {
+      version: 1,
+      pendingCount: accessStore.pendingRequestCount(),
+      requests: accessStore.listRequests({ status }),
+    });
+  }
+
+  async function handleAccessRequestDecision(req, res, session, requestId) {
+    requireAccessAdmin(session);
+    const body = await readJsonBody(req);
+    const decided = await accessStore.decideRequest(requestId, body.decision, session.email);
+    clog?.info?.('access request decided', {
+      admin: session.email,
+      requestId: decided.id,
+      email: decided.email,
+      resource: decided.resource,
+      decision: decided.status,
+    });
+    sendJson(res, 200, {
+      request: decided,
+      pendingCount: accessStore.pendingRequestCount(),
+      access: accessView(),
+    });
+  }
+
+  function requireStringArray(value, field, { maxItems = 500 } = {}) {
+    if (!Array.isArray(value) || value.length > maxItems) {
+      throw new ApiError(400, `${field} must be an array with at most ${maxItems} items`);
+    }
+    const items = value.map((item) => requireString(item, field));
+    if (new Set(items).size !== items.length) {
+      throw new ApiError(400, `${field} must not contain duplicates`);
+    }
+    return items;
+  }
+
+  function requireTelegram() {
+    if (!telegram) throw new ApiError(503, 'Telegram control is unavailable');
+    return telegram;
+  }
+
+  async function telegramProjects() {
+    const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+    if (!Array.isArray(inventory?.repositories)) {
+      throw new ApiError(502, 'coordinator returned an invalid repository collection');
+    }
+    const projects = inventory.repositories.map((repository) => {
+      const id = repository?.repo_id;
+      if (typeof id !== 'string' || !id || /[\u0000-\u001f\u007f]/.test(id)) {
+        throw new ApiError(502, 'coordinator returned an invalid repository identity');
+      }
+      return {
+        id,
+        name: repository.display_name || repository.name || id,
+        path: repository.canonical_root || repository.project_root || null,
+      };
+    });
+    projects.sort((a, b) => String(a.name).localeCompare(String(b.name)) || a.id.localeCompare(b.id));
+    return projects;
+  }
+
+  async function telegramView(session) {
+    const service = requireTelegram();
+    const [managedBots, projects] = await Promise.all([
+      service.listBots({ email: session.email }),
+      telegramProjects(),
+    ]);
+    const bots = await Promise.all(managedBots.map(async (bot) => ({
+      id: bot.id,
+      label: bot.label ?? null,
+      username: bot.username ?? null,
+      firstName: bot.firstName ?? null,
+      ownerEmail: bot.ownerEmail,
+      enabled: bot.enabled !== false,
+      projects: Array.isArray(bot.projects) ? [...bot.projects] : [],
+      createdAt: bot.createdAt ?? null,
+      updatedAt: bot.updatedAt ?? null,
+      lastPollAt: bot.lastPollAt ?? null,
+      lastUpdateAt: bot.lastUpdateAt ?? null,
+      lastDeliveryAt: bot.lastDeliveryAt ?? null,
+      lastError: bot.lastError ?? null,
+      hasToken: bot.hasToken === true,
+      authorizations: (await service.listAuthorizationQueue({
+        email: session.email,
+        botId: bot.id,
+        status: null,
+      })).map((request) => ({
+        id: request.id,
+        botId: request.botId,
+        botUsername: request.botUsername ?? null,
+        telegramUserId: request.telegramUserId,
+        username: request.username ?? null,
+        firstName: request.firstName ?? null,
+        lastName: request.lastName ?? null,
+        languageCode: request.languageCode ?? null,
+        status: request.status,
+        requestedAt: request.requestedAt,
+        decidedAt: request.decidedAt ?? null,
+        decidedBy: request.decidedBy ?? null,
+      })),
+    })));
+    return { version: 1, bots, projects };
+  }
+
+  async function handleTelegramGet(res, session) {
+    sendJson(res, 200, await telegramView(session));
+  }
+
+  async function handleTelegramRegister(req, res, session) {
+    const body = await readJsonBody(req);
+    const registered = await requireTelegram().registerBot({
+      email: session.email,
+      token: body.token, // public-artifact-guard: allow text-secret -- runtime request-value plumbing, not a literal credential
+      label: body.label,
+      takeoverWebhook: body.takeOver === true,
+    });
+    clog?.info?.('Telegram bot registered', { owner: session.email });
+    sendJson(res, 201, { ...(await telegramView(session)), registeredBotId: registered.id });
+  }
+
+  async function handleTelegramRemove(res, session, botId) {
+    await requireTelegram().removeBot({ email: session.email, botId });
+    clog?.info?.('Telegram bot removed', { actor: session.email, botId });
+    sendJson(res, 200, await telegramView(session));
+  }
+
+  async function handleTelegramProjects(req, res, session, botId) {
+    const service = requireTelegram();
+    const body = await readJsonBody(req);
+    const repoIds = requireStringArray(body.projectIds, 'projectIds');
+    const projects = await telegramProjects();
+    const known = new Set(projects.map((project) => project.id));
+    if (repoIds.some((repoId) => !known.has(repoId))) {
+      throw new ApiError(404, 'one or more coordinator repositories no longer exist');
+    }
+    if (typeof service.setProjects === 'function') {
+      await service.setProjects({ email: session.email, botId, repoIds });
+    } else {
+      const bot = (await service.listBots({ email: session.email }))
+        .find((candidate) => String(candidate.id) === String(botId));
+      if (!bot) throw new TelegramServiceError(404, 'bot_not_found', 'Telegram bot not found');
+      const current = new Set((bot.projects || []).map(String));
+      for (const repoId of new Set([...current, ...repoIds])) {
+        const assigned = repoIds.includes(repoId);
+        if (current.has(repoId) !== assigned) {
+          await service.assignProject({ email: session.email, botId, repoId, assigned });
+        }
+      }
+    }
+    clog?.info?.('Telegram bot projects changed', { actor: session.email, botId, count: repoIds.length });
+    sendJson(res, 200, await telegramView(session));
+  }
+
+  async function handleTelegramAuthorizationDecision(req, res, session, botId, requestId) {
+    const service = requireTelegram();
+    const body = await readJsonBody(req);
+    const request = (await service.listAuthorizationQueue({
+      email: session.email,
+      botId,
+      status: null,
+    })).find((candidate) => candidate.id === requestId);
+    if (!request) throw new TelegramServiceError(404, 'request_not_found', 'authorization request not found');
+    await service.decideAuthorization({ email: session.email, requestId, decision: body.decision });
+    clog?.info?.('Telegram authorization decided', {
+      actor: session.email,
+      botId,
+      requestId,
+      decision: body.decision,
+    });
+    sendJson(res, 200, await telegramView(session));
   }
 
   async function routeViews() {
@@ -708,15 +1031,22 @@ export function createConsoleApi({
       || err instanceof RouteError
       || err instanceof PrefsError
       || err instanceof AccessError
+      || err instanceof TelegramServiceError
       || err instanceof UpstreamAuthError
     ) {
       status = Number.isInteger(err.status) ? err.status : 500;
+      // A 401 from Telegram means the submitted bot token is invalid; it is
+      // not a Console-session failure. Returning 401 here would make the UI
+      // reload into Google sign-in and hide the actionable token error.
+      if (err instanceof TelegramServiceError && err.status === 401) status = 400;
       message = err.message;
     } else if (err instanceof CoordError) {
       // The coordinator answered with a client error (e.g. "matching lease
-      // not found"): pass it through as 400. Anything else — unreachable,
+      // not found"): pass it through as 400. Lifecycle conflicts and
+      // incomplete HTTP-200 reports preserve 409 so the reviewed operation is
+      // never mistaken for a validation typo. Anything else — unreachable,
       // timeout, 5xx — is a gateway failure and stays 502.
-      status = err.status >= 400 && err.status < 500 ? 400 : 502;
+      status = err.status === 409 ? 409 : err.status >= 400 && err.status < 500 ? 400 : 502;
       message = err.message;
     } else {
       clog?.error?.('console api internal error', { error: err?.stack ?? String(err) });
@@ -725,7 +1055,14 @@ export function createConsoleApi({
       res.destroy();
       return;
     }
-    sendJson(res, status, { error: message });
+    const payload = { error: message };
+    if (err instanceof TelegramServiceError && typeof err.code === 'string') payload.code = err.code;
+    if (
+      err instanceof TelegramServiceError
+      && err.code === 'telegram_rate_limited'
+      && Number.isFinite(err.retryAfter)
+    ) payload.retryAfter = err.retryAfter;
+    sendJson(res, status, payload);
   }
 
   function safeDecode(segment) {
@@ -772,6 +1109,18 @@ export function createConsoleApi({
       if (method === 'GET' && pathname === '/api/access') {
         return handleAccessGet(res, session);
       }
+      if (method === 'GET' && pathname === '/api/access/requests') {
+        return handleAccessRequestsGet(res, session, searchParams);
+      }
+      const accessRequestDecisionMatch = pathname.match(/^\/api\/access\/requests\/([^/]+)\/decision$/);
+      if (accessRequestDecisionMatch && method === 'POST') {
+        return await handleAccessRequestDecision(
+          req,
+          res,
+          session,
+          safeDecode(accessRequestDecisionMatch[1]),
+        );
+      }
       if (method === 'POST' && pathname === '/api/access/users') {
         return await handleAccessAdd(req, res, session);
       }
@@ -781,6 +1130,32 @@ export function createConsoleApi({
       }
       if (accessUserMatch && method === 'DELETE') {
         return await handleAccessRemove(res, session, safeDecode(accessUserMatch[1]));
+      }
+      if (method === 'GET' && pathname === '/api/telegram') {
+        return await handleTelegramGet(res, session);
+      }
+      if (method === 'POST' && pathname === '/api/telegram/bots') {
+        return await handleTelegramRegister(req, res, session);
+      }
+      const telegramBotMatch = pathname.match(/^\/api\/telegram\/bots\/([^/]+)$/);
+      if (telegramBotMatch && method === 'DELETE') {
+        return await handleTelegramRemove(res, session, safeDecode(telegramBotMatch[1]));
+      }
+      const telegramProjectsMatch = pathname.match(/^\/api\/telegram\/bots\/([^/]+)\/projects$/);
+      if (telegramProjectsMatch && method === 'PATCH') {
+        return await handleTelegramProjects(req, res, session, safeDecode(telegramProjectsMatch[1]));
+      }
+      const telegramDecisionMatch = pathname.match(
+        /^\/api\/telegram\/bots\/([^/]+)\/authorizations\/([^/]+)\/decision$/,
+      );
+      if (telegramDecisionMatch && method === 'POST') {
+        return await handleTelegramAuthorizationDecision(
+          req,
+          res,
+          session,
+          safeDecode(telegramDecisionMatch[1]),
+          safeDecode(telegramDecisionMatch[2]),
+        );
       }
       if (method === 'POST' && pathname === '/api/routes') {
         return await handleRouteCreate(req, res);
@@ -837,6 +1212,18 @@ export function createConsoleApi({
       }
       if (method === 'POST' && pathname === '/api/projects/action') {
         return await handleProjectAction(req, res, session);
+      }
+      if (method === 'GET' && pathname === '/api/lifecycle/list') {
+        return await handleLifecycleList(res, session);
+      }
+      if (method === 'POST' && pathname === '/api/lifecycle/plan') {
+        return await handleLifecyclePlan(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/lifecycle/apply') {
+        return await handleLifecycleApply(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/lifecycle/restore') {
+        return await handleLifecycleRestore(req, res, session);
       }
       if (method === 'GET' && pathname === '/api/prefs') {
         return handlePrefsGet(res);

@@ -12,15 +12,16 @@ import { promises as fsp } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import tls from 'node:tls';
 
 import {
+  COORDINATOR_SCRIPT,
   apiCall,
   browse,
+  canonicalTempDir,
   fetchUrl,
   login,
   makeJar,
@@ -30,11 +31,6 @@ import { FIXTURE_UPSTREAM_AUTHORIZATION } from './helpers/upstream.mjs';
 import { wsAcceptFor } from './helpers/ws-echo.mjs';
 
 const FIXTURE_EMAIL = 'ja@vr.ae';
-
-async function canonicalTempDir(prefix) {
-  const created = await fsp.mkdtemp(path.join(os.tmpdir(), prefix));
-  return fsp.realpath(created);
-}
 
 // macOS CI runners hang `python3 -m http.server` in getfqdn() before it ever
 // listens; this equivalent fixture uses plain socketserver.TCPServer (same
@@ -92,21 +88,21 @@ describe('e2e: full console stack', () => {
     };
     const psRows = [
       {
-        ID: 'eeeb00000001', Names: 'e2eweb-app-1', Image: 'e2eweb-app',
+        ID: 'eeeb00000001'.padEnd(64, '0'), Names: 'e2eweb-app-1', Image: 'e2eweb-app',
         Status: 'Up 2 minutes (healthy)',
         // Container port 3000 published on the fixture listener's host port —
         // different numbers on purpose, so resolution must use the mapping.
         Ports: `0.0.0.0:${webHostPort}->3000/tcp, :::${webHostPort}->3000/tcp`,
       },
       {
-        ID: 'eeea00000002', Names: 'e2emulti-app-1', Image: 'e2emulti-app',
+        ID: 'eeea00000002'.padEnd(64, '0'), Names: 'e2emulti-app-1', Image: 'e2emulti-app',
         Status: 'Up 2 minutes',
         Ports: '0.0.0.0:19998->3000/tcp, 0.0.0.0:19999->9000/tcp',
       },
       {
         // Dedicated to the stale-route lifecycle test: a seeded route points
         // at container port 4000, which this container does NOT publish.
-        ID: 'eeea00000003', Names: 'e2estale-app-1', Image: 'e2estale-app',
+        ID: 'eeea00000003'.padEnd(64, '0'), Names: 'e2estale-app-1', Image: 'e2estale-app',
         Status: 'Up 2 minutes',
         Ports: '0.0.0.0:19997->3000/tcp',
       },
@@ -123,7 +119,7 @@ describe('e2e: full console stack', () => {
         published[key].push({ HostIp: '0.0.0.0', HostPort: hostPort });
       }
       const full = {
-        Id: row.ID.padEnd(64, '0'),
+        Id: row.ID,
         Name: `/${row.Names}`,
         Config: { Labels: labels },
         State: { Status: 'running', Running: true, Health: { Status: 'healthy' } },
@@ -133,11 +129,35 @@ describe('e2e: full console stack', () => {
       inspectMap[row.ID] = full;
       inspectMap[row.Names] = full;
     }
+    const networkId = 'eeec00000001'.padEnd(64, '0');
+    const volumeName = 'e2eweb_fixture_data';
+    const composeAssets = {
+      network: {
+        listed: [networkId.slice(0, 12)],
+        inspected: {
+          [networkId.slice(0, 12)]: {
+            Id: networkId,
+            Name: 'e2eweb_default',
+            Labels: labels,
+          },
+        },
+      },
+      volume: {
+        listed: [volumeName],
+        inspected: {
+          [volumeName]: {
+            Name: volumeName,
+            Labels: labels,
+          },
+        },
+      },
+    };
     const script = `#!/usr/bin/env python3
 import json, sys
 args = sys.argv[1:]
 ps_rows = json.loads(${JSON.stringify(JSON.stringify(psRows))})
 inspect_map = json.loads(${JSON.stringify(JSON.stringify(inspectMap))})
+compose_assets = json.loads(${JSON.stringify(JSON.stringify(composeAssets))})
 if args[:1] == ["ps"]:
     for row in ps_rows:
         print(json.dumps(row))
@@ -147,6 +167,15 @@ elif args[:3] == ["inspect", "--format", "{{json .State}}"]:
 elif args[:3] == ["inspect", "--format", "{{json .}}"]:
     for key in args[3:]:
         print(json.dumps(inspect_map[key]))
+elif len(args) >= 2 and args[0] in ("network", "volume") and args[1] == "ls":
+    for identity in compose_assets[args[0]]["listed"]:
+        print(identity)
+elif args[:4] in (
+    ["network", "inspect", "--format", "{{json .}}"],
+    ["volume", "inspect", "--format", "{{json .}}"],
+):
+    for key in args[4:]:
+        print(json.dumps(compose_assets[args[0]]["inspected"][key]))
 elif args[:1] == ["stats"]:
     pass
 elif args[:1] == ["logs"]:
@@ -161,6 +190,46 @@ else:
     await fsp.writeFile(fakeDocker, script, { encoding: 'utf8', mode: 0o755 });
   }
 
+  function assertDockerFixtureContract(extraEnv) {
+    // Exercise the production parser directly. The public inventory projection
+    // intentionally omits internal exhaustive-Compose fields, so this fixture
+    // must prove full inspection plus both retained asset kinds before startup.
+    const script = `
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import dev_coordinator
+
+print(json.dumps(dev_coordinator.docker_ps_inventory()))
+`;
+    const stdout = execFileSync(
+      'python3',
+      ['-c', script, path.dirname(COORDINATOR_SCRIPT)],
+      {
+        env: { ...process.env, ...extraEnv },
+        encoding: 'utf8',
+        timeout: 60_000,
+        maxBuffer: 16 * 1024 * 1024,
+      },
+    );
+    const docker = JSON.parse(stdout);
+    const composeAssetKinds = new Set(
+      (docker?.compose_assets || []).map((asset) => asset?.kind),
+    );
+    if (
+      docker?.available !== true
+      || docker?.container_inspection_available !== true
+      || docker?.compose_assets_available !== true
+      || !composeAssetKinds.has('network')
+      || !composeAssetKinds.has('volume')
+    ) {
+      throw new Error(
+        `E2E fake Docker does not satisfy the production full-ID and exhaustive Compose-asset contract: ${JSON.stringify(docker)}`,
+      );
+    }
+  }
+
   before(async () => {
     dockerWeb = await startDockerWebBackend();
     const fakeBin = await canonicalTempDir('devops-console-e2e-dockerbin-');
@@ -168,9 +237,14 @@ else:
     dockerCallsLog = path.join(fakeBin, 'docker-calls.log');
     await writeFakeDocker(fakeBin, dockerWeb.port, dockerCallsLog);
 
+    const coordinatorEnv = {
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}`,
+    };
+    assertDockerFixtureContract(coordinatorEnv);
+
     stack = await startStack({
       allowedEmails: [FIXTURE_EMAIL],
-      coordinatorEnv: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` },
+      coordinatorEnv,
       expectDocker: true,
       routes: ({ upstream, wsEcho }) => [
         // app -> ws-echo (answers plain GET too) — protected by default.
@@ -395,24 +469,127 @@ else:
     userJar = jar;
   });
 
-  it('4. disallowed email gets the 403 denied page and NO session cookie', async () => {
+  it('4. verified unknown email requests an exact invite; owner approval activates the same cookie', async () => {
     const jar = makeJar();
     stack.issuer.setClaims({ email: 'intruder@evil.example', email_verified: true });
     try {
-      const res = await login(stack, jar);
+      const requestedUrl = `https://echo.${stack.domain}/`;
+      const res = await login(stack, jar, { rt: requestedUrl });
       assert.equal(res.status, 403);
       assert.match(res.text, /Access denied/);
       assert.match(res.text, /intruder@evil\.example/);
+      assert.match(res.text, />Request invite</);
       const allSetCookies = res.hops.flatMap((h) => h.setCookies);
       assert.ok(
-        !allSetCookies.some((c) => c.startsWith('dc_session=') && !/Max-Age=0/i.test(c)),
-        `no session cookie may be issued: ${allSetCookies.join(' | ')}`,
+        allSetCookies.some((c) => c.startsWith('dc_session=') && !/Max-Age=0/i.test(c)),
+        `verified identity cookie must be issued without granting access: ${allSetCookies.join(' | ')}`,
       );
-      assert.equal(jar.get('dc_session'), null, 'jar must hold no session');
+      assert.ok(jar.get('dc_session'), 'jar retains the verified identity cookie');
 
-      // And the cookieless jar still cannot reach protected content.
-      const probe = await fetchUrl(stack, 'https://echo.vr.ae/', { jar, headers: { accept: 'text/html' } });
-      assert.equal(probe.status, 302);
+      const token = res.text.match(/name="request_token" value="([^"]+)"/)?.[1];
+      assert.ok(token, 'denied page carries a server-signed exact-resource request token');
+      const body = new URLSearchParams({ request_token: token }).toString();
+      const siblingCsrf = await fetchUrl(stack, `https://echo.${stack.domain}/auth/request-invite`, {
+        method: 'POST', jar, body,
+        headers: {
+          origin: `https://pub.${stack.domain}`,
+          'content-type': 'application/x-www-form-urlencoded',
+          accept: 'text/html',
+        },
+      });
+      assert.equal(siblingCsrf.status, 403, 'a sibling *.vr.ae origin cannot submit the domain cookie');
+
+      const requested = await fetchUrl(stack, `https://echo.${stack.domain}/auth/request-invite`, {
+        method: 'POST', jar, body,
+        headers: {
+          origin: `https://echo.${stack.domain}`,
+          'content-type': 'application/x-www-form-urlencoded',
+          accept: 'text/html',
+        },
+      });
+      assert.equal(requested.status, 202, requested.text);
+      assert.match(requested.text, /Invite requested/);
+
+      const duplicate = await fetchUrl(stack, `https://echo.${stack.domain}/auth/request-invite`, {
+        method: 'POST', jar, body,
+        headers: {
+          origin: `https://echo.${stack.domain}`,
+          'content-type': 'application/x-www-form-urlencoded',
+          accept: 'text/html',
+        },
+      });
+      assert.equal(duplicate.status, 202);
+      assert.match(duplicate.text, /already pending/i);
+
+      const pending = await apiCall(stack, userJar, 'GET', '/api/access/requests');
+      assert.equal(pending.status, 200, pending.text);
+      const row = pending.json.requests.find((request) => request.email === 'intruder@evil.example');
+      assert.equal(row.resource, 'route:echo');
+      assert.equal(row.host, `echo.${stack.domain}`);
+      assert.equal(row.subjectHash, undefined, 'Google subject hash is private store state');
+
+      const approved = await apiCall(
+        stack,
+        userJar,
+        'POST',
+        `/api/access/requests/${encodeURIComponent(row.id)}/decision`,
+        { decision: 'approve' },
+        { origin: stack.consoleOrigin },
+      );
+      assert.equal(approved.status, 200, approved.text);
+      assert.equal(approved.json.request.status, 'approved');
+
+      const probe = await fetchUrl(stack, requestedUrl, { jar, headers: { accept: 'text/html' } });
+      assert.equal(probe.status, 200, 'approval applies to the existing identity cookie without another login');
+      const consoleStillDenied = await fetchUrl(stack, `${stack.consoleOrigin}/`, { jar, headers: { accept: 'text/html' } });
+      assert.equal(consoleStillDenied.status, 403, 'exact route approval does not imply Console access');
+      const consoleToken = consoleStillDenied.text.match(/name="request_token" value="([^"]+)"/)?.[1];
+      assert.ok(consoleToken, 'Console denial carries its own exact request token');
+      const consoleBody = new URLSearchParams({ request_token: consoleToken }).toString();
+      const consoleRequested = await fetchUrl(stack, `${stack.consoleOrigin}/auth/request-invite`, {
+        method: 'POST', jar, body: consoleBody,
+        headers: {
+          origin: stack.consoleOrigin,
+          'content-type': 'application/x-www-form-urlencoded',
+          accept: 'text/html',
+        },
+      });
+      assert.equal(consoleRequested.status, 202, consoleRequested.text);
+      const consolePending = await apiCall(stack, userJar, 'GET', '/api/access/requests');
+      const consoleRow = consolePending.json.requests.find(
+        (request) => request.email === 'intruder@evil.example' && request.resource === 'console',
+      );
+      assert.ok(consoleRow);
+      const denied = await apiCall(
+        stack,
+        userJar,
+        'POST',
+        `/api/access/requests/${encodeURIComponent(consoleRow.id)}/decision`,
+        { decision: 'deny' },
+        { origin: stack.consoleOrigin },
+      );
+      assert.equal(denied.status, 200, denied.text);
+      assert.equal(denied.json.request.status, 'denied');
+      const deniedRetry = await fetchUrl(stack, `${stack.consoleOrigin}/auth/request-invite`, {
+        method: 'POST', jar, body: consoleBody,
+        headers: {
+          origin: stack.consoleOrigin,
+          'content-type': 'application/x-www-form-urlencoded',
+          accept: 'text/html',
+        },
+      });
+      assert.equal(deniedRetry.status, 429);
+      assert.ok(Number(deniedRetry.headers['retry-after']) > 0);
+
+      const removed = await apiCall(
+        stack,
+        userJar,
+        'DELETE',
+        `/api/access/users/${encodeURIComponent('intruder@evil.example')}`,
+        null,
+        { origin: stack.consoleOrigin },
+      );
+      assert.equal(removed.status, 200, removed.text);
     } finally {
       stack.issuer.setClaims({ email: FIXTURE_EMAIL, email_verified: true });
     }
@@ -1594,6 +1771,8 @@ else:
     assert.equal(guestSession.json.accessAdmin, false);
     const guestCannotAdmin = await apiCall(stack, guestJar, 'GET', '/api/access');
     assert.equal(guestCannotAdmin.status, 403, 'Console access does not imply access-administration rights');
+    const guestCannotSeeRequests = await apiCall(stack, guestJar, 'GET', '/api/access/requests');
+    assert.equal(guestCannotSeeRequests.status, 403, 'incoming invite identities remain owner-only');
     const guestCannotSetUpstreamAuth = await apiCall(
       stack,
       guestJar,
@@ -1666,7 +1845,7 @@ else:
       `/api/access/users/${encodeURIComponent(guestEmail)}`, null, { origin: stack.consoleOrigin });
     assert.equal(removed.status, 200, removed.text);
     const afterRemoval = await fetchUrl(stack, `https://app.${stack.domain}/`, { jar: guestJar });
-    assert.equal(afterRemoval.status, 302, 'user removal invalidates an existing signed session immediately');
-    assert.match(afterRemoval.headers.location, /\/auth\/login\?rt=/);
+    assert.equal(afterRemoval.status, 403, 'user removal revokes authorization on the existing identity immediately');
+    assert.match(afterRemoval.text, />Request invite</, 'the still-verified identity may request access again');
   });
 });

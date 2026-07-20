@@ -2686,10 +2686,16 @@ class NormalizedServerLifecycle:
             "pid": row["pid"],
             "process_start_time": row["process_start_time"],
             "process_fingerprint": row["process_fingerprint"],
-            "registration_identity": (
-                {"source": "normalized_exact_listener"}
-                if row["pid"] is not None and port is not None
-                else None
+            **(
+                {
+                    "registration_identity": {
+                        "source": "normalized_exact_listener"
+                    }
+                }
+                if row["pid"] is not None
+                and port is not None
+                and lifecycle in {"running", "starting", "unhealthy", "stopping"}
+                else {}
             ),
             "log_path": row["log_path"],
             "adopted": not bool(argv),

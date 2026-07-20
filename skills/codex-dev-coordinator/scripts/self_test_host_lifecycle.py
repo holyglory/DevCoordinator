@@ -38,6 +38,10 @@ from devcoordinator.repository_lifecycle import (  # noqa: E402
 CONTAINER_ID = "d" * 64
 
 
+class SimulatedCrash(BaseException):
+    pass
+
+
 def expect(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -47,7 +51,9 @@ class FakeNativeBackend:
     def __init__(self) -> None:
         self.container = ContainerBoundary(True, CONTAINER_ID, True, "always")
         self.server = ServerBoundary(True, True, RunningState.RUNNING, True, True)
-        self.supervisor = SupervisorBoundary(True, True, True, True)
+        self.supervisor = SupervisorBoundary(
+            True, True, True, True, "systemd", "enabled", True
+        )
         self.calls: list[str] = []
 
     def observe_server(self, identity: Mapping[str, str]) -> ServerBoundary:
@@ -93,7 +99,13 @@ class FakeNativeBackend:
     def disable_supervisor(self, identity: Mapping[str, str]) -> Mapping[str, Any]:
         self.calls.append(f"disable-supervisor:{identity.get('unit')}")
         self.supervisor = SupervisorBoundary(
-            True, True, self.supervisor.active, False
+            True,
+            True,
+            self.supervisor.active,
+            False,
+            "systemd",
+            "masked",
+            self.supervisor.loaded,
         )
         return {"enabled": False}
 
@@ -114,7 +126,7 @@ class FakeNativeBackend:
 
     def stop_supervisor(self, identity: Mapping[str, str]) -> Mapping[str, Any]:
         self.calls.append(f"stop-supervisor:{identity.get('unit')}")
-        self.supervisor = SupervisorBoundary(True, True, False, False)
+        self.supervisor = replace(self.supervisor, active=False)
         return {"stopped": True}
 
 
@@ -270,6 +282,7 @@ class ScriptedSystemdBackend(LocalHostLifecycleBackend):
         self.active = True
         self.unit_state = "enabled"
         self.commands: list[tuple[str, ...]] = []
+        self.fail_before_once: set[str] = set()
 
     def _run(
         self,
@@ -281,6 +294,10 @@ class ScriptedSystemdBackend(LocalHostLifecycleBackend):
         del timeout, allow
         command = tuple(argv)
         self.commands.append(command)
+        for action in tuple(self.fail_before_once):
+            if action in command:
+                self.fail_before_once.remove(action)
+                raise SimulatedCrash(f"before systemd {action}")
         if "show" in command:
             payload = (
                 "Id=example.service\n"
@@ -296,7 +313,7 @@ class ScriptedSystemdBackend(LocalHostLifecycleBackend):
         if "enable" in command:
             self.unit_state = "enabled-runtime" if "--runtime" in command else "enabled"
         if "mask" in command:
-            self.unit_state = "masked"
+            self.unit_state = "masked-runtime" if "--runtime" in command else "masked"
         if "stop" in command:
             self.active = False
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -309,6 +326,7 @@ class ScriptedLaunchdBackend(LocalHostLifecycleBackend):
         self.loaded = True
         self.active = True
         self.commands: list[tuple[str, ...]] = []
+        self.fail_before_once: set[str] = set()
 
     @staticmethod
     def _verified_launchd_plist(identity: Mapping[str, str]) -> str:
@@ -326,6 +344,10 @@ class ScriptedLaunchdBackend(LocalHostLifecycleBackend):
         del timeout, allow
         command = tuple(argv)
         self.commands.append(command)
+        for action in tuple(self.fail_before_once):
+            if action in command:
+                self.fail_before_once.remove(action)
+                raise SimulatedCrash(f"before launchd {action}")
         if "print-disabled" in command:
             value = "true" if self.disabled else "false"
             return subprocess.CompletedProcess(
@@ -405,6 +427,53 @@ def test_local_systemd_backend_disables_and_masks_before_stop() -> None:
     expect(all("example.service" in command for command in mutations), "wrong systemd unit")
 
 
+def test_systemd_unmasked_disabled_is_partial_not_complete_policy() -> None:
+    backend = ScriptedSystemdBackend()
+    backend.active = False
+    backend.unit_state = "disabled"
+    policy = StartupPolicyRef(
+        "policy-unit", PolicyKind.SUPERVISOR, "policy-unit-fp", "disabled"
+    )
+    target = ExactResourceRef(
+        "example.service",
+        ResourceKind.SUPERVISOR,
+        "target-fp",
+        "binding",
+        "ownership",
+        (policy,),
+        (),
+        (
+            ("manager", "systemd"),
+            ("scope", "user"),
+            ("unit", "example.service"),
+        ),
+    )
+    adapter = CoordinatorHostLifecycleAdapter(backend)
+    partial = adapter.observe_exact(target).policies[policy.policy_id]
+    expect(partial.disabled is False, "disabled-but-unmasked systemd unit looked complete")
+    expect(partial.supervisor_unit_file_state == "disabled", str(partial))
+    backend.unit_state = "masked"
+    complete = adapter.observe_exact(target).policies[policy.policy_id]
+    expect(complete.disabled is True, "masked systemd unit was not fully disabled")
+
+
+def test_local_systemd_disable_replays_mask_after_interruption() -> None:
+    backend = ScriptedSystemdBackend()
+    identity = {"manager": "systemd", "scope": "user", "unit": "example.service"}
+    backend.fail_before_once.add("mask")
+    try:
+        backend.disable_supervisor(identity)
+    except SimulatedCrash:
+        pass
+    else:
+        raise AssertionError("systemd disable fixture did not interrupt before mask")
+    expect(backend.unit_state == "disabled", backend.unit_state)
+    backend.disable_supervisor(identity)
+    expect(backend.unit_state == "masked", backend.unit_state)
+    masks = [command for command in backend.commands if "mask" in command]
+    expect(len(masks) == 2, f"mask was not retried after interruption: {masks}")
+
+
 def test_local_systemd_backend_restores_only_exact_captured_unit_file_state() -> None:
     backend = ScriptedSystemdBackend()
     identity = {"manager": "systemd", "scope": "user", "unit": "example.service"}
@@ -452,8 +521,101 @@ def test_local_systemd_backend_restores_only_exact_captured_unit_file_state() ->
         raise AssertionError("unsupported systemd state was guessed")
     expect(len(backend.commands) == count, "unknown systemd state reached host mutation")
 
+    inconsistent_enabled = replace(captured, supervisor_enabled=False)
+    count = len(backend.commands)
+    try:
+        backend.restore_supervisor(identity, inconsistent_enabled)
+    except Exception as error:
+        expect("not captured as enabled" in str(error), error)
+    else:
+        raise AssertionError("inconsistent enabled systemd capture was guessed")
+    expect(
+        len(backend.commands) == count,
+        "inconsistent systemd enabled tuple reached host mutation",
+    )
 
-def test_local_launchd_backend_restores_captured_enable_and_loaded_state() -> None:
+    inconsistent_value = replace(captured, captured_value="disabled")
+    count = len(backend.commands)
+    try:
+        backend.restore_supervisor(identity, inconsistent_value)
+    except Exception as error:
+        expect("does not match its unit-file state" in str(error), error)
+    else:
+        raise AssertionError("inconsistent systemd captured value was guessed")
+    expect(
+        len(backend.commands) == count,
+        "inconsistent systemd policy value reached host mutation",
+    )
+
+
+def test_local_systemd_restore_resumes_partial_and_preserves_preexisting_disabled() -> None:
+    identity = {"manager": "systemd", "scope": "user", "unit": "example.service"}
+    captured_enabled = CapturedStartupPolicyState(
+        "policy-unit",
+        "repo",
+        ResourceKind.SUPERVISOR,
+        "example.service",
+        PolicyKind.SUPERVISOR,
+        "policy-fp",
+        "target-fp",
+        "binding",
+        "ownership",
+        "native-fp",
+        "enabled",
+        True,
+        "captured",
+        supervisor_manager="systemd",
+        supervisor_unit_file_state="enabled",
+        supervisor_loaded=True,
+        supervisor_enabled=True,
+    )
+    backend = ScriptedSystemdBackend()
+    backend.disable_supervisor(identity)
+    backend.fail_before_once.add("enable")
+    try:
+        backend.restore_supervisor(identity, captured_enabled)
+    except SimulatedCrash:
+        pass
+    else:
+        raise AssertionError("systemd restore did not interrupt after unmask")
+    expect(backend.unit_state == "disabled", backend.unit_state)
+    result = backend.restore_supervisor(identity, captured_enabled)
+    expect(result["unit_file_state"] == "enabled", str(result))
+
+    captured_disabled = replace(
+        captured_enabled,
+        captured_value="disabled",
+        supervisor_unit_file_state="disabled",
+        supervisor_enabled=False,
+    )
+    backend.unit_state = "disabled"
+    backend.disable_supervisor(identity)
+    command_start = len(backend.commands)
+    result = backend.restore_supervisor(identity, captured_disabled)
+    restore_commands = backend.commands[command_start:]
+    expect(result["unit_file_state"] == "disabled", str(result))
+    expect(any("unmask" in command for command in restore_commands), str(restore_commands))
+    expect(not any("enable" in command for command in restore_commands), str(restore_commands))
+
+    captured_runtime_mask = replace(
+        captured_enabled,
+        captured_value="masked-runtime",
+        supervisor_unit_file_state="masked-runtime",
+        supervisor_enabled=False,
+    )
+    backend.unit_state = "masked"
+    result = backend.restore_supervisor(identity, captured_runtime_mask)
+    expect(result["unit_file_state"] == "masked-runtime", str(result))
+    expect(
+        any(
+            "mask" in command and "--runtime" in command
+            for command in backend.commands
+        ),
+        str(backend.commands),
+    )
+
+
+def test_local_launchd_backend_restores_policy_without_loading_or_starting() -> None:
     backend = ScriptedLaunchdBackend()
     identity = {
         "manager": "launchd",
@@ -493,18 +655,56 @@ def test_local_launchd_backend_restores_captured_enable_and_loaded_state() -> No
     backend.active = False
     backend.loaded = False
     result = backend.restore_supervisor(identity, captured)
-    expect(result["host_may_have_started"] is True, result)
-    bootstrap = [command for command in backend.commands if "bootstrap" in command]
-    expect(
-        bootstrap[-1]
-        == (
-            "launchctl",
-            "bootstrap",
-            "gui/501",
-            "/exact/com.example.app.plist",
-        ),
-        bootstrap,
+    expect(result["enabled"] is True and result["loaded"] is False, result)
+    expect(result["host_may_have_started"] is False, result)
+    expect(not any("bootstrap" in command for command in backend.commands), backend.commands)
+    expect(not any("start" in command for command in backend.commands), backend.commands)
+
+
+def test_local_launchd_restore_rejects_inconsistent_capture_before_command() -> None:
+    backend = ScriptedLaunchdBackend()
+    identity = {
+        "manager": "launchd",
+        "domain": "gui/501",
+        "unit": "com.example.app",
+        "plist_path": "/exact/com.example.app.plist",
+        "plist_sha256": "f" * 64,
+    }
+    captured = CapturedStartupPolicyState(
+        "policy-launchd",
+        "repo",
+        ResourceKind.SUPERVISOR,
+        "com.example.app",
+        PolicyKind.SUPERVISOR,
+        "policy-fp",
+        "target-fp",
+        "binding",
+        "ownership",
+        "native-fp",
+        "enabled",
+        True,
+        "captured",
+        supervisor_manager="launchd",
+        supervisor_unit_file_state="enabled",
+        supervisor_loaded=True,
+        supervisor_enabled=True,
     )
+    for inconsistent in (
+        replace(captured, supervisor_enabled=False),
+        replace(captured, captured_value="disabled"),
+        replace(captured, supervisor_loaded=None),
+    ):
+        count = len(backend.commands)
+        try:
+            backend.restore_supervisor(identity, inconsistent)
+        except Exception as error:
+            expect("incomplete or inconsistent" in str(error), error)
+        else:
+            raise AssertionError("inconsistent launchd capture was guessed")
+        expect(
+            len(backend.commands) == count,
+            "inconsistent launchd capture reached host mutation",
+        )
 
 
 def test_launchd_bootstrap_rejects_changed_or_symlinked_plist_provenance() -> None:

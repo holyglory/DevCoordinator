@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import verify_legacy_console_rollback_ready as rollback_ready
 from verify_legacy_console_rollback_ready import (
     RollbackReadinessError,
     RollbackReadinessTimeout,
@@ -421,6 +422,49 @@ class LoopbackInventoryServer:
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="legacy-rollback-ready-") as raw:
         root = Path(raw).resolve(strict=True)
+
+        # A handled signal may arrive immediately after the first durable
+        # running ledger becomes visible. Reproduce that exact boundary
+        # deterministically: the valid running pair must be replaced by
+        # checksum-valid terminal interruption evidence.
+        interrupted_boundary_root = root / "interrupted-after-running-write"
+        interrupted_boundary_root.mkdir(mode=0o700)
+        interrupted_boundary_fixture = RuntimeFixture(interrupted_boundary_root)
+        interrupted_boundary_evidence = (
+            interrupted_boundary_root / "rollback-readiness.json"
+        )
+        original_writer = rollback_ready.LedgerWriter
+
+        class InterruptAfterRunningWrite(original_writer):
+            def __init__(self, path: Path) -> None:
+                super().__init__(path)
+                self.interrupted = False
+
+            def write(self, ledger: dict[str, object]) -> None:
+                super().write(ledger)
+                if ledger.get("status") == "running" and not self.interrupted:
+                    self.interrupted = True
+                    raise rollback_ready.RollbackReadinessInterrupted(
+                        "fixture interruption after durable running evidence"
+                    )
+
+        rollback_ready.LedgerWriter = InterruptAfterRunningWrite
+        try:
+            expect_failure(
+                lambda: call_wait(
+                    interrupted_boundary_fixture,
+                    interrupted_boundary_evidence,
+                    clock=FakeClock(),
+                ),
+                contains="after durable running evidence",
+                error_type=rollback_ready.RollbackReadinessInterrupted,
+            )
+        finally:
+            rollback_ready.LedgerWriter = original_writer
+        require(
+            read_ledger(interrupted_boundary_evidence)["status"] == "interrupted",
+            "post-running-write interruption left running evidence",
+        )
 
         # Reproduce the production timing: Type=simple is active, the child
         # coordinator appears first, a legitimate transient Docker helper

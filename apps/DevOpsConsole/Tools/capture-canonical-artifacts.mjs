@@ -5,7 +5,7 @@ import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { makeJar, login, startStack } from '../test/helpers/stack.mjs';
+import { canonicalTempDir, makeJar, login, startStack } from '../test/helpers/stack.mjs';
 import {
   CANONICAL_FIXTURE_ID,
   CANONICAL_NOW,
@@ -159,12 +159,26 @@ async function captureOne({ browser, stack, sessionCookie, definition }) {
 async function main() {
   const { chromium } = loadLockedPlaywright();
   await fsp.mkdir(OUTPUT_ROOT, { recursive: true });
-  const stack = await startStack({
-    allowedEmails: ['operator@example.test'],
-    claims: { email: 'operator@example.test', name: 'Fixture Operator' },
-  });
+  // The canonical renderer must never discover the developer host's real
+  // Docker inventory. Mask only the semantic Docker executable with an empty,
+  // successful fixture; the coordinator still exercises its full-Docker
+  // observation contract, but the snapshot is deterministic and private host
+  // resources cannot leak into capture state or failure output.
+  const fakeBin = await canonicalTempDir('devops-console-canonical-dockerbin-');
+  await fsp.writeFile(
+    path.join(fakeBin, 'docker'),
+    '#!/bin/sh\nexit 0\n',
+    { encoding: 'utf8', mode: 0o755 },
+  );
+  let stack;
   let browser;
   try {
+    stack = await startStack({
+      allowedEmails: ['operator@example.test'],
+      claims: { email: 'operator@example.test', name: 'Fixture Operator' },
+      coordinatorEnv: { PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` },
+      expectDocker: true,
+    });
     const jar = makeJar();
     const loginResult = await login(stack, jar);
     const sessionCookie = jar.get('dc_session');
@@ -180,7 +194,8 @@ async function main() {
     }
   } finally {
     if (browser) await browser.close();
-    await stack.close();
+    if (stack) await stack.close();
+    await fsp.rm(fakeBin, { recursive: true, force: true });
   }
 }
 

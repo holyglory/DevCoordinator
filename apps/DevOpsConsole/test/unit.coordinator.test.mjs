@@ -59,6 +59,7 @@ async function fixture(t, { tokenOnDisk = TOKEN, expectedToken = TOKEN, responde
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const record = {
+      method: req.method,
       path: req.url,
       authorization: req.headers.authorization ?? null,
       body: Buffer.concat(chunks).toString('utf8'),
@@ -115,6 +116,54 @@ test('coordinator probe is anonymous while every protected request uses the priv
   assert.equal(requests[0].authorization, null);
   assert.equal(requests[1].path, '/v1/inventory');
   assert.equal(requests[1].authorization, `Bearer ${TOKEN}`);
+});
+
+test('event pages preserve opaque cursors and explicit host observation identity', async (t) => {
+  const page = {
+    schema_version: 1,
+    events: [{
+      event_id: 'event-1',
+      repo_id: 'repo-1',
+      event_kind: 'server_failed',
+      code: 'process_exited',
+      message: 'web exited unexpectedly',
+      occurred_at: '2026-07-18T12:00:00Z',
+    }],
+    next_cursor: 'opaque_cursor-1',
+    has_more: false,
+  };
+  const responder = async ({ req, res }) => {
+    if (req.url === '/v1/events?limit=200&after=opaque_cursor-0') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(page));
+      return true;
+    }
+    if (req.url === '/v1/observe') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, observed: true }));
+      return true;
+    }
+    return false;
+  };
+  const { client, requests } = await fixture(t, { responder });
+
+  assert.deepEqual(await client.events({ after: 'opaque_cursor-0', limit: 200 }), page);
+  assert.deepEqual(await client.observeHost({ agent: 'console:telegram', project: '/repo' }), {
+    ok: true,
+    observed: true,
+  });
+  assert.deepEqual(JSON.parse(requests.find((request) => request.path === '/v1/observe').body), {
+    agent: 'console:telegram',
+    project: '/repo',
+  });
+  assert.throws(
+    () => client.events({ after: '', limit: 100 }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+  assert.throws(
+    () => client.events({ after: null, limit: 501 }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
 });
 
 test('schema-v2 inventory projects only its declared v1 compatibility rows for Console consumers', async (t) => {
@@ -340,6 +389,117 @@ test('HTTP 200 project reports with ok=false remain failures with structured evi
     },
   );
 });
+
+test('lifecycle client uses only fixed coordinator endpoints and preserves exact plan payloads', async (t) => {
+  const responder = async ({ req, res }) => {
+    const payloads = {
+      '/v1/archives': { archives: [] },
+      '/v1/lifecycle/plan': {
+        plan_id: 'plan-fixture-1',
+        plan_fingerprint: 'fingerprint-fixture-1',
+        effects: ['stop'],
+        retained: ['history'],
+        deleted: [],
+        blockers: [],
+      },
+      '/v1/lifecycle/apply': {
+        ok: true, status: 'completed', partial: false, needs_attention: false,
+      },
+      '/v1/lifecycle/restore': {
+        ok: true, status: 'completed', partial: false, needs_attention: false,
+      },
+    };
+    if (!Object.hasOwn(payloads, req.url)) return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(payloads[req.url]));
+    return true;
+  };
+  const { client, requests } = await fixture(t, { responder });
+  const planBody = {
+    target_kind: 'project',
+    target_id: 'repo-fixture-1',
+    action: 'archive',
+    reason: 'fixture reason',
+    agent: 'devops-console:owner@example.test',
+  };
+  const applyBody = {
+    plan_id: 'plan-fixture-1',
+    plan_fingerprint: 'fingerprint-fixture-1',
+    confirmation_phrase: 'PURGE project repo-fixture-1',
+  };
+  const restoreBody = {
+    target_kind: 'project',
+    target_id: 'repo-fixture-1',
+    reason: 'fixture restore',
+    agent: 'devops-console:owner@example.test',
+    explicit: true,
+  };
+
+  assert.deepEqual(await client.lifecycleArchives(), { archives: [] });
+  assert.equal((await client.lifecyclePlan(planBody)).plan_id, 'plan-fixture-1');
+  assert.equal((await client.lifecycleApply(applyBody)).status, 'completed');
+  assert.equal((await client.lifecycleRestore(restoreBody)).status, 'completed');
+
+  assert.deepEqual(requests.map((request) => [request.method, request.path]), [
+    ['GET', '/v1/archives'],
+    ['POST', '/v1/lifecycle/plan'],
+    ['POST', '/v1/lifecycle/apply'],
+    ['POST', '/v1/lifecycle/restore'],
+  ]);
+  assert.equal(requests.every((request) => request.authorization === `Bearer ${TOKEN}`), true);
+  assert.deepEqual(JSON.parse(requests[1].body), planBody);
+  assert.deepEqual(JSON.parse(requests[2].body), applyBody);
+  assert.deepEqual(JSON.parse(requests[3].body), restoreBody);
+});
+
+for (const [endpoint, invoke, payload, evidence] of [
+  [
+    '/v1/lifecycle/apply',
+    (client) => client.lifecycleApply({ plan_id: 'p', plan_fingerprint: 'f' }),
+    {
+      ok: false,
+      status: 'partial',
+      partial: true,
+      needs_attention: true,
+      action_errors: [{ error: 'container cleanup failed' }],
+    },
+    'container cleanup failed',
+  ],
+  [
+    '/v1/lifecycle/restore',
+    (client) => client.lifecycleRestore({
+      target_kind: 'server', target_id: 's', reason: 'fixture', agent: 'test', explicit: true,
+    }),
+    {
+      ok: false,
+      status: 'needs_attention',
+      partial: false,
+      needs_attention: true,
+      blockers: [{ message: 'manual recovery required' }],
+    },
+    'manual recovery required',
+  ],
+]) {
+  test(`${endpoint} HTTP 200 incomplete result remains a visible lifecycle failure`, async (t) => {
+    const responder = async ({ req, res }) => {
+      if (req.url !== endpoint) return false;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(payload));
+      return true;
+    };
+    const { client } = await fixture(t, { responder });
+    await assert.rejects(
+      () => invoke(client),
+      (err) => {
+        assert.ok(err instanceof CoordError);
+        assert.equal(err.status, 409);
+        assert.deepEqual(err.body, payload);
+        assert.match(err.message, new RegExp(evidence));
+        return true;
+      },
+    );
+  });
+}
 
 test('a completed mutation detaches an older in-flight inventory read before it can repopulate the cache', async (t) => {
   let releaseStale;

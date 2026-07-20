@@ -127,6 +127,36 @@ sudo python3 scripts/install_server_wide_coordinator.py apply \
   --transaction-dir /var/lib/devcoordinator-install/$(date +%Y%m%d-%H%M%S)
 ```
 
+The installed broker retains `ProtectSystem=strict`,
+`ProtectHome=read-only`, `PrivateTmp=true`, `NoNewPrivileges=true`, and the
+system manager's capability ceiling with no ambient capabilities. Its only
+writable base exceptions are `/var/lib/devcoordinator` and
+`/run/devcoordinator`. The installer transaction also replaces one generated
+drop-in containing only the canonical, real, directly-under-`/home` homes of
+the complete explicit `--client-user` set. Reapply with the complete current
+client list after enrollment changes; omitted homes leave the writable set
+instead of accumulating in the configured unit. A running broker retains its
+old mount namespace until it is safely drained and restarted; omission is not
+live revocation before that restart. `/home` itself, `/root`, `/etc`, other
+users' homes, and every other protected path remain read-only. Peer ACLs, the
+cleanup plan and fingerprint, exact worktree identity, and the cleanup safety
+checks still authorize each mutation. After the safe restart, verify the
+deployed boundary with
+`scripts/check_broker_shutdown_unit.py` before enabling cleanup.
+
+Apply records and checks the broker runtime contract before changing the host.
+The exact Docker CLI available to the service must provide a stable official
+Compose plugin in the supported ranges `>=2.17,<3` or `>=5,<6`; Compose v1,
+2.0–2.16, major 3/4 or unknown versions, and prereleases fail closed. Only the
+reviewed `-desktop.N` vendor suffix, a positive numeric Debian package revision
+such as `-4`, and SemVer `+` build metadata are accepted; arbitrary vendor,
+canary, milestone, and experimental suffixes fail closed.
+The preflight performs only a throwaway
+`docker compose config --format json`: it proves two ordered explicit
+`--env-file` inputs, second-file override, and suppression of an implicit
+`.env`. It never contacts the daemon or starts a container. The installed
+systemd unit repeats the same proof before every broker start.
+
 Enroll each UID/repository. Repeat `--server` to give that account control of
 only those declared servers; omitting it grants no server control unless the
 administrator supplies the explicit `--all-servers` override. Re-enrollment
@@ -143,19 +173,103 @@ sudo python3 scripts/dev_coordinator.py broker enroll \
   --agent "$USER" \
   --server web \
   --server worker \
-  --port-range 3000-3999
+  --port-range 3000-3999 \
+  --grant-cleanup
 
 sudo systemctl enable --now devcoordinator-broker.service
 ```
 
 Enrollment performs a fresh full-Docker observation, grants only exact opaque
 normalized IDs, writes the protected system client profile, and starts no
-resource. To migrate an already-running listener, enroll its definition and
+resource. `--grant-cleanup` is an explicit administrator-only opt-in: it grants
+archive/list/restore and permanent-cleanup capabilities for that repository,
+plus separately bound `cleanup.plan` and `cleanup.apply` grants for each exact
+currently observed server/container. Ordinary enrollment never receives these
+destructive capabilities, and revocation is re-read at both plan and apply.
+Before enabling Compose, the root-owned service renders the exact
+merged `docker compose config --format json` model from sealed inputs before
+changing any authority or profile. Enrollment holds the broker lifetime lock,
+and commit-time validation repeats the exact file and model checks. The
+declared service set must equal the rendered set, every requested profile must
+exist, dependency references must stay inside that set, each service is capped
+from one through 16 replicas, and the whole project is capped at 64. Unknown
+top-level or service features fail closed until reviewed. Privileged mode,
+host/container namespaces, devices/GPUs/capabilities, bind mounts, Docker API
+sockets, external volumes/networks, published host ports, and bind-style volume
+drivers fail closed unless the administrator repeats enrollment with
+`--approve-compose-host-access`. That approval is bound to the exact definition
+and rendered-model fingerprints, records UID 0 and the bounded risk classes,
+and does not waive replica limits. Every mutation re-renders the merged model
+with the installed Compose runtime and refuses fingerprint, risk, or replica
+drift before any lifecycle command. One kernel UID is bound to one account
+identity; ordinary reenrollment cannot replace that account while retaining
+its ACLs or profile repositories. Every UID/repository enrollment has its own
+service-enforced expiry, so renewing repository B never extends repository A,
+and a raw socket request cannot bypass client-profile expiry checks. Profile
+publication uses a protected root-owned cross-process lock, and
+observation-derived grants are bound to the exact fresh snapshot plus
+still-current ownership evidence.
+To migrate an already-running listener, enroll its definition and
 run `server register` as the owning UID; the service verifies the exact UID,
 PID, repository cwd, port, and listener before publication. Preserve the old
 account store until the shared inventory and Console show the migrated server.
 Use the install transaction with the installer's `rollback` command if the
 configuration or canonical links must be restored.
+
+#### Authorization-schema upgrade gate
+
+Before any server-wide broker restart after an authorization/schema upgrade,
+run the installer `plan` with the complete client-user set. A
+`profile_database_enrollment_drift` result is a stop condition: do not restart
+the broker, API, or Console until it is resolved. Create and verify a private
+service-store backup first, then stop and drain the broker before either
+offline repair command. Do not stop the Console or loopback API merely because
+the broker is being maintained: their production units use soft startup
+dependencies so the public TLS edge and authenticated API listener remain
+available, while broker-backed requests fail closed until the socket returns.
+Preserve their PIDs and public/listener evidence across the broker maintenance
+window. An explicit Console/API unit replacement is a separate mutation and
+must be restarted and verified on its own.
+
+Arbitrary generation drift is never ignored. For each generation issue, use
+the exact values reported by the protected profile and service database and an
+existing root-owned `0700` rollback transaction directory:
+
+```bash
+sudo python3 scripts/dev_coordinator.py broker reconcile-profile-repository-generation \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --profile /etc/devcoordinator/client-profiles.json \
+  --client-uid NUMERIC_CLIENT_UID \
+  --account-id EXACT_CLIENT_ACCOUNT_ID \
+  --repo-id EXACT_REPOSITORY_ID \
+  --canonical-root /absolute/canonical/repository \
+  --rollback-root /var/lib/devcoordinator-install/PRIVATE-TRANSACTION \
+  --from-generation OLD_GENERATION \
+  --to-generation CURRENT_GENERATION
+```
+
+This command holds the broker and profile-publication locks, proves the exact
+repository/principal/installation and unchanged enabled-ACL digest, saves a
+private rollback profile, and changes only the one generation integer. It does
+not rebuild grants. Then backfill only the missing enrollment rows from the
+protected profile:
+
+```bash
+sudo python3 scripts/dev_coordinator.py broker migrate-profile-enrollments \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --profile /etc/devcoordinator/client-profiles.json
+```
+
+Rerun the migration to prove idempotence, then rerun installer `plan` and
+`verify`. Start the broker only when the two-way profile/database check is
+exact; prove that the still-running API recovers authenticated inventory and
+that the still-running Console retained its public listener. Finish by proving
+every UID/repository inventory plus the Console's authenticated
+MainPID/listener/assignment/lease graph and public login path. If a preexisting
+host still has hard `Requires=` dependencies, treat that as unit drift: restore
+the complete previously active service set before ending the transaction, then
+install and verify the canonical soft-dependency units through their documented
+rollback-safe deployment path.
 
 ### Normalized store backup, restore, and corrupt recovery
 
@@ -207,8 +321,7 @@ PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 python3 scripts/dev_coordinator.py inventory --project "$PROJECT_ROOT"
 python3 scripts/dev_coordinator.py observe \
   --agent "$USER" \
-  --project "$PROJECT_ROOT" \
-  --max-age-seconds 30
+  --project "$PROJECT_ROOT"
 python3 scripts/dev_coordinator.py inventory --project "$PROJECT_ROOT"
 ```
 
@@ -228,18 +341,20 @@ python3 scripts/dev_coordinator.py project restart --agent "$USER" --project "$P
 python3 scripts/dev_coordinator.py project stop --agent "$USER" --project "$PROJECT_ROOT"
 ```
 
-## Remove, Reinstall, Attach, Or Retire
+## Archive, Restore, Permanently Purge, Attach, Or Retire
 
 Do not hide a repository with a Board preference or delete its state rows.
-Repository removal is a two-step, fingerprint-bound decommission:
+Repository Archive is a two-step, fingerprint-bound decommission. The legacy
+`plan-remove`, `remove`, `list-removed`, and `reinstall` spellings remain exact
+compatibility aliases:
 
 ```bash
-python3 scripts/dev_coordinator.py repository plan-remove \
+python3 scripts/dev_coordinator.py repository plan-archive \
   --agent "$USER" \
   --project "$PROJECT_ROOT" \
   --reason "No longer used on this machine"
 
-python3 scripts/dev_coordinator.py repository remove \
+python3 scripts/dev_coordinator.py repository archive \
   --agent "$USER" \
   --project "$PROJECT_ROOT" \
   --plan-id EXACT_PLAN_ID \
@@ -258,8 +373,8 @@ volumes, databases, backups, and history are never deleted by this journey.
 Inspect retained removal records or explicitly reinstall:
 
 ```bash
-python3 scripts/dev_coordinator.py repository list-removed
-python3 scripts/dev_coordinator.py repository reinstall \
+python3 scripts/dev_coordinator.py repository list-archived
+python3 scripts/dev_coordinator.py repository restore \
   --agent "$USER" \
   --project "$PROJECT_ROOT" \
   --reason "Needed again" \
@@ -279,6 +394,67 @@ validated repository. If the resource is intentionally standalone, use
 fingerprint to `resource retire`. Standalone retirement applies the same fresh
 observation, policy-disable, exact-stop, verification, retained-data, and fence
 rules as repository removal.
+
+Archive/restore one exact attached managed server or Docker container with the
+service-issued immutable identity fields. Resource restore replays the captured
+startup-policy values while the resource is proved stopped, verifies a managed
+server listener remains absent, clears the archive fence last, and never starts
+the runtime:
+
+```bash
+python3 scripts/dev_coordinator.py resource plan-archive \
+  --resource-kind container \
+  --resource-id EXACT_RESOURCE_ID \
+  --control-binding-id EXACT_BINDING_ID \
+  --immutable-fingerprint sha256:EXACT_IMMUTABLE_FINGERPRINT \
+  --ownership-fingerprint sha256:EXACT_OWNERSHIP_FINGERPRINT \
+  --request-project "$PROJECT_ROOT" --agent "$USER" --reason "Archive"
+
+python3 scripts/dev_coordinator.py resource archive \
+  --resource-kind container \
+  --resource-id EXACT_RESOURCE_ID \
+  --control-binding-id EXACT_BINDING_ID \
+  --immutable-fingerprint sha256:EXACT_IMMUTABLE_FINGERPRINT \
+  --ownership-fingerprint sha256:EXACT_OWNERSHIP_FINGERPRINT \
+  --request-project "$PROJECT_ROOT" --agent "$USER" \
+  --plan-id EXACT_PLAN_ID --plan-fingerprint sha256:EXACT_PLAN_FINGERPRINT
+```
+
+List the unified archive catalogue, or plan permanent removal only after the
+target is archived. Apply requires the plan's exact generated phrase, formatted
+as `PURGE KIND human display name`:
+
+```bash
+python3 scripts/dev_coordinator.py archives list --agent "$USER"
+python3 scripts/dev_coordinator.py cleanup plan \
+  --action purge --target-kind server --target-id EXACT_SERVER_ID \
+  --agent "$USER" --reason "Permanently remove"
+python3 scripts/dev_coordinator.py cleanup apply \
+  --plan-id EXACT_PLAN_ID --plan-fingerprint sha256:EXACT_PLAN_FINGERPRINT \
+  --confirmation-phrase 'PURGE SERVER human-name' --agent "$USER"
+```
+
+Project purge removes only the Coordinator catalogue entry. Server purge
+retains logs and audit evidence. Docker purge accepts one exact stopped 64-hex
+container identity and never uses force, removes mounts/volumes/images, or
+operates on Compose/database-owned containers. Worktree purge is offered only
+after the archived project has its own catalog tombstone, so removing the
+physical source cannot leave a false Restore promise. It accepts only a clean,
+non-root-owned secondary linked worktree; binds branch, HEAD, root, and Git
+admin/common device+inode identities; fails closed when mount, process-cwd, or
+open-file discovery is unavailable; rejects observed mounts/process paths; and
+runs `git worktree remove` without `--force`. Every purge retains a tombstone
+and crash-replay phase evidence. Purge planning and apply each require a newly
+committed bounded full-Docker host observation; unavailable observation or
+Docker authority fails closed before mutation.
+
+The authenticated local HTTP surface used by DevOps Console is deliberately
+typed: `GET /v1/archives` and `POST /v1/lifecycle/plan`, `/apply`, `/restore`.
+Plan accepts exactly `action`, `target_kind`, `target_id`, and `reason`; Apply
+accepts only the durable plan ID/fingerprint and confirmation phrase. The
+service—not the browser—resolves the plan to its repository and exact resource
+controller, rechecks current grants and host truth, and dispatches Archive or
+Purge.
 
 For a single managed process inside a project, start a server and let the
 coordinator lease the port, keep the PID, store logs, and health-check it:
@@ -469,19 +645,19 @@ project `status` evidence before assuming a server is healthy when it is slow,
 GC-bound, or memory-heavy. The `project_usage` rollup lists CPU percent, memory
 bytes, process counts, and hot PIDs by repo; it must be treated as diagnostic
 evidence, not synthetic UI decoration. Each row also carries authoritative
-membership (`usage_key`, `server_ids`, `container_names`) so UIs group
+membership (`usage_key`, `server_ids`, `container_resource_ids`) so UIs group
 inventory rows without re-implementing repo-identity heuristics.
+`container_names` remains alongside the exact resource IDs as legacy display
+data; it is not an ownership or join key.
 
 Display grouping and whole-project actions share one membership model: the
 same attribution that places a container in a `project_usage` row decides
 whether `project start|restart|stop` acts on it. Explicit attribution (Docker
-Compose labels, then coordinator sidecar metadata) always wins; an
-unattributed container is claimed by a known repo only when exactly one known
-project path matches its name key; a container whose name key matches several
-known repos stays in its own name-keyed group (`usage_key` `name:<key>`,
-`project` null) and no whole-project action touches it. A UI grouped by
-`project_usage` therefore shows exactly the blast radius of whole-project
-actions.
+Compose labels, then coordinator sidecar metadata) is required; repository or
+container name similarity is only read-only evidence and never establishes
+membership. Unattributed containers remain explicit unassigned resources and
+no whole-project action touches them. A UI grouped by `project_usage`
+therefore shows exactly the blast radius of whole-project actions.
 
 Inventory must show one current row per logical server identity
 (`canonical project path + server name`). Repeated starts, stops, restarts, or
@@ -523,6 +699,10 @@ than replacing it with a different token.
 Useful endpoints:
 
 - `GET /v1/inventory`
+- `GET /v1/events?after=OPAQUE_CURSOR&limit=100` — ascending durable event
+  catch-up; `limit` is bounded to 1..500 and the response never exposes
+  private diagnostic payloads. Persist `next_cursor` only after handling the
+  page; it is an insertion-order high watermark, not an event-time cursor
 - `GET /v1/inventory/no-docker` — the same observed coordinator graph with
   Docker discovery intentionally omitted (`available: null`, empty container
   and PostgreSQL rows); use only for authenticated service readiness where
@@ -532,6 +712,8 @@ Useful endpoints:
 - `GET /v1/ports/assignments`
 - `GET /v1/servers`
 - `POST /v1/ports/lease`
+- `POST /v1/observe` — run one explicit full host observation with exactly
+  `agent` and `project`; inventory reads remain pure
 - `POST /v1/ports/release`
 - `POST /v1/ports/assign`
 - `POST /v1/ports/unassign`
@@ -610,6 +792,12 @@ does not provide Compose project labels, register coordinator-side metadata with
 from `--agent` and `--project`. Inventory merges real Docker Compose labels
 first, then coordinator sidecar metadata for unlabeled containers.
 
+Compose's working-directory label may point at a `deploy` or `infra`
+subdirectory. Inventory resolves that explicit path to the deepest enrolled
+canonical Git worktree containing it; a closer nested `.git` marker remains a
+distinct repository. Container/image names are never consulted for this
+resolution.
+
 When a declared dependency is also owned by declared Compose, keep the
 dependency for health/readiness evidence and map its lifecycle explicitly with
 `"service": "<compose-service>"` (preferred), or give it a `name` that exactly
@@ -641,13 +829,21 @@ sidecar attribution for the containers they act on. This keeps databases such
 as `aerodb-pg` grouped under the repo that declared them instead of under a
 name-derived pseudo-project.
 
-The shared inventory includes stopped containers (`docker ps --all`) so agents
-can see containers that are available to start instead of accidentally creating
-duplicates.
+The shared inventory includes stopped containers (`docker ps --all --no-trunc`)
+so agents can see containers that are available to start instead of
+accidentally creating duplicates. Both inventory and stats request untruncated
+IDs. Only exact 64-hex IDs become immutable Docker resources. If inspect is
+temporarily unavailable, the full-ID `ps` row may update name, image, and
+lifecycle, while previously proved labels, ports, health, restart policy, and
+repository attribution remain unchanged until inspection succeeds again.
+Legacy retained 12-character rows remain in normalized history; the v1
+projection hides one only when exactly one same-engine 64-hex strict-prefix row
+is a safe newer replacement. Ambiguous prefixes and attribution mismatches
+remain visible.
 
 After an explicit full-Docker `observe`, inventory includes the committed real
 telemetry for running containers. The observer samples `docker stats
---no-stream` once per coalesced host scope, stores a bounded rolling
+--no-stream --no-trunc` once per coalesced host scope, stores a bounded rolling
 `stats_history` per immutable container, and exposes current CPU, memory,
 network I/O, and block I/O values plus per-second network/block rates. Pure
 inventory reads never resample Docker. Stopped containers remain visible but
@@ -685,6 +881,96 @@ the file as discovered evidence, but `project start` must not run `docker
 compose up` from that discovery. Add a declaration or register/adopt the
 already-running containers instead of creating a duplicate stack.
 
+The declaration must name at least one exact Compose service and every Compose
+profile and environment file that changes the effective model. Environment files must be regular, private files
+inside the canonical repository, owned by root or the repository owner, and
+free of symbolic-link components. The service persists only their canonical
+paths, sizes, and SHA-256 fingerprints—never their plaintext—and refuses a
+mutation after drift. It preserves the declared order of environment files,
+profiles, Compose files, and services when building the exact command. An
+enabled Compose project name is globally unique across enrolled repositories
+and must not collide with a differently owned project observed on the host,
+including a stopped project's retained Compose-labeled network or volume.
+Immediately before every mutation, the broker commits a fresh full-Docker
+snapshot with exhaustive container, network, and volume project evidence,
+rechecks both observed and persisted project-name ownership, and
+binds that evidence to the durable operation. It executes the already-verified
+Compose and environment bytes through sealed anonymous inputs on Linux, so a
+repository-side replacement cannot race validation. The Compose subprocess
+receives a bounded Docker-connection environment and an explicit sealed empty
+environment-file baseline before any declared sealed environment files. This
+suppresses implicit `.env` loading independently of the fixed
+`COMPOSE_DISABLE_ENV_FILE=1` compatibility switch; unrelated broker environment
+variables never become interpolation inputs. Brokered Compose files must be
+self-contained: transitive file/provider
+features such as `include`, `extends`, `build`, service `env_file`,
+`label_file`, `configs`, `secrets`, `develop`, `credential_spec`, and
+`provider` fail closed until the coordinator can fingerprint and seal their
+complete dependency graphs. The exact `/usr/bin/python3` service runtime must
+provide PyYAML 6.x (the Debian/Ubuntu package is `python3-yaml`; use the
+equivalent system package on other distributions). The same isolated
+installer/systemd preflight also resolves the exact Docker executable the
+broker will use, enforces the stable Compose version ranges `>=2.17,<3` or
+`>=5,<6`, and proves non-mutating JSON config rendering with both ordered
+explicit environment files and implicit `.env` suppression. The broker uses
+PyYAML's safe loader with aliases, custom tags, and duplicate keys rejected,
+and fails closed when that parser or the Compose capability contract is
+unavailable.
+
+The broker fixes `COMPOSE_REMOVE_ORPHANS=0`, a parallelism limit of four, and
+noninteractive plain output in the process environment, which takes precedence
+over declared env files. Detached `up` also uses `--no-deps`; dependency
+containers cannot expand beyond the complete persisted service allowlist, and
+post-action proof rejects every observed project service outside that set.
+
+Project stop uses the typed `compose.stop` operation against only the persisted
+service list; project restart uses typed `compose.restart`, which performs an
+exact stop followed by detached up under one durable broker operation. Neither
+action removes containers, networks, or volumes. `compose.down` is a separate,
+explicit destructive lifecycle operation and is never inferred from stop or
+restart. Once any Compose runner is invoked, a nonzero exit, timeout, or sealed
+input cleanup failure is recorded as an uncertain outcome that blocks every
+new operation for that definition until service reconciliation; it is never
+treated as a safe terminal failure that may be blindly retried.
+
+Inspect an uncertain operation without changing state, then reconcile it under
+the exclusive service lifetime lock with a new full-Docker observation:
+
+```bash
+sudo python3 scripts/dev_coordinator.py broker reconcile-compose \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --operation-id EXACT_OPERATION_ID --plan
+
+sudo python3 scripts/dev_coordinator.py broker reconcile-compose \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --operation-id EXACT_OPERATION_ID
+```
+
+Only when the plan proves the original service scope is unrecoverable may an
+administrator record an offline terminal failure. It never claims the desired
+host state and requires the exact displayed fingerprint:
+
+```bash
+sudo python3 scripts/dev_coordinator.py broker reconcile-compose \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --operation-id EXACT_OPERATION_ID \
+  --abandon-as-failed \
+  --confirm-definition-fingerprint EXACT_SHA256_FINGERPRINT
+```
+
+A disabled definition retains its project-name claim. Release it only after
+the project has no containers, networks, or volumes and no unresolved Compose
+operation; this command obtains its own strict new observation and records the
+old-name provenance before another repository may claim it. Release also
+atomically revokes every lifecycle ACL for the old definition, so stop/down
+authority cannot survive the name transfer:
+
+```bash
+sudo python3 scripts/dev_coordinator.py broker release-compose-project-name \
+  --database /var/lib/devcoordinator/coordinator.sqlite3 \
+  --compose-definition-id EXACT_DEFINITION_ID
+```
+
 Minimal example:
 
 ```json
@@ -692,6 +978,9 @@ Minimal example:
   "name": "example-app",
   "docker": {
     "compose_files": ["docker-compose.yml"],
+    "env_files": [".codex/dev.env"],
+    "profiles": ["application"],
+    "project_name": "example-app",
     "services": ["postgres", "worker"]
   },
   "servers": [
@@ -726,11 +1015,10 @@ If there is no declaration, the coordinator may discover existing managed
 servers, Docker Compose files, Compose working-directory labels, and matching
 containers. Container discovery uses the same attribution as inventory's
 `project_usage` grouping: a container explicitly attributed to another project
-never joins this project's runtime, and a name match claims a container only
-when this project is the single known claimant for its name key. If the
-coordinator still cannot identify a complete runtime, it returns `ok=false`
-with `classification=missing_dependency` instead of guessing ports or
-reporting success.
+never joins this project's runtime, and a name match alone never claims a
+container. If the coordinator still cannot identify a complete runtime, it
+returns `ok=false` with `classification=missing_dependency` instead of
+guessing ports or reporting success.
 
 ## Agent Workflow
 
@@ -738,7 +1026,13 @@ reporting success.
    run `inventory --project "$PROJECT_ROOT"` before starting, stopping, or replacing any
    local service. If the snapshot is absent or stale for the task, run one
    explicit `observe --agent "$USER" --project "$PROJECT_ROOT"` and read
-   inventory again. Do not treat inventory itself as a refresh mutation.
+   inventory again. In server-wide mode this is a typed full-Docker broker
+   observation against the service-owned database; it never opens or imports
+   the client's execution journal. Account-only discovery flags (`--no-docker`,
+   `--backup-dir`, `--legacy-home`, and `--legacy-backup-root`) are rejected in
+   server-wide mode, as is nonzero `--max-age-seconds`; a system observation
+   always creates or joins a new bounded service snapshot. Do not treat
+   inventory itself as a refresh mutation.
 2. For "run/start/restart/check the dev server", call `project status` or
    `project start` with the canonical repo path. Do not manually run package
    manager dev commands, Docker, database, worker, and web commands unless the
