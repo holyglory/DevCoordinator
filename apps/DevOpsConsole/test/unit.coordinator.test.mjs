@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { CoordError, createCoordinator } from '../src/coordinator.mjs';
+import { CoordError, coordinatorTimeoutFor, createCoordinator } from '../src/coordinator.mjs';
 
 const TOKEN = 'fixture-coordinator-token-0123456789abcdef';
 
@@ -44,6 +44,13 @@ test('published HTTP contract describes normalized query-only inventory and its 
   assert.match(contract.inventory_contract.no_docker, /excludes unrelated services/);
   assert.equal(contract.state.persistence_model, 'normalized SQLite');
   assert.ok(contract.endpoints.POST.includes('/v1/ports/relocate'));
+});
+
+test('host observation receives a Docker-sized deadline without widening ordinary requests', () => {
+  assert.equal(coordinatorTimeoutFor('/v1/observe'), 60_000);
+  assert.equal(coordinatorTimeoutFor('/v1/inventory'), 60_000);
+  assert.equal(coordinatorTimeoutFor('/v1/servers/start'), 15_000);
+  assert.equal(coordinatorTimeoutFor('/v1/lifecycle/apply'), 600_000);
 });
 
 async function fixture(t, { tokenOnDisk = TOKEN, expectedToken = TOKEN, responder = null } = {}) {
@@ -229,6 +236,363 @@ test('schema-v2 inventory projects only its declared v1 compatibility rows for C
     'the wire compatibility object must remain available and unmodified');
   assert.equal(inventory.leases[0].lease_id, undefined);
   assert.equal(inventory.port_assignments[0].assignment_id, undefined);
+});
+
+test('schema-v2 inventory derives current Docker stats and excludes absent compatibility rows', async (t) => {
+  const currentStats = {
+    source: 'normalized_observation',
+    cpu_percent: 9,
+    memory_usage_bytes: 9000,
+  };
+  const compatibility = {
+    coordinator_home: '/fixture/coordinator',
+    state_path: '/fixture/coordinator/coordinator.sqlite3',
+    project: null,
+    urls: [],
+    servers: [],
+    leases: [],
+    port_assignments: [],
+    recent_events: [],
+    docker: {
+      available: true,
+      containers: [
+        {
+          id: 'full-1',
+          host_resource_id: 'docker-1',
+          name: 'current-running',
+          status: 'running',
+        },
+        {
+          id: 'full-2',
+          host_resource_id: 'docker-2',
+          name: 'current-stopped',
+          status: 'stopped',
+        },
+        {
+          id: 'full-3',
+          host_resource_id: 'docker-3',
+          name: 'canonical-stats-win',
+          status: 'running',
+          stats: currentStats,
+        },
+        {
+          id: 'full-absent',
+          host_resource_id: 'docker-absent',
+          name: 'absent-history',
+          status: 'running',
+        },
+      ],
+      postgres: [],
+    },
+    postgres: [],
+    backups: [],
+    project_usage: [],
+  };
+  const payload = {
+    schema_version: 2,
+    repositories: [],
+    docker_engines: [
+      { engine_id: 'engine-1', host_id: 'host-1', capability_state: 'available' },
+    ],
+    resources: {
+      docker: [
+        { docker_resource_id: 'docker-1', engine_id: 'engine-1' },
+        { docker_resource_id: 'docker-2', engine_id: 'engine-1' },
+        { docker_resource_id: 'docker-3', engine_id: 'engine-1' },
+      ],
+    },
+    observations: {
+      snapshots: [
+        {
+          snapshot_id: 'snapshot-running',
+          host_id: 'host-1',
+          observer_domain: 'host-runtime-v2:full-docker',
+          status: 'running',
+          started_at: '2026-07-21T11:00:00Z',
+          completed_at: null,
+        },
+        {
+          snapshot_id: 'snapshot-current',
+          host_id: 'host-1',
+          observer_domain: 'host-runtime-v2:full-docker',
+          status: 'completed',
+          started_at: '2026-07-21T10:00:00Z',
+          completed_at: '2026-07-21T10:00:10Z',
+        },
+        {
+          snapshot_id: 'snapshot-old',
+          host_id: 'host-1',
+          observer_domain: 'host-runtime-v2:full-docker',
+          status: 'completed',
+          started_at: '2026-07-21T09:00:00Z',
+          completed_at: '2026-07-21T09:00:10Z',
+        },
+      ],
+      docker: [
+        {
+          docker_resource_id: 'docker-1', lifecycle: 'running',
+          sampled_at: '2026-07-21T10:00:09Z',
+        },
+        {
+          docker_resource_id: 'docker-2', lifecycle: 'stopped',
+          sampled_at: '2026-07-21T10:00:09Z',
+        },
+        {
+          docker_resource_id: 'docker-3', lifecycle: 'running',
+          sampled_at: '2026-07-21T10:00:09Z',
+        },
+      ],
+      telemetry: [
+        {
+          sample_id: 'sample-current-1',
+          host_resource_kind: 'docker',
+          host_resource_id: 'docker-1',
+          sampled_at: '2026-07-21T10:00:08Z',
+          cpu_percent: 1.25,
+          memory_bytes: 48234496,
+          network_rx_bytes: 11,
+          network_tx_bytes: 12,
+          block_read_bytes: 13,
+          block_write_bytes: 14,
+        },
+        {
+          sample_id: 'sample-old-1',
+          host_resource_kind: 'docker',
+          host_resource_id: 'docker-1',
+          sampled_at: '2026-07-21T09:00:08Z',
+          cpu_percent: 99,
+          memory_bytes: 999,
+        },
+        {
+          sample_id: 'sample-stopped-2',
+          host_resource_kind: 'docker',
+          host_resource_id: 'docker-2',
+          sampled_at: '2026-07-21T10:00:08Z',
+          cpu_percent: 2,
+          memory_bytes: 2000,
+        },
+        {
+          sample_id: 'sample-current-3',
+          host_resource_kind: 'docker',
+          host_resource_id: 'docker-3',
+          sampled_at: '2026-07-21T10:00:08Z',
+          cpu_percent: 88,
+          memory_bytes: 88000,
+        },
+      ],
+    },
+    v1_compatibility: compatibility,
+  };
+  const responder = async ({ req, res }) => {
+    if (req.url === '/v1/observe') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        schema_version: 2,
+        status: 'completed',
+        snapshot_id: 'snapshot-current',
+        host_id: 'host-1',
+        observer_domain: 'host-runtime-v2:full-docker',
+        docker_available: true,
+        capability_fingerprint: 'capability-proof',
+        material_fingerprint: 'material-proof',
+        completed_at: '2026-07-21T10:00:10Z',
+      }));
+      return true;
+    }
+    if (req.url !== '/v1/inventory') return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(payload));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  await client.observeHost({ agent: 'devops-console:metrics', project: '/repo' });
+  const inventory = await client.inventory({ maxAgeMs: 0 });
+
+  assert.deepEqual(inventory.docker.containers.map((item) => item.name), [
+    'current-running', 'current-stopped', 'canonical-stats-win',
+  ]);
+  assert.deepEqual(inventory.docker.containers[0].stats, {
+    source: 'normalized_observation',
+    id: 'full-1',
+    container_id: 'full-1',
+    name: 'current-running',
+    timestamp: '2026-07-21T10:00:08Z',
+    live: true,
+    cpu_percent: 1.25,
+    memory_usage_bytes: 48234496,
+    network_rx_bytes: 11,
+    network_tx_bytes: 12,
+    block_read_bytes: 13,
+    block_write_bytes: 14,
+  });
+  assert.equal(inventory.docker.containers[1].stats, undefined,
+    'stopped containers must never receive stale utilization');
+  assert.deepEqual(inventory.docker.containers[2].stats, currentStats,
+    'the canonical compatibility projection wins once the broker is updated');
+  assert.equal(inventory.v1_compatibility.docker.containers.length, 4,
+    'the wire compatibility graph must remain available and unmodified');
+  assert.equal(inventory.v1_compatibility.docker.containers[0].stats, undefined);
+});
+
+test('Docker fallback rejects unproved, unavailable, stale, and stopped telemetry', async (t) => {
+  const containers = [
+    {
+      id: 'full-null', host_resource_id: 'docker-null', name: 'explicit-null',
+      status: 'running', stats: null,
+    },
+    {
+      id: 'full-unavailable', host_resource_id: 'docker-unavailable',
+      name: 'unavailable-engine', status: 'running',
+    },
+    {
+      id: 'full-other-host', host_resource_id: 'docker-other-host',
+      name: 'unproved-host', status: 'running',
+    },
+    {
+      id: 'full-newer-window', host_resource_id: 'docker-newer-window',
+      name: 'untrusted-newer-window', status: 'running',
+    },
+    {
+      id: 'full-stopped-observation', host_resource_id: 'docker-stopped-observation',
+      name: 'stopped-observation', status: 'running',
+    },
+  ];
+  const compatibility = {
+    coordinator_home: '/fixture/coordinator',
+    state_path: '/fixture/coordinator/coordinator.sqlite3',
+    project: null,
+    urls: [],
+    servers: [],
+    leases: [],
+    port_assignments: [],
+    recent_events: [],
+    docker: { available: true, containers, postgres: [] },
+    postgres: [],
+    backups: [],
+    project_usage: [],
+  };
+  const payload = {
+    schema_version: 2,
+    docker_engines: [
+      { engine_id: 'engine-1', host_id: 'host-1', capability_state: 'available' },
+      { engine_id: 'engine-down', host_id: 'host-1', capability_state: 'unavailable' },
+      { engine_id: 'engine-2', host_id: 'host-2', capability_state: 'available' },
+    ],
+    resources: {
+      docker: [
+        { docker_resource_id: 'docker-null', engine_id: 'engine-1' },
+        { docker_resource_id: 'docker-unavailable', engine_id: 'engine-down' },
+        { docker_resource_id: 'docker-other-host', engine_id: 'engine-2' },
+        { docker_resource_id: 'docker-newer-window', engine_id: 'engine-1' },
+        { docker_resource_id: 'docker-stopped-observation', engine_id: 'engine-1' },
+      ],
+    },
+    observations: {
+      snapshots: [
+        {
+          snapshot_id: 'approved-snapshot', host_id: 'host-1',
+          observer_domain: 'host-runtime-v2:full-docker', status: 'completed',
+          started_at: '2026-07-21T10:00:00Z', completed_at: '2026-07-21T10:00:10Z',
+        },
+        {
+          snapshot_id: 'untrusted-newer-snapshot', host_id: 'host-1',
+          observer_domain: 'host-runtime-v2:full-docker', status: 'completed',
+          started_at: '2026-07-21T11:00:00Z', completed_at: '2026-07-21T11:00:10Z',
+        },
+        {
+          snapshot_id: 'other-host-snapshot', host_id: 'host-2',
+          observer_domain: 'host-runtime-v2:full-docker', status: 'completed',
+          started_at: '2026-07-21T10:00:00Z', completed_at: '2026-07-21T10:00:10Z',
+        },
+      ],
+      docker: [
+        {
+          docker_resource_id: 'docker-null', lifecycle: 'running',
+          sampled_at: '2026-07-21T10:00:09Z',
+        },
+        {
+          docker_resource_id: 'docker-unavailable', lifecycle: 'running',
+          sampled_at: '2026-07-21T10:00:09Z',
+        },
+        {
+          docker_resource_id: 'docker-other-host', lifecycle: 'running',
+          sampled_at: '2026-07-21T10:00:09Z',
+        },
+        {
+          docker_resource_id: 'docker-newer-window', lifecycle: 'running',
+          sampled_at: '2026-07-21T11:00:09Z',
+        },
+        {
+          docker_resource_id: 'docker-stopped-observation', lifecycle: 'stopped',
+          sampled_at: '2026-07-21T10:00:09Z',
+        },
+      ],
+      telemetry: [
+        {
+          sample_id: 'null-sample', host_resource_kind: 'docker',
+          host_resource_id: 'docker-null', sampled_at: '2026-07-21T10:00:08Z',
+          cpu_percent: 1, memory_bytes: 1000,
+        },
+        {
+          sample_id: 'unavailable-sample', host_resource_kind: 'docker',
+          host_resource_id: 'docker-unavailable', sampled_at: '2026-07-21T10:00:08Z',
+          cpu_percent: 2, memory_bytes: 2000,
+        },
+        {
+          sample_id: 'other-host-sample', host_resource_kind: 'docker',
+          host_resource_id: 'docker-other-host', sampled_at: '2026-07-21T10:00:08Z',
+          cpu_percent: 3, memory_bytes: 3000,
+        },
+        {
+          sample_id: 'newer-window-sample', host_resource_kind: 'docker',
+          host_resource_id: 'docker-newer-window', sampled_at: '2026-07-21T11:00:08Z',
+          cpu_percent: 4, memory_bytes: 4000,
+        },
+        {
+          sample_id: 'stopped-observation-sample', host_resource_kind: 'docker',
+          host_resource_id: 'docker-stopped-observation', sampled_at: '2026-07-21T10:00:08Z',
+          cpu_percent: 5, memory_bytes: 5000,
+        },
+      ],
+    },
+    v1_compatibility: compatibility,
+  };
+  const responder = async ({ req, res }) => {
+    if (req.url === '/v1/observe') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        schema_version: 2,
+        status: 'completed',
+        snapshot_id: 'approved-snapshot',
+        host_id: 'host-1',
+        observer_domain: 'host-runtime-v2:full-docker',
+        docker_available: true,
+        capability_fingerprint: 'approved-capability',
+        material_fingerprint: 'approved-material',
+        completed_at: '2026-07-21T10:00:10Z',
+      }));
+      return true;
+    }
+    if (req.url !== '/v1/inventory') return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(payload));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  await client.observeHost({ agent: 'devops-console:metrics', project: '/repo' });
+  const first = await client.inventory({ maxAgeMs: 0 });
+  const cached = await client.inventory({ maxAgeMs: 60_000 });
+
+  assert.equal(first.docker.containers[0].stats, null,
+    'an explicit canonical null is not replaced by fallback telemetry');
+  for (const item of first.docker.containers.slice(1)) {
+    assert.equal(item.stats, undefined, `${item.name} must not receive unproved telemetry`);
+  }
+  assert.equal(cached.v1_compatibility.docker.containers[0].stats, null);
+  assert.equal(cached.v1_compatibility.docker.containers[1].stats, undefined,
+    're-projecting a cached wire graph must not mutate its compatibility rows');
 });
 
 test('schema-v2 inventory without a complete v1 compatibility projection fails closed', async (t) => {

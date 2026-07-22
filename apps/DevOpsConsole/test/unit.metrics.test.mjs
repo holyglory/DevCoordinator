@@ -11,7 +11,7 @@ const INTERVAL = 10_000;
 
 function makeStore(overrides = {}) {
   return createMetricsStore({
-    config: { metricsIntervalMs: INTERVAL },
+    config: { metricsIntervalMs: INTERVAL, projectRoot: '/repos/console' },
     log: null,
     coordinator: overrides.coordinator ?? null,
     maxPoints: overrides.maxPoints ?? METRICS_MAX_POINTS,
@@ -205,25 +205,71 @@ describe('metrics store: history view', () => {
 });
 
 describe('metrics store: sampler', () => {
-  it('sampleOnce ingests the coordinator inventory and records failures without throwing', async () => {
-    let fail = false;
+  it('sampleOnce observes before reading and ingests the newly committed inventory', async () => {
+    const calls = [];
     const coordinator = {
-      inventory: async () => {
-        if (fail) throw new Error('coordinator unreachable');
+      observeHost: async (body) => {
+        calls.push(['observe', body]);
+      },
+      inventory: async (options) => {
+        calls.push(['inventory', options]);
         return inventoryFixture();
       },
     };
     const store = makeStore({ coordinator });
 
     await store.sampleOnce();
+    assert.deepEqual(calls, [
+      ['observe', { agent: 'devops-console:metrics', project: '/repos/console' }],
+      ['inventory', { maxAgeMs: INTERVAL / 2 }],
+    ]);
     assert.ok(store.history().entities.length > 0);
     assert.equal(store.history().sampler.lastError, null);
+    assert.ok(Number.isFinite(store.history().sampler.lastSampleAt));
+  });
 
-    fail = true;
+  it('falls back to last committed inventory and exposes an observation failure', async () => {
+    const calls = [];
+    const coordinator = {
+      observeHost: async () => {
+        calls.push('observe');
+        throw new Error('docker observation unavailable');
+      },
+      inventory: async () => {
+        calls.push('inventory');
+        return inventoryFixture();
+      },
+    };
+    const store = makeStore({ coordinator });
+
+    await store.sampleOnce();
+    assert.deepEqual(calls, ['observe', 'inventory'],
+      'a failed observation must not suppress the last committed inventory read');
+    assert.ok(store.history().entities.length > 0);
+    assert.match(
+      String(store.history().sampler.lastError),
+      /host observation failed; using last committed inventory: docker observation unavailable/,
+    );
+    assert.ok(Number.isFinite(store.history().sampler.lastSampleAt),
+      'fallback ingestion remains a completed sampler read');
+  });
+
+  it('records an inventory failure without throwing and preserves prior history', async () => {
+    let failInventory = false;
+    const coordinator = {
+      observeHost: async () => {},
+      inventory: async () => {
+        if (failInventory) throw new Error('coordinator unreachable');
+        return inventoryFixture();
+      },
+    };
+    const store = makeStore({ coordinator });
+
+    await store.sampleOnce();
+    failInventory = true;
     await store.sampleOnce();
     assert.match(String(store.history().sampler.lastError), /unreachable/);
-    // Existing history survives a failed sample.
-    assert.ok(store.history().entities.length > 0);
+    assert.ok(store.history().entities.length > 0, 'existing history survives a failed inventory read');
   });
 });
 
@@ -280,13 +326,17 @@ describe('host health', () => {
   });
 
   it('store: host readings are recorded even while the coordinator is down', async () => {
+    const coordinatorDown = {
+      observeHost: async () => { throw new Error('coordinator down'); },
+      inventory: async () => { throw new Error('coordinator down'); },
+    };
     const store = makeStore({
-      coordinator: { inventory: async () => { throw new Error('coordinator down'); } },
+      coordinator: coordinatorDown,
     });
     // Not started (no timer): drive one tick by hand with an injected probe.
     const hosted = createMetricsStore({
-      config: { metricsIntervalMs: INTERVAL },
-      coordinator: { inventory: async () => { throw new Error('coordinator down'); } },
+      config: { metricsIntervalMs: INTERVAL, projectRoot: '/repos/console' },
+      coordinator: coordinatorDown,
       host: {
         sample: async () => ({
           at: Date.now(),
@@ -307,7 +357,11 @@ describe('host health', () => {
     assert.ok(hostEnt, 'host history entity must exist');
     assert.equal(hostEnt.kind, 'host');
     assert.deepEqual(hostEnt.points[0].slice(1), [33, 250]);
-    assert.match(String(view.sampler.lastError), /coordinator down/);
+    assert.match(
+      String(view.sampler.lastError),
+      /host observation failed: coordinator down; inventory read failed: coordinator down/,
+      'both failed coordinator boundaries stay visible',
+    );
     void store;
   });
 });

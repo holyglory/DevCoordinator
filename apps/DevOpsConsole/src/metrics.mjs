@@ -1,9 +1,10 @@
 // In-memory CPU/memory history for coordinator-managed servers, Docker
-// containers and per-project usage. A background sampler pulls the (cached)
-// coordinator inventory on a fixed interval; every successful /api/overview
-// inventory fetch is also ingested so charts stay fresh while someone is
-// watching. History lives only in this process: it resets on console restart
-// and an entity's points age out after the retention window.
+// containers and per-project usage. A background sampler first commits one
+// explicit host observation, then pulls the coordinator's pure inventory on a
+// fixed interval; every successful /api/overview inventory fetch is also
+// ingested so charts stay fresh while someone is watching. History lives only
+// in this process: it resets on console restart and an entity's points age out
+// after the retention window.
 
 import { createHostProbe } from './host.mjs';
 import { isDockerContainerRunningStatus } from './docker-status.mjs';
@@ -155,22 +156,39 @@ export function createMetricsStore({ config, log, coordinator, host, maxPoints =
     }
   }
 
-  /** One sampler tick: machine health first, then the coordinator inventory. */
+  /** One sampler tick: machine health, explicit host observation, then inventory. */
   async function sampleOnce() {
     if (sampling) return;
     sampling = true;
+    let observationError = null;
     try {
       // The machine reading must never depend on coordinator health.
       await sampleHost();
+      try {
+        await coordinator.observeHost({
+          agent: 'devops-console:metrics',
+          project: config.projectRoot,
+        });
+      } catch (err) {
+        // A failed observation is unknown host state, not proof that retained
+        // containers disappeared. Still read and ingest the last atomically
+        // committed inventory, but keep the failure visible to the operator.
+        observationError = err;
+      }
       const inventoryData = await coordinator.inventory({
         maxAgeMs: Math.max(1000, Math.floor(intervalMs / 2)),
       });
       ingest(inventoryData);
       lastSampleAt = Date.now();
-      lastError = null;
+      lastError = observationError
+        ? `host observation failed; using last committed inventory: ${observationError?.message ?? String(observationError)}`
+        : null;
     } catch (err) {
       // Coordinator down: keep the buffers, note the failure, retry next tick.
-      lastError = err?.message ?? String(err);
+      const inventoryError = err?.message ?? String(err);
+      lastError = observationError
+        ? `host observation failed: ${observationError?.message ?? String(observationError)}; inventory read failed: ${inventoryError}`
+        : inventoryError;
     } finally {
       sampling = false;
     }

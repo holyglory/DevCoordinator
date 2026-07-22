@@ -24,12 +24,20 @@ third-party dependencies) that:
   [codex-dev-coordinator](../../skills/codex-dev-coordinator/SKILL.md) HTTP API
   on loopback `127.0.0.1:29876`, authenticated with a private token. Production
   runs it as the dedicated `dev-coordinator.service`; optional local autostart
-  remains available. The
-  console samples coordinator inventory (default every 10s,
-  `METRICS_INTERVAL_MS`) into in-memory ring buffers; every running server and
-  container row shows CPU %/memory numbers plus a sparkline, and the
+  remains available. On each metrics tick (default every 10s,
+  `METRICS_INTERVAL_MS`), the Console explicitly requests one attributed host
+  observation and then reads the coordinator's pure inventory into in-memory
+  ring buffers. Every current running server and container row shows CPU
+  %/memory numbers plus a sparkline, and the
   Performance page renders full history charts (history resets when the
   console restarts).
+
+  The API and server-wide broker are independently supervised. During a
+  rolling deployment, the Console accepts canonical compatibility stats when
+  present; otherwise it derives a detached view only after its authenticated
+  observation result exactly matches the normalized full-Docker snapshot,
+  current immutable resource, available engine, running observation, and
+  in-window telemetry. Missing proof renders no utilization, never stale data.
 
 Configured owners also get Active/Archived views on Projects, Servers, and
 Docker. Archive prepares and applies a coordinator-authored stop-and-fence
@@ -84,7 +92,7 @@ ones:
 | `COORDINATOR_TOKEN_FILE` | Private mode-0600 bearer token created by the coordinator and read only by the server-side Console client. |
 | `COORDINATOR_AUTOSTART` | Optional local fallback; production sets `0` and uses `dev-coordinator.service`. |
 | `COORDINATOR_REGISTRATION_REQUIRED` | Production-only fail-closed gate. The unit pins `1`; direct/local runs omit it and log a bounded registration failure without exiting. |
-| `METRICS_INTERVAL_MS` | CPU/memory sampling cadence for the history charts (default `10000`, floor `2000`). Each sample reads coordinator inventory, which shells out to `docker stats` when Docker is present. |
+| `METRICS_INTERVAL_MS` | CPU/memory observation cadence for the history charts (default `10000`, floor `2000`). Each tick requests an explicit coordinator host observation, then reads its committed pure inventory. A failed observation keeps the last committed inventory visible and reports the sampling error. |
 
 Telegram bot tokens are registered from the Console UI, not from
 `console.env`. They remain server-only in private

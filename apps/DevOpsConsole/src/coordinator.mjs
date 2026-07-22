@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
 const PROJECT_ACTIONS = new Set(['start', 'stop', 'restart']);
 const TOKEN_MAX_BYTES = 4096;
+const FULL_DOCKER_OBSERVER_DOMAIN = 'host-runtime-v2:full-docker';
 const CONSOLE_INVENTORY_KEYS = Object.freeze([
   'coordinator_home',
   'state_path',
@@ -57,11 +58,172 @@ function cleanMessage(raw) {
   return msg || 'coordinator error';
 }
 
-function timeoutFor(apiPath) {
+function timestampMillis(value) {
+  if (typeof value !== 'string' || !value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+// During a rolling server-wide upgrade, the HTTP API can already expose a
+// newer normalized graph while the independently supervised broker still
+// emits an older v1 compatibility projection. Derive only facts that the
+// normalized graph proves: present container identities and telemetry from
+// the latest completed Docker observation window. The canonical broker stats
+// remain authoritative and win as soon as they are available.
+function consoleDockerProjection(value, docker, trustedObservations) {
+  if (!docker || typeof docker !== 'object' || Array.isArray(docker)) return docker;
+  if (!Array.isArray(docker.containers)) return docker;
+
+  const resources = value?.resources?.docker;
+  if (!Array.isArray(resources)) return docker;
+
+  const resourceById = new Map();
+  const resourceByContainerId = new Map();
+  for (const resource of resources) {
+    if (!resource || typeof resource !== 'object' || Array.isArray(resource)) continue;
+    const resourceId = String(resource.docker_resource_id ?? '');
+    if (!resourceId) continue;
+    resourceById.set(resourceId, resource);
+    const containerId = String(resource.full_container_id ?? '');
+    if (containerId) resourceByContainerId.set(containerId, resource);
+  }
+
+  const rows = [];
+  for (const original of docker.containers) {
+    if (!original || typeof original !== 'object' || Array.isArray(original)) continue;
+    const resource = resourceById.get(String(original.host_resource_id ?? ''))
+      ?? resourceByContainerId.get(String(original.id ?? ''));
+    if (!resource) continue;
+    rows.push({ item: { ...original }, resource });
+  }
+
+  const engines = value?.docker_engines;
+  const snapshots = value?.observations?.snapshots;
+  const dockerObservations = value?.observations?.docker;
+  const telemetry = value?.observations?.telemetry;
+  if (
+    !Array.isArray(engines)
+    || !Array.isArray(snapshots)
+    || !Array.isArray(dockerObservations)
+    || !Array.isArray(telemetry)
+  ) {
+    return { ...docker, containers: rows.map(({ item }) => item) };
+  }
+
+  const engineById = new Map(
+    engines
+      .filter((engine) => engine && typeof engine === 'object' && !Array.isArray(engine))
+      .map((engine) => [String(engine.engine_id ?? ''), engine]),
+  );
+  const snapshotByHost = new Map();
+  for (const [hostId, proof] of trustedObservations ?? []) {
+    if (
+      proof?.schema_version !== 2
+      || !['completed', 'fresh'].includes(proof.status)
+      || proof.observer_domain !== FULL_DOCKER_OBSERVER_DOMAIN
+      || proof.docker_available !== true
+      || typeof proof.capability_fingerprint !== 'string'
+      || typeof proof.material_fingerprint !== 'string'
+      || String(proof.host_id ?? '') !== hostId
+    ) continue;
+    const snapshot = snapshots.find((candidate) => (
+      candidate?.snapshot_id === proof.snapshot_id
+      && String(candidate.host_id ?? '') === hostId
+      && candidate.observer_domain === FULL_DOCKER_OBSERVER_DOMAIN
+      && candidate.status === 'completed'
+      && candidate.completed_at === proof.completed_at
+    ));
+    if (!snapshot) continue;
+    const startedAt = timestampMillis(snapshot.started_at);
+    const completedAt = timestampMillis(snapshot.completed_at);
+    if (startedAt === null || completedAt === null || startedAt > completedAt) continue;
+    snapshotByHost.set(hostId, {
+      startedAt,
+      completedAt,
+      snapshotId: String(snapshot.snapshot_id),
+    });
+  }
+
+  const dockerObservationByResource = new Map();
+  for (const observation of dockerObservations) {
+    const resourceId = String(observation?.docker_resource_id ?? '');
+    const sampledAt = timestampMillis(observation?.sampled_at);
+    if (!resourceById.has(resourceId) || sampledAt === null) continue;
+    const previous = dockerObservationByResource.get(resourceId);
+    if (!previous || sampledAt > previous.sampledAt) {
+      dockerObservationByResource.set(resourceId, { observation, sampledAt });
+    }
+  }
+
+  const sampleByResource = new Map();
+  for (const sample of telemetry) {
+    if (sample?.host_resource_kind !== 'docker') continue;
+    const resourceId = String(sample.host_resource_id ?? '');
+    const resource = resourceById.get(resourceId);
+    const engine = resource ? engineById.get(String(resource.engine_id ?? '')) : null;
+    const hostId = engine ? String(engine.host_id ?? '') : null;
+    const snapshot = hostId ? snapshotByHost.get(hostId) : null;
+    const sampledAt = timestampMillis(sample.sampled_at);
+    if (
+      !snapshot
+      || sampledAt === null
+      || sampledAt < snapshot.startedAt
+      || sampledAt > snapshot.completedAt
+    ) continue;
+    const previous = sampleByResource.get(resourceId);
+    const sampleId = String(sample.sample_id ?? '');
+    if (
+      !previous
+      || sampledAt > previous.sampledAt
+      || (sampledAt === previous.sampledAt && sampleId > previous.sampleId)
+    ) {
+      sampleByResource.set(resourceId, { sample, sampledAt, sampleId });
+    }
+  }
+
+  const containers = rows.map(({ item, resource }) => {
+    if (item.status !== 'running' || Object.hasOwn(item, 'stats')) return item;
+    const resourceId = String(resource.docker_resource_id ?? '');
+    const engine = engineById.get(String(resource.engine_id ?? ''));
+    if (engine?.capability_state !== 'available') return item;
+    const hostId = String(engine.host_id ?? '');
+    const snapshot = snapshotByHost.get(hostId);
+    const currentObservation = dockerObservationByResource.get(resourceId);
+    if (
+      !snapshot
+      || currentObservation?.observation?.lifecycle !== 'running'
+      || currentObservation.sampledAt < snapshot.startedAt
+      || currentObservation.sampledAt > snapshot.completedAt
+    ) return item;
+    const usage = sampleByResource.get(resourceId)?.sample;
+    if (!usage) return item;
+    return {
+      ...item,
+      stats: {
+        source: 'normalized_observation',
+        id: item.id,
+        container_id: item.id,
+        name: item.name,
+        timestamp: usage.sampled_at,
+        live: true,
+        cpu_percent: usage.cpu_percent,
+        memory_usage_bytes: usage.memory_bytes,
+        network_rx_bytes: usage.network_rx_bytes,
+        network_tx_bytes: usage.network_tx_bytes,
+        block_read_bytes: usage.block_read_bytes,
+        block_write_bytes: usage.block_write_bytes,
+      },
+    };
+  });
+  return { ...docker, containers };
+}
+
+export function coordinatorTimeoutFor(apiPath) {
   if (apiPath === '/v1/lifecycle/apply') return 600_000;
   if (apiPath.startsWith('/v1/lifecycle/')) return 300_000;
   if (apiPath.startsWith('/v1/projects/')) return 300_000; // compose up can run minutes
-  if (apiPath === '/v1/inventory') return 60_000; // shells out to docker
+  if (apiPath === '/v1/inventory') return 60_000; // may read a large host snapshot
+  if (apiPath === '/v1/observe') return 60_000; // broker sampling includes Docker stats
   if (apiPath.startsWith('/v1/docker/')) return 60_000;
   return 15_000;
 }
@@ -85,7 +247,7 @@ function failureCode(err) {
 // deliberately consume that declared projection: overlay only its known keys
 // into a new view, retaining the normalized graph as non-conflicting evidence
 // and never mutating the cached wire response.
-function consoleInventoryView(value) {
+function consoleInventoryView(value, trustedObservations = new Map()) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.schema_version !== 2) {
     return value;
   }
@@ -104,7 +266,11 @@ function consoleInventoryView(value) {
     });
   }
   const projected = { ...value };
-  for (const key of CONSOLE_INVENTORY_KEYS) projected[key] = compatibility[key];
+  for (const key of CONSOLE_INVENTORY_KEYS) {
+    projected[key] = key === 'docker'
+      ? consoleDockerProjection(value, compatibility.docker, trustedObservations)
+      : compatibility[key];
+  }
   return projected;
 }
 
@@ -124,6 +290,7 @@ export function createCoordinator({ config, log }) {
 
   const invCache = { value: undefined, at: 0, inflight: null, generation: 0 };
   const srvCache = { value: undefined, at: 0, inflight: null, generation: 0 };
+  const trustedDockerObservations = new Map();
 
   function noteAlive() {
     ok = true;
@@ -333,7 +500,7 @@ export function createCoordinator({ config, log }) {
 
   async function request(method, apiPath, body, { timeoutMs } = {}) {
     if (closed) throw new CoordError('coordinator client is closed');
-    const ms = timeoutMs ?? timeoutFor(apiPath);
+    const ms = timeoutMs ?? coordinatorTimeoutFor(apiPath);
     const result = await attempt(method, apiPath, body ?? null, ms);
     if (isMutation(method, apiPath)) invalidateCaches();
     return result;
@@ -474,7 +641,23 @@ export function createCoordinator({ config, log }) {
   }
 
   function inventory({ maxAgeMs = 5000 } = {}) {
-    return cachedGet(invCache, '/v1/inventory', maxAgeMs).then(consoleInventoryView);
+    return cachedGet(invCache, '/v1/inventory', maxAgeMs)
+      .then((value) => consoleInventoryView(value, trustedDockerObservations));
+  }
+
+  async function observeHost(body = {}) {
+    const result = await request('POST', '/v1/observe', body);
+    if (
+      result?.schema_version === 2
+      && ['completed', 'fresh'].includes(result.status)
+      && result.observer_domain === FULL_DOCKER_OBSERVER_DOMAIN
+      && result.docker_available === true
+      && typeof result.host_id === 'string'
+      && result.host_id
+    ) {
+      trustedDockerObservations.set(result.host_id, { ...result });
+    }
+    return result;
   }
 
   function serversRaw({ maxAgeMs = 3000 } = {}) {
@@ -564,6 +747,7 @@ export function createCoordinator({ config, log }) {
     closed = true;
     for (const ac of pendingAborts) ac.abort();
     pendingAborts.clear();
+    trustedDockerObservations.clear();
   }
 
   return {
@@ -572,7 +756,7 @@ export function createCoordinator({ config, log }) {
     inventory,
     serversRaw,
     events,
-    observeHost: (b = {}) => request('POST', '/v1/observe', b),
+    observeHost,
     request,
     leasePort: (b = {}) => request('POST', '/v1/ports/lease', b),
     releasePort: (b = {}) => request('POST', '/v1/ports/release', b),

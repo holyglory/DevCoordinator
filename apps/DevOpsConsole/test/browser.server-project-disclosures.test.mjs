@@ -269,6 +269,16 @@ test('real Servers UI keeps project disclosures exclusive, persistent, focused, 
       const restoredServerIds = new Set();
       let archives = [];
       const plans = new Map();
+      const telegramBots = [{
+        id: 'fixture-telegram-bot',
+        label: 'Operations',
+        ownerEmail: CANONICAL_SESSION.email,
+        username: 'fixture_operations_bot',
+        enabled: true,
+        projectIds: [],
+        authorizations: [],
+        hasToken: true,
+      }];
       page.on('pageerror', (error) => browserErrors.push(`pageerror: ${error.message}`));
       page.on('console', (message) => {
         if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`);
@@ -292,7 +302,7 @@ test('real Servers UI keeps project disclosures exclusive, persistent, focused, 
           body = { version: 1, pendingCount: 0, requests: [] };
         }
         else if (request.method() === 'GET' && pathname === '/api/telegram') {
-          body = { version: 1, bots: [], projects: [] };
+          body = { version: 1, bots: telegramBots, projects: [] };
         }
         else if (request.method() === 'GET' && pathname === '/api/prefs') body = CANONICAL_PREFS;
         else if (request.method() === 'GET' && pathname === '/api/overview') {
@@ -409,6 +419,20 @@ test('real Servers UI keeps project disclosures exclusive, persistent, focused, 
         dockerRow.locator('[data-label="Ports"]'), dockerRow.locator('.actions'),
         'Docker port mappings must not be covered by lifecycle and runtime actions',
       );
+      assert.match(
+        await dockerRow.locator('[data-label="CPU / Mem"] button').getAttribute('aria-label'),
+        /CPU 1\.1%, memory 46\.0 MiB/,
+        'a running Docker row must expose its observed CPU and memory utilization',
+      );
+
+      await page.goto(`${origin}/#/telegram`, { waitUntil: 'networkidle' });
+      await page.locator('#telegram-body [data-telegram-bot="fixture-telegram-bot"]').waitFor();
+      assert.equal(await page.locator('#nav-count-telegram').textContent(), '1',
+        'the Telegram navigation badge must count registered bots, not pending users');
+      assert.equal(await page.locator('#telegram-count').textContent(), '1',
+        'the Telegram collection count must agree with the navigation badge');
+      assert.equal(await page.getByRole('heading', { name: 'Bot authorization queue' }).count(), 1,
+        'an empty authorization queue must stay separately and truthfully labeled');
 
       await page.goto(`${origin}/#/servers`, { waitUntil: 'networkidle' });
       await page.waitForFunction(() => (

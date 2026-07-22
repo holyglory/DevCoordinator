@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -327,6 +328,53 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
             ),
         )
 
+    def _observe_at(
+        self,
+        store: AccountStore,
+        host_id: str,
+        containers: list[dict],
+        *,
+        started_at: str,
+        sampled_at: str,
+        completed_at: str,
+    ) -> None:
+        """Commit one Docker snapshot with a deterministic sampling window."""
+
+        sample = {
+            "sampled_at": sampled_at,
+            "inventory": {
+                "servers": [],
+                "docker": {
+                    "available": True,
+                    "containers": containers,
+                    "postgres": [],
+                },
+            },
+        }
+        clock_values = iter(
+            [
+                datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+                datetime.fromisoformat(started_at.replace("Z", "+00:00")),
+                datetime.fromisoformat(completed_at.replace("Z", "+00:00")),
+            ]
+        )
+        SingleFlightObserver(
+            store,
+            clock=lambda: next(clock_values).astimezone(timezone.utc),
+        ).observe(
+            host_id=host_id,
+            observer_domain="fixture-docker",
+            sampler=lambda: sample,
+            commit=lambda connection, snapshot_id, observed: commit_host_inventory_observation(
+                connection,
+                snapshot_id,
+                observed,
+                host_id=host_id,
+                coordinator_home=str(self.home),
+                effective_uid=os.geteuid(),
+            ),
+        )
+
     @staticmethod
     def _container(
         full_id: str,
@@ -354,6 +402,139 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
             container["project"] = str(project)
             container["metadata_source"] = "docker_labels"
         return container
+
+    def test_compatibility_container_stats_belong_to_latest_available_snapshot(self) -> None:
+        first_time = "2026-07-21T00:00:05Z"
+        second_time = "2026-07-21T00:01:05Z"
+        stale_id = "a" * 64
+        stopped_id = "b" * 64
+        current_id = "c" * 64
+        repository = self.root / "metrics-project"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+
+        stale_running = self._container(
+            stale_id,
+            "stale-running",
+            project=repository,
+        )
+        stale_running["stats"] = {
+            "timestamp": first_time,
+            "cpu_percent": 91.0,
+            "memory_usage_bytes": 9_100,
+            "network_rx_bytes": 910,
+            "network_tx_bytes": 911,
+            "block_read_bytes": 912,
+            "block_write_bytes": 913,
+        }
+        previously_running = self._container(
+            stopped_id,
+            "stopped-history",
+            project=repository,
+        )
+        previously_running["stats"] = {
+            "timestamp": first_time,
+            "cpu_percent": 82.0,
+            "memory_usage_bytes": 8_200,
+        }
+
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            self._insert_repository(store, host_id, repository)
+            self._observe_at(
+                store,
+                host_id,
+                [stale_running, previously_running],
+                started_at="2026-07-21T00:00:00Z",
+                sampled_at=first_time,
+                completed_at="2026-07-21T00:00:10Z",
+            )
+
+            current_running = self._container(
+                current_id,
+                "current-running",
+                project=repository,
+            )
+            current_running["stats"] = {
+                "timestamp": second_time,
+                "cpu_percent": 3.25,
+                "memory_usage_bytes": 32_500,
+                "network_rx_bytes": 3_210,
+                "network_tx_bytes": 3_211,
+                "block_read_bytes": 3_212,
+                "block_write_bytes": 3_213,
+            }
+            self._observe_at(
+                store,
+                host_id,
+                [
+                    self._container(
+                        stale_id,
+                        "stale-running",
+                        project=repository,
+                    ),
+                    self._container(
+                        stopped_id,
+                        "stopped-history",
+                        project=repository,
+                        status="Exited (0) 1 minute ago",
+                    ),
+                    current_running,
+                ],
+                started_at="2026-07-21T00:01:00Z",
+                sampled_at=second_time,
+                completed_at="2026-07-21T00:01:10Z",
+            )
+            graph = store.inventory_v2()
+            with store.read_transaction() as connection:
+                retained_samples = connection.execute(
+                    "SELECT COUNT(*) FROM telemetry_samples WHERE host_resource_kind = 'docker'"
+                ).fetchone()[0]
+
+        containers = {
+            item["name"]: item
+            for item in graph["v1_compatibility"]["docker"]["containers"]
+        }
+        self.assertEqual(
+            containers["current-running"]["stats"],
+            {
+                "source": "normalized_observation",
+                "id": current_id,
+                "container_id": current_id,
+                "name": "current-running",
+                "timestamp": second_time,
+                "live": True,
+                "cpu_percent": 3.25,
+                "memory_usage_bytes": 32_500,
+                "network_rx_bytes": 3_210,
+                "network_tx_bytes": 3_211,
+                "block_read_bytes": 3_212,
+                "block_write_bytes": 3_213,
+            },
+            "a running exact resource must expose telemetry measured in the current snapshot",
+        )
+        self.assertNotIn(
+            "stats",
+            containers["stale-running"],
+            "must-catch: a newer available snapshot without stats cannot reuse an older sample",
+        )
+        self.assertNotIn(
+            "stats",
+            containers["stopped-history"],
+            "stopped containers must not present retained telemetry as live utilization",
+        )
+        self.assertEqual(
+            retained_samples,
+            3,
+            "projection freshness must not delete retained telemetry history",
+        )
+        project_usage = next(
+            item
+            for item in graph["v1_compatibility"]["project_usage"]
+            if item["project"] == str(repository)
+        )
+        self.assertEqual(project_usage["cpu_percent"], 3.25)
+        self.assertEqual(project_usage["memory_bytes"], 32_500)
 
     def test_nested_compose_path_joins_enrolled_root_with_exact_resource_membership(self) -> None:
         repository = self.root / "GlobalFinance"

@@ -875,17 +875,9 @@
     return bots.map(telegramBotCard);
   }
 
-  function telegramPendingCount() {
-    return telegramBots().reduce(
-      (count, bot) => count + telegramAuthorizations(bot)
-        .filter((row) => String(row.status || 'pending').toLowerCase() === 'pending').length,
-      0,
-    );
-  }
-
   function renderTelegram() {
     if (!state.session?.email) return;
-    setNavCount('telegram', state.telegram ? telegramPendingCount() : null);
+    setNavCount('telegram', state.telegram ? telegramBots().length : null);
     if (currentPage() !== 'telegram') return;
     setSection('telegram-body', sig(state.telegram), buildTelegram, true);
     setCount('telegram-count', state.telegram ? telegramBots().length : null);

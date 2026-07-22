@@ -2047,6 +2047,114 @@ class AccountStore(CoordinatorStore):
                     """
                 )
             ]
+            current_docker_stats = {
+                str(row["docker_resource_id"]): dict(row)
+                for row in connection.execute(
+                    """
+                    WITH ranked_snapshots AS (
+                        SELECT s.host_id, s.snapshot_id, s.started_at,
+                               s.completed_at,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY s.host_id
+                                   ORDER BY s.completed_at DESC, s.snapshot_id DESC
+                               ) AS snapshot_ordinal
+                        FROM observation_snapshots s
+                        JOIN observation_capabilities c USING(snapshot_id)
+                        WHERE s.status = 'completed'
+                          AND s.completed_at IS NOT NULL
+                          AND c.observer_domain = s.observer_domain
+                          AND c.docker_available = 1
+                    ), latest_snapshots AS (
+                        SELECT host_id, snapshot_id, started_at, completed_at
+                        FROM ranked_snapshots WHERE snapshot_ordinal = 1
+                    ), ranked_samples AS (
+                        SELECT resources.resource_id AS docker_resource_id,
+                               telemetry.sampled_at, telemetry.cpu_percent,
+                               telemetry.memory_bytes,
+                               telemetry.network_rx_bytes,
+                               telemetry.network_tx_bytes,
+                               telemetry.block_read_bytes,
+                               telemetry.block_write_bytes,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY resources.resource_id
+                                   ORDER BY telemetry.sampled_at DESC,
+                                            telemetry.sample_id DESC
+                               ) AS sample_ordinal
+                        FROM latest_snapshots snapshot
+                        JOIN observation_snapshot_resources resources
+                          ON resources.snapshot_id = snapshot.snapshot_id
+                         AND resources.resource_kind = 'container'
+                        JOIN docker_resources resource
+                          ON resource.docker_resource_id = resources.resource_id
+                        JOIN docker_engines engine
+                          ON engine.engine_id = resource.engine_id
+                         AND engine.host_id = snapshot.host_id
+                        JOIN docker_observations observation
+                          ON observation.docker_resource_id = resources.resource_id
+                         AND observation.lifecycle = 'running'
+                        JOIN telemetry_samples telemetry
+                          ON telemetry.host_resource_kind = 'docker'
+                         AND telemetry.host_resource_id = resources.resource_id
+                        WHERE julianday(telemetry.sampled_at)
+                                  >= julianday(snapshot.started_at)
+                          AND julianday(telemetry.sampled_at)
+                                  <= julianday(snapshot.completed_at)
+                    )
+                    SELECT docker_resource_id, sampled_at, cpu_percent,
+                           memory_bytes, network_rx_bytes, network_tx_bytes,
+                           block_read_bytes, block_write_bytes
+                    FROM ranked_samples WHERE sample_ordinal = 1
+                    ORDER BY docker_resource_id
+                    """
+                )
+            }
+            project_docker_stats = dict(current_docker_stats)
+            project_docker_stats.update(
+                {
+                    str(row["docker_resource_id"]): dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT observation.docker_resource_id,
+                               telemetry.sampled_at, telemetry.cpu_percent,
+                               telemetry.memory_bytes,
+                               telemetry.network_rx_bytes,
+                               telemetry.network_tx_bytes,
+                               telemetry.block_read_bytes,
+                               telemetry.block_write_bytes
+                        FROM docker_observations observation
+                        JOIN docker_resources resource USING(docker_resource_id)
+                        JOIN docker_engines engine USING(engine_id)
+                        JOIN telemetry_samples telemetry
+                          ON telemetry.host_resource_kind = 'docker'
+                         AND telemetry.host_resource_id = observation.docker_resource_id
+                        WHERE observation.lifecycle = 'running'
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM observation_snapshots snapshot
+                              JOIN observation_capabilities capability
+                                USING(snapshot_id)
+                              WHERE snapshot.host_id = engine.host_id
+                                AND snapshot.status = 'completed'
+                                AND snapshot.completed_at IS NOT NULL
+                                AND capability.observer_domain
+                                    = snapshot.observer_domain
+                                AND capability.docker_available = 1
+                          )
+                          AND telemetry.sample_id = (
+                              SELECT newer.sample_id
+                              FROM telemetry_samples newer
+                              WHERE newer.host_resource_kind = 'docker'
+                                AND newer.host_resource_id
+                                    = observation.docker_resource_id
+                              ORDER BY newer.sampled_at DESC,
+                                       newer.sample_id DESC
+                              LIMIT 1
+                          )
+                        ORDER BY observation.docker_resource_id
+                        """
+                    )
+                }
+            )
             compatibility_containers: list[dict[str, Any]] = []
             containers_by_resource: dict[str, dict[str, Any]] = {}
             unassigned_by_resource = {
@@ -2161,6 +2269,22 @@ class AccountStore(CoordinatorStore):
                     "metadata_source": row["metadata_source"] or "none",
                     "attribution": violation or unassigned_by_resource.get(resource_id),
                 }
+                usage = current_docker_stats.get(resource_id)
+                if item["status"] == "running" and usage is not None:
+                    item["stats"] = {
+                        "source": "normalized_observation",
+                        "id": row["full_container_id"],
+                        "container_id": row["full_container_id"],
+                        "name": row["name"],
+                        "timestamp": usage["sampled_at"],
+                        "live": True,
+                        "cpu_percent": usage["cpu_percent"],
+                        "memory_usage_bytes": usage["memory_bytes"],
+                        "network_rx_bytes": usage["network_rx_bytes"],
+                        "network_tx_bytes": usage["network_tx_bytes"],
+                        "block_read_bytes": usage["block_read_bytes"],
+                        "block_write_bytes": usage["block_write_bytes"],
+                    }
                 compatibility_containers.append(item)
                 containers_by_resource[resource_id] = item
             compatibility_postgres: list[dict[str, Any]] = []
@@ -2344,53 +2468,10 @@ class AccountStore(CoordinatorStore):
                         (repo_id,),
                     )
                 )
-                container_usage_rows = list(
-                    connection.execute(
-                        """
-                        SELECT t.cpu_percent, t.memory_bytes,
-                               m.host_resource_id AS docker_resource_id,
-                               e.host_id
-                        FROM repository_memberships m
-                        JOIN docker_observations o
-                          ON o.docker_resource_id = m.host_resource_id
-                        JOIN docker_resources d
-                          ON d.docker_resource_id = m.host_resource_id
-                        JOIN docker_engines e USING(engine_id)
-                        JOIN telemetry_samples t
-                          ON t.host_resource_kind = 'docker'
-                         AND t.host_resource_id = m.host_resource_id
-                        WHERE m.repo_id = ? AND m.resource_kind = 'container'
-                          AND o.lifecycle = 'running'
-                          AND NOT EXISTS (
-                              SELECT 1 FROM resource_retirements retirement
-                              WHERE retirement.resource_kind = 'container'
-                                AND retirement.host_resource_id = m.host_resource_id
-                                AND retirement.status = 'retired'
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM cleanup_tombstones tombstone
-                              WHERE (tombstone.target_kind = 'project'
-                                     AND tombstone.target_id = m.repo_id)
-                                 OR (tombstone.target_kind = 'container'
-                                     AND tombstone.target_id = m.host_resource_id)
-                          )
-                          AND t.sample_id = (
-                              SELECT newer.sample_id
-                              FROM telemetry_samples newer
-                              WHERE newer.host_resource_kind = 'docker'
-                                AND newer.host_resource_id = m.host_resource_id
-                              ORDER BY newer.sampled_at DESC, newer.sample_id DESC
-                              LIMIT 1
-                          )
-                        """,
-                        (repo_id,),
-                    )
-                )
                 usage_rows.extend(
-                    row
-                    for row in container_usage_rows
-                    if str(row["docker_resource_id"])
-                    in active_docker_resource_ids
+                    project_docker_stats[resource_id]
+                    for resource_id in container_resource_ids
+                    if resource_id in project_docker_stats
                 )
                 cpu_samples = [
                     float(row["cpu_percent"])
