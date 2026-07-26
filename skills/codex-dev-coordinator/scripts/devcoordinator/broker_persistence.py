@@ -5374,20 +5374,21 @@ class BrokerPersistence:
                 lease = _authorize_connection(
                     connection, peer=authorized.peer, request=request
                 )
-                if lease is None or lease["status"] != "active":
+                if lease is None or lease["status"] not in {"active", "released"}:
                     raise BrokerError(
                         "lease_not_active",
                         "The exact authorized lease is no longer active.",
                         operation_id=request.operation_id,
                     )
-                connection.execute(
-                    """
-                    UPDATE leases SET status = 'released', deactivated_at = ?,
-                                      updated_at = ?, generation = generation + 1
-                    WHERE lease_id = ? AND status = 'active'
-                    """,
-                    (now, now, request.resource_id),
-                )
+                if lease["status"] == "active":
+                    connection.execute(
+                        """
+                        UPDATE leases SET status = 'released', deactivated_at = ?,
+                                          updated_at = ?, generation = generation + 1
+                        WHERE lease_id = ? AND status = 'active'
+                        """,
+                        (now, now, request.resource_id),
+                    )
                 result = {
                     "lease_id": request.resource_id,
                     "port": int(lease["port"]),

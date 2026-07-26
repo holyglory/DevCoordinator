@@ -28,8 +28,11 @@ def expect(condition: bool, message: str) -> None:
 def driver_for(root: Path) -> object:
     driver = object.__new__(MODULE.Driver)
     driver.raw_checkpoint = root / "writer-free-database"
+    driver.client_database = root / "client" / "coordinator.sqlite3"
+    driver.client_checkpoint = root / "writer-free-client-database"
     driver.deployment_id = "11111111-1111-4111-8111-111111111111"
     driver.database_captured = False
+    driver.client_database_captured = False
     driver.journal = lambda **_extra: None
     return driver
 
@@ -147,6 +150,22 @@ def main() -> int:
                 database.read_bytes() == before,
                 "atomic rollback did not replace a concurrently recreated database",
             )
+
+            driver.client_database.parent.mkdir(mode=0o700)
+            initialize_database(driver.client_database)
+            client_before = driver.client_database.read_bytes()
+            driver.capture_client_database()
+            driver.client_database.write_bytes(b"migrated client database")
+            driver.client_database.chmod(0o600)
+            driver.restore_client_database()
+            expect(
+                driver.client_database.read_bytes() == client_before,
+                "rollback did not restore the exact client database",
+            )
+            expect(
+                driver.client_schema_evidence(expected=9)["schema_version"] == 9,
+                "restored client database lost its schema evidence",
+            )
         finally:
             MODULE.DATABASE = previous
 
@@ -219,7 +238,24 @@ def main() -> int:
         "devcoordinator-sqlite-backup" in source,
         "deployment does not verify the canonical backup artifact type",
     )
+    expect(
+        '"/usr/sbin/runuser",\n                "--user",\n                "holyglory"'
+        in source,
+        "root deployment still runs private auth evidence as the wrong user",
+    )
     deploy_source = inspect.getsource(MODULE.Driver.deploy)
+    expect(
+        deploy_source.index("self.capture_client_database()")
+        < deploy_source.index("self.migrate()"),
+        "client database is not checkpointed before target migration/startup",
+    )
+    expect(
+        all(
+            unit in deploy_source
+            for unit in ("CONSOLE_UNIT", "API_UNIT", "BROKER_UNIT")
+        ),
+        "writer-free checkpoint does not stop every production writer",
+    )
     expect(
         deploy_source.index("clear_maintenance(")
         < deploy_source.index('"restart", API_UNIT'),
@@ -229,9 +265,19 @@ def main() -> int:
         "recovery-maintenance-active" in deploy_source,
         "post-clear target failure does not reactivate maintenance before rollback",
     )
+    rollback_source = inspect.getsource(MODULE.Driver.rollback)
+    expect(
+        rollback_source.index('attempt("restore client database"')
+        < rollback_source.index('"checkout compatibility source"'),
+        "rollback starts compatibility code before restoring its client database",
+    )
+    expect(
+        rollback_source.count("normalize_console_private_state") == 2,
+        "rollback does not protect legacy Console state before and after startup",
+    )
     print(
         "maintenance deployment self-test ok "
-        "(quiescence, bounded inventory, atomic checkpoint, privacy, rollback guard)"
+        "(quiescence, dual checkpoints, bounded inventory, auth identity, privacy, rollback guard)"
     )
     return 0
 

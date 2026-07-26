@@ -15060,6 +15060,19 @@ def acquire_broker_lease_link(
     adopt_existing_listener: bool = False,
 ) -> tuple[BrokerLink, dict[str, Any]]:
     server_definition_id = repository.server_id(server_name)
+    if adopt_existing_listener:
+        # A service restart can leave the client journal's former listener
+        # lease active after the server authority has already released it.
+        # Reconcile that exact saved link before reserving a replacement; the
+        # broker release is idempotent for an already-released authorized
+        # lease, so no unproved local row is deleted or overwritten.
+        existing = broker_lease_link_for_server(repository, server_name)
+        if existing is not None:
+            released = release_broker_lease_link(existing, rollback=False)
+            if released.get("status") != "released":
+                raise RuntimeError(
+                    "superseded broker listener lease did not reach released state"
+                )
     arguments: dict[str, Any] = {"protocol": "tcp", "ttl_seconds": ttl_seconds}
     if requested_port is not None:
         arguments["requested_port"] = int(requested_port)

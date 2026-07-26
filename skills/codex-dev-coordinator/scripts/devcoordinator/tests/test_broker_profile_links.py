@@ -2262,7 +2262,7 @@ class BrokerLinkStoreTests(unittest.TestCase):
 
     def test_replacement_broker_lease_rebinds_only_a_released_local_link(self) -> None:
         prior = self._reserve_lease()
-        self.links.bind_local_lease(prior.link_id, "local-lease-web")
+        prior = self.links.bind_local_lease(prior.link_id, "local-lease-web")
 
         with self.assertRaises(sqlite3.IntegrityError):
             self._reserve_lease(
@@ -2289,6 +2289,59 @@ class BrokerLinkStoreTests(unittest.TestCase):
                 (prior.link_id,),
             ).fetchone()[0]
         self.assertIsNone(prior_local)
+
+    def test_listener_adoption_reconciles_superseded_active_link_first(self) -> None:
+        prior = self._reserve_lease()
+        prior = self.links.bind_local_lease(prior.link_id, "local-lease-web")
+        order: list[str] = []
+        store_root = self.root / "account-store"
+
+        def release_existing(link: object, *, rollback: bool) -> dict[str, object]:
+            self.assertEqual(link, prior)
+            self.assertFalse(rollback)
+            order.append("release")
+            with AccountStore.open_default(store_root) as store:
+                links = BrokerLinkStore(store)
+                links.begin_lease_release(prior.link_id, "release-prior")
+                links.complete_lease_release(prior.link_id)
+            return {"status": "released"}
+
+        def reserve_replacement(**_kwargs: object) -> tuple[str, dict[str, object]]:
+            order.append("reserve")
+            return (
+                "operation-replacement",
+                {
+                    "lease_id": "broker-lease-replacement",
+                    "port": 43100,
+                    "protocol": "tcp",
+                    "status": "active",
+                    "expires_at": "2026-07-14T02:00:00Z",
+                },
+            )
+
+        with mock.patch.object(
+            dev_coordinator, "coordinator_home", return_value=store_root
+        ), mock.patch.object(
+            dev_coordinator,
+            "release_broker_lease_link",
+            side_effect=release_existing,
+        ), mock.patch.object(
+            BrokerClientProfile,
+            "call",
+            side_effect=reserve_replacement,
+        ):
+            replacement, result = dev_coordinator.acquire_broker_lease_link(
+                profile=self.profile,
+                repository=self.repository,
+                server_name="web",
+                requested_port=43100,
+                ttl_seconds=600,
+                adopt_existing_listener=True,
+            )
+
+        self.assertEqual(order, ["release", "reserve"])
+        self.assertEqual(replacement.broker_resource_id, "broker-lease-replacement")
+        self.assertEqual(result["lease_id"], "broker-lease-replacement")
 
     def test_renewed_broker_lease_rebinds_exact_stale_local_process_lease(self) -> None:
         reserved = self._reserve_lease()

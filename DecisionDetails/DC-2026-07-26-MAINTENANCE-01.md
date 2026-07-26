@@ -42,8 +42,11 @@ bypass the fence with lower-level host access.
 
 One root foreground transaction owns an outer deployment lock and the marker.
 It verifies a pre-migration backup, terminal operation state, and rollback
-material before stopping the broker. It performs the installer/profile/schema
-transition and proves the exact target broker active while the fence remains.
+material before stopping the Console, API, and broker writers. It creates and
+verifies writer-free checkpoints for both the service authority and per-user
+client reconciliation journal before either crosses its schema boundary. It
+performs the installer/profile/schema transition and proves the exact target
+broker active while the fence remains.
 API readiness and Console self-registration intentionally require normal broker
 traffic, so the transaction clears the owner-bound marker immediately before
 starting those independently supervised services, then proves authenticated
@@ -57,6 +60,15 @@ slow multi-gigabyte copy window. The marker does not claim that unsupported
 runtime, database cancellation, or replay combinations are implemented; those
 remain fail-closed Completion Ledger work.
 
+Console listener adoption first reconciles any saved active client link. The
+broker permits a repeated release only after the normal peer, account,
+repository, resource, and lease authorization succeeds, and returns the exact
+already-released lease without another generation change. The client then
+records that link released before reserving and binding its replacement. This
+preserves evidence across a crash between authoritative release and client
+journal completion without deleting local state or weakening the one-active
+lease invariant.
+
 ## Verification
 
 Focused tests cover active/absent behavior, malformed modes and content,
@@ -64,6 +76,12 @@ symlink refusal, descriptor transport, deployment-bound clear, competing
 publication, removal of the separate broker runtime directory, inventory above
 the former 8 MiB ceiling and the new hard bound, atomic replacement against a
 recreated database target, post-clear fence reactivation, and legacy Console
-state privacy normalization. Installer tests require the independent tmpfiles
+state privacy normalization. The deployment self-test additionally requires
+all three writers to stop before dual checkpoints, restores the client journal
+before compatibility source, runs the private authentication probe as its
+actual account, and normalizes the Console identity before and after rollback
+startup. Broker/link regressions prove authorized repeated release,
+foreign-owner rejection, and release-before-reserve listener adoption in both
+normal and optimized Python. Installer tests require the independent tmpfiles
 entry. Release validation and the live cutover must additionally prove the same
 authenticated and public surfaces used in production readiness.

@@ -97,10 +97,17 @@ class Driver:
         self.phase = "initializing"
         self.install_transaction = self.transaction / "server-wide-install"
         self.raw_checkpoint = self.transaction / "writer-free-database"
+        self.client_database = (
+            Path("/var/lib/devcoordinator-clients")
+            / str(self.console_uid)
+            / "coordinator.sqlite3"
+        )
+        self.client_checkpoint = self.transaction / "writer-free-client-database"
         self.command_index = 0
         self.marker_active = False
         self.checkout_changed = False
         self.database_captured = False
+        self.client_database_captured = False
         self.installer_applied = False
         self.units_captured = False
 
@@ -117,6 +124,7 @@ class Driver:
                 "marker_active": self.marker_active,
                 "checkout_changed": self.checkout_changed,
                 "database_captured": self.database_captured,
+                "client_database_captured": self.client_database_captured,
                 "installer_applied": self.installer_applied,
                 "units_captured": self.units_captured,
                 **extra,
@@ -165,9 +173,9 @@ class Driver:
             timeout=timeout,
         )
 
-    def schema_evidence(self, *, expected: int) -> dict[str, Any]:
+    def _schema_evidence(self, database: Path, *, expected: int) -> dict[str, Any]:
         connection = sqlite3.connect(
-            f"file:{DATABASE}?mode=ro", uri=True, isolation_level=None, timeout=5
+            f"file:{database}?mode=ro", uri=True, isolation_level=None, timeout=5
         )
         try:
             connection.execute("PRAGMA query_only = ON")
@@ -201,6 +209,12 @@ class Driver:
             "integrity_check": "ok",
             "foreign_key_check": "ok",
         }
+
+    def schema_evidence(self, *, expected: int) -> dict[str, Any]:
+        return self._schema_evidence(DATABASE, expected=expected)
+
+    def client_schema_evidence(self, *, expected: int) -> dict[str, Any]:
+        return self._schema_evidence(self.client_database, expected=expected)
 
     def require_no_database_helpers(self) -> None:
         findings: list[dict[str, Any]] = []
@@ -465,10 +479,10 @@ class Driver:
             )
         self.run(["/usr/bin/systemctl", "daemon-reload"])
 
-    def capture_database(self) -> None:
-        self.raw_checkpoint.mkdir(mode=0o700)
+    def _capture_database_files(self, database: Path, checkpoint: Path) -> None:
+        checkpoint.mkdir(mode=0o700)
         documents: dict[str, Any] = {}
-        for source in (DATABASE, Path(f"{DATABASE}-wal"), Path(f"{DATABASE}-shm")):
+        for source in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
             name = source.name
             if not os.path.lexists(source):
                 documents[name] = {"present": False}
@@ -477,7 +491,7 @@ class Driver:
             if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise DeploymentError(f"database checkpoint source is unsafe: {source}")
             payload = source.read_bytes()
-            target = self.raw_checkpoint / name
+            target = checkpoint / name
             target.write_bytes(payload)
             target.chmod(0o600)
             with target.open("rb") as handle:
@@ -490,19 +504,25 @@ class Driver:
                 "size": len(payload),
                 "sha256": hashlib.sha256(payload).hexdigest(),
             }
-        if not documents.get(DATABASE.name, {}).get("present"):
-            raise DeploymentError("writer-free checkpoint omitted the authority database")
-        _json_write(self.raw_checkpoint / "manifest.json", documents)
+        if not documents.get(database.name, {}).get("present"):
+            raise DeploymentError(f"writer-free checkpoint omitted database: {database}")
+        _json_write(checkpoint / "manifest.json", documents)
+
+    def capture_database(self) -> None:
+        self._capture_database_files(DATABASE, self.raw_checkpoint)
         self.database_captured = True
         self.journal()
 
-    def restore_database(self) -> None:
-        if not self.database_captured:
-            return
+    def capture_client_database(self) -> None:
+        self._capture_database_files(self.client_database, self.client_checkpoint)
+        self.client_database_captured = True
+        self.journal()
+
+    def _restore_database_files(self, database: Path, checkpoint: Path) -> None:
         documents = json.loads(
-            (self.raw_checkpoint / "manifest.json").read_text(encoding="utf-8")
+            (checkpoint / "manifest.json").read_text(encoding="utf-8")
         )
-        targets = (DATABASE, Path(f"{DATABASE}-wal"), Path(f"{DATABASE}-shm"))
+        targets = (database, Path(f"{database}-wal"), Path(f"{database}-shm"))
         prepared: dict[Path, Path] = {}
         try:
             # Prepare and checksum every replacement before removing or replacing
@@ -513,7 +533,7 @@ class Driver:
                 record = documents[target.name]
                 if not record["present"]:
                     continue
-                source = self.raw_checkpoint / target.name
+                source = checkpoint / target.name
                 source_metadata = source.lstat()
                 if (
                     stat.S_ISLNK(source_metadata.st_mode)
@@ -573,7 +593,7 @@ class Driver:
                 elif os.path.lexists(target):
                     target.unlink()
             directory = os.open(
-                DATABASE.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                database.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
             )
             try:
                 os.fsync(directory)
@@ -583,6 +603,14 @@ class Driver:
             for temporary in prepared.values():
                 with suppress(FileNotFoundError):
                     temporary.unlink()
+
+    def restore_database(self) -> None:
+        if self.database_captured:
+            self._restore_database_files(DATABASE, self.raw_checkpoint)
+
+    def restore_client_database(self) -> None:
+        if self.client_database_captured:
+            self._restore_database_files(self.client_database, self.client_checkpoint)
 
     def normalize_console_private_state(self) -> dict[str, Any]:
         path = self.console_identity_assertion
@@ -654,6 +682,10 @@ class Driver:
         console = self.require_active(CONSOLE_UNIT)
         self.run(
             [
+                "/usr/sbin/runuser",
+                "--user",
+                "holyglory",
+                "--",
                 "/usr/bin/python3",
                 str(self.repository / "scripts/check_coordinator_auth_boundary.py"),
                 "--token-file",
@@ -719,11 +751,22 @@ class Driver:
                 failures.append(f"{label}: {type(error).__name__}: {error}")
 
         attempt(
-            "stop broker",
-            lambda: self.run(["/usr/bin/systemctl", "stop", "--no-block", BROKER_UNIT]),
+            "stop compatibility writers",
+            lambda: self.run(
+                [
+                    "/usr/bin/systemctl",
+                    "stop",
+                    "--no-block",
+                    CONSOLE_UNIT,
+                    API_UNIT,
+                    BROKER_UNIT,
+                ]
+            ),
         )
-        attempt("wait broker stopped", lambda: self.wait_inactive(BROKER_UNIT))
+        for unit in (CONSOLE_UNIT, API_UNIT, BROKER_UNIT):
+            attempt(f"wait {unit} stopped", lambda unit=unit: self.wait_inactive(unit))
         attempt("restore database", self.restore_database)
+        attempt("restore client database", self.restore_client_database)
         if self.installer_applied:
             attempt(
                 "rollback server-wide installer",
@@ -749,6 +792,7 @@ class Driver:
             "restart compatible API",
             lambda: self.run(["/usr/bin/systemctl", "restart", API_UNIT], timeout=90),
         )
+        attempt("normalize compatible Console state", self.normalize_console_private_state)
         attempt(
             "restart compatible Console",
             lambda: self.run(["/usr/bin/systemctl", "restart", CONSOLE_UNIT], timeout=120),
@@ -760,7 +804,15 @@ class Driver:
                     inventory_name="rollback-inventory.json"
                 ),
             )
+            attempt(
+                "renormalize compatible Console state",
+                self.normalize_console_private_state,
+            )
             attempt("verify rollback schema", lambda: self.schema_evidence(expected=SCHEMA_BEFORE))
+            attempt(
+                "verify rollback client schema",
+                lambda: self.client_schema_evidence(expected=SCHEMA_BEFORE),
+            )
         if not failures and self.marker_active:
             attempt(
                 "clear maintenance marker after rollback",
@@ -806,6 +858,7 @@ class Driver:
             for unit in (BROKER_UNIT, API_UNIT, CONSOLE_UNIT)
         }
         pre_schema = self.schema_evidence(expected=SCHEMA_BEFORE)
+        pre_client_schema = self.client_schema_evidence(expected=SCHEMA_BEFORE)
         self.require_no_database_helpers()
         self.inventory("pre-inventory.json")
         public_before = [
@@ -828,6 +881,7 @@ class Driver:
         self.journal(
             pre_units=pre_units,
             pre_schema=pre_schema,
+            pre_client_schema=pre_client_schema,
             public_before=public_before,
             online_backup_manifest=str(backup_manifest),
         )
@@ -836,13 +890,24 @@ class Driver:
             self.checkout_changed = True
             self.phase = "target-source-active"
             self.journal()
-            self.run(["/usr/bin/systemctl", "stop", "--no-block", BROKER_UNIT])
-            self.wait_inactive(BROKER_UNIT)
+            self.run(
+                [
+                    "/usr/bin/systemctl",
+                    "stop",
+                    "--no-block",
+                    CONSOLE_UNIT,
+                    API_UNIT,
+                    BROKER_UNIT,
+                ]
+            )
+            for unit in (CONSOLE_UNIT, API_UNIT, BROKER_UNIT):
+                self.wait_inactive(unit)
             if BROKER_SOCKET.exists() or BROKER_SOCKET.is_symlink():
                 raise DeploymentError("broker socket remains after stopped boundary")
             self.schema_evidence(expected=SCHEMA_BEFORE)
             self.require_no_database_helpers()
             self.capture_database()
+            self.capture_client_database()
             self.phase = "writer-free-checkpoint"
             self.journal()
             self.migrate()
