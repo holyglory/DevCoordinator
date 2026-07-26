@@ -49,7 +49,7 @@ test('route assertions carry the verified Console actor and are signed by a priv
     true,
   );
   assert.equal((await fsp.stat(path.join(dir, 'identity-assertion-private.pem'))).mode & 0o777, 0o600);
-  assert.equal((await fsp.stat(path.join(dir, 'identity-assertion-public.json'))).mode & 0o777, 0o644);
+  assert.equal((await fsp.stat(path.join(dir, 'identity-assertion-public.json'))).mode & 0o777, 0o600);
 
   const reloaded = createIdentityAssertionSigner({ stateDir: dir, issuer: 'https://console.vr.ae', clock });
   await reloaded.load();

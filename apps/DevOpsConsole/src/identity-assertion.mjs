@@ -105,8 +105,11 @@ export function createIdentityAssertionSigner({ stateDir, issuer, clock = Date.n
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
-    if (current !== payload) await atomicWrite(publicFile, payload, 0o644);
-    else await fsp.chmod(publicFile, 0o644);
+    // The JWKS is public through the Console endpoint, not through filesystem
+    // permissions. Keep every state object private so production preflight can
+    // prove that no Console-state file is group/world accessible.
+    if (current !== payload) await atomicWrite(publicFile, payload, 0o600);
+    else await fsp.chmod(publicFile, 0o600);
   }
 
   function publicJwks() {

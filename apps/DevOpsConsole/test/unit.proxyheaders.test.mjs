@@ -86,6 +86,9 @@ async function startUpstream(t) {
           'dc_session=project-owned-name; Path=/; HttpOnly',
         ];
       }
+      if (req.url.startsWith('/resp-csp')) {
+        headers['content-security-policy'] = "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'";
+      }
       const status = req.url.startsWith('/resp-upstream-auth-challenge') ? 401 : 200;
       if (status === 401) headers['www-authenticate'] = 'Basic realm="fixture-upstream"';
       res.writeHead(status, headers);
@@ -309,6 +312,41 @@ test('response direction: hop-by-hop headers stripped, incl. Connection-named ex
   assert.equal(res.headers['x-resp-keep'], 'kept', 'end-to-end response headers must survive');
   assert.equal(res.headers['content-type'], 'application/json');
   JSON.parse(res.body); // body intact
+});
+
+test('protected routes open only the annotation style surface in an upstream CSP', async (t) => {
+  const upstream = await startUpstream(t);
+  const protectedEdge = await startEdge(t, {
+    upstreamPort: upstream.port,
+    routeAuth: 'google',
+  });
+  const publicEdge = await startEdge(t, {
+    upstreamPort: upstream.port,
+    routeAuth: 'public',
+  });
+
+  const protectedResponse = await request({
+    port: protectedEdge.port,
+    method: 'GET',
+    path: '/resp-csp',
+    headers: { host: 'slug.vr.ae', connection: 'close' },
+  });
+  const publicResponse = await request({
+    port: publicEdge.port,
+    method: 'GET',
+    path: '/resp-csp',
+    headers: { host: 'slug.vr.ae', connection: 'close' },
+  });
+
+  assert.equal(
+    protectedResponse.headers['content-security-policy'],
+    "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; style-src-elem 'self' 'unsafe-inline'; object-src 'none'",
+  );
+  assert.doesNotMatch(protectedResponse.headers['content-security-policy'], /script-src[^;]*unsafe-inline/);
+  assert.equal(
+    publicResponse.headers['content-security-policy'],
+    "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'",
+  );
 });
 
 test('Google-protected routes replace browser Authorization and never expose upstream auth JSON', async (t) => {
