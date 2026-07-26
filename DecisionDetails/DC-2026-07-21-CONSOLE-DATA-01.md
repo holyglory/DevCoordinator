@@ -92,3 +92,13 @@ server IDs without lifecycle evidence. Database fixtures must separately prove
 that positive catalog absence exits current resources/tree/observations while
 catalog-discovery failure preserves them. Canonical artifacts remain bound to
 current renderer inputs and source hashes.
+
+Production verification on 2026-07-26 exercised the authenticated
+`/v1/inventory` response with the exact deployed Console
+`repositoryTreeContractProblemsOf` validator and returned HTTP 200 with no
+problems. The fresh graph classified all 15 normalized server definitions and
+all 188 current database bindings exactly once. GlobalFinance retained seven
+`validation-port-lease` definitions in normalized resources and its repository
+scope while exposing zero compatibility/project-usage servers; two live
+running servers and five retained stopped servers remained visible through the
+lifecycle projection.
