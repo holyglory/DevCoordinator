@@ -85,3 +85,26 @@ foreign-owner rejection, and release-before-reserve listener adoption in both
 normal and optimized Python. Installer tests require the independent tmpfiles
 entry. Release validation and the live cutover must additionally prove the same
 authenticated and public surfaces used in production readiness.
+
+## Live cutover evidence
+
+The 2026-07-26 production cutover exposed two recovery gaps before readiness:
+the original transaction checkpointed only the authority database while the
+API/Console client journal crossed the schema boundary, and Console listener
+adoption attempted a replacement reservation while its saved link still
+appeared active even though the broker had already released the exact lease.
+The strengthened guards reproduced both cases before the fixes. Normal and
+optimized full skill self-tests and focused broker/link suites passed before
+activation.
+
+The final cutover migrated both databases to schema 12, restarted the broker,
+API, and Console under systemd, and cleared maintenance only after the broker
+ready event. Systemd's capability-matched Console `ExecStartPost` proved PID,
+listener, working directory, assignment, active lease, and exact server ID.
+Read-only checks returned `integrity_check=ok`, no foreign-key violations, no
+planned/running operations, the prior Console lease released, and exactly one
+replacement active. Server-wide normalized inventory reported that exact
+Console PID healthy and running. The public Console health endpoint and the
+Console, gf2, and PRTZN HTTPS/auth journeys returned 200; effective loaded
+systemd paths passed their production preflight; all three units were enabled
+and active; and the owner-bound maintenance marker was absent.
