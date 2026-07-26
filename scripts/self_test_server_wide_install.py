@@ -1886,6 +1886,11 @@ def main() -> int:
         "tmpfiles omits the client journal parent",
     )
     expect(
+        "d /run/devcoordinator-maintenance 0750 root devcoordinator-clients"
+        in tmpfiles,
+        "tmpfiles omits the broker-independent maintenance directory",
+    )
+    expect(
         "d /etc/devcoordinator 0750 root devcoordinator-clients" in tmpfiles,
         "tmpfiles omits the shared profile directory",
     )

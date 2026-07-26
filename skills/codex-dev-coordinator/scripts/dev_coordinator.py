@@ -335,6 +335,15 @@ def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
             "action_required": "Reinstall the removed repository through the Coordinator skill before starting it.",
         }
     if isinstance(exc, BrokerError):
+        if exc.code in {"maintenance_in_progress", "maintenance_state_invalid"}:
+            return {
+                "error": exc.message,
+                "code": exc.code,
+                "classification": "maintenance",
+                "operation_id": exc.operation_id,
+                "retry_after_seconds": exc.retry_after_seconds or 60,
+                "action_required": "Wait for the maintenance window to finish, then retry through the Coordinator skill.",
+            }
         return {
             "error": exc.message,
             "code": exc.code,
@@ -17664,6 +17673,10 @@ def coordinated_broker_runtime_request(payload: Any) -> dict[str, Any]:
             arguments=arguments,
         )
     except BrokerError as error:
+        maintenance = error.code in {
+            "maintenance_in_progress",
+            "maintenance_state_invalid",
+        }
         raise StructuredCoordinatorError(
             error.message,
             {
@@ -17678,9 +17691,17 @@ def coordinated_broker_runtime_request(payload: Any) -> dict[str, Any]:
                         "operation_access_denied",
                         "cross_account_access_denied",
                     }
-                    else "broker_runtime_unavailable"
+                    else ("maintenance" if maintenance else "broker_runtime_unavailable")
                 ),
                 "operation_id": error.operation_id,
+                **(
+                    {
+                        "retry_after_seconds": error.retry_after_seconds or 60,
+                        "action_required": "Wait for the maintenance window to finish, then retry through the Coordinator skill.",
+                    }
+                    if maintenance
+                    else {}
+                ),
             },
         ) from error
     repository = result.get("repository")
