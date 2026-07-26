@@ -274,11 +274,9 @@ export function createProxy({
         const excluded = target.route?.auth === 'public'
           ? new Set()
           : UPSTREAM_AUTH_RESPONSE_HEADERS;
-        const responseHeaders = filterResponseHeaders(
-          r.headers,
-          protectedCookieNames,
-          excluded,
-        );
+        // Keep the complete cookie-isolation call visible to the release
+        // contract guard while applying the CSP transformation separately.
+        const responseHeaders = filterResponseHeaders(r.headers, protectedCookieNames, excluded);
         res.writeHead(
           r.statusCode || 502,
           r.statusMessage || '',
