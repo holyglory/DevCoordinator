@@ -21,11 +21,15 @@ remain first-class services when the producer proves their container, port,
 health, route, and lifecycle relationship.
 
 Enrollment-only server definitions remain exact control identities for port
-leases and assignments but do not enter operational Servers, membership,
-counts, Unassigned Resources, or actions until a concrete running, starting,
-unhealthy, stopping, or stopped observation exists. Public TLS terminates at
-the Console and routed HTTP/WebSocket traffic goes only to an explicitly
-selected application HTTP listener; protocol is never guessed from a port.
+leases and assignments. Every current normalized definition is classified
+exactly once under its repository scope, but definitions do not enter
+compatibility Servers, operational counts, Unassigned Resources, or actions
+until a concrete running, starting, unhealthy, stopping, or stopped observation
+exists. The authoritative tree is a complete ownership graph, while its usage
+fields and compatibility projection remain lifecycle-only. Public TLS
+terminates at the Console and routed HTTP/WebSocket traffic goes only to an
+explicitly selected application HTTP listener; protocol is never guessed from
+a port.
 
 ## Presentation direction
 
@@ -61,12 +65,19 @@ history regardless of lifecycle invents current state. Rapid start-to-start
 polling, loading-state replacement, metric sorting, and unbounded expansion
 create high CPU use, permanent Updating badges, clipped content, and unstable
 operator focus. Deleting absent history would sacrifice auditability without
-fixing the read model.
+fixing the read model. Deriving authoritative tree membership from
+lifecycle-only compatibility usage was also rejected after production schema
+activation exposed the contradiction: it left current normalized control
+definitions uncovered and correctly triggered the Console's fail-closed
+inventory guard.
 
 ## Verification contract
 
 Console coordinator, project-membership, DOM-budget, lifecycle, and canonical
 artifact tests cover the read model and bounded interface. DevOps Board core and
 vertical-layout tests cover exact tree consumption, stable grouping, and center
-pane geometry. Canonical artifacts remain bound to current renderer inputs and
-source hashes.
+pane geometry. A producer regression fixture must keep a current definition
+with exact control evidence in `resources.servers` and one repository scope,
+while proving it remains absent from compatibility servers and project-usage
+server IDs without lifecycle evidence. Canonical artifacts remain bound to
+current renderer inputs and source hashes.

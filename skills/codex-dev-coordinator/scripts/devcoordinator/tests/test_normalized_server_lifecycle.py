@@ -438,6 +438,77 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.assertNotIn("registration_identity", projected_server)
         self.assertEqual(compatibility["leases"], [])
 
+    def test_repository_tree_classifies_current_definition_without_inventing_lifecycle(
+        self,
+    ) -> None:
+        service = self.service()
+        host_id = service.store.ensure_local_host()
+        repo_id = deterministic_id("repository", host_id, str(self.project))
+        server_id = deterministic_id("server-definition", repo_id, "lease-only")
+        timestamp = utc_timestamp()
+        with service.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO server_definitions(
+                    server_definition_id, repo_id, name, role, cwd,
+                    health_url_template, log_path, definition_fingerprint,
+                    generation, created_at, updated_at
+                ) VALUES (?, ?, 'lease-only', 'validation-port-lease', ?,
+                          NULL, NULL, ?, 0, ?, ?)
+                """,
+                (
+                    server_id,
+                    repo_id,
+                    str(self.project),
+                    "sha256:lease-only-definition",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO port_assignments(
+                    assignment_id, host_id, repo_id, server_name, port, status,
+                    generation, deactivated_at, created_at, updated_at
+                ) VALUES (?, ?, ?, 'lease-only', 3219, 'active', 0, NULL, ?, ?)
+                """,
+                (
+                    deterministic_id("port-assignment", repo_id, "lease-only"),
+                    host_id,
+                    repo_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        graph = service.store.inventory_v2()
+        scope = next(
+            scope
+            for tree in graph["repository_trees"]
+            for scope in tree["scopes"]
+            if scope["repo_id"] == repo_id
+        )
+        usage = next(
+            item
+            for item in graph["v1_compatibility"]["project_usage"]
+            if item["project"] == str(self.project)
+        )
+
+        self.assertIn(
+            server_id,
+            {item["server_definition_id"] for item in graph["resources"]["servers"]},
+        )
+        self.assertIn(
+            server_id,
+            scope["server_ids"],
+            "every current normalized definition needs exactly one repository scope",
+        )
+        self.assertNotIn(server_id, usage["server_ids"])
+        self.assertNotIn(
+            server_id,
+            {item["id"] for item in graph["v1_compatibility"]["servers"]},
+            "repository classification must not invent a server lifecycle",
+        )
+
     def test_compatibility_ignores_unusable_relocation_result_payloads(self) -> None:
         running = self.running_server(name="invalid-relocation-web", port=3214)
         servers = self.server_service()
