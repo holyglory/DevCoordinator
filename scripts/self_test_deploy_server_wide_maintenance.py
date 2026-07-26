@@ -55,6 +55,21 @@ def initialize_database(path: Path) -> None:
     path.chmod(0o600)
 
 
+class InventoryResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.status = 200
+
+    def __enter__(self) -> "InventoryResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, limit: int = -1) -> bytes:
+        return self.payload if limit < 0 else self.payload[:limit]
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="maintenance-deploy-test-") as raw:
         root = Path(raw).resolve()
@@ -113,6 +128,48 @@ def main() -> int:
             )
         finally:
             MODULE.DATABASE = previous
+
+    with tempfile.TemporaryDirectory(prefix="maintenance-inventory-test-") as raw:
+        root = Path(raw).resolve()
+        token_file = root / "api-token"
+        token_file.write_text("fixture-token\n", encoding="utf-8")
+        token_file.chmod(0o600)
+        driver = object.__new__(MODULE.Driver)
+        driver.token_file = token_file
+        driver.transaction = root
+        padding = "x" * (8 * 1024 * 1024)
+        response_payload = json.dumps({"padding": padding}).encode("utf-8")
+        previous_urlopen = MODULE.urllib.request.urlopen
+        MODULE.urllib.request.urlopen = lambda *_args, **_kwargs: InventoryResponse(
+            response_payload
+        )
+        try:
+            inventory = driver.inventory("large-inventory.json")
+        finally:
+            MODULE.urllib.request.urlopen = previous_urlopen
+        expect(
+            inventory == {"padding": padding},
+            "authenticated inventory larger than the former 8 MiB ceiling was truncated",
+        )
+
+        previous_limit = MODULE.MAX_INVENTORY_RESPONSE_BYTES
+        MODULE.MAX_INVENTORY_RESPONSE_BYTES = 1024
+        MODULE.urllib.request.urlopen = lambda *_args, **_kwargs: InventoryResponse(
+            json.dumps({"padding": "x" * 2048}).encode("utf-8")
+        )
+        try:
+            try:
+                driver.inventory("oversized-inventory.json")
+            except MODULE.DeploymentError as error:
+                expect(
+                    "exceeds the bounded 1024-byte" in str(error),
+                    "oversized authenticated inventory returned the wrong failure",
+                )
+            else:
+                raise AssertionError("oversized authenticated inventory was accepted")
+        finally:
+            MODULE.urllib.request.urlopen = previous_urlopen
+            MODULE.MAX_INVENTORY_RESPONSE_BYTES = previous_limit
 
     source = SCRIPT.read_text(encoding="utf-8")
     expect('self.checkout("main")' in source, "target checkout is not explicit")

@@ -46,6 +46,7 @@ CLIENT_GROUP = "devcoordinator-clients"
 SCHEMA_BEFORE = 9
 SCHEMA_AFTER = 12
 CONSOLE_SERVER_ID = "144ba3fb-9939-5a81-91b1-f1bb3a5db418"
+MAX_INVENTORY_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 class DeploymentError(RuntimeError):
@@ -322,7 +323,20 @@ class Driver:
                 raise DeploymentError(
                     f"authenticated inventory returned {response.status}"
                 )
-            document = json.loads(response.read(8 * 1024 * 1024))
+            payload = response.read(MAX_INVENTORY_RESPONSE_BYTES + 1)
+        if len(payload) > MAX_INVENTORY_RESPONSE_BYTES:
+            raise DeploymentError(
+                "authenticated inventory exceeds the bounded "
+                f"{MAX_INVENTORY_RESPONSE_BYTES}-byte deployment limit"
+            )
+        try:
+            document = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise DeploymentError(
+                "authenticated inventory returned invalid JSON"
+            ) from error
+        if not isinstance(document, dict):
+            raise DeploymentError("authenticated inventory must be a JSON object")
         _json_write(self.transaction / name, document)
         return document
 
