@@ -1785,11 +1785,21 @@ class AccountStore(CoordinatorStore):
                 str(row["database_binding_id"])
                 for row in connection.execute(
                     """
-                    SELECT database_binding_id, docker_resource_id
-                    FROM database_bindings ORDER BY database_binding_id
+                    SELECT b.database_binding_id, b.docker_resource_id,
+                           o.available, o.error_code
+                    FROM database_bindings b
+                    LEFT JOIN database_observations o USING(database_binding_id)
+                    ORDER BY b.database_binding_id
                     """
                 )
                 if str(row["docker_resource_id"]) in active_docker_resource_ids
+                # A completed catalog observation that proves a named database
+                # absent makes that binding history. Observer failure remains
+                # unknown presence and must retain the last current binding.
+                and not (
+                    row["available"] == 0
+                    and str(row["error_code"] or "") == "database_absent"
+                )
                 and ("database_stack", str(row["database_binding_id"]))
                 not in removed_runtime_resources
             )
@@ -3206,6 +3216,8 @@ class AccountStore(CoordinatorStore):
                     """
                 )
                 if str(row["docker_resource_id"]) in visible_docker_ids
+                and str(row["database_binding_id"])
+                in current_database_binding_ids
             ]
             leases = [
                 dict(row)

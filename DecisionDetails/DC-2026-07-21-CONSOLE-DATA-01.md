@@ -14,6 +14,12 @@ last committed inventory and reports that it is stale or unavailable rather
 than erasing it or inventing fresh state. Retained historical records never
 outrank a proven live replacement.
 
+A database binding remains current after a catalog-discovery failure because
+that failure is unknown presence. A completed catalog observation with
+`database_absent` is positive absence: the binding and observation remain
+durable history but leave normalized current resources, repository scopes, and
+current observations until the database is proved present again.
+
 Board and Console consume the same Python-produced repository tree. A current
 resource without proved membership remains explicit diagnostic evidence; the
 clients do not assign it by similar names or paths. Docker-hosted HTTP services
@@ -69,7 +75,10 @@ fixing the read model. Deriving authoritative tree membership from
 lifecycle-only compatibility usage was also rejected after production schema
 activation exposed the contradiction: it left current normalized control
 definitions uncovered and correctly triggered the Console's fail-closed
-inventory guard.
+inventory guard. Treating every binding of a running PostgreSQL container as a
+current database was likewise rejected: three positively absent historical
+databases remained normalized without a repository or explicit ownership
+problem, producing the same contract failure.
 
 ## Verification contract
 
@@ -79,5 +88,7 @@ vertical-layout tests cover exact tree consumption, stable grouping, and center
 pane geometry. A producer regression fixture must keep a current definition
 with exact control evidence in `resources.servers` and one repository scope,
 while proving it remains absent from compatibility servers and project-usage
-server IDs without lifecycle evidence. Canonical artifacts remain bound to
+server IDs without lifecycle evidence. Database fixtures must separately prove
+that positive catalog absence exits current resources/tree/observations while
+catalog-discovery failure preserves them. Canonical artifacts remain bound to
 current renderer inputs and source hashes.
