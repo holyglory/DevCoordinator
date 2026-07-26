@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import sqlite3
 import ssl
 import stat
@@ -84,8 +85,15 @@ class Driver:
         self.transaction = Path(args.transaction_dir)
         self.token_file = Path(args.token_file)
         self.console_env_file = Path(args.console_env_file)
+        console_state_dir = Path(args.console_state_dir)
+        if not console_state_dir.is_absolute() or ".." in console_state_dir.parts:
+            raise DeploymentError("Console state directory must be one absolute path")
+        self.console_identity_assertion = (
+            console_state_dir / "identity-assertion-public.json"
+        )
         self.deployment_id = str(uuid.UUID(args.deployment_id))
         self.group_gid = grp.getgrnam(CLIENT_GROUP).gr_gid
+        self.console_uid = pwd.getpwnam("holyglory").pw_uid
         self.phase = "initializing"
         self.install_transaction = self.transaction / "server-wide-install"
         self.raw_checkpoint = self.transaction / "writer-free-database"
@@ -494,32 +502,113 @@ class Driver:
         documents = json.loads(
             (self.raw_checkpoint / "manifest.json").read_text(encoding="utf-8")
         )
-        for target in (DATABASE, Path(f"{DATABASE}-wal"), Path(f"{DATABASE}-shm")):
-            if os.path.lexists(target):
-                metadata = target.lstat()
-                if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-                    raise DeploymentError(f"database restore target is unsafe: {target}")
-                target.unlink()
-            record = documents[target.name]
-            if not record["present"]:
-                continue
-            source = self.raw_checkpoint / target.name
-            payload = source.read_bytes()
-            if hashlib.sha256(payload).hexdigest() != record["sha256"]:
-                raise DeploymentError(f"database checkpoint checksum drifted: {source}")
-            descriptor = os.open(
-                target,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                int(record["mode"]),
+        targets = (DATABASE, Path(f"{DATABASE}-wal"), Path(f"{DATABASE}-shm"))
+        prepared: dict[Path, Path] = {}
+        try:
+            # Prepare and checksum every replacement before removing or replacing
+            # any live name. A slow multi-gigabyte checkpoint copy therefore
+            # never creates a window in which another process can recreate an
+            # empty authority database at the final path.
+            for target in targets:
+                record = documents[target.name]
+                if not record["present"]:
+                    continue
+                source = self.raw_checkpoint / target.name
+                source_metadata = source.lstat()
+                if (
+                    stat.S_ISLNK(source_metadata.st_mode)
+                    or not stat.S_ISREG(source_metadata.st_mode)
+                    or source_metadata.st_size != int(record["size"])
+                ):
+                    raise DeploymentError(f"database checkpoint source is unsafe: {source}")
+                temporary = target.parent / (
+                    f".{target.name}.restore-{self.deployment_id}-{uuid.uuid4().hex}"
+                )
+                source_descriptor = os.open(
+                    source,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                )
+                target_descriptor = os.open(
+                    temporary,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    int(record["mode"]),
+                )
+                digest = hashlib.sha256()
+                copied = 0
+                try:
+                    os.fchown(
+                        target_descriptor, int(record["uid"]), int(record["gid"])
+                    )
+                    while True:
+                        chunk = os.read(source_descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        offset = 0
+                        while offset < len(chunk):
+                            offset += os.write(target_descriptor, chunk[offset:])
+                        copied += len(chunk)
+                    os.fsync(target_descriptor)
+                finally:
+                    os.close(target_descriptor)
+                    os.close(source_descriptor)
+                if copied != int(record["size"]) or digest.hexdigest() != record["sha256"]:
+                    raise DeploymentError(f"database checkpoint checksum drifted: {source}")
+                prepared[target] = temporary
+
+            for target in targets:
+                if os.path.lexists(target):
+                    metadata = target.lstat()
+                    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                        raise DeploymentError(f"database restore target is unsafe: {target}")
+                record = documents[target.name]
+                if record["present"]:
+                    os.replace(prepared.pop(target), target)
+                elif os.path.lexists(target):
+                    target.unlink()
+            directory = os.open(
+                DATABASE.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
             )
             try:
-                os.fchown(descriptor, int(record["uid"]), int(record["gid"]))
-                written = 0
-                while written < len(payload):
-                    written += os.write(descriptor, payload[written:])
-                os.fsync(descriptor)
+                os.fsync(directory)
             finally:
-                os.close(descriptor)
+                os.close(directory)
+        finally:
+            for temporary in prepared.values():
+                with suppress(FileNotFoundError):
+                    temporary.unlink()
+
+    def normalize_console_private_state(self) -> dict[str, Any]:
+        path = self.console_identity_assertion
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return {"path": str(path), "present": False}
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != self.console_uid
+            or metadata.st_size > 1024 * 1024
+        ):
+            raise DeploymentError(f"Console identity assertion is unsafe: {path}")
+        previous_mode = stat.S_IMODE(metadata.st_mode)
+        if previous_mode != 0o600:
+            os.chmod(path, 0o600, follow_symlinks=False)
+        final = path.lstat()
+        if final.st_uid != self.console_uid or stat.S_IMODE(final.st_mode) != 0o600:
+            raise DeploymentError("Console identity assertion privacy migration failed")
+        return {
+            "path": str(path),
+            "present": True,
+            "previous_mode": previous_mode,
+            "mode": 0o600,
+        }
 
     def checkout(self, ref: str) -> None:
         self.git("checkout", ref)
@@ -772,6 +861,7 @@ class Driver:
                 timeout=60,
             )
             self.install_console_units()
+            console_private_state = self.normalize_console_private_state()
             self.run(
                 [
                     "/usr/bin/python3",
@@ -782,19 +872,22 @@ class Driver:
                 timeout=30,
             )
             self.phase = "starting-target"
-            self.journal(migrated=migrated)
+            self.journal(migrated=migrated, console_private_state=console_private_state)
             self.run(["/usr/bin/systemctl", "start", BROKER_UNIT], timeout=180)
-            self.run(["/usr/bin/systemctl", "restart", API_UNIT], timeout=90)
-            self.run(["/usr/bin/systemctl", "restart", CONSOLE_UNIT], timeout=120)
-            services = self.verify_services(inventory_name="post-inventory.json")
-            final_schema = self.schema_evidence(expected=SCHEMA_AFTER)
-            public_after = [self.public_get(url) for url in self.args.public_url]
+            self.require_active(BROKER_UNIT)
             clear_maintenance(
                 expected_uid=0,
                 expected_gid=self.group_gid,
                 deployment_id=self.deployment_id,
             )
             self.marker_active = False
+            self.phase = "starting-target-services"
+            self.journal(migrated=migrated, console_private_state=console_private_state)
+            self.run(["/usr/bin/systemctl", "restart", API_UNIT], timeout=90)
+            self.run(["/usr/bin/systemctl", "restart", CONSOLE_UNIT], timeout=120)
+            services = self.verify_services(inventory_name="post-inventory.json")
+            final_schema = self.schema_evidence(expected=SCHEMA_AFTER)
+            public_after = [self.public_get(url) for url in self.args.public_url]
             self.phase = "complete"
             result = {
                 "ok": True,
@@ -813,6 +906,29 @@ class Driver:
             self.journal(result=result)
             return result
         except BaseException as error:
+            if not self.marker_active:
+                try:
+                    activate_maintenance(
+                        expected_uid=0,
+                        expected_gid=self.group_gid,
+                        deployment_id=self.deployment_id,
+                        message=(
+                            "Coordinator recovery in progress; please wait a moment "
+                            "and retry."
+                        ),
+                        retry_after_seconds=30,
+                        started_at=time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                        ),
+                    )
+                    self.marker_active = True
+                    self.phase = "recovery-maintenance-active"
+                    self.journal()
+                except BaseException as maintenance_error:
+                    error = DeploymentError(
+                        f"{error}; maintenance reactivation also failed: "
+                        f"{type(maintenance_error).__name__}: {maintenance_error}"
+                    )
             self.rollback(error)
 
 
@@ -827,6 +943,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--public-url", action="append", required=True)
     parser.add_argument("--token-file", required=True)
     parser.add_argument("--console-env-file", required=True)
+    parser.add_argument("--console-state-dir", required=True)
     return parser.parse_args(argv)
 
 

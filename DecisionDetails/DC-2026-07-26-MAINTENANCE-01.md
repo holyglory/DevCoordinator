@@ -43,19 +43,27 @@ bypass the fence with lower-level host access.
 One root foreground transaction owns an outer deployment lock and the marker.
 It verifies a pre-migration backup, terminal operation state, and rollback
 material before stopping the broker. It performs the installer/profile/schema
-transition, restarts and verifies broker and API, proves exact Console
-registration/assignment/lease and a public route, then clears the marker.
-Failure keeps the fence active while the same driver restores the exact stopped
-database and installation transaction, starts the compatible services, proves
-the old readiness graph, and only then clears it. The marker does not claim
-that unsupported runtime, database cancellation, or replay combinations are
-implemented; those remain fail-closed Completion Ledger work.
+transition and proves the exact target broker active while the fence remains.
+API readiness and Console self-registration intentionally require normal broker
+traffic, so the transaction clears the owner-bound marker immediately before
+starting those independently supervised services, then proves authenticated
+inventory, exact Console registration/assignment/lease, and public routes. A
+later failure first republishes the same owner-bound maintenance state and only
+then restores the exact stopped database and installation transaction, starts
+the compatible services, proves the old readiness graph, and clears it.
+Checkpoint restore stages and checksums every file before atomically replacing
+the live SQLite names, so a concurrently recreated empty database cannot win a
+slow multi-gigabyte copy window. The marker does not claim that unsupported
+runtime, database cancellation, or replay combinations are implemented; those
+remain fail-closed Completion Ledger work.
 
 ## Verification
 
 Focused tests cover active/absent behavior, malformed modes and content,
 symlink refusal, descriptor transport, deployment-bound clear, competing
-publication, and removal of the separate broker runtime directory. Installer
-tests require the independent tmpfiles entry. Release validation and the live
-cutover must additionally prove the same authenticated and public surfaces
-used in production readiness.
+publication, removal of the separate broker runtime directory, inventory above
+the former 8 MiB ceiling and the new hard bound, atomic replacement against a
+recreated database target, post-clear fence reactivation, and legacy Console
+state privacy normalization. Installer tests require the independent tmpfiles
+entry. Release validation and the live cutover must additionally prove the same
+authenticated and public surfaces used in production readiness.

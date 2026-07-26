@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -26,6 +28,7 @@ def expect(condition: bool, message: str) -> None:
 def driver_for(root: Path) -> object:
     driver = object.__new__(MODULE.Driver)
     driver.raw_checkpoint = root / "writer-free-database"
+    driver.deployment_id = "11111111-1111-4111-8111-111111111111"
     driver.database_captured = False
     driver.journal = lambda **_extra: None
     return driver
@@ -126,8 +129,41 @@ def main() -> int:
                 not Path(f"{database}-wal").exists(),
                 "rollback retained a sidecar that was absent at checkpoint",
             )
+
+            database.write_bytes(b"second damaged database")
+            previous_replace = MODULE.os.replace
+
+            def racing_replace(source: object, target: object) -> None:
+                if Path(target) == database:
+                    database.write_bytes(b"concurrent empty database")
+                previous_replace(source, target)
+
+            MODULE.os.replace = racing_replace
+            try:
+                driver.restore_database()
+            finally:
+                MODULE.os.replace = previous_replace
+            expect(
+                database.read_bytes() == before,
+                "atomic rollback did not replace a concurrently recreated database",
+            )
         finally:
             MODULE.DATABASE = previous
+
+    with tempfile.TemporaryDirectory(prefix="maintenance-console-state-test-") as raw:
+        root = Path(raw).resolve()
+        assertion = root / "identity-assertion-public.json"
+        assertion.write_text("{}\n", encoding="utf-8")
+        assertion.chmod(0o644)
+        driver = object.__new__(MODULE.Driver)
+        driver.console_uid = os.getuid()
+        driver.console_identity_assertion = assertion
+        evidence = driver.normalize_console_private_state()
+        expect(evidence["previous_mode"] == 0o644, "legacy state mode was not recorded")
+        expect(
+            assertion.stat().st_mode & 0o777 == 0o600,
+            "legacy Console identity assertion was not made private",
+        )
 
     with tempfile.TemporaryDirectory(prefix="maintenance-inventory-test-") as raw:
         root = Path(raw).resolve()
@@ -183,7 +219,20 @@ def main() -> int:
         "devcoordinator-sqlite-backup" in source,
         "deployment does not verify the canonical backup artifact type",
     )
-    print("maintenance deployment self-test ok (quiescence, exact checkpoint, rollback guard)")
+    deploy_source = inspect.getsource(MODULE.Driver.deploy)
+    expect(
+        deploy_source.index("clear_maintenance(")
+        < deploy_source.index('"restart", API_UNIT'),
+        "target API is started while its own maintenance fence blocks readiness",
+    )
+    expect(
+        "recovery-maintenance-active" in deploy_source,
+        "post-clear target failure does not reactivate maintenance before rollback",
+    )
+    print(
+        "maintenance deployment self-test ok "
+        "(quiescence, bounded inventory, atomic checkpoint, privacy, rollback guard)"
+    )
     return 0
 
 
