@@ -85,13 +85,14 @@ class NormalizedPortLifecycle:
 
     def __init__(self, store: AccountStore) -> None:
         self.store = store
+        self.host_id = store.local_host_id()
 
     def list_leases(
         self, *, canonical_project: str | None = None, active_only: bool = True
     ) -> list[dict[str, Any]]:
         with self.store.read_transaction() as connection:
-            parameters: list[Any] = []
-            where: list[str] = []
+            parameters: list[Any] = [self.host_id, self.host_id]
+            where: list[str] = ["l.host_id = ?", "r.host_id = ?"]
             if canonical_project is not None:
                 where.append("r.canonical_root = ?")
                 parameters.append(canonical_project)
@@ -113,8 +114,8 @@ class NormalizedPortLifecycle:
         self, *, canonical_project: str | None = None, active_only: bool = True
     ) -> list[dict[str, Any]]:
         with self.store.read_transaction() as connection:
-            parameters: list[Any] = []
-            where: list[str] = []
+            parameters: list[Any] = [self.host_id, self.host_id]
+            where: list[str] = ["p.host_id = ?", "r.host_id = ?"]
             if canonical_project is not None:
                 where.append("r.canonical_root = ?")
                 parameters.append(canonical_project)
@@ -160,21 +161,29 @@ class NormalizedPortLifecycle:
             else None
         )
         with self.store.immediate_transaction() as connection:
-            repository = self._repository(connection, request.canonical_project)
+            repository = self._repository(
+                connection, request.canonical_project, host_id=self.host_id
+            )
             self._require_installed(repository)
-            self._expire_safe_leases(connection, timestamp)
+            self._expire_safe_leases(connection, timestamp, host_id=self.host_id)
             assignment_rows = connection.execute(
                 """
                 SELECT p.port, p.repo_id, p.server_name, r.canonical_root
                 FROM port_assignments p JOIN repositories r USING(repo_id)
-                WHERE p.status = 'active'
-                """
+                WHERE p.status = 'active' AND p.host_id = ? AND r.host_id = ?
+                """,
+                (self.host_id, self.host_id),
             ).fetchall()
             assignments = {int(row["port"]): row for row in assignment_rows}
             active_ports = {
                 int(row[0])
                 for row in connection.execute(
-                    "SELECT port FROM leases WHERE status = 'active'"
+                    """
+                    SELECT l.port FROM leases l
+                    JOIN repositories r USING(repo_id)
+                    WHERE l.status = 'active' AND l.host_id = ? AND r.host_id = ?
+                    """,
+                    (self.host_id, self.host_id),
                 )
             }
             if request.preferred is not None and request.preferred in assignments:
@@ -231,9 +240,10 @@ class NormalizedPortLifecycle:
             row = connection.execute(
                 """
                 SELECT l.*, r.canonical_root FROM leases l
-                JOIN repositories r USING(repo_id) WHERE l.lease_id = ?
+                JOIN repositories r USING(repo_id)
+                WHERE l.lease_id = ? AND l.host_id = ? AND r.host_id = ?
                 """,
-                (lease_id,),
+                (lease_id, self.host_id, self.host_id),
             ).fetchone()
             return self._lease_payload(row)
 
@@ -251,15 +261,18 @@ class NormalizedPortLifecycle:
             raise ValueError("port release requires --lease-id or --port")
         timestamp = utc_timestamp()
         with self.store.immediate_transaction() as connection:
-            repository = self._repository(connection, canonical_project)
+            repository = self._repository(
+                connection, canonical_project, host_id=self.host_id
+            )
             if lease_id:
                 matches = connection.execute(
                     """
                     SELECT l.*, r.canonical_root FROM leases l
                     JOIN repositories r USING(repo_id)
                     WHERE l.lease_id = ? AND l.status = 'active'
+                      AND l.host_id = ? AND r.host_id = ?
                     """,
-                    (lease_id,),
+                    (lease_id, self.host_id, self.host_id),
                 ).fetchall()
             else:
                 matches = connection.execute(
@@ -267,8 +280,9 @@ class NormalizedPortLifecycle:
                     SELECT l.*, r.canonical_root FROM leases l
                     JOIN repositories r USING(repo_id)
                     WHERE l.port = ? AND l.status = 'active'
+                      AND l.host_id = ? AND r.host_id = ?
                     """,
-                    (int(port),),
+                    (int(port), self.host_id, self.host_id),
                 ).fetchall()
             if len(matches) != 1:
                 raise KeyError("matching lease not found")
@@ -330,16 +344,25 @@ class NormalizedPortLifecycle:
             raise ValueError(f"port {port} is outside 1-65535")
         timestamp = utc_timestamp()
         with self.store.immediate_transaction() as connection:
-            repository = self._repository(connection, canonical_project)
+            repository = self._repository(
+                connection, canonical_project, host_id=self.host_id
+            )
             self._require_installed(repository)
             owner = connection.execute(
                 """
                 SELECT p.*, r.canonical_root FROM port_assignments p
                 JOIN repositories r USING(repo_id)
                 WHERE p.port = ? AND p.status = 'active'
+                  AND p.host_id = ? AND r.host_id = ?
                   AND NOT (p.repo_id = ? AND p.server_name = ?)
                 """,
-                (port, repository["repo_id"], name),
+                (
+                    port,
+                    self.host_id,
+                    self.host_id,
+                    repository["repo_id"],
+                    name,
+                ),
             ).fetchone()
             if owner is not None:
                 raise NormalizedLifecycleConflict(
@@ -351,10 +374,11 @@ class NormalizedPortLifecycle:
                     """
                     SELECT l.*, r.canonical_root FROM leases l
                     JOIN repositories r USING(repo_id)
-                    WHERE l.port = ? AND l.status = 'active' AND l.repo_id != ?
+                    WHERE l.port = ? AND l.status = 'active'
+                      AND l.host_id = ? AND r.host_id = ? AND l.repo_id != ?
                     LIMIT 1
                     """,
-                    (port, repository["repo_id"]),
+                    (port, self.host_id, self.host_id, repository["repo_id"]),
                 ).fetchone()
                 if lease is not None:
                     raise NormalizedLifecycleConflict(
@@ -418,15 +442,18 @@ class NormalizedPortLifecycle:
             raise ValueError("port unassign requires --name or --port")
         timestamp = utc_timestamp()
         with self.store.immediate_transaction() as connection:
-            repository = self._repository(connection, canonical_project)
+            repository = self._repository(
+                connection, canonical_project, host_id=self.host_id
+            )
             if name is not None:
                 row = connection.execute(
                     """
                     SELECT p.*, r.canonical_root FROM port_assignments p
                     JOIN repositories r USING(repo_id)
                     WHERE p.repo_id = ? AND p.server_name = ? AND p.status = 'active'
+                      AND p.host_id = ? AND r.host_id = ?
                     """,
-                    (repository["repo_id"], name),
+                    (repository["repo_id"], name, self.host_id, self.host_id),
                 ).fetchone()
                 if row is not None and port is not None and int(row["port"]) != int(port):
                     row = None
@@ -436,8 +463,9 @@ class NormalizedPortLifecycle:
                     SELECT p.*, r.canonical_root FROM port_assignments p
                     JOIN repositories r USING(repo_id)
                     WHERE p.port = ? AND p.status = 'active'
+                      AND p.host_id = ? AND r.host_id = ?
                     """,
-                    (int(port),),
+                    (int(port), self.host_id, self.host_id),
                 ).fetchone()
                 if row is not None and str(row["repo_id"]) != str(repository["repo_id"]) and not force:
                     raise PermissionError(
@@ -499,14 +527,19 @@ class NormalizedPortLifecycle:
         return candidates
 
     @staticmethod
-    def _repository(connection: sqlite3.Connection, canonical_project: str) -> sqlite3.Row:
+    def _repository(
+        connection: sqlite3.Connection,
+        canonical_project: str,
+        *,
+        host_id: str,
+    ) -> sqlite3.Row:
         row = connection.execute(
             """
             SELECT r.*, i.status AS installation_status, i.startup_fenced
             FROM repositories r JOIN repository_installations i USING(repo_id)
-            WHERE r.canonical_root = ?
+            WHERE r.host_id = ? AND r.canonical_root = ?
             """,
-            (canonical_project,),
+            (host_id, canonical_project),
         ).fetchone()
         if row is None:
             raise KeyError(f"normalized repository not found: {canonical_project}")
@@ -524,15 +557,20 @@ class NormalizedPortLifecycle:
             )
 
     @staticmethod
-    def _expire_safe_leases(connection: sqlite3.Connection, timestamp: str) -> None:
+    def _expire_safe_leases(
+        connection: sqlite3.Connection, timestamp: str, *, host_id: str
+    ) -> None:
         rows = connection.execute(
             """
             SELECT l.lease_id, l.expires_at, l.server_definition_id,
                    o.lifecycle AS server_lifecycle
             FROM leases l
+            JOIN repositories r USING(repo_id)
             LEFT JOIN server_observations o USING(server_definition_id)
-            WHERE l.status = 'active' AND l.expires_at IS NOT NULL
-            """
+            WHERE l.status = 'active' AND l.host_id = ? AND r.host_id = ?
+              AND l.expires_at IS NOT NULL
+            """,
+            (host_id, host_id),
         ).fetchall()
         now_value = datetime.now(timezone.utc)
         for row in rows:
@@ -639,16 +677,17 @@ class NormalizedServerLifecycle:
 
     def __init__(self, store: AccountStore) -> None:
         self.store = store
+        self.host_id = store.local_host_id()
 
     def list_servers(
         self, *, canonical_project: str | None = None
     ) -> list[dict[str, Any]]:
         with self.store.read_transaction() as connection:
-            parameters: tuple[Any, ...] = ()
-            clause = ""
+            parameters: tuple[Any, ...] = (self.host_id,)
+            clause = "WHERE r.host_id = ?"
             if canonical_project is not None:
-                clause = "WHERE r.canonical_root = ?"
-                parameters = (canonical_project,)
+                clause += " AND r.canonical_root = ?"
+                parameters += (canonical_project,)
             rows = connection.execute(
                 self._server_select(clause) + " ORDER BY r.canonical_root, d.name",
                 parameters,
@@ -686,10 +725,12 @@ class NormalizedServerLifecycle:
         timestamp = utc_timestamp()
         with self.store.immediate_transaction() as connection:
             repository = NormalizedPortLifecycle._repository(
-                connection, request.canonical_project
+                connection, request.canonical_project, host_id=self.host_id
             )
             NormalizedPortLifecycle._require_installed(repository)
-            NormalizedPortLifecycle._expire_safe_leases(connection, timestamp)
+            NormalizedPortLifecycle._expire_safe_leases(
+                connection, timestamp, host_id=self.host_id
+            )
             existing = connection.execute(
                 """
                 SELECT d.*, o.lifecycle, o.pid, o.observation_fingerprint
@@ -714,6 +755,17 @@ class NormalizedServerLifecycle:
                     "server-definition", str(repository["repo_id"]), request.name
                 )
             )
+            if connection.execute(
+                """
+                SELECT 1 FROM cleanup_tombstones
+                WHERE target_kind = 'server' AND target_id = ?
+                """,
+                (definition_id,),
+            ).fetchone() is not None:
+                raise NormalizedLifecycleConflict(
+                    f"server {request.name} was permanently removed; "
+                    "install it as a new worker identity before starting it"
+                )
             self._require_no_pending_server_operation(connection, definition_id)
 
             assignment = connection.execute(
@@ -743,8 +795,9 @@ class NormalizedServerLifecycle:
                 manual_lease = connection.execute(
                     """
                     SELECT * FROM leases WHERE lease_id = ? AND status = 'active'
+                      AND host_id = ?
                     """,
-                    (request.manual_lease_id,),
+                    (request.manual_lease_id, self.host_id),
                 ).fetchone()
                 self._validate_manual_lease(
                     manual_lease,
@@ -757,7 +810,13 @@ class NormalizedServerLifecycle:
                 active_lease_ports = {
                     int(row[0])
                     for row in connection.execute(
-                        "SELECT port FROM leases WHERE status = 'active'"
+                        """
+                        SELECT l.port FROM leases l
+                        JOIN repositories r USING(repo_id)
+                        WHERE l.status = 'active' AND l.host_id = ?
+                          AND r.host_id = ?
+                        """,
+                        (self.host_id, self.host_id),
                     )
                 }
                 selected = next(
@@ -790,9 +849,10 @@ class NormalizedServerLifecycle:
                     """
                     SELECT r.canonical_root, p.server_name
                     FROM port_assignments p JOIN repositories r USING(repo_id)
-                    WHERE p.host_id = ? AND p.port = ? AND p.status = 'active'
+                    WHERE p.host_id = ? AND r.host_id = ?
+                      AND p.port = ? AND p.status = 'active'
                     """,
-                    (repository["host_id"], selected),
+                    (repository["host_id"], repository["host_id"], selected),
                 ).fetchone()
                 raise NormalizedLifecycleConflict(
                     f"port {selected} is durably assigned to server "
@@ -1033,10 +1093,12 @@ class NormalizedServerLifecycle:
             operation = self._running_operation(connection, operation_id, "server.start")
             definition = connection.execute(
                 """
-                SELECT generation FROM server_definitions
-                WHERE server_definition_id = ?
+                SELECT definition.generation FROM server_definitions definition
+                JOIN repositories repository USING(repo_id)
+                WHERE definition.server_definition_id = ?
+                  AND repository.host_id = ?
                 """,
-                (server_definition_id,),
+                (server_definition_id, self.host_id),
             ).fetchone()
             if definition is None or int(definition["generation"]) != int(
                 definition_generation
@@ -1052,8 +1114,9 @@ class NormalizedServerLifecycle:
                  AND t.target_id = l.lease_id
                 WHERE l.status = 'active'
                   AND l.server_definition_id = ?
+                  AND l.host_id = ?
                 """,
-                (operation_id, server_definition_id),
+                (operation_id, server_definition_id, self.host_id),
             ).fetchone()
             if lease is None:
                 raise NormalizedLifecycleConflict(
@@ -1252,9 +1315,10 @@ class NormalizedServerLifecycle:
                 SELECT d.generation, d.repo_id, o.*
                 FROM server_definitions d JOIN server_observations o
                   USING(server_definition_id)
-                WHERE d.server_definition_id = ?
+                JOIN repositories r USING(repo_id)
+                WHERE d.server_definition_id = ? AND r.host_id = ?
                 """,
-                (server_definition_id,),
+                (server_definition_id, self.host_id),
             ).fetchone()
             if definition is None or int(definition["generation"]) != int(
                 definition_generation
@@ -1349,8 +1413,12 @@ class NormalizedServerLifecycle:
         cleanup_errors = list(cleanup_errors or [])
         with self.store.immediate_transaction() as connection:
             operation = connection.execute(
-                "SELECT * FROM operations WHERE operation_id = ?",
-                (operation_id,),
+                """
+                SELECT operation.* FROM operations operation
+                JOIN repositories repository USING(repo_id)
+                WHERE operation.operation_id = ? AND repository.host_id = ?
+                """,
+                (operation_id, self.host_id),
             ).fetchone()
             if operation is None:
                 raise KeyError(f"server start operation not found: {operation_id}")
@@ -1359,9 +1427,10 @@ class NormalizedServerLifecycle:
                 SELECT d.repo_id, d.log_path, o.*
                 FROM server_definitions d LEFT JOIN server_observations o
                   USING(server_definition_id)
-                WHERE d.server_definition_id = ?
+                JOIN repositories r USING(repo_id)
+                WHERE d.server_definition_id = ? AND r.host_id = ?
                 """,
-                (server_definition_id,),
+                (server_definition_id, self.host_id),
             ).fetchone()
             if definition is None:
                 raise KeyError("server definition disappeared during failed start")
@@ -1505,7 +1574,7 @@ class NormalizedServerLifecycle:
         timestamp = utc_timestamp()
         with self.store.immediate_transaction() as connection:
             repository = NormalizedPortLifecycle._repository(
-                connection, request.canonical_project
+                connection, request.canonical_project, host_id=self.host_id
             )
             NormalizedPortLifecycle._require_installed(repository)
             existing = connection.execute(
@@ -1538,11 +1607,13 @@ class NormalizedServerLifecycle:
                 LEFT JOIN server_definitions d USING(server_definition_id)
                 LEFT JOIN server_observations o USING(server_definition_id)
                 WHERE l.host_id = ? AND l.port = ? AND l.status = 'active'
+                  AND r.host_id = ?
                   AND (l.repo_id != ? OR l.server_definition_id != ?)
                 """,
                 (
                     repository["host_id"],
                     int(request.port),
+                    repository["host_id"],
                     repository["repo_id"],
                     definition_id,
                 ),
@@ -1688,9 +1759,10 @@ class NormalizedServerLifecycle:
                     """
                     SELECT * FROM leases
                     WHERE server_definition_id = ? AND status = 'active'
+                      AND host_id = ?
                     ORDER BY updated_at DESC LIMIT 1
                     """,
-                    (definition_id,),
+                    (definition_id, self.host_id),
                 ).fetchone()
                 lease_id = (
                     str(existing_lease["lease_id"])
@@ -2124,8 +2196,12 @@ class NormalizedServerLifecycle:
         cleanup_errors = list(cleanup_errors or [])
         with self.store.immediate_transaction() as connection:
             operation = connection.execute(
-                "SELECT * FROM operations WHERE operation_id = ?",
-                (operation_id,),
+                """
+                SELECT operation.* FROM operations operation
+                JOIN repositories repository USING(repo_id)
+                WHERE operation.operation_id = ? AND repository.host_id = ?
+                """,
+                (operation_id, self.host_id),
             ).fetchone()
             if operation is None:
                 raise KeyError(f"server stop operation not found: {operation_id}")
@@ -2207,10 +2283,11 @@ class NormalizedServerLifecycle:
                 """
                 SELECT p.*, r.canonical_root FROM port_assignments p
                 JOIN repositories r USING(repo_id)
-                WHERE r.canonical_root = ? AND p.server_name = ?
+                WHERE r.host_id = ? AND p.host_id = ?
+                  AND r.canonical_root = ? AND p.server_name = ?
                   AND p.port = ? AND p.status = 'active'
                 """,
-                (old_project, name, int(port)),
+                (self.host_id, self.host_id, old_project, name, int(port)),
             ).fetchone()
             if assignment is None:
                 raise KeyError("matching active old-project assignment not found")
@@ -2218,9 +2295,10 @@ class NormalizedServerLifecycle:
                 """
                 SELECT l.*, r.canonical_root FROM leases l
                 JOIN repositories r USING(repo_id)
-                WHERE l.lease_id = ? AND r.canonical_root = ? AND l.port = ?
+                WHERE l.lease_id = ? AND l.host_id = ? AND r.host_id = ?
+                  AND r.canonical_root = ? AND l.port = ?
                 """,
-                (lease_id, old_project, int(port)),
+                (lease_id, self.host_id, self.host_id, old_project, int(port)),
             ).fetchone()
             if lease is None:
                 raise KeyError("exact relocation lease not found")
@@ -2263,19 +2341,19 @@ class NormalizedServerLifecycle:
         timestamp = utc_timestamp()
         with self.store.immediate_transaction() as connection:
             old_repository = NormalizedPortLifecycle._repository(
-                connection, old_project
+                connection, old_project, host_id=self.host_id
             )
             new_repository = NormalizedPortLifecycle._repository(
-                connection, new_project
+                connection, new_project, host_id=self.host_id
             )
             NormalizedPortLifecycle._require_installed(new_repository)
             assignment = connection.execute(
                 """
                 SELECT * FROM port_assignments
                 WHERE repo_id = ? AND server_name = ? AND port = ?
-                  AND status = 'active'
+                  AND host_id = ? AND status = 'active'
                 """,
-                (old_repository["repo_id"], name, int(port)),
+                (old_repository["repo_id"], name, int(port), self.host_id),
             ).fetchone()
             if assignment is None:
                 raise KeyError("matching active old-project assignment not found")
@@ -2283,9 +2361,10 @@ class NormalizedServerLifecycle:
                 """
                 SELECT * FROM leases
                 WHERE lease_id = ? AND repo_id = ? AND port = ?
+                  AND host_id = ?
                   AND status IN ('active','stale','released')
                 """,
-                (lease_id, old_repository["repo_id"], int(port)),
+                (lease_id, old_repository["repo_id"], int(port), self.host_id),
             ).fetchone()
             if lease is None:
                 raise KeyError("exact relocation lease not found")
@@ -2567,12 +2646,14 @@ class NormalizedServerLifecycle:
             LEFT JOIN leases l ON l.lease_id = (
                 SELECT candidate.lease_id FROM leases candidate
                 WHERE candidate.server_definition_id = d.server_definition_id
+                  AND candidate.host_id = r.host_id
                 ORDER BY CASE candidate.status WHEN 'active' THEN 0 ELSE 1 END,
                          candidate.updated_at DESC, candidate.lease_id DESC
                 LIMIT 1
             )
             LEFT JOIN port_assignments p
               ON p.repo_id = d.repo_id AND p.server_name = d.name
+             AND p.host_id = r.host_id
              AND p.status = 'active'
             {where_clause}
         """
@@ -2587,15 +2668,17 @@ class NormalizedServerLifecycle:
     ) -> sqlite3.Row:
         if server_definition_id:
             rows = connection.execute(
-                self._server_select("WHERE d.server_definition_id = ?"),
-                (server_definition_id,),
+                self._server_select(
+                    "WHERE r.host_id = ? AND d.server_definition_id = ?"
+                ),
+                (self.host_id, server_definition_id),
             ).fetchall()
         elif canonical_project and name:
             rows = connection.execute(
                 self._server_select(
-                    "WHERE r.canonical_root = ? AND d.name = ?"
+                    "WHERE r.host_id = ? AND r.canonical_root = ? AND d.name = ?"
                 ),
-                (canonical_project, name),
+                (self.host_id, canonical_project, name),
             ).fetchall()
         else:
             raise KeyError("server-id or project/name is required")
@@ -2797,12 +2880,14 @@ class NormalizedServerLifecycle:
     ) -> bool:
         row = connection.execute(
             """
-            SELECT assignment_id FROM port_assignments
-            WHERE host_id = ? AND port = ? AND status = 'active'
-              AND NOT (repo_id = ? AND server_name = ?)
+            SELECT p.assignment_id FROM port_assignments p
+            JOIN repositories r USING(repo_id)
+            WHERE p.host_id = ? AND r.host_id = ?
+              AND p.port = ? AND p.status = 'active'
+              AND NOT (p.repo_id = ? AND p.server_name = ?)
             LIMIT 1
             """,
-            (host_id, int(port), repo_id, server_name),
+            (host_id, host_id, int(port), repo_id, server_name),
         ).fetchone()
         return row is not None
 
@@ -3092,16 +3177,17 @@ class NormalizedServerLifecycle:
             ),
         )
 
-    @staticmethod
     def _running_operation(
-        connection: sqlite3.Connection, operation_id: str, kind: str
+        self, connection: sqlite3.Connection, operation_id: str, kind: str
     ) -> sqlite3.Row:
         row = connection.execute(
             """
-            SELECT * FROM operations
-            WHERE operation_id = ? AND kind = ? AND status = 'running'
+            SELECT operation.* FROM operations operation
+            JOIN repositories repository USING(repo_id)
+            WHERE operation.operation_id = ? AND operation.kind = ?
+              AND operation.status = 'running' AND repository.host_id = ?
             """,
-            (operation_id, kind),
+            (operation_id, kind, self.host_id),
         ).fetchone()
         if row is None:
             raise NormalizedLifecycleConflict(

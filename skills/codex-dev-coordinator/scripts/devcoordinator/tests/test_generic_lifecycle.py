@@ -8,7 +8,9 @@ import time
 import unittest
 from unittest import mock
 
+from devcoordinator import broker_backend as broker_backend_module
 from devcoordinator.broker import (
+    AuthorizedBrokerRequest,
     BrokerOperation,
     BrokerRequest,
     BrokerService,
@@ -78,6 +80,105 @@ def _grant_project_archive(persistence: object) -> None:
 
 
 class GenericLifecycleBrokerTests(unittest.TestCase):
+    def test_completed_permanent_cleanup_replay_does_not_resolve_deleted_resource(self) -> None:
+        with fixtures.CanonicalTemporaryDirectory() as root:
+            persistence, actions = fixtures.seed_store_backed_broker(root)
+            plan_id = "6f070080-1da7-44bb-9e98-8ea43fcbeb34"
+            plan_fingerprint = "sha256:" + "9" * 64
+            confirmation = "PURGE SERVER obsolete-worker"
+            now = utc_timestamp()
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO operations(
+                            operation_id, repo_id, kind, status, phase,
+                            generation, request_fingerprint, owner_uid, actor,
+                            created_at, updated_at
+                        ) VALUES (?, ?, 'cleanup:purge', 'succeeded', 'complete',
+                                  0, ?, ?, 'fixture', ?, ?)
+                        """,
+                        (
+                            plan_id,
+                            fixtures.PROJECT_ID,
+                            plan_fingerprint,
+                            os.geteuid(),
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO cleanup_plans(
+                            plan_id, repo_id, target_kind, target_id, action,
+                            target_fingerprint, plan_fingerprint,
+                            confirmation_phrase, snapshot_json, status, phase,
+                            actor, reason, created_at, updated_at
+                        ) VALUES (?, ?, 'server', 'deleted-worker', 'purge',
+                                  ?, ?, ?, '{}', 'succeeded', 'complete',
+                                  'fixture', 'obsolete', ?, ?)
+                        """,
+                        (
+                            plan_id,
+                            fixtures.PROJECT_ID,
+                            "sha256:" + "8" * 64,
+                            plan_fingerprint,
+                            confirmation,
+                            now,
+                            now,
+                        ),
+                    )
+                backend = StoreBackedMutationBackend(
+                    persistence,
+                    actions,
+                    lifecycle_adapter=RestorableLifecycleAdapter(),
+                    observe_before_lifecycle_plan=fixtures._committed_available_observer,
+                )
+                request = fixtures.request_for(
+                    BrokerOperation.CLEANUP_APPLY,
+                    resource_id=fixtures.PROJECT_ID,
+                    arguments={
+                        "plan_id": plan_id,
+                        "plan_fingerprint": plan_fingerprint,
+                        "confirmation_phrase": confirmation,
+                    },
+                )
+                authorized = AuthorizedBrokerRequest(
+                    peer=fixtures.peer_for(), request=request
+                )
+                cleanup = mock.Mock()
+                cleanup.apply.return_value = {
+                    "ok": True,
+                    "status": "succeeded",
+                    "plan_id": plan_id,
+                }
+                with mock.patch.object(
+                    backend,
+                    "_authorize_generic_cleanup_resource",
+                    side_effect=AssertionError("deleted resource must not be resolved"),
+                ), mock.patch.object(
+                    backend,
+                    "_observe_fresh_full_docker",
+                    side_effect=AssertionError("completed replay must not observe host"),
+                ):
+                    result = backend._apply_generic_lifecycle(
+                        authorized,
+                        store=store,
+                        cleanup=cleanup,
+                        actor="fixture-replayer",
+                    )
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["replayed_after_completion"])
+            self.assertIsNone(result["pre_apply_observation"])
+            cleanup.apply.assert_called_once_with(
+                plan_id=plan_id,
+                plan_fingerprint=plan_fingerprint,
+                confirmation_phrase=confirmation,
+                actor="fixture-replayer",
+            )
+
     def test_project_purge_observes_fresh_host_at_plan_and_apply(self) -> None:
         with fixtures.CanonicalTemporaryDirectory() as root:
             persistence, actions = fixtures.seed_store_backed_broker(root)
@@ -144,18 +245,41 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
             self.assertEqual(observations, 1)
             self.assertTrue(planned["result"]["broker_observation"]["observed"])
 
-            applied = service.reply_for_document(
-                fixtures.peer_for(),
-                fixtures.request_for(
-                    BrokerOperation.CLEANUP_APPLY,
-                    resource_id=fixtures.PROJECT_ID,
-                    arguments={
-                        "plan_id": planned["result"]["plan_id"],
-                        "plan_fingerprint": planned["result"]["plan_fingerprint"],
-                        "confirmation_phrase": planned["result"]["confirmation_phrase"],
+            with (
+                mock.patch.object(
+                    broker_backend_module,
+                    "configured_profile_path",
+                    return_value=Path("/protected/profile.json"),
+                ),
+                mock.patch.object(
+                    broker_backend_module,
+                    "revoke_repository_from_protected_profile",
+                    side_effect=lambda **arguments: {
+                        "status": "revoked",
+                        "repo_id": arguments["repo_id"],
+                        "repository_generation": arguments[
+                            "repository_generation"
+                        ],
+                        "cleanup_operation_id": arguments[
+                            "cleanup_operation_id"
+                        ],
+                        "affected_client_uids": [os.geteuid()],
+                        "profile_path": str(arguments["profile_path"]),
                     },
-                ).to_wire(),
-            )
+                ),
+            ):
+                applied = service.reply_for_document(
+                    fixtures.peer_for(),
+                    fixtures.request_for(
+                        BrokerOperation.CLEANUP_APPLY,
+                        resource_id=fixtures.PROJECT_ID,
+                        arguments={
+                            "plan_id": planned["result"]["plan_id"],
+                            "plan_fingerprint": planned["result"]["plan_fingerprint"],
+                            "confirmation_phrase": planned["result"]["confirmation_phrase"],
+                        },
+                    ).to_wire(),
+                )
             self.assertTrue(applied["ok"], applied)
             self.assertEqual(observations, 2)
             self.assertTrue(applied["result"]["pre_apply_observation"]["observed"])

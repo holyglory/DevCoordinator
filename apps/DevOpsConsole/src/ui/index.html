@@ -8,8 +8,8 @@
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-  <link rel="stylesheet" href="/app.css?v=cd419926f435">
-  <script src="/app.js?v=cd419926f435" defer></script>
+<link rel="stylesheet" href="/app.css?v=0988b1234395">
+<script src="/app.js?v=0988b1234395" defer></script>
 </head>
 <body>
 
@@ -47,7 +47,7 @@
     <div class="sec-head collection-head">
       <div>
         <h2 id="projects-h">Projects <span class="count" id="projects-count" hidden></span></h2>
-        <p class="sec-sub">Every repo with its servers, databases and containers. Start, stop or restart single items or whole projects; hide idle ones — they reappear the moment an agent starts them.</p>
+        <p class="sec-sub">Root repos contain their direct services and nested temporary repos. Item actions are exact; project actions affect only the root runtime. Hidden idle items reappear when an agent starts them.</p>
       </div>
       <div class="lifecycle-filter" data-lifecycle-filter="projects" role="group" aria-label="Project lifecycle view" hidden>
         <button class="btn small is-selected" type="button" data-lifecycle-view="active" aria-pressed="true">Active <span class="count" id="projects-active-count" hidden></span></button>

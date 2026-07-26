@@ -1,41 +1,72 @@
-# DC-2026-07-21-CONSOLE-DATA-01 — Console observations drive truthful Docker rows and collection counts
+# DC-2026-07-21-CONSOLE-DATA-01 — Observations and interfaces stay truthful and bounded
 
-## Context
+## Durable decision
 
-The Console Docker page retained its CPU / Mem column but every running row rendered an em dash. A live server-wide inventory after an explicit observation contained 18 current physical containers, 14 running containers, and no `stats` objects in the compatibility projection consumed by the Console, even though the normalized store retained hundreds of exact-resource Docker telemetry samples. The normalized migration had correctly made ordinary inventory query-only, but the Console metrics loop continued to perform only cached inventory reads. Current Docker presence therefore also stopped advancing unless another agent or a Telegram bot with an eligible recipient happened to request `HOST_OBSERVE`.
+The server-side metrics loop is the sole periodic host observer; explicit
+authorization-bound observation remains available, while other consumers read
+durable events and snapshots. Exact-project work coalesces, host-wide work is
+serialized, retries are scheduled after completion with bounded exponential
+backoff, and pure committed-inventory sampling continues without multiplying
+observer calls. Inventory itself remains a pure read. Current presence and
+telemetry are joined only by immutable resource identity within the host's
+latest completed Docker-available snapshot. Observation failure retains the
+last committed inventory and reports that it is stale or unavailable rather
+than erasing it or inventing fresh state. Retained historical records never
+outrank a proven live replacement.
 
-Production journal evidence showed repeated `POST /v1/observe` failures at the generic 15-second Console client timeout. A direct attributed observation completed successfully in 8.7 seconds, confirming Docker sampling is technically available but can approach the old deadline under broker contention.
+Board and Console consume the same Python-produced repository tree. A current
+resource without proved membership remains explicit diagnostic evidence; the
+clients do not assign it by similar names or paths. Docker-hosted HTTP services
+remain first-class services when the producer proves their container, port,
+health, route, and lifecycle relationship.
 
-Separately, the Telegram navigation badge displayed the total number of pending private-chat authorization requests. A user with registered bots and no pending `/start` requests therefore saw `Telegram 0`, while the page's own collection heading correctly counted bots.
+Enrollment-only server definitions remain exact control identities for port
+leases and assignments but do not enter operational Servers, membership,
+counts, Unassigned Resources, or actions until a concrete running, starting,
+unhealthy, stopping, or stopped observation exists. Public TLS terminates at
+the Console and routed HTTP/WebSocket traffic goes only to an explicitly
+selected application HTTP listener; protocol is never guessed from a port.
 
-## Decision
+## Presentation direction
 
-- The Console's server-side metrics loop is a designated attributed observer. Each non-overlapping tick requests `HOST_OBSERVE` as `devops-console:metrics` for the configured canonical project, then performs a pure inventory read and ingests that committed view.
-- Observation failure is unknown current host state, not absence. The sampler still reads and displays the last atomically committed inventory, preserves history, and exposes the observation error. If the inventory read also fails, the structured operator-facing message retains both failures.
-- Give `/v1/observe` a 60-second client deadline, matching the existing Docker/inventory class, without widening ordinary control requests.
-- Attach compatibility `stats` only when the exact immutable Docker resource is running, belongs to the latest completed Docker-available snapshot for its host, and has a telemetry sample inside that snapshot's start/completion window. Preserve stopped, absent, and older telemetry in normalized history without presenting it as live.
-- Keep broker and HTTP API restartable as independent availability boundaries. While an older broker projection is still serving, the Console may fill a missing `stats` value only after its own authenticated `/v1/observe` result proves the exact completed `host-runtime-v2:full-docker` snapshot in the normalized graph, the current immutable resource maps through an available engine to the same host, its normalized observation is running inside that window, and its exact Docker telemetry is also inside the window. Canonical `stats` ownership—including an explicit `null`—always wins, and the cached wire graph remains unchanged.
-- Keep current presence defined by that same latest available snapshot. Do not hide stopped-but-present containers and do not use UI status or names to infer physical absence.
-- Make the Telegram navigation badge and page heading both count registered bots. Pending users remain visible only in each explicitly labeled bot authorization queue.
+- Put the named collection and its honest loading, error, empty, or populated
+  state first.
+- Keep cached content visible during background refresh. Schedule the next poll
+  only after completion, run it only while an aggregate surface is visible, and
+  coalesce equivalent work.
+- Mount only the active Console page, page large collections, and allow one
+  bounded project/server disclosure at a time.
+- Keep every nonempty project group discoverable, while responsive rows protect
+  resource identity, essential facts, and local actions before optional
+  telemetry yields at narrow widths.
+- Keep destructive cleanup fail closed until the complete host capability is
+  explicitly activated after matching migration and authorization readiness.
+- Sort by stable identity and lifecycle fields, never rapidly changing CPU or
+  memory samples.
+- Collection badges count the collection they name.
+- Show global non-nominal status only when current evidence identifies the
+  affected resource or operation and a safe route the user can take.
+- Keep inventory transport bounded and compact, decode large payloads off the
+  native main actor, and retain source-bound production snapshots for wide and
+  narrow layouts.
 
 ## Alternatives rejected
 
-- Removing the Docker CPU / Mem column was rejected because the broker already measures exact running-container CPU and memory; the missing numbers were a projection and observation-scheduling defect.
-- Sampling implicitly inside ordinary inventory was rejected because inventory is a query-only API and callers must be able to inspect retained state without host mutation.
-- Filtering stopped rows or applying a browser-side `exists` heuristic was rejected because a stopped container can still physically exist and the browser lacks authoritative snapshot membership.
-- Reusing the newest retained telemetry sample was rejected because it can belong to a prior physical-presence snapshot and would display stale utilization as live.
-- Depending on Telegram polling or another agent to refresh Docker state was rejected because Console truth must not depend on an unrelated integration having eligible recipients.
-- Treating any completed snapshot or timestamp overlap as Docker proof was rejected because the normalized wire graph intentionally omits capability and snapshot-membership tables. The authenticated observation result supplies the missing capability identity during a rolling deployment; without a matching proof the Console leaves utilization empty.
-- Keeping the Telegram badge as an unlabeled attention count was rejected because its destination and section count promise the bot collection; authorization queues already carry their own labeled counts.
+Pure reads without an observer left removed containers current indefinitely,
+while independent periodic observers and short client deadlines created a
+retry storm. Treating policies or leases as instances produced phantom
+servers, and routing plaintext HTTP to a TLS-only upstream broke the public
+route. Joining old samples, filtering by display names, or preferring newest
+history regardless of lifecycle invents current state. Rapid start-to-start
+polling, loading-state replacement, metric sorting, and unbounded expansion
+create high CPU use, permanent Updating badges, clipped content, and unstable
+operator focus. Deleting absent history would sacrifice auditability without
+fixing the read model.
 
-## Guard evidence
+## Verification contract
 
-Focused coordinator regressions prove that a current running immutable container receives telemetry only from the latest Docker-available snapshot window, a running row with only an older sample receives no live stats, a stopped-but-present row receives no live stats, and retained samples are not deleted. Existing controls continue to prove that absent history is excluded, stopped-but-present resources remain visible, Docker-unavailable observations preserve the last proved presence, and later reappearance restores the exact identity.
-
-Focused Console sampler regressions prove observe-before-inventory ordering and identity, successful telemetry ingestion, last-committed fallback after observation failure, retained history after inventory failure, and preservation of both errors when both boundaries fail. The coordinator-client policy test pins the larger observation deadline without widening ordinary server actions. A real shipped-assets browser regression asserts rendered Docker CPU/memory values and a one-bot/zero-pending Telegram badge and heading of `1`.
-
-Console projection controls additionally prove authoritative filtering against the normalized current-resource set, exact authenticated snapshot/host/engine/running-observation/window matching, rejection of unavailable engines, unproved hosts, stopped observations, stale and newer-untrusted telemetry, preservation of canonical objects and explicit `null`, and non-mutation across cached re-projection.
-
-## Verification
-
-The focused Docker grouping and normalized lifecycle suites pass 46 tests in both normal and optimized Python; the focused inventory-v2 store contract passes. Focused Console coordinator-client and metrics suites pass, including every projection false-positive control. The shipped-assets Chromium regression passes. Formal authenticated Docker-page verification passes at 390×844 and 1440×900 with complete coverage and no critical or warning findings. Repository validation, boundary checks, and whitespace checks pass. In production, an authenticated attributed observation proved the exact full-Docker snapshot and the Console projection returned stats for every currently running authoritative row while stopped rows remained without live stats; `https://console.vr.ae/healthz` returned 200, the replacement supervised Console PID registered exactly to port 443, and its post-restart journal contained no observation timeout, crash, or restart error.
+Console coordinator, project-membership, DOM-budget, lifecycle, and canonical
+artifact tests cover the read model and bounded interface. DevOps Board core and
+vertical-layout tests cover exact tree consumption, stable grouping, and center
+pane geometry. Canonical artifacts remain bound to current renderer inputs and
+source hashes.

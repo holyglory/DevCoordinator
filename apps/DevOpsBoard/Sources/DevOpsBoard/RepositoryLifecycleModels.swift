@@ -262,6 +262,119 @@ struct ResourceAttachResult: Decodable, Hashable, Sendable {
     }
 }
 
+struct WorkerRemovalPlanDetail: Decodable, Hashable, Sendable, Identifiable {
+    var id: String { "\(code ?? "detail")|\(message)" }
+    let code: String?
+    let message: String
+
+    private enum CodingKeys: String, CodingKey {
+        case code, message, description, effect, name, path
+    }
+
+    init(from decoder: Decoder) throws {
+        if let value = try? decoder.singleValueContainer().decode(String.self) {
+            code = nil
+            message = value
+            return
+        }
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        code = try values.decodeIfPresent(String.self, forKey: .code)
+        message = try values.decodeIfPresent(String.self, forKey: .message)
+            ?? values.decodeIfPresent(String.self, forKey: .description)
+            ?? values.decodeIfPresent(String.self, forKey: .effect)
+            ?? values.decodeIfPresent(String.self, forKey: .name)
+            ?? values.decodeIfPresent(String.self, forKey: .path)
+            ?? code
+            ?? "Coordinator plan detail unavailable"
+    }
+}
+
+struct WorkerRemovalPlan: Decodable, Hashable, Sendable, Identifiable {
+    var id: String { planID }
+    let planID: String
+    let planFingerprint: String
+    let confirmationPhrase: String
+    let action: String
+    let effects: [WorkerRemovalPlanDetail]
+    let retained: [WorkerRemovalPlanDetail]
+    let deleted: [WorkerRemovalPlanDetail]
+    let blockers: [WorkerRemovalPlanDetail]
+    let status: String
+
+    enum CodingKeys: String, CodingKey {
+        case planID = "plan_id"
+        case planFingerprint = "plan_fingerprint"
+        case fingerprint
+        case confirmationPhrase = "confirmation_phrase"
+        case action, effects, retained, deleted, blockers, status
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        planID = try values.decode(String.self, forKey: .planID)
+        planFingerprint = try values.decodeIfPresent(String.self, forKey: .planFingerprint)
+            ?? values.decode(String.self, forKey: .fingerprint)
+        confirmationPhrase = try values.decodeIfPresent(String.self, forKey: .confirmationPhrase) ?? ""
+        action = try values.decode(String.self, forKey: .action)
+        effects = try values.decodeIfPresent([WorkerRemovalPlanDetail].self, forKey: .effects) ?? []
+        retained = try values.decodeIfPresent([WorkerRemovalPlanDetail].self, forKey: .retained) ?? []
+        deleted = try values.decodeIfPresent([WorkerRemovalPlanDetail].self, forKey: .deleted) ?? []
+        blockers = try values.decodeIfPresent([WorkerRemovalPlanDetail].self, forKey: .blockers) ?? []
+        status = try values.decodeIfPresent(String.self, forKey: .status) ?? "planned"
+    }
+
+    var isPermanent: Bool { action == "purge" || action == "forget" }
+}
+
+struct WorkerRuntimeResult: Decodable, Hashable, Sendable {
+    let stage: String?
+    let plan: WorkerRemovalPlan?
+    let lifecycle: WorkerRuntimeLifecycleResult?
+    let nextAction: String?
+
+    enum CodingKeys: String, CodingKey {
+        case stage, plan, lifecycle
+        case nextAction = "next_action"
+    }
+}
+
+struct WorkerRuntimeLifecycleResult: Decodable, Hashable, Sendable {
+    let ok: Bool?
+    let action: String?
+    let status: String?
+}
+
+struct WorkerRuntimeEnvelope: Decodable, Hashable, Sendable {
+    let schemaVersion: Int
+    let ok: Bool
+    let action: String
+    let classification: String
+    let target: WorkerRuntimeTarget
+    let result: WorkerRuntimeResult
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case ok, action, classification, target, result, error
+    }
+}
+
+struct WorkerRuntimeTarget: Decodable, Hashable, Sendable {
+    let kind: String
+    let id: String?
+    let name: String?
+}
+
+struct WorkerRemovalPrompt: Identifiable, Hashable, Sendable {
+    var id: String { plan.planID }
+    let serverID: String
+    let serverName: String
+    let origin: CoordinatorOrigin
+    let context: RepositoryExecutionContext
+    let plan: WorkerRemovalPlan
+    let archivedInThisJourney: Bool
+}
+
 func repositoryRetainedDataLabel(_ value: String) -> String {
     switch value {
     case "repository_files": return "Repository files"

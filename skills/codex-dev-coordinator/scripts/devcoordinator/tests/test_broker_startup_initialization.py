@@ -35,7 +35,7 @@ class _Rows:
 
 
 class _InitializationConnection:
-    def execute(self, statement: str):
+    def execute(self, statement: str, parameters: object = ()):
         compact = " ".join(statement.split())
         if (
             "SELECT sql FROM sqlite_master" in compact

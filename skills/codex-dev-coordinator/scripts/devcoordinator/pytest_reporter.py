@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import time
@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from _pytest.reports import TestReport
 
 _CONFIG: pytest.Config | None = None
+UTC = timezone.utc
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

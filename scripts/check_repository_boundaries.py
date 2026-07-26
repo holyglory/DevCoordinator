@@ -52,6 +52,40 @@ CROSS_DEPENDENCY_PATTERNS = (
     re.compile(r"(?:\.\./)+holyskills(?:/|\b)", re.IGNORECASE),
 )
 
+# Commit ab5141d was published on main with current canonical image/sidecar
+# bytes but changed the Board renderer inputs without regenerating them. Public
+# history is immutable, so accept only that exact tree and blob set, only for
+# the resulting source-fingerprint mismatch. Current-tip provenance remains a
+# mandatory check and the repaired successor replaces all four artifacts.
+KNOWN_HISTORICAL_BOARD_SOURCE_DRIFT = frozenset(
+    {
+        (
+            "24179f8205f339066ea3bd1a37c53fd96714e129",
+            "apps/DevOpsBoard/Artifacts/Canonical/databases.png",
+            "c4d2b324b42b09a49a6ffcaa316fa299c7d7d03d",
+            "42f29fae8320846964340261d35b23c4e444fb3c",
+        ),
+        (
+            "24179f8205f339066ea3bd1a37c53fd96714e129",
+            "apps/DevOpsBoard/Artifacts/Canonical/dev-servers.png",
+            "303f77c3f4f1e58120d519b7931cd619f35e9b4e",
+            "d19a0eb99e0f3cb91cabcc1bfbdc2e64974d2b9e",
+        ),
+        (
+            "24179f8205f339066ea3bd1a37c53fd96714e129",
+            "apps/DevOpsBoard/Artifacts/Canonical/docker-board.png",
+            "4134bcb68ceb5dc7785a12fcd1222ae0310c9e59",
+            "a44c603c12783f9710fbd72728405b0f2d6fd159",
+        ),
+        (
+            "24179f8205f339066ea3bd1a37c53fd96714e129",
+            "apps/DevOpsBoard/Artifacts/Canonical/menu-action-error.png",
+            "842876ee2db927833c0f2d0f494fa27796c3cbac",
+            "8770bdb3053dccadb33a6e199a3a036eeb261aa4",
+        ),
+    }
+)
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -109,6 +143,22 @@ def forbidden_history_path(path: str) -> str | None:
     if any(part.lower() in PRIVATE_DIRECTORY_NAMES for part in value.parts):
         return "runtime secret/state/backup path"
     return None
+
+
+def known_historical_board_source_drift(
+    *,
+    tree: str,
+    image_path: str,
+    image_blob: str,
+    sidecar_blob: str,
+    detail: str,
+) -> bool:
+    return detail == "aggregate source hash mismatch" and (
+        tree,
+        image_path,
+        image_blob,
+        sidecar_blob,
+    ) in KNOWN_HISTORICAL_BOARD_SOURCE_DRIFT
 
 
 def production_dependency_paths(paths: list[str]) -> list[str]:
@@ -517,6 +567,43 @@ def scan_tip(repo: Path) -> list[Finding]:
                 findings.append(
                     Finding("console-artifact-source-provenance", sidecar.relative_to(repo).as_posix(), str(error))
                 )
+
+    board_root = repo / "apps/DevOpsBoard"
+    board_artifacts = board_root / "Artifacts/Canonical"
+    if board_artifacts.is_dir():
+        for sidecar in sorted(board_artifacts.glob("*.png.provenance.json")):
+            try:
+                provenance = json.loads(sidecar.read_text(encoding="utf-8"))
+                records = provenance["source_files"]
+                if (
+                    not isinstance(records, list)
+                    or not records
+                    or not all(isinstance(record, str) for record in records)
+                    or len(set(records)) != len(records)
+                ):
+                    raise ValueError("relative source_files must be unique canonical paths")
+                fingerprint = hashlib.sha256()
+                for source_path in sorted(records):
+                    relative = PurePosixPath(source_path)
+                    if (
+                        relative.is_absolute()
+                        or relative.as_posix() != source_path
+                        or any(part in {"", ".", ".."} for part in relative.parts)
+                    ):
+                        raise ValueError("relative source_files contains a non-canonical path")
+                    source = board_root / source_path
+                    if not source.is_file():
+                        raise ValueError(f"source_files names a missing path: {source_path}")
+                    fingerprint.update(source_path.encode("utf-8"))
+                    fingerprint.update(b"\0")
+                    fingerprint.update(source.read_bytes())
+                    fingerprint.update(b"\0")
+                if fingerprint.hexdigest() != provenance["source_sha256"]:
+                    raise ValueError("aggregate source hash drift")
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                findings.append(
+                    Finding("board-artifact-source-provenance", sidecar.relative_to(repo).as_posix(), str(error))
+                )
     return findings
 
 
@@ -637,7 +724,19 @@ def scan_history(repo: Path) -> list[Finding]:
                     else:
                         raise ValueError("source_files must use one supported provenance schema")
             except (AssertionError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                findings.append(Finding("historical-image-provenance", location, str(error)))
+                detail = str(error)
+                image_blob = git(repo, "rev-parse", f"{commit}:{image_path}")
+                sidecar_blob = git(repo, "rev-parse", f"{commit}:{sidecar_path}")
+                assert isinstance(image_blob, str) and isinstance(sidecar_blob, str)
+                if known_historical_board_source_drift(
+                    tree=tree,
+                    image_path=image_path,
+                    image_blob=image_blob.strip(),
+                    sidecar_blob=sidecar_blob.strip(),
+                    detail=detail,
+                ):
+                    continue
+                findings.append(Finding("historical-image-provenance", location, detail))
 
     mapping = repo / "docs/history/holyskills-to-devcoordinator.commit-map"
     try:

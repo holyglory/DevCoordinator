@@ -84,7 +84,7 @@ BOARD_SPEC = ArtifactSpec(
         AnchorSpec("service-map-heading", 0, 60, 325, 45, 120, 5, 1),
         AnchorSpec("project-tree", 0, 95, 325, 200, 900, 10, 6),
         AnchorSpec("project-load-summary", 327, 60, 785, 80, 900, 20, 3),
-        AnchorSpec("filters-and-resource-tabs", 327, 125, 785, 90, 2_200, 40, 5),
+        AnchorSpec("filters-and-resource-tabs", 327, 125, 785, 90, 1_800, 40, 5),
         AnchorSpec("details-heading", 1125, 0, 315, 80, 300, 6, 2),
         AnchorSpec("sidebar-footer", 0, 920, 325, 104, 400, 10, 4),
         AnchorSpec("center-status-footer", 327, 970, 785, 54, 500, 20, 2),
@@ -96,13 +96,13 @@ DEV_SERVERS_SPEC = ArtifactSpec(
     height=BOARD_SPEC.height,
     minimum_nonblack_ratio=BOARD_SPEC.minimum_nonblack_ratio,
     regions=tuple(
-        RegionSpec("resource-table", 327, 380, 785, 220, 700)
+        RegionSpec("resource-table", 327, 260, 785, 160, 700)
         if region.name == "resource-table"
         else region
         for region in BOARD_SPEC.regions
     ),
     anchors=tuple(
-        AnchorSpec("filters-and-resource-tabs", 327, 220, 785, 90, 2_200, 40, 5)
+        AnchorSpec("filters-and-resource-tabs", 327, 220, 785, 90, 1_800, 40, 5)
         if anchor.name == "filters-and-resource-tabs"
         else anchor
         for anchor in BOARD_SPEC.anchors
@@ -115,15 +115,15 @@ MENU_SPEC = ArtifactSpec(
     minimum_nonblack_ratio=0.85,
     regions=(
         RegionSpec("menu-header", 0, 0, 430, 55, 100),
-        RegionSpec("task-list", 0, 55, 430, 190, 250),
+        RegionSpec("source-status-and-hierarchy", 0, 55, 430, 410, 1_500),
         RegionSpec("error-panel", 0, 360, 430, 195, 300),
         RegionSpec("menu-footer", 0, 555, 430, 45, 80),
     ),
     anchors=(
         AnchorSpec("menu-title", 0, 0, 250, 55, 350, 8, 2),
         AnchorSpec("menu-actions", 330, 0, 100, 55, 40, 2, 2),
-        AnchorSpec("project-row", 0, 55, 430, 50, 250, 8, 2),
-        AnchorSpec("task-rows", 0, 100, 430, 125, 800, 12, 5),
+        AnchorSpec("source-status", 0, 55, 430, 50, 250, 8, 2),
+        AnchorSpec("hierarchy-unavailable", 55, 225, 320, 115, 1_500, 20, 7),
         AnchorSpec("error-heading", 0, 495, 430, 30, 350, 12, 2),
         AnchorSpec("error-summary", 0, 520, 430, 35, 400, 12, 2),
         AnchorSpec("menu-footer", 0, 555, 430, 45, 250, 12, 1),

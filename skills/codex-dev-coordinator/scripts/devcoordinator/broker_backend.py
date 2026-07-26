@@ -37,6 +37,21 @@ from .broker_persistence import (
     RegisteredDatabaseBackup,
     StoreBackedAuthorizer,
 )
+from .broker_enrollment import (
+    revoke_repository_from_protected_profile,
+    revoke_server_from_protected_profile,
+)
+from .broker_profile import configured_profile_path
+from .broker_runtime import (
+    build_broker_runtime_snapshot_report,
+    execute_broker_runtime_request,
+    load_broker_runtime_snapshot,
+    unclassified_broker_runtime_report,
+)
+from .broker_workers import BrokerWorkerOperations, WORKER_OPERATIONS
+from .worker_control import WorkerControlError, WorkerController, WorkerReplaceError
+from .worker_cleanup import unregister_workers_for_plan
+from .runtime_api import validate_runtime_terminal_state
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
 from .cleanup_lifecycle import CleanupLifecycle
 from .observer import observation_owner_scope
@@ -229,6 +244,7 @@ class StoreBackedMutationBackend:
         self._ephemeral = EphemeralContainerCoordinator(
             persistence, host_mutations, secret_manager=self._secret_manager
         )
+        self._worker_operations = BrokerWorkerOperations(persistence)
         self._postgres_backup_root = _private_postgres_backup_root(
             persistence.database_path, expected_uid=persistence.expected_uid
         )
@@ -250,6 +266,10 @@ class StoreBackedMutationBackend:
             return self._test_records.stats(authorized)
         if request.operation == BrokerOperation.HOST_OBSERVE:
             return self._observe_committed_host(request.operation_id)
+        if request.operation == BrokerOperation.RUNTIME_REQUEST:
+            return self._execute_runtime_request(authorized)
+        if request.operation in WORKER_OPERATIONS:
+            return self._worker_operations.execute(authorized)
         if request.operation == BrokerOperation.REPOSITORY_LIST_REMOVED:
             return {
                 "repositories": self._persistence.list_removed_repository(authorized)
@@ -401,6 +421,12 @@ class StoreBackedMutationBackend:
                         lifecycle_adapter=self._lifecycle_adapter,
                         authorize=lambda _cap, _kind, _target, _actor: self._persistence.authorize(
                             authorized.peer, authorized.request
+                        ),
+                        prepare_apply=lambda plan, prepare_actor: self._prepare_worker_lifecycle_apply(
+                            authorized,
+                            store=store,
+                            plan=plan,
+                            actor=prepare_actor,
                         ),
                     )
                     actor = f"broker:{request.account_id}:uid:{authorized.peer.uid}"
@@ -950,6 +976,697 @@ class StoreBackedMutationBackend:
             ) from exc
         return result
 
+    def _execute_runtime_request(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Execute an ID-only shared runtime request through broker authority."""
+
+        request = authorized.request
+        action = str(request.arguments["action"])
+        target_kind = str(request.arguments["target_kind"])
+        if target_kind == "service":
+            role = self._persistence.runtime_service_role(authorized)
+            if isinstance(role, str) and role.lower() == "worker":
+                return self._execute_worker_runtime_request(authorized)
+            raise BrokerBackendError(
+                "runtime_supervisor_required",
+                "Service lifecycle requires an installed worker-role definition and broker-owned peer-UID supervisor.",
+                operation_id=request.operation_id,
+            )
+        if action == "status":
+            # Status remains a fresh observation rather than a catalog-only
+            # read. Clients cannot provide host evidence or paths.
+            observation = self._observe_committed_host(request.operation_id)
+            return execute_broker_runtime_request(
+                authorized,
+                persistence=self._persistence,
+                observation=observation,
+            )
+        if request.arguments["ttl_seconds"] is not None:
+            raise BrokerBackendError(
+                "runtime_cleanup_owner_required",
+                "Shared start/restart with a TTL requires the broker-owned runtime reaper; no resource was changed.",
+                operation_id=request.operation_id,
+            )
+
+        existing = self._persistence.existing_operation_disposition(authorized)
+        if existing is not None:
+            if existing.state == "completed":
+                return dict(existing.result or {})
+            if existing.state == "reconcile":
+                return self._reconcile_runtime_request(authorized)
+            if existing.state == "failed":
+                raise BrokerBackendError(
+                    existing.error_code or "mutation_failed",
+                    existing.error_message or "Broker runtime mutation failed.",
+                    operation_id=request.operation_id,
+                )
+            raise BrokerBackendError(
+                "operation_in_progress",
+                "This durable runtime operation is pending or requires reconciliation; it was not executed again.",
+                operation_id=request.operation_id,
+            )
+
+        before_observation = self._observe_fresh_full_docker(
+            request.operation_id, project_id=request.project_id
+        )
+        if before_observation.get("docker_available") is not True:
+            raise BrokerBackendError(
+                "lifecycle_observation_incomplete",
+                "Docker lifecycle requires an available fresh service-owned Docker observation; no resource was changed.",
+                operation_id=request.operation_id,
+            )
+        before_snapshot = load_broker_runtime_snapshot(
+            authorized, persistence=self._persistence
+        )
+        blocked = unclassified_broker_runtime_report(
+            authorized,
+            snapshot=before_snapshot,
+            observation=before_observation,
+        )
+        if blocked is not None:
+            return blocked
+
+        disposition = self._persistence.reserve_operation(authorized)
+        if disposition.state == "completed":
+            return dict(disposition.result or {})
+        if disposition.state == "failed":
+            raise BrokerBackendError(
+                disposition.error_code or "mutation_failed",
+                disposition.error_message or "Broker runtime mutation failed.",
+                operation_id=request.operation_id,
+            )
+        if disposition.state == "pending":
+            raise BrokerBackendError(
+                "operation_in_progress",
+                "This durable runtime operation is pending or requires reconciliation; it was not executed again.",
+                operation_id=request.operation_id,
+            )
+
+        try:
+            target = self._persistence.runtime_docker_target(authorized)
+        except BrokerError as exc:
+            self._record_failure(
+                request.operation_id, code=exc.code, message=exc.message
+            )
+            raise BrokerBackendError(
+                exc.code, exc.message, operation_id=request.operation_id
+            ) from None
+
+        try:
+            if action == "start":
+                raw_result = self._host_mutations.docker_start(target)
+            elif action == "stop":
+                raw_result = self._host_mutations.docker_stop(target)
+            elif action == "restart":
+                raw_result = self._host_mutations.docker_restart(target)
+            else:  # wire validation makes this unreachable
+                raise BrokerBackendError(
+                    "unsupported_runtime_action",
+                    "Unsupported shared runtime lifecycle action.",
+                    operation_id=request.operation_id,
+                )
+        except Exception:
+            self._raise_runtime_outcome_uncertain(
+                request.operation_id,
+                action=action,
+                failed_phase="host_invocation",
+                message=(
+                    "Docker runtime invocation did not prove a terminal host outcome; "
+                    "fresh reconciliation is required."
+                ),
+            )
+
+        try:
+            after_observation = self._observe_fresh_full_docker(
+                request.operation_id, project_id=request.project_id
+            )
+            after_snapshot = load_broker_runtime_snapshot(
+                authorized, persistence=self._persistence
+            )
+        except Exception as exc:
+            self._raise_runtime_outcome_uncertain(
+                request.operation_id,
+                action=action,
+                failed_phase="observation",
+                message=(
+                    "Docker runtime action completed but authoritative final "
+                    "observation did not commit; reconciliation is required."
+                ),
+                cause=exc,
+            )
+
+        try:
+            final_target = self._persistence.runtime_docker_target(authorized)
+        except BrokerError as exc:
+            if exc.code != "stale_resource_definition":
+                self._record_failure(
+                    request.operation_id, code=exc.code, message=exc.message
+                )
+                raise BrokerBackendError(
+                    exc.code, exc.message, operation_id=request.operation_id
+                ) from None
+            code = "lifecycle_target_identity_changed"
+            message = "Runtime target changed immutable Docker identity after the host action."
+            self._record_failure(request.operation_id, code=code, message=message)
+            raise BrokerBackendError(
+                code, message, operation_id=request.operation_id
+            ) from None
+        stable_target = (
+            target.resource_kind,
+            target.resource_id,
+            target.docker_resource_id,
+            target.full_container_id,
+            target.database_binding_id,
+            target.database_name,
+            target.control_generation,
+            target.immutable_fingerprint,
+        )
+        stable_final_target = (
+            final_target.resource_kind,
+            final_target.resource_id,
+            final_target.docker_resource_id,
+            final_target.full_container_id,
+            final_target.database_binding_id,
+            final_target.database_name,
+            final_target.control_generation,
+            final_target.immutable_fingerprint,
+        )
+        if stable_final_target != stable_target:
+            code = "lifecycle_target_identity_changed"
+            message = "Runtime target changed immutable Docker identity after the host action."
+            self._record_failure(request.operation_id, code=code, message=message)
+            raise BrokerBackendError(
+                code, message, operation_id=request.operation_id
+            )
+
+        final_blocked = unclassified_broker_runtime_report(
+            authorized,
+            snapshot=after_snapshot,
+            observation=after_observation,
+        )
+        if final_blocked is not None:
+            code = "unclassified_resource"
+            message = "Runtime family became unclassified after the host action."
+            self._record_failure(request.operation_id, code=code, message=message)
+            raise BrokerBackendError(
+                code, message, operation_id=request.operation_id
+            )
+
+        mutation_result = _json_safe_mapping(raw_result)
+        mutation_result.update(
+            {
+                "ok": True,
+                "terminal_state_pending": True,
+                "authority": "broker",
+                "operation_id": request.operation_id,
+                "runtime_target": {
+                    "resource_kind": target.resource_kind,
+                    "resource_id": target.resource_id,
+                    "docker_resource_id": target.docker_resource_id,
+                    "full_container_id": target.full_container_id,
+                },
+                "observation": {
+                    "before": before_observation,
+                    "after": after_observation,
+                },
+            }
+        )
+        terminal = validate_runtime_terminal_state(
+            request=after_snapshot.runtime_request,
+            action_result=mutation_result,
+            observation=after_observation,
+            inventory=after_snapshot.inventory,
+            pre_inventory=before_snapshot.inventory,
+        )
+        if terminal.get("ok") is not True:
+            code = str(terminal.get("classification") or "runtime_terminal_state_mismatch")
+            message = str(
+                terminal.get("error")
+                or "Runtime target did not reach the requested terminal state."
+            )
+            self._record_failure(request.operation_id, code=code, message=message)
+            raise BrokerBackendError(
+                code, message, operation_id=request.operation_id
+            )
+        report = build_broker_runtime_snapshot_report(
+            authorized,
+            snapshot=after_snapshot,
+            action_result=terminal,
+        )
+        try:
+            self._persistence.finish_operation(
+                request.operation_id, result=report
+            )
+        except Exception as exc:
+            self._raise_runtime_outcome_uncertain(
+                request.operation_id,
+                action=action,
+                failed_phase="journal_commit",
+                message=(
+                    "Runtime action completed but its durable result could not be "
+                    "committed; reconciliation is required."
+                ),
+                cause=exc,
+            )
+        return report
+
+    def _execute_worker_runtime_request(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Control one exact installed worker under its authenticated peer UID."""
+
+        request = authorized.request
+        action = str(request.arguments["action"])
+        if (
+            action != "status"
+            and (
+                request.arguments["purpose"] != "development"
+                or request.arguments["ttl_seconds"] is not None
+                or request.arguments["kill_after_run"] is not False
+            )
+        ):
+            raise BrokerBackendError(
+                "supervised_worker_purpose_conflict",
+                "Persistent supervised workers require purpose=development, ttl_seconds=null, and kill_after_run=false.",
+                operation_id=request.operation_id,
+            )
+
+        snapshot = load_broker_runtime_snapshot(
+            authorized, persistence=self._persistence
+        )
+        blocked = unclassified_broker_runtime_report(
+            authorized,
+            snapshot=snapshot,
+            observation={"source": "broker_authoritative_inventory"},
+        )
+        if blocked is not None:
+            return blocked
+        target = snapshot.matching_resources[0]
+        name = target.get("name")
+        if not isinstance(name, str) or not name:
+            raise BrokerBackendError(
+                "worker_identity_unavailable",
+                "The exact service has no immutable worker name.",
+                operation_id=request.operation_id,
+            )
+        canonical_repository = (
+            snapshot.context["temporary_repo"]
+            if snapshot.context["temporary_repo"] is not None
+            else snapshot.context["root_repo"]
+        )
+        if not isinstance(canonical_repository, str) or not canonical_repository:
+            raise BrokerBackendError(
+                "worker_identity_unavailable",
+                "The exact worker repository path is unavailable to system authority.",
+                operation_id=request.operation_id,
+            )
+        replacement_definition: dict[str, Any] | None = None
+        if action == "replace":
+            replacement_definition = _validated_broker_worker_replacement(
+                canonical_repository=canonical_repository,
+                peer_uid=authorized.peer.uid,
+                arguments=request.arguments,
+                operation_id=request.operation_id,
+            )
+
+        if action != "status":
+            existing = self._persistence.existing_operation_disposition(authorized)
+            if existing is not None:
+                if existing.state == "completed":
+                    return dict(existing.result or {})
+                if existing.state == "failed":
+                    raise BrokerBackendError(
+                        existing.error_code or "worker_control_failed",
+                        existing.error_message or "Worker control failed.",
+                        operation_id=request.operation_id,
+                    )
+                raise BrokerBackendError(
+                    "worker_operation_uncertain",
+                    "This exact worker control operation is pending; inspect status before issuing a new operation.",
+                    operation_id=request.operation_id,
+                )
+            disposition = self._persistence.reserve_operation(authorized)
+            if disposition.state == "completed":
+                return dict(disposition.result or {})
+            if disposition.state == "failed":
+                raise BrokerBackendError(
+                    disposition.error_code or "worker_control_failed",
+                    disposition.error_message or "Worker control failed.",
+                    operation_id=request.operation_id,
+                )
+            if disposition.state != "execute":
+                raise BrokerBackendError(
+                    "worker_operation_uncertain",
+                    "This exact worker control operation is pending; inspect status before issuing a new operation.",
+                    operation_id=request.operation_id,
+                )
+            try:
+                self._persistence.require_worker_runtime_operation_current(
+                    authorized
+                )
+            except BrokerError as error:
+                self._record_failure(
+                    request.operation_id,
+                    code=error.code,
+                    message=error.message,
+                )
+                raise BrokerBackendError(
+                    error.code,
+                    error.message,
+                    operation_id=request.operation_id,
+                ) from None
+
+        try:
+            with AccountStore.open(
+                self._persistence.database_path,
+                expected_uid=self._persistence.expected_uid,
+                busy_timeout_ms=self._persistence.busy_timeout_ms,
+            ) as store:
+                controller = WorkerController(
+                    store,
+                    coordinator_script=(
+                        Path(__file__).resolve().parent.parent
+                        / "dev_coordinator.py"
+                    ),
+                    execution_uid=authorized.peer.uid,
+                )
+                identity = {
+                    "worker_id": request.resource_id,
+                    "canonical_repository": canonical_repository,
+                    "name": name,
+                }
+                if action == "status":
+                    controlled = controller.status(**identity)
+                elif action == "start":
+                    controlled = controller.start(
+                        **identity,
+                        actor=str(request.arguments["agent"]),
+                        keep_alive=request.arguments.get("keep_alive"),
+                        crash_limit=request.arguments.get("restart_limit"),
+                        crash_window_seconds=request.arguments.get(
+                            "restart_window_seconds"
+                        ),
+                        rearm=bool(
+                            request.arguments.get("rearm_crash_loop", False)
+                        ),
+                    )
+                elif action == "stop":
+                    controlled = controller.stop(
+                        **identity,
+                        actor=str(request.arguments["agent"]),
+                    )
+                elif action == "restart":
+                    controlled = controller.restart(
+                        **identity,
+                        actor=str(request.arguments["agent"]),
+                        keep_alive=request.arguments.get("keep_alive"),
+                        crash_limit=request.arguments.get("restart_limit"),
+                        crash_window_seconds=request.arguments.get(
+                            "restart_window_seconds"
+                        ),
+                        rearm=bool(
+                            request.arguments.get("rearm_crash_loop", False)
+                        ),
+                    )
+                elif action == "replace":
+                    if replacement_definition is None:  # pragma: no cover
+                        raise RuntimeError("validated replacement definition is missing")
+                    controlled = controller.replace(
+                        **identity,
+                        actor=str(request.arguments["agent"]),
+                        expected_generation=int(
+                            request.arguments["expected_definition_generation"]
+                        ),
+                        argv=replacement_definition["argv"],
+                        cwd=replacement_definition["cwd"],
+                        environment=replacement_definition["environment"],
+                        keep_alive=request.arguments.get("keep_alive"),
+                        crash_limit=request.arguments.get("restart_limit"),
+                        crash_window_seconds=request.arguments.get(
+                            "restart_window_seconds"
+                        ),
+                        rearm=bool(
+                            request.arguments.get("rearm_crash_loop", False)
+                        ),
+                    )
+                else:  # strict wire validation makes this unreachable
+                    raise BrokerBackendError(
+                        "unsupported_runtime_action",
+                        "Unsupported supervised-worker action.",
+                        operation_id=request.operation_id,
+                    )
+        except WorkerReplaceError as error:
+            failure = {
+                **dict(error.payload),
+                "ok": False,
+                "ready": False,
+                "error": str(error),
+                "authority": "broker_worker_supervisor",
+                "broker_operation_id": request.operation_id,
+            }
+            try:
+                after_failure = load_broker_runtime_snapshot(
+                    authorized, persistence=self._persistence
+                )
+                report = build_broker_runtime_snapshot_report(
+                    authorized,
+                    snapshot=after_failure,
+                    action_result=failure,
+                )
+                self._persistence.finish_operation(
+                    request.operation_id, result=report
+                )
+            except Exception as commit_error:
+                raise BrokerBackendError(
+                    "worker_operation_uncertain",
+                    "Worker replacement failed but its rollback evidence did not commit; inspect exact status before retrying.",
+                    operation_id=request.operation_id,
+                ) from commit_error
+            return report
+        except WorkerControlError as error:
+            if action != "status":
+                self._record_failure(
+                    request.operation_id,
+                    code="worker_control_rejected",
+                    message=str(error),
+                )
+            raise BrokerBackendError(
+                "worker_control_rejected",
+                str(error),
+                operation_id=request.operation_id,
+            ) from None
+        except BrokerError:
+            raise
+        except Exception as error:
+            if action == "status":
+                raise BrokerBackendError(
+                    "worker_status_unavailable",
+                    "System authority could not inspect the exact worker; inspect broker logs.",
+                    operation_id=request.operation_id,
+                ) from error
+            raise BrokerBackendError(
+                "worker_operation_uncertain",
+                "Worker control may have changed host state but did not return complete evidence; inspect status before issuing a new operation.",
+                operation_id=request.operation_id,
+            ) from error
+
+        state = str(controlled.get("status") or "unobserved").lower()
+        ready = bool(
+            state == "running"
+            and isinstance(controlled.get("health"), Mapping)
+            and controlled["health"].get("ok") is True
+        )
+        if action == "status":
+            ok = state not in {"", "missing", "unobserved", "unknown"}
+        elif action == "stop":
+            ok = state == "stopped"
+        else:
+            ok = ready
+        action_result = {
+            **dict(controlled),
+            "ok": ok,
+            "ready": ready,
+            "state": state,
+            "classification": (
+                "ready" if ready else "stopped" if state == "stopped" else "observed_not_ready"
+            ),
+            "authority": "broker_worker_supervisor",
+            "operation_id": request.operation_id,
+        }
+        if action != "status":
+            try:
+                if action == "replace":
+                    self._persistence.require_worker_runtime_replacement_committed(
+                        authorized, replacement=controlled
+                    )
+                else:
+                    self._persistence.require_worker_runtime_operation_current(
+                        authorized
+                    )
+            except BrokerError as error:
+                code = "lifecycle_target_identity_changed"
+                message = (
+                    "Worker definition or authority changed during the control action; "
+                    "inspect exact worker status before retrying."
+                )
+                self._record_failure(
+                    request.operation_id, code=code, message=message
+                )
+                raise BrokerBackendError(
+                    code, message, operation_id=request.operation_id
+                ) from error
+        after = load_broker_runtime_snapshot(
+            authorized, persistence=self._persistence
+        )
+        report = build_broker_runtime_snapshot_report(
+            authorized,
+            snapshot=after,
+            action_result=action_result,
+        )
+        if action != "status":
+            try:
+                self._persistence.finish_operation(
+                    request.operation_id, result=report
+                )
+            except Exception as error:
+                raise BrokerBackendError(
+                    "worker_operation_uncertain",
+                    "Worker control completed but its durable broker result did not commit; retry only this operation ID.",
+                    operation_id=request.operation_id,
+                ) from error
+        return report
+
+    def _raise_runtime_outcome_uncertain(
+        self,
+        operation_id: str,
+        *,
+        action: str,
+        failed_phase: str,
+        message: str,
+        cause: BaseException | None = None,
+    ) -> None:
+        try:
+            self._persistence.mark_runtime_operation_reconciliation_required(
+                operation_id,
+                action=action,
+                failed_phase=failed_phase,
+            )
+        except Exception:
+            # A still-running reservation remains a no-reexecution fence and
+            # startup recovery promotes it to needs_attention.
+            pass
+        error = BrokerBackendError(
+            "operation_outcome_uncertain", message, operation_id=operation_id
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
+    def _reconcile_runtime_request(
+        self, authorized: AuthorizedBrokerRequest
+    ) -> Mapping[str, Any]:
+        """Settle an uncertain runtime operation from fresh state, never rerun it."""
+
+        request = authorized.request
+        action = str(request.arguments["action"])
+        try:
+            observation = self._observe_fresh_full_docker(
+                request.operation_id, project_id=request.project_id
+            )
+            if observation.get("docker_available") is not True:
+                raise RuntimeError("Docker observation is unavailable")
+            snapshot = load_broker_runtime_snapshot(
+                authorized, persistence=self._persistence
+            )
+            if unclassified_broker_runtime_report(
+                authorized, snapshot=snapshot, observation=observation
+            ) is not None:
+                raise RuntimeError("runtime family is not exactly classified")
+            target = self._persistence.runtime_docker_target(authorized)
+        except BrokerError as exc:
+            if exc.code == "stale_resource_definition":
+                code = "lifecycle_target_identity_changed"
+                message = "Runtime target changed immutable Docker identity before reconciliation."
+                self._persistence.finish_runtime_reconciliation(
+                    request.operation_id,
+                    error_code=code,
+                    error_message=message,
+                )
+                raise BrokerBackendError(
+                    code, message, operation_id=request.operation_id
+                ) from None
+            raise
+        except Exception as exc:
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "Runtime outcome remains uncertain because fresh exact reconciliation is unavailable.",
+                operation_id=request.operation_id,
+            ) from exc
+
+        pending = {
+            "ok": True,
+            "terminal_state_pending": True,
+            "authority": "broker",
+            "operation_id": request.operation_id,
+            "reconciled_without_reexecution": True,
+            "runtime_target": {
+                "resource_kind": target.resource_kind,
+                "resource_id": target.resource_id,
+                "docker_resource_id": target.docker_resource_id,
+                "full_container_id": target.full_container_id,
+            },
+            "observation": {"after": observation},
+        }
+        terminal = validate_runtime_terminal_state(
+            request=snapshot.runtime_request,
+            action_result=pending,
+            observation=observation,
+            inventory=snapshot.inventory,
+            pre_inventory=snapshot.inventory,
+        )
+        if terminal.get("ok") is not True:
+            code = str(
+                terminal.get("classification")
+                or "runtime_terminal_state_mismatch"
+            )
+            message = str(
+                terminal.get("error")
+                or "Runtime reconciliation proved the requested state was not reached."
+            )
+            self._persistence.finish_runtime_reconciliation(
+                request.operation_id,
+                error_code=code,
+                error_message=message,
+            )
+            raise BrokerBackendError(
+                code, message, operation_id=request.operation_id
+            )
+        if action == "restart":
+            # A fresh running state proves start, but it cannot distinguish a
+            # completed restart from a restart request the daemon never
+            # accepted.  Without durable transition evidence, settle neither
+            # success nor failure and never reissue the host action.
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "The target is running, but fresh state alone cannot prove that the uncertain restart occurred; manual reconciliation is required.",
+                operation_id=request.operation_id,
+            )
+        report = build_broker_runtime_snapshot_report(
+            authorized, snapshot=snapshot, action_result=terminal
+        )
+        try:
+            self._persistence.finish_runtime_reconciliation(
+                request.operation_id, result=report
+            )
+        except Exception as exc:
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "Runtime state was reconciled but its durable result did not commit.",
+                operation_id=request.operation_id,
+            ) from exc
+        return report
+
     def _observe_committed_host(self, operation_id: str) -> dict[str, Any]:
         """Run or join an explicit host observation and verify its durable row."""
 
@@ -1436,9 +2153,24 @@ class StoreBackedMutationBackend:
         confirmation_phrase = str(request.arguments["confirmation_phrase"])
         with store.read_transaction() as connection:
             cleanup_row = connection.execute(
-                "SELECT 1 FROM cleanup_plans WHERE plan_id = ?", (plan_id,)
+                "SELECT status FROM cleanup_plans WHERE plan_id = ?", (plan_id,)
             ).fetchone()
         if cleanup_row is not None:
+            if str(cleanup_row["status"]) == "succeeded":
+                # Permanent cleanup intentionally deletes the exact live
+                # resource and its broker ACL projection. A later request with
+                # the same durable plan must validate the plan, confirmation,
+                # and current project authorization without trying to
+                # resurrect/re-resolve the deleted resource identity.
+                result = cleanup.apply(
+                    plan_id=plan_id,
+                    plan_fingerprint=plan_fingerprint,
+                    confirmation_phrase=confirmation_phrase,
+                    actor=actor,
+                )
+                result["pre_apply_observation"] = None
+                result["replayed_after_completion"] = True
+                return result
             cleanup_plan = cleanup.load_plan(plan_id)
             planned_identity: Mapping[str, Any] | None = None
             if cleanup_plan.target_kind in {"server", "container"}:
@@ -1569,7 +2301,16 @@ class StoreBackedMutationBackend:
             busy_timeout_ms=self._persistence.busy_timeout_ms,
         ) as store:
             persistence = SQLiteLifecyclePersistence(store)
-            lifecycle = RepositoryLifecycle(persistence, self._lifecycle_adapter)
+            lifecycle = RepositoryLifecycle(
+                persistence,
+                self._lifecycle_adapter,
+                prepare_apply=lambda plan, prepare_actor: self._prepare_worker_lifecycle_apply(
+                    authorized,
+                    store=store,
+                    plan=plan,
+                    actor=prepare_actor,
+                ),
+            )
             if request.operation == BrokerOperation.REPOSITORY_PLAN_REMOVE:
                 plan = lifecycle.plan_repository_decommission(
                     request.project_id,
@@ -1846,6 +2587,126 @@ class StoreBackedMutationBackend:
                 operation_id=operation_id,
             ) from exc
 
+    def _prepare_worker_lifecycle_apply(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        store: AccountStore,
+        plan: Any,
+        actor: str,
+    ) -> dict[str, Any]:
+        """Deregister exact workers after plan validation, before retirement."""
+
+        if (
+            getattr(plan, "action", None) == "forget"
+            and getattr(plan, "target_kind", None) == "project"
+        ):
+            repo_id = str(plan.target_id)
+            identity = getattr(plan, "snapshot", {}).get("identity", {})
+            repository_generation = identity.get("generation")
+            if (
+                getattr(plan, "repo_id", None) != repo_id
+                or type(repository_generation) is not int
+            ):
+                raise BrokerBackendError(
+                    "cleanup_plan_drift",
+                    "Project cleanup lacks an exact repository-generation identity.",
+                    operation_id=str(plan.plan_id),
+                )
+            service_revocation = (
+                self._persistence.revoke_repository_for_permanent_cleanup(
+                    repo_id=repo_id,
+                    repository_generation=repository_generation,
+                    cleanup_operation_id=str(plan.plan_id),
+                    immutable_fingerprint=str(plan.target_fingerprint),
+                    actor=actor,
+                )
+            )
+            worker_evidence = unregister_workers_for_plan(
+                store,
+                plan=plan,
+                actor=actor,
+                coordinator_script=(
+                    Path(__file__).resolve().parent.parent / "dev_coordinator.py"
+                ),
+                execution_uid=authorized.peer.uid,
+            )
+            removed_servers = (
+                self._persistence.remove_revoked_repository_server_definitions(
+                    repo_id=repo_id,
+                    repository_generation=repository_generation,
+                    cleanup_operation_id=str(plan.plan_id),
+                )
+            )
+            profile_revocation = revoke_repository_from_protected_profile(
+                profile_path=configured_profile_path(),
+                repo_id=repo_id,
+                repository_generation=repository_generation,
+                cleanup_operation_id=str(plan.plan_id),
+                expected_database_generation=(
+                    self._persistence.database_generation()
+                ),
+            )
+            return {
+                "status": "project_generation_revoked",
+                "repository_revocation": {
+                    "service": service_revocation,
+                    "protected_profile": profile_revocation,
+                },
+                "workers": worker_evidence["workers"],
+                "server_projections": removed_servers,
+            }
+
+        revoke = None
+        if (
+            getattr(plan, "action", None) == "purge"
+            and getattr(plan, "target_kind", None) == "server"
+        ):
+            plan_worker_id = str(plan.target_id)
+            plan_repo_id = str(plan.repo_id)
+
+            def revoke(
+                worker_id: str, repo_id: str, revoke_actor: str
+            ) -> dict[str, Any]:
+                if worker_id != plan_worker_id or repo_id != plan_repo_id:
+                    raise BrokerBackendError(
+                        "cleanup_plan_drift",
+                        "Worker revocation escaped the exact permanent-cleanup target.",
+                        operation_id=str(plan.plan_id),
+                    )
+                service_revocation = self._persistence.revoke_server_for_permanent_cleanup(
+                    repo_id=repo_id,
+                    server_definition_id=worker_id,
+                    cleanup_operation_id=str(plan.plan_id),
+                    immutable_fingerprint=str(plan.target_fingerprint),
+                    actor=revoke_actor,
+                )
+                profile_revocation = revoke_server_from_protected_profile(
+                    profile_path=configured_profile_path(),
+                    repo_id=repo_id,
+                    server_name=str(service_revocation["server_name"]),
+                    server_definition_id=worker_id,
+                    cleanup_operation_id=str(plan.plan_id),
+                    expected_database_generation=(
+                        self._persistence.database_generation()
+                    ),
+                )
+                return {
+                    "service": service_revocation,
+                    "protected_profile": profile_revocation,
+                }
+
+        return unregister_workers_for_plan(
+            store,
+            plan=plan,
+            actor=actor,
+            coordinator_script=(
+                Path(__file__).resolve().parent.parent / "dev_coordinator.py"
+            ),
+            execution_uid=authorized.peer.uid,
+            revoke=revoke,
+        )
+
 
 @dataclass(frozen=True)
 class StoreBackedBrokerRuntime:
@@ -1857,6 +2718,24 @@ class StoreBackedBrokerRuntime:
     service: BrokerService
     server: UnixBrokerServer
     shutdown_timeout_seconds: float = BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+    coordinator_script: Path | None = None
+
+    def reconcile_workers_on_startup(self) -> dict[str, Any]:
+        """Fence prior worker authority and autostart each eligible worker once."""
+
+        script = self.coordinator_script
+        if script is None:
+            script = Path(__file__).resolve().parent.parent / "dev_coordinator.py"
+        supervisor_epoch = str(uuid.uuid4())
+        with AccountStore.open(
+            self.persistence.database_path,
+            expected_uid=self.persistence.expected_uid,
+            busy_timeout_ms=self.persistence.busy_timeout_ms,
+        ) as store:
+            return WorkerController(
+                store,
+                coordinator_script=script,
+            ).reconcile_startup(supervisor_epoch=supervisor_epoch)
 
     def begin_shutdown(self) -> int:
         """Fence mutation admission and request background stop without joining."""
@@ -2003,6 +2882,54 @@ def _json_safe_mapping(value: Any) -> dict[str, Any]:
     # The writer applies the configured response-size bound.  This copy blocks
     # custom mapping objects from changing after the durable commit begins.
     return dict(value)
+
+
+def _validated_broker_worker_replacement(
+    *,
+    canonical_repository: str,
+    peer_uid: int,
+    arguments: Mapping[str, Any],
+    operation_id: str,
+) -> dict[str, Any]:
+    """Anchor one structured replacement inside the peer-owned enrolled repo."""
+
+    try:
+        repository = Path(canonical_repository).resolve(strict=True)
+        requested_cwd = Path(str(arguments["cwd"]))
+        cwd = requested_cwd.resolve(strict=True)
+        cwd.relative_to(repository)
+        repository_metadata = repository.stat()
+        cwd_metadata = cwd.stat()
+    except (KeyError, OSError, RuntimeError, ValueError) as error:
+        raise BrokerBackendError(
+            "worker_replacement_path_denied",
+            "Worker replacement cwd must resolve to an existing directory inside the exact enrolled repository.",
+            operation_id=operation_id,
+        ) from error
+    if (
+        not repository.is_dir()
+        or not cwd.is_dir()
+        or repository_metadata.st_uid != peer_uid
+        or cwd_metadata.st_uid != peer_uid
+    ):
+        raise BrokerBackendError(
+            "worker_replacement_path_denied",
+            "Worker replacement repository and cwd must be directories owned by the authenticated execution account.",
+            operation_id=operation_id,
+        )
+    argv = arguments.get("argv")
+    environment = arguments.get("environment")
+    if not isinstance(argv, list) or not isinstance(environment, Mapping):
+        raise BrokerBackendError(
+            "invalid_arguments",
+            "Worker replacement requires structured argv and environment values.",
+            operation_id=operation_id,
+        )
+    return {
+        "argv": list(argv),
+        "cwd": str(cwd),
+        "environment": dict(environment),
+    }
 
 
 def _private_postgres_backup_root(database_path: Path, *, expected_uid: int) -> Path:

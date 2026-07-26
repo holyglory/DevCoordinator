@@ -134,6 +134,13 @@ async function captureOne({ browser, stack, sessionCookie, definition }) {
         document.querySelector('#projects-body .tree-node')
         && !document.querySelector('#projects-body .skel')
       ));
+      await page.getByRole('button', { name: 'Expand project Sample API' }).click();
+      await page.getByRole('button', {
+        name: /Expand temporary repo Sample API preview/,
+      }).click();
+      await page.getByText('queue-worker', { exact: true }).waitFor();
+      await page.getByText('preview-web', { exact: true }).waitFor();
+      await page.getByText('cleanup after run', { exact: false }).waitFor();
     }
     await settle(page);
     if (unexpectedRequests.length || browserErrors.length) {

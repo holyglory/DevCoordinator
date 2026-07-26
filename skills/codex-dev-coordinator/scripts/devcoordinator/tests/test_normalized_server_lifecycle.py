@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -30,12 +31,31 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.home = self.root / "coordinator"
+        self.git_home = self.root / "git-home"
+        self.git_home.mkdir(mode=0o700)
         self.project = self.root / "project-a"
-        self.project.mkdir()
-        (self.project / ".git").mkdir()
         self.project_b = self.root / "project-b"
-        self.project_b.mkdir()
-        (self.project_b / ".git").mkdir()
+        git = "/usr/bin/git" if Path("/usr/bin/git").is_file() else "/bin/git"
+        git_environment = {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": str(self.git_home),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+        for project in (self.project, self.project_b):
+            subprocess.run(
+                [git, "init", "-q", str(project)],
+                env=git_environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=10,
+            )
         self.open_stores: list[AccountStore] = []
         with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
             host_id = store.ensure_local_host()
@@ -90,6 +110,141 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         store = AccountStore.open_default(self.home, effective_uid=os.geteuid())
         self.open_stores.append(store)
         return NormalizedServerLifecycle(store)
+
+    def insert_foreign_same_root_runtime(
+        self, *, name: str, port: int
+    ) -> dict[str, str]:
+        """Model an account database copied from another physical host."""
+
+        store = AccountStore.open_default(self.home, effective_uid=os.geteuid())
+        self.open_stores.append(store)
+        timestamp = utc_timestamp()
+        foreign_host_id = deterministic_id("host", "foreign-restored-host")
+        foreign_repo_id = deterministic_id(
+            "repository", foreign_host_id, str(self.project)
+        )
+        server_id = deterministic_id(
+            "server-definition", foreign_repo_id, name
+        )
+        assignment_id = deterministic_id(
+            "port-assignment", foreign_repo_id, name
+        )
+        lease_id = deterministic_id("lease", foreign_repo_id, name, port)
+        with store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO hosts(
+                    host_id, machine_fingerprint, platform, hostname,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'fixture', 'foreign-host', ?, ?)
+                """,
+                (foreign_host_id, "foreign-restored-host", timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO repositories(
+                    repo_id, host_id, canonical_root, display_name, state,
+                    generation, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'active', 0, ?, ?)
+                """,
+                (
+                    foreign_repo_id,
+                    foreign_host_id,
+                    str(self.project),
+                    self.project.name,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO repository_installations(
+                    repo_id, status, startup_fenced, generation, actor, updated_at
+                ) VALUES (?, 'installed', 0, 0, 'foreign-fixture', ?)
+                """,
+                (foreign_repo_id, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO server_definitions(
+                    server_definition_id, repo_id, name, role, cwd,
+                    health_url_template, log_path, definition_fingerprint,
+                    generation, created_at, updated_at
+                ) VALUES (?, ?, ?, 'web', ?, NULL, NULL, ?, 0, ?, ?)
+                """,
+                (
+                    server_id,
+                    foreign_repo_id,
+                    name,
+                    str(self.project),
+                    f"sha256:foreign-{name}",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO server_observations(
+                    server_definition_id, source_resource_id, lifecycle, pid,
+                    process_start_time, process_fingerprint, listener_host,
+                    listener_port, listener_observable, health_classification,
+                    health_ok, stopped_at, stopped_reason, sampled_at,
+                    observation_fingerprint
+                ) VALUES (?, NULL, 'stopped', NULL, NULL, NULL, '127.0.0.1',
+                          ?, 1, 'stopped', NULL, ?, 'foreign fixture', ?, ?)
+                """,
+                (
+                    server_id,
+                    port,
+                    timestamp,
+                    timestamp,
+                    f"sha256:foreign-observation-{name}",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO port_assignments(
+                    assignment_id, host_id, repo_id, server_name, port, status,
+                    generation, deactivated_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'active', 0, NULL, ?, ?)
+                """,
+                (
+                    assignment_id,
+                    foreign_host_id,
+                    foreign_repo_id,
+                    name,
+                    port,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO leases(
+                    lease_id, host_id, repo_id, server_definition_id, source_id,
+                    port, owner, agent, purpose, status, expires_at,
+                    process_fingerprint, generation, deactivated_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, NULL, 'foreign-agent',
+                          'server:foreign', 'active', NULL, NULL, 0, NULL, ?, ?)
+                """,
+                (
+                    lease_id,
+                    foreign_host_id,
+                    foreign_repo_id,
+                    server_id,
+                    port,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return {
+            "host_id": foreign_host_id,
+            "repo_id": foreign_repo_id,
+            "server_id": server_id,
+            "assignment_id": assignment_id,
+            "lease_id": lease_id,
+        }
 
     def start_request(
         self,
@@ -528,7 +683,9 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(project_usage["cpu_percent"], 3.75)
         self.assertEqual(project_usage["memory_bytes"], 1500)
-        self.assertIsNone(project_usage["process_count"])
+        self.assertEqual(project_usage["process_count"], 2)
+        self.assertEqual(project_usage["usage"]["server"]["process_count"], 1)
+        self.assertEqual(project_usage["usage"]["docker"]["process_count"], 1)
 
         with ports.store.immediate_transaction() as connection:
             connection.execute(
@@ -649,6 +806,99 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.assertEqual(service.list_assignments(), [assignment])
         self.assertEqual(service.list_leases(), [lease])
 
+    def test_restored_foreign_host_ports_are_ignored_and_never_mutated(self) -> None:
+        foreign = self.insert_foreign_same_root_runtime(name="web", port=3222)
+        service = self.service()
+
+        lease = service.lease(
+            PortLeaseRequest(
+                agent="codex-a",
+                canonical_project=str(self.project),
+                port_start=3222,
+                port_end=3222,
+                preferred=3222,
+                ttl_seconds=60,
+                purpose="manual",
+            ),
+            port_available=lambda _port: True,
+        )
+        assignment = service.assign(
+            agent="codex-a",
+            canonical_project=str(self.project),
+            name="web",
+            port=3222,
+        )
+        self.assertEqual(service.list_leases(), [lease])
+        self.assertEqual(service.list_assignments(), [assignment])
+
+        with self.assertRaises(KeyError):
+            service.release(
+                agent="codex-a",
+                canonical_project=str(self.project),
+                lease_id=foreign["lease_id"],
+            )
+        service.release(
+            agent="codex-a",
+            canonical_project=str(self.project),
+            lease_id=lease["id"],
+        )
+        service.unassign(
+            agent="codex-a",
+            canonical_project=str(self.project),
+            name="web",
+        )
+        with self.assertRaises(KeyError):
+            service.unassign(
+                agent="codex-a",
+                canonical_project=str(self.project),
+                port=3222,
+                force=True,
+            )
+
+        with service.store.read_transaction() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM leases WHERE lease_id = ?",
+                    (foreign["lease_id"],),
+                ).fetchone()[0],
+                "active",
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM port_assignments WHERE assignment_id = ?",
+                    (foreign["assignment_id"],),
+                ).fetchone()[0],
+                "active",
+            )
+
+    def test_restored_foreign_host_server_ids_are_rejected_and_local_start_wins(self) -> None:
+        foreign = self.insert_foreign_same_root_runtime(name="web", port=3223)
+        service = self.server_service()
+
+        with self.assertRaises(KeyError):
+            service.server(server_definition_id=foreign["server_id"])
+        with self.assertRaises(KeyError):
+            service.reserve_stop(
+                agent="codex-a",
+                server_definition_id=foreign["server_id"],
+                expected_definition_generation=0,
+                expected_observation_fingerprint=f"sha256:foreign-observation-web",
+            )
+
+        local = self.running_server(name="web", port=3223)
+        self.assertEqual(service.server(canonical_project=str(self.project), name="web")["id"], local["id"])
+        self.assertEqual(
+            [item["id"] for item in service.list_servers(canonical_project=str(self.project))],
+            [local["id"]],
+        )
+        reservation = service.reserve_stop(
+            agent="codex-a",
+            server_definition_id=str(local["id"]),
+            expected_definition_generation=int(local["generation"]),
+            expected_observation_fingerprint=local.get("_observation_fingerprint"),
+        )
+        self.assertEqual(reservation["id"], local["id"])
+
     def test_concurrent_exact_port_lease_has_one_winner(self) -> None:
         reached_probe = threading.Barrier(2)
         results: list[dict[str, object]] = []
@@ -696,6 +946,8 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.assertEqual(results[0]["port"], 3230)
 
     def test_default_public_port_commands_never_load_legacy_projection(self) -> None:
+        restored = self.insert_foreign_same_root_runtime(name="web", port=3241)
+
         def command(*arguments: str) -> object:
             return dev_coordinator.handle_cli(
                 dev_coordinator.build_parser().parse_args(list(arguments))
@@ -748,6 +1000,17 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             )
             self.assertEqual(command("port", "list"), [lease])
             self.assertIn(lease["id"], command("state", "show")["leases"])
+            with self.assertRaises(KeyError):
+                command(
+                    "port",
+                    "release",
+                    "--agent",
+                    "codex-a",
+                    "--project",
+                    str(self.project),
+                    "--lease-id",
+                    restored["lease_id"],
+                )
 
             released = command(
                 "port",
@@ -928,6 +1191,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.assertNotIn("legacy_state_projection", sampler_source)
 
         expected_post_routes = {
+            "/v1/runtime",
             "/v1/servers/start",
             "/v1/servers/stop",
             "/v1/servers/restart",
@@ -1297,9 +1561,86 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(reservation["port"], 3281)
 
+    def test_server_start_rejects_permanently_removed_deterministic_identity(self) -> None:
+        service = self.server_service()
+        request = self.start_request(
+            name="removed-worker",
+            port_start=3283,
+            port_end=3283,
+            preferred=3283,
+            explicit_range=True,
+        )
+        timestamp = utc_timestamp()
+        with service.store.immediate_transaction() as connection:
+            repository = connection.execute(
+                "SELECT repo_id FROM repositories WHERE canonical_root = ?",
+                (str(self.project),),
+            ).fetchone()
+            repo_id = str(repository["repo_id"])
+            server_id = deterministic_id(
+                "server-definition", repo_id, request.name
+            )
+            operation_id = deterministic_id("cleanup-test", server_id)
+            connection.execute(
+                """
+                INSERT INTO operations(
+                    operation_id, repo_id, kind, status, phase, generation,
+                    request_fingerprint, owner_uid, actor, created_at, updated_at
+                ) VALUES (?, ?, 'cleanup', 'succeeded', 'complete', 0,
+                          ?, ?, 'test', ?, ?)
+                """,
+                (
+                    operation_id,
+                    repo_id,
+                    deterministic_id("cleanup-request", server_id),
+                    os.geteuid(),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cleanup_tombstones(
+                    target_kind, target_id, repo_id, immutable_fingerprint,
+                    operation_id, actor, reason, evidence_json, removed_at
+                ) VALUES ('server', ?, ?, ?, ?, 'test', 'obsolete', '{}', ?)
+                """,
+                (
+                    server_id,
+                    repo_id,
+                    deterministic_id("removed-identity", server_id),
+                    operation_id,
+                    timestamp,
+                ),
+            )
+
+        with self.assertRaisesRegex(
+            NormalizedLifecycleConflict, "permanently removed"
+        ):
+            service.reserve_start(request, observed_available_ports=[3283])
+
+        with service.store.read_transaction() as connection:
+            definition = connection.execute(
+                "SELECT 1 FROM server_definitions WHERE server_definition_id = ?",
+                (server_id,),
+            ).fetchone()
+            assignment = connection.execute(
+                "SELECT 1 FROM port_assignments WHERE repo_id = ? AND server_name = ?",
+                (repo_id, request.name),
+            ).fetchone()
+            lease = connection.execute(
+                "SELECT 1 FROM leases WHERE repo_id = ? AND server_definition_id = ?",
+                (repo_id, server_id),
+            ).fetchone()
+        self.assertIsNone(definition)
+        self.assertIsNone(assignment)
+        self.assertIsNone(lease)
+
     def test_default_public_server_lifecycle_and_relocation_never_load_legacy_projection(
         self,
     ) -> None:
+        restored = self.insert_foreign_same_root_runtime(name="web", port=3290)
+
         def command(*arguments: str) -> object:
             return dev_coordinator.handle_cli(
                 dev_coordinator.build_parser().parse_args(list(arguments))
@@ -1366,6 +1707,16 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 dev_coordinator, "locked_state", side_effect=poisoned_locked_state
             ),
         ):
+            self.assertEqual(command("server", "list"), [])
+            with self.assertRaises(KeyError):
+                command(
+                    "server",
+                    "status",
+                    "--project",
+                    str(self.project),
+                    "--name",
+                    "web",
+                )
             started = command(
                 "server",
                 "start",
@@ -1478,8 +1829,13 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 self.assertEqual(projected_relocation[key], expected)
             self.assertTrue(projected_relocation["relocated_at"])
             self.assertEqual(
-                relocation_inventory["v1_compatibility"]["leases"], []
+                [
+                    item["id"]
+                    for item in relocation_inventory["v1_compatibility"]["leases"]
+                ],
+                [restored["lease_id"]],
             )
+            self.assertEqual(command("port", "list"), [])
             projected_assignment = next(
                 item
                 for item in relocation_inventory["v1_compatibility"][

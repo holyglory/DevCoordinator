@@ -87,6 +87,8 @@ test('render wiring: hidden pages unmount and every inventory-heavy surface is b
   const buildDocker = extractFunction(appJs, 'function buildDocker(o)');
   const dockerProjectBlock = extractFunction(appJs, 'function dockerProjectBlock(o, entry)');
   const projectNode = extractFunction(appJs, 'function projectNode(o, group, hiddenProject, revealing, hiddenServers, hiddenDocker)');
+  const projectScopeRows = extractFunction(appJs, 'function projectScopeRows(o, group, scope, revealing, hiddenServers, hiddenDocker, label)');
+  const temporaryScopeBlock = extractFunction(appJs, 'function temporaryScopeBlock(o, group, scope, revealing, hiddenServers, hiddenDocker)');
 
   assert.match(renderAll, /unmountInactiveSections\(page\)/,
     'poll rendering must remove dynamic bodies belonging to hidden hash pages');
@@ -111,10 +113,15 @@ test('render wiring: hidden pages unmount and every inventory-heavy surface is b
     'the expanded Docker project must not mount its complete member inventory');
   assert.match(projectNode, /const collapsed = !ui\.treeExpanded\.has\(group\.key\);/,
     'Projects must start as the promised project collection, with members disclosed on demand');
-  assert.match(projectNode, /pageSlice\(entries, ui\.resourcePages\.projects\)/,
-    'an expanded project must not recreate the complete host-wide inventory DOM');
+  assert.match(projectScopeRows, /pageSlice\(entries, requestedPage\)/,
+    'each disclosed root or temporary repo must retain a bounded member page');
+  assert.match(projectNode, /group\.rootScope[\s\S]*for \(const scope of group\.temporaryScopes\)/,
+    'root services must render directly before nested temporary repo disclosures');
+  assert.match(temporaryScopeBlock,
+    /setExclusiveExpansion\(ui\.temporaryScopesExpanded, scope\.key\)/,
+    'only one nested temporary repo member page may be disclosed at a time');
   assert.match(projectNode, /ui\.treeExpanded\.clear\(\)/,
-    'only one project member collection may be mounted at a time');
+    'only one repository family may be mounted at a time');
   assert.doesNotMatch(appJs, /treeCollapsed/,
     'newly discovered projects must default closed instead of silently expanding on the next poll');
 });

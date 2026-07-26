@@ -11,6 +11,7 @@ import os
 import signal
 import socket
 import stat
+import sys
 import threading
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -154,7 +155,14 @@ def add_broker_parser(subparsers: Any) -> None:
     enroll.add_argument("--port-range", default="3000-3999")
     enroll.add_argument("--profile-output")
     enroll.add_argument("--profile-valid-days", type=int, default=30)
-    enroll.add_argument("--explicit-reinstall", action="store_true")
+    enroll.add_argument(
+        "--explicit-reinstall",
+        action="store_true",
+        help=(
+            "deliberately reinstall a removed repository or worker as a new "
+            "immutable incarnation; ordinary enrollment refuses tombstoned resources"
+        ),
+    )
     enroll.add_argument(
         "--grant-ephemeral-image-prefetch",
         action="store_true",
@@ -731,6 +739,7 @@ def serve_broker(
         runtime.persistence.recover_interrupted_docker_operations()
         runtime.persistence.recover_interrupted_compose_operations()
         runtime.backend.recover_ephemeral_runs()
+
         def reclaim_stale_socket_before_admission() -> None:
             """Reclaim only a proven-dead socket while this function holds flock.
 
@@ -854,6 +863,53 @@ def serve_broker(
                     "socket_path_reclaim_failed",
                     "Broker stale socket could not be removed.",
                 ) from None
+
+        worker_reconciliation = runtime.reconcile_workers_on_startup()
+        print(
+            json.dumps(
+                {
+                    "event": "worker.startup_reconciled",
+                    "ok": worker_reconciliation.get("ok") is True,
+                    "supervisor_epoch": worker_reconciliation.get(
+                        "supervisor_epoch"
+                    ),
+                    "fenced_old_runners": worker_reconciliation.get(
+                        "fenced_old_runners", []
+                    ),
+                    "started": worker_reconciliation.get("started", []),
+                    "failure_count": len(worker_reconciliation.get("errors", [])),
+                },
+                sort_keys=True,
+            ),
+            file=(
+                sys.stdout
+                if worker_reconciliation.get("ok") is True
+                else sys.stderr
+            ),
+            flush=True,
+        )
+        for failure in worker_reconciliation.get("errors", []):
+            worker_id = str(failure.get("worker_id") or "unknown")[:128]
+            phase = str(failure.get("phase") or "unknown")[:128]
+            detail = str(failure.get("error") or "inspect broker logs")[:4096]
+            print(
+                json.dumps(
+                    {
+                        "event": "worker.startup_failed",
+                        "worker_id": worker_id,
+                        "phase": phase,
+                        "error": detail,
+                        "action_required": (
+                            "Inspect this worker's retained attempt/native-runner logs, "
+                            "fix its installed definition or host service state, then "
+                            "explicitly start it again."
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         stop = threading.Event()
         previous: dict[int, Any] = {}
         shutdown_requested = False

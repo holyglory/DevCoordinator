@@ -141,6 +141,337 @@ def _projected_binding_fingerprint(row: Any) -> str | None:
     )
 
 
+def _usage_part(
+    rows: Iterable[Any], *, resource_count: int, process_count: int
+) -> dict[str, Any]:
+    material = list(rows)
+    cpu = [
+        float(row["cpu_percent"])
+        for row in material
+        if row["cpu_percent"] is not None
+    ]
+    memory = [
+        int(row["memory_bytes"])
+        for row in material
+        if row["memory_bytes"] is not None
+    ]
+    return {
+        "resource_count": int(resource_count),
+        "process_count": int(process_count),
+        "cpu_percent": sum(cpu) if cpu else None,
+        "memory_bytes": sum(memory) if memory else None,
+    }
+
+
+def _combined_usage(server: dict[str, Any], docker: dict[str, Any]) -> dict[str, Any]:
+    cpu = [
+        float(value)
+        for value in (server.get("cpu_percent"), docker.get("cpu_percent"))
+        if value is not None
+    ]
+    memory = [
+        int(value)
+        for value in (server.get("memory_bytes"), docker.get("memory_bytes"))
+        if value is not None
+    ]
+    return {
+        "cpu_percent": sum(cpu) if cpu else None,
+        "memory_bytes": sum(memory) if memory else None,
+        "process_count": int(server.get("process_count") or 0)
+        + int(docker.get("process_count") or 0),
+        "server": server,
+        "docker": docker,
+    }
+
+
+def _worker_supervision_projection(
+    connection: sqlite3.Connection,
+    *,
+    server_definition_id: str,
+    sampled_at_epoch: float,
+) -> dict[str, Any] | None:
+    """Return one concise policy, breaker, and crash-evidence projection."""
+
+    policy = connection.execute(
+        """
+        SELECT policy.*, supervisor.state AS supervisor_state,
+               supervisor.supervisor_epoch,
+               supervisor.supervisor_generation,
+               supervisor.current_attempt_id,
+               supervisor.last_attempt_id,
+               supervisor.next_restart_at,
+               supervisor.last_error_code,
+               supervisor.last_error_message
+        FROM worker_policies policy
+        JOIN worker_supervisor_states supervisor USING(server_definition_id)
+        WHERE policy.server_definition_id = ?
+        """,
+        (server_definition_id,),
+    ).fetchone()
+    if policy is None:
+        return None
+
+    crash_generation = int(policy["generation"])
+    if policy["breaker_state"] == "tripped" and policy["last_trip_attempt_id"]:
+        trip_attempt = connection.execute(
+            "SELECT policy_generation FROM worker_attempts WHERE attempt_id = ?",
+            (policy["last_trip_attempt_id"],),
+        ).fetchone()
+        if trip_attempt is not None:
+            crash_generation = int(trip_attempt["policy_generation"])
+    window_start = float(sampled_at_epoch) - int(policy["crash_window_seconds"])
+    crash_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM worker_attempts
+            WHERE server_definition_id = ?
+              AND policy_generation = ?
+              AND counts_toward_breaker = 1
+              AND exited_at_epoch >= ? AND exited_at_epoch <= ?
+            """,
+            (
+                server_definition_id,
+                crash_generation,
+                window_start,
+                float(sampled_at_epoch),
+            ),
+        ).fetchone()[0]
+    )
+
+    def attempt_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        log = (
+            None
+            if row["log_artifact_id"] is None
+            else {
+                "artifact_id": row["log_artifact_id"],
+                "path": row["log_artifact_path"],
+                "sha256": row["log_artifact_sha256"],
+            }
+        )
+        return {
+            "attempt_id": row["attempt_id"],
+            "state": row["state"],
+            "pid": row["pid"],
+            "process_start_time": row["process_start_time"],
+            "process_fingerprint": row["process_fingerprint"],
+            "reserved_at": row["reserved_at"],
+            "launched_at": row["launched_at"],
+            "exited_at": row["exited_at"],
+            "exit_kind": row["exit_kind"],
+            "exit_code": row["exit_code"],
+            "exit_signal": row["exit_signal"],
+            "classification": row["exit_classification"],
+            "expected": (
+                None
+                if row["expected_exit"] is None
+                else bool(row["expected_exit"])
+            ),
+            "crash_event_id": row["crash_event_id"],
+            "log": log,
+        }
+
+    last_attempt = connection.execute(
+        """
+        SELECT * FROM worker_attempts
+        WHERE attempt_id = ?
+        """,
+        (policy["last_attempt_id"],),
+    ).fetchone() if policy["last_attempt_id"] is not None else None
+    current_attempt = connection.execute(
+        "SELECT * FROM worker_attempts WHERE attempt_id = ?",
+        (policy["current_attempt_id"],),
+    ).fetchone() if policy["current_attempt_id"] is not None else None
+    recent_rows = connection.execute(
+        """
+        SELECT * FROM worker_attempts
+        WHERE server_definition_id = ? AND counts_toward_breaker = 1
+        ORDER BY exited_at_epoch DESC, attempt_id DESC
+        LIMIT 20
+        """,
+        (server_definition_id,),
+    ).fetchall()
+    total_crashes = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM worker_attempts
+            WHERE server_definition_id = ? AND counts_toward_breaker = 1
+            """,
+            (server_definition_id,),
+        ).fetchone()[0]
+    )
+    recent_crashes = [attempt_payload(row) for row in recent_rows]
+    return {
+        "keep_alive": bool(policy["keep_alive"]),
+        "desired_state": policy["desired_state"],
+        "state": policy["supervisor_state"],
+        "execution_uid": int(policy["execution_uid"]),
+        "requested_by": policy["requested_by"],
+        "current_attempt_id": policy["current_attempt_id"],
+        "current_attempt": attempt_payload(current_attempt),
+        "last_attempt": attempt_payload(last_attempt),
+        "recent_crashes": recent_crashes,
+        "recent_crashes_truncated": total_crashes > len(recent_crashes),
+        "breaker": {
+            "state": policy["breaker_state"],
+            "crash_limit": int(policy["crash_limit"]),
+            "window_seconds": int(policy["crash_window_seconds"]),
+            "crash_count_in_window": crash_count,
+            "tripped_at": policy["last_tripped_at"],
+            "reason": policy["last_trip_reason"],
+            "rearmed_at": policy["last_rearmed_at"],
+            "rearmed_by": policy["last_rearmed_by"],
+        },
+        "generation": {
+            "policy": int(policy["generation"]),
+            "supervisor": int(policy["supervisor_generation"]),
+            "epoch": policy["supervisor_epoch"],
+        },
+        "next_restart_at": policy["next_restart_at"],
+        "error": (
+            None
+            if policy["last_error_code"] is None
+            else {
+                "code": policy["last_error_code"],
+                "message": policy["last_error_message"],
+            }
+        ),
+    }
+
+
+def _aggregate_scope_usage(scopes: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    scope_list = list(scopes)
+
+    def aggregate_kind(kind: str) -> dict[str, Any]:
+        entries = [scope["usage"][kind] for scope in scope_list]
+        cpu = [float(item["cpu_percent"]) for item in entries if item["cpu_percent"] is not None]
+        memory = [int(item["memory_bytes"]) for item in entries if item["memory_bytes"] is not None]
+        return {
+            "resource_count": sum(int(item.get("resource_count") or 0) for item in entries),
+            "process_count": sum(int(item.get("process_count") or 0) for item in entries),
+            "cpu_percent": sum(cpu) if cpu else None,
+            "memory_bytes": sum(memory) if memory else None,
+        }
+
+    return _combined_usage(aggregate_kind("server"), aggregate_kind("docker"))
+
+
+def _repository_trees_projection(
+    connection: sqlite3.Connection,
+    *,
+    repositories: list[dict[str, Any]],
+    project_usage: list[dict[str, Any]],
+    current_database_binding_ids: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Build the authoritative primary/temporary repository hierarchy."""
+
+    repositories_by_id = {str(item["repo_id"]): item for item in repositories}
+    usage_by_root = {str(item["project"]): item for item in project_usage}
+    databases_by_repo: dict[str, list[str]] = {}
+    for row in connection.execute(
+        """
+        SELECT repo_id, database_binding_id FROM database_bindings
+        WHERE repo_id IS NOT NULL ORDER BY repo_id, database_binding_id
+        """
+    ):
+        binding_id = str(row["database_binding_id"])
+        if binding_id in current_database_binding_ids:
+            databases_by_repo.setdefault(str(row["repo_id"]), []).append(binding_id)
+
+    active_session_by_repo: dict[str, dict[str, Any]] = {}
+    for row in connection.execute(
+        """
+        SELECT session_id, repo_id, expires_at, kill_after_run, created_at
+        FROM runtime_sessions
+        WHERE status IN ('planned', 'running', 'cleanup_pending', 'cleaning')
+        ORDER BY repo_id, created_at DESC, session_id DESC
+        """
+    ):
+        active_session_by_repo.setdefault(str(row["repo_id"]), dict(row))
+
+    families: dict[str, dict[str, Any]] = {}
+    for row in connection.execute(
+        """
+        SELECT f.family_id, f.root_repo_id, s.repo_id, s.project_kind
+        FROM repository_families f
+        JOIN repository_scopes s USING(family_id)
+        ORDER BY f.family_id,
+                 CASE s.project_kind WHEN 'primary' THEN 0 ELSE 1 END,
+                 s.repo_id
+        """
+    ):
+        family_id = str(row["family_id"])
+        root_repo_id = str(row["root_repo_id"])
+        repository = repositories_by_id.get(str(row["repo_id"]))
+        root_repository = repositories_by_id.get(root_repo_id)
+        if repository is None or root_repository is None:
+            continue
+        family = families.setdefault(
+            family_id,
+            {
+                "family_id": family_id,
+                "root_repository": {
+                    "repo_id": root_repo_id,
+                    "canonical_root": root_repository["canonical_root"],
+                    "display_name": root_repository["display_name"],
+                },
+                "scopes": [],
+            },
+        )
+        projected_usage = usage_by_root.get(str(repository["canonical_root"]), {})
+        usage = projected_usage.get("usage") or _combined_usage(
+            _usage_part([], resource_count=0, process_count=0),
+            _usage_part([], resource_count=0, process_count=0),
+        )
+        session = active_session_by_repo.get(str(row["repo_id"]))
+        family["scopes"].append(
+            {
+                "repo_id": str(row["repo_id"]),
+                "kind": (
+                    "root"
+                    if str(row["project_kind"]) == "primary"
+                    else "temporary"
+                ),
+                "canonical_root": repository["canonical_root"],
+                "display_name": repository["display_name"],
+                "run_id": None if session is None else session["session_id"],
+                "expires_at": None if session is None else session["expires_at"],
+                "kill_after_run": (
+                    None if session is None else bool(session["kill_after_run"])
+                ),
+                "usage": usage,
+                "server_ids": list(projected_usage.get("server_ids") or []),
+                "container_resource_ids": list(
+                    projected_usage.get("container_resource_ids") or []
+                ),
+                "database_binding_ids": databases_by_repo.get(
+                    str(row["repo_id"]), []
+                ),
+            }
+        )
+
+    result: list[dict[str, Any]] = []
+    for family in families.values():
+        family["scopes"].sort(
+            key=lambda item: (
+                0 if item["kind"] == "root" else 1,
+                str(item["display_name"]).casefold(),
+                str(item["canonical_root"]),
+            )
+        )
+        family["usage"] = _aggregate_scope_usage(family["scopes"])
+        result.append(family)
+    result.sort(
+        key=lambda item: (
+            str(item["root_repository"]["display_name"]).casefold(),
+            str(item["root_repository"]["canonical_root"]),
+            str(item["family_id"]),
+        )
+    )
+    return result
+
+
 def _latest_available_docker_presence(
     connection: sqlite3.Connection,
 ) -> dict[str, frozenset[str]]:
@@ -268,7 +599,9 @@ def _current_server_resource_ids(
                     AND NOT EXISTS (
                         SELECT 1 FROM cleanup_tombstones tombstone
                         WHERE (tombstone.target_kind = 'project'
-                               AND tombstone.target_id = d.repo_id)
+                               AND tombstone.target_id = d.repo_id
+                               AND tombstone.target_generation
+                                   BETWEEN r.generation - 1 AND r.generation)
                            OR (tombstone.target_kind = 'server'
                                AND tombstone.target_id = d.server_definition_id)
                     )
@@ -304,12 +637,46 @@ def _current_server_resource_ids(
                                   'planned', 'running', 'partial', 'needs_attention'
                               )
                         )
+                        OR EXISTS (
+                            SELECT 1 FROM worker_policies worker_policy
+                            WHERE worker_policy.server_definition_id = d.server_definition_id
+                        )
                         OR {broker_management}
                     )
                )
             ORDER BY d.server_definition_id
             """,
             (observed_at,),
+        )
+    )
+
+
+def _latest_removed_runtime_resources(
+    connection: sqlite3.Connection,
+) -> frozenset[tuple[str, str]]:
+    """Return resources whose newest runtime-session state is removed.
+
+    Cleanup rows are durable audit evidence. Only the newest link controls the
+    active projection, so reinstalling/restarting a resource through a later
+    session makes it visible again without deleting history.
+    """
+
+    return frozenset(
+        (str(row["resource_kind"]), str(row["resource_id"]))
+        for row in connection.execute(
+            """
+            WITH ranked AS (
+                SELECT resource_kind, resource_id, cleanup_state,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY resource_kind, resource_id
+                           ORDER BY linked_at DESC, session_id DESC
+                       ) AS ordinal
+                FROM runtime_session_resources
+            )
+            SELECT resource_kind, resource_id
+            FROM ranked WHERE ordinal = 1 AND cleanup_state = 'removed'
+            ORDER BY resource_kind, resource_id
+            """
         )
     )
 
@@ -1152,10 +1519,18 @@ class AccountStore(CoordinatorStore):
         base.__class__ = cls
         return base  # type: ignore[return-value]
 
+    @staticmethod
+    def local_host_id() -> str:
+        """Return this machine's deterministic host identity without store writes."""
+
+        machine = f"{platform.system()}\x1f{platform.node()}\x1f{socket.gethostname()}"
+        machine_fingerprint = hashlib.sha256(machine.encode("utf-8")).hexdigest()
+        return deterministic_id("host", machine_fingerprint)
+
     def ensure_local_host(self) -> str:
         machine = f"{platform.system()}\x1f{platform.node()}\x1f{socket.gethostname()}"
         machine_fingerprint = hashlib.sha256(machine.encode("utf-8")).hexdigest()
-        host_id = deterministic_id("host", machine_fingerprint)
+        host_id = self.local_host_id()
         timestamp = utc_timestamp()
         with self.immediate_transaction() as connection:
             connection.execute(
@@ -1223,8 +1598,10 @@ class AccountStore(CoordinatorStore):
                     """
                 ).fetchone()
             )
-            inventory_time = utc_timestamp()
+            inventory_epoch = time.time()
+            inventory_time = utc_timestamp(inventory_epoch)
             present_docker_resources = _latest_available_docker_presence(connection)
+            removed_runtime_resources = _latest_removed_runtime_resources(connection)
 
             def docker_resource_is_present(host_id: Any, resource_id: Any) -> bool:
                 """Preserve legacy visibility until this host has proved presence."""
@@ -1244,6 +1621,8 @@ class AccountStore(CoordinatorStore):
                 if docker_resource_is_present(
                     row["host_id"], row["docker_resource_id"]
                 )
+                and ("docker", str(row["docker_resource_id"]))
+                not in removed_runtime_resources
             )
             active_docker_resource_ids = frozenset(
                 str(row["docker_resource_id"])
@@ -1286,6 +1665,9 @@ class AccountStore(CoordinatorStore):
                                           SELECT 1 FROM cleanup_tombstones tombstone
                                           WHERE tombstone.target_kind = 'project'
                                             AND tombstone.target_id = membership.repo_id
+                                            AND tombstone.target_generation
+                                                BETWEEN repository.generation - 1
+                                                    AND repository.generation
                                       )
                                 )
                             )
@@ -1350,6 +1732,38 @@ class AccountStore(CoordinatorStore):
 
             current_server_resource_ids = _current_server_resource_ids(
                 connection, observed_at=inventory_time
+            ) - frozenset(
+                resource_id
+                for kind, resource_id in removed_runtime_resources
+                if kind == "service"
+            )
+            worker_supervision_by_id = {
+                server_id: supervision
+                for server_id in current_server_resource_ids
+                if (
+                    supervision := _worker_supervision_projection(
+                        connection,
+                        server_definition_id=server_id,
+                        sampled_at_epoch=inventory_epoch,
+                    )
+                )
+                is not None
+            }
+            removed_runtime_server_ids = frozenset(
+                resource_id
+                for kind, resource_id in removed_runtime_resources
+                if kind == "service"
+            )
+            removed_runtime_server_keys = frozenset(
+                (str(row["repo_id"]), str(row["name"]))
+                for row in connection.execute(
+                    """
+                    SELECT server_definition_id, repo_id, name
+                    FROM server_definitions ORDER BY server_definition_id
+                    """
+                )
+                if str(row["server_definition_id"])
+                in removed_runtime_server_ids
             )
             current_database_binding_ids = frozenset(
                 str(row["database_binding_id"])
@@ -1360,6 +1774,8 @@ class AccountStore(CoordinatorStore):
                     """
                 )
                 if str(row["docker_resource_id"]) in active_docker_resource_ids
+                and ("database_stack", str(row["database_binding_id"]))
+                not in removed_runtime_resources
             )
 
             repositories = [
@@ -1377,6 +1793,8 @@ class AccountStore(CoordinatorStore):
                         SELECT 1 FROM cleanup_tombstones t
                         WHERE t.target_kind = 'project'
                           AND t.target_id = r.repo_id
+                          AND t.target_generation
+                              BETWEEN r.generation - 1 AND r.generation
                       )
                     ORDER BY lower(r.display_name), r.canonical_root
                     """
@@ -1421,7 +1839,10 @@ class AccountStore(CoordinatorStore):
                       AND rr.host_resource_id IS NULL
                       AND NOT EXISTS (
                         SELECT 1 FROM cleanup_tombstones t
-                        WHERE (t.target_kind = 'project' AND t.target_id = m.repo_id)
+                        WHERE (t.target_kind = 'project'
+                               AND t.target_id = m.repo_id
+                               AND t.target_generation
+                                   BETWEEN r.generation - 1 AND r.generation)
                            OR (t.target_kind = m.resource_kind
                                AND t.target_id = m.host_resource_id)
                       )
@@ -1689,7 +2110,9 @@ class AccountStore(CoordinatorStore):
                     OR EXISTS (
                         SELECT 1 FROM cleanup_tombstones tombstone
                         WHERE (tombstone.target_kind = 'project'
-                               AND tombstone.target_id = m.repo_id)
+                               AND tombstone.target_id = m.repo_id
+                               AND tombstone.target_generation
+                                   BETWEEN r.generation - 1 AND r.generation)
                            OR (tombstone.target_kind = 'container'
                                AND tombstone.target_id = d.docker_resource_id)
                     )
@@ -1763,7 +2186,9 @@ class AccountStore(CoordinatorStore):
                     OR EXISTS (
                         SELECT 1 FROM cleanup_tombstones tombstone
                         WHERE (tombstone.target_kind = 'project'
-                               AND tombstone.target_id = d.repo_id)
+                               AND tombstone.target_id = d.repo_id
+                               AND tombstone.target_generation
+                                   BETWEEN r.generation - 1 AND r.generation)
                            OR (tombstone.target_kind = 'server'
                                AND tombstone.target_id = d.server_definition_id)
                     )
@@ -2003,6 +2428,9 @@ class AccountStore(CoordinatorStore):
                     "stopped_reason": row["stopped_reason"],
                     "updated_at": row["sampled_at"],
                     "attribution": violation,
+                    "supervision": worker_supervision_by_id.get(
+                        str(row["server_definition_id"])
+                    ),
                 }
                 latest_operation = connection.execute(
                     """
@@ -2102,12 +2530,18 @@ class AccountStore(CoordinatorStore):
                     ,
                     (inventory_time,),
                 )
+                if row["server_id"] is None
+                or str(row["server_id"]) not in removed_runtime_server_ids
             ]
             compatibility_assignments = [
-                dict(row)
+                {
+                    key: value
+                    for key, value in dict(row).items()
+                    if key != "_repo_id"
+                }
                 for row in connection.execute(
                     """
-                    SELECT p.assignment_id AS id,
+                    SELECT p.assignment_id AS id, p.repo_id AS _repo_id,
                            r.canonical_root || '::' || p.server_name AS key,
                            r.canonical_root AS project,
                            p.server_name AS name, p.port, p.status,
@@ -2122,6 +2556,8 @@ class AccountStore(CoordinatorStore):
                     ORDER BY p.port, r.canonical_root, p.server_name
                     """
                 )
+                if (str(row["_repo_id"]), str(row["name"]))
+                not in removed_runtime_server_keys
             ]
             current_docker_stats = {
                 str(row["docker_resource_id"]): dict(row)
@@ -2488,7 +2924,16 @@ class AccountStore(CoordinatorStore):
                           AND NOT EXISTS (
                             SELECT 1 FROM cleanup_tombstones tombstone
                             WHERE (tombstone.target_kind = 'project'
-                                   AND tombstone.target_id = m.repo_id)
+                                   AND tombstone.target_id = m.repo_id
+                                   AND tombstone.target_generation BETWEEN (
+                                       SELECT repository.generation - 1
+                                       FROM repositories repository
+                                       WHERE repository.repo_id = m.repo_id
+                                   ) AND (
+                                       SELECT repository.generation
+                                       FROM repositories repository
+                                       WHERE repository.repo_id = m.repo_id
+                                   ))
                                OR (tombstone.target_kind = 'container'
                                    AND tombstone.target_id = m.host_resource_id)
                           )
@@ -2502,15 +2947,18 @@ class AccountStore(CoordinatorStore):
                     for row in container_memberships
                     if str(row["docker_resource_id"])
                     in active_docker_resource_ids
+                    and str(row["docker_resource_id"])
+                    not in suppressed_alias_ids
                 ]
                 container_names = [str(row["current_name"]) for row in container_memberships]
                 container_resource_ids = [
                     str(row["docker_resource_id"]) for row in container_memberships
                 ]
-                usage_rows = list(
+                server_usage_rows = list(
                     connection.execute(
                         """
-                        SELECT t.cpu_percent, t.memory_bytes
+                        SELECT d.server_definition_id,
+                               t.cpu_percent, t.memory_bytes
                         FROM server_definitions d
                         JOIN server_observations o USING(server_definition_id)
                         JOIN telemetry_samples t
@@ -2527,7 +2975,16 @@ class AccountStore(CoordinatorStore):
                           AND NOT EXISTS (
                               SELECT 1 FROM cleanup_tombstones tombstone
                               WHERE (tombstone.target_kind = 'project'
-                                     AND tombstone.target_id = d.repo_id)
+                                     AND tombstone.target_id = d.repo_id
+                                     AND tombstone.target_generation BETWEEN (
+                                         SELECT repository.generation - 1
+                                         FROM repositories repository
+                                         WHERE repository.repo_id = d.repo_id
+                                     ) AND (
+                                         SELECT repository.generation
+                                         FROM repositories repository
+                                         WHERE repository.repo_id = d.repo_id
+                                     ))
                                  OR (tombstone.target_kind = 'server'
                                      AND tombstone.target_id = d.server_definition_id)
                           )
@@ -2545,21 +3002,55 @@ class AccountStore(CoordinatorStore):
                         (repo_id,),
                     )
                 )
-                usage_rows.extend(
+                server_usage_rows = [
+                    row
+                    for row in server_usage_rows
+                    if str(row["server_definition_id"])
+                    in current_server_resource_ids
+                ]
+                docker_usage_rows = [
                     project_docker_stats[resource_id]
                     for resource_id in container_resource_ids
                     if resource_id in project_docker_stats
+                ]
+                server_running_count = sum(
+                    1
+                    for row in connection.execute(
+                        """
+                        SELECT d.server_definition_id FROM server_definitions d
+                        JOIN server_observations o USING(server_definition_id)
+                        WHERE d.repo_id = ?
+                          AND o.lifecycle IN ('running', 'starting', 'unhealthy')
+                        """,
+                        (repo_id,),
+                    )
+                    if str(row["server_definition_id"])
+                    in current_server_resource_ids
                 )
-                cpu_samples = [
-                    float(row["cpu_percent"])
-                    for row in usage_rows
-                    if row["cpu_percent"] is not None
-                ]
-                memory_samples = [
-                    int(row["memory_bytes"])
-                    for row in usage_rows
-                    if row["memory_bytes"] is not None
-                ]
+                docker_running_count = sum(
+                    1
+                    for resource_id in container_resource_ids
+                    if connection.execute(
+                        """
+                        SELECT 1 FROM docker_observations
+                        WHERE docker_resource_id = ?
+                          AND lifecycle IN ('running', 'starting', 'unhealthy')
+                        """,
+                        (resource_id,),
+                    ).fetchone()
+                    is not None
+                )
+                server_usage = _usage_part(
+                    server_usage_rows,
+                    resource_count=len(server_ids),
+                    process_count=server_running_count,
+                )
+                docker_usage = _usage_part(
+                    docker_usage_rows,
+                    resource_count=len(container_resource_ids),
+                    process_count=docker_running_count,
+                )
+                combined_usage = _combined_usage(server_usage, docker_usage)
                 compatibility_usage.append(
                     {
                         "usage_key": f"path:{repository['canonical_root']}",
@@ -2568,9 +3059,10 @@ class AccountStore(CoordinatorStore):
                         "server_ids": server_ids,
                         "container_names": container_names,
                         "container_resource_ids": container_resource_ids,
-                        "process_count": None,
-                        "cpu_percent": sum(cpu_samples) if cpu_samples else None,
-                        "memory_bytes": sum(memory_samples) if memory_samples else None,
+                        "process_count": combined_usage["process_count"],
+                        "cpu_percent": combined_usage["cpu_percent"],
+                        "memory_bytes": combined_usage["memory_bytes"],
+                        "usage": combined_usage,
                     }
                 )
             compatibility_urls = [
@@ -2647,6 +3139,9 @@ class AccountStore(CoordinatorStore):
                         (row["server_definition_id"],),
                     )
                 ]
+                server["supervision"] = worker_supervision_by_id.get(
+                    str(row["server_definition_id"])
+                )
                 server_resources.append(server)
             docker_resources = [
                 dict(row)
@@ -2710,6 +3205,9 @@ class AccountStore(CoordinatorStore):
                     ORDER BY l.port, l.lease_id
                     """
                 )
+                if row["server_definition_id"] is None
+                or str(row["server_definition_id"])
+                not in removed_runtime_server_ids
             ]
             port_assignments = [
                 dict(row)
@@ -2723,6 +3221,8 @@ class AccountStore(CoordinatorStore):
                     ORDER BY p.port, p.repo_id, p.server_name
                     """
                 )
+                if (str(row["repo_id"]), str(row["server_name"]))
+                not in removed_runtime_server_keys
             ]
             backup_evidence = [
                 dict(row)
@@ -2791,10 +3291,17 @@ class AccountStore(CoordinatorStore):
                     """
                 )
             ]
+            repository_trees = _repository_trees_projection(
+                connection,
+                repositories=repositories,
+                project_usage=compatibility_usage,
+                current_database_binding_ids=current_database_binding_ids,
+            )
             graph = {
                 "schema_version": 2,
                 "store": metadata,
                 "repositories": repositories,
+                "repository_trees": repository_trees,
                 "coordinator_sources": coordinator_sources,
                 "docker_engines": docker_engines,
                 "memberships": memberships,

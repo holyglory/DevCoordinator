@@ -122,7 +122,55 @@ test('lifecycle controls retain 44px mobile targets without widening archived ro
   const css = await fsp.readFile(new URL('../src/ui/app.css', import.meta.url), 'utf8');
   assert.match(css, /\.lifecycle-filter \.btn \{[^}]*min-height: 44px;/s);
   assert.match(css, /\.archive-actions \.btn \{ min-height: 44px; \}/);
-  assert.match(css, /\.iconbtn\[data-fk\^="archive:"\], #lifecycle-dialog-close \{\s*width: 44px;\s*height: 44px;/s);
+  assert.match(css, /\.iconbtn\[data-fk\^="archive:"\], \.iconbtn\[data-fk\^="worker-remove:"\], #lifecycle-dialog-close \{\s*width: 44px;\s*height: 44px;/s);
+  assert.match(css, /\.iconbtn\[data-fk\^="worker-remove:"\]/,
+    'worker removal must keep the same coarse-pointer target as archive controls');
   assert.match(css, /\.archive-row \{ grid-template-columns: minmax\(0, 1fr\); \}/,
     'narrow archived rows must stack instead of overflowing horizontally');
+});
+
+test('supervised workers expose exact crash evidence, policy controls and staged removal', async () => {
+  const app = await fsp.readFile(new URL('../src/ui/app.js', import.meta.url), 'utf8');
+  const css = await fsp.readFile(new URL('../src/ui/app.css', import.meta.url), 'utf8');
+  const index = await fsp.readFile(new URL('../src/ui/index.html', import.meta.url), 'utf8');
+  const status = extractFunction(app, 'function serverStatusMeta(s)');
+  const message = extractFunction(app, 'function workerCrashLoopMessage(supervision)');
+  const panel = extractFunction(app, 'function workerSupervisionPanel(s)');
+  const controls = extractFunction(app, 'function workerControlButtons(server, busy, prefix = \'srv\')');
+  const treeRow = extractFunction(app, 'function treeServerRow(o, s, hiddenRow)');
+  const dialog = extractFunction(app, 'function renderLifecycleDialog()');
+  const removal = extractFunction(app, 'async function submitLifecycleDialog()');
+
+  assert.match(status, /breaker\?\.state === 'tripped'/);
+  assert.match(status, /crash loop stopped/);
+  assert.match(message, /crash_count_in_window/);
+  assert.match(message, /window_seconds/);
+  assert.match(panel, /Keep alive/);
+  assert.match(panel, /Turning this off does not stop a worker that is already running/);
+  assert.match(panel, /\/api\/runtime\/artifacts\/worker_attempt\//);
+  assert.match(panel, /Retained crash traces/);
+  assert.match(controls, /Start and re-arm/);
+  assert.match(controls, /rearmCrashLoop: true/);
+  assert.match(controls, /desired state to stopped/);
+  assert.match(treeRow, /supervised \? 'worker' : 'server'/,
+    'the Projects tree must identify a supervised service as a worker');
+  assert.match(treeRow, /Keep alive on/,
+    'the Projects tree must disclose the worker restart policy');
+  assert.match(index, /project actions affect only the root runtime/,
+    'Projects help must state the exact root-only action boundary');
+  assert.match(css,
+    /\.tree-grid \{\s*grid-template-columns: 84px minmax\(0, 1fr\) 180px 180px 352px;/,
+    'the desktop running-count column must fit root-scope wording without entering actions');
+
+  assert.match(removal, /model\.action === 'worker-remove'/);
+  assert.match(dialog, /no-resurrection tombstone/,
+    'permanent removal must disclose retained safety and crash evidence');
+  assert.doesNotMatch(dialog, /deletes its retained coordinator record/,
+    'the UI must not claim retained tombstone and crash evidence is deleted');
+  assert.match(removal, /remove_plan_id = plan\.plan_id/);
+  assert.match(removal, /remove_plan_fingerprint = plan\.plan_fingerprint \|\| plan\.fingerprint/);
+  assert.match(removal, /model\.archivedInThisJourney = true;[\s\S]*model\.plan = null;[\s\S]*checkedPlan\(await workerRequest\(\)\)/,
+    'after archive the dialog may fetch only a new read-only plan');
+  assert.doesNotMatch(removal, /workerRequest\(model\.plan\)[\s\S]*workerRequest\(model\.plan\)/,
+    'one submit must never apply archive and permanent removal plans in sequence');
 });

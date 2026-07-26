@@ -16,6 +16,7 @@ import http.server
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import socket
 import socketserver
@@ -58,10 +59,16 @@ def private_file(path: Path, payload: str | bytes) -> Path:
     return path
 
 
-def executable_file(path: Path, payload: str) -> Path:
+def shell_executable_file(path: Path, body: str) -> Path:
+    """Create an executable fixture without depending on the test interpreter path."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(payload, encoding="utf-8")
+    path.write_text("#!/bin/sh\nset -eu\n" + body, encoding="utf-8")
     path.chmod(0o755)
+    require(
+        path.read_text(encoding="utf-8").splitlines()[0] == "#!/bin/sh",
+        "fixture executable must use the stable no-argument /bin/sh shebang",
+    )
     return path
 
 
@@ -107,6 +114,16 @@ def require_success(completed: subprocess.CompletedProcess[str], label: str) -> 
     require(
         completed.returncode == 0,
         f"{label} failed\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+    )
+
+
+def subprocess_diagnostics(completed: subprocess.CompletedProcess[str]) -> str:
+    """Keep a failed real-CLI boundary actionable instead of masking its cause."""
+
+    return (
+        f"returncode={completed.returncode}\n"
+        f"stdout:\n{completed.stdout}\n"
+        f"stderr:\n{completed.stderr}"
     )
 
 
@@ -677,11 +694,12 @@ while True:
         else:
             cgroup = "/system.slice/devops-console-cli-contract.service"
             listener_inode = "123456"
-        fake_systemctl = executable_file(
+        fake_systemctl = shell_executable_file(
             case / "fake-systemctl",
-            f"#!{sys.executable}\n"
-            "import sys\n"
-            f"sys.stdout.write('ActiveState=active\\nMainPID={child.pid}\\nControlGroup={cgroup}\\n')\n",
+            "printf '%s\\n' "
+            f"{shlex.quote('ActiveState=active')} "
+            f"{shlex.quote(f'MainPID={child.pid}')} "
+            f"{shlex.quote(f'ControlGroup={cgroup}')}\n",
         )
         inventory = current_registration_inventory(
             project=project,
@@ -743,7 +761,8 @@ while True:
             require(
                 completed.returncode == 1
                 and "cannot observe Console process identity" in completed.stderr,
-                "non-Linux registration CLI did not reach its procfs-specific post-parse outcome",
+                "non-Linux registration CLI did not reach its procfs-specific "
+                f"post-parse outcome\n{subprocess_diagnostics(completed)}",
             )
     finally:
         child.terminate()
@@ -846,13 +865,18 @@ def test_loaded_unit_evidence(root: Path) -> None:
     coordinator_file = private_file(case / "coordinator.show", coordinator_raw)
     console_file = private_file(case / "console.show", console_raw)
     bin_directory = private_directory(case / "bin")
-    executable_file(
+    shell_executable_file(
         bin_directory / "systemctl",
-        f"#!{sys.executable}\n"
-        "import os, pathlib, sys\n"
-        "unit = sys.argv[-1]\n"
-        "key = 'FAKE_COORDINATOR_SHOW' if unit == 'dev-coordinator.service' else 'FAKE_CONSOLE_SHOW'\n"
-        "sys.stdout.write(pathlib.Path(os.environ[key]).read_text(encoding='utf-8'))\n",
+        "unit=\n"
+        "for argument do\n"
+        "    unit=$argument\n"
+        "done\n"
+        "case $unit in\n"
+        "    dev-coordinator.service) show_file=$FAKE_COORDINATOR_SHOW ;;\n"
+        "    devops-console.service) show_file=$FAKE_CONSOLE_SHOW ;;\n"
+        "    *) printf '%s\\n' 'unexpected fixture unit' >&2; exit 64 ;;\n"
+        "esac\n"
+        "exec /bin/cat \"$show_file\"\n",
     )
     environment = os.environ.copy()
     environment["PATH"] = str(bin_directory) + os.pathsep + environment.get("PATH", "")
@@ -882,7 +906,8 @@ def test_loaded_unit_evidence(root: Path) -> None:
         require(
             completed.returncode == 1
             and "loaded systemd path preflight failed:" in completed.stderr,
-            "host without a compatible Linux manager did not reach a helper-specific post-parse outcome",
+            "host without a compatible Linux manager did not reach a helper-specific "
+            f"post-parse outcome\n{subprocess_diagnostics(completed)}",
         )
 
 

@@ -1080,10 +1080,14 @@ def _identity_path_permission(
             "source": "posix_acl",
             "permissions": "".join(value for value in "rwx" if value in permissions),
         }
-    try:
-        extended_acl = "system.posix_acl_access" in os.listxattr(path)
-    except OSError:
+    listxattr = getattr(os, "listxattr", None)
+    if listxattr is None:
         extended_acl = None
+    else:
+        try:
+            extended_acl = "system.posix_acl_access" in listxattr(path)
+        except OSError:
+            extended_acl = None
     if extended_acl is True:
         return {
             "allowed": None,

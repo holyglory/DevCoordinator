@@ -412,7 +412,7 @@ class CrashAtRenewalCheckpointCoordinator(EphemeralContainerCoordinator):
 class EphemeralFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
-            prefix="devcoordinator-ephemeral-", dir="/tmp"
+            prefix="devcoordinator-ephemeral-", dir=str(Path("/tmp").resolve())
         )
         self.root = Path(self.temporary.name)
         self.database = self.root / "coordinator.sqlite3"

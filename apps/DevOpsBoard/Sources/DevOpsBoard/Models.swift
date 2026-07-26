@@ -225,6 +225,7 @@ struct ManagedServer: Decodable, Identifiable, Hashable, Sendable {
     var portReused: Bool?
     var portReusedBy: PortReuseOwner?
     var processUsage: ProcessUsage?
+    var supervision: WorkerSupervision?
     var attribution: ResourceAttribution? = nil
     // Populated by the Board's repository catalog after source inventories
     // are reconciled. These are presentation/control facts, not coordinator
@@ -254,8 +255,143 @@ struct ManagedServer: Decodable, Identifiable, Hashable, Sendable {
         case portReused = "port_reused"
         case portReusedBy = "port_reused_by"
         case processUsage = "process_usage"
+        case supervision
         case attribution
     }
+}
+
+struct WorkerLogArtifact: Decodable, Hashable, Sendable, Identifiable {
+    var id: String { artifactID }
+    let artifactID: String
+    let path: String?
+    let sha256: String?
+
+    enum CodingKeys: String, CodingKey {
+        case artifactID = "artifact_id"
+        case path, sha256
+    }
+
+    var localURL: URL? {
+        guard let path,
+              path.hasPrefix("/"),
+              !artifactID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+}
+
+struct WorkerAttemptEvidence: Decodable, Hashable, Sendable, Identifiable {
+    var id: String { attemptID }
+    let attemptID: String
+    let state: String
+    let pid: Int?
+    let reservedAt: String?
+    let launchedAt: String?
+    let exitedAt: String?
+    let exitKind: String?
+    let exitCode: Int?
+    let exitSignal: Int?
+    let classification: String?
+    let expected: Bool?
+    let crashEventID: String?
+    let log: WorkerLogArtifact?
+
+    enum CodingKeys: String, CodingKey {
+        case attemptID = "attempt_id"
+        case state, pid
+        case reservedAt = "reserved_at"
+        case launchedAt = "launched_at"
+        case exitedAt = "exited_at"
+        case exitKind = "exit_kind"
+        case exitCode = "exit_code"
+        case exitSignal = "exit_signal"
+        case classification, expected
+        case crashEventID = "crash_event_id"
+        case log
+    }
+}
+
+struct WorkerCrashBreaker: Decodable, Hashable, Sendable {
+    let state: String
+    let crashLimit: Int
+    let windowSeconds: Int
+    let crashCountInWindow: Int
+    let trippedAt: String?
+    let reason: String?
+    let rearmedAt: String?
+    let rearmedBy: String?
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case crashLimit = "crash_limit"
+        case windowSeconds = "window_seconds"
+        case crashCountInWindow = "crash_count_in_window"
+        case trippedAt = "tripped_at"
+        case reason
+        case rearmedAt = "rearmed_at"
+        case rearmedBy = "rearmed_by"
+    }
+
+    var isTripped: Bool { state.lowercased() == "tripped" }
+}
+
+struct WorkerSupervision: Decodable, Hashable, Sendable {
+    let keepAlive: Bool
+    let desiredState: String
+    let state: String
+    let executionUID: Int?
+    let requestedBy: String?
+    let currentAttemptID: String?
+    let lastAttempt: WorkerAttemptEvidence?
+    let recentCrashes: [WorkerAttemptEvidence]
+    let recentCrashesTruncated: Bool
+    let breaker: WorkerCrashBreaker
+    let nextRestartAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case keepAlive = "keep_alive"
+        case desiredState = "desired_state"
+        case state
+        case executionUID = "execution_uid"
+        case requestedBy = "requested_by"
+        case currentAttemptID = "current_attempt_id"
+        case lastAttempt = "last_attempt"
+        case recentCrashes = "recent_crashes"
+        case recentCrashesTruncated = "recent_crashes_truncated"
+        case breaker
+        case nextRestartAt = "next_restart_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        keepAlive = try values.decodeIfPresent(Bool.self, forKey: .keepAlive) ?? false
+        desiredState = try values.decodeIfPresent(String.self, forKey: .desiredState) ?? "stopped"
+        state = try values.decodeIfPresent(String.self, forKey: .state) ?? "idle"
+        executionUID = try values.decodeIfPresent(Int.self, forKey: .executionUID)
+        requestedBy = try values.decodeIfPresent(String.self, forKey: .requestedBy)
+        currentAttemptID = try values.decodeIfPresent(String.self, forKey: .currentAttemptID)
+        lastAttempt = try values.decodeIfPresent(WorkerAttemptEvidence.self, forKey: .lastAttempt)
+        recentCrashes = try values.decodeIfPresent([WorkerAttemptEvidence].self, forKey: .recentCrashes) ?? []
+        recentCrashesTruncated = try values.decodeIfPresent(Bool.self, forKey: .recentCrashesTruncated) ?? false
+        breaker = try values.decode(WorkerCrashBreaker.self, forKey: .breaker)
+        nextRestartAt = try values.decodeIfPresent(String.self, forKey: .nextRestartAt)
+    }
+
+    var isCrashLoopStopped: Bool { breaker.isTripped }
+
+    var crashLoopMessage: String {
+        let count = breaker.crashCountInWindow
+        let window = workerDurationLabel(seconds: breaker.windowSeconds)
+        return "Crash loop stopped — \(count) crash\(count == 1 ? "" : "es") in \(window)"
+    }
+}
+
+func workerDurationLabel(seconds: Int) -> String {
+    if seconds > 0, seconds.isMultiple(of: 60) {
+        let minutes = seconds / 60
+        return "\(minutes) min"
+    }
+    return "\(max(0, seconds)) sec"
 }
 
 enum AttributionReasonCode: String, Codable, Hashable, Sendable {
@@ -2051,6 +2187,12 @@ enum ActionKind: String, Codable, Hashable, Sendable {
     case startServer
     case stopServer
     case restartServer
+    case startWorker
+    case stopWorker
+    case restartWorker
+    case setWorkerKeepAlive
+    case workerRemovalPlan
+    case workerRemovalApply
     case serverLogs
     case startDocker
     case stopDocker

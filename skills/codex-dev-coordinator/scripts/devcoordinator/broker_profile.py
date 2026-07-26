@@ -119,6 +119,17 @@ class BrokerRepositoryProfile:
             )
         return value
 
+    def require_server_id(self, resource_id: str) -> str:
+        """Require an exact opaque server ID already present in this enrollment."""
+
+        candidate = str(resource_id)
+        if candidate not in self.server_ids.values():
+            raise BrokerProfileError(
+                f"server identity {candidate!r} is not enrolled with the host coordinator broker; "
+                "rerun Coordinator skill installation as the host administrator"
+            )
+        return candidate
+
     def container_id(self, identity: str) -> str:
         value = self.container_ids.get(str(identity))
         if value is None:
@@ -212,6 +223,28 @@ class BrokerClientProfile:
         value.require_account(account_id=self.account_id)
         return value
 
+    def repository_for_server_id(self, server_id: str) -> BrokerRepositoryProfile:
+        """Resolve one fixed runner ID only through current protected enrollments."""
+
+        candidate = str(server_id)
+        matches: list[BrokerRepositoryProfile] = []
+        for repository in self.repositories.values():
+            try:
+                repository.require_current(account_id=self.account_id)
+            except BrokerProfileError:
+                continue
+            if candidate in repository.server_ids.values():
+                matches.append(repository)
+        if not matches:
+            raise BrokerProfileError(
+                f"server identity {candidate!r} is not present in a current host broker enrollment"
+            )
+        if len(matches) != 1:
+            raise BrokerProfileError(
+                f"server identity {candidate!r} is ambiguous across protected repository enrollments"
+            )
+        return matches[0]
+
     def call(
         self,
         *,
@@ -237,6 +270,35 @@ class BrokerClientProfile:
             service=self.service,
             account_id=self.account_id,
             repo_id=repository.repo_id,
+            repository_generation=repository.generation,
+            resource_id=resource_id,
+            operation=operation,
+            arguments=arguments,
+            operation_id=operation_id,
+        )
+
+    def worker_call(
+        self,
+        *,
+        repository: BrokerRepositoryProfile,
+        server_id: str,
+        operation: BrokerOperation,
+        arguments: Optional[Mapping[str, Any]] = None,
+        operation_id: Optional[str] = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Call only the fixed worker protocol for one exactly enrolled server."""
+
+        if operation not in {
+            BrokerOperation.WORKER_LAUNCH_TICKET,
+            BrokerOperation.WORKER_LAUNCHED,
+            BrokerOperation.WORKER_EXIT,
+            BrokerOperation.WORKER_POLICY_READ,
+            BrokerOperation.WORKER_ATTEMPT_READ,
+        }:
+            raise ValueError("operation is not a worker broker operation")
+        resource_id = repository.require_server_id(server_id)
+        return self.call(
+            repository=repository,
             resource_id=resource_id,
             operation=operation,
             arguments=arguments,
@@ -318,12 +380,14 @@ def call_broker(
     repo_id: str,
     resource_id: str,
     operation: BrokerOperation,
+    repository_generation: int = 0,
     arguments: Optional[Mapping[str, Any]] = None,
     operation_id: Optional[str] = None,
 ) -> tuple[str, dict[str, Any]]:
     request = BrokerRequest.create(
         account_id=account_id,
         project_id=repo_id,
+        repository_generation=repository_generation,
         resource_id=resource_id,
         operation=operation,
         arguments=arguments,

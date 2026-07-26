@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -20,6 +20,8 @@ from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.store import CoordinatorStore
 from devcoordinator.test_records import CoordinatorTestRecords
 from devcoordinator.test_runner import TestHarnessError, load_manifest
+
+UTC = timezone.utc
 
 
 class UniversalTestHarnessTests(unittest.TestCase):

@@ -9,10 +9,19 @@ fixtures and their provenance are documented in `design-qa.md`.
 The production store decodes only the coordinator's schema-v2 repository and
 resource graph. One canonical worktree is one project regardless of imported
 source provenance. Legacy homes are migration evidence rather than Board data
-sources, name-only evidence stays in one Unassigned Resources group, and every
-mutation uses an exact normalized control binding. A refresh performs one
-coalesced observation and then reads its committed snapshot; cached content
-remains visible during later scheduled observations.
+sources. With authoritative `repository_trees`, ownership failures are
+actionable diagnostics rather than synthetic projects. A tree-absent payload
+renders an explicit incompatible-Coordinator state; the Board never rebuilds
+projects or an Unassigned Resources node from names or paths. The Board renders
+each original root repo with its direct services and nested temporary repos;
+temporary scopes retain their TTL and `KillAfterRun` policy, and root actions
+do not act on them. Supervised workers expose explicit start, stop, restart,
+crash-loop rearm, Keep Alive, and review-first permanent removal. Turning Keep
+Alive off does not stop a running worker; a removed worker stays absent until
+the Coordinator explicitly reinstalls it. Every mutation uses an exact
+normalized control binding. A refresh performs one coalesced observation and
+then reads its committed snapshot; cached content remains visible during later
+scheduled observations.
 
 ## Agent workflow
 

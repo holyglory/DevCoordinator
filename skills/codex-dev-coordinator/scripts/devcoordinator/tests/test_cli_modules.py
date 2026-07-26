@@ -19,6 +19,7 @@ from devcoordinator.broker import BrokerError, BrokerOperation, UnixBrokerServer
 from devcoordinator.broker_cli import add_broker_parser, handle_broker_cli, serve_broker
 from devcoordinator.lifecycle_cli import add_lifecycle_parsers
 from devcoordinator.store import CoordinatorStore, utc_timestamp
+from devcoordinator.tests.test_broker import CanonicalTemporaryDirectory
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1175,6 +1176,30 @@ class LifecycleParserContractTests(unittest.TestCase):
         commands = (
             ["repository", "list-removed", "--compact-json"],
             [
+                "cleanup",
+                "plan-remove",
+                "--target-kind",
+                "server",
+                "--target-id",
+                "server-id",
+                "--agent",
+                "codex",
+                "--reason",
+                "obsolete",
+            ],
+            [
+                "cleanup",
+                "remove",
+                "--plan-id",
+                "cleanup-plan",
+                "--plan-fingerprint",
+                "sha256:cleanup-plan",
+                "--confirm",
+                "REMOVE server server-id",
+                "--agent",
+                "codex",
+            ],
+            [
                 "resource",
                 "plan-retire",
                 "--resource-kind",
@@ -1208,6 +1233,8 @@ class LifecycleParserContractTests(unittest.TestCase):
             [(item.group, item.action) for item in parsed],
             [
                 ("repository", "list-removed"),
+                ("cleanup", "plan-remove"),
+                ("cleanup", "remove"),
                 ("resource", "plan-retire"),
                 ("broker", "serve"),
             ],
@@ -1858,6 +1885,16 @@ class BrokerCLIContractTests(unittest.TestCase):
                 self.fenced = False
                 self.begin_shutdown_calls = 0
 
+            def reconcile_workers_on_startup(self) -> dict[str, object]:
+                events.append("workers-reconciled")
+                return {
+                    "ok": True,
+                    "supervisor_epoch": "epoch-a",
+                    "fenced_old_runners": [],
+                    "started": [],
+                    "errors": [],
+                }
+
             def begin_shutdown(self) -> int:
                 self.begin_shutdown_calls += 1
                 self.fenced = True
@@ -1906,7 +1943,12 @@ class BrokerCLIContractTests(unittest.TestCase):
 
         self.assertEqual(
             events,
-            ["server-started", "mutation-fenced", "runtime-closed"],
+            [
+                "workers-reconciled",
+                "server-started",
+                "mutation-fenced",
+                "runtime-closed",
+            ],
         )
         self.assertEqual(runtime.begin_shutdown_calls, 1)
         (
@@ -1936,6 +1978,16 @@ class BrokerCLIContractTests(unittest.TestCase):
                 self.persistence = mock.Mock()
                 self.backend = mock.Mock()
                 self.begin_shutdown_calls = 0
+
+            def reconcile_workers_on_startup(self) -> dict[str, object]:
+                events.append("workers-reconciled")
+                return {
+                    "ok": True,
+                    "supervisor_epoch": "epoch-a",
+                    "fenced_old_runners": [],
+                    "started": [],
+                    "errors": [],
+                }
 
             def begin_shutdown(self) -> int:
                 if not admission_lock.acquire(blocking=False):
@@ -2013,6 +2065,7 @@ class BrokerCLIContractTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
+                "workers-reconciled",
                 "server-started",
                 "mutation-fenced",
                 "drain-started",
@@ -2023,11 +2076,7 @@ class BrokerCLIContractTests(unittest.TestCase):
     def test_serve_reclaims_only_proven_dead_socket_under_real_service_lock(self) -> None:
         events: list[str] = []
         handlers: dict[int, object] = {}
-        with tempfile.TemporaryDirectory(
-            prefix=".broker-lexical-reclaim-",
-            dir=str(Path.home().resolve()),
-        ) as raw_root:
-            root = Path(raw_root).resolve()
+        with CanonicalTemporaryDirectory() as root:
             runtime_directory = root / "runtime"
             runtime_directory.mkdir(mode=0o750)
             os.chmod(runtime_directory, 0o750)
@@ -2072,6 +2121,16 @@ class BrokerCLIContractTests(unittest.TestCase):
                     self.persistence = mock.Mock()
                     self.backend = mock.Mock()
                     self.begin_shutdown_calls = 0
+
+                @staticmethod
+                def reconcile_workers_on_startup() -> dict[str, object]:
+                    return {
+                        "ok": True,
+                        "supervisor_epoch": "socket-reclaim-test",
+                        "fenced_old_runners": [],
+                        "started": [],
+                        "errors": [],
+                    }
 
                 def begin_shutdown(self) -> int:
                     self.begin_shutdown_calls += 1
@@ -2128,11 +2187,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve sibling")
 
     def test_serve_lexical_recovery_failure_guards_leave_paths_untouched(self) -> None:
-        with tempfile.TemporaryDirectory(
-            prefix=".broker-lexical-guards-",
-            dir=str(Path.home().resolve()),
-        ) as raw_root:
-            root = Path(raw_root).resolve()
+        with CanonicalTemporaryDirectory() as root:
             runtime_directory = root / "runtime"
             runtime_directory.mkdir(mode=0o750)
             os.chmod(runtime_directory, 0o750)
@@ -2164,6 +2219,16 @@ class BrokerCLIContractTests(unittest.TestCase):
                         self.server = server
                         self.persistence = mock.Mock()
                         self.backend = mock.Mock()
+
+                    @staticmethod
+                    def reconcile_workers_on_startup() -> dict[str, object]:
+                        return {
+                            "ok": True,
+                            "supervisor_epoch": "socket-guard-test",
+                            "fenced_old_runners": [],
+                            "started": [],
+                            "errors": [],
+                        }
 
                     def begin_shutdown(self) -> int:
                         return 1

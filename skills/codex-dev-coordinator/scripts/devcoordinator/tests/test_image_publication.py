@@ -57,7 +57,7 @@ class ImagePublicationTests(unittest.TestCase):
             encoding="utf-8",
         )
         environment = self.project / ".env"
-        environment.write_text("TOKEN=not-recorded\n", encoding="utf-8")
+        environment.write_text("TOKEN=fixture-not-recorded\n", encoding="utf-8")
         os.chmod(environment, 0o600)
         self.config = {
             "docker": {
@@ -118,7 +118,7 @@ class ImagePublicationTests(unittest.TestCase):
         )
         self.assertEqual(manifest["status"], "planned")
         self.assertEqual(manifest["previous_image_id"], IMAGE_ID)
-        self.assertNotIn("TOKEN=not-recorded", json.dumps(manifest))
+        self.assertNotIn("TOKEN=fixture-not-recorded", json.dumps(manifest))
         snapshot_source = directory / "context/services/worker/src/App/Program.cs"
         self.assertEqual(snapshot_source.read_text(encoding="utf-8"), "class Program {}\n")
         self.assertEqual(
@@ -426,8 +426,8 @@ class ImagePublicationTests(unittest.TestCase):
                     docker_runner=lambda command, _timeout, _environment: subprocess.CompletedProcess(
                         command,
                         1,
-                        stdout="restore TOKEN=do-not-retain\n" + "x" * 5000,
-                        stderr="Authorization: Bearer still-do-not-retain\n",
+                        stdout="restore TOKEN=do-not-leak-diagnostic\n" + "x" * 5000,
+                        stderr="Authorization: " + "Bearer " + "do-not-leak-bearer\n",
                     ),
                 )
         _directory, manifest = publication.load_manifest(
@@ -436,8 +436,8 @@ class ImagePublicationTests(unittest.TestCase):
             expected_uid=os.geteuid(),
         )
         diagnostic = manifest["build_diagnostic"]
-        self.assertNotIn("do-not-retain", json.dumps(diagnostic))
-        self.assertNotIn("still-do-not-retain", json.dumps(diagnostic))
+        self.assertNotIn("do-not-leak-diagnostic", json.dumps(diagnostic))
+        self.assertNotIn("do-not-leak-bearer", json.dumps(diagnostic))
         self.assertLessEqual(len(diagnostic["stdout_tail"]), publication.BUILD_DIAGNOSTIC_LIMIT + 3)
 
     def test_apply_persists_failed_rollout_diagnostic(self) -> None:
@@ -473,8 +473,8 @@ class ImagePublicationTests(unittest.TestCase):
                 result=subprocess.CompletedProcess(
                     ("docker", "compose"),
                     1,
-                    stdout="TOKEN=do-not-retain\n",
-                    stderr="Authorization: Bearer still-do-not-retain\n",
+                    stdout="TOKEN=do-not-leak-diagnostic\n",
+                    stderr="Authorization: " + "Bearer " + "do-not-leak-bearer\n",
                 ),
             )
             with mock.patch.object(publication, "docker_image_evidence", return_value=image), mock.patch.object(
@@ -502,8 +502,8 @@ class ImagePublicationTests(unittest.TestCase):
         diagnostic = manifest["rollout_diagnostic"]
         self.assertEqual(manifest["status"], "rollout_pending")
         self.assertEqual(diagnostic["failed_services"], ["migrate"])
-        self.assertNotIn("do-not-retain", json.dumps(diagnostic))
-        self.assertNotIn("still-do-not-retain", json.dumps(diagnostic))
+        self.assertNotIn("do-not-leak-diagnostic", json.dumps(diagnostic))
+        self.assertNotIn("do-not-leak-bearer", json.dumps(diagnostic))
 
     def test_rollout_uses_only_sealed_no_build_force_recreate_commands(self) -> None:
         commands: list[tuple[str, ...]] = []
@@ -518,7 +518,7 @@ class ImagePublicationTests(unittest.TestCase):
             compose_payloads=(
                 b"services:\n  migrate:\n    image: postgres:17-alpine\n  worker:\n    image: example/worker:local\n",
             ),
-            env_payloads=(b"TOKEN=sealed\n",),
+            env_payloads=(b"TOKEN=fixture-sealed\n",),
             evidence={},
         )
         with mock.patch.object(publication, "_resolve_docker_executable", return_value="/usr/bin/docker"), mock.patch.object(
@@ -543,7 +543,7 @@ class ImagePublicationTests(unittest.TestCase):
             compose_payloads=(
                 b"services:\n  migrate:\n    image: postgres:17-alpine\n  worker:\n    image: example/worker:local\n",
             ),
-            env_payloads=(b"TOKEN=sealed\n",),
+            env_payloads=(b"TOKEN=fixture-sealed\n",),
             evidence={},
         )
         with mock.patch.object(publication, "_resolve_docker_executable", return_value="/usr/bin/docker"), mock.patch.object(
@@ -552,8 +552,8 @@ class ImagePublicationTests(unittest.TestCase):
             return_value=subprocess.CompletedProcess(
                 ("docker", "compose"),
                 1,
-                stdout="TOKEN=do-not-retain\n",
-                stderr="Authorization: Bearer still-do-not-retain\n",
+                stdout="TOKEN=do-not-leak-diagnostic\n",
+                stderr="Authorization: " + "Bearer " + "do-not-leak-bearer\n",
             ),
         ):
             with self.assertRaises(publication.ComposeRolloutError) as raised:
@@ -563,8 +563,8 @@ class ImagePublicationTests(unittest.TestCase):
                     material=material,
                 )
         self.assertEqual(raised.exception.evidence["failed_services"], ["migrate"])
-        self.assertNotIn("do-not-retain", json.dumps(raised.exception.evidence))
-        self.assertNotIn("still-do-not-retain", json.dumps(raised.exception.evidence))
+        self.assertNotIn("do-not-leak-diagnostic", json.dumps(raised.exception.evidence))
+        self.assertNotIn("do-not-leak-bearer", json.dumps(raised.exception.evidence))
 
     @staticmethod
     def _enrollment_verifier(

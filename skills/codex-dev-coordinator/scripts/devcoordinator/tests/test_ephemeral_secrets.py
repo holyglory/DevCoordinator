@@ -47,7 +47,7 @@ class _Clock:
 class VolatileSecretManagerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
-            prefix="devcoordinator-ephemeral-secret-", dir="/tmp"
+            prefix="devcoordinator-ephemeral-secret-", dir=str(Path("/tmp").resolve())
         )
         self.root = Path(self.temporary.name)
         self.root.chmod(0o700)
@@ -404,7 +404,8 @@ class SecretPolicyEnrollmentTests(unittest.TestCase):
         """Existing service stores gain the typed operation without a reset."""
 
         with tempfile.TemporaryDirectory(
-            prefix="devcoordinator-secret-acl-migration-", dir="/tmp"
+            prefix="devcoordinator-secret-acl-migration-",
+            dir=str(Path("/tmp").resolve()),
         ) as temporary:
             database = Path(temporary) / "coordinator.sqlite3"
             persistence = BrokerPersistence(database, expected_uid=os.geteuid())

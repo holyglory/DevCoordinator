@@ -307,6 +307,17 @@ test('schema-v2 inventory projects only its declared v1 compatibility rows for C
   const payload = {
     schema_version: 2,
     repositories: [{ repo_id: 'repo-1', canonical_root: '/repo' }],
+    repository_trees: [{
+      family_id: 'family-1',
+      root_repository: { repo_id: 'repo-1', canonical_root: '/repo', display_name: 'Repo' },
+      usage: { cpu_percent: 1, memory_bytes: 1024, process_count: 1 },
+      scopes: [{
+        repo_id: 'repo-1', kind: 'root', canonical_root: '/repo', display_name: 'Repo',
+        run_id: null, expires_at: null, kill_after_run: false,
+        usage: { cpu_percent: 1, memory_bytes: 1024, process_count: 1 },
+        server_ids: ['server-1'], container_resource_ids: [], database_binding_ids: [],
+      }],
+    }],
     leases: [normalizedLease],
     port_assignments: [normalizedAssignment],
     v1_compatibility: compatibility,
@@ -328,6 +339,8 @@ test('schema-v2 inventory projects only its declared v1 compatibility rows for C
     'control-only definitions must not enter Console project membership');
   assert.deepEqual(inventory.repositories, payload.repositories,
     'the Console projection must retain non-conflicting normalized evidence');
+  assert.deepEqual(inventory.repository_trees, payload.repository_trees,
+    'the authoritative repository hierarchy must survive the compatibility projection unchanged');
   assert.deepEqual(inventory.v1_compatibility, compatibility,
     'the wire compatibility object must remain available and unmodified');
   assert.equal(inventory.leases[0].lease_id, undefined);

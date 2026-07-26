@@ -207,8 +207,24 @@ def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="coordinator-multi-runtime-test-")).resolve(strict=True)
     try:
         project = root / "project"
-        project.mkdir()
-        (project / ".git").mkdir()
+        project.mkdir(mode=0o700)
+        git = "/usr/bin/git" if Path("/usr/bin/git").is_file() else "/bin/git"
+        subprocess.run(
+            [git, "init", "-q", str(project)],
+            env={
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "HOME": str(root),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=10,
+        )
         empty_path = root / "empty-path"
         empty_path.mkdir()
         wrapper = root / "coordinator-wrapper.py"
@@ -224,14 +240,32 @@ def main() -> int:
             "CODEX_AGENT_COORDINATOR_TOKEN_FILE",
             "COORDINATOR_TEST_START_BARRIER",
             "COORDINATOR_TEST_START_BARRIER_COUNT",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG",
             "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_PARAMETERS",
             "GIT_CONFIG_SYSTEM",
+            "GIT_DIR",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_EXEC_PATH",
+            "GIT_GRAFT_FILE",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
+            "GIT_TEMPLATE_DIR",
+            "GIT_WORK_TREE",
         ):
             base_environment.pop(key, None)
+        for key in tuple(base_environment):
+            if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+                base_environment.pop(key, None)
         base_environment.update(
             {
                 "PATH": str(empty_path),
-                "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_NOSYSTEM": "1",
                 # This fixture exercises the explicit isolated-account
                 # compatibility topology. Product default is server-wide.

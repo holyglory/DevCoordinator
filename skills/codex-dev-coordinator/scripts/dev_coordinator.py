@@ -38,7 +38,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, urlparse
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
@@ -126,11 +126,64 @@ from devcoordinator.observation_freshness import (
     capture_observation_freshness_fence,
     require_exact_fresh_observation,
 )
+from devcoordinator.repository_context import (
+    RepositoryScopeIdentity,
+    find_repository_id_by_filesystem_identity,
+    persist_repository_context,
+    resolve_effective_repository_context,
+    resolve_repository_context,
+)
+from devcoordinator.runtime_api import (
+    MAX_RUNTIME_TTL_SECONDS,
+    RuntimeCallbacks,
+    RuntimeRequestError,
+    execute_runtime_request,
+    reject_unsupported_safe_replace,
+    validate_runtime_terminal_state,
+    validate_runtime_request,
+)
+from devcoordinator.runtime_cli import (
+    add_runtime_cli_arguments,
+    load_runtime_cli_request,
+    runtime_cli_error_context,
+)
+from devcoordinator.runtime_sessions import (
+    next_runtime_cleanup_at,
+    reap_expired_runtime_sessions,
+)
+from devcoordinator.runtime_redaction import (
+    redact_runtime_value,
+    runtime_secret_values,
+)
+from devcoordinator.runtime_artifacts import (
+    RUNTIME_LOG_MAX_BYTES,
+    RUNTIME_LOG_MAX_LINES,
+    load_latest_runtime_log_artifact,
+    load_runtime_log_artifact,
+    persist_runtime_log_artifact,
+)
+from devcoordinator.runtime_report import build_runtime_report
+from devcoordinator.worker_artifacts import worker_log_directory
+from devcoordinator.worker_control import (
+    WorkerController,
+    WorkerReplaceError,
+)
+from devcoordinator.worker_runner import (
+    BrokerWorkerAuthority,
+    DirectWorkerAuthority,
+    WorkerAuthorityBlocked,
+    add_worker_cli_parser,
+    worker_runner_cli_result,
+)
+from devcoordinator.worker_supervision import WorkerSupervision
+from devcoordinator.worker_cleanup import unregister_workers_for_plan
 
 
 VERSION = 2
 NORMALIZED_SCHEMA_VERSION = 2
 NORMALIZED_DATABASE_NAME = "coordinator.sqlite3"
+RUNTIME_REAPER_WAKE = threading.Event()
+RUNTIME_CLEANUP_AGENT = "runtime-session-cleanup"
 STATE_BACKEND_ENV = "DEVCOORDINATOR_STATE_BACKEND"
 AUTHORITY_ENV = "DEVCOORDINATOR_AUTHORITY"
 SYSTEM_AUTHORITY_ROOT = Path(
@@ -150,6 +203,7 @@ DEFAULT_RANGE = "3000-3999"
 DEFAULT_TTL_SECONDS = 8 * 60 * 60
 DEFAULT_API_PORT = 29876
 API_BODY_LIMIT_BYTES = 64 * 1024
+RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024
 API_MAX_CONCURRENT_REQUESTS = 16
 API_REQUEST_TIMEOUT_SECONDS = 10
 API_TOKEN_MAX_BYTES = 4096
@@ -2723,8 +2777,7 @@ _GUARD_ONLY_LIFECYCLE_ADAPTER = _GuardOnlyLifecycleAdapter()
 
 
 def _local_normalized_host_id() -> str:
-    machine = f"{platform.system()}\x1f{platform.node()}\x1f{socket.gethostname()}"
-    return deterministic_id("host", hashlib.sha256(machine.encode("utf-8")).hexdigest())
+    return AccountStore.local_host_id()
 
 
 def _strict_git_repository_root(project: str) -> Path:
@@ -2830,7 +2883,9 @@ def _mark_first_normalized_action(store: AccountStore) -> None:
         )
 
 
-def resolve_or_install_repository_for_action(store: AccountStore, project: str) -> str:
+def resolve_or_install_repository_for_action(
+    store: AccountStore, scope: RepositoryScopeIdentity
+) -> str:
     """Resolve one repository, installing only a never-before-seen Git root.
 
     Existing rows are returned unchanged. In particular, this helper never
@@ -2838,7 +2893,7 @@ def resolve_or_install_repository_for_action(store: AccountStore, project: str) 
     repository; only the explicit lifecycle reinstall journey may do that.
     """
 
-    root = _strict_git_repository_root(project)
+    root = _strict_git_repository_root(scope.canonical_root)
     host_id = _local_normalized_host_id()
     with store.read_transaction() as connection:
         existing = connection.execute(
@@ -2859,6 +2914,13 @@ def resolve_or_install_repository_for_action(store: AccountStore, project: str) 
     timestamp = utc_timestamp()
     repo_id = deterministic_id("repository", host_id, str(root))
     with store.immediate_transaction() as connection:
+        identity_match = find_repository_id_by_filesystem_identity(
+            connection,
+            host_id=host_id,
+            scope=scope,
+        )
+        if identity_match is not None:
+            return identity_match
         # Recheck under the writer boundary. A concurrently created row may
         # already carry a decommission fence and must never be overwritten.
         current = connection.execute(
@@ -3036,14 +3098,32 @@ def normalized_repository_action_guard(
             return
     with _open_normalized_action_store() as store:
         _require_normalized_bootstrap_before_mutation(store)
+        # Preserve the existing fence-first boundary for a known effective
+        # worktree. Discovery of its primary worktree invokes trusted Git and
+        # happens only after an already-disabled effective repository fails.
         _precheck_normalized_repository_action(
-            store,
-            project=canonical,
-            action=action,
+            store, project=canonical, action=action
         )
         if preflight is not None:
             preflight(store)
-        repo_id = resolve_or_install_repository_for_action(store, canonical)
+        context = resolve_effective_repository_context(project=canonical)
+        if context.effective.canonical_root != canonical:
+            raise ActionFencedError(
+                "repository effective worktree changed during action admission"
+            )
+        if context.temporary is not None:
+            _precheck_normalized_repository_action(
+                store, project=context.root.canonical_root, action=action
+            )
+        root_repo_id = resolve_or_install_repository_for_action(store, context.root)
+        repo_id = resolve_or_install_repository_for_action(store, context.effective)
+        persist_repository_context(
+            store,
+            context,
+            root_repo_id=root_repo_id,
+            effective_repo_id=repo_id,
+            timestamp=utc_timestamp(),
+        )
         lifecycle = RepositoryLifecycle(
             SQLiteLifecyclePersistence(store),
             (
@@ -11677,7 +11757,7 @@ def latest_fresh_observation(
             SELECT snapshot_id, material_fingerprint, completed_at
             FROM observation_snapshots
             WHERE host_id = ? AND observer_domain = ? AND status = 'completed'
-            ORDER BY completed_at DESC LIMIT 1
+            ORDER BY completed_at DESC, rowid DESC LIMIT 1
             """,
             (host_id, observer_domain),
         ).fetchone()
@@ -11901,7 +11981,37 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
             )
         else:
             outcome = fresh
-        metadata = store.metadata
+        with store.read_transaction() as connection:
+            metadata = connection.execute(
+                """
+                SELECT state_revision, observation_revision
+                FROM schema_metadata WHERE singleton = 1
+                """
+            ).fetchone()
+            capability = connection.execute(
+                """
+                SELECT docker_available, capability_fingerprint, committed_at
+                FROM observation_capabilities
+                WHERE snapshot_id = ? AND observer_domain = ?
+                """,
+                (outcome.snapshot_id, outcome.observer_domain),
+            ).fetchone()
+            latest = connection.execute(
+                """
+                SELECT snapshot_id FROM observation_snapshots
+                WHERE host_id = ? AND observer_domain = ? AND status = 'completed'
+                ORDER BY completed_at DESC, rowid DESC LIMIT 1
+                """,
+                (outcome.host_id, outcome.observer_domain),
+            ).fetchone()
+        if metadata is None or capability is None:
+            raise RuntimeError(
+                "completed host observation lacks committed capability evidence"
+            )
+        if latest is None or str(latest["snapshot_id"]) != outcome.snapshot_id:
+            raise RuntimeError(
+                "host observation was superseded before its evidence was returned"
+            )
         return {
             "schema_version": NORMALIZED_SCHEMA_VERSION,
             "status": "completed" if observed else "fresh",
@@ -11911,12 +12021,15 @@ def coordinated_observe_host(options: dict[str, Any]) -> dict[str, Any]:
             "host_id": outcome.host_id,
             "observer_domain": outcome.observer_domain,
             "material_fingerprint": outcome.material_fingerprint,
+            "docker_available": bool(capability["docker_available"]),
+            "capability_fingerprint": str(capability["capability_fingerprint"]),
+            "capability_committed_at": str(capability["committed_at"]),
             "completed_at": outcome.completed_at,
             "max_age_seconds": max_age_seconds,
             "request": {"agent": agent, "project": project},
             "imported": imported,
-            "state_revision": metadata.state_revision,
-            "observation_revision": metadata.observation_revision,
+            "state_revision": int(metadata["state_revision"]),
+            "observation_revision": int(metadata["observation_revision"]),
         }
 
 
@@ -13819,7 +13932,24 @@ def status_server(state: dict[str, Any], options: dict[str, Any]) -> dict[str, A
 def tail_text(path: Path, lines: int) -> str:
     if not path.exists():
         return ""
-    content = path.read_text(encoding="utf-8", errors="replace")
+    maximum_bytes = 1024 * 1024
+    chunks: list[bytes] = []
+    captured = 0
+    newline_count = 0
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        while position > 0 and captured < maximum_bytes:
+            size = min(64 * 1024, position, maximum_bytes - captured)
+            position -= size
+            handle.seek(position)
+            chunk = handle.read(size)
+            chunks.append(chunk)
+            captured += len(chunk)
+            newline_count += chunk.count(b"\n")
+            if lines > 0 and newline_count > lines:
+                break
+    content = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
     if lines <= 0:
         return content
     return "\n".join(content.splitlines()[-lines:])
@@ -15652,6 +15782,2122 @@ def coordinated_relocate_port_assignment(options: dict[str, Any]) -> dict[str, A
             )
 
 
+def _runtime_service_start_options(
+    request: dict[str, Any], project: str
+) -> dict[str, Any]:
+    options = request["options"]
+    prepared: dict[str, Any] = {
+        "agent": request["agent"],
+        "project": project,
+        "name": request["target"]["name"],
+        "cwd": options.get("cwd") or project,
+        "argv": options.get("argv"),
+        "ttl": int(request.get("ttl_seconds") or DEFAULT_TTL_SECONDS),
+        "host": options.get("host") or "127.0.0.1",
+        "health_timeout": float(options.get("health_timeout") or 10),
+    }
+    for key in ("preferred", "range", "health_url"):
+        if options.get(key) is not None:
+            prepared[key] = options[key]
+    if options.get("env") is not None:
+        prepared["env"] = [
+            f"{key}={value}" for key, value in sorted(options["env"].items())
+        ]
+    return prepared
+
+
+def _runtime_existing_service_start_options(
+    *, project: str, name: str, agent: str
+) -> dict[str, Any]:
+    with AccountStore.open_default(coordinator_home()) as store:
+        with store.read_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT d.server_definition_id, d.cwd, d.health_url_template,
+                       p.port
+                FROM server_definitions d
+                LEFT JOIN port_assignments p
+                  ON p.repo_id = d.repo_id AND p.server_name = d.name
+                 AND p.status = 'active'
+                JOIN repositories r USING(repo_id)
+                WHERE r.canonical_root = ? AND d.name = ?
+                """,
+                (project, name),
+            ).fetchone()
+            if row is None:
+                raise KeyError("matching service definition not found")
+            arguments = [
+                str(item[0])
+                for item in connection.execute(
+                    """
+                    SELECT argument FROM server_command_arguments
+                    WHERE server_definition_id = ? ORDER BY ordinal
+                    """,
+                    (row["server_definition_id"],),
+                )
+            ]
+            environment = [
+                f"{item['name']}={item['value']}"
+                for item in connection.execute(
+                    """
+                    SELECT name, value FROM server_environment
+                    WHERE server_definition_id = ? ORDER BY name
+                    """,
+                    (row["server_definition_id"],),
+                )
+                if str(item["name"]) not in {"PORT", "HOST"}
+            ]
+    if not arguments:
+        raise RuntimeError("service definition has no restartable argv")
+    prepared: dict[str, Any] = {
+        "agent": agent,
+        "project": project,
+        "name": name,
+        "cwd": str(row["cwd"]),
+        "argv": arguments,
+        "health_url": row["health_url_template"],
+        "health_timeout": 10,
+        "env": environment,
+    }
+    if row["port"] is not None:
+        prepared["preferred"] = int(row["port"])
+        prepared["range"] = f"{int(row['port'])}-{int(row['port'])}"
+    return prepared
+
+
+def _runtime_docker_identity(
+    *, target_kind: str, target_id: str, project: str
+) -> dict[str, Any]:
+    with AccountStore.open_default(coordinator_home()) as store:
+        with store.read_transaction() as connection:
+            if target_kind == "docker":
+                row = connection.execute(
+                    """
+                    SELECT d.docker_resource_id, d.full_container_id,
+                           d.current_name, m.immutable_fingerprint
+                    FROM docker_resources d
+                    JOIN repository_memberships m
+                      ON m.resource_kind = 'container'
+                     AND m.host_resource_id = d.docker_resource_id
+                    JOIN repositories r USING(repo_id)
+                    WHERE d.docker_resource_id = ? AND r.canonical_root = ?
+                    """,
+                    (target_id, project),
+                ).fetchone()
+                database_binding_id = None
+            else:
+                row = connection.execute(
+                    """
+                    SELECT d.docker_resource_id, d.full_container_id,
+                           d.current_name, m.immutable_fingerprint,
+                           b.database_binding_id
+                    FROM database_bindings b
+                    JOIN docker_resources d USING(docker_resource_id)
+                    JOIN repository_memberships m
+                      ON m.resource_kind = 'container'
+                     AND m.host_resource_id = d.docker_resource_id
+                    JOIN repositories r ON r.repo_id = b.repo_id
+                    WHERE b.database_binding_id = ? AND r.canonical_root = ?
+                      AND m.repo_id = b.repo_id
+                    """,
+                    (target_id, project),
+                ).fetchone()
+                database_binding_id = target_id
+            if row is None:
+                raise KeyError("matching classified Docker resource not found")
+            if target_kind == "database_stack":
+                strong_backup = connection.execute(
+                    """
+                    SELECT database_backup_id FROM database_backups
+                    WHERE database_binding_id = ? AND status = 'available'
+                      AND verification_status = 'strong'
+                      AND source_container_id = ?
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    (database_binding_id, row["full_container_id"]),
+                ).fetchone()
+            else:
+                strong_backup = None
+    return {
+        "docker_resource_id": str(row["docker_resource_id"]),
+        "full_container_id": str(row["full_container_id"]),
+        "name": str(row["current_name"]),
+        "immutable_fingerprint": str(row["immutable_fingerprint"]),
+        "strong_backup_id": (
+            None if strong_backup is None else str(strong_backup[0])
+        ),
+    }
+
+
+def _runtime_status_docker(identity: dict[str, Any]) -> dict[str, Any]:
+    inventory = coordinated_build_inventory()
+    resource_id = identity["docker_resource_id"]
+    container = next(
+        (
+            item
+            for item in inventory.get("v1_compatibility", {})
+            .get("docker", {})
+            .get("containers", [])
+            if str(item.get("host_resource_id") or "") == resource_id
+        ),
+        None,
+    )
+    if container is None:
+        return {
+            "ok": False,
+            "classification": "missing_dependency",
+            "resource_id": resource_id,
+            "state": "missing",
+        }
+    return {"ok": True, **container}
+
+
+def _runtime_service_identity(server: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": "service",
+        "id": server.get("id"),
+        "generation": server.get("generation"),
+        "lease_id": server.get("lease_id"),
+        "process_fingerprint": server.get("process_fingerprint"),
+    }
+
+
+def _runtime_service_fingerprint(server: Mapping[str, Any]) -> str:
+    return "sha256:" + fingerprint(_runtime_service_identity(server))
+
+
+def _runtime_service_is_running(server: Mapping[str, Any]) -> bool:
+    health = server.get("health")
+    return (
+        str(server.get("status") or "") == "running"
+        and isinstance(health, Mapping)
+        and health.get("ok") is True
+    )
+
+
+def _runtime_result_with_status(
+    *, action: str, kind: str, result: dict[str, Any]
+) -> dict[str, Any]:
+    if action == "status":
+        state = str(result.get("status") or result.get("state") or "").lower()
+        observed = bool(
+            state
+            and state not in {"missing", "unobserved", "unknown"}
+            and (kind == "service" or result.get("ok") is True)
+        )
+        ready = bool(
+            observed
+            and state == "running"
+            and (
+                kind != "service"
+                or (
+                    isinstance(result.get("health"), Mapping)
+                    and result["health"].get("ok") is True
+                )
+            )
+        )
+        result["ok"] = observed
+        result["ready"] = ready
+        result["state"] = state or "unobserved"
+        if observed:
+            result["classification"] = (
+                "ready" if ready else "observed_not_ready"
+            )
+            result.pop("error", None)
+        else:
+            result.setdefault("classification", "terminal_state_unavailable")
+            result.setdefault(
+                "error", "lifecycle status has no authoritative observed state"
+            )
+        return result
+    if kind == "service":
+        observed = result.get("started", result) if action == "replace" else result
+        if not isinstance(observed, Mapping):
+            ok = False
+        elif action == "stop":
+            ok = str(observed.get("status") or "") == "stopped"
+        else:
+            ok = _runtime_service_is_running(observed)
+    elif action == "status":
+        ok = (
+            result.get("ok") is True
+            and str(result.get("status") or "") == "running"
+        )
+    else:
+        # A zero Docker CLI exit proves only that the daemon accepted the
+        # command.  The unified runtime API promotes this pending result only
+        # after a fresh full-Docker observation proves the exact terminal state.
+        if result.get("returncode") == 0:
+            result["ok"] = False
+            result["terminal_state_pending"] = True
+            result["classification"] = "terminal_state_pending"
+            result["error"] = (
+                "Docker command completed; exact terminal state is awaiting "
+                "authoritative observation"
+            )
+            return result
+        ok = False
+    result["ok"] = bool(ok)
+    if not ok:
+        result.setdefault("classification", "lifecycle_target_not_ready")
+        result.setdefault(
+            "error", "lifecycle action did not prove the requested terminal state"
+        )
+    return result
+
+
+def _runtime_compose_replace(
+    request: dict[str, Any], project: str, *, database: bool
+) -> dict[str, Any]:
+    del project, database
+    target = request["target"]
+    raise StructuredCoordinatorError(
+        "Docker/database replacement is unavailable until the coordinator can "
+        "prove and rebind the exact post-recreate container identity",
+        {
+            "code": "runtime_safe_replace_unavailable",
+            "classification": "unsupported_safe_replace",
+            "resource_kind": target["kind"],
+            "resource_id": target["id"],
+            "action_required": (
+                "Use the enrolled typed broker Compose lifecycle after it "
+                "supports post-recreate identity publication."
+            ),
+        },
+    )
+
+
+def _runtime_run_command(
+    request: dict[str, Any], project: str, session_id: str
+) -> dict[str, Any]:
+    options = request["options"]
+    cwd = Path(str(options.get("cwd") or project)).expanduser().resolve()
+    project_root = Path(project)
+    if cwd != project_root and project_root not in cwd.parents:
+        raise ValueError("runtime test cwd must remain inside the effective repository")
+    if not cwd.is_dir():
+        raise FileNotFoundError(f"runtime test cwd is unavailable: {cwd}")
+    timeout = float(
+        options.get("run_timeout_seconds")
+        or request.get("ttl_seconds")
+        or 300
+    )
+    if request.get("ttl_seconds") is not None:
+        timeout = min(timeout, float(request["ttl_seconds"]))
+    if not 0 < timeout <= MAX_RUNTIME_TTL_SECONDS:
+        raise ValueError("runtime test timeout must be positive and within the TTL limit")
+    environment = os.environ.copy()
+    environment.update(options.get("run_env") or {})
+    ensure_private_directory(logs_dir())
+    log_path = logs_dir() / f"runtime-run-{session_id}.log"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(log_path, flags, 0o600)
+    process: subprocess.Popen[bytes] | None = None
+    reader: threading.Thread | None = None
+    written = 0
+    discarded = 0
+    reader_error: list[BaseException] = []
+    maximum_log_bytes = 8 * 1024 * 1024
+    secret_bytes = tuple(
+        value.encode("utf-8", errors="replace")
+        for value in runtime_secret_values(request)
+        if value
+    )
+    maximum_secret_bytes = max((len(value) for value in secret_bytes), default=1)
+
+    def record_output(value: bytes) -> None:
+        nonlocal written, discarded
+        remaining = max(0, maximum_log_bytes - written)
+        accepted = value[:remaining]
+        if accepted:
+            os.write(descriptor, accepted)
+            written += len(accepted)
+        discarded += max(0, len(value) - len(accepted))
+
+    def redact_output_prefix(
+        raw: bytes, *, final: bool
+    ) -> tuple[bytes, bytes]:
+        if not secret_bytes:
+            return (raw, b"") if final else (raw, b"")
+        safe_start_limit = (
+            len(raw)
+            if final
+            else max(0, len(raw) - (maximum_secret_bytes - 1))
+        )
+        output = bytearray()
+        cursor = 0
+        while cursor < safe_start_limit:
+            found: tuple[int, bytes] | None = None
+            for secret in secret_bytes:
+                index = raw.find(secret, cursor)
+                if index >= 0 and (found is None or index < found[0]):
+                    found = (index, secret)
+            if found is None or found[0] >= safe_start_limit:
+                output.extend(raw[cursor:safe_start_limit])
+                cursor = safe_start_limit
+                break
+            index, secret = found
+            output.extend(raw[cursor:index])
+            output.extend(b"[REDACTED]")
+            cursor = index + len(secret)
+        return bytes(output), raw[cursor:]
+
+    def drain_output() -> None:
+        local_process = process
+        if local_process is None or local_process.stdout is None:
+            reader_error.append(
+                RuntimeError("runtime output reader started without a process pipe")
+            )
+            return
+        try:
+            pending = b""
+            while True:
+                chunk = local_process.stdout.read(64 * 1024)
+                if not chunk:
+                    redacted, pending = redact_output_prefix(pending, final=True)
+                    record_output(redacted)
+                    if pending:  # pragma: no cover - final mode consumes all input
+                        raise RuntimeError("runtime log redactor retained final bytes")
+                    return
+                redacted, pending = redact_output_prefix(
+                    pending + chunk, final=False
+                )
+                record_output(redacted)
+        except BaseException as error:
+            reader_error.append(error)
+        finally:
+            local_process.stdout.close()
+
+    def group_exists(process_group: int) -> bool:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def terminate_group(process_group: int) -> dict[str, Any]:
+        signals_sent: list[str] = []
+        if group_exists(process_group):
+            os.killpg(process_group, signal.SIGTERM)
+            signals_sent.append("SIGTERM")
+        deadline = time.monotonic() + 2.0
+        while group_exists(process_group) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if group_exists(process_group):
+            os.killpg(process_group, signal.SIGKILL)
+            signals_sent.append("SIGKILL")
+        deadline = time.monotonic() + 2.0
+        while group_exists(process_group) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if group_exists(process_group):
+            raise RuntimeError(
+                f"runtime test process group {process_group} remained alive after SIGKILL"
+            )
+        if process is not None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=1.0)
+        return {"process_group": process_group, "signals_sent": signals_sent}
+
+    timed_out = False
+    descendant_cleanup: dict[str, Any] = {}
+    try:
+        os.fchmod(descriptor, 0o600)
+        process = subprocess.Popen(
+            list(options["run_argv"]),
+            cwd=str(cwd),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        reader = threading.Thread(
+            target=drain_output,
+            name=f"runtime-log-{session_id}",
+            daemon=True,
+        )
+        reader.start()
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            returncode = None
+        process_group = process.pid
+        if timed_out or group_exists(process_group):
+            descendant_cleanup = terminate_group(process_group)
+        reader.join(timeout=5.0)
+        if reader.is_alive():
+            raise RuntimeError("runtime test output reader did not reach EOF")
+        if reader_error:
+            raise RuntimeError(
+                "runtime test output capture failed: "
+                f"{type(reader_error[0]).__name__}: {reader_error[0]}"
+            )
+        if discarded:
+            marker = (
+                f"\n[DevCoordinator log truncated; discarded {discarded} bytes]\n"
+            ).encode("utf-8")
+            os.write(descriptor, marker)
+        os.fsync(descriptor)
+    except BaseException as execution_error:
+        cleanup_errors: list[BaseException] = []
+        direct_process_cleanup: list[str] = []
+        if process is not None:
+            try:
+                descendant_cleanup = terminate_group(process.pid)
+            except BaseException as error:
+                cleanup_errors.append(error)
+                try:
+                    if process.poll() is None:
+                        process.terminate()
+                        direct_process_cleanup.append("SIGTERM")
+                        try:
+                            process.wait(timeout=2.0)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            direct_process_cleanup.append("SIGKILL")
+                            process.wait(timeout=2.0)
+                    else:
+                        direct_process_cleanup.append("already_exited")
+                except BaseException as direct_error:
+                    cleanup_errors.append(direct_error)
+        if reader is not None:
+            reader.join(timeout=5.0)
+            if reader.is_alive():
+                cleanup_errors.append(
+                    RuntimeError("runtime output reader remained active after cleanup")
+                )
+        if cleanup_errors:
+            raise StructuredCoordinatorError(
+                "runtime test execution and process-group cleanup both failed",
+                {
+                    "code": "runtime_test_cleanup_failed",
+                    "classification": "reconciliation_required",
+                    "execution_error": (
+                        f"{type(execution_error).__name__}: {execution_error}"
+                    ),
+                    "cleanup_errors": [
+                        f"{type(error).__name__}: {error}"
+                        for error in cleanup_errors
+                    ],
+                    "direct_process_cleanup": direct_process_cleanup,
+                    "log_path": str(log_path),
+                },
+            ) from execution_error
+        raise
+    finally:
+        os.close(descriptor)
+    if timed_out:
+        raise StructuredCoordinatorError(
+            "runtime test command exceeded its bounded timeout",
+            {
+                "code": "runtime_test_timeout",
+                "classification": "timeout",
+                "timeout_seconds": timeout,
+                "log_path": str(log_path),
+                "process_group_cleanup": descendant_cleanup,
+            },
+        )
+    result = {
+        "ok": returncode == 0,
+        "returncode": returncode,
+        "argv": list(options["run_argv"]),
+        "cwd": str(cwd),
+        "timeout_seconds": timeout,
+        "log_path": str(log_path),
+        "log_bytes": written,
+        "discarded_log_bytes": discarded,
+        "process_group_cleanup": descendant_cleanup,
+    }
+    if returncode != 0:
+        raise StructuredCoordinatorError(
+            f"runtime test command exited with {returncode}",
+            {
+                "code": "runtime_test_failed",
+                "classification": "crashed_process",
+                **result,
+            },
+        )
+    return result
+
+
+def _runtime_write_diagnostic(
+    *, session_id: str, payload: Mapping[str, Any], request: Mapping[str, Any]
+) -> str:
+    ensure_private_directory(logs_dir())
+    canonical_session_id = str(uuid.UUID(session_id))
+    path = logs_dir() / f"runtime-diagnostic-{canonical_session_id}.log"
+    safe_payload = redact_runtime_value(payload, request=request)
+    encoded = (
+        json.dumps(
+            safe_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            indent=2,
+            default=str,
+        ).encode("utf-8", errors="replace")[: 1024 * 1024]
+        + b"\n"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.write(descriptor, encoded)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return str(path)
+
+
+def _runtime_read_exact_docker_logs(
+    full_container_id: str,
+) -> tuple[bytes, int]:
+    """Read a bounded tail from one immutable container ID.
+
+    The Docker CLI is a bounded observer here, never a source of ownership.
+    Output is drained concurrently into a fixed tail buffer so a pathological
+    line cannot consume unbounded memory or block the child on a full pipe.
+    """
+
+    if not is_full_docker_container_id(full_container_id):
+        raise StructuredCoordinatorError(
+            "Docker log capture requires a verified full container ID",
+            {
+                "code": "runtime_log_identity_invalid",
+                "classification": "unclassified_resource",
+            },
+        )
+    executable = resolve_docker_executable()
+    command = [
+        executable,
+        "logs",
+        "--tail",
+        str(RUNTIME_LOG_MAX_LINES),
+        "--timestamps",
+        full_container_id,
+    ]
+    maximum_buffer = RUNTIME_LOG_MAX_BYTES + 64 * 1024
+    tail = bytearray()
+    discarded = 0
+    reader_errors: list[BaseException] = []
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    def drain() -> None:
+        nonlocal discarded
+        try:
+            assert process.stdout is not None
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                tail.extend(chunk)
+                overflow = len(tail) - maximum_buffer
+                if overflow > 0:
+                    del tail[:overflow]
+                    discarded += overflow
+        except BaseException as error:  # pragma: no cover - defensive pipe boundary
+            reader_errors.append(error)
+
+    reader = threading.Thread(
+        target=drain,
+        name="runtime-docker-log-reader",
+        daemon=True,
+    )
+    reader.start()
+    timeout = configured_docker_timeout(lifecycle=False)
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        returncode = process.wait(timeout=5)
+    finally:
+        reader.join(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+    if reader.is_alive():
+        raise RuntimeError("Docker log capture pipe did not close")
+    if reader_errors:
+        raise RuntimeError(f"Docker log capture failed while reading: {reader_errors[0]}")
+    if timed_out:
+        raise StructuredCoordinatorError(
+            "Docker log capture exceeded its bounded timeout",
+            {
+                "code": "runtime_log_capture_timeout",
+                "classification": "timeout",
+                "timeout_seconds": timeout,
+            },
+        )
+    if returncode != 0:
+        diagnostic = bytes(tail).decode("utf-8", errors="replace").strip()
+        lowered = diagnostic.lower()
+        missing = "no such container" in lowered or "no such object" in lowered
+        raise StructuredCoordinatorError(
+            "exact Docker log target is no longer available"
+            if missing
+            else "Docker could not capture logs for the exact container",
+            {
+                "code": (
+                    "runtime_log_target_removed"
+                    if missing
+                    else "runtime_docker_log_capture_failed"
+                ),
+                "classification": (
+                    "resource_removed" if missing else "observation_unavailable"
+                ),
+                "returncode": returncode,
+                "diagnostic": diagnostic,
+            },
+        )
+    return bytes(tail), discarded
+
+
+def coordinated_runtime_capture_logs(
+    request: dict[str, Any], project: str
+) -> dict[str, Any]:
+    """Capture or recover one exact-ID Docker/database runtime artifact."""
+
+    target = request["target"]
+    kind = str(target["kind"])
+    if kind not in {"docker", "database_stack"}:
+        return {
+            "availability": "unavailable",
+            "reason_code": "runtime_log_kind_unsupported",
+        }
+    try:
+        identity = _runtime_docker_identity(
+            target_kind=kind,
+            target_id=str(target["id"]),
+            project=project,
+        )
+    except BaseException as error:
+        return {
+            "availability": "unavailable",
+            "reason_code": "target_not_authoritatively_classified",
+            "error": str(error),
+            "error_type": type(error).__name__,
+        }
+
+    def retained() -> dict[str, Any] | None:
+        return load_latest_runtime_log_artifact(
+            root=logs_dir(),
+            artifact_kind=kind,
+            target_resource_id=str(target["id"]),
+            docker_resource_id=str(identity["docker_resource_id"]),
+            full_container_id=str(identity["full_container_id"]),
+        )
+
+    try:
+        raw, discarded = _runtime_read_exact_docker_logs(
+            str(identity["full_container_id"])
+        )
+        after = _runtime_docker_identity(
+            target_kind=kind,
+            target_id=str(target["id"]),
+            project=project,
+        )
+        exact_fields = (
+            "docker_resource_id",
+            "full_container_id",
+            "immutable_fingerprint",
+        )
+        if any(str(after[field]) != str(identity[field]) for field in exact_fields):
+            return {
+                "availability": "unavailable",
+                "reason_code": "runtime_resource_identity_changed",
+                "message": (
+                    "The normalized Docker identity changed during log capture; "
+                    "no artifact was published."
+                ),
+            }
+        ensure_private_directory(logs_dir())
+        return persist_runtime_log_artifact(
+            root=logs_dir(),
+            artifact_kind=kind,
+            target_resource_id=str(target["id"]),
+            docker_resource_id=str(identity["docker_resource_id"]),
+            full_container_id=str(identity["full_container_id"]),
+            raw=raw,
+            request=request,
+            input_discarded_bytes=discarded,
+        )
+    except BaseException as error:
+        previous = retained()
+        if previous is not None:
+            previous["capture_error"] = coordinator_exception_payload(error)
+            return previous
+        evidence = coordinator_exception_payload(error)
+        return {
+            "availability": "unavailable",
+            "reason_code": str(
+                evidence.get("code") or "authoritative_docker_log_capture_unavailable"
+            ),
+            "message": str(error),
+            "error_type": type(error).__name__,
+        }
+
+
+def coordinated_runtime_dispatch(
+    request: dict[str, Any],
+    project: str,
+    session_id: str | None,
+    link_resource: Callable[[dict[str, Any]], None],
+    *,
+    runtime_store: AccountStore | None = None,
+) -> dict[str, Any]:
+    action = request["action"]
+    target = request["target"]
+    kind = target["kind"]
+    options = request["options"]
+    track_cleanup = bool(
+        request.get("ttl_seconds") is not None or request.get("kill_after_run")
+    )
+    if action == "run":
+        if session_id is None:  # pragma: no cover - validated runtime boundary
+            raise RuntimeError("runtime run requires a durable session identity")
+        start_request = copy.deepcopy(request)
+        start_request["action"] = "start"
+        pre_start_inventory = coordinated_build_inventory()
+        started = coordinated_runtime_dispatch(
+            start_request,
+            project,
+            session_id,
+            link_resource,
+            runtime_store=runtime_store,
+        )
+        if not (
+            started.get("ok") is True
+            or started.get("terminal_state_pending") is True
+        ):
+            raise StructuredCoordinatorError(
+                "runtime test target did not start; the test command was not executed",
+                {
+                    "code": "runtime_test_start_failed",
+                    "classification": "lifecycle_target_not_ready",
+                    "start": started,
+                },
+            )
+        start_observation = coordinated_observe_host(
+            {
+                "agent": request["agent"],
+                "project": project,
+                "max_age_seconds": 0,
+                "no_docker": False,
+                "backup_dir": None,
+                "legacy_home": [],
+                "legacy_backup_root": None,
+            }
+        )
+        start_inventory = coordinated_build_inventory()
+        started = validate_runtime_terminal_state(
+            request=start_request,
+            action_result=started,
+            observation=start_observation,
+            inventory=start_inventory,
+            pre_inventory=pre_start_inventory,
+        )
+        if started.get("ok") is not True:
+            raise StructuredCoordinatorError(
+                "runtime test target is not ready; the test command was not executed",
+                {
+                    "code": "runtime_test_start_unproven",
+                    "classification": str(
+                        started.get("classification")
+                        or "lifecycle_target_not_ready"
+                    ),
+                    "start": started,
+                },
+            )
+        run_result = _runtime_run_command(request, project, session_id)
+        result = {"ok": True, "start": started, "run": run_result}
+        return result
+
+    if kind == "service":
+        supervision_fields = {
+            "keep_alive",
+            "restart_limit",
+            "restart_window_seconds",
+            "rearm_crash_loop",
+        }
+        supervision_requested = bool(supervision_fields & set(options))
+        supervised_existing = False
+        if target.get("id") is not None and runtime_store is not None:
+            with runtime_store.read_transaction() as connection:
+                supervised_existing = connection.execute(
+                    """
+                    SELECT 1 FROM worker_policies
+                    WHERE server_definition_id = ?
+                    """,
+                    (str(target["id"]),),
+                ).fetchone() is not None
+        if supervision_requested or supervised_existing:
+            if request["purpose"] != "development":
+                raise StructuredCoordinatorError(
+                    "persistent supervised workers cannot be borrowed by a temporary/test runtime",
+                    {
+                        "code": "supervised_worker_purpose_conflict",
+                        "classification": "preexisting_resource_not_owned",
+                        "resource_id": target.get("id"),
+                        "action_required": (
+                            "Use a distinct installed worker in the temporary repository, "
+                            "or operate this persistent worker with purpose=development."
+                        ),
+                    },
+                )
+            if target.get("id") is None:
+                raise ValueError(
+                    "supervised worker lifecycle requires an installed immutable target ID"
+                )
+            store_context = (
+                contextlib.nullcontext(runtime_store)
+                if runtime_store is not None
+                else AccountStore.open_default(coordinator_home())
+            )
+            with store_context as store:
+                controller = WorkerController(
+                    store,
+                    coordinator_script=Path(__file__),
+                )
+                arguments = {
+                    "worker_id": str(target["id"]),
+                    "canonical_repository": project,
+                    "name": str(target["name"]),
+                }
+                timeout = float(options.get("health_timeout") or 10.0)
+                if action == "status":
+                    result = controller.status(**arguments)
+                elif action == "start":
+                    result = controller.start(
+                        **arguments,
+                        actor=str(request["agent"]),
+                        keep_alive=options.get("keep_alive"),
+                        crash_limit=options.get("restart_limit"),
+                        crash_window_seconds=options.get(
+                            "restart_window_seconds"
+                        ),
+                        rearm=bool(options.get("rearm_crash_loop", False)),
+                        timeout_seconds=timeout,
+                    )
+                elif action == "stop":
+                    result = controller.stop(
+                        **arguments,
+                        actor=str(request["agent"]),
+                        timeout_seconds=timeout,
+                    )
+                elif action == "restart":
+                    result = controller.restart(
+                        **arguments,
+                        actor=str(request["agent"]),
+                        keep_alive=options.get("keep_alive"),
+                        crash_limit=options.get("restart_limit"),
+                        crash_window_seconds=options.get(
+                            "restart_window_seconds"
+                        ),
+                        rearm=bool(options.get("rearm_crash_loop", False)),
+                        timeout_seconds=timeout,
+                    )
+                elif action == "replace":
+                    expected_generation = options.get(
+                        "expected_definition_generation"
+                    )
+                    if type(expected_generation) is not int:
+                        raise ValueError(
+                            "supervised worker replace requires options.expected_definition_generation"
+                        )
+                    result = controller.replace(
+                        **arguments,
+                        actor=str(request["agent"]),
+                        expected_generation=expected_generation,
+                        argv=options["argv"],
+                        cwd=str(options.get("cwd") or project),
+                        environment=dict(options.get("env") or {}),
+                        keep_alive=options.get("keep_alive"),
+                        crash_limit=options.get("restart_limit"),
+                        crash_window_seconds=options.get(
+                            "restart_window_seconds"
+                        ),
+                        rearm=bool(options.get("rearm_crash_loop", False)),
+                        timeout_seconds=timeout,
+                    )
+                else:
+                    raise ValueError(f"unsupported supervised worker action {action}")
+            result = _runtime_result_with_status(
+                action=action, kind=kind, result=result
+            )
+            result["runtime_ownership"] = "persistent_supervised_worker"
+            return result
+
+        previous: dict[str, Any] | None = None
+        if action in {"start", "restart", "replace"}:
+            with contextlib.suppress(KeyError):
+                previous = coordinated_status_server(
+                    {
+                        "project": project,
+                        "name": target["name"],
+                        "server_id": target["id"],
+                    }
+                )
+        if (
+            request["purpose"] in {"test", "temporary"}
+            and previous is not None
+            and _runtime_service_is_running(previous)
+            and action in {"start", "restart", "replace"}
+        ):
+            raise StructuredCoordinatorError(
+                "temporary/test runtime refuses an already-active service",
+                {
+                    "code": "runtime_preexisting_active_resource",
+                    "classification": "preexisting_resource_not_owned",
+                    "resource_kind": "service",
+                    "resource_id": target["id"],
+                    "state": previous.get("status"),
+                },
+            )
+        identity = {
+            "agent": request["agent"],
+            "project": project,
+            "name": target["name"],
+            "server_id": target["id"],
+            "health_timeout": float(options.get("health_timeout") or 10),
+        }
+        owns_lifetime = action in {"restart", "replace"} or (
+            action == "start"
+            and not (previous is not None and _runtime_service_is_running(previous))
+        )
+        cleanup_disposition = "removed" if previous is None else "retained"
+        if track_cleanup and owns_lifetime:
+            prior_identity = (
+                None if previous is None else _runtime_service_identity(previous)
+            )
+            expected_generation = (
+                0
+                if previous is None
+                else int(previous.get("generation") or 0) + 1
+            )
+            link_resource(
+                {
+                    "kind": "service",
+                    "id": target["id"],
+                    "cleanup_disposition": cleanup_disposition,
+                    "identity": {
+                        "state": "reserved",
+                        "expected_generation": expected_generation,
+                        "prior": prior_identity,
+                    },
+                }
+            )
+        if action == "status":
+            result = coordinated_status_server(identity)
+        elif action == "start":
+            start_options = (
+                _runtime_service_start_options(request, project)
+                if options.get("argv") is not None
+                else _runtime_existing_service_start_options(
+                    project=project,
+                    name=target["name"],
+                    agent=request["agent"],
+                )
+            )
+            result = coordinated_start_server(
+                start_options
+            )
+        elif action == "stop":
+            result = coordinated_stop_server(
+                {**identity, "reason": options.get("reason") or "Stopped by runtime API"}
+            )
+        elif action == "restart":
+            result = coordinated_restart_server(identity)
+        elif action == "replace":
+            rollback = _runtime_existing_service_start_options(
+                project=project, name=target["name"], agent=request["agent"]
+            )
+            stopped = coordinated_stop_server(
+                {**identity, "reason": "Replaced by runtime API"}
+            )
+            try:
+                replaced = coordinated_start_server(
+                    _runtime_service_start_options(request, project)
+                )
+            except BaseException as replace_error:
+                try:
+                    coordinated_start_server(rollback)
+                except BaseException as rollback_error:
+                    raise StructuredCoordinatorError(
+                        "service replacement and rollback both failed",
+                        {
+                            "code": "service_replace_rollback_failed",
+                            "classification": "reconciliation_required",
+                            "replace_error": coordinator_exception_payload(replace_error),
+                            "rollback_error": coordinator_exception_payload(rollback_error),
+                        },
+                    ) from replace_error
+                raise
+            result = {"ok": True, "stopped": stopped, "started": replaced}
+        else:  # pragma: no cover - validated boundary
+            raise ValueError(f"unsupported service action {action}")
+        observed_id = str(
+            result.get("id")
+            or (result.get("started") or {}).get("id")
+            or target["id"]
+        )
+        if observed_id != str(target["id"]):
+            raise RuntimeError("service lifecycle result changed immutable identity")
+        result = _runtime_result_with_status(
+            action=action, kind=kind, result=result
+        )
+        if track_cleanup and owns_lifetime and result["ok"]:
+            observed = result.get("started") if action == "replace" else result
+            if not isinstance(observed, Mapping):
+                raise RuntimeError(
+                    "service lifecycle result omitted its observed server"
+                )
+            link_resource(
+                {
+                    "kind": "service",
+                    "id": observed_id,
+                    "cleanup_disposition": cleanup_disposition,
+                    "identity": _runtime_service_identity(observed),
+                    "immutable_fingerprint": _runtime_service_fingerprint(observed),
+                }
+            )
+            result["runtime_ownership"] = (
+                "created" if previous is None else "started_existing"
+            )
+        elif owns_lifetime and result["ok"]:
+            result["runtime_ownership"] = (
+                "persistent_created" if previous is None else "persistent_started"
+            )
+        elif action == "start" and previous is not None:
+            result["runtime_ownership"] = "borrowed"
+        return result
+
+    if action == "replace":
+        return _runtime_compose_replace(
+            request, project, database=kind == "database_stack"
+        )
+    identity = _runtime_docker_identity(
+        target_kind=kind, target_id=target["id"], project=project
+    )
+    previous_status = _runtime_status_docker(identity) if action == "start" else None
+    if action in {"restart", "replace"}:
+        previous_status = _runtime_status_docker(identity)
+    if (
+        request["purpose"] in {"test", "temporary"}
+        and action in {"start", "restart", "replace"}
+        and str((previous_status or {}).get("status") or "")
+        in {"running", "starting", "unhealthy"}
+    ):
+        raise StructuredCoordinatorError(
+            "temporary/test runtime refuses an already-active Docker resource",
+            {
+                "code": "runtime_preexisting_active_resource",
+                "classification": "preexisting_resource_not_owned",
+                "resource_kind": kind,
+                "resource_id": target["id"],
+                "state": (previous_status or {}).get("status"),
+            },
+        )
+    owns_lifetime = action in {"restart", "replace"} or (
+        action == "start"
+        and str((previous_status or {}).get("status") or "")
+        not in {"running", "starting", "unhealthy"}
+    )
+    resources = [
+        {
+            "kind": "docker",
+            "id": identity["docker_resource_id"],
+            "cleanup_disposition": "retained",
+            "identity": {
+                "kind": "docker",
+                "docker_resource_id": identity["docker_resource_id"],
+                "full_container_id": identity["full_container_id"],
+                "membership_fingerprint": identity["immutable_fingerprint"],
+                "prior_state": (previous_status or {}).get("status"),
+            },
+            "immutable_fingerprint": identity["immutable_fingerprint"],
+        }
+    ]
+    if kind == "database_stack":
+        resources.insert(
+            0,
+            {
+                "kind": "database_stack",
+                "id": target["id"],
+                "cleanup_disposition": "retained",
+                "identity": {
+                    "kind": "database_stack",
+                    "database_binding_id": target["id"],
+                    "docker_resource_id": identity["docker_resource_id"],
+                    "full_container_id": identity["full_container_id"],
+                    "membership_fingerprint": identity["immutable_fingerprint"],
+                    "prior_state": (previous_status or {}).get("status"),
+                },
+                "immutable_fingerprint": identity["immutable_fingerprint"],
+            },
+        )
+    if track_cleanup and owns_lifetime:
+        for resource in resources:
+            link_resource(resource)
+    try:
+        if action == "status":
+            result = _runtime_status_docker(identity)
+        else:
+            result = coordinated_run_docker(
+                ["docker", action, identity["full_container_id"]],
+                cwd=str(options.get("cwd") or project),
+                dry_run=options.get("dry_run", False),
+                project=project,
+                agent=request["agent"],
+                container=identity["full_container_id"],
+                role=options.get("role"),
+            )
+    except BaseException as error:
+        diagnostic = coordinator_exception_payload(error)
+        if session_id is not None:
+            diagnostic["log_path"] = _runtime_write_diagnostic(
+                session_id=session_id, payload=diagnostic, request=request
+            )
+        raise StructuredCoordinatorError(
+            str(error), diagnostic
+        ) from error
+    result = _runtime_result_with_status(action=action, kind=kind, result=result)
+    lifecycle_dispatched = bool(
+        result.get("ok") is True
+        or result.get("terminal_state_pending") is True
+    )
+    if track_cleanup and owns_lifetime and lifecycle_dispatched:
+        for resource in resources:
+            link_resource(resource)
+        result["runtime_ownership"] = "started_existing"
+    elif owns_lifetime and lifecycle_dispatched:
+        result["runtime_ownership"] = "persistent_started"
+    elif action == "start" and previous_status is not None:
+        result["runtime_ownership"] = "borrowed"
+    return result
+
+
+def _runtime_inspect_container_state(full_container_id: str) -> str:
+    completed = subprocess.run(
+        [
+            resolve_docker_executable(),
+            "inspect",
+            "--format",
+            "{{.State.Status}}",
+            full_container_id,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10.0,
+        check=False,
+    )
+    if completed.returncode == 0:
+        state = completed.stdout.strip()
+        if not state:
+            raise RuntimeError("Docker inspect returned no container state")
+        return state
+    diagnostic = (completed.stderr or completed.stdout).strip()
+    if "No such object" in diagnostic or "No such container" in diagnostic:
+        return "absent"
+    raise RuntimeError(
+        "Docker inspect failed for the exact runtime resource: "
+        + (diagnostic or f"exit {completed.returncode}")
+    )
+
+
+def _runtime_verify_service_ports(
+    *,
+    project: str,
+    name: str,
+    server_id: str,
+    assignment_must_be_inactive: bool,
+) -> None:
+    with AccountStore.open_default(coordinator_home()) as store:
+        with store.read_transaction() as connection:
+            row = connection.execute(
+                "SELECT repo_id FROM repositories WHERE canonical_root = ?",
+                (project,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("runtime repository disappeared during cleanup")
+            repo_id = str(row["repo_id"])
+            active_lease = connection.execute(
+                """
+                SELECT lease_id FROM leases
+                WHERE repo_id = ? AND server_definition_id = ?
+                  AND status = 'active' LIMIT 1
+                """,
+                (repo_id, server_id),
+            ).fetchone()
+            active_assignment = connection.execute(
+                """
+                SELECT assignment_id FROM port_assignments
+                WHERE repo_id = ? AND server_name = ? AND status = 'active'
+                LIMIT 1
+                """,
+                (repo_id, name),
+            ).fetchone()
+    if active_lease is not None or (
+        assignment_must_be_inactive and active_assignment is not None
+    ):
+        raise RuntimeError(
+            "runtime service cleanup left an unexpected active lease or port assignment"
+        )
+
+
+def coordinated_runtime_cleanup(
+    request: dict[str, Any], resources: list[dict[str, Any]]
+) -> dict[str, Any]:
+    project = str(request["temporary_repo"] or request["root_repo"])
+    target = request["target"]
+    linked = {
+        (str(resource["resource_kind"]), str(resource["resource_id"])): resource
+        for resource in resources
+    }
+    if target["kind"] == "service":
+        exact = linked.get(("service", str(target["id"])))
+        if exact is None or len(linked) != 1:
+            raise RuntimeError(
+                "runtime service cleanup is missing its exact durable resource link"
+            )
+        try:
+            status = coordinated_status_server(
+                {
+                    "project": project,
+                    "name": target["name"],
+                    "server_id": target["id"],
+                }
+            )
+        except KeyError:
+            recorded = (
+                json.loads(str(exact["identity_json"]))
+                if exact.get("identity_json")
+                else {}
+            )
+            if recorded.get("state") == "reserved" and recorded.get("prior") is None:
+                return {
+                    "ok": True,
+                    "state": "removed",
+                    "resource_id": target["id"],
+                    "cleanup_disposition": exact["cleanup_disposition"],
+                    "reservation_outcome": "not_created",
+                }
+            raise RuntimeError(
+                "runtime service identity disappeared before cleanup proof"
+            )
+        recorded = (
+            json.loads(str(exact["identity_json"]))
+            if exact.get("identity_json")
+            else {}
+        )
+        observed_fingerprint = _runtime_service_fingerprint(status)
+        reserved = recorded.get("state") == "reserved"
+        prior = recorded.get("prior") if reserved else None
+        observed_generation = int(status.get("generation") or 0)
+        if reserved:
+            expected_generation = int(recorded.get("expected_generation") or 0)
+            if prior is not None and _runtime_service_identity(status) == prior:
+                return {
+                    "ok": True,
+                    "state": "retained",
+                    "resource_id": target["id"],
+                    "cleanup_disposition": "retained",
+                    "reservation_outcome": "unchanged_preexisting",
+                }
+            if observed_generation != expected_generation:
+                raise StructuredCoordinatorError(
+                    "runtime service generation changed after reservation",
+                    {
+                        "code": "runtime_resource_identity_changed",
+                        "classification": "reconciliation_required",
+                        "resource_id": target["id"],
+                        "expected_generation": expected_generation,
+                        "observed_generation": observed_generation,
+                    },
+                )
+        elif (
+            type(recorded.get("generation")) is not int
+            or int(recorded["generation"]) != observed_generation
+        ):
+            raise StructuredCoordinatorError(
+                "runtime service generation changed before cleanup",
+                {
+                    "code": "runtime_resource_identity_changed",
+                    "classification": "reconciliation_required",
+                    "resource_id": target["id"],
+                    "expected_generation": recorded.get("generation"),
+                    "observed_generation": observed_generation,
+                },
+            )
+        elif observed_fingerprint != str(exact["immutable_fingerprint"]) and str(
+            status.get("status") or ""
+        ) != "stopped":
+            raise StructuredCoordinatorError(
+                "runtime service changed after this session acquired it",
+                {
+                    "code": "runtime_resource_identity_changed",
+                    "classification": "reconciliation_required",
+                    "resource_id": target["id"],
+                    "expected_fingerprint": exact["immutable_fingerprint"],
+                    "observed_fingerprint": observed_fingerprint,
+                },
+            )
+        stopped: dict[str, Any]
+        if str(status.get("status")) == "stopped":
+            stopped = status
+        else:
+            stopped = coordinated_stop_server(
+                {
+                    "agent": RUNTIME_CLEANUP_AGENT,
+                    "project": project,
+                    "name": target["name"],
+                    "server_id": target["id"],
+                    "reason": "Runtime session ended",
+                }
+            )
+        if str(stopped.get("status") or "") != "stopped":
+            return {
+                "ok": False,
+                "state": stopped.get("status"),
+                "resource_id": target["id"],
+            }
+        with AccountStore.open_default(coordinator_home()) as store:
+            assignments = NormalizedPortLifecycle(store).list_assignments(
+                canonical_project=project,
+                active_only=True,
+            )
+        assignment = next(
+            (
+                item
+                for item in assignments
+                if str(item["name"]) == str(target["name"])
+            ),
+            None,
+        )
+        unassigned = None
+        remove_assignment = exact["cleanup_disposition"] == "removed"
+        if assignment is not None and remove_assignment:
+            unassigned = coordinated_unassign_port(
+                {
+                    "agent": RUNTIME_CLEANUP_AGENT,
+                    "project": project,
+                    "name": target["name"],
+                    "port": int(assignment["port"]),
+                }
+            )
+        _runtime_verify_service_ports(
+            project=project,
+            name=str(target["name"]),
+            server_id=str(target["id"]),
+            assignment_must_be_inactive=remove_assignment,
+        )
+        return {
+            "ok": True,
+            "state": "removed" if remove_assignment else "stopped",
+            "resource_id": target["id"],
+            "cleanup_disposition": exact["cleanup_disposition"],
+            "server": stopped,
+            "port_assignment": unassigned,
+        }
+    identity = _runtime_docker_identity(
+        target_kind=target["kind"], target_id=target["id"], project=project
+    )
+    docker_link = linked.get(("docker", identity["docker_resource_id"]))
+    required_keys = {("docker", identity["docker_resource_id"])}
+    if target["kind"] == "database_stack":
+        required_keys.add(("database_stack", str(target["id"])))
+    if set(linked) != required_keys or docker_link is None:
+        raise RuntimeError(
+            "runtime Docker cleanup is missing its exact durable resource links"
+        )
+    if any(
+        str(resource["immutable_fingerprint"])
+        != identity["immutable_fingerprint"]
+        for resource in linked.values()
+    ):
+        raise StructuredCoordinatorError(
+            "runtime Docker identity changed after this session acquired it",
+            {
+                "code": "runtime_resource_identity_changed",
+                "classification": "reconciliation_required",
+                "resource_id": target["id"],
+            },
+        )
+    before = _runtime_inspect_container_state(identity["full_container_id"])
+    stopped_result = None
+    if before not in {"absent", "created", "exited"}:
+        stopped_result = coordinated_run_docker(
+            ["docker", "stop", identity["full_container_id"]],
+            cwd=project,
+            project=project,
+            agent=RUNTIME_CLEANUP_AGENT,
+            container=identity["full_container_id"],
+            role=None,
+        )
+    after = _runtime_inspect_container_state(identity["full_container_id"])
+    if after not in {"absent", "created", "exited"}:
+        return {
+            "ok": False,
+            "state": after,
+            "resource_id": identity["docker_resource_id"],
+        }
+    disposition = str(docker_link["cleanup_disposition"])
+    if disposition == "removed" and after != "absent":
+        return {
+            "ok": False,
+            "state": after,
+            "resource_id": identity["docker_resource_id"],
+            "cleanup_disposition": disposition,
+            "error": "runtime Docker cleanup stopped but did not remove its target",
+        }
+    return {
+        "ok": True,
+        "state": (
+            "removed"
+            if disposition == "removed"
+            else "absent"
+            if after == "absent"
+            else "stopped"
+        ),
+        "resource_id": identity["docker_resource_id"],
+        "cleanup_disposition": disposition,
+        "container_state_before": before,
+        "container_state_after": after,
+        "stop": stopped_result,
+    }
+
+
+def _runtime_error_envelope(
+    payload: Any, error: BaseException
+) -> dict[str, Any]:
+    request = payload if isinstance(payload, dict) else {}
+    evidence = getattr(error, "payload", None)
+    envelope = {
+        "schema_version": 1,
+        "ok": False,
+        "action": request.get("action"),
+        "classification": (
+            evidence.get("classification")
+            if isinstance(evidence, dict)
+            else "invalid_request"
+            if isinstance(error, (ValueError, RuntimeRequestError))
+            else "runtime_execution_failed"
+        ),
+        "error": str(error),
+        "error_type": type(error).__name__,
+        "evidence": evidence,
+        "repository": {
+            "root_repo": request.get("root_repo"),
+            "temporary_repo": request.get("temporary_repo"),
+        },
+        "target": request.get("target"),
+    }
+    redacted = redact_runtime_value(
+        envelope, request=request if isinstance(request, Mapping) else None
+    )
+    if not isinstance(redacted, dict):  # pragma: no cover - envelope is an object
+        raise RuntimeError("runtime error redaction returned a non-object")
+    return redacted
+
+
+def _runtime_repository_tree_identity(
+    request: Mapping[str, Any], inventory: Mapping[str, Any]
+) -> tuple[str, str, str, str]:
+    """Resolve one request context from the producer-owned repository tree."""
+
+    root_path = canonical_project(str(request["root_repo"]))
+    effective_path = canonical_project(
+        str(request.get("temporary_repo") or request["root_repo"])
+    )
+    matches: list[tuple[str, str, str, str]] = []
+    for raw_tree in inventory.get("repository_trees") or []:
+        if not isinstance(raw_tree, Mapping):
+            continue
+        root = raw_tree.get("root_repository")
+        if not isinstance(root, Mapping):
+            continue
+        if canonical_project(str(root.get("canonical_root") or "")) != root_path:
+            continue
+        root_repo_id = str(root.get("repo_id") or "")
+        family_id = str(raw_tree.get("family_id") or "")
+        for raw_scope in raw_tree.get("scopes") or []:
+            if not isinstance(raw_scope, Mapping):
+                continue
+            if (
+                canonical_project(str(raw_scope.get("canonical_root") or ""))
+                != effective_path
+            ):
+                continue
+            matches.append(
+                (
+                    family_id,
+                    root_repo_id,
+                    str(raw_scope.get("repo_id") or ""),
+                    str(raw_scope.get("kind") or "root"),
+                )
+            )
+    if len(matches) != 1 or not all(matches[0]):
+        raise RuntimeError(
+            "runtime repository context does not resolve exactly once in the authoritative tree"
+        )
+    return matches[0]
+
+
+def coordinated_runtime_remove(request: dict[str, Any]) -> dict[str, Any]:
+    """Plan or apply exact worker archive/permanent cleanup through one API action."""
+
+    pre_action_inventory = coordinated_build_inventory()
+    family_id, root_repo_id, effective_repo_id, project_kind = (
+        _runtime_repository_tree_identity(request, pre_action_inventory)
+    )
+    options = request["options"]
+    target_id = str(request["target"]["id"])
+    plan_id = options.get("remove_plan_id")
+    if plan_id is None:
+        reason = str(options["reason"])
+        archives = coordinated_list_archives().get("archives") or []
+        archived = any(
+            isinstance(item, Mapping)
+            and item.get("target_kind") == "server"
+            and str(item.get("target_id") or "") == target_id
+            and item.get("status") == "archived"
+            for item in archives
+        )
+        stage = "purge" if archived else "archive"
+        lifecycle = coordinated_lifecycle_plan(
+            {
+                "action": stage,
+                "target_kind": "server",
+                "target_id": target_id,
+                "reason": reason,
+            }
+        )
+        blockers = lifecycle.get("blockers")
+        blocked = bool(blockers) or lifecycle.get("status") == "blocked"
+        action_result: dict[str, Any] = {
+            "ok": not blocked,
+            "ready": False,
+            "classification": (
+                "worker_remove_blocked"
+                if blocked
+                else "worker_remove_plan_ready"
+            ),
+            "stage": stage,
+            "plan": lifecycle,
+            "terminal_state": {
+                "proof": "cleanup_plan_snapshot",
+                "resource_kind": "service",
+                "resource_id": target_id,
+            },
+            "next_action": (
+                "Resolve the listed blockers, then plan removal again."
+                if blocked
+                else (
+                    "Apply this exact archive plan with action=remove; then invoke remove again to plan permanent cleanup."
+                    if stage == "archive"
+                    else "Apply this exact permanent-removal plan with action=remove."
+                )
+            ),
+        }
+    else:
+        lifecycle = coordinated_lifecycle_apply(
+            {
+                "plan_id": str(plan_id),
+                "plan_fingerprint": str(options["remove_plan_fingerprint"]),
+                "confirmation_phrase": str(options["remove_confirmation_phrase"]),
+            }
+        )
+        stage = str(lifecycle.get("action") or "")
+        succeeded = bool(
+            lifecycle.get("ok") is True
+            or lifecycle.get("status") in {"succeeded", "already_complete"}
+        )
+        permanent = stage in {"purge", "forget"}
+        action_result = {
+            "ok": succeeded,
+            "ready": False,
+            "classification": (
+                "worker_removed"
+                if succeeded and permanent
+                else "worker_archived"
+                if succeeded
+                else "worker_remove_needs_attention"
+            ),
+            "stage": stage or "unknown",
+            "lifecycle": lifecycle,
+            "terminal_state": (
+                {
+                    "proof": (
+                        "cleanup_tombstone" if permanent else "cleanup_archive"
+                    ),
+                    "resource_kind": "service",
+                    "resource_id": target_id,
+                }
+                if succeeded
+                else None
+            ),
+            "next_action": (
+                None
+                if succeeded and permanent
+                else "Invoke remove again to plan permanent cleanup."
+                if succeeded
+                else "Inspect the lifecycle evidence and retry the exact plan only after resolving it."
+            ),
+        }
+    inventory = coordinated_build_inventory()
+    return build_runtime_report(
+        request=request,
+        session_id=None,
+        family_id=family_id,
+        root_repo_id=root_repo_id,
+        effective_repo_id=effective_repo_id,
+        project_kind=project_kind,
+        inventory=inventory,
+        action_result=action_result,
+        pre_action_inventory=pre_action_inventory,
+    )
+
+
+def coordinated_runtime_request(
+    payload: Any, *, cleanup_owner_available: bool = False
+) -> dict[str, Any]:
+    if state_backend() == LEGACY_JSON_BACKEND:
+        return _runtime_error_envelope(
+            payload,
+            RuntimeError("unified runtime API requires the normalized SQLite backend"),
+        )
+    if authority_mode() == "system":
+        try:
+            normalized_payload = validate_runtime_request(payload)
+            if normalized_payload["action"] == "remove":
+                return coordinated_runtime_remove(normalized_payload)
+            return coordinated_broker_runtime_request(normalized_payload)
+        except BaseException as error:
+            return _runtime_error_envelope(payload, error)
+    if authority_mode() != "account":
+        return _runtime_error_envelope(
+            payload,
+            StructuredCoordinatorError(
+                "the broker service process is not a runtime client",
+                {
+                    "code": "runtime_service_client_forbidden",
+                    "classification": "invalid_authority_context",
+                    "action_required": "Submit the ID-only runtime request from an enrolled peer account.",
+                },
+            ),
+        )
+    try:
+        normalized_payload = validate_runtime_request(payload)
+        if normalized_payload["action"] == "remove":
+            return coordinated_runtime_remove(normalized_payload)
+        reject_unsupported_safe_replace(normalized_payload)
+        with AccountStore.open_default(coordinator_home()) as store:
+            result = execute_runtime_request(
+                normalized_payload,
+                store=store,
+                callbacks=RuntimeCallbacks(
+                    ensure_repository=resolve_or_install_repository_for_action,
+                    dispatch=lambda request, project, session_id, link_resource: (
+                        coordinated_runtime_dispatch(
+                            request,
+                            project,
+                            session_id,
+                            link_resource,
+                            runtime_store=store,
+                        )
+                    ),
+                    cleanup=coordinated_runtime_cleanup,
+                    observe=lambda project: coordinated_observe_host(
+                        {
+                            "agent": str(
+                                payload.get("agent")
+                                if isinstance(payload, dict)
+                                else os.environ.get("USER") or "runtime"
+                            ),
+                            "project": project,
+                            "max_age_seconds": 0,
+                            "no_docker": False,
+                            "backup_dir": None,
+                            "legacy_home": [],
+                            "legacy_backup_root": None,
+                        }
+                    ),
+                    inventory=coordinated_build_inventory,
+                    capture_logs=coordinated_runtime_capture_logs,
+                    cleanup_owner_available=lambda: cleanup_owner_available,
+                ),
+            )
+        RUNTIME_REAPER_WAKE.set()
+        return result
+    except BaseException as error:
+        return _runtime_error_envelope(payload, error)
+
+
+def coordinated_broker_runtime_request(payload: Any) -> dict[str, Any]:
+    """Submit one path-free runtime request through the enrolled host broker."""
+
+    request = validate_runtime_request(payload)
+    if request["action"] == "run":
+        raise StructuredCoordinatorError(
+            "the host broker does not accept client commands",
+            {
+                "code": "unsupported_runtime_action",
+                "classification": "unsupported_safe_lifecycle",
+                "action_required": (
+                    "Use the temporary/test account runtime for run; the shared "
+                    "broker accepts only typed enrolled lifecycle requests."
+                ),
+            },
+        )
+    supervision_option_names = {
+        "keep_alive",
+        "rearm_crash_loop",
+        "restart_limit",
+        "restart_window_seconds",
+    }
+    replacement_option_names = {
+        "argv",
+        "cwd",
+        "env",
+        "expected_definition_generation",
+    }
+    permitted_options = set(supervision_option_names)
+    if request["action"] == "replace" and request["target"]["kind"] == "service":
+        permitted_options |= replacement_option_names
+        missing = sorted(replacement_option_names - set(request["options"]))
+        if missing:
+            raise StructuredCoordinatorError(
+                "system worker replacement requires an explicit complete definition and generation",
+                {
+                    "code": "broker_worker_replace_fields_required",
+                    "classification": "invalid_request",
+                    "missing_options": missing,
+                },
+            )
+    unsupported_options = sorted(
+        set(request["options"]) - permitted_options
+    )
+    if unsupported_options:
+        raise StructuredCoordinatorError(
+            "system runtime request contains options outside its typed lifecycle contract",
+            {
+                "code": "broker_runtime_options_forbidden",
+                "classification": "invalid_request",
+                "action_required": "Reference an existing enrolled immutable resource ID only.",
+                "unsupported_options": unsupported_options,
+            },
+        )
+    target_id = str(request["target"].get("id") or "")
+    if not target_id:
+        raise StructuredCoordinatorError(
+            "system runtime requests require an existing immutable target ID",
+            {
+                "code": "broker_runtime_target_id_required",
+                "classification": "invalid_request",
+            },
+        )
+    profile = configured_broker_profile()
+    if profile is None:
+        raise StructuredCoordinatorError(
+            "the unified runtime authority is not enrolled with the host broker",
+            {
+                "code": "runtime_broker_enrollment_required",
+                "classification": "shared_authority_required",
+                "action_required": "Enroll this exact root/worktree and resource through the Coordinator skill.",
+            },
+        )
+    root = profile.repository(canonical_project(request["root_repo"]))
+    effective = (
+        root
+        if request["temporary_repo"] is None
+        else profile.repository(canonical_project(request["temporary_repo"]))
+    )
+    arguments = {
+        "action": request["action"],
+        "agent": request["agent"],
+        "root_repo_id": root.repo_id,
+        "temporary_repo_id": (
+            None if request["temporary_repo"] is None else effective.repo_id
+        ),
+        "target_kind": request["target"]["kind"],
+        "purpose": request["purpose"],
+        "ttl_seconds": request["ttl_seconds"],
+        "kill_after_run": request["kill_after_run"],
+        "keep_alive": request["options"].get("keep_alive"),
+        "rearm_crash_loop": bool(
+            request["options"].get("rearm_crash_loop", False)
+        ),
+        "restart_limit": request["options"].get("restart_limit"),
+        "restart_window_seconds": request["options"].get(
+            "restart_window_seconds"
+        ),
+    }
+    if request["action"] == "replace":
+        arguments.update(
+            {
+                "expected_definition_generation": request["options"][
+                    "expected_definition_generation"
+                ],
+                "argv": request["options"]["argv"],
+                "cwd": request["options"]["cwd"],
+                "environment": request["options"]["env"],
+            }
+        )
+    try:
+        operation_id, result = profile.call(
+            repository=effective,
+            resource_id=target_id,
+            operation=BrokerOperation.RUNTIME_REQUEST,
+            arguments=arguments,
+        )
+    except BrokerError as error:
+        raise StructuredCoordinatorError(
+            error.message,
+            {
+                "code": error.code,
+                "classification": (
+                    "access_denied"
+                    if error.code
+                    in {
+                        "peer_not_authorized",
+                        "project_access_denied",
+                        "resource_access_denied",
+                        "operation_access_denied",
+                        "cross_account_access_denied",
+                    }
+                    else "broker_runtime_unavailable"
+                ),
+                "operation_id": error.operation_id,
+            },
+        ) from error
+    repository = result.get("repository")
+    target = result.get("target")
+    if (
+        result.get("schema_version") != 1
+        or result.get("action") != request["action"]
+        or not isinstance(repository, Mapping)
+        or repository.get("root_repo_id") != root.repo_id
+        or repository.get("effective_repo_id") != effective.repo_id
+        or not isinstance(target, Mapping)
+        or target.get("kind") != request["target"]["kind"]
+        or target.get("id") != target_id
+    ):
+        raise BrokerError(
+            "invalid_reply",
+            "Broker runtime reply does not match the enrolled request context.",
+            operation_id=operation_id,
+        )
+    return result
+
+
+def coordinated_reap_runtime_sessions() -> list[dict[str, Any]]:
+    """Reap expired account-authority sessions from a long-lived owner."""
+
+    if state_backend() == LEGACY_JSON_BACKEND:
+        return []
+    if authority_mode() != "account":
+        raise RuntimeError(
+            "account runtime reaper cannot own system/service authority state"
+        )
+    with AccountStore.open_default(coordinator_home()) as store:
+        return reap_expired_runtime_sessions(
+            store, cleanup=coordinated_runtime_cleanup
+        )
+
+
+def coordinated_next_runtime_cleanup_at() -> str | None:
+    if state_backend() == LEGACY_JSON_BACKEND or authority_mode() != "account":
+        return None
+    with AccountStore.open_default(coordinator_home()) as store:
+        return next_runtime_cleanup_at(store)
+
+
+def coordinated_runtime_artifact(
+    *, resource_kind: str, resource_id: str
+) -> dict[str, Any]:
+    expected_sha256: str | None = None
+    if resource_kind == "service":
+        with AccountStore.open_default(coordinator_home()) as store:
+            with store.read_transaction() as connection:
+                row = connection.execute(
+                    """
+                    SELECT log_path FROM server_definitions
+                    WHERE server_definition_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+        if row is None or not row["log_path"]:
+            raise KeyError("service log artifact not found")
+        path = Path(str(row["log_path"]))
+    elif resource_kind in {"run", "diagnostic"}:
+        try:
+            canonical_session_id = str(uuid.UUID(resource_id))
+        except ValueError as error:
+            raise ValueError("invalid runtime log artifact identity") from error
+        with AccountStore.open_default(coordinator_home()) as store:
+            with store.read_transaction() as connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM runtime_sessions WHERE session_id = ?",
+                    (canonical_session_id,),
+                ).fetchone()
+        if exists is None:
+            raise KeyError("runtime log artifact not found")
+        prefix = "runtime-run" if resource_kind == "run" else "runtime-diagnostic"
+        path = logs_dir() / f"{prefix}-{canonical_session_id}.log"
+    elif resource_kind in {"docker", "database_stack"}:
+        try:
+            canonical_artifact_id = str(uuid.UUID(resource_id))
+        except ValueError as error:
+            raise ValueError("invalid runtime log artifact identity") from error
+        try:
+            manifest, path = load_runtime_log_artifact(
+                root=logs_dir(),
+                artifact_kind=resource_kind,
+                artifact_id=canonical_artifact_id,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise KeyError("runtime log artifact not found") from error
+        expected_sha256 = str(manifest["sha256"])
+    elif resource_kind == "worker_attempt":
+        try:
+            canonical_artifact_id = str(uuid.UUID(resource_id))
+        except ValueError as error:
+            raise ValueError("invalid worker log artifact identity") from error
+        matches: list[Mapping[str, Any]] = []
+        inventory = coordinated_build_inventory()
+        resources = inventory.get("resources")
+        server_rows = (
+            resources.get("servers")
+            if isinstance(resources, Mapping)
+            else []
+        )
+        for server in server_rows or []:
+            if not isinstance(server, Mapping):
+                continue
+            supervision = server.get("supervision")
+            if not isinstance(supervision, Mapping):
+                continue
+            for crash in supervision.get("recent_crashes") or []:
+                if not isinstance(crash, Mapping):
+                    continue
+                log = crash.get("log")
+                if (
+                    isinstance(log, Mapping)
+                    and str(log.get("artifact_id") or "")
+                    == canonical_artifact_id
+                ):
+                    matches.append(log)
+        if len(matches) != 1:
+            raise KeyError("worker log artifact not found")
+        path = Path(str(matches[0].get("path") or ""))
+        expected_sha256 = str(matches[0].get("sha256") or "")
+        if (
+            path.name != f"worker-attempt-{canonical_artifact_id}.log"
+            or not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", expected_sha256)
+        ):
+            raise KeyError("worker log artifact identity is invalid")
+        expected_sha256 = expected_sha256.removeprefix("sha256:")
+    else:
+        raise ValueError("unsupported runtime artifact kind")
+    root = logs_dir()
+    if not path.is_absolute() or path.parent != root:
+        raise KeyError("runtime log artifact is unavailable")
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise KeyError("runtime log artifact cannot be opened safely")
+    try:
+        root_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            root_flags |= os.O_DIRECTORY
+        root_flags |= os.O_NOFOLLOW
+        root_descriptor = os.open(root, root_flags)
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            os.close(root_descriptor)
+            raise KeyError("runtime log artifact root is unavailable")
+    except OSError as error:
+        raise KeyError("runtime log artifact root is unavailable") from error
+    descriptor: int | None = None
+    maximum_bytes = RUNTIME_ARTIFACT_MAX_BYTES
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        descriptor = os.open(path.name, flags, dir_fd=root_descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise KeyError("runtime log artifact is unavailable")
+        cursor = metadata.st_size
+        chunks: list[bytes] = []
+        newline_count = 0
+        captured = 0
+        while cursor > 0 and captured < maximum_bytes and newline_count <= 2000:
+            amount = min(64 * 1024, cursor, maximum_bytes - captured)
+            cursor -= amount
+            chunk = os.pread(descriptor, amount, cursor)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            captured += len(chunk)
+            newline_count += chunk.count(b"\n")
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_dev != metadata.st_dev
+            or after.st_ino != metadata.st_ino
+            or after.st_size != metadata.st_size
+            or after.st_mtime_ns != metadata.st_mtime_ns
+            or after.st_uid != metadata.st_uid
+            or stat.S_IMODE(after.st_mode) != stat.S_IMODE(metadata.st_mode)
+        ):
+            raise KeyError("runtime log artifact changed while being read")
+        raw = b"".join(reversed(chunks))
+        if expected_sha256 is not None and not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(), expected_sha256
+        ):
+            raise KeyError("runtime log artifact does not match its manifest")
+        text_value = "\n".join(
+            raw.decode("utf-8", errors="replace").splitlines()[-2000:]
+        )
+        encoded_text = text_value.encode("utf-8")
+        if len(encoded_text) > maximum_bytes:
+            text_value = encoded_text[-maximum_bytes:].decode(
+                "utf-8", errors="ignore"
+            )
+    except (OSError, ValueError) as error:
+        raise KeyError("runtime log artifact is unavailable") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(root_descriptor)
+    return {
+        "path": str(path),
+        "text": text_value,
+        "tail": 2000,
+        "max_bytes": maximum_bytes,
+    }
+
+
 def print_result(
     value: Any, *, as_json: bool = True, compact_json: bool = False
 ) -> None:
@@ -15701,15 +17947,67 @@ def parse_stats_history_limit(raw: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    runtime_reference = (
+        Path(__file__).resolve().parent.parent / "references" / "runtime-api.md"
+    )
     parser = argparse.ArgumentParser(
-        description="Coordinate Codex dev ports, servers, and Docker."
+        description=(
+            "Coordinate attributed local services, Docker resources, database "
+            "stacks, ports, and runtime evidence."
+        )
     )
     sub = parser.add_subparsers(dest="group", required=True)
 
-    inventory = sub.add_parser("inventory")
-    inventory.add_argument("--project")
-    inventory.add_argument("--backup-dir", action="append")
-    inventory.add_argument("--no-docker", action="store_true")
+    runtime = sub.add_parser(
+        "runtime",
+        help="run one attributed repository-scoped runtime lifecycle request",
+        description="Run one strict repository-scoped lifecycle request.",
+        epilog=(
+            "Flag mode covers existing-target status/start/stop/restart/remove.\n"
+            "Discover immutable IDs with: inventory --project ROOT_REPO --compact-json\n"
+            "Read repository_trees for ownership, then the matching resources entry for its ID.\n\n"
+            "Every request supplies agent, root_repo, explicit nullable temporary_repo, "
+            "purpose, TTL/null, and KillAfterRun. Only run may set KillAfterRun=true.\n"
+            "Test/temporary start, restart, replace, and run require a positive TTL. "
+            "Status requires null; stop and development work may use null.\n"
+            "A persistent worker's first start supplies Keep Alive explicitly. The default "
+            "breaker permanently trips after 10 crashes in 300 seconds until an attributed "
+            "start explicitly re-arms it.\n\n"
+            "Structured new-service, replacement, and bounded-run request examples: "
+            f"{runtime_reference}#structured-request-examples"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_runtime_cli_arguments(runtime)
+    add_worker_cli_parser(sub)
+
+    inventory = sub.add_parser(
+        "inventory",
+        help="read repository trees and immutable runtime resource IDs",
+        description=(
+            "Read normalized runtime inventory without performing a lifecycle action."
+        ),
+        epilog=(
+            "Use repository_trees for authoritative membership. Immutable IDs are in "
+            "resources.servers[].server_definition_id, "
+            "resources.docker[].docker_resource_id, and "
+            "resources.databases[].database_binding_id."
+        ),
+    )
+    inventory.add_argument(
+        "--project",
+        help="canonical root or temporary Git worktree to select; omit for all",
+    )
+    inventory.add_argument(
+        "--backup-dir",
+        action="append",
+        help="additional backup directory to include (repeatable)",
+    )
+    inventory.add_argument(
+        "--no-docker",
+        action="store_true",
+        help="omit Docker compatibility details from this read",
+    )
     inventory.add_argument(
         "--compact-json",
         action="store_true",
@@ -15987,6 +18285,54 @@ def namespace_to_options(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def blocked_worker_runner_result(worker_id: str, error: BaseException) -> dict[str, Any]:
+    """Return a terminal native-runner result which must not restart-loop."""
+
+    return {
+        "schema_version": 1,
+        "ok": False,
+        "worker_id": worker_id,
+        "classification": "worker_not_launchable",
+        "error": str(error),
+        "attempts": 0,
+        "repository": {"root_repo": None, "temporary_repo": None},
+        "log_artifacts": [],
+        "restart_allowed": False,
+    }
+
+
+def coordinated_worker_runner(worker_id: str) -> dict[str, Any]:
+    """Run one fixed native worker through account or broker authority."""
+
+    clear_exec_capability_inheritance()
+    mode = authority_mode()
+    if mode == "system":
+        try:
+            authority = BrokerWorkerAuthority.load(worker_id=worker_id)
+        except WorkerAuthorityBlocked as error:
+            return blocked_worker_runner_result(worker_id, error)
+        return worker_runner_cli_result(
+            worker_id=worker_id,
+            authority=authority,
+            artifact_root=worker_log_directory(os.geteuid()),
+        )
+    if mode != "account":
+        raise PermissionError(
+            "the service authority must never execute a user worker runner"
+        )
+    if state_backend() == LEGACY_JSON_BACKEND:
+        return blocked_worker_runner_result(
+            worker_id,
+            RuntimeError("worker supervision requires the normalized SQLite backend"),
+        )
+    with AccountStore.open_default(coordinator_home()) as store:
+        return worker_runner_cli_result(
+            worker_id=worker_id,
+            authority=DirectWorkerAuthority(WorkerSupervision(store)),
+            artifact_root=logs_dir(),
+        )
+
+
 def handle_cli(args: argparse.Namespace) -> Any:
     if authority_mode() == "service":
         allowed = (
@@ -16030,6 +18376,8 @@ def handle_cli(args: argparse.Namespace) -> Any:
             ),
             broker_profile_loader=configured_broker_profile,
         )
+    if args.group == "worker" and args.action == "runner":
+        return coordinated_worker_runner(args.worker_id)
     if args.group == "broker" and args.action == "enroll":
         return coordinated_broker_enroll(args)
     if args.group == "broker" and args.action == "reconcile-compose":
@@ -16076,6 +18424,15 @@ def handle_cli(args: argparse.Namespace) -> Any:
         )
     if args.group == "observe":
         return coordinated_observe_host(namespace_to_options(args))
+    if args.group == "runtime":
+        try:
+            request = load_runtime_cli_request(args)
+        except (OSError, RuntimeRequestError, ValueError) as error:
+            context = getattr(error, "request_context", None)
+            if not isinstance(context, Mapping):
+                context = runtime_cli_error_context(args)
+            return _runtime_error_envelope(dict(context), error)
+        return coordinated_runtime_request(request)
     if args.group == "state" and args.action == "reset":
         if not args.force:
             raise SystemExit("--force is required")
@@ -16206,7 +18563,11 @@ def handle_cli(args: argparse.Namespace) -> Any:
                     active_only=True,
                 )
         if args.group == "server" and args.action == "list":
-            return list(normalized_control_snapshot()["servers"].values())
+            with AccountStore.open_default(coordinator_home()) as store:
+                return [
+                    normalized_public_server(server)
+                    for server in NormalizedServerLifecycle(store).list_servers()
+                ]
     with locked_state() as state:
         if args.group == "state" and args.action == "show":
             return state
@@ -16742,6 +19103,132 @@ def coordinated_lifecycle_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
         return result
 
 
+def _mirror_permanent_worker_revocations(
+    profile: BrokerClientProfile, result: dict[str, Any]
+) -> None:
+    """Fence broker-confirmed permanent IDs in the account projection."""
+
+    if (
+        str(result.get("action") or "") != "purge"
+        or result.get("status") not in {"succeeded", "already_complete"}
+    ):
+        return
+    pre_apply = result.get("pre_apply")
+    if not isinstance(pre_apply, Mapping):
+        return
+    repositories = {
+        repository.repo_id: repository
+        for repository in _cleanup_profile_repositories(profile)
+    }
+    mirrored: list[dict[str, Any]] = []
+    with AccountStore.open_default(coordinator_home()) as store:
+        links = BrokerLinkStore(store)
+        repository_revocation = pre_apply.get("repository_revocation")
+        if repository_revocation is not None:
+            if not isinstance(repository_revocation, Mapping):
+                raise RuntimeError(
+                    "broker project revocation evidence is invalid"
+                )
+            service = repository_revocation.get("service")
+            protected = repository_revocation.get("protected_profile")
+            if not isinstance(service, Mapping) or not isinstance(
+                protected, Mapping
+            ):
+                raise RuntimeError(
+                    "broker permanent project cleanup lacks dual revocation evidence"
+                )
+            repo_id = str(service.get("repo_id") or "")
+            repository_generation = service.get("repository_generation")
+            cleanup_operation_id = str(
+                service.get("cleanup_operation_id") or ""
+            )
+            immutable_fingerprint = str(
+                service.get("immutable_fingerprint") or ""
+            )
+            repository = repositories.get(repo_id)
+            if (
+                repository is None
+                or type(repository_generation) is not int
+                or repository.generation != repository_generation
+                or (
+                    str(protected.get("repo_id") or ""),
+                    protected.get("repository_generation"),
+                    str(protected.get("cleanup_operation_id") or ""),
+                )
+                != (repo_id, repository_generation, cleanup_operation_id)
+            ):
+                raise RuntimeError(
+                    "broker permanent project revocation identity is inconsistent"
+                )
+            result["client_repository_materialization_revocation"] = (
+                links.revoke_repository_materialization(
+                    profile=profile,
+                    repository=repository,
+                    broker_operation_id=cleanup_operation_id,
+                    immutable_fingerprint=immutable_fingerprint,
+                )
+            )
+
+        workers = pre_apply.get("workers")
+        if not isinstance(workers, list):
+            workers = []
+        for raw_worker in workers:
+            if not isinstance(raw_worker, Mapping):
+                raise RuntimeError("broker worker cleanup evidence is invalid")
+            revocation = raw_worker.get("revocation")
+            if revocation is None:
+                continue
+            if not isinstance(revocation, Mapping):
+                raise RuntimeError("broker worker revocation evidence is invalid")
+            service = revocation.get("service")
+            protected = revocation.get("protected_profile")
+            if not isinstance(service, Mapping) or not isinstance(
+                protected, Mapping
+            ):
+                raise RuntimeError(
+                    "broker permanent worker cleanup lacks dual revocation evidence"
+                )
+            repo_id = str(service.get("repo_id") or "")
+            server_definition_id = str(
+                service.get("server_definition_id") or ""
+            )
+            server_name = str(service.get("server_name") or "")
+            cleanup_operation_id = str(
+                service.get("cleanup_operation_id") or ""
+            )
+            immutable_fingerprint = str(
+                service.get("immutable_fingerprint") or ""
+            )
+            exact = (
+                repo_id,
+                server_definition_id,
+                server_name,
+                cleanup_operation_id,
+            )
+            protected_exact = (
+                str(protected.get("repo_id") or ""),
+                str(protected.get("server_definition_id") or ""),
+                str(protected.get("server_name") or ""),
+                str(protected.get("cleanup_operation_id") or ""),
+            )
+            if exact != protected_exact or repo_id not in repositories:
+                raise RuntimeError(
+                    "broker permanent worker revocation identity is inconsistent"
+                )
+            mirrored.append(
+                links.revoke_server_materialization(
+                    profile=profile,
+                    repository=repositories[repo_id],
+                    server_name=server_name,
+                    server_definition_id=server_definition_id,
+                    broker_operation_id=cleanup_operation_id,
+                    immutable_fingerprint=immutable_fingerprint,
+                )
+            )
+    if mirrored:
+        result["client_materialization_revocations"] = mirrored
+
+
 def coordinated_lifecycle_apply(payload: Mapping[str, Any]) -> dict[str, Any]:
     required = {"plan_id", "plan_fingerprint", "confirmation_phrase"}
     if set(payload) != required:
@@ -16757,6 +19244,7 @@ def coordinated_lifecycle_apply(payload: Mapping[str, Any]) -> dict[str, Any]:
             operation=BrokerOperation.CLEANUP_APPLY,
             arguments={key: str(payload[key]) for key in required},
         )
+        _mirror_permanent_worker_revocations(profile, result)
         return result
     if authority_mode() == "service":
         raise PermissionError(
@@ -16772,8 +19260,23 @@ def coordinated_lifecycle_apply(payload: Mapping[str, Any]) -> dict[str, Any]:
             cleanup_row = connection.execute(
                 "SELECT 1 FROM cleanup_plans WHERE plan_id = ?", (plan_id,)
             ).fetchone()
+        prepared_worker_evidence: list[dict[str, Any]] = []
+
+        def prepare_worker_apply(plan: Any, actor: str) -> dict[str, Any]:
+            evidence = unregister_workers_for_plan(
+                store,
+                plan=plan,
+                actor=actor,
+                coordinator_script=Path(__file__),
+                execution_uid=os.geteuid(),
+            )
+            prepared_worker_evidence.append(evidence)
+            return evidence
+
         if cleanup_row is not None:
-            result = CleanupLifecycle(store).apply(
+            result = CleanupLifecycle(
+                store, prepare_apply=prepare_worker_apply
+            ).apply(
                 plan_id=plan_id,
                 plan_fingerprint=plan_fingerprint,
                 confirmation_phrase=confirmation_phrase,
@@ -16785,7 +19288,9 @@ def coordinated_lifecycle_apply(payload: Mapping[str, Any]) -> dict[str, Any]:
             persistence = SQLiteLifecyclePersistence(store)
             plan = persistence.load_plan(plan_id)
             lifecycle = RepositoryLifecycle(
-                persistence, CoordinatorHostLifecycleAdapter()
+                persistence,
+                CoordinatorHostLifecycleAdapter(),
+                prepare_apply=prepare_worker_apply,
             )
             if isinstance(plan, RepositoryDecommissionPlan):
                 result = lifecycle.apply_repository_decommission(
@@ -16805,6 +19310,8 @@ def coordinated_lifecycle_apply(payload: Mapping[str, Any]) -> dict[str, Any]:
                     "ok": result.get("status") in {"succeeded", "already_complete"},
                 }
             )
+            if prepared_worker_evidence:
+                result["pre_apply"] = prepared_worker_evidence[-1]
         result["pre_apply_observation"] = observation
         return result
 
@@ -16887,6 +19394,7 @@ API_GET_ROUTES = frozenset(
 )
 API_POST_ROUTES = frozenset(
     {
+        "/v1/runtime",
         "/v1/servers/start",
         "/v1/servers/stop",
         "/v1/servers/restart",
@@ -17073,6 +19581,21 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _send_runtime_artifact(self, payload: Mapping[str, Any]) -> None:
+        text_value = payload.get("text")
+        if not isinstance(text_value, str):
+            raise RuntimeError("runtime log artifact has no text representation")
+        body = text_value.encode("utf-8")
+        if len(body) > RUNTIME_ARTIFACT_MAX_BYTES:
+            raise RuntimeError("runtime log artifact exceeds the 1 MiB limit")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _method_not_allowed(self, allowed: tuple[str, ...]) -> None:
         self._send(
             405, {"error": "method not allowed"}, headers={"Allow": ", ".join(allowed)}
@@ -17142,8 +19665,18 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         print(f"{self.address_string()} - {format % args}", file=sys.stderr)
 
     def _handle_get(self, path: str, raw_query: str = "") -> None:
+        runtime_artifact = path.startswith("/v1/runtime/artifacts/")
         try:
-            if path == "/v1/inventory":
+            if runtime_artifact:
+                parts = path.split("/")
+                if len(parts) != 6 or parts[:4] != ["", "v1", "runtime", "artifacts"]:
+                    raise ValueError("invalid runtime artifact path")
+                result = coordinated_runtime_artifact(
+                    resource_kind=parts[4], resource_id=parts[5]
+                )
+                self._send_runtime_artifact(result)
+                return
+            elif path == "/v1/inventory":
                 result: Any = coordinated_build_inventory()
             elif path == "/v1/archives":
                 result = coordinated_list_archives()
@@ -17200,25 +19733,45 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                             if path == "/v1/ports"
                             else ports.list_assignments(active_only=True)
                         )
+                elif path == "/v1/servers":
+                    with AccountStore.open_default(coordinator_home()) as store:
+                        result = [
+                            normalized_public_server(server)
+                            for server in NormalizedServerLifecycle(store).list_servers()
+                        ]
                 else:
                     snapshot = normalized_control_snapshot()
-                    result = (
-                        snapshot
-                        if path == "/v1/state"
-                        else list(snapshot["servers"].values())
-                    )
+                    result = snapshot
             else:
                 self._send(404, {"error": "not found"})
                 return
             self._send(200, result)
         except ValueError as exc:
             self._send(400, {"error": str(exc)})
+        except KeyError as exc:
+            if runtime_artifact:
+                self._send(404, {"error": str(exc)})
+            else:  # preserve the existing unrelated GET failure contract
+                self._send(500, {"error": str(exc)})
         except Exception as exc:  # pragma: no cover - defensive endpoint wrapper
             self._send(500, {"error": str(exc)})
 
     def _handle_post(self, path: str) -> None:
         try:
             payload = self._read_json()
+            if path == "/v1/runtime":
+                result = coordinated_runtime_request(
+                    payload,
+                    cleanup_owner_available=bool(
+                        getattr(
+                            self.server,
+                            "runtime_cleanup_owner_available",
+                            False,
+                        )
+                    ),
+                )
+                self._send(200 if result.get("ok") else 409, result)
+                return
             if path == "/v1/observe":
                 if set(payload) != {"agent", "project"}:
                     raise ValueError(
@@ -17414,7 +19967,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         if not self._require_authorization():
             return
 
-        if path in API_GET_ROUTES:
+        runtime_artifact = path.startswith("/v1/runtime/artifacts/")
+        if path in API_GET_ROUTES or runtime_artifact:
             if method != "GET":
                 self._method_not_allowed(("GET",))
                 return
@@ -17495,13 +20049,87 @@ def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
         ),
         flush=True,
     )
+    reaper_stop = threading.Event()
+    reaper_thread: threading.Thread | None = None
+    server.runtime_cleanup_owner_available = False
+    if authority_mode() == "account" and state_backend() != LEGACY_JSON_BACKEND:
+        with AccountStore.open_default(coordinator_home()) as store:
+            worker_reconciliation = WorkerController(
+                store, coordinator_script=Path(__file__)
+            ).reconcile_startup(supervisor_epoch=str(uuid.uuid4()))
+        print(
+            json.dumps(
+                {
+                    "event": "worker.startup_reconciled",
+                    **worker_reconciliation,
+                },
+                sort_keys=True,
+            ),
+            file=(
+                sys.stdout
+                if worker_reconciliation.get("ok") is True
+                else sys.stderr
+            ),
+            flush=True,
+        )
+
+        def reap_runtime_sessions_forever() -> None:
+            while not reaper_stop.is_set():
+                try:
+                    deadline = coordinated_next_runtime_cleanup_at()
+                    if deadline is None:
+                        timeout = 300.0
+                    else:
+                        cleanup_at = datetime.strptime(
+                            deadline, "%Y-%m-%dT%H:%M:%SZ"
+                        ).replace(tzinfo=timezone.utc)
+                        timeout = max(
+                            0.0,
+                            min(
+                                300.0,
+                                (cleanup_at - datetime.now(timezone.utc)).total_seconds(),
+                            ),
+                        )
+                    woke = RUNTIME_REAPER_WAKE.wait(timeout)
+                    RUNTIME_REAPER_WAKE.clear()
+                    if reaper_stop.is_set():
+                        return
+                    if woke:
+                        continue
+                    coordinated_reap_runtime_sessions()
+                except BaseException as error:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "runtime.reaper.failed",
+                                "error": str(error),
+                                "error_type": type(error).__name__,
+                            },
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+        reaper_thread = threading.Thread(
+            target=reap_runtime_sessions_forever,
+            name="runtime-session-reaper",
+            daemon=True,
+        )
+        reaper_thread.start()
+        server.runtime_cleanup_owner_available = True
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        server.runtime_cleanup_owner_available = False
         profile_watch_stop.set()
+        reaper_stop.set()
+        RUNTIME_REAPER_WAKE.set()
         server.server_close()
+        if reaper_thread is not None:
+            reaper_thread.join(timeout=2.0)
         if profile_watch_thread is not None:
             profile_watch_thread.join(
                 timeout=API_PROFILE_RELOAD_POLL_SECONDS * 2 + 1.0
@@ -17540,9 +20168,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
     try:
+        result = handle_cli(args)
         print_result(
-            handle_cli(args), compact_json=bool(getattr(args, "compact_json", False))
+            result, compact_json=bool(getattr(args, "compact_json", False))
         )
+        if (
+            args.group == "runtime"
+            and isinstance(result, dict)
+            and result.get("ok") is not True
+        ):
+            return 1
         return 0
     except Exception as exc:
         print(

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import pwd
 import socket
 import struct
 import sys
@@ -147,8 +148,9 @@ class _SocketDirectory:
     """Test-owned canonical private socket directory."""
 
     def __enter__(self) -> Path:
+        account_home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
         self._temporary = tempfile.TemporaryDirectory(
-            prefix=".ephemeral-secret-fd-", dir=str(Path.home().resolve())
+            prefix=".dc-fd-", dir=str(account_home)
         )
         self.path = Path(self._temporary.name).resolve()
         # The production broker socket is group-readable/writable (0660), so
@@ -298,7 +300,7 @@ class _StoreBackedFixture:
 
     def __init__(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(
-            prefix="devcoordinator-store-secret-", dir="/tmp"
+            prefix="devcoordinator-store-secret-", dir=str(Path("/tmp").resolve())
         )
         self.root = Path(self._temporary.name)
         self.root.chmod(0o700)

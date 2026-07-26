@@ -258,8 +258,13 @@ class SQLiteCutoverTests(unittest.TestCase):
         )
         self.assertEqual(before_bytes, database.read_bytes())
 
+        # The copied fixture is fully checkpointed but intentionally retains
+        # its WAL journal-mode header without copying disposable sidecars.
+        # Open the final byte snapshot as immutable so SQLite does not require
+        # a writable directory merely to recreate absent WAL coordination
+        # files during this read-only assertion.
         verification = sqlite3.connect(
-            f"{database.as_uri()}?mode=ro",
+            f"{database.as_uri()}?mode=ro&immutable=1",
             uri=True,
             isolation_level=None,
         )

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -557,6 +558,11 @@ def exercise_legacy_docker_dropin_controls() -> None:
 
 
 def exercise_source_acl_transaction() -> None:
+    # The installed broker and this ACL transaction are Linux-only. macOS does
+    # not provide getfacl/setfacl, so retain the source-contract assertions in
+    # main() and run the executable round trip only where both tools exist.
+    if shutil.which("getfacl") is None or shutil.which("setfacl") is None:
+        return
     original_root = INSTALLER.ROOT
     original_source = INSTALLER.SKILL_SOURCE
     original_group = INSTALLER.ACCESS_GROUP
@@ -736,6 +742,28 @@ def exercise_docker_socket_admission_evidence() -> None:
         "ACL mask was not applied to a named-user Docker socket grant",
     )
 
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-missing-listxattr-") as raw:
+        owned = Path(raw).resolve(strict=True)
+        owned.chmod(0o700)
+        with mock.patch.object(INSTALLER, "_read_posix_acl", return_value=(None, "getfacl_unavailable")), mock.patch.object(
+            INSTALLER.os, "listxattr", new=None, create=True
+        ):
+            owner = INSTALLER._identity_path_permission(
+                owned, uid=os.getuid(), gids={os.getgid()}, required="x"
+            )
+            foreign = INSTALLER._identity_path_permission(
+                owned, uid=os.getuid() + 10_000, gids=set(), required="x"
+            )
+        expect(
+            owner["allowed"] is True and owner["source"] == "owner_mode",
+            f"missing listxattr rejected a directly owned path: {owner}",
+        )
+        expect(
+            foreign["allowed"] is None
+            and foreign["source"] == "getfacl_unavailable",
+            f"missing listxattr trusted a non-owner mode approximation: {foreign}",
+        )
+
     with tempfile.TemporaryDirectory(prefix="devcoordinator-docker-socket-") as raw:
         root = Path(raw).resolve(strict=True)
         root.chmod(0o755)
@@ -753,7 +781,9 @@ def exercise_docker_socket_admission_evidence() -> None:
         # The sandbox may forbid creating AF_UNIX filesystem sockets. Patch
         # only the type predicate; real inode, alias, ACL, mode, and traversal
         # evidence still exercise the full read-only admission path.
-        with mock.patch.object(INSTALLER.stat, "S_ISSOCK", return_value=True):
+        with mock.patch.object(INSTALLER.stat, "S_ISSOCK", return_value=True), mock.patch.object(
+            INSTALLER.os, "listxattr", return_value=[], create=True
+        ):
             evidence = INSTALLER.docker_socket_admission_evidence(
                 [(record, root)], socket_candidates=[socket_path, alias_path]
             )
@@ -1536,8 +1566,33 @@ def exercise_profile_database_enrollment_guard() -> None:
                     "profile_database_enrollment_check",
                     return_value=drift_result,
                 ),
+                mock.patch.object(
+                    INSTALLER,
+                    "client_records",
+                    return_value=[
+                        (
+                            pwd.struct_passwd(
+                                (
+                                    "devcoordinator-fixture",
+                                    "x",
+                                    os.geteuid(),
+                                    os.getegid(),
+                                    "",
+                                    "/home/devcoordinator-fixture",
+                                    "/bin/sh",
+                                )
+                            ),
+                            Path("/home/devcoordinator-fixture"),
+                        )
+                    ],
+                ),
+                mock.patch.object(
+                    INSTALLER,
+                    "enrolled_home_write_paths",
+                    return_value=[Path("/home/devcoordinator-fixture")],
+                ),
             ):
-                plan = INSTALLER.desired_plan([pwd.getpwuid(os.geteuid()).pw_name])
+                plan = INSTALLER.desired_plan(["devcoordinator-fixture"])
             expect(
                 plan["restart_allowed"] is False
                 and INSTALLER.PROFILE_DATABASE_ENROLLMENT_DRIFT in plan["next_step"]
@@ -1658,8 +1713,28 @@ def exercise_profile_database_enrollment_guard() -> None:
 
 
 def main() -> int:
-    user = pwd.getpwuid(os.geteuid()).pw_name
-    plan = INSTALLER.desired_plan([user])
+    user = "devcoordinator-fixture"
+    fixture_home = Path("/home/devcoordinator-fixture")
+    fixture_record = pwd.struct_passwd(
+        (user, "x", os.geteuid(), os.getegid(), "", str(fixture_home), "/bin/sh")
+    )
+    # The production installer deliberately accepts only direct /home children.
+    # Keep this plan fixture independent of the developer host's account layout
+    # (for example macOS /Users) while the focused home-path tests exercise the
+    # real validation function separately.
+    with (
+        mock.patch.object(
+            INSTALLER,
+            "client_records",
+            return_value=[(fixture_record, fixture_home)],
+        ),
+        mock.patch.object(
+            INSTALLER,
+            "enrolled_home_write_paths",
+            return_value=[fixture_home],
+        ),
+    ):
+        plan = INSTALLER.desired_plan([user])
     expect(
         plan["authority"]["database"] == "/var/lib/devcoordinator/coordinator.sqlite3",
         "plan selected the wrong authority database",
@@ -1719,7 +1794,7 @@ def main() -> int:
         and plan["system_files"][-1]["destination"]
         == str(INSTALLER.ENROLLED_HOME_DROPIN)
         and plan["system_files"][-1]["home_write_paths"]
-        == [pwd.getpwuid(os.geteuid()).pw_dir],
+        == [str(fixture_home)],
         "installer plan does not bind the generated drop-in to the complete client set",
     )
     assert plan["runtime_requirements"]["python"] == "/usr/bin/python3"

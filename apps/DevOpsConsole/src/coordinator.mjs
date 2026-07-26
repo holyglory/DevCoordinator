@@ -9,6 +9,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
 const PROJECT_ACTIONS = new Set(['start', 'stop', 'restart']);
+const RUNTIME_ARTIFACT_KINDS = new Set([
+  'service', 'run', 'diagnostic', 'docker', 'database_stack', 'worker_attempt',
+]);
+const RUNTIME_ARTIFACT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024;
 const TOKEN_MAX_BYTES = 4096;
 const FULL_DOCKER_OBSERVER_DOMAIN = 'host-runtime-v2:full-docker';
 const OPERATIONAL_SERVER_STATES = new Set([
@@ -222,6 +227,7 @@ function consoleDockerProjection(value, docker, trustedObservations) {
 }
 
 export function coordinatorTimeoutFor(apiPath) {
+  if (apiPath === '/v1/runtime') return 300_000;
   if (apiPath === '/v1/lifecycle/apply') return 600_000;
   if (apiPath.startsWith('/v1/lifecycle/')) return 300_000;
   if (apiPath.startsWith('/v1/projects/')) return 300_000; // compose up can run minutes
@@ -408,7 +414,40 @@ export function createCoordinator({ config, log }) {
     }
   }
 
-  async function fetchJson(method, apiPath, body, timeoutMs) {
+  async function readBoundedRuntimeArtifact(res) {
+    const rawLength = res.headers.get('content-length');
+    if (rawLength && /^\d+$/.test(rawLength) && Number(rawLength) > RUNTIME_ARTIFACT_MAX_BYTES) {
+      await res.body?.cancel().catch(() => {});
+      throw new CoordError('coordinator returned an oversized runtime log artifact', { status: 502 });
+    }
+    if (!String(res.headers.get('content-type') ?? '').toLowerCase().startsWith('text/plain')) {
+      await res.body?.cancel().catch(() => {});
+      throw new CoordError('coordinator returned an invalid runtime log artifact', { status: 502 });
+    }
+    if (!res.body) return { text: '' };
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        size += chunk.length;
+        if (size > RUNTIME_ARTIFACT_MAX_BYTES) {
+          await reader.cancel().catch(() => {});
+          throw new CoordError('coordinator returned an oversized runtime log artifact', { status: 502 });
+        }
+        chunks.push(chunk);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return { text: Buffer.concat(chunks, size).toString('utf8') };
+  }
+
+  async function fetchJson(method, apiPath, body, timeoutMs, responseMode = 'json') {
     const ac = new AbortController();
     pendingAborts.add(ac);
     const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -446,23 +485,40 @@ export function createCoordinator({ config, log }) {
         noteDown(coordErr);
         throw coordErr;
       }
-      let text = '';
-      try {
-        text = await res.text();
-      } catch (err) {
-        const coordErr = new CoordError(
-          `coordinator response read failed (${method} ${apiPath}): ${err?.message ?? err}`,
-        );
-        coordErr.cause = err;
-        noteDown(coordErr);
-        throw coordErr;
-      }
       let data = null;
-      if (text) {
+      if (responseMode === 'runtime-artifact' && res.status === 200) {
         try {
-          data = JSON.parse(text);
-        } catch {
-          data = text;
+          data = await readBoundedRuntimeArtifact(res);
+        } catch (err) {
+          if (err instanceof CoordError) {
+            noteAlive();
+            throw err;
+          }
+          const coordErr = new CoordError(
+            `coordinator response read failed (${method} ${apiPath}): ${err?.message ?? err}`,
+          );
+          coordErr.cause = err;
+          noteDown(coordErr);
+          throw coordErr;
+        }
+      } else {
+        let text = '';
+        try {
+          text = await res.text();
+        } catch (err) {
+          const coordErr = new CoordError(
+            `coordinator response read failed (${method} ${apiPath}): ${err?.message ?? err}`,
+          );
+          coordErr.cause = err;
+          noteDown(coordErr);
+          throw coordErr;
+        }
+        if (text) {
+          try {
+            data = JSON.parse(text);
+          } catch {
+            data = text;
+          }
         }
       }
       if (res.status !== 200) {
@@ -486,9 +542,9 @@ export function createCoordinator({ config, log }) {
     }
   }
 
-  async function attempt(method, apiPath, body, timeoutMs) {
+  async function attempt(method, apiPath, body, timeoutMs, responseMode = 'json') {
     try {
-      return await fetchJson(method, apiPath, body, timeoutMs);
+      return await fetchJson(method, apiPath, body, timeoutMs, responseMode);
     } catch (err) {
       const canRetry =
         err instanceof CoordError && err.status === 0 && err.retryable === true && !closed;
@@ -496,7 +552,7 @@ export function createCoordinator({ config, log }) {
       // Lazy autostart on connection failure (rate-limited inside).
       const revived = await ensureRunning();
       if (!revived.ok) throw err;
-      return fetchJson(method, apiPath, body, timeoutMs);
+      return fetchJson(method, apiPath, body, timeoutMs, responseMode);
     }
   }
 
@@ -519,10 +575,10 @@ export function createCoordinator({ config, log }) {
     return method !== 'GET' && !apiPath.endsWith('/logs');
   }
 
-  async function request(method, apiPath, body, { timeoutMs } = {}) {
+  async function request(method, apiPath, body, { timeoutMs, responseMode = 'json' } = {}) {
     if (closed) throw new CoordError('coordinator client is closed');
     const ms = timeoutMs ?? coordinatorTimeoutFor(apiPath);
-    const result = await attempt(method, apiPath, body ?? null, ms);
+    const result = await attempt(method, apiPath, body ?? null, ms, responseMode);
     if (isMutation(method, apiPath)) invalidateCaches();
     return result;
   }
@@ -753,6 +809,28 @@ export function createCoordinator({ config, log }) {
     return result;
   }
 
+  function runtimeArtifact(kind, id) {
+    if (!RUNTIME_ARTIFACT_KINDS.has(kind)) {
+      throw new CoordError('unsupported runtime artifact kind', { status: 400 });
+    }
+    if (typeof id !== 'string' || !RUNTIME_ARTIFACT_ID_RE.test(id)) {
+      throw new CoordError('runtime artifact id must be a UUID', { status: 400 });
+    }
+    return request(
+      'GET',
+      `/v1/runtime/artifacts/${kind}/${encodeURIComponent(id.toLowerCase())}`,
+      null,
+      { responseMode: 'runtime-artifact' },
+    );
+  }
+
+  function runtimeAction(body) {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new CoordError('runtime request must be an object', { status: 400 });
+    }
+    return request('POST', '/v1/runtime', body);
+  }
+
   function lifecycleResult(action, result) {
     const status = String(result?.status ?? '').toLowerCase();
     const failedStatus = new Set(['blocked', 'failed', 'needs_attention', 'partial']);
@@ -818,6 +896,8 @@ export function createCoordinator({ config, log }) {
     projectAction,
     projectStatus: (b = {}) => request('POST', '/v1/projects/status', b),
     dockerLogs: (b = {}) => request('POST', '/v1/docker/logs', b),
+    runtimeAction,
+    runtimeArtifact,
     lifecycleArchives: () => request('GET', '/v1/archives'),
     lifecyclePlan: (b = {}) => request('POST', '/v1/lifecycle/plan', b),
     lifecycleApply: async (b = {}) => lifecycleResult(

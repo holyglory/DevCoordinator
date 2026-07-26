@@ -12,11 +12,17 @@ import { UpstreamAuthError } from './upstream-auth.mjs';
 
 const BODY_LIMIT = 64 * 1024;
 const SERVER_ACTIONS = new Set(['stop', 'restart']);
+const WORKER_ACTIONS = new Set(['start', 'stop', 'restart', 'remove']);
 const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
 const PROJECT_ACTIONS = new Set(['start', 'stop', 'restart']);
 const LIFECYCLE_ACTIONS = new Set(['archive', 'purge']);
 const LIFECYCLE_TARGET_KINDS = new Set(['project', 'server', 'container', 'worktree']);
 const CONTAINER_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+const RUNTIME_ARTIFACT_KINDS = new Set([
+  'service', 'run', 'diagnostic', 'docker', 'database_stack', 'worker_attempt',
+]);
+const RUNTIME_ARTIFACT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024;
 const TAIL_MAX = 5000;
 
 class ApiError extends Error {
@@ -60,6 +66,21 @@ export function createConsoleApi({
       'content-type': 'application/json; charset=utf-8',
       'content-length': Buffer.byteLength(body),
       'cache-control': 'no-store',
+    });
+    res.end(body);
+  }
+
+  function sendRuntimeArtifact(res, kind, id, text) {
+    const body = Buffer.from(text, 'utf8');
+    if (body.length > RUNTIME_ARTIFACT_MAX_BYTES) {
+      throw new ApiError(502, 'coordinator returned an oversized runtime log artifact');
+    }
+    res.writeHead(200, {
+      'content-type': 'text/plain; charset=utf-8',
+      'content-length': body.length,
+      'content-disposition': `inline; filename="${kind}-${id}.log"`,
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
     });
     res.end(body);
   }
@@ -718,6 +739,175 @@ export function createConsoleApi({
     sendJson(res, 200, { server: result });
   }
 
+  function optionalBoolean(body, field) {
+    if (!Object.hasOwn(body, field)) return undefined;
+    if (typeof body[field] !== 'boolean') {
+      throw new ApiError(400, `${field} must be a boolean`);
+    }
+    return body[field];
+  }
+
+  function exactWorkerContext(inventory, serverId) {
+    if (!Array.isArray(inventory?.repository_trees)) {
+      throw new ApiError(409, 'worker actions require an authoritative repository tree');
+    }
+    const servers = Array.isArray(inventory?.servers) ? inventory.servers : [];
+    const serverMatches = servers.filter((server) => String(server?.id ?? '') === serverId);
+    if (serverMatches.length !== 1) {
+      throw new ApiError(
+        serverMatches.length ? 409 : 404,
+        serverMatches.length
+          ? 'worker identity is duplicated in inventory'
+          : 'worker not found',
+      );
+    }
+
+    const memberships = [];
+    for (const tree of inventory.repository_trees) {
+      const root = tree?.root_repository;
+      for (const scope of Array.isArray(tree?.scopes) ? tree.scopes : []) {
+        if (!Array.isArray(scope?.server_ids) || !scope.server_ids.some(
+          (id) => String(id) === serverId,
+        )) continue;
+        memberships.push({ tree, root, scope });
+      }
+    }
+    if (memberships.length !== 1) {
+      throw new ApiError(
+        409,
+        memberships.length
+          ? 'worker belongs to more than one repository scope; action was refused'
+          : 'worker has no authoritative repository scope; action was refused',
+      );
+    }
+    const [{ root, scope }] = memberships;
+    const rootRepo = root?.canonical_root;
+    const effectiveRepo = scope?.canonical_root;
+    if (
+      typeof rootRepo !== 'string' || !rootRepo.startsWith('/')
+      || typeof effectiveRepo !== 'string' || !effectiveRepo.startsWith('/')
+      || !['root', 'temporary'].includes(scope?.kind)
+      || (scope.kind === 'root' && effectiveRepo !== rootRepo)
+    ) {
+      throw new ApiError(409, 'worker repository scope is incomplete or contradictory');
+    }
+    const server = serverMatches[0];
+    if (!server.supervision || typeof server.supervision !== 'object') {
+      throw new ApiError(409, 'this server is not a supervised worker');
+    }
+    if (typeof server.name !== 'string' || !server.name) {
+      throw new ApiError(409, 'worker has no canonical service name');
+    }
+    return {
+      server,
+      rootRepo,
+      temporaryRepo: scope.kind === 'temporary' ? effectiveRepo : null,
+    };
+  }
+
+  async function handleWorkerAction(req, res, session) {
+    const body = await readJsonBody(req);
+    const allowedFields = new Set([
+      'id', 'action', 'reason', 'keep_alive', 'rearm_crash_loop',
+      'remove_plan_id', 'remove_plan_fingerprint', 'remove_confirmation_phrase',
+    ]);
+    const unknown = Object.keys(body).filter((field) => !allowedFields.has(field));
+    if (unknown.length) {
+      throw new ApiError(400, `unsupported worker action field: ${unknown.join(', ')}`);
+    }
+    const id = requireString(body.id, 'id');
+    const action = requireString(body.action, 'action');
+    if (!WORKER_ACTIONS.has(action)) {
+      throw new ApiError(400, "action must be 'start', 'stop', 'restart' or 'remove'");
+    }
+    if (action === 'remove') requireAccessAdmin(session);
+
+    const keepAlive = optionalBoolean(body, 'keep_alive');
+    const rearmCrashLoop = optionalBoolean(body, 'rearm_crash_loop');
+    if (action === 'remove' && (keepAlive !== undefined || rearmCrashLoop !== undefined)) {
+      throw new ApiError(400, 'worker removal cannot change supervision policy');
+    }
+    if (action === 'stop' && (keepAlive !== undefined || rearmCrashLoop !== undefined)) {
+      throw new ApiError(400, 'stop is a distinct desired-stopped action and accepts no policy fields');
+    }
+
+    const removalFields = [
+      'remove_plan_id', 'remove_plan_fingerprint', 'remove_confirmation_phrase',
+    ];
+    const suppliedRemovalFields = removalFields.filter((field) => Object.hasOwn(body, field));
+    if (action !== 'remove' && suppliedRemovalFields.length) {
+      throw new ApiError(400, 'removal plan fields are valid only for action remove');
+    }
+    if (suppliedRemovalFields.length !== 0 && suppliedRemovalFields.length !== removalFields.length) {
+      throw new ApiError(400, 'all exact removal plan fields are required together');
+    }
+
+    const inventory = await coordinator.inventory({ maxAgeMs: 0 });
+    const context = exactWorkerContext(inventory, id);
+    const options = {
+      reason: lifecycleReason(
+        body.reason,
+        `${action} worker requested via DevOps Console by ${session.email}`,
+      ),
+    };
+    if (keepAlive !== undefined) options.keep_alive = keepAlive;
+    if (rearmCrashLoop !== undefined) options.rearm_crash_loop = rearmCrashLoop;
+    for (const field of suppliedRemovalFields) {
+      if (field === 'remove_confirmation_phrase') {
+        if (typeof body[field] !== 'string') {
+          throw new ApiError(400, `${field} must be a string`);
+        }
+        options[field] = body[field];
+      } else {
+        options[field] = requireString(body[field], field);
+      }
+    }
+
+    const request = {
+      schema_version: 1,
+      action,
+      agent: `devops-console:${session.email}`,
+      root_repo: context.rootRepo,
+      temporary_repo: context.temporaryRepo,
+      target: { kind: 'service', id, name: context.server.name },
+      purpose: 'development',
+      ttl_seconds: null,
+      kill_after_run: false,
+      options,
+    };
+    let runtime;
+    try {
+      runtime = await coordinator.runtimeAction(request);
+    } catch (error) {
+      // A blocked removal is still a useful, read-only plan. Preserve its
+      // exact blockers for the review dialog; every mutation failure remains
+      // an HTTP error.
+      if (
+        action === 'remove'
+        && error instanceof CoordError
+        && error.status === 409
+        && error.body?.classification === 'worker_remove_blocked'
+      ) {
+        runtime = error.body;
+      } else {
+        throw error;
+      }
+    }
+    if (
+      !runtime || runtime.schema_version !== 1 || runtime.action !== action
+      || runtime.target?.kind !== 'service' || String(runtime.target?.id ?? '') !== id
+    ) {
+      throw new ApiError(502, 'coordinator returned a worker result for a different target');
+    }
+    clog?.info?.('worker lifecycle requested', {
+      actor: session.email,
+      action,
+      workerId: id,
+      classification: runtime.classification,
+    });
+    sendJson(res, 200, { runtime });
+  }
+
   // Assign / change / remove the subdomain of a coordinator server in one call.
   // Body: { id, slug, auth? }. Empty slug unassigns. Reuses the route store, so
   // slug validation, reserved names, and the coordinator-port guard all apply.
@@ -1089,6 +1279,32 @@ export function createConsoleApi({
     sendJson(res, 200, { text });
   }
 
+  async function handleRuntimeArtifact(res, rawKind, rawId) {
+    const kind = safeDecode(rawKind);
+    const id = safeDecode(rawId);
+    if (!RUNTIME_ARTIFACT_KINDS.has(kind) || !RUNTIME_ARTIFACT_ID_RE.test(id)) {
+      throw new ApiError(404, 'runtime log artifact not found');
+    }
+    let artifact;
+    try {
+      artifact = await coordinator.runtimeArtifact(kind, id.toLowerCase());
+    } catch (error) {
+      if (error instanceof CoordError && error.status === 404) {
+        throw new ApiError(404, 'runtime log artifact is unavailable');
+      }
+      throw error;
+    }
+    if (
+      !artifact
+      || typeof artifact !== 'object'
+      || Array.isArray(artifact)
+      || typeof artifact.text !== 'string'
+    ) {
+      throw new ApiError(502, 'coordinator returned an invalid runtime log artifact');
+    }
+    return sendRuntimeArtifact(res, kind, id.toLowerCase(), artifact.text);
+  }
+
   function handleError(res, err) {
     let status = 500;
     let message = 'internal error';
@@ -1168,6 +1384,16 @@ export function createConsoleApi({
       }
       if (method === 'GET' && pathname === '/api/metrics/history') {
         return handleMetricsHistory(res, searchParams);
+      }
+      const runtimeArtifactMatch = pathname.match(
+        /^\/api\/runtime\/artifacts\/([^/]+)\/([^/]+)$/,
+      );
+      if (runtimeArtifactMatch && method === 'GET') {
+        return await handleRuntimeArtifact(
+          res,
+          runtimeArtifactMatch[1],
+          runtimeArtifactMatch[2],
+        );
       }
       if (method === 'GET' && pathname === '/api/session') {
         return sendJson(res, 200, {
@@ -1258,6 +1484,9 @@ export function createConsoleApi({
       }
       if (method === 'POST' && pathname === '/api/servers/action') {
         return await handleServerAction(req, res, session);
+      }
+      if (method === 'POST' && pathname === '/api/workers/action') {
+        return await handleWorkerAction(req, res, session);
       }
       if (method === 'POST' && pathname === '/api/servers/subdomain') {
         return await handleServerSubdomain(req, res, session);

@@ -210,6 +210,44 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         )
         baseline_history = module.scan_history(repo)
         check(not baseline_history, f"clean history false positive: {baseline_history}")
+
+        clean_tip = module.scan_tip(repo)
+        check(
+            not any(item.rule == "board-artifact-source-provenance" for item in clean_tip),
+            "current Board artifact/source provenance produced a false positive",
+        )
+        write(repo / "apps/DevOpsBoard" / safe_board_source_path, b"changed Board renderer source\n")
+        drifted_tip = module.scan_tip(repo)
+        check(
+            any(
+                item.rule == "board-artifact-source-provenance"
+                and item.path.endswith("safe-relative.png.provenance.json")
+                for item in drifted_tip
+            ),
+            "current Board renderer drift was not caught before commit",
+        )
+        write(repo / "apps/DevOpsBoard" / safe_board_source_path, safe_board_source)
+
+        for tree, image_path, image_blob, sidecar_blob in module.KNOWN_HISTORICAL_BOARD_SOURCE_DRIFT:
+            exact = {
+                "tree": tree,
+                "image_path": image_path,
+                "image_blob": image_blob,
+                "sidecar_blob": sidecar_blob,
+                "detail": "aggregate source hash mismatch",
+            }
+            check(
+                module.known_historical_board_source_drift(**exact),
+                "sealed historical repair did not accept its exact immutable tuple",
+            )
+            for field in ("tree", "image_path", "image_blob", "sidecar_blob", "detail"):
+                changed = dict(exact)
+                changed[field] = f"changed-{field}"
+                check(
+                    not module.known_historical_board_source_drift(**changed),
+                    f"historical repair was not exact for {field}",
+                )
+
         missing_contract_findings = module.scan_tip(repo)
         check(
             any(item.rule == "required-contract-file" for item in missing_contract_findings)

@@ -206,6 +206,8 @@ final class OpsStore: ObservableObject {
     }
     @Published private(set) var repositoryCatalog: RepositoryCatalog = .empty
     @Published private(set) var projectGroups: [ProjectGroup] = []
+    @Published private(set) var repositoryTrees: [RepositoryTreePresentation] = []
+    @Published private(set) var repositoryTreesAreAuthoritative = false
     @Published var selectedServerID: ManagedServer.ID?
     @Published var selectedDockerID: String?
     @Published var selectedDatabaseID: String?
@@ -224,6 +226,7 @@ final class OpsStore: ObservableObject {
     @Published var showingLeaseSheet = false
     @Published var showingServerLogs = false
     @Published var repositoryDecommissionPrompt: RepositoryDecommissionPrompt?
+    @Published var workerRemovalPrompt: WorkerRemovalPrompt?
     @Published var resourceAttachPrompt: ResourceAttachPrompt?
     @Published var resourceRetirementPrompt: ResourceRetirementPrompt?
     @Published var serverLogTitle = "Server Logs"
@@ -260,6 +263,8 @@ final class OpsStore: ObservableObject {
     private var lastErrorSource: String?
     private var inventoryByOrigin: [String: Inventory] = [:]
     private var normalizedCatalogByOrigin: [String: RepositoryCatalog] = [:]
+    private var normalizedRepositoryTreesByOrigin: [String: [NormalizedRepositoryTree]] = [:]
+    private var originsWithAuthoritativeRepositoryTrees = Set<String>()
     private var lastInventoryAttemptAt: Date?
     private var visibleSurfaces: Set<RefreshSurface> = []
     private var autoRefreshTask: Task<Void, Never>?
@@ -268,6 +273,8 @@ final class OpsStore: ObservableObject {
     private var verifiedBackupsByKey: [String: BackupRecord] = [:]
     private var backupVerificationTasks: [String: Task<Void, Never>] = [:]
     private var stagedRepositoryCatalog: RepositoryCatalog?
+    private var stagedRepositoryTrees: [NormalizedRepositoryTree]?
+    private var stagedRepositoryTreesAreAuthoritative = false
 
     init(
         coordinatorService: (any CoordinatorServing)? = nil,
@@ -310,9 +317,25 @@ final class OpsStore: ObservableObject {
         if catalog != repositoryCatalog { repositoryCatalog = catalog }
         let groups = makeProjectGroups(from: catalog, inventory: inventory)
         if groups != projectGroups { projectGroups = groups }
+        let definitions = stagedRepositoryTreesAreAuthoritative
+            ? (stagedRepositoryTrees ?? [])
+            : []
+        if repositoryTreesAreAuthoritative != stagedRepositoryTreesAreAuthoritative {
+            repositoryTreesAreAuthoritative = stagedRepositoryTreesAreAuthoritative
+        }
+        stagedRepositoryTrees = nil
+        stagedRepositoryTreesAreAuthoritative = false
+        let trees = makeRepositoryTreePresentations(groups: groups, definitions: definitions)
+        if trees != repositoryTrees { repositoryTrees = trees }
     }
 
-    private func publishInventory(_ decoded: Inventory, catalog: RepositoryCatalog) {
+    private func publishInventory(
+        _ decoded: Inventory,
+        catalog: RepositoryCatalog,
+        repositoryTreeDefinitions: [NormalizedRepositoryTree]?
+    ) {
+        stagedRepositoryTrees = repositoryTreeDefinitions
+        stagedRepositoryTreesAreAuthoritative = repositoryTreeDefinitions != nil
         let needsInventoryPublication = decoded != inventory
             || !inventoryUsesCurrentSourcePresentation(inventory)
         if needsInventoryPublication {
@@ -337,6 +360,94 @@ final class OpsStore: ObservableObject {
     var selectedDatabase: DockerContainer? {
         guard let selectedDatabaseID else { return nil }
         return inventory.postgres.first { $0.databaseSelectionID == selectedDatabaseID }
+    }
+
+    var unassignedProjectGroup: ProjectGroup? {
+        // Ownership failures are diagnostics, never a synthetic repository.
+        // Missing producer-owned hierarchy renders an incompatible state.
+        nil
+    }
+
+    var repositoryTreeContractUnavailable: Bool {
+        !repositoryTreesAreAuthoritative && sourceStates.contains {
+            $0.phase == .loaded || $0.phase == .stale
+        }
+    }
+
+    var authoritativeOwnershipMutationsBlocked: Bool {
+        authoritativeOwnershipProblemCount > 0
+    }
+
+    private var authoritativeOwnershipProblemCount: Int {
+        guard repositoryTreesAreAuthoritative else { return 0 }
+        var identities = Set<String>()
+        for server in inventory.servers
+            where server.attribution != nil || server.ownershipError != nil {
+            identities.insert("server|\(server.coordinatorID ?? server.id)")
+        }
+        for container in inventory.docker.containers
+            where container.attribution != nil || container.ownershipError != nil {
+            identities.insert("container|\(container.attribution?.hostResourceID ?? container.id ?? container.stableID)")
+        }
+        return identities.count
+    }
+
+    private var authoritativeOwnershipBlockMessage: String? {
+        let count = authoritativeOwnershipProblemCount
+        guard count > 0 else { return nil }
+        return "The coordinator reports \(count) resource\(count == 1 ? "" : "s") without safe lifecycle ownership. Review the exact reason and next step in the attention banner or affected resource, resolve it with the Coordinator skill, then refresh."
+    }
+
+    private func isOrdinaryRuntimeMutation(_ kind: ActionKind) -> Bool {
+        switch kind {
+        case .startServer, .stopServer, .restartServer,
+             .startWorker, .stopWorker, .restartWorker, .setWorkerKeepAlive,
+             .startDocker, .stopDocker, .restartDocker,
+             .leasePort, .releasePort,
+             .projectStart, .projectStop, .projectRestart,
+             .backupDatabase, .verifyBackup, .restoreDatabase:
+            return true
+        case .refreshInventory, .serverLogs, .dockerLogs, .projectStatus,
+             .repositoryDecommissionPlan, .repositoryDecommission,
+             .workerRemovalPlan, .workerRemovalApply,
+             .attachResource, .retireStandaloneResource:
+            // Read-only inspection and the exact corrective ownership/removal
+            // journeys remain available; unrelated runtime mutation does not.
+            return false
+        }
+    }
+
+    func repositoryBreadcrumb(for server: ManagedServer) -> String {
+        let nativeID = server.coordinatorID ?? server.id
+        for tree in repositoryTrees {
+            if let scope = tree.scopes.first(where: { scope in
+                scope.definition.serverIDs.contains(nativeID)
+            }) {
+                return scope.breadcrumb(rootName: tree.root.displayName)
+            }
+        }
+        return projectDisplayLabel(server.project)
+    }
+
+    func repositoryBreadcrumb(for container: DockerContainer) -> String {
+        let selectionID = container.database == nil
+            ? container.containerSelectionID
+            : container.databaseSelectionID
+        for tree in repositoryTrees {
+            if let scope = tree.scopes.first(where: { scope in
+                if container.database == nil {
+                    return scope.group.containers.contains {
+                        $0.containerSelectionID == selectionID
+                    }
+                }
+                return scope.group.databases.contains {
+                    $0.databaseSelectionID == selectionID
+                }
+            }) {
+                return scope.breadcrumb(rootName: tree.root.displayName)
+            }
+        }
+        return projectLabel(for: container, in: projectGroups)
     }
 
     var filteredServerRows: [PresentedServerRow] {
@@ -450,6 +561,52 @@ final class OpsStore: ObservableObject {
     /// a new assertion that a resource presently requires intervention.
     var resourceAttentionItems: [ResourceAttentionItem] {
         var items: [ResourceAttentionItem] = []
+
+        // Producer-reported unassigned resources remain visible as actionable
+        // diagnostics, never as a synthetic project beside the exact tree.
+        // Each item supplies a concrete explanation, next step, and review
+        // route rather than collapsing the entire inventory into an
+        // unavailable state.
+        if repositoryTreesAreAuthoritative {
+            for observation in repositoryCatalog.unassigned.servers {
+                let server = observation.server
+                guard let attribution = server.attribution,
+                      !attribution.lifecycleViolation,
+                      hasLoadedEvidence(primary: server.origin, observations: server.observationOrigins)
+                else { continue }
+                let selectionID = serverSelectionID(for: server)
+                items.append(
+                    ResourceAttentionItem(
+                        id: "unassigned:server:\(selectionID)",
+                        kind: .server,
+                        title: "\(server.name) is not assigned to a repository",
+                        reason: attribution.explanation,
+                        recommendedNextStep: attribution.recommendedNextStep
+                            ?? "Rerun Coordinator installation for the root repository, or attach or retire this exact server.",
+                        reviewTarget: AttentionReviewTarget(kind: .server, selectionID: selectionID)
+                    )
+                )
+            }
+            for resource in repositoryCatalog.unassigned.docker {
+                let container = resource.representative
+                guard let attribution = container.attribution,
+                      !attribution.lifecycleViolation,
+                      hasLoadedEvidence(primary: container.origin, observations: container.observationOrigins)
+                else { continue }
+                let selectionID = container.containerSelectionID
+                items.append(
+                    ResourceAttentionItem(
+                        id: "unassigned:docker:\(selectionID)",
+                        kind: .docker,
+                        title: "\(container.name ?? "Docker container") is not assigned to a repository",
+                        reason: attribution.explanation,
+                        recommendedNextStep: attribution.recommendedNextStep
+                            ?? "Rerun Coordinator installation for the root repository, or attach or retire this exact container.",
+                        reviewTarget: AttentionReviewTarget(kind: .docker, selectionID: selectionID)
+                    )
+                )
+            }
+        }
 
         // A completed removal is normally absent from the active projection.
         // If a later host observation proves one of its exact resources is
@@ -838,6 +995,10 @@ final class OpsStore: ObservableObject {
         case .failed:
             return .blocked(.failedSource, "Coordinator source \(origin.label) is unavailable; refresh it before acting")
         }
+        if isOrdinaryRuntimeMutation(kind),
+           let message = authoritativeOwnershipBlockMessage {
+            return .blocked(.invalidResource, message)
+        }
         let capability = requiredCapability(for: kind, projectRequiresDocker: projectRequiresDocker)
         if capability != .coordinator {
             guard let state = capabilityStates.first(where: {
@@ -999,6 +1160,8 @@ final class OpsStore: ObservableObject {
             return .database
         case .refreshInventory,
              .startServer, .stopServer, .restartServer, .serverLogs,
+             .startWorker, .stopWorker, .restartWorker, .setWorkerKeepAlive,
+             .workerRemovalPlan, .workerRemovalApply,
              .leasePort, .releasePort,
              .projectStatus, .projectStart, .projectStop, .projectRestart,
              .repositoryDecommissionPlan, .repositoryDecommission,
@@ -1264,6 +1427,13 @@ final class OpsStore: ObservableObject {
             case .success(let projection):
                 decoded = projection.inventory
                 normalizedCatalogByOrigin[origin.id] = projection.catalog
+                if let repositoryTrees = projection.repositoryTrees {
+                    normalizedRepositoryTreesByOrigin[origin.id] = repositoryTrees
+                    originsWithAuthoritativeRepositoryTrees.insert(origin.id)
+                } else {
+                    normalizedRepositoryTreesByOrigin.removeValue(forKey: origin.id)
+                    originsWithAuthoritativeRepositoryTrees.remove(origin.id)
+                }
             case .failure(let failure):
                 sourceFailure = failure
             }
@@ -1368,6 +1538,10 @@ final class OpsStore: ObservableObject {
         let activeIDs = Set(origins.map(\.id))
         inventoryByOrigin = inventoryByOrigin.filter { activeIDs.contains($0.key) }
         normalizedCatalogByOrigin = normalizedCatalogByOrigin.filter { activeIDs.contains($0.key) }
+        normalizedRepositoryTreesByOrigin = normalizedRepositoryTreesByOrigin.filter {
+            activeIDs.contains($0.key)
+        }
+        originsWithAuthoritativeRepositoryTrees.formIntersection(activeIDs)
         let sourceInventories = origins.compactMap { origin -> RepositoryInventorySource? in
             guard let inventory = inventoryByOrigin[origin.id] else { return nil }
             return RepositoryInventorySource(origin: origin, inventory: inventory)
@@ -1377,17 +1551,53 @@ final class OpsStore: ObservableObject {
         // The multi-origin branch exists only for injected migration fixtures;
         // it still derives from v2 projections, never from v1 compatibility.
         let catalog: RepositoryCatalog
+        let repositoryTreeDefinitions: [NormalizedRepositoryTree]?
         if usesNormalizedAccountStore,
            origins.count == 1,
            let direct = normalizedCatalogByOrigin[origins[0].id]
         {
             catalog = direct
+            repositoryTreeDefinitions = originsWithAuthoritativeRepositoryTrees.contains(origins[0].id)
+                ? (normalizedRepositoryTreesByOrigin[origins[0].id] ?? [])
+                : nil
         } else {
             catalog = RepositoryCatalog.build(from: sourceInventories)
+            var treesByFamilyID: [String: NormalizedRepositoryTree] = [:]
+            var contradictoryFamilies = Set<String>()
+            for origin in origins {
+                for tree in normalizedRepositoryTreesByOrigin[origin.id] ?? [] {
+                    if let existing = treesByFamilyID[tree.familyID], existing != tree {
+                        contradictoryFamilies.insert(tree.familyID)
+                    } else {
+                        treesByFamilyID[tree.familyID] = tree
+                    }
+                }
+            }
+            if !contradictoryFamilies.isEmpty {
+                sourceFailures.append(
+                    "Coordinator sources returned contradictory repository trees for: "
+                        + contradictoryFamilies.sorted().joined(separator: ", ")
+                )
+                repositoryTreeDefinitions = []
+            } else {
+                let everyLoadedOriginHasTrees = sourceInventories.allSatisfy {
+                    originsWithAuthoritativeRepositoryTrees.contains($0.origin.id)
+                }
+                repositoryTreeDefinitions = everyLoadedOriginHasTrees
+                    ? treesByFamilyID.values.sorted {
+                        ($0.rootRepository.displayName.lowercased(), $0.familyID)
+                            < ($1.rootRepository.displayName.lowercased(), $1.familyID)
+                    }
+                    : nil
+            }
         }
         var decoded = mergeInventories(sourceInventories.map(\.inventory))
         decoded.servers = deduplicatedManagedServers(decoded.servers)
-        publishInventory(decoded, catalog: catalog)
+        publishInventory(
+            decoded,
+            catalog: catalog,
+            repositoryTreeDefinitions: repositoryTreeDefinitions
+        )
         rebuildBackupRecords(from: decoded.backups)
         reconcileLeaseResults(now: clock.now())
         keepSelectionValid()
@@ -1690,6 +1900,30 @@ final class OpsStore: ObservableObject {
             {
                 selected.ownershipCandidates = Array(explicitOrigins)
                 selected.ownershipError = nil
+                return selected
+            }
+            // An unassigned normalized resource has no repository path by
+            // definition, but it can still carry one exact controller and
+            // immutable attach/retire evidence. Preserve that origin so the
+            // corrective action remains available; do not reinterpret it as
+            // a generic name-only Docker observation.
+            let exactUnassigned = bucket.filter { container in
+                guard container.origin != nil,
+                      let attribution = container.attribution
+                else { return false }
+                return attribution.hostResourceID?.isEmpty == false
+                    && attribution.immutableFingerprint?.isEmpty == false
+                    && attribution.controlBindingID?.isEmpty == false
+                    && attribution.ownershipFingerprint?.isEmpty == false
+                    && (attribution.canAttach || attribution.canRetire)
+            }
+            let exactUnassignedOrigins = Set(exactUnassigned.compactMap(\.origin))
+            if exactUnassignedOrigins.count == 1,
+               var selected = exactUnassigned.max(by: {
+                   dockerContainerRank($0) < dockerContainerRank($1)
+               })
+            {
+                selected.ownershipCandidates = Array(exactUnassignedOrigins)
                 return selected
             }
             let sidecarOwners = Dictionary(
@@ -2429,6 +2663,374 @@ final class OpsStore: ObservableObject {
         requestBackupVerification(for: container)
     }
 
+    func repositoryExecutionContext(for server: ManagedServer) -> RepositoryExecutionContext? {
+        let serverID = server.coordinatorID ?? server.id
+        let matches = repositoryTrees.flatMap { tree in
+            tree.scopes.compactMap { scope in
+                scope.definition.serverIDs.contains(serverID) ? scope.context : nil
+            }
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    private func workerRuntimeArguments(
+        action: String,
+        serverID: String,
+        serverName: String,
+        context: RepositoryExecutionContext,
+        keepAlive: Bool? = nil,
+        rearmCrashLoop: Bool? = nil,
+        removalPlan: WorkerRemovalPlan? = nil
+    ) -> [String] {
+        var arguments = [
+            "runtime", action,
+            "--agent", agentID,
+            "--root-repo", context.rootCanonicalRoot,
+        ]
+        if context.projectKind == .temporary {
+            arguments.append(contentsOf: ["--temporary-repo", context.effectiveCanonicalRoot])
+        } else {
+            arguments.append("--no-temporary-repo")
+        }
+        arguments.append(contentsOf: [
+            "--target-kind", "service",
+            "--target-id", serverID,
+            "--target-name", serverName,
+            "--purpose", "development",
+            "--no-ttl",
+            "--kill-after-run", "false",
+            "--reason", "Worker lifecycle requested from DevOps Board",
+        ])
+        if let keepAlive {
+            arguments.append(contentsOf: ["--keep-alive", keepAlive ? "true" : "false"])
+        }
+        if let rearmCrashLoop {
+            arguments.append(contentsOf: ["--rearm-crash-loop", rearmCrashLoop ? "true" : "false"])
+        }
+        if let removalPlan {
+            arguments.append(contentsOf: [
+                "--remove-plan-id", removalPlan.planID,
+                "--remove-plan-fingerprint", removalPlan.planFingerprint,
+                "--remove-confirmation-phrase", removalPlan.confirmationPhrase,
+            ])
+        }
+        return arguments
+    }
+
+    private func validateWorkerRuntimeEnvelope(
+        _ execution: CommandExecution,
+        serverID: String,
+        action: String
+    ) throws -> WorkerRuntimeEnvelope {
+        let envelope = try JSONDecoder().decode(
+            WorkerRuntimeEnvelope.self,
+            from: Data(execution.stdout.utf8)
+        )
+        guard envelope.schemaVersion == 1,
+              envelope.action == action,
+              envelope.target.kind == "service",
+              envelope.target.id == serverID
+        else {
+            throw RuntimeError("Coordinator returned a worker result for a different target")
+        }
+        return envelope
+    }
+
+    private func runWorkerRuntime(
+        _ action: String,
+        server: ManagedServer,
+        kind: ActionKind,
+        title: String,
+        keepAlive: Bool? = nil,
+        rearmCrashLoop: Bool? = nil
+    ) {
+        guard server.supervision != nil,
+              let origin = server.origin,
+              let identity = server.resourceIdentity,
+              let context = repositoryExecutionContext(for: server)
+        else {
+            reportMissingOwnership(title)
+            return
+        }
+        let serverID = server.coordinatorID ?? server.id
+        let arguments = workerRuntimeArguments(
+            action: action,
+            serverID: serverID,
+            serverName: server.name,
+            context: context,
+            keepAlive: keepAlive,
+            rearmCrashLoop: rearmCrashLoop
+        )
+        runTracked(
+            title: title,
+            subtitle: context.effectiveCanonicalRoot,
+            kind: kind,
+            origin: origin,
+            resource: identity,
+            projectPath: context.effectiveCanonicalRoot,
+            arguments: arguments,
+            onSuccess: { [weak self] execution in
+                guard let self else { return }
+                let envelope = try self.validateWorkerRuntimeEnvelope(
+                    execution,
+                    serverID: serverID,
+                    action: action
+                )
+                guard envelope.ok else {
+                    throw RuntimeError(envelope.error ?? envelope.classification)
+                }
+            }
+        )
+    }
+
+    func startWorker(_ server: ManagedServer, rearmCrashLoop: Bool = false) {
+        runWorkerRuntime(
+            "start",
+            server: server,
+            kind: .startWorker,
+            title: rearmCrashLoop ? "Start and re-arm \(server.name)" : "Start \(server.name)",
+            keepAlive: server.supervision?.keepAlive,
+            rearmCrashLoop: rearmCrashLoop
+        )
+    }
+
+    func stopWorker(_ server: ManagedServer) {
+        runWorkerRuntime(
+            "stop",
+            server: server,
+            kind: .stopWorker,
+            title: "Stop \(server.name)"
+        )
+    }
+
+    func restartWorker(_ server: ManagedServer) {
+        runWorkerRuntime(
+            "restart",
+            server: server,
+            kind: .restartWorker,
+            title: "Restart \(server.name)",
+            keepAlive: server.supervision?.keepAlive
+        )
+    }
+
+    func setWorkerKeepAlive(_ server: ManagedServer, enabled: Bool) {
+        runWorkerRuntime(
+            "start",
+            server: server,
+            kind: .setWorkerKeepAlive,
+            title: "Turn Keep alive \(enabled ? "on" : "off") for \(server.name)",
+            keepAlive: enabled,
+            rearmCrashLoop: false
+        )
+    }
+
+    func planWorkerRemoval(_ server: ManagedServer) {
+        guard server.supervision != nil,
+              let origin = server.origin,
+              let identity = server.resourceIdentity,
+              let context = repositoryExecutionContext(for: server)
+        else {
+            reportMissingOwnership("Remove \(server.name)")
+            return
+        }
+        let serverID = server.coordinatorID ?? server.id
+        guard requireMutationAvailability(
+            title: "Plan removal of \(server.name)",
+            kind: .workerRemovalPlan,
+            origin: origin,
+            resource: identity,
+            projectPath: context.effectiveCanonicalRoot
+        ) else { return }
+        let request = beginAction(
+            kind: .workerRemovalPlan,
+            title: "Plan removal of \(server.name)",
+            origin: origin,
+            resource: identity,
+            projectPath: context.effectiveCanonicalRoot
+        )
+        Task {
+            markActionRunning(request.id)
+            let arguments = workerRuntimeArguments(
+                action: "remove",
+                serverID: serverID,
+                serverName: server.name,
+                context: context
+            )
+            do {
+                let execution = try await coordinatorService.execute(origin: origin, arguments: arguments)
+                let envelope = try validateWorkerRuntimeEnvelope(
+                    execution,
+                    serverID: serverID,
+                    action: "remove"
+                )
+                guard let plan = envelope.result.plan,
+                      ["archive", "purge", "forget"].contains(plan.action),
+                      ["worker_remove_plan_ready", "worker_remove_blocked"].contains(envelope.classification)
+                else {
+                    throw RuntimeError(
+                        envelope.error
+                            ?? (execution.exitStatus == 0
+                                ? "Coordinator returned no exact worker removal plan"
+                                : commandFailureMessage(execution))
+                    )
+                }
+                workerRemovalPrompt = WorkerRemovalPrompt(
+                    serverID: serverID,
+                    serverName: server.name,
+                    origin: origin,
+                    context: context,
+                    plan: plan,
+                    archivedInThisJourney: false
+                )
+                finishAction(request.id, execution: execution)
+                clearActionErrorIfPresent(actionID: request.id)
+            } catch {
+                failAction(request.id, error: error)
+                setLastError(
+                    title: "Worker removal plan unavailable",
+                    summary: error.localizedDescription,
+                    details: "No worker lifecycle mutation was applied. Refresh the exact worker and try again.",
+                    source: "action",
+                    actionID: request.id
+                )
+            }
+        }
+    }
+
+    func cancelWorkerRemoval() {
+        workerRemovalPrompt = nil
+    }
+
+    func applyWorkerRemoval(_ prompt: WorkerRemovalPrompt) {
+        let identity = ResourceIdentity(
+            origin: prompt.origin,
+            kind: .server,
+            nativeID: prompt.serverID
+        )
+        guard requireMutationAvailability(
+            title: prompt.plan.isPermanent
+                ? "Permanently remove \(prompt.serverName)"
+                : "Archive \(prompt.serverName)",
+            kind: .workerRemovalApply,
+            origin: prompt.origin,
+            resource: identity,
+            projectPath: prompt.context.effectiveCanonicalRoot
+        ) else { return }
+        let request = beginAction(
+            kind: .workerRemovalApply,
+            title: prompt.plan.isPermanent
+                ? "Permanently remove \(prompt.serverName)"
+                : "Archive \(prompt.serverName)",
+            origin: prompt.origin,
+            resource: identity,
+            projectPath: prompt.context.effectiveCanonicalRoot
+        )
+        Task {
+            markActionRunning(request.id)
+            do {
+                let applyArguments = workerRuntimeArguments(
+                    action: "remove",
+                    serverID: prompt.serverID,
+                    serverName: prompt.serverName,
+                    context: prompt.context,
+                    removalPlan: prompt.plan
+                )
+                let execution = try await coordinatorService.execute(
+                    origin: prompt.origin,
+                    arguments: applyArguments
+                )
+                guard execution.exitStatus == 0 else {
+                    throw RuntimeError(commandFailureMessage(execution))
+                }
+                let envelope = try validateWorkerRuntimeEnvelope(
+                    execution,
+                    serverID: prompt.serverID,
+                    action: "remove"
+                )
+                guard envelope.ok else {
+                    throw RuntimeError(envelope.error ?? envelope.classification)
+                }
+                if prompt.plan.isPermanent {
+                    guard envelope.classification == "worker_removed" else {
+                        throw RuntimeError("Coordinator did not prove permanent worker removal")
+                    }
+                    workerRemovalPrompt = nil
+                    finishAction(request.id, execution: execution)
+                    clearActionErrorIfPresent(actionID: request.id)
+                    await loadInventory(force: true)
+                    return
+                }
+
+                guard envelope.classification == "worker_archived" else {
+                    throw RuntimeError("Coordinator did not prove the worker archived and stopped")
+                }
+                // Archive is already a complete mutation. Clear the reviewed
+                // archive plan before requesting the distinct, read-only purge
+                // plan so a failed follow-up can never re-apply the old plan.
+                workerRemovalPrompt = nil
+                finishAction(request.id, execution: execution)
+                clearActionErrorIfPresent(actionID: request.id)
+                await loadInventory(force: true)
+                do {
+                    let planExecution = try await coordinatorService.execute(
+                        origin: prompt.origin,
+                        arguments: workerRuntimeArguments(
+                            action: "remove",
+                            serverID: prompt.serverID,
+                            serverName: prompt.serverName,
+                            context: prompt.context
+                        )
+                    )
+                    let planned = try validateWorkerRuntimeEnvelope(
+                        planExecution,
+                        serverID: prompt.serverID,
+                        action: "remove"
+                    )
+                    guard let permanentPlan = planned.result.plan,
+                          permanentPlan.isPermanent,
+                          ["worker_remove_plan_ready", "worker_remove_blocked"].contains(planned.classification)
+                    else {
+                        throw RuntimeError(
+                            planned.error
+                                ?? (planExecution.exitStatus == 0
+                                    ? "No permanent-removal plan was returned"
+                                    : commandFailureMessage(planExecution))
+                        )
+                    }
+                    workerRemovalPrompt = WorkerRemovalPrompt(
+                        serverID: prompt.serverID,
+                        serverName: prompt.serverName,
+                        origin: prompt.origin,
+                        context: prompt.context,
+                        plan: permanentPlan,
+                        archivedInThisJourney: true
+                    )
+                } catch {
+                    setLastError(
+                        title: "Worker archived; permanent-removal plan unavailable",
+                        summary: error.localizedDescription,
+                        details: "The worker is stopped, fenced, and hidden. Open Archived resources to review permanent removal later.",
+                        source: "action",
+                        actionID: request.id
+                    )
+                }
+                return
+            } catch {
+                failAction(request.id, error: error)
+                setLastError(
+                    title: prompt.plan.isPermanent
+                        ? "Permanent worker removal needs attention"
+                        : "Worker archive needs attention",
+                    summary: error.localizedDescription,
+                    details: "The coordinator retains the exact lifecycle fence and plan evidence. No unproved deletion is shown as complete.",
+                    source: "action",
+                    actionID: request.id
+                )
+                await loadInventory(force: true)
+            }
+        }
+    }
+
     func isBackupVerificationInProgress(for container: DockerContainer) -> Bool {
         guard let identity = container.databaseIdentity else { return false }
         return backupVerificationInProgress.contains(identity.id)
@@ -2476,6 +3078,10 @@ final class OpsStore: ObservableObject {
     }
 
     func restart(_ server: ManagedServer) {
+        if server.supervision != nil {
+            restartWorker(server)
+            return
+        }
         guard let origin = server.origin, let identity = server.resourceIdentity, let project = server.project else {
             reportMissingOwnership("Restart \(server.name)")
             return
@@ -2491,6 +3097,10 @@ final class OpsStore: ObservableObject {
     }
 
     func stop(_ server: ManagedServer) {
+        if server.supervision != nil {
+            stopWorker(server)
+            return
+        }
         guard let origin = server.origin, let identity = server.resourceIdentity, let project = server.project else {
             reportMissingOwnership("Stop \(server.name)")
             return
@@ -2506,6 +3116,10 @@ final class OpsStore: ObservableObject {
     }
 
     func toggle(_ server: ManagedServer) {
+        if server.supervision != nil {
+            canStopServer(server) ? stopWorker(server) : startWorker(server)
+            return
+        }
         if canStopServer(server) {
             stop(server)
         } else {

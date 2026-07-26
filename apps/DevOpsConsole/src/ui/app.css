@@ -963,6 +963,30 @@ select:disabled { color: var(--dim); }
   width: 100%;  /* stable width regardless of collapsed row contents */
 }
 
+.worker-supervision {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 11px;
+  border: 1px solid var(--line2);
+  border-radius: 8px;
+  background: rgba(82, 143, 255, .055);
+}
+.worker-supervision.is-tripped { border-color: #7c3038; background: var(--err-bg); }
+.worker-supervision-head { display: flex; align-items: flex-start; gap: 14px; justify-content: space-between; }
+.worker-supervision-head h3, .worker-crash-history h4 { margin: 0; font-size: 13px; }
+.worker-supervision-head p { margin: 3px 0 0; white-space: normal; }
+.worker-state-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 5px 14px; }
+.worker-crash-loop { padding: 9px 10px; border: 1px solid #7c3038; border-radius: 7px; background: rgba(236, 95, 103, .08); }
+.worker-crash-loop > strong { color: #ffb3b8; }
+.worker-crash-loop p { margin: 4px 0 8px; color: var(--muted); font-size: 12.5px; }
+.worker-crash-history h4 { margin-bottom: 6px; }
+.worker-crash-history ul { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.worker-crash-history li { display: flex; gap: 8px 14px; justify-content: space-between; color: var(--muted); font-size: 12px; }
+.worker-crash-history a { flex: none; }
+.worker-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.worker-archived-note { margin: 0; padding: 9px 10px; border: 1px solid var(--ok); border-radius: 7px; color: var(--ok); background: var(--ok-bg); }
+
 .panel-meta {
   display: grid;
   gap: 6px 18px;
@@ -1355,7 +1379,7 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
    fixed widths for everything except the name — so tags, numbers, badges and
    buttons line up in clean columns on every row. */
 .tree-grid {
-  grid-template-columns: 84px minmax(0, 1fr) 180px 112px 352px;
+  grid-template-columns: 84px minmax(0, 1fr) 180px 180px 352px;
   gap: 8px 12px;
   padding: 5px 8px;
 }
@@ -1363,6 +1387,7 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
    long lists stay scannable (same concept on every list page). */
 .tree-head { padding: 8px; background: rgba(148, 161, 179, .07); border-radius: 7px; }
 .tree-head .proj-name { font-size: 13.5px; }
+.tree-grid.tree-head .c-primary { display: flex; align-items: center; gap: 7px; }
 .tree-item { border-top: 1px dashed var(--line); border-radius: 0; }
 .tree-children > .tree-item:nth-child(even) { background: rgba(255, 255, 255, .025); }
 .tree-children > .tree-item:hover { background: var(--bg3); }
@@ -1398,6 +1423,66 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
 .tree-children { padding-left: 22px; min-width: 0; }
 .tree-children .inline-note { padding: 4px 10px 6px; margin: 0; }
 
+/* A repository family discloses root-owned services directly. Temporary
+   checkouts are a second, nested accordion so their lifecycle boundary is
+   visible without flattening them into duplicate top-level projects. */
+.temporary-scope-block {
+  min-width: 0;
+  margin: 7px 0 0 10px;
+  border-left: 2px solid rgba(82, 143, 255, .28);
+}
+.temporary-scope-head { min-width: 0; margin: 0; font: inherit; background: rgba(82, 143, 255, .055); }
+.temporary-scope-toggle {
+  appearance: none;
+  display: grid;
+  grid-template-columns: 24px auto minmax(0, 1fr) auto auto;
+  gap: 4px 9px;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.temporary-scope-toggle:hover { background: var(--bg3); }
+.temporary-scope-toggle > .proj-name { min-width: 0; }
+.temporary-scope-policy {
+  grid-column: 3 / -1;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.temporary-scope-items { min-width: 0; padding-left: 14px; }
+.temporary-scope-items[hidden] { display: none; }
+.temporary-scope-items > .tree-item:first-child { border-top: 0; }
+.kind-tag.k-root { color: #a9bad0; border-color: #46566c; }
+.kind-tag.k-temp { color: #8db4ff; border-color: #36578f; }
+.repository-family-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 6px 10px;
+  min-width: 0;
+  margin: 5px 8px 1px 92px;
+  font-size: 11.5px;
+}
+.repository-family-summary > .meta-passive { min-width: 0; }
+.repository-family-summary > .proj-usage { margin-left: auto; white-space: nowrap; }
+.repository-inventory-error { align-items: flex-start; }
+.inventory-problem-list {
+  margin: 7px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.inventory-problem-list li { margin-top: 6px; }
+.inventory-problem-list li > * { display: block; }
+.inventory-problem-list li > strong { color: var(--text); }
+.inventory-problem-next-step { color: var(--blue); }
+
 /* Invisible slot that keeps action groups equal width across rows. */
 .iconbtn.ghost { visibility: hidden; pointer-events: none; }
 
@@ -1426,6 +1511,16 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   .tree-grid > .actions { flex: 0 0 auto; justify-self: auto; margin-left: auto; }
   .iconbtn.ghost { display: none; }
   .tree-children { padding-left: 14px; }
+  .repository-family-summary { margin-left: 22px; flex-wrap: wrap; }
+  .repository-family-summary > .proj-usage { margin-left: 0; }
+  .temporary-scope-block { margin-left: 4px; }
+  .temporary-scope-toggle {
+    grid-template-columns: 24px auto minmax(0, 1fr) auto;
+    min-height: 44px;
+  }
+  .temporary-scope-toggle > .proj-usage { display: none; }
+  .temporary-scope-policy { grid-column: 3 / -1; }
+  .temporary-scope-items { padding-left: 8px; }
 }
 
 @media (max-width: 599px) {
@@ -1442,6 +1537,13 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   .tree-grid .actions { gap: 4px; }
   .tree-grid .actions .btn { padding: 3px 8px; font-size: 12px; }
   .tree-grid .badge { padding: 1px 8px; font-size: 11px; }
+  .temporary-scope-toggle {
+    grid-template-columns: 24px auto minmax(0, 1fr);
+    gap: 3px 7px;
+    padding: 7px 6px;
+  }
+  .temporary-scope-toggle > .temporary-scope-count { grid-column: 3; grid-row: 2; }
+  .temporary-scope-policy { grid-column: 3; grid-row: 3; }
 }
 
 .kind-tag.k-db { color: #e8b23e; border-color: #6d541f; }
@@ -1733,7 +1835,7 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
 @media (pointer: coarse) {
   .btn.small { padding: 6px 12px; }
   .iconbtn { width: 34px; height: 34px; }
-  .iconbtn[data-fk^="archive:"], #lifecycle-dialog-close {
+  .iconbtn[data-fk^="archive:"], .iconbtn[data-fk^="worker-remove:"], #lifecycle-dialog-close {
     width: 44px;
     height: 44px;
   }

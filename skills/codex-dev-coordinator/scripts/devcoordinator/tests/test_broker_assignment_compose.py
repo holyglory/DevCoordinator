@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import pwd
+import stat
 import subprocess
 import tempfile
 import threading
@@ -97,6 +99,31 @@ def capture_sealed_compose_command(
 
 class ExtendedBrokerFixture:
     def __init__(self) -> None:
+        self._platform_overrides = ExitStack()
+        if not Path("/proc/self/fd").is_dir():
+            def in_process_descriptor_path(descriptor: int) -> str:
+                raw_path = fcntl.fcntl(descriptor, 50, b"\0" * 1024)
+                path = Path(raw_path.split(b"\0", 1)[0].decode("utf-8"))
+                if not path.is_dir():
+                    raise RuntimeError(
+                        "test interpreter cannot expose an open directory descriptor"
+                    )
+                return str(path)
+
+            self._platform_overrides.enter_context(
+                mock.patch.object(
+                    broker_persistence,
+                    "stable_compose_descriptor_path",
+                    side_effect=in_process_descriptor_path,
+                )
+            )
+            self._platform_overrides.enter_context(
+                mock.patch.object(
+                    broker_host,
+                    "stable_compose_descriptor_path",
+                    side_effect=in_process_descriptor_path,
+                )
+            )
         home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve()
         self._temporary = tempfile.TemporaryDirectory(
             prefix=".broker-extended-", dir=str(home)
@@ -260,7 +287,10 @@ class ExtendedBrokerFixture:
             )
 
     def close(self) -> None:
-        self._temporary.cleanup()
+        try:
+            self._temporary.cleanup()
+        finally:
+            self._platform_overrides.close()
 
     def peer(self, *, foreign: bool = False) -> PeerCredentials:
         return PeerCredentials(
@@ -2076,12 +2106,20 @@ volumes:
                 command
             )
             for path in paths:
-                descriptor = os.open(path, os.O_WRONLY)
-                try:
-                    with self.assertRaises(OSError):
-                        os.write(descriptor, b"tamper")
-                finally:
-                    os.close(descriptor)
+                if hasattr(os, "memfd_create") and Path("/proc/self/fd").is_dir():
+                    descriptor = os.open(path, os.O_WRONLY)
+                    try:
+                        with self.assertRaises(OSError):
+                            os.write(descriptor, b"tamper")
+                    finally:
+                        os.close(descriptor)
+                else:
+                    metadata = Path(path).stat()
+                    parent_metadata = Path(path).parent.stat()
+                    self.assertEqual(metadata.st_uid, os.geteuid())
+                    self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+                    self.assertEqual(parent_metadata.st_uid, os.geteuid())
+                    self.assertEqual(stat.S_IMODE(parent_metadata.st_mode), 0o700)
             self.assertEqual(
                 (os.stat(cwd).st_dev, os.stat(cwd).st_ino),
                 (
@@ -2615,7 +2653,7 @@ volumes:
                 command,
                 1,
                 stdout="",
-                stderr="METRICS_WORKER_ADMIN_TOKEN=redacted-test-secret",
+                stderr="METRICS_WORKER_ADMIN_TOKEN=do-not-leak-admin-token",
             )
 
         service, _ = service_for(self.fixture, compose_runner=runner)
@@ -2632,7 +2670,7 @@ volumes:
         self.assertIn("action=down", diagnostic)
         self.assertIn("phase=down", diagnostic)
         self.assertIn("returncode=1", diagnostic)
-        self.assertNotIn("redacted-test-secret", diagnostic)
+        self.assertNotIn("do-not-leak-admin-token", diagnostic)
         with CoordinatorStore.open(
             self.fixture.persistence.database_path,
             expected_uid=os.geteuid(),

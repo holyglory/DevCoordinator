@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from enum import Enum, IntEnum
 import hashlib
 import json
-from typing import Any, Callable, Mapping, Protocol, Sequence, Union
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence, Union
 import uuid
 
 
@@ -723,11 +723,17 @@ class RepositoryLifecycle:
         *,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[], str] | None = None,
+        prepare_apply: Optional[
+            Callable[[LifecyclePlan, str], Optional[Mapping[str, Any]]]
+        ] = None,
     ) -> None:
+        if prepare_apply is not None and not callable(prepare_apply):
+            raise TypeError("prepare_apply must be callable")
         self._persistence = persistence
         self._adapter = adapter
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._id_factory = id_factory or (lambda: str(uuid.uuid4()))
+        self._prepare_apply = prepare_apply
 
     def plan_repository_decommission(
         self, repo_id: str, *, actor: str, reason: str
@@ -788,6 +794,7 @@ class RepositoryLifecycle:
         progress = self._persistence.fence_repository(plan, actor=actor)
         if progress.status is OperationStatus.SUCCEEDED:
             return self._result(plan, progress, already_complete=True)
+        self._run_prepare_apply(plan, actor)
         progress = self._run_phases(plan, progress)
         if progress.status is OperationStatus.NEEDS_ATTENTION:
             return self._result(plan, progress)
@@ -873,11 +880,19 @@ class RepositoryLifecycle:
         progress = self._persistence.fence_resource(plan, actor=actor)
         if progress.status is OperationStatus.SUCCEEDED:
             return self._result(plan, progress, already_complete=True)
+        self._run_prepare_apply(plan, actor)
         progress = self._run_phases(plan, progress)
         if progress.status is OperationStatus.NEEDS_ATTENTION:
             return self._result(plan, progress)
         progress = self._persistence.complete_resource_retirement(plan)
         return self._result(plan, progress)
+
+    def _run_prepare_apply(self, plan: LifecyclePlan, actor: str) -> None:
+        if self._prepare_apply is None:
+            return
+        evidence = self._prepare_apply(plan, actor)
+        if evidence is not None and not isinstance(evidence, Mapping):
+            raise LifecycleError("prepare_apply must return an evidence object or None")
 
     def restore_resource_archive(
         self,

@@ -8,6 +8,7 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
     let schemaVersion: Int
     let store: NormalizedStoreMetadata
     let repositories: [NormalizedRepository]
+    let repositoryTrees: [NormalizedRepositoryTree]?
     let coordinatorSources: [NormalizedCoordinatorSource]
     let dockerEngines: [NormalizedDockerEngine]
     let memberships: [NormalizedMembership]
@@ -27,6 +28,7 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
         case store, repositories, memberships, resources, leases, events, observations
+        case repositoryTrees = "repository_trees"
         case coordinatorSources = "coordinator_sources"
         case dockerEngines = "docker_engines"
         case portAssignments = "port_assignments"
@@ -54,6 +56,12 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
         // itself schema 2.
         store = try values.decode(NormalizedStoreMetadata.self, forKey: .store)
         repositories = try values.decode([NormalizedRepository].self, forKey: .repositories)
+        // Absence is retained only so the UI can render an explicit
+        // incompatible-producer state. It must never trigger inferred trees.
+        // A present null, object, or malformed array still fails decoding.
+        repositoryTrees = values.contains(.repositoryTrees)
+            ? try values.decode([NormalizedRepositoryTree].self, forKey: .repositoryTrees)
+            : nil
         memberships = try values.decode([NormalizedMembership].self, forKey: .memberships)
         resources = try values.decode(NormalizedResources.self, forKey: .resources)
         unassignedResources = try values.decode(
@@ -254,11 +262,12 @@ struct NormalizedServerDefinition: Decodable, Sendable {
     let definitionFingerprint: String
     let generation: Int
     let arguments: [String]
+    let supervision: WorkerSupervision?
 
     enum CodingKeys: String, CodingKey {
         case serverDefinitionID = "server_definition_id"
         case repoID = "repo_id"
-        case name, role, cwd, generation, arguments
+        case name, role, cwd, generation, arguments, supervision
         case healthURLTemplate = "health_url_template"
         case logPath = "log_path"
         case definitionFingerprint = "definition_fingerprint"
@@ -276,6 +285,7 @@ struct NormalizedServerDefinition: Decodable, Sendable {
         definitionFingerprint = try values.decode(String.self, forKey: .definitionFingerprint)
         generation = try values.decodeIfPresent(Int.self, forKey: .generation) ?? 0
         arguments = try values.decodeIfPresent([String].self, forKey: .arguments) ?? []
+        supervision = try values.decodeIfPresent(WorkerSupervision.self, forKey: .supervision)
     }
 }
 
@@ -713,6 +723,7 @@ struct NormalizedUnassignedResource: Decodable, Sendable {
 struct NormalizedBoardProjection: Sendable {
     let inventory: Inventory
     let catalog: RepositoryCatalog
+    let repositoryTrees: [NormalizedRepositoryTree]?
 }
 
 extension NormalizedInventoryGraph {
@@ -721,6 +732,21 @@ extension NormalizedInventoryGraph {
         now: Date = Date()
     ) throws -> NormalizedBoardProjection {
         let repositoriesByID = try validatedRepositories()
+        let validatedRepositoryTrees = try validatedRepositoryTrees(repositoriesByID: repositoriesByID)
+        let reportedContainerIDs = Set((unassignedResources + lifecycleViolations)
+            .filter { $0.resourceKind == "container" }
+            .map(\.resourceID))
+        let reportedDatabaseIDs = Set((unassignedResources + lifecycleViolations)
+            .filter { $0.resourceKind == "database" }
+            .map(\.resourceID))
+        let authoritativeContainerIDs = validatedRepositoryTrees.map { trees in
+            Set(trees.flatMap(\.scopes).flatMap(\.containerResourceIDs))
+                .union(reportedContainerIDs)
+        }
+        let authoritativeDatabaseIDs = validatedRepositoryTrees.map { trees in
+            Set(trees.flatMap(\.scopes).flatMap(\.databaseBindingIDs))
+                .union(reportedDatabaseIDs)
+        }
         let bindingsByID = Dictionary(uniqueKeysWithValues: controlBindings.map { ($0.bindingID, $0) })
         let membershipsByRepository = Dictionary(grouping: memberships) { $0.repoID }
         let serverObservations = Dictionary(uniqueKeysWithValues: observations.servers.map {
@@ -824,6 +850,13 @@ extension NormalizedInventoryGraph {
         var dockerByRepository: [String: [RepositoryDockerResource]] = [:]
         var dockerPresentations: [String: DockerContainer] = [:]
         for resource in resources.docker {
+            // Authoritative trees are also the current presentation boundary.
+            // The resource table may retain immutable aliases for provenance;
+            // an omitted alias must not reappear as a duplicate service.
+            if let authoritativeContainerIDs,
+               !authoritativeContainerIDs.contains(resource.dockerResourceID) {
+                continue
+            }
             let membership = memberships.first {
                 $0.resourceKind == "container" && $0.hostResourceID == resource.dockerResourceID
             }
@@ -876,6 +909,10 @@ extension NormalizedInventoryGraph {
 
         var databasePresentations: [DockerContainer] = []
         for database in resources.databases {
+            if let authoritativeDatabaseIDs,
+               !authoritativeDatabaseIDs.contains(database.databaseBindingID) {
+                continue
+            }
             guard var container = dockerPresentations[database.dockerResourceID] else { continue }
             let observation = databaseObservations[database.databaseBindingID]
             container.database = database.databaseName
@@ -1033,6 +1070,16 @@ extension NormalizedInventoryGraph {
         for item in unassignedResources + lifecycleViolations
             where seenUnassigned.insert("\(item.resourceKind)|\(item.resourceID)|\(item.reasonCode.rawValue)").inserted {
             if item.resourceKind == "server" {
+                // A lifecycle violation can concern a resource that still has
+                // one exact repository scope. Keep it in that scope with its
+                // attribution callout instead of duplicating it under
+                // Unassigned Resources.
+                if item.lifecycleViolation,
+                   memberships.contains(where: {
+                       $0.resourceKind == "server" && $0.hostResourceID == item.resourceID
+                   }) {
+                    continue
+                }
                 let definition = resources.servers.first { $0.serverDefinitionID == item.resourceID }
                 let server = normalizedUnassignedServer(item, definition: definition, origin: origin)
                 unassignedServers.append(
@@ -1043,6 +1090,7 @@ extension NormalizedInventoryGraph {
                 )
                 serverPresentations.append(server)
             } else if item.resourceKind == "container",
+                      !(item.lifecycleViolation && assignedDockerIDs.contains(item.resourceID)),
                       let resource = resources.docker.first(where: { $0.dockerResourceID == item.resourceID }),
                       var container = dockerPresentations[item.resourceID] {
                 container.project = nil
@@ -1159,7 +1207,11 @@ extension NormalizedInventoryGraph {
             statistics.origin = origin
             return statistics
         }
-        return NormalizedBoardProjection(inventory: inventory, catalog: catalog)
+        return NormalizedBoardProjection(
+            inventory: inventory,
+            catalog: catalog,
+            repositoryTrees: validatedRepositoryTrees
+        )
     }
 
     private func validatedRepositories() throws -> [String: NormalizedRepository] {
@@ -1175,6 +1227,140 @@ extension NormalizedInventoryGraph {
             }
         }
         return byID
+    }
+
+    private func validatedRepositoryTrees(
+        repositoriesByID: [String: NormalizedRepository]
+    ) throws -> [NormalizedRepositoryTree]? {
+        guard let repositoryTrees else { return nil }
+
+        var familyIDs = Set<String>()
+        var classifiedRepositoryIDs = Set<String>()
+        var classifiedServerIDs = Set<String>()
+        var classifiedContainerIDs = Set<String>()
+        var classifiedDatabaseIDs = Set<String>()
+        let serversByID = Dictionary(grouping: resources.servers, by: \.serverDefinitionID)
+        let containerMembershipsByID = Dictionary(
+            grouping: memberships.filter { $0.resourceKind == "container" },
+            by: \.hostResourceID
+        )
+        let databasesByID = Dictionary(grouping: resources.databases, by: \.databaseBindingID)
+
+        let lifecycleServerIDs = Set(lifecycleViolations
+            .filter { $0.resourceKind == "server" }
+            .map(\.resourceID))
+        let lifecycleContainerIDs = Set(lifecycleViolations
+            .filter { $0.resourceKind == "container" }
+            .map(\.resourceID))
+        let reportedProblems = unassignedResources + lifecycleViolations
+        let regularUnassignedServerIDs = Set(unassignedResources
+            .filter {
+                $0.resourceKind == "server"
+                    && !$0.lifecycleViolation
+                    && !lifecycleServerIDs.contains($0.resourceID)
+            }
+            .map(\.resourceID))
+        let regularUnassignedContainerIDs = Set(unassignedResources
+            .filter {
+                $0.resourceKind == "container"
+                    && !$0.lifecycleViolation
+                    && !lifecycleContainerIDs.contains($0.resourceID)
+            }
+            .map(\.resourceID))
+        let reportedServerIDs = Set(reportedProblems
+            .filter { $0.resourceKind == "server" }
+            .map(\.resourceID))
+        let reportedContainerIDs = Set(reportedProblems
+            .filter { $0.resourceKind == "container" }
+            .map(\.resourceID))
+        let reportedDatabaseIDs = Set(reportedProblems
+            .filter { $0.resourceKind == "database" }
+            .map(\.resourceID))
+
+        func uniqueNonempty(_ values: [String]) -> Bool {
+            values.allSatisfy { !$0.isEmpty } && Set(values).count == values.count
+        }
+
+        for tree in repositoryTrees {
+            guard !tree.familyID.isEmpty,
+                  familyIDs.insert(tree.familyID).inserted,
+                  let rootRepository = repositoriesByID[tree.rootRepository.repoID],
+                  rootRepository.canonicalRoot == tree.rootRepository.canonicalRoot,
+                  rootRepository.displayName == tree.rootRepository.displayName
+            else {
+                throw RuntimeError("Normalized inventory contains an invalid repository tree root")
+            }
+
+            let rootScopes = tree.scopes.filter { $0.kind == .root }
+            guard rootScopes.count == 1,
+                  rootScopes[0].repoID == tree.rootRepository.repoID,
+                  !tree.scopes.isEmpty
+            else {
+                throw RuntimeError("Normalized inventory repository tree must contain its one root scope")
+            }
+
+            for scope in tree.scopes {
+                guard let repository = repositoriesByID[scope.repoID],
+                      repository.hostID == rootRepository.hostID,
+                      repository.canonicalRoot == scope.canonicalRoot,
+                      repository.displayName == scope.displayName,
+                      classifiedRepositoryIDs.insert(scope.repoID).inserted,
+                      uniqueNonempty(scope.serverIDs),
+                      uniqueNonempty(scope.containerResourceIDs),
+                      uniqueNonempty(scope.databaseBindingIDs)
+                else {
+                    throw RuntimeError("Normalized inventory contains an invalid repository tree scope")
+                }
+                for serverID in scope.serverIDs {
+                    guard let matches = serversByID[serverID],
+                          matches.count == 1,
+                          matches[0].repoID == scope.repoID,
+                          classifiedServerIDs.insert(serverID).inserted
+                    else {
+                        throw RuntimeError("Normalized inventory contains an invalid repository tree server")
+                    }
+                }
+                for containerID in scope.containerResourceIDs {
+                    guard let matches = containerMembershipsByID[containerID],
+                          matches.count == 1,
+                          matches[0].repoID == scope.repoID,
+                          classifiedContainerIDs.insert(containerID).inserted
+                    else {
+                        throw RuntimeError("Normalized inventory contains an invalid repository tree container")
+                    }
+                }
+                for databaseID in scope.databaseBindingIDs {
+                    guard let matches = databasesByID[databaseID],
+                          matches.count == 1,
+                          matches[0].repoID == scope.repoID,
+                          scope.containerResourceIDs.contains(matches[0].dockerResourceID),
+                          classifiedDatabaseIDs.insert(databaseID).inserted
+                    else {
+                        throw RuntimeError("Normalized inventory contains an invalid repository tree database")
+                    }
+                }
+                if scope.kind == .temporary && scope.repoID == tree.rootRepository.repoID {
+                    throw RuntimeError("Normalized inventory marks its root repository as temporary")
+                }
+            }
+        }
+
+        let observedDockerIDs = Set(observations.docker.map(\.dockerResourceID))
+        let observedDatabaseIDs = Set(observations.databases.map(\.databaseBindingID))
+        let normalizedServerIDs = Set(resources.servers.map(\.serverDefinitionID))
+        let coveredServerIDs = classifiedServerIDs.union(reportedServerIDs.intersection(normalizedServerIDs))
+        guard classifiedRepositoryIDs == Set(repositoriesByID.keys),
+              coveredServerIDs == normalizedServerIDs,
+              regularUnassignedServerIDs.isDisjoint(with: classifiedServerIDs),
+              regularUnassignedContainerIDs.isDisjoint(with: classifiedContainerIDs),
+              observedDockerIDs.isSubset(of: classifiedContainerIDs.union(reportedContainerIDs)),
+              observedDatabaseIDs.isSubset(of: classifiedDatabaseIDs.union(reportedDatabaseIDs))
+        else {
+            throw RuntimeError(
+                "Normalized inventory repository trees and explicit ownership problems do not cover every resource exactly once"
+            )
+        }
+        return repositoryTrees
     }
 }
 
@@ -1252,6 +1438,7 @@ private func normalizedServerPresentation(
         portReused: nil,
         portReusedBy: nil,
         processUsage: processUsage,
+        supervision: definition.supervision,
         attribution: attribution,
         ownershipError: actionable ? nil : "No authoritative normalized control binding matches this server membership.",
         ownershipCandidates: actionable ? [origin] : [],
@@ -1297,6 +1484,7 @@ private func normalizedUnassignedServer(
         portReused: nil,
         portReusedBy: nil,
         processUsage: nil,
+        supervision: definition?.supervision,
         attribution: item.attribution,
         ownershipError: "Use the exact Attach or Retire action; repository ownership is not established.",
         ownershipCandidates: [origin],

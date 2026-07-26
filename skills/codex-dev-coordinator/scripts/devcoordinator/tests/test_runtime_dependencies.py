@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -97,29 +98,72 @@ class ComposeVersionContractTests(unittest.TestCase):
 
 
 class ComposeCapabilityContractTests(unittest.TestCase):
+    def test_isolated_service_argv_fails_closed_without_pyyaml(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name)
+        isolated_script = directory / SCRIPT.name
+        shutil.copy2(SCRIPT, isolated_script)
+        shutil.copytree(
+            SCRIPT.parent / "devcoordinator",
+            directory / "devcoordinator",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        (directory / "yaml.py").write_text(
+            "raise ImportError('deterministic missing-PyYAML fixture')\n",
+            encoding="utf-8",
+        )
+
+        completed = subprocess.run(
+            [sys.executable, "-I", str(isolated_script)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            timeout=15,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, "")
+        evidence = json.loads(completed.stdout)
+        self.assertIs(evidence.get("ok"), False)
+        self.assertEqual(evidence.get("code"), "pyyaml_missing")
+
     def test_isolated_service_argv_loads_its_sibling_package_and_proves_runtime(
         self,
     ) -> None:
-        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name)
         docker = directory / "docker"
+        config_output = _config_output(
+            explicit=VALIDATOR._PROBE_EXPLICIT_VALUE,
+            implicit=VALIDATOR._PROBE_IMPLICIT_DEFAULT,
+        )
         docker.write_text(
-            f"#!{sys.executable}\n"
-            "import json\n"
-            "import sys\n"
-            "arguments = sys.argv[1:]\n"
-            "if arguments == ['compose', 'version', '--short']:\n"
-            "    print('2.26.1-4')\n"
-            "    raise SystemExit(0)\n"
-            "if arguments[:1] == ['compose'] and arguments[-3:] == "
-            "['config', '--format', 'json']:\n"
-            "    print(json.dumps({'services': {'runtime-capability-probe': "
-            "{'environment': {"
-            "'DEVCOORDINATOR_EXPLICIT_ENV_PROBE': "
-            "'second-explicit-env-file-wins', "
-            "'DEVCOORDINATOR_IMPLICIT_ENV_PROBE': "
-            "'implicit-dotenv-suppressed'}}}}))\n"
-            "    raise SystemExit(0)\n"
-            "raise SystemExit(9)\n",
+            "#!/bin/sh\n"
+            "if [ \"$#\" -eq 3 ] && "
+            "[ \"$1\" = compose ] && [ \"$2\" = version ] && "
+            "[ \"$3\" = --short ]; then\n"
+            "  printf '%s\\n' '2.26.1-4'\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ \"$#\" -eq 14 ] && "
+            "[ \"$1\" = compose ] && "
+            "[ \"$2\" = --project-directory ] && "
+            "[ \"$4\" = --env-file ] && "
+            "[ \"$6\" = --env-file ] && "
+            "[ \"$8\" = --file ] && "
+            "[ \"${10}\" = --project-name ] && "
+            "[ \"${11}\" = devcoordinator-runtime-capability-probe ] && "
+            "[ \"${12}\" = config ] && "
+            "[ \"${13}\" = --format ] && [ \"${14}\" = json ]; then\n"
+            f"  printf '%s\\n' '{config_output}'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 9\n",
             encoding="utf-8",
         )
         docker.chmod(0o700)
@@ -138,7 +182,11 @@ class ComposeCapabilityContractTests(unittest.TestCase):
             check=False,
         )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"stdout={completed.stdout!r}; stderr={completed.stderr!r}",
+        )
         self.assertEqual(completed.stderr, "")
         evidence = json.loads(completed.stdout)
         self.assertIs(evidence.get("ok"), True)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -21,6 +21,7 @@ from .broker_profile import BrokerClientProfile
 
 MANIFEST_PATH = Path(".codex/tests.json")
 _KINDS = frozenset({"pytest", "jsonl", "trx", "automation"})
+UTC = timezone.utc
 
 
 class TestHarnessError(RuntimeError):

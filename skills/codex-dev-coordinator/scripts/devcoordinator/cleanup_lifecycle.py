@@ -24,7 +24,7 @@ import re
 import shutil
 import stat
 import subprocess
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 import uuid
 
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
@@ -44,6 +44,9 @@ TARGET_KINDS = frozenset({"project", "server", "container", "worktree"})
 _FULL_CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OID = re.compile(r"^[0-9a-f]{40,64}$")
 RETAINED_AUDIT = ("audit_history", "cleanup_tombstone", "operation_evidence")
+
+
+PrepareApplyCallback = Callable[["CleanupPlan", str], Optional[Mapping[str, Any]]]
 
 
 class CleanupError(LifecycleError):
@@ -198,12 +201,16 @@ class CleanupLifecycle:
         lifecycle_adapter: CoordinatorHostLifecycleAdapter | None = None,
         docker_backend: DockerCleanupBackend | None = None,
         authorize: Callable[[str, str, str, str], None] | None = None,
+        prepare_apply: PrepareApplyCallback | None = None,
     ) -> None:
+        if prepare_apply is not None and not callable(prepare_apply):
+            raise TypeError("prepare_apply must be callable")
         self.store = store
         self.persistence = SQLiteLifecyclePersistence(store)
         self.lifecycle_adapter = lifecycle_adapter or CoordinatorHostLifecycleAdapter()
         self.docker_backend = docker_backend or DockerCleanupBackend()
         self._authorize = authorize or (lambda _cap, _kind, _target, _actor: None)
+        self._prepare_apply = prepare_apply
 
     def list_archives(self, *, actor: str) -> dict[str, Any]:
         self._authorize("archives.read", "project", "*", actor)
@@ -212,11 +219,13 @@ class CleanupLifecycle:
             for row in connection.execute(
                 """
                 SELECT r.repo_id, r.display_name, r.canonical_root,
+                       r.state, r.generation,
                        i.disabled_at, i.reason, i.actor
                 FROM repositories r
                 JOIN repository_installations i USING(repo_id)
                 LEFT JOIN cleanup_tombstones t
-                  ON t.target_kind = 'project' AND t.target_id = r.repo_id
+                 ON t.target_kind = 'project' AND t.target_id = r.repo_id
+                 AND t.target_generation IN (r.generation, r.generation - 1)
                 WHERE i.status = 'disabled' AND t.target_id IS NULL
                 ORDER BY i.disabled_at DESC, lower(r.display_name), r.repo_id
                 """
@@ -241,8 +250,17 @@ class CleanupLifecycle:
                 )
                 worktree_blockers = list(blockers)
                 if connection.execute(
-                    "SELECT 1 FROM cleanup_tombstones WHERE target_kind = 'project' AND target_id = ?",
-                    (str(row["repo_id"]),),
+                    """
+                    SELECT 1 FROM cleanup_tombstones
+                    WHERE target_kind = 'project' AND target_id = ?
+                      AND target_generation IN (?, ?)
+                    """,
+                    (
+                        str(row["repo_id"]),
+                        int(row["generation"])
+                        - 1,
+                        int(row["generation"]),
+                    ),
                 ).fetchone() is None:
                     worktree_blockers.append(
                         _blocker(
@@ -329,7 +347,8 @@ class CleanupLifecycle:
                 rows.append(item)
             for row in connection.execute(
                 """
-                SELECT target_kind, target_id, repo_id, actor, reason,
+                SELECT target_kind, target_id, target_generation,
+                       repo_id, actor, reason,
                        evidence_json, removed_at
                 FROM cleanup_tombstones
                 ORDER BY removed_at DESC, target_kind, target_id
@@ -348,9 +367,36 @@ class CleanupLifecycle:
                 )
                 kind = str(row["target_kind"])
                 repo_id = str(row["repo_id"]) if row["repo_id"] is not None else None
+                # A removed managed worker no longer belongs in the routine
+                # archive collection.  Its immutable tombstone and lifecycle
+                # history remain available to explicit audit readers.
+                if kind == "server":
+                    continue
+                current_project_removed = False
+                if kind == "project":
+                    current_repository = (
+                        None
+                        if repo_id is None
+                        else connection.execute(
+                            """
+                            SELECT state, generation FROM repositories
+                            WHERE repo_id = ?
+                            """,
+                            (repo_id,),
+                        ).fetchone()
+                    )
+                    current_project_removed = bool(
+                        current_repository is not None
+                        and str(current_repository["state"]) == "missing"
+                        and int(current_repository["generation"])
+                        == int(row["target_generation"]) + 1
+                    )
+                    if not current_project_removed:
+                        continue
                 removed = {
                     "target_kind": kind,
                     "target_id": str(row["target_id"]),
+                    "target_generation": int(row["target_generation"]),
                     "display_name": str(
                         target_payload.get("display_name")
                         or f"Removed {kind}"
@@ -395,7 +441,11 @@ class CleanupLifecycle:
                         """,
                         (repo_id,),
                     ).fetchone()
-                    if root_text and worktree_tombstone is None:
+                    if (
+                        root_text
+                        and worktree_tombstone is None
+                        and current_project_removed
+                    ):
                         retained_blockers = self._project_static_blockers(
                             connection, repo_id
                         )
@@ -522,6 +572,7 @@ class CleanupLifecycle:
             recovery_evidence: Mapping[str, Any] = {"target_absent": True}
             if plan.target_kind == "worktree":
                 recovery_evidence = self._verify_worktree_absent(plan)
+            self._run_prepare_apply(plan, actor)
             if host_phase == "running":
                 self._finish_phase(
                     plan.plan_id,
@@ -541,6 +592,7 @@ class CleanupLifecycle:
             if blockers:
                 self._mark_needs_attention(plan, blockers)
                 raise CleanupBlocked(blockers)
+            self._run_prepare_apply(plan, actor)
         self._mark_running(plan, actor)
         try:
             if plan.target_kind == "container":
@@ -625,9 +677,19 @@ class CleanupLifecycle:
             ).fetchone()
             if row is None:
                 raise CleanupError("project target does not exist")
+            if str(row["state"]) != "active":
+                raise CleanupError("project is already removed")
             if connection.execute(
-                "SELECT 1 FROM cleanup_tombstones WHERE target_kind = 'project' AND target_id = ?",
-                (repo_id,),
+                """
+                SELECT 1 FROM cleanup_tombstones
+                WHERE target_kind = 'project' AND target_id = ?
+                  AND target_generation IN (?, ?)
+                """,
+                (
+                    repo_id,
+                    int(row["generation"]) - 1,
+                    int(row["generation"]),
+                ),
             ).fetchone() is not None:
                 raise CleanupError("project is already removed")
             blockers = self._project_static_blockers(connection, repo_id)
@@ -819,6 +881,7 @@ class CleanupLifecycle:
             row = connection.execute(
                 """
                 SELECT r.repo_id, r.canonical_root, r.display_name, r.state,
+                       r.generation,
                        i.status, i.startup_fenced
                 FROM repositories r JOIN repository_installations i USING(repo_id)
                 WHERE r.repo_id = ?
@@ -831,8 +894,16 @@ class CleanupLifecycle:
                 raise CleanupError("worktree project does not exist")
             blockers = self._project_static_blockers(connection, repo_id)
             project_catalog_removed = connection.execute(
-                "SELECT 1 FROM cleanup_tombstones WHERE target_kind = 'project' AND target_id = ?",
-                (repo_id,),
+                """
+                SELECT 1 FROM cleanup_tombstones
+                WHERE target_kind = 'project' AND target_id = ?
+                  AND target_generation IN (?, ?)
+                """,
+                (
+                    repo_id,
+                    int(row["generation"]) - 1,
+                    int(row["generation"]),
+                ),
             ).fetchone() is not None
         root = Path(str(row["canonical_root"]))
         if not root.exists():
@@ -1022,6 +1093,26 @@ class CleanupLifecycle:
             ).fetchone()
             return str(row["status"]) if row is not None else None
 
+    def _run_prepare_apply(self, plan: CleanupPlan, actor: str) -> None:
+        """Run and durably record the optional last pre-mutation hook.
+
+        Apply has already revalidated the durable plan, confirmation,
+        authorization, exact current identity, and blockers before reaching
+        this method.  The callback therefore may perform an idempotent
+        prerequisite such as unregistering a native worker.  Its evidence is
+        committed only after it returns successfully; an exception or invalid
+        result leaves the cleanup plan and target catalogue unapplied.
+        """
+
+        if self._phase_succeeded(plan.plan_id, "prepare_apply"):
+            return
+        if self._prepare_apply is None:
+            return
+        evidence = _validated_prepare_apply_evidence(
+            self._prepare_apply(plan, actor)
+        )
+        self._finish_phase(plan.plan_id, "prepare_apply", evidence)
+
     def _finalize_container(self, plan: CleanupPlan, actor: str) -> None:
         timestamp = utc_timestamp()
         full_id = str(plan.snapshot["identity"]["full_container_id"])
@@ -1078,59 +1169,317 @@ class CleanupLifecycle:
                 self._complete_in_transaction(connection, plan, timestamp)
                 return
             definition = connection.execute(
-                "SELECT log_path FROM server_definitions WHERE server_definition_id = ?",
+                """
+                SELECT repo_id, name, log_path
+                FROM server_definitions
+                WHERE server_definition_id = ?
+                """,
                 (plan.target_id,),
             ).fetchone()
             if definition is None:
                 raise PlanDriftError("managed server definition disappeared before finalization")
+            if str(definition["repo_id"] or "") != str(plan.repo_id or ""):
+                raise PlanDriftError(
+                    "managed server repository identity changed before finalization"
+                )
             observation = connection.execute(
-                "SELECT lifecycle, listener_observable FROM server_observations WHERE server_definition_id = ?",
+                """
+                SELECT lifecycle, pid, listener_observable
+                FROM server_observations
+                WHERE server_definition_id = ?
+                """,
                 (plan.target_id,),
             ).fetchone()
-            if observation is not None and str(observation["lifecycle"]) not in {"stopped", "unknown", "unobserved"}:
-                raise CleanupBlocked([_blocker("resource_running", "server is not durably stopped")])
+            if (
+                observation is None
+                or str(observation["lifecycle"]) != "stopped"
+                or observation["pid"] is not None
+                or observation["listener_observable"] != 1
+            ):
+                raise CleanupBlocked(
+                    [
+                        _blocker(
+                            "resource_not_proved_stopped",
+                            "server has no durable stopped process and listener observation",
+                        )
+                    ]
+                )
+
+            unreleased_link = connection.execute(
+                """
+                SELECT 'lease' AS link_kind, status
+                FROM broker_lease_links
+                WHERE server_definition_id = ? AND status != 'released'
+                UNION ALL
+                SELECT 'assignment' AS link_kind, status
+                FROM broker_assignment_links
+                WHERE server_definition_id = ? AND status != 'released'
+                LIMIT 1
+                """,
+                (plan.target_id, plan.target_id),
+            ).fetchone()
+            if unreleased_link is not None:
+                raise CleanupBlocked(
+                    [
+                        _blocker(
+                            "unreleased_broker_link",
+                            "server still has an unreleased broker "
+                            f"{unreleased_link['link_kind']} link ({unreleased_link['status']})",
+                        )
+                    ]
+                )
+            unresolved_reconciliation = connection.execute(
+                """
+                SELECT 'reconciliation' AS link_kind, status
+                FROM broker_reconciliation_queue
+                WHERE resource_id = ? AND status IN ('pending', 'operator_required')
+                UNION ALL
+                SELECT 'lifecycle' AS link_kind, status
+                FROM broker_lifecycle_links
+                WHERE resource_id = ? AND status IN (
+                    'pending', 'reconciliation_required', 'operator_required'
+                )
+                LIMIT 1
+                """,
+                (plan.target_id, plan.target_id),
+            ).fetchone()
+            if unresolved_reconciliation is not None:
+                raise CleanupBlocked(
+                    [
+                        _blocker(
+                            "unresolved_broker_reconciliation",
+                            "server still has an unresolved broker "
+                            f"{unresolved_reconciliation['link_kind']} record "
+                            f"({unresolved_reconciliation['status']})",
+                        )
+                    ]
+                )
+
+            deleted: dict[str, int] = {}
+
+            def delete(
+                label: str, statement: str, parameters: tuple[Any, ...]
+            ) -> None:
+                deleted[label] = connection.execute(statement, parameters).rowcount
+
+            available_tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
             connection.execute(
-                "UPDATE port_assignments SET status = 'inactive', deactivated_at = COALESCE(deactivated_at, ?), updated_at = ? WHERE repo_id = ? AND server_name = (SELECT name FROM server_definitions WHERE server_definition_id = ?) AND status = 'active'",
+                """
+                UPDATE port_assignments
+                SET status = 'inactive',
+                    deactivated_at = COALESCE(deactivated_at, ?),
+                    updated_at = ?
+                WHERE repo_id = ?
+                  AND server_name = (
+                    SELECT name FROM server_definitions
+                    WHERE server_definition_id = ?
+                  )
+                  AND status = 'active'
+                """,
                 (timestamp, timestamp, plan.repo_id, plan.target_id),
             )
             connection.execute(
-                "UPDATE leases SET status = 'released', deactivated_at = COALESCE(deactivated_at, ?), updated_at = ? WHERE server_definition_id = ? AND status = 'active'",
+                """
+                UPDATE leases
+                SET status = 'released',
+                    deactivated_at = COALESCE(deactivated_at, ?),
+                    updated_at = ?
+                WHERE server_definition_id = ? AND status = 'active'
+                """,
                 (timestamp, timestamp, plan.target_id),
             )
-            connection.execute(
-                "DELETE FROM server_command_arguments WHERE server_definition_id = ?",
+
+            delete(
+                "broker_lease_links",
+                """
+                DELETE FROM broker_lease_links
+                WHERE server_definition_id = ? AND status = 'released'
+                """,
                 (plan.target_id,),
             )
-            connection.execute(
-                "DELETE FROM server_environment WHERE server_definition_id = ?",
+            delete(
+                "broker_assignment_links",
+                """
+                DELETE FROM broker_assignment_links
+                WHERE server_definition_id = ? AND status = 'released'
+                """,
                 (plan.target_id,),
             )
-            connection.execute(
-                "DELETE FROM repository_memberships WHERE resource_kind = 'server' AND host_resource_id = ?",
+            delete(
+                "broker_reconciliation_queue",
+                """
+                DELETE FROM broker_reconciliation_queue
+                WHERE resource_id = ? AND status = 'resolved'
+                """,
                 (plan.target_id,),
             )
-            connection.execute(
-                "DELETE FROM unassigned_resources WHERE resource_kind = 'server' AND resource_id = ?",
+            delete(
+                "broker_lifecycle_links",
+                """
+                DELETE FROM broker_lifecycle_links
+                WHERE resource_id = ? AND status = 'applied'
+                """,
                 (plan.target_id,),
             )
-            connection.execute(
-                "DELETE FROM startup_policies WHERE resource_kind = 'server' AND resource_id = ?",
+
+            # Broker-private ACL/ownership tables exist only in service-owned
+            # stores.  Remove their exact projections when present without
+            # making account-local cleanup depend on broker schema bootstrap.
+            conditional_deletes = (
+                (
+                    "broker_runtime_acl",
+                    """
+                    DELETE FROM broker_runtime_acl
+                    WHERE repo_id = ? AND resource_kind = 'service'
+                      AND resource_id = ?
+                    """,
+                    (plan.repo_id, plan.target_id),
+                ),
+                (
+                    "broker_resource_acl",
+                    """
+                    DELETE FROM broker_resource_acl
+                    WHERE repo_id = ? AND resource_kind = 'server'
+                      AND resource_id = ?
+                    """,
+                    (plan.repo_id, plan.target_id),
+                ),
+                (
+                    "broker_assignment_acl",
+                    """
+                    DELETE FROM broker_assignment_acl
+                    WHERE repo_id = ? AND server_definition_id = ?
+                    """,
+                    (plan.repo_id, plan.target_id),
+                ),
+                (
+                    "broker_port_policies",
+                    """
+                    DELETE FROM broker_port_policies
+                    WHERE repo_id = ? AND server_definition_id = ?
+                    """,
+                    (plan.repo_id, plan.target_id),
+                ),
+                (
+                    "broker_lease_owners",
+                    """
+                    DELETE FROM broker_lease_owners
+                    WHERE repo_id = ? AND server_definition_id = ?
+                    """,
+                    (plan.repo_id, plan.target_id),
+                ),
+                (
+                    "broker_assignment_owners",
+                    """
+                    DELETE FROM broker_assignment_owners
+                    WHERE repo_id = ? AND server_definition_id = ?
+                    """,
+                    (plan.repo_id, plan.target_id),
+                ),
+                (
+                    "broker_cleanup_resource_acl",
+                    """
+                    DELETE FROM broker_cleanup_resource_acl
+                    WHERE repo_id = ? AND resource_kind = 'server'
+                      AND resource_id = ?
+                    """,
+                    (plan.repo_id, plan.target_id),
+                ),
+            )
+            for table, statement, parameters in conditional_deletes:
+                if table in available_tables:
+                    delete(table, statement, parameters)
+
+            delete(
+                "leases",
+                """
+                DELETE FROM leases
+                WHERE server_definition_id = ?
+                  AND status IN ('released', 'stale')
+                """,
                 (plan.target_id,),
             )
-            connection.execute(
-                "UPDATE control_bindings SET authority_state = 'retired', generation = generation + 1, updated_at = ? WHERE resource_kind = 'server' AND resource_id = ?",
-                (timestamp, plan.target_id),
+            delete(
+                "port_assignments",
+                """
+                DELETE FROM port_assignments
+                WHERE repo_id = ? AND server_name = ? AND status = 'inactive'
+                """,
+                (plan.repo_id, str(definition["name"])),
             )
-            connection.execute(
-                "DELETE FROM resource_retirements WHERE resource_kind = 'server' AND host_resource_id = ?",
+            delete(
+                "repository_memberships",
+                """
+                DELETE FROM repository_memberships
+                WHERE resource_kind = 'server' AND host_resource_id = ?
+                """,
                 (plan.target_id,),
             )
+            delete(
+                "unassigned_resources",
+                """
+                DELETE FROM unassigned_resources
+                WHERE resource_kind = 'server' AND resource_id = ?
+                """,
+                (plan.target_id,),
+            )
+            delete(
+                "startup_policies",
+                """
+                DELETE FROM startup_policies
+                WHERE resource_kind = 'server' AND resource_id = ?
+                """,
+                (plan.target_id,),
+            )
+            delete(
+                "startup_policy_restore_states",
+                """
+                DELETE FROM startup_policy_restore_states
+                WHERE resource_kind = 'server' AND resource_id = ?
+                """,
+                (plan.target_id,),
+            )
+            delete(
+                "control_bindings",
+                """
+                DELETE FROM control_bindings
+                WHERE resource_kind = 'server' AND resource_id = ?
+                """,
+                (plan.target_id,),
+            )
+            delete(
+                "resource_retirements",
+                """
+                DELETE FROM resource_retirements
+                WHERE resource_kind = 'server' AND host_resource_id = ?
+                """,
+                (plan.target_id,),
+            )
+            delete(
+                "server_definitions",
+                """
+                DELETE FROM server_definitions
+                WHERE server_definition_id = ? AND repo_id = ?
+                """,
+                (plan.target_id, plan.repo_id),
+            )
+            if deleted["server_definitions"] != 1:
+                raise PlanDriftError("managed server definition changed before deletion")
             self._insert_tombstone(
                 connection,
                 plan,
                 actor,
                 timestamp,
-                extra={"retained_log_path": definition["log_path"]},
+                extra={
+                    "retained_log_path": definition["log_path"],
+                    "active_catalog_deleted": True,
+                    "deleted_rows": deleted,
+                },
             )
             self._complete_in_transaction(connection, plan, timestamp)
 
@@ -1143,9 +1492,15 @@ class CleanupLifecycle:
             blockers = self._project_static_blockers(connection, plan.target_id)
             if blockers:
                 raise CleanupBlocked(blockers)
+            planned_generation = _cleanup_target_generation(plan)
             changed = connection.execute(
-                "UPDATE repositories SET state = 'missing', generation = generation + 1, updated_at = ? WHERE repo_id = ? AND state = 'active'",
-                (timestamp, plan.target_id),
+                """
+                UPDATE repositories
+                SET state = 'missing', generation = generation + 1,
+                    updated_at = ?
+                WHERE repo_id = ? AND state = 'active' AND generation = ?
+                """,
+                (timestamp, plan.target_id, planned_generation),
             ).rowcount
             if changed != 1:
                 raise PlanDriftError("project catalog identity changed before removal")
@@ -1266,17 +1621,20 @@ class CleanupLifecycle:
         evidence["applied_by"] = actor
         if extra:
             evidence.update(dict(extra))
+        target_generation = _cleanup_target_generation(plan)
         connection.execute(
             """
             INSERT INTO cleanup_tombstones(
-                target_kind, target_id, repo_id, immutable_fingerprint,
-                operation_id, actor, reason, evidence_json, removed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(target_kind, target_id) DO NOTHING
+                target_kind, target_id, target_generation, repo_id,
+                immutable_fingerprint, operation_id, actor, reason,
+                evidence_json, removed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(target_kind, target_id, target_generation) DO NOTHING
             """,
             (
                 plan.target_kind,
                 plan.target_id,
+                target_generation,
                 plan.repo_id,
                 plan.target_fingerprint,
                 plan.plan_id,
@@ -1286,6 +1644,22 @@ class CleanupLifecycle:
                 timestamp,
             ),
         )
+        retained = connection.execute(
+            """
+            SELECT immutable_fingerprint, operation_id
+            FROM cleanup_tombstones
+            WHERE target_kind = ? AND target_id = ?
+              AND target_generation = ?
+            """,
+            (plan.target_kind, plan.target_id, target_generation),
+        ).fetchone()
+        if retained is None or (
+            str(retained["immutable_fingerprint"]) != plan.target_fingerprint
+            or str(retained["operation_id"]) != plan.plan_id
+        ):
+            raise PlanDriftError(
+                "cleanup tombstone generation conflicts with retained evidence"
+            )
         if plan.target_kind in {"server", "container"}:
             connection.execute(
                 """
@@ -1313,8 +1687,16 @@ class CleanupLifecycle:
     @staticmethod
     def _tombstone_exists(connection: Any, plan: CleanupPlan) -> bool:
         return connection.execute(
-            "SELECT 1 FROM cleanup_tombstones WHERE target_kind = ? AND target_id = ?",
-            (plan.target_kind, plan.target_id),
+            """
+            SELECT 1 FROM cleanup_tombstones
+            WHERE target_kind = ? AND target_id = ?
+              AND target_generation = ?
+            """,
+            (
+                plan.target_kind,
+                plan.target_id,
+                _cleanup_target_generation(plan),
+            ),
         ).fetchone() is not None
 
     @staticmethod
@@ -1391,11 +1773,10 @@ class CleanupLifecycle:
                 raise CleanupError("cleanup plan disappeared")
             return str(row["status"])
 
-    @staticmethod
     def _apply_result(
-        plan: CleanupPlan, *, partial: bool, needs_attention: bool
+        self, plan: CleanupPlan, *, partial: bool, needs_attention: bool
     ) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "status": "needs_attention" if needs_attention else "succeeded",
             "partial": bool(partial),
             "needs_attention": bool(needs_attention),
@@ -1403,11 +1784,37 @@ class CleanupLifecycle:
             "errors": [],
             "plan_id": plan.plan_id,
             "plan_fingerprint": plan.plan_fingerprint,
+            "action": plan.action,
+            "target_fingerprint": plan.target_fingerprint,
+            "confirmation_phrase": plan.confirmation_phrase,
             "target": {
                 "target_kind": plan.target_kind,
                 "target_id": plan.target_id,
             },
         }
+        evidence = self._phase_evidence(plan.plan_id, "prepare_apply")
+        if evidence is not None:
+            result["pre_apply"] = evidence
+        return result
+
+    def _phase_evidence(self, plan_id: str, phase: str) -> dict[str, Any] | None:
+        with self.store.read_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT status, evidence_json FROM cleanup_phase_evidence
+                WHERE plan_id = ? AND phase = ?
+                """,
+                (plan_id, phase),
+            ).fetchone()
+        if row is None or str(row["status"]) != "succeeded":
+            return None
+        try:
+            evidence = json.loads(str(row["evidence_json"]))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise CleanupError("durable prepare-apply evidence is invalid") from error
+        if not isinstance(evidence, dict):
+            raise CleanupError("durable prepare-apply evidence must be an object")
+        return evidence
 
     @staticmethod
     def _resource_static_blockers(
@@ -1500,6 +1907,18 @@ def _canonical_target_kind(value: str) -> str:
     return normalized
 
 
+def _cleanup_target_generation(plan: CleanupPlan) -> int:
+    if plan.target_kind != "project":
+        return 0
+    identity = plan.snapshot.get("identity")
+    generation = identity.get("generation") if isinstance(identity, Mapping) else None
+    if type(generation) is not int or generation < 0:
+        raise PlanDriftError(
+            "project cleanup plan lacks an exact repository generation"
+        )
+    return generation
+
+
 def _require_target(kind: str, target_id: str) -> None:
     if kind not in TARGET_KINDS:
         raise CleanupError("unsupported cleanup target kind")
@@ -1525,6 +1944,25 @@ def _require_sha256(value: str, field: str) -> None:
 def _require_full_container_id(value: str) -> None:
     if _FULL_CONTAINER_ID.fullmatch(str(value).lower()) is None:
         raise CleanupError("Docker cleanup requires an exact 64-hex container ID")
+
+
+def _validated_prepare_apply_evidence(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise CleanupError("prepare_apply must return a JSON object or None")
+    if any(not isinstance(key, str) for key in value):
+        raise CleanupError("prepare_apply evidence keys must be strings")
+    try:
+        encoded = canonical_json(dict(value))
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise CleanupError("prepare_apply evidence must be valid JSON") from error
+    if not isinstance(decoded, dict):
+        raise CleanupError("prepare_apply must return a JSON object or None")
+    return decoded
 
 
 def _blocker(code: str, message: str, **evidence: Any) -> dict[str, Any]:

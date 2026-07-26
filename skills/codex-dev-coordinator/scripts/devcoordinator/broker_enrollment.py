@@ -55,11 +55,16 @@ from .store import (
     fingerprint,
     utc_timestamp,
 )
+from .worker_artifacts import provision_worker_log_directory
 
 
 _FULL_DOCKER_OBSERVER_DOMAIN = FULL_DOCKER_OBSERVER_DOMAIN
 _SHA256_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
 _BARE_SHA256 = re.compile(r"[0-9a-f]{64}")
+_MAX_SERVER_ENVIRONMENT_ENTRIES = 128
+_MAX_SERVER_ENVIRONMENT_NAME_BYTES = 256
+_MAX_SERVER_ENVIRONMENT_VALUE_BYTES = 8_192
+_MAX_SERVER_ENVIRONMENT_BYTES = 32_768
 
 
 def enroll_repository(
@@ -116,6 +121,8 @@ def enroll_repository(
     if type(grant_ephemeral_image_prefetch) is not bool:
         raise TypeError("grant_ephemeral_image_prefetch must be a boolean")
     normalized_ephemeral = _normalize_ephemeral_templates(ephemeral_containers)
+    if type(explicit_reinstall) is not bool:
+        raise TypeError("explicit_reinstall must be a boolean")
     if approve_compose_host_access and not (compose and compose.get("declared")):
         raise ValueError(
             "Compose host-access approval requires a declared Compose definition"
@@ -141,6 +148,10 @@ def enroll_repository(
         compose_model_renderer=compose_model_renderer,
         host_access_approved=approve_compose_host_access,
     )
+    # Provision the only writable runner artifact location before changing
+    # enrollment authority. A failed filesystem boundary must not leave a new
+    # principal/grant set that cannot produce broker-verifiable crash evidence.
+    worker_log_root = provision_worker_log_directory(client_uid)
 
     persistence = BrokerPersistence(
         database_path,
@@ -183,18 +194,55 @@ def enroll_repository(
                     (repo_id, host_id, str(root), root.name or str(root), now, now),
                 )
             else:
-                if str(existing["state"]) != "active":
-                    raise RuntimeError(
-                        "repository identity is missing or relocated; observe and reconcile it before enrollment"
+                if str(existing["state"]) == "missing":
+                    removed_generation = int(existing["generation"]) - 1
+                    revocation = connection.execute(
+                        """
+                        SELECT 1 FROM broker_repository_revocations
+                        WHERE repo_id = ? AND repository_generation = ?
+                        """,
+                        (repo_id, removed_generation),
+                    ).fetchone()
+                    if revocation is None:
+                        raise RuntimeError(
+                            "repository identity is missing or relocated; observe and reconcile it before enrollment"
+                        )
+                    if not explicit_reinstall:
+                        raise RuntimeError(
+                            "repository generation was permanently removed; reinstall it explicitly through the Coordinator skill"
+                        )
+                    changed = connection.execute(
+                        """
+                        UPDATE repositories
+                        SET state = 'active', generation = generation + 1,
+                            display_name = ?, updated_at = ?
+                        WHERE repo_id = ? AND state = 'missing'
+                          AND generation = ?
+                        """,
+                        (
+                            root.name or str(root),
+                            now,
+                            repo_id,
+                            int(existing["generation"]),
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise RuntimeError(
+                            "repository generation changed during explicit reinstall"
+                        )
+                elif str(existing["state"]) == "active":
+                    connection.execute(
+                        """
+                        UPDATE repositories
+                        SET display_name = ?, updated_at = ?
+                        WHERE repo_id = ?
+                        """,
+                        (root.name or str(root), now, repo_id),
                     )
-                connection.execute(
-                    """
-                    UPDATE repositories
-                    SET display_name = ?, updated_at = ?
-                    WHERE repo_id = ?
-                    """,
-                    (root.name or str(root), now, repo_id),
-                )
+                else:
+                    raise RuntimeError(
+                        "repository identity is relocated; observe and reconcile it before enrollment"
+                    )
 
         persistence_api = SQLiteLifecyclePersistence(store)
         lifecycle = RepositoryLifecycle(persistence_api, object())
@@ -228,73 +276,14 @@ def enroll_repository(
             )
 
         with store.immediate_transaction() as connection:
-            server_ids: dict[str, str] = {}
-            for raw in servers:
-                name = str(raw.get("name") or "").strip()
-                if not name or len(name) > 128:
-                    raise ValueError("every enrolled server requires a bounded name")
-                cwd = Path(str(raw.get("cwd") or root)).resolve(strict=True)
-                if not _within(cwd, root):
-                    raise ValueError(
-                        f"enrolled server cwd escapes canonical repository: {cwd}"
-                    )
-                server_id = deterministic_id("server-definition", repo_id, name)
-                definition = {
-                    "repo_id": repo_id,
-                    "name": name,
-                    "role": raw.get("role"),
-                    "cwd": str(cwd),
-                    "cmd": raw.get("cmd"),
-                    "argv": raw.get("argv"),
-                    "health_url": raw.get("health_url"),
-                    "env": raw.get("env"),
-                }
-                connection.execute(
-                    """
-                    INSERT INTO server_definitions(
-                        server_definition_id, repo_id, name, role, cwd,
-                        health_url_template, definition_fingerprint, generation,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-                    ON CONFLICT(server_definition_id) DO UPDATE SET
-                        role = excluded.role,
-                        cwd = excluded.cwd,
-                        health_url_template = excluded.health_url_template,
-                        definition_fingerprint = excluded.definition_fingerprint,
-                        generation = server_definitions.generation + 1,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        server_id,
-                        repo_id,
-                        name,
-                        raw.get("role"),
-                        str(cwd),
-                        raw.get("health_url"),
-                        "sha256:" + fingerprint(definition),
-                        now,
-                        now,
-                    ),
-                )
-                connection.execute(
-                    "DELETE FROM server_command_arguments WHERE server_definition_id = ?",
-                    (server_id,),
-                )
-                argv = raw.get("argv")
-                if (
-                    isinstance(argv, list)
-                    and argv
-                    and all(isinstance(item, str) for item in argv)
-                ):
-                    connection.executemany(
-                        """
-                        INSERT INTO server_command_arguments(
-                            server_definition_id, ordinal, argument
-                        ) VALUES (?, ?, ?)
-                        """,
-                        [(server_id, index, item) for index, item in enumerate(argv)],
-                    )
-                server_ids[name] = server_id
+            server_ids = _synchronize_server_definitions(
+                connection,
+                repo_id=repo_id,
+                root=root,
+                servers=servers,
+                now=now,
+                explicit_reinstall=explicit_reinstall,
+            )
         database_generation = store.metadata.database_generation
 
         if allowed_server_names is None:
@@ -511,8 +500,295 @@ def enroll_repository(
         "valid_until_epoch": valid_until_epoch,
         "starts_resources": False,
         "cleanup_capabilities": bool(grant_cleanup_capabilities),
+        "worker_log_root": str(worker_log_root),
         "observation_snapshot_id": enrollment_snapshot_id,
     }
+
+
+def _synchronize_server_definitions(
+    connection: sqlite3.Connection,
+    *,
+    repo_id: str,
+    root: Path,
+    servers: Sequence[Mapping[str, Any]],
+    now: str,
+    explicit_reinstall: bool,
+) -> dict[str, str]:
+    """Persist exact worker definitions without reviving a purged identity."""
+
+    specifications: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for raw in servers:
+        if not isinstance(raw, Mapping):
+            raise TypeError("every enrolled server definition must be an object")
+        name = str(raw.get("name") or "").strip()
+        if not name or len(name) > 128:
+            raise ValueError("every enrolled server requires a bounded name")
+        if name in names:
+            raise ValueError(f"duplicate enrolled server name: {name}")
+        names.add(name)
+        cwd = Path(str(raw.get("cwd") or root)).resolve(strict=True)
+        if not _within(cwd, root):
+            raise ValueError(
+                f"enrolled server cwd escapes canonical repository: {cwd}"
+            )
+        environment = _bounded_server_environment(raw.get("env"))
+        specifications.append(
+            {
+                "raw": raw,
+                "name": name,
+                "cwd": str(cwd),
+                "environment": environment,
+            }
+        )
+
+    active_ids = {
+        str(row["name"]): str(row["server_definition_id"])
+        for row in connection.execute(
+            """
+            SELECT name, server_definition_id
+            FROM server_definitions
+            WHERE repo_id = ?
+            """,
+            (repo_id,),
+        )
+    }
+    missing_names = {item["name"] for item in specifications} - set(active_ids)
+    tombstones = (
+        _reinstall_server_tombstones_by_name(connection, repo_id=repo_id)
+        if missing_names
+        else {}
+    )
+    server_ids: dict[str, str] = {}
+    for item in specifications:
+        raw = item["raw"]
+        name = str(item["name"])
+        server_id = active_ids.get(name)
+        tombstone = tombstones.get(name)
+        if server_id is None and tombstone is not None:
+            if not explicit_reinstall:
+                raise RuntimeError(
+                    f"server {name!r} was permanently removed; reinstall it explicitly through the Coordinator skill"
+                )
+            server_id = _reinstalled_server_id(
+                repo_id=repo_id,
+                name=name,
+                tombstone=tombstone,
+            )
+        elif server_id is None:
+            server_id = deterministic_id("server-definition", repo_id, name)
+
+        conflicting = connection.execute(
+            """
+            SELECT repo_id, name
+            FROM server_definitions
+            WHERE server_definition_id = ?
+              AND (repo_id != ? OR name != ?)
+            """,
+            (server_id, repo_id, name),
+        ).fetchone()
+        if conflicting is not None:
+            raise RuntimeError(
+                "derived server identity conflicts with another persisted definition"
+            )
+        definition = {
+            "repo_id": repo_id,
+            "name": name,
+            "role": raw.get("role"),
+            "cwd": item["cwd"],
+            "cmd": raw.get("cmd"),
+            "argv": raw.get("argv"),
+            "health_url": raw.get("health_url"),
+            "env": item["environment"],
+        }
+        connection.execute(
+            """
+            INSERT INTO server_definitions(
+                server_definition_id, repo_id, name, role, cwd,
+                health_url_template, definition_fingerprint, generation,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            ON CONFLICT(server_definition_id) DO UPDATE SET
+                role = excluded.role,
+                cwd = excluded.cwd,
+                health_url_template = excluded.health_url_template,
+                definition_fingerprint = excluded.definition_fingerprint,
+                generation = server_definitions.generation + 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                server_id,
+                repo_id,
+                name,
+                raw.get("role"),
+                item["cwd"],
+                raw.get("health_url"),
+                "sha256:" + fingerprint(definition),
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "DELETE FROM server_command_arguments WHERE server_definition_id = ?",
+            (server_id,),
+        )
+        argv = raw.get("argv")
+        if (
+            isinstance(argv, list)
+            and argv
+            and all(isinstance(argument, str) for argument in argv)
+        ):
+            connection.executemany(
+                """
+                INSERT INTO server_command_arguments(
+                    server_definition_id, ordinal, argument
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (server_id, index, argument)
+                    for index, argument in enumerate(argv)
+                ],
+            )
+        connection.execute(
+            "DELETE FROM server_environment WHERE server_definition_id = ?",
+            (server_id,),
+        )
+        if item["environment"]:
+            connection.executemany(
+                """
+                INSERT INTO server_environment(
+                    server_definition_id, name, value
+                ) VALUES (?, ?, ?)
+                """,
+                [
+                    (server_id, key, value)
+                    for key, value in item["environment"].items()
+                ],
+            )
+        server_ids[name] = server_id
+    return server_ids
+
+
+def _reinstall_server_tombstones_by_name(
+    connection: sqlite3.Connection, *, repo_id: str
+) -> dict[str, Mapping[str, Any]]:
+    grouped: dict[str, dict[tuple[str, str, str], Mapping[str, Any]]] = {}
+    rows = connection.execute(
+        """
+        SELECT target_id, immutable_fingerprint, operation_id,
+               evidence_json, removed_at
+        FROM cleanup_tombstones
+        WHERE target_kind = 'server' AND repo_id = ?
+        ORDER BY removed_at DESC, target_id DESC
+        """,
+        (repo_id,),
+    )
+    for row in rows:
+        try:
+            evidence = json.loads(str(row["evidence_json"]))
+        except (json.JSONDecodeError, TypeError) as error:
+            raise RuntimeError(
+                "server cleanup evidence is unreadable; enrollment cannot safely determine identity lineage"
+            ) from error
+        if not isinstance(evidence, dict):
+            raise RuntimeError(
+                "server cleanup evidence is invalid; enrollment cannot safely determine identity lineage"
+            )
+        plan = evidence.get("plan")
+        snapshot = evidence.get("snapshot")
+        target = plan.get("target") if isinstance(plan, dict) else None
+        if not isinstance(target, dict) and isinstance(snapshot, dict):
+            target = snapshot.get("target")
+        name = target.get("display_name") if isinstance(target, dict) else None
+        if not isinstance(name, str) or not name:
+            raise RuntimeError(
+                "server cleanup evidence lacks its exact name; enrollment cannot safely determine identity lineage"
+            )
+        normalized = dict(row)
+        key = (
+            str(normalized["target_id"]),
+            str(normalized["immutable_fingerprint"]),
+            str(normalized["operation_id"]),
+        )
+        grouped.setdefault(name, {})[key] = normalized
+    for row in connection.execute(
+        """
+        SELECT server_definition_id AS target_id,
+               immutable_fingerprint,
+               cleanup_operation_id AS operation_id,
+               server_name
+        FROM broker_server_revocations
+        WHERE repo_id = ?
+        ORDER BY revoked_at DESC, server_definition_id DESC
+        """,
+        (repo_id,),
+    ):
+        normalized = dict(row)
+        key = (
+            str(normalized["target_id"]),
+            str(normalized["immutable_fingerprint"]),
+            str(normalized["operation_id"]),
+        )
+        grouped.setdefault(str(row["server_name"]), {})[key] = normalized
+    result: dict[str, Mapping[str, Any]] = {}
+    for name, grouped_candidates in grouped.items():
+        candidates = list(grouped_candidates.values())
+        tombstoned_ids = {str(row["target_id"]) for row in candidates}
+        lineage_tips = [
+            row
+            for row in candidates
+            if _reinstalled_server_id(
+                repo_id=repo_id,
+                name=name,
+                tombstone=row,
+            )
+            not in tombstoned_ids
+        ]
+        if len(lineage_tips) != 1:
+            raise RuntimeError(
+                "server cleanup evidence has ambiguous identity lineage; enrollment requires administrative reconciliation"
+            )
+        result[name] = lineage_tips[0]
+    return result
+
+
+def _reinstalled_server_id(
+    *, repo_id: str, name: str, tombstone: Mapping[str, Any]
+) -> str:
+    return deterministic_id(
+        "server-definition-incarnation",
+        repo_id,
+        name,
+        str(tombstone["target_id"]),
+        str(tombstone["immutable_fingerprint"]),
+        str(tombstone["operation_id"]),
+    )
+
+
+def _bounded_server_environment(value: Any) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or len(value) > _MAX_SERVER_ENVIRONMENT_ENTRIES:
+        raise ValueError("server env must be a bounded NUL-free string map")
+    environment: dict[str, str] = {}
+    total_bytes = 0
+    for name, item in value.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or "=" in name
+            or "\x00" in name
+            or len(name.encode("utf-8")) > _MAX_SERVER_ENVIRONMENT_NAME_BYTES
+            or not isinstance(item, str)
+            or "\x00" in item
+            or len(item.encode("utf-8")) > _MAX_SERVER_ENVIRONMENT_VALUE_BYTES
+        ):
+            raise ValueError("server env must be a bounded NUL-free string map")
+        total_bytes += len(name.encode("utf-8")) + len(item.encode("utf-8"))
+        environment[name] = item
+    if total_bytes > _MAX_SERVER_ENVIRONMENT_BYTES:
+        raise ValueError("server env must be a bounded NUL-free string map")
+    return dict(sorted(environment.items()))
 
 
 def _ensure_host(store: CoordinatorStore) -> str:
@@ -766,6 +1042,14 @@ def _grant_observed_containers(
                     )
     for row in rows:
         resource_id = str(row["docker_resource_id"])
+        for runtime_action in ("status", "start", "stop", "restart"):
+            persistence.grant_runtime(
+                uid=client_uid,
+                repo_id=repo_id,
+                resource_kind="docker",
+                resource_id=resource_id,
+                action=runtime_action,
+            )
         for operation in (
             BrokerOperation.DOCKER_START,
             BrokerOperation.DOCKER_STOP,
@@ -854,6 +1138,14 @@ def _grant_observed_databases(
                     )
                 )
     for binding_id in binding_ids:
+        for runtime_action in ("status", "start", "stop", "restart"):
+            persistence.grant_runtime(
+                uid=client_uid,
+                repo_id=repo_id,
+                resource_kind="database_stack",
+                resource_id=binding_id,
+                action=runtime_action,
+            )
         for operation in (
             BrokerOperation.DATABASE_BACKUP,
             BrokerOperation.DATABASE_RESTORE,
@@ -1523,6 +1815,251 @@ def _preflight_compose_definition(
         project_name=project_name,
         host_access_approved=host_access_approved,
     )
+
+
+def revoke_server_from_protected_profile(
+    *,
+    profile_path: Path,
+    repo_id: str,
+    server_name: str,
+    server_definition_id: str,
+    cleanup_operation_id: str,
+    expected_database_generation: str,
+) -> dict[str, Any]:
+    """Remove one permanently revoked server ID from every protected grant.
+
+    SQLite revocation is committed first.  If publication fails, the broker
+    remains safely fenced and cleanup retry can repeat this idempotently.
+    """
+
+    if os.geteuid() != 0:
+        raise PermissionError("protected broker profile revocation requires root")
+    path = profile_path.expanduser()
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("broker profile path must be absolute without traversal")
+    for value, label in (
+        (repo_id, "repo_id"),
+        (server_name, "server_name"),
+        (server_definition_id, "server_definition_id"),
+        (cleanup_operation_id, "cleanup_operation_id"),
+        (expected_database_generation, "database_generation"),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label} must be a non-empty string")
+    initial, access_gid = _read_protected_profile_for_revocation(
+        path, expected_database_generation=expected_database_generation
+    )
+    del initial
+    _ensure_root_profile_parent(path.parent, access_gid=access_gid)
+    with _locked_root_profile(path, access_gid=access_gid):
+        document, locked_gid = _read_protected_profile_for_revocation(
+            path, expected_database_generation=expected_database_generation
+        )
+        if locked_gid != access_gid:
+            raise RuntimeError(
+                "protected broker profile service identity changed before revocation"
+            )
+        affected = _revoke_server_from_profile_document(
+            document,
+            repo_id=repo_id,
+            server_name=server_name,
+            server_definition_id=server_definition_id,
+        )
+        if affected:
+            _atomic_write_root_json(path, document, access_gid=access_gid)
+    return {
+        "status": "revoked" if affected else "already_revoked",
+        "repo_id": repo_id,
+        "server_name": server_name,
+        "server_definition_id": server_definition_id,
+        "cleanup_operation_id": cleanup_operation_id,
+        "affected_client_uids": affected,
+        "profile_path": str(path),
+    }
+
+
+def revoke_repository_from_protected_profile(
+    *,
+    profile_path: Path,
+    repo_id: str,
+    repository_generation: int,
+    cleanup_operation_id: str,
+    expected_database_generation: str,
+) -> dict[str, Any]:
+    """Remove one permanently revoked repository generation from all clients."""
+
+    if os.geteuid() != 0:
+        raise PermissionError("protected broker profile revocation requires root")
+    path = profile_path.expanduser()
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("broker profile path must be absolute without traversal")
+    for value, label in (
+        (repo_id, "repo_id"),
+        (cleanup_operation_id, "cleanup_operation_id"),
+        (expected_database_generation, "database_generation"),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label} must be a non-empty string")
+    if type(repository_generation) is not int or repository_generation < 0:
+        raise ValueError("repository_generation must be a non-negative integer")
+    initial, access_gid = _read_protected_profile_for_revocation(
+        path, expected_database_generation=expected_database_generation
+    )
+    del initial
+    _ensure_root_profile_parent(path.parent, access_gid=access_gid)
+    with _locked_root_profile(path, access_gid=access_gid):
+        document, locked_gid = _read_protected_profile_for_revocation(
+            path, expected_database_generation=expected_database_generation
+        )
+        if locked_gid != access_gid:
+            raise RuntimeError(
+                "protected broker profile service identity changed before revocation"
+            )
+        affected = _revoke_repository_from_profile_document(
+            document,
+            repo_id=repo_id,
+            repository_generation=repository_generation,
+        )
+        if affected:
+            _atomic_write_root_json(path, document, access_gid=access_gid)
+    return {
+        "status": "revoked" if affected else "already_revoked",
+        "repo_id": repo_id,
+        "repository_generation": repository_generation,
+        "cleanup_operation_id": cleanup_operation_id,
+        "affected_client_uids": affected,
+        "profile_path": str(path),
+    }
+
+
+def _read_protected_profile_for_revocation(
+    path: Path, *, expected_database_generation: str
+) -> tuple[dict[str, Any], int]:
+    metadata = path.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise PermissionError(
+            "broker profile revocation requires a protected root-owned regular file"
+        )
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("protected broker profile cannot be decoded") from error
+    after = path.lstat()
+    if (metadata.st_dev, metadata.st_ino) != (after.st_dev, after.st_ino):
+        raise RuntimeError("protected broker profile identity changed while read")
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"version", "service", "clients"}
+        or document.get("version") != PROFILE_VERSION
+        or not isinstance(document.get("service"), dict)
+        or not isinstance(document.get("clients"), dict)
+    ):
+        raise RuntimeError("protected broker profile structure is invalid")
+    service = document["service"]
+    if str(service.get("database_generation") or "") != expected_database_generation:
+        raise RuntimeError(
+            "protected broker profile belongs to another database generation"
+        )
+    access_gid = service.get("gid")
+    if type(access_gid) is not int or access_gid < 0:
+        raise RuntimeError("protected broker profile socket GID is invalid")
+    return document, access_gid
+
+
+def _revoke_server_from_profile_document(
+    document: dict[str, Any],
+    *,
+    repo_id: str,
+    server_name: str,
+    server_definition_id: str,
+) -> list[int]:
+    """Pure exact-ID profile mutation used by publication and regression tests."""
+
+    affected: list[int] = []
+    clients = document.get("clients")
+    if not isinstance(clients, dict):
+        raise RuntimeError("protected broker profile clients are invalid")
+    for uid_text, client in clients.items():
+        if not isinstance(client, dict) or not isinstance(
+            client.get("repositories"), list
+        ):
+            raise RuntimeError("protected broker profile client is invalid")
+        try:
+            uid = int(uid_text)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("protected broker profile UID is invalid") from error
+        if uid < 0 or str(uid) != str(uid_text):
+            raise RuntimeError("protected broker profile UID is invalid")
+        changed = False
+        for repository in client["repositories"]:
+            if not isinstance(repository, dict):
+                raise RuntimeError("protected broker repository profile is invalid")
+            if str(repository.get("repo_id") or "") != repo_id:
+                continue
+            servers = repository.get("servers")
+            if not isinstance(servers, dict):
+                raise RuntimeError("protected broker server mapping is invalid")
+            aliases = [
+                str(name)
+                for name, resource_id in servers.items()
+                if str(resource_id) == server_definition_id
+            ]
+            if any(name != server_name for name in aliases):
+                raise RuntimeError(
+                    "protected profile maps the revoked server ID under a conflicting name"
+                )
+            if aliases:
+                del servers[server_name]
+                changed = True
+        if changed:
+            affected.append(uid)
+    return sorted(affected)
+
+
+def _revoke_repository_from_profile_document(
+    document: dict[str, Any],
+    *,
+    repo_id: str,
+    repository_generation: int,
+) -> list[int]:
+    """Remove only the exact revoked repository incarnation from each client."""
+
+    affected: list[int] = []
+    clients = document.get("clients")
+    if not isinstance(clients, dict):
+        raise RuntimeError("protected broker profile clients are invalid")
+    for uid_text, client in clients.items():
+        if not isinstance(client, dict) or not isinstance(
+            client.get("repositories"), list
+        ):
+            raise RuntimeError("protected broker profile client is invalid")
+        try:
+            uid = int(uid_text)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("protected broker profile UID is invalid") from error
+        if uid < 0 or str(uid) != str(uid_text):
+            raise RuntimeError("protected broker profile UID is invalid")
+        retained: list[dict[str, Any]] = []
+        changed = False
+        for repository in client["repositories"]:
+            if not isinstance(repository, dict):
+                raise RuntimeError("protected broker repository profile is invalid")
+            if (
+                str(repository.get("repo_id") or "") == repo_id
+                and repository.get("generation") == repository_generation
+            ):
+                changed = True
+                continue
+            retained.append(repository)
+        if changed:
+            client["repositories"] = retained
+            affected.append(uid)
+    return sorted(affected)
 
 
 def _merge_profile(

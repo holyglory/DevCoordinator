@@ -684,6 +684,67 @@ def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def _schema_trigger_definitions(
+    connection: sqlite3.Connection,
+) -> dict[str, str]:
+    """Return the trusted triggers installed by the current schema build."""
+
+    definitions: dict[str, str] = {}
+    for row in connection.execute(
+        """
+        SELECT name, sql FROM sqlite_master
+        WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+        """
+    ):
+        name = str(row[0])
+        sql = row[1]
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError(f"normalized schema trigger {name!r} lacks SQL")
+        definitions[name] = sql
+    if not definitions:
+        raise ValueError("normalized schema has no importable trigger contract")
+    return definitions
+
+
+def _suspend_schema_triggers_for_import(
+    connection: sqlite3.Connection,
+) -> dict[str, str]:
+    """Drop trusted schema triggers while authoritative exported rows replay."""
+
+    definitions = _schema_trigger_definitions(connection)
+    for name in definitions:
+        connection.execute(f"DROP TRIGGER {_quote_identifier(name)}")
+    if _schema_trigger_definitions_or_empty(connection):
+        raise RuntimeError("logical import could not suspend normalized schema triggers")
+    return definitions
+
+
+def _schema_trigger_definitions_or_empty(
+    connection: sqlite3.Connection,
+) -> dict[str, str]:
+    return {
+        str(row[0]): str(row[1])
+        for row in connection.execute(
+            """
+            SELECT name, sql FROM sqlite_master
+            WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%'
+            ORDER BY name
+            """
+        )
+    }
+
+
+def _restore_schema_triggers_after_import(
+    connection: sqlite3.Connection,
+    definitions: Mapping[str, str],
+) -> None:
+    for name in sorted(definitions):
+        connection.execute(definitions[name])
+    if _schema_trigger_definitions(connection) != dict(definitions):
+        raise RuntimeError("logical import did not restore the exact schema triggers")
+
+
 def _build_export_staging(
     database: Path,
     incoming: Mapping[str, Any],
@@ -712,6 +773,7 @@ def _build_export_staging(
                 raise ValueError(
                     "logical export schema does not exactly match this coordinator build"
                 )
+            trigger_definitions = _suspend_schema_triggers_for_import(connection)
             table_names = sorted(expected_schema["tables"])
             for table_name in table_names:
                 connection.execute(f"DELETE FROM {_quote_identifier(table_name)}")
@@ -727,6 +789,7 @@ def _build_export_staging(
                 )
                 for row in decoded_tables[table_name]:
                     connection.execute(statement, tuple(row[column] for column in columns))
+            _restore_schema_triggers_after_import(connection, trigger_definitions)
             connection.commit()
         except BaseException:
             if connection.in_transaction:

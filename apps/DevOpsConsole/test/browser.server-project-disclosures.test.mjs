@@ -151,7 +151,10 @@ function unassignedContainer() {
   };
 }
 
-function fixtureOverview(revision, { archivedServerIds = new Set(), removedServerIds = new Set(), restoredServerIds = new Set() } = {}) {
+function fixtureOverview(revision, {
+  archivedServerIds = new Set(), removedServerIds = new Set(),
+  restoredServerIds = new Set(), includeUnassigned = false,
+} = {}) {
   const overview = structuredClone(CANONICAL_OVERVIEW);
   const alphaProject = '/fixtures/projects/alpha';
   const betaProject = '/fixtures/projects/beta';
@@ -185,14 +188,88 @@ function fixtureOverview(revision, { archivedServerIds = new Set(), removedServe
     index + 1,
   ));
   const xfoil = [container(xfoilProject, 'repo-xfoil', 'xfoil-solver-1', 101)];
-  const unassigned = unassignedContainer();
+  const dockerContainer = {
+    ...structuredClone(CANONICAL_OVERVIEW.inventory.docker.containers[0]),
+    host_resource_id: 'fixture-container-sample-api-db',
+    repo_id: 'repo-db',
+    project: '/fixtures/projects/db',
+    compose_project: 'sample-api',
+  };
+  const unassigned = includeUnassigned ? unassignedContainer() : null;
+  const dockerResources = [
+    ...globalFinance, ...xfoil, dockerContainer, ...(unassigned ? [unassigned] : []),
+  ];
   overview.inventory.docker = {
     available: true,
     error: null,
     stats_error: null,
-    postgres: [{ name: unassigned.name }],
-    containers: [...globalFinance, ...xfoil, unassigned],
+    postgres: [{ database_binding_id: 'fixture-database-binding', name: dockerContainer.name }],
+    containers: dockerResources,
   };
+  overview.inventory.repositories = [
+    { repo_id: 'repo-alpha', host_id: 'fixture-host', canonical_root: alphaProject, display_name: 'Alpha' },
+    { repo_id: 'repo-beta', host_id: 'fixture-host', canonical_root: betaProject, display_name: 'Beta' },
+    {
+      repo_id: 'repo-beta-run', host_id: 'fixture-host', canonical_root: '/fixtures/runs/beta-1',
+      display_name: 'Beta browser run',
+    },
+    {
+      repo_id: 'repo-db', host_id: 'fixture-host', canonical_root: '/fixtures/projects/db',
+      display_name: 'Database',
+    },
+    {
+      repo_id: 'repo-global-finance', host_id: 'fixture-host',
+      canonical_root: globalFinanceProject, display_name: 'GlobalFinance',
+    },
+    {
+      repo_id: 'repo-xfoil', host_id: 'fixture-host',
+      canonical_root: xfoilProject, display_name: 'XFoil',
+    },
+  ];
+  overview.inventory.memberships = [
+    ...globalFinance.map((item) => ({
+      resource_kind: 'container', host_resource_id: item.host_resource_id,
+      repo_id: 'repo-global-finance',
+    })),
+    ...xfoil.map((item) => ({
+      resource_kind: 'container', host_resource_id: item.host_resource_id,
+      repo_id: 'repo-xfoil',
+    })),
+    {
+      resource_kind: 'container', host_resource_id: dockerContainer.host_resource_id,
+      repo_id: 'repo-db',
+    },
+  ];
+  overview.inventory.resources = {
+    servers: [
+      ...alpha.map((item) => ({ server_definition_id: item.id, repo_id: 'repo-alpha' })),
+      ...beta.map((item) => ({ server_definition_id: item.id, repo_id: 'repo-beta-run' })),
+    ],
+    docker: dockerResources.map((item) => ({
+      docker_resource_id: item.host_resource_id,
+    })),
+    databases: [{
+      database_binding_id: 'fixture-database-binding',
+      docker_resource_id: dockerContainer.host_resource_id,
+      repo_id: 'repo-db',
+      database_name: 'sample_api',
+      lifecycle: 'running',
+    }],
+  };
+  overview.inventory.observations = {
+    docker: dockerResources.map((item) => ({
+      docker_resource_id: item.host_resource_id,
+    })),
+    databases: [{ database_binding_id: 'fixture-database-binding' }],
+  };
+  overview.inventory.unassigned_resources = unassigned ? [{
+    resource_kind: 'container', resource_id: unassigned.host_resource_id,
+    display_name: unassigned.name,
+    reason_code: unassigned.attribution.reason_code,
+    explanation: unassigned.attribution.explanation,
+    recommended_next_step: 'Attach this exact container to its original root repository, or retire it.',
+  }] : [];
+  overview.inventory.lifecycle_violations = [];
   overview.inventory.project_usage = [
     {
       usage_key: `path:${alphaProject}`,
@@ -247,6 +324,125 @@ function fixtureOverview(revision, { archivedServerIds = new Set(), removedServe
       container_count: 1,
       server_ids: [],
       container_resource_ids: xfoil.map((item) => item.host_resource_id),
+    },
+    {
+      usage_key: 'path:/fixtures/projects/db',
+      project_key: 'db',
+      repo_id: 'repo-db',
+      name: 'Database',
+      project: '/fixtures/projects/db',
+      cpu_percent: dockerContainer.stats.cpu_percent,
+      memory_bytes: dockerContainer.stats.memory_usage_bytes,
+      process_count: 1,
+      server_count: 0,
+      container_count: 1,
+      server_ids: [],
+      container_resource_ids: [dockerContainer.host_resource_id],
+    },
+  ];
+  overview.inventory.repository_trees = [
+    {
+      family_id: `path:${alphaProject}`,
+      root_repository: { repo_id: 'repo-alpha', canonical_root: alphaProject, display_name: 'Alpha' },
+      usage: {
+        cpu_percent: 3.2, memory_bytes: 82 * 16_777_216, process_count: alpha.length,
+      },
+      scopes: [{
+        repo_id: 'repo-alpha', kind: 'root', canonical_root: alphaProject, display_name: 'Alpha',
+        run_id: null, expires_at: null, kill_after_run: false,
+        usage: { cpu_percent: 3.2, memory_bytes: 82 * 16_777_216, process_count: alpha.length },
+        server_ids: alpha.map((item) => item.id), container_resource_ids: [], database_binding_ids: [],
+      }],
+    },
+    {
+      family_id: `path:${betaProject}`,
+      root_repository: { repo_id: 'repo-beta', canonical_root: betaProject, display_name: 'Beta' },
+      usage: {
+        cpu_percent: revision === 0 ? 4.4 : 12.5,
+        memory_bytes: 16_777_216,
+        process_count: beta.length,
+      },
+      scopes: [
+        {
+          repo_id: 'repo-beta', kind: 'root', canonical_root: betaProject, display_name: 'Beta',
+          run_id: null, expires_at: null, kill_after_run: false,
+          usage: { cpu_percent: 0, memory_bytes: 0, process_count: 0 },
+          server_ids: [], container_resource_ids: [], database_binding_ids: [],
+        },
+        {
+          repo_id: 'repo-beta-run', kind: 'temporary', canonical_root: '/fixtures/runs/beta-1',
+          display_name: 'Beta browser run', run_id: 'fixture-run',
+          expires_at: '2099-01-01T00:00:00Z', kill_after_run: true,
+          usage: {
+            cpu_percent: revision === 0 ? 4.4 : 12.5,
+            memory_bytes: 16_777_216,
+            process_count: beta.length,
+          },
+          server_ids: beta.map((item) => item.id), container_resource_ids: [], database_binding_ids: [],
+        },
+      ],
+    },
+    {
+      family_id: `path:${globalFinanceProject}`,
+      root_repository: {
+        repo_id: 'repo-global-finance', canonical_root: globalFinanceProject,
+        display_name: 'GlobalFinance',
+      },
+      usage: {
+        cpu_percent: 93.5,
+        memory_bytes: globalFinance.length * 48_234_496,
+        process_count: globalFinance.length,
+      },
+      scopes: [{
+        repo_id: 'repo-global-finance', kind: 'root',
+        canonical_root: globalFinanceProject, display_name: 'GlobalFinance',
+        run_id: null, expires_at: null, kill_after_run: false,
+        usage: {
+          cpu_percent: 93.5,
+          memory_bytes: globalFinance.length * 48_234_496,
+          process_count: globalFinance.length,
+        },
+        server_ids: [],
+        container_resource_ids: globalFinance.map((item) => item.host_resource_id),
+        database_binding_ids: [],
+      }],
+    },
+    {
+      family_id: `path:${xfoilProject}`,
+      root_repository: {
+        repo_id: 'repo-xfoil', canonical_root: xfoilProject, display_name: 'XFoil',
+      },
+      usage: { cpu_percent: 1.1, memory_bytes: 48_234_496, process_count: 1 },
+      scopes: [{
+        repo_id: 'repo-xfoil', kind: 'root', canonical_root: xfoilProject,
+        display_name: 'XFoil', run_id: null, expires_at: null, kill_after_run: false,
+        usage: { cpu_percent: 1.1, memory_bytes: 48_234_496, process_count: 1 },
+        server_ids: [],
+        container_resource_ids: xfoil.map((item) => item.host_resource_id),
+        database_binding_ids: [],
+      }],
+    },
+    {
+      family_id: 'path:/fixtures/projects/db',
+      root_repository: {
+        repo_id: 'repo-db', canonical_root: '/fixtures/projects/db', display_name: 'Database',
+      },
+      usage: {
+        cpu_percent: dockerContainer.stats.cpu_percent,
+        memory_bytes: dockerContainer.stats.memory_usage_bytes,
+        process_count: 1,
+      },
+      scopes: [{
+        repo_id: 'repo-db', kind: 'root', canonical_root: '/fixtures/projects/db', display_name: 'Database',
+        run_id: null, expires_at: null, kill_after_run: false,
+        usage: {
+          cpu_percent: dockerContainer.stats.cpu_percent,
+          memory_bytes: dockerContainer.stats.memory_usage_bytes,
+          process_count: 1,
+        },
+        server_ids: [], container_resource_ids: [dockerContainer.host_resource_id],
+        database_binding_ids: ['fixture-database-binding'],
+      }],
     },
   ];
   return overview;
@@ -352,6 +548,7 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       const unexpectedRequests = [];
       let overviewRevision = 0;
       let overviewRequests = 0;
+      let includeUnassigned = false;
       const archivedServerIds = new Set();
       const removedServerIds = new Set();
       const restoredServerIds = new Set();
@@ -396,7 +593,7 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         else if (request.method() === 'GET' && pathname === '/api/overview') {
           overviewRequests += 1;
           body = fixtureOverview(overviewRevision, {
-            archivedServerIds, removedServerIds, restoredServerIds,
+            archivedServerIds, removedServerIds, restoredServerIds, includeUnassigned,
           });
         } else if (request.method() === 'GET' && pathname === '/api/metrics/history') {
           body = fixtureMetrics();
@@ -497,10 +694,54 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       const origin = `https://${stack.consoleHost}:${stack.httpsPort}`;
       await page.goto(`${origin}/#/projects`, { waitUntil: 'networkidle' });
       const projectHead = page.locator('#projects-body .tree-head').first();
-      await projectHead.waitFor();
+      await projectHead.waitFor().catch(async (error) => {
+        const body = String(await page.locator('body').innerText().catch(() => ''))
+          .replace(/\s+/g, ' ').slice(0, 1000);
+        throw new Error(
+          `${error.message}\nbrowser errors: ${JSON.stringify(browserErrors)}`
+          + `\nunexpected requests: ${JSON.stringify(unexpectedRequests)}`
+          + `\nrendered body: ${body}`,
+        );
+      });
       await assertAdjacentCellsDoNotOverlap(
         projectHead.locator('.c-status'), projectHead.locator('.actions'),
         'project running count must not be covered by lifecycle and runtime actions',
+      );
+      assert.equal(
+        await page.locator('#projects-body .tree-head .proj-name', { hasText: 'Beta' }).count(),
+        1,
+        'one authoritative root repo must render as one top-level project',
+      );
+      const betaProjectToggle = page.locator('[data-fk="tree-x:path:/fixtures/projects/beta"]');
+      const betaProjectBlock = page.locator('.tree-node').filter({ has: betaProjectToggle });
+      assert.match(await betaProjectBlock.locator('.tree-head .tree-count').textContent(),
+        /0 of 0 root services running/,
+        'the root action row must not present temporary services as root action targets');
+      assert.match(await betaProjectBlock.locator('.repository-family-summary').textContent(),
+        /Family total.*root \+ 1 temporary repo.*1 of 1 services running/,
+        'family-wide totals must be visibly separate from the root-only action row');
+      assert.match(await betaProjectBlock.locator('[data-fk^="proj-stop:"]').getAttribute('title'),
+        /root repository runtime only.*temporary repository runs stay separate/i,
+        'project controls must state their exact root-only action scope');
+      await betaProjectToggle.click();
+      assert.equal(
+        await betaProjectBlock.getByText('No services registered directly under this root repo.').count(),
+        1,
+        'temporary services must not be flattened into the root repo member list',
+      );
+      const temporaryToggle = page.locator(
+        '[data-fk="temporary-scope:path:/fixtures/projects/beta:repo-beta-run"]',
+      );
+      await temporaryToggle.waitFor();
+      assert.equal(await temporaryToggle.getAttribute('aria-expanded'), 'false');
+      assert.match(await temporaryToggle.textContent(), /Beta browser run/);
+      assert.match(await temporaryToggle.textContent(), /cleanup after run/);
+      await temporaryToggle.click();
+      assert.equal(await temporaryToggle.getAttribute('aria-expanded'), 'true');
+      assert.equal(
+        await betaProjectBlock.locator('.temporary-scope-items .tree-item strong', { hasText: 'smoke-caddy-http' }).count(),
+        1,
+        'the temporary repo disclosure must reveal only its exact-ID service membership',
       );
 
       await page.goto(`${origin}/#/docker`, { waitUntil: 'networkidle' });
@@ -510,10 +751,8 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       ));
       const globalFinanceKey = 'dock-group:path:/fixtures/projects/global-finance';
       const xfoilKey = 'dock-group:path:/fixtures/projects/xfoil';
-      const unassignedKey = 'dock-group:other';
       const globalFinanceToggle = page.locator(`[data-fk="${globalFinanceKey}"]`);
       const xfoilToggle = page.locator(`[data-fk="${xfoilKey}"]`);
-      const unassignedToggle = page.locator(`[data-fk="${unassignedKey}"]`);
       const globalFinanceBlock = page.locator('.docker-project-block').filter({ has: globalFinanceToggle });
 
       assert.deepEqual(
@@ -676,44 +915,29 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       assert.equal(await activeFocusKey(page), xfoilKey,
         'the keyboard-activated Docker disclosure must retain focus after rerender');
 
-      await unassignedToggle.click();
-      assert.equal(await xfoilToggle.getAttribute('aria-expanded'), 'false');
-      assert.equal(await unassignedToggle.getAttribute('aria-expanded'), 'true');
-      const unassignedBlock = page.locator('.docker-project-block').filter({ has: unassignedToggle });
-      const unassignedRow = unassignedBlock.locator('.row.dock-grid[data-ownership="unverified"]');
-      await unassignedRow.waitFor();
-      assert.equal(await unassignedRow.getAttribute('data-lifecycle-target'), null,
-        'unverified ownership must not become an Archive target in the browser');
-      assert.match(await unassignedRow.locator('.ownership-warning').textContent(),
-        /Ownership not verified.*only its name—not a repository path—was observed.*attach it to a verified project or retire it as a standalone resource/is,
-        'the affected row must explain the exact coordinator reason and available repair journeys');
-      for (const action of ['Restart', 'Stop', 'Archive']) {
-        const button = unassignedRow.getByRole('button', {
-          name: new RegExp(`^${action} unavailable`),
-        });
-        assert.equal(await button.isDisabled(), true,
-          `${action} must fail closed while container ownership is unverified`);
-      }
-      const logs = unassignedRow.getByRole('button', { name: 'Logs' });
-      assert.equal(await logs.isEnabled(), true, 'read-only container logs must remain available');
-      await logs.click();
-      await unassignedBlock.getByText('validation failed safely').waitFor();
+      // A producer-reported ownership problem is a global lifecycle fence,
+      // not another actionable pseudo-project. The exact diagnosis and repair
+      // replace every stale control, then normal rendering recovers after the
+      // authoritative inventory is corrected.
+      includeUnassigned = true;
+      overviewRevision += 1;
+      await page.reload({ waitUntil: 'networkidle' });
+      const assignmentError = page.locator('#docker-body .repository-inventory-error');
+      await assignmentError.waitFor();
+      assert.match(await assignmentError.textContent(),
+        /Repository assignment is incomplete.*gnt-artifact-pg.*only its name—not a repository path—was observed.*Attach this exact container to its original root repository, or retire it/is);
+      assert.equal(await page.locator('#docker-body .docker-project-block').count(), 0,
+        'no repository lifecycle target may survive an ownership error');
+      assert.equal(await page.locator('#docker-body button').count(), 0,
+        'the blocking diagnosis must expose no stale lifecycle mutation');
 
-      await page.setViewportSize({ width: 319, height: 900 });
-      const ownershipGeometry = await unassignedRow.evaluate((rowNode) => {
-        const row = rowNode.getBoundingClientRect();
-        const note = rowNode.querySelector('.ownership-warning').getBoundingClientRect();
-        return {
-          rowClientWidth: rowNode.clientWidth,
-          rowScrollWidth: rowNode.scrollWidth,
-          noteInside: note.left >= row.left - 1 && note.right <= row.right + 1,
-        };
-      });
-      assert.equal(ownershipGeometry.noteInside, true,
-        'the ownership explanation must remain inside the narrow Docker card');
-      assert.ok(ownershipGeometry.rowScrollWidth <= ownershipGeometry.rowClientWidth,
-        'the unassigned row must not create hidden horizontal overflow');
-      await page.setViewportSize({ width: 1135, height: 919 });
+      includeUnassigned = false;
+      overviewRevision = 0;
+      await page.reload({ waitUntil: 'networkidle' });
+      await page.waitForFunction(() => (
+        document.querySelectorAll('#docker-body [data-fk^="dock-group:"]').length === 3
+        && !document.querySelector('#docker-body .repository-inventory-error')
+      ));
 
       await page.goto(`${origin}/#/telegram`, { waitUntil: 'networkidle' });
       await page.locator('#telegram-body [data-telegram-bot="fixture-telegram-bot"]').waitFor();
@@ -1125,7 +1349,15 @@ test('lifecycle-disabled admin sessions never request archives or surface an aut
       await page.waitForFunction(() => (
         document.querySelectorAll('#docker-body [data-fk^="dock-group:"]').length === 3
         && !document.querySelector('#docker-body .skel')
-      ));
+      )).catch(async (error) => {
+        const body = String(await page.locator('body').innerText().catch(() => ''))
+          .replace(/\s+/g, ' ').slice(0, 1000);
+        throw new Error(
+          `${error.message}\nbrowser errors: ${JSON.stringify(browserErrors)}`
+          + `\nunexpected requests: ${JSON.stringify(unexpectedRequests)}`
+          + `\nrendered body: ${body}`,
+        );
+      });
 
       const archived = page.locator(
         '[data-lifecycle-filter="docker"] [data-lifecycle-view="archived"]',

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -16,6 +18,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+VALIDATION_REQUIREMENTS = ROOT / "ci" / "validation-requirements.txt"
+VALIDATION_ENVIRONMENT_MARKER = "DEVCOORDINATOR_VALIDATION_ENVIRONMENT"
 SKILLS = [
     ROOT / "skills" / "codex-dev-coordinator",
     ROOT / "skills" / "postgres-docker-backup",
@@ -26,10 +30,208 @@ DECISION_METADATA = re.compile(
     r"^ID: (DC-[A-Z0-9-]+) · Details: "
     r"\[supporting record\]\(DecisionDetails/(DC-[A-Z0-9-]+)\.md\)$"
 )
+MAX_DECISION_HISTORY_LINES = 160
+MAX_DECISION_ENTRIES = 12
+
+
+def validation_pyyaml_ready() -> bool:
+    """Return whether this test interpreter has the pinned runtime contract."""
+
+    try:
+        yaml = importlib.import_module("yaml")
+    except ImportError:
+        return False
+    return (
+        str(getattr(yaml, "__version__", "")) == "6.0.2"
+        and callable(getattr(yaml, "load", None))
+        and isinstance(getattr(yaml, "SafeLoader", None), type)
+    )
+
+
+def validation_pip_command(python: Path) -> list[str]:
+    """Build the non-global, hash-locked test dependency install command."""
+
+    return [
+        str(python),
+        "-I",
+        "-m",
+        "pip",
+        "--isolated",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--no-deps",
+        "--only-binary=:all:",
+        "--require-hashes",
+        "--requirement",
+        str(VALIDATION_REQUIREMENTS),
+    ]
+
+
+def validation_dependency_lock_errors(
+    source: str, *, minimum_hashes: int
+) -> list[str]:
+    """Return errors for a non-exact or non-hash-locked test requirement."""
+
+    fragments: list[str] = []
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fragments.append(line[:-1].strip() if line.endswith("\\") else line)
+    try:
+        tokens = shlex.split(" ".join(fragments))
+    except ValueError:
+        return ["validation dependency lock is not valid requirement syntax"]
+    errors: list[str] = []
+    if not tokens or tokens[0] != "PyYAML==6.0.2":
+        errors.append("validation must pin exactly PyYAML 6.0.2")
+    hashes = tokens[1:]
+    hash_pattern = re.compile(r"--hash=sha256:[0-9a-f]{64}")
+    if any(hash_pattern.fullmatch(token) is None for token in hashes):
+        errors.append("validation dependency lock contains an unapproved token")
+    if len(hashes) < minimum_hashes or len(set(hashes)) != len(hashes):
+        errors.append("validation dependency lock has missing or duplicate wheel hashes")
+    return errors
+
+
+def check_validation_environment_contract() -> None:
+    """Prove validation dependencies stay isolated, pinned, and hash-locked."""
+
+    digest_a = "0" * 64
+    digest_b = "1" * 64
+    good = (
+        f"PyYAML==6.0.2 --hash=sha256:{digest_a} "
+        f"--hash=sha256:{digest_b}"
+    )
+    if validation_dependency_lock_errors(good, minimum_hashes=2):
+        raise SystemExit("validation dependency lock rejected its control fixture")
+    must_catch = (
+        "PyYAML>=6",
+        "PyYAML==6.0.2",
+        good + " requests==2.0.0",
+        "PyYAML==6.0.2 --hash=sha256:not-a-digest",
+    )
+    if any(
+        not validation_dependency_lock_errors(source, minimum_hashes=2)
+        for source in must_catch
+    ):
+        raise SystemExit("validation dependency lock detector missed a broken fixture")
+    errors = validation_dependency_lock_errors(
+        VALIDATION_REQUIREMENTS.read_text(encoding="utf-8"),
+        minimum_hashes=8,
+    )
+    if errors:
+        raise SystemExit("validation dependency lock failed: " + "; ".join(errors))
+    if not validation_pyyaml_ready():
+        raise SystemExit("validation did not enter the pinned PyYAML environment")
+    command = validation_pip_command(Path("/test/python"))
+    required_flags = {
+        "--isolated",
+        "--no-deps",
+        "--only-binary=:all:",
+        "--require-hashes",
+    }
+    if not required_flags.issubset(command):
+        raise SystemExit("validation dependency installer is not isolated and locked")
+
+
+def run_in_validation_environment(argv: list[str]) -> int:
+    """Run validation in a temporary venv without changing the host Python."""
+
+    if os.environ.get(VALIDATION_ENVIRONMENT_MARKER):
+        raise SystemExit(
+            "the isolated validation environment does not provide pinned PyYAML 6.0.2"
+        )
+    if not VALIDATION_REQUIREMENTS.is_file():
+        raise SystemExit(
+            f"validation dependency lock is missing: {VALIDATION_REQUIREMENTS}"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix="devcoordinator-validation-environment-"
+    ) as raw_directory:
+        environment_root = Path(raw_directory)
+        subprocess.run(
+            [sys.executable, "-I", "-m", "venv", str(environment_root)],
+            stdin=subprocess.DEVNULL,
+            check=True,
+            timeout=60,
+        )
+        python = environment_root / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        )
+        subprocess.run(
+            validation_pip_command(python),
+            stdin=subprocess.DEVNULL,
+            check=True,
+            timeout=180,
+        )
+        environment = dict(os.environ)
+        environment[VALIDATION_ENVIRONMENT_MARKER] = "pyyaml-6.0.2"
+        completed = subprocess.run(
+            [str(python), "-I", str(Path(__file__).resolve()), *argv],
+            stdin=subprocess.DEVNULL,
+            env=environment,
+            check=False,
+        )
+        return int(completed.returncode)
+
+
 DECISION_INDEX_BOILERPLATE = (
     "the selected contract replaces the earlier behavior documented in the linked record",
     "that record retains the concrete failure",
 )
+
+
+def check_agent_documentation_contract() -> None:
+    """Keep agent entrypoints short; executable help owns operational detail."""
+
+    limits = {
+        ROOT / "AGENTS.md": 60,
+        ROOT / "README.md": 120,
+        ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md": 300,
+        ROOT / "skills" / "codex-dev-coordinator" / "README.md": 80,
+    }
+    errors: list[str] = []
+    for path, limit in limits.items():
+        count = len(path.read_text(encoding="utf-8").splitlines())
+        if count > limit:
+            errors.append(f"{path.relative_to(ROOT)} has {count} lines; limit is {limit}")
+
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    for label, text, needles in (
+        (
+            "AGENTS.md",
+            agents,
+            (
+                "dev_coordinator.py runtime --help",
+                "original root repository",
+                "temporary repository",
+                "kill_after_run",
+                "status/start/stop/restart/remove",
+            ),
+        ),
+        (
+            "codex-dev-coordinator/SKILL.md",
+            skill,
+            (
+                "dev_coordinator.py runtime --help",
+                "root_repo",
+                "temporary_repo",
+                "kill_after_run",
+                "ok=false",
+                "status/start/stop/restart/remove",
+            ),
+        ),
+    ):
+        for needle in needles:
+            if needle not in text:
+                errors.append(f"{label} omits required entrypoint term {needle!r}")
+    if errors:
+        raise SystemExit("agent documentation contract failed:\n" + "\n".join(errors))
 
 
 def duplicate_literal_dict_key_errors(source: str, *, label: str) -> list[str]:
@@ -90,6 +292,12 @@ def decision_history_contract_errors(history: str, detail_names: set[str]) -> li
     """
 
     errors: list[str] = []
+    line_count = len(history.splitlines())
+    if line_count > MAX_DECISION_HISTORY_LINES:
+        errors.append(
+            "history must stay within "
+            f"{MAX_DECISION_HISTORY_LINES} lines; consolidate durable direction"
+        )
     if history.count("# Decision History") != 1:
         errors.append("history must contain exactly one top-level Decision History heading")
     if history.count("## Direction") != 1:
@@ -99,6 +307,11 @@ def decision_history_contract_errors(history: str, detail_names: set[str]) -> li
     if not matches:
         errors.append("history must contain at least one stable decision entry")
         return errors
+    if len(matches) > MAX_DECISION_ENTRIES:
+        errors.append(
+            "history must stay within "
+            f"{MAX_DECISION_ENTRIES} decisions; merge overlapping direction"
+        )
 
     direction_offset = history.find("## Direction")
     direction_cited_ids: set[str] = set()
@@ -218,6 +431,41 @@ Why: Separate writable stores can disagree; one authority preserves identity.
             raise SystemExit(f"DecisionHistory detector missed must-catch fixture: {label}")
     if not decision_history_contract_errors(good, {"DC-TEST-01", "DC-ORPHAN"}):
         raise SystemExit("DecisionHistory detector missed an unindexed detail file")
+
+    extra_blocks: list[str] = []
+    extra_details = set(good_details)
+    for number in range(1, MAX_DECISION_ENTRIES + 1):
+        decision_id = f"DC-EXTRA-{number:02d}"
+        extra_details.add(decision_id)
+        extra_blocks.append(
+            f"""## {decision_id} — Distinct durable boundary {number}
+
+ID: {decision_id} · Details: [supporting record](DecisionDetails/{decision_id}.md)
+
+Decision: Preserve durable boundary {number}.
+
+Why: This fixture proves excessive entries require consolidation.
+"""
+        )
+    too_many = good.rstrip() + "\n\n" + "\n".join(extra_blocks)
+    if not any(
+        "decisions; merge overlapping direction" in error
+        for error in decision_history_contract_errors(too_many, extra_details)
+    ):
+        raise SystemExit("DecisionHistory detector missed an excessive decision count")
+
+    oversized_direction = good.replace(
+        "Confirmed user intent keeps one authority;",
+        "\n".join(
+            "Confirmed user intent keeps one authority;"
+            for _ in range(MAX_DECISION_HISTORY_LINES + 1)
+        ),
+    )
+    if not any(
+        "lines; consolidate durable direction" in error
+        for error in decision_history_contract_errors(oversized_direction, good_details)
+    ):
+        raise SystemExit("DecisionHistory detector missed an oversized index")
 
     history_path = ROOT / "DecisionHistory.md"
     detail_dir = ROOT / "DecisionDetails"
@@ -767,7 +1015,6 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     coordinator = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "dev_coordinator.py").read_text(encoding="utf-8")
     coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
     coordinator_capability_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "capability_integration_test.py").read_text(encoding="utf-8")
-    coordinator_skill = (ROOT / "skills" / "codex-dev-coordinator" / "SKILL.md").read_text(encoding="utf-8")
 
     check_devops_board_center_pane_geometry(views, split_sizing, vertical_layout_tests)
     check_menu_source_summary_toggle(menu_bar_views)
@@ -894,7 +1141,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "window occlusion tracking": "windowDidChangeOcclusionState",
         "popover visibility tracking": "popoverDidClose",
         "coalesced inventory refresh": "followUpRequested",
-        "publish inventory and repository catalog atomically": "publishInventory(decoded, catalog: catalog)",
+        "publish inventory, repository catalog, and tree atomically": "repositoryTreeDefinitions: repositoryTreeDefinitions",
         "cached project groups": "@Published private(set) var projectGroups",
         "main-actor-safe detached command execution": "let worker = Task.detached(priority: .userInitiated)",
         "pre-launch subprocess completion handler": "process.terminationHandler = { finished in",
@@ -942,8 +1189,9 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "Docker-free restart dry-run regression": "restart dry-run should expose one semantic Compose action without Docker",
         "project runtime declaration": "PROJECT_RUNTIME_FILES",
         "project dependency classification": "stopped_container",
-        "project runtime skill workflow": "project start --agent \"$USER\" --project \"$PROJECT_ROOT\"",
-        "canonical project root workflow": "PROJECT_ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"",
+        "unified runtime API parser": "runtime = sub.add_parser(",
+        "required root repository context": "root_repo",
+        "explicit temporary repository context": "temporary_repo",
         "server register command": "server register",
         "server register parser": "server_sub.add_parser(\"register\")",
         "server adoption marker": "\"adopted\": True",
@@ -961,7 +1209,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "assignment survival self-test": "assignment must survive server stop and stopped-record pruning",
         "pinned restart self-test": "server start after record pruning must land on the durably assigned port",
         "undeclared compose autostart guard": "\"autostart\": compose_declared",
-        "undeclared compose skill policy": "`project start` must not run `docker\ncompose up` from that discovery",
+        "undeclared compose start guard": "project start will not create a duplicate Compose stack",
         "docker identity enforcement": "requires --agent so the coordinator can attribute the action",
         "project runtime model": "struct ProjectRuntimeReport",
         "project action path from canonical group": "nativeID: projectPath",
@@ -1049,11 +1297,11 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "port reuse owner marker": "port_reused_by",
         "strict default http health": "200 <= status < 400",
         "404 health self-test": "HTTP 404 health checks should not be treated as healthy",
-        "strict health skill policy": "Default HTTP health accepts 2xx and 3xx responses",
+        "strict health executable regression": "HTTP 404 health checks should not be treated as healthy",
         "foreign adoption self-test": "wrong-project adoption should report stale coordinator metadata",
         "foreign register self-test": "server register should reject a listener owned by another project",
         "stale url reuse self-test": "stopped historical URL should be marked non-current when another project reuses its port",
-        "skill listener ownership policy": "listener PID can be attributed to the canonical project root",
+        "listener ownership executable guard": "def registration_pid_identity(",
         "menu current url action": "openAction: server.currentURL == nil",
         "stopped server cannot stop": "if isStoppedStatus(server.status)",
         "server restart keeps agent": "\"agent\": agent, \"project\": project, \"name\": name, \"release_port\": True",
@@ -1062,7 +1310,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "server start reuses logical record": "server_id = existing_id or str(uuid.uuid4())",
         "inventory logical server row self-test": "inventory should expose one row per logical server",
         "inventory duplicate URL self-test": "inventory URLs should not duplicate stale logical servers",
-        "skill logical server inventory contract": "Inventory must show one current row per logical server identity",
+        "logical server executable contract": "inventory should expose one row per logical server",
         "swift managed server dedupe": "func deduplicatedManagedServers(",
         "inventory servers deduplicated at load": "decoded.servers = deduplicatedManagedServers(decoded.servers)",
         "swift xfoilfoam duplicate regression": "project tree should not show duplicate api server rows",
@@ -1074,7 +1322,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "membership claim set shared by display and actions": "def known_project_paths(",
         "ambiguous container name match stays unclaimed": "\"ambiguous_name\"",
         "membership divergence must-catch fixture": "must-catch: unattributed grouprepo-db must remain visible as read-only evidence",
-        "membership blast radius skill contract": "shows exactly the blast radius",
+        "membership blast radius regression": "one physical conflict must render as one unassigned resource",
         "bounded socket http health": "socket.create_connection((parsed.hostname, port), timeout=timeout)",
         # macOS runners black-hole reverse DNS: a stock HTTPServer.server_bind
         # stalls ~30s in socket.getfqdn between bind() and listen(). The API
@@ -1104,7 +1352,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "coordinator env per inventory": "CODEX_AGENT_COORDINATOR_HOME",
         "process usage self-test": "inventory should expose project usage rollups",
         "hanging health self-test": "hanging HTTP health checks should be bounded",
-        "project resource skill contract": "per-server process CPU/RSS",
+        "project resource executable contract": "project usage should include managed process memory",
     }
     haystacks = "\n".join(
         [
@@ -1125,7 +1373,6 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
             coordinator,
             coordinator_self_test,
             coordinator_capability_test,
-            coordinator_skill,
         ]
     )
     missing = [label for label, needle in required.items() if needle not in haystacks]
@@ -1365,12 +1612,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    args = parse_args(arguments)
     if not args.skip_macos_app:
         raise SystemExit(
             "native validation must run through Build macOS Apps; "
             "this CLI only supports --skip-macos-app"
         )
+    if not validation_pyyaml_ready():
+        print(
+            "bootstrapping temporary hash-locked validation environment "
+            "(PyYAML 6.0.2)",
+            flush=True,
+        )
+        return run_in_validation_environment(arguments)
+    check_validation_environment_contract()
+    check_agent_documentation_contract()
     check_duplicate_literal_dict_keys()
     check_decision_history_contract()
     run([sys.executable, str(ROOT / "scripts" / "self_test_cleanup_contract.py")])

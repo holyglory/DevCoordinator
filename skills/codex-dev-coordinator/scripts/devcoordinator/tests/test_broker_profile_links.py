@@ -1340,24 +1340,24 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 dev_coordinator.configured_broker_profile()
             loader.assert_called_once_with(required=True)
 
-        with mock.patch.dict(
-            os.environ,
-            {
-                dev_coordinator.AUTHORITY_ENV: "account",
-                "CODEX_AGENT_COORDINATOR_HOME": "/tmp/isolated-coordinator-test",
-            },
-            clear=True,
-        ), mock.patch.object(
-            dev_coordinator,
-            "load_broker_profile",
-            side_effect=AssertionError("isolated account mode consulted system profile"),
-        ):
-            self.assertEqual(dev_coordinator.authority_mode(), "account")
-            self.assertEqual(
-                dev_coordinator.coordinator_home(),
-                Path("/tmp/isolated-coordinator-test"),
-            )
-            self.assertIsNone(dev_coordinator.configured_broker_profile())
+        with CanonicalTemporaryDirectory("isolated-coordinator-test-") as isolated_home:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    dev_coordinator.AUTHORITY_ENV: "account",
+                    "CODEX_AGENT_COORDINATOR_HOME": str(isolated_home),
+                },
+                clear=True,
+            ), mock.patch.object(
+                dev_coordinator,
+                "load_broker_profile",
+                side_effect=AssertionError(
+                    "isolated account mode consulted system profile"
+                ),
+            ):
+                self.assertEqual(dev_coordinator.authority_mode(), "account")
+                self.assertEqual(dev_coordinator.coordinator_home(), isolated_home)
+                self.assertIsNone(dev_coordinator.configured_broker_profile())
 
     def test_missing_default_is_unconfigured_but_required_default_fails(self) -> None:
         missing = broker_profile_module.SYSTEM_PROFILE_PATH.parent / (
@@ -2167,6 +2167,34 @@ class BrokerLinkStoreTests(unittest.TestCase):
             )
 
     def test_stopped_cleanup_accepts_an_already_inactive_local_lease(self) -> None:
+        local_host_id = self.store.ensure_local_host()
+        local_repo_id = "repo-local-lifecycle"
+        now = utc_timestamp()
+        with self.store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO repositories(
+                    repo_id, host_id, canonical_root, display_name, state,
+                    generation, created_at, updated_at
+                ) VALUES (?, ?, ?, 'Local lifecycle', 'active', 0, ?, ?)
+                """,
+                (
+                    local_repo_id,
+                    local_host_id,
+                    str(self.repository_root),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO repository_installations(
+                    repo_id, status, startup_fenced, generation, actor,
+                    updated_at
+                ) VALUES (?, 'installed', 0, 0, 'fixture', ?)
+                """,
+                (local_repo_id, now),
+            )
         ports = NormalizedPortLifecycle(self.store)
         lease = ports.lease(
             PortLeaseRequest(
@@ -2180,6 +2208,12 @@ class BrokerLinkStoreTests(unittest.TestCase):
             ),
             port_available=lambda _port: True,
         )
+        with self.store.read_transaction() as connection:
+            owner = connection.execute(
+                "SELECT host_id, repo_id FROM leases WHERE lease_id = ?",
+                (str(lease["id"]),),
+            ).fetchone()
+        self.assertEqual(tuple(owner), (local_host_id, local_repo_id))
         ports.release(
             agent="codex-test",
             canonical_project=str(self.repository_root),
@@ -2732,6 +2766,154 @@ class BrokerLinkStoreTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM broker_lease_links"
             ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_permanent_revocation_blocks_stale_profile_and_allows_new_incarnation(
+        self,
+    ) -> None:
+        reserved = self._reserve_lease(
+            server_name="worker",
+            server_id="server-worker",
+            broker_lease_id="broker-lease-worker-old",
+            operation_id="operation-lease-worker-old",
+        )
+        with self.assertRaisesRegex(RuntimeError, "unresolved local lease"):
+            self.links.revoke_server_materialization(
+                profile=self.profile,
+                repository=self.repository,
+                server_name="worker",
+                server_definition_id="server-worker",
+                broker_operation_id="operation-purge-worker-old",
+                immutable_fingerprint="sha256:" + "a" * 64,
+            )
+        with self.store.read_transaction() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM broker_server_materialization_revocations WHERE repo_id = ? AND server_definition_id = 'server-worker'",
+                    (REPO_ID,),
+                ).fetchone()
+            )
+        self.links.begin_lease_release(
+            reserved.link_id, "operation-release-worker-old"
+        )
+        self.links.complete_lease_release(reserved.link_id)
+
+        revoked = self.links.revoke_server_materialization(
+            profile=self.profile,
+            repository=self.repository,
+            server_name="worker",
+            server_definition_id="server-worker",
+            broker_operation_id="operation-purge-worker-old",
+            immutable_fingerprint="sha256:" + "a" * 64,
+        )
+        self.assertTrue(revoked["active_projection_deleted"], revoked)
+        self.assertFalse(revoked["already_revoked"], revoked)
+        repeated = self.links.revoke_server_materialization(
+            profile=self.profile,
+            repository=self.repository,
+            server_name="worker",
+            server_definition_id="server-worker",
+            broker_operation_id="operation-purge-worker-old",
+            immutable_fingerprint="sha256:" + "a" * 64,
+        )
+        self.assertTrue(repeated["already_revoked"], repeated)
+
+        with self.assertRaisesRegex(RuntimeError, "permanently removed"):
+            self.links.reserve_lease(
+                profile=self.profile,
+                repository=self.repository,
+                server_name="worker",
+                server_definition_id="server-worker",
+                broker_lease_id="broker-lease-worker-stale-profile",
+                port=43100,
+                protocol="tcp",
+                operation_id="operation-stale-worker",
+                expires_at=None,
+            )
+        with self.store.read_transaction() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM server_definitions WHERE server_definition_id = 'server-worker'"
+                ).fetchone()
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM broker_lease_links WHERE broker_lease_id = 'broker-lease-worker-stale-profile'"
+                ).fetchone()
+            )
+        removal_inventory = self.store.inventory_v2()
+        projected_after_removal = {
+            str(row["server_definition_id"])
+            for row in removal_inventory["resources"]["servers"]
+        }
+        self.assertNotIn("server-worker", projected_after_removal)
+        self.assertTrue(
+            all(
+                "server-worker" not in set(scope.get("server_ids") or [])
+                for tree in removal_inventory["repository_trees"]
+                for scope in tree["scopes"]
+            ),
+            removal_inventory["repository_trees"],
+        )
+
+        replacement_repository = BrokerRepositoryProfile(
+            canonical_root=self.repository.canonical_root,
+            repo_id=self.repository.repo_id,
+            generation=self.repository.generation,
+            server_ids={**self.repository.server_ids, "worker": "server-worker-v2"},
+            container_ids=self.repository.container_ids,
+            compose_definition_id=self.repository.compose_definition_id,
+            account_id=self.repository.account_id,
+            enabled=self.repository.enabled,
+            issued_at=self.repository.issued_at,
+            valid_until_epoch=self.repository.valid_until_epoch,
+        )
+        replacement_profile = BrokerClientProfile(
+            service=self.profile.service,
+            client_uid=self.profile.client_uid,
+            account_id=self.profile.account_id,
+            issued_at=self.profile.issued_at,
+            valid_until_epoch=self.profile.valid_until_epoch,
+            repositories={
+                replacement_repository.canonical_root: replacement_repository
+            },
+        )
+        replacement = self.links.reserve_lease(
+            profile=replacement_profile,
+            repository=replacement_repository,
+            server_name="worker",
+            server_definition_id="server-worker-v2",
+            broker_lease_id="broker-lease-worker-v2",
+            port=43100,
+            protocol="tcp",
+            operation_id="operation-worker-v2",
+            expires_at=None,
+        )
+        self.assertEqual(replacement.server_definition_id, "server-worker-v2")
+        with self.store.read_transaction() as connection:
+            visible = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT server_definition_id FROM server_definitions"
+                )
+            }
+            retained = connection.execute(
+                """
+                SELECT broker_operation_id
+                FROM broker_server_materialization_revocations
+                WHERE repo_id = ? AND server_definition_id = 'server-worker'
+                """,
+                (REPO_ID,),
+            ).fetchone()
+        self.assertNotIn("server-worker", visible)
+        self.assertIn("server-worker-v2", visible)
+        projected_after_reinstall = {
+            str(row["server_definition_id"])
+            for row in self.store.inventory_v2()["resources"]["servers"]
+        }
+        self.assertNotIn("server-worker", projected_after_reinstall)
+        self.assertEqual(
+            str(retained["broker_operation_id"]), "operation-purge-worker-old"
+        )
 
 
 if __name__ == "__main__":

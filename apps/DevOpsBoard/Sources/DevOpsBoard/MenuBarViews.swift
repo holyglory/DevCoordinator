@@ -5,8 +5,8 @@ struct MenuBarRuntimeView: View {
     let openConsole: () -> Void
     let quit: () -> Void
 
-    private var groups: [ProjectGroup] {
-        store.projectGroups
+    private var hasProjects: Bool {
+        !store.repositoryTrees.isEmpty || store.unassignedProjectGroup != nil
     }
 
     private var latestResult: RetainedActionResult? {
@@ -52,7 +52,7 @@ struct MenuBarRuntimeView: View {
 
             Divider().overlay(Color.white.opacity(0.08))
 
-            if store.isInitialInventoryLoading && groups.isEmpty {
+            if store.isInitialInventoryLoading && !hasProjects {
                 VStack(spacing: 9) {
                     ProgressView().controlSize(.small)
                     Text("Refreshing coordinator sources…")
@@ -60,26 +60,51 @@ struct MenuBarRuntimeView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityIdentifier("menu-loading-state")
-            } else if groups.isEmpty {
+            } else if !hasProjects {
                 VStack(spacing: 8) {
-                    Image(systemName: "tray")
+                    Image(systemName: store.repositoryTreeContractUnavailable
+                        ? "exclamationmark.triangle.fill" : "tray")
                         .font(.system(size: 24))
-                        .foregroundStyle(Theme.secondary)
-                    Text("No managed tasks")
+                        .foregroundStyle(store.repositoryTreeContractUnavailable
+                            ? Theme.orange : Theme.secondary)
+                    Text(store.repositoryTreeContractUnavailable
+                        ? "Repository hierarchy unavailable" : "No managed tasks")
                         .font(.system(size: 13, weight: .semibold))
-                    Text(store.sourceStates.isEmpty ? "No coordinator source is available." : "The loaded sources contain no managed resources.")
+                    Text(store.repositoryTreeContractUnavailable
+                        ? "Update or reinstall the Coordinator, then refresh. No project tree is inferred from names or paths."
+                        : (store.sourceStates.isEmpty
+                            ? "No coordinator source is available."
+                            : "The loaded sources contain no managed resources."))
                         .font(.system(size: 11))
                         .multilineTextAlignment(.center)
                         .foregroundStyle(Theme.secondary)
                         .frame(maxWidth: 260)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .accessibilityIdentifier("menu-empty-state")
+                .accessibilityIdentifier(store.repositoryTreeContractUnavailable
+                    ? "menu-repository-tree-unavailable" : "menu-empty-state")
             } else {
                 ScrollView(.vertical, showsIndicators: true) {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(groups, id: \.id) { group in
-                            MenuProjectRow(store: store, group: group)
+                        ForEach(store.repositoryTrees) { tree in
+                            MenuProjectRow(
+                                store: store,
+                                group: tree.root.group
+                            )
+                            ForEach(tree.temporaryScopes) { scope in
+                                MenuProjectRow(
+                                    store: store,
+                                    group: scope.group,
+                                    indentation: 18,
+                                    projectKind: .temporary,
+                                    runID: scope.definition.runID,
+                                    expiresAt: scope.definition.expiresAt,
+                                    killAfterRun: scope.definition.killAfterRun
+                                )
+                            }
+                        }
+                        if let unassigned = store.unassignedProjectGroup {
+                            MenuProjectRow(store: store, group: unassigned)
                         }
                     }
                     .padding(10)
@@ -521,6 +546,11 @@ struct MenuBarErrorPanel: View {
 struct MenuProjectRow: View {
     @ObservedObject var store: OpsStore
     let group: ProjectGroup
+    var indentation: CGFloat = 0
+    var projectKind: RepositoryProjectKind? = nil
+    var runID: String? = nil
+    var expiresAt: String? = nil
+    var killAfterRun: Bool? = nil
 
     var body: some View {
         VStack(spacing: 6) {
@@ -530,6 +560,13 @@ struct MenuProjectRow: View {
                 } label: {
                     HStack(spacing: 8) {
                         StatusDot(status: projectGroupStatus(group))
+                        if projectKind == .temporary {
+                            Image(systemName: "arrow.triangle.branch")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Theme.blue)
+                                .help(temporaryProjectHelp)
+                                .accessibilityLabel("Temporary repository")
+                        }
                         Text(group.name)
                             .font(.system(size: 13, weight: .semibold))
                             .lineLimit(1)
@@ -600,18 +637,29 @@ struct MenuProjectRow: View {
                             primary: server.origin,
                             candidates: server.observationOrigins
                         ),
-                        status: server.status,
+                        status: workerPresentationStatus(server),
                         canStop: canStopServer(server),
                         toggleAllowed: serverActionAllowed(
                             store,
-                            kind: canStopServer(server) ? .stopServer : .restartServer,
+                            kind: serverToggleActionKind(server),
                             server: server
                         ),
-                        restartAllowed: serverActionAllowed(store, kind: .restartServer, server: server),
+                        restartAllowed: server.supervision?.isCrashLoopStopped != true
+                            && serverActionAllowed(store, kind: serverRestartActionKind(server), server: server),
                         selectAction: { store.selectServer(server) },
-                        toggleAction: { store.toggle(server) },
+                        toggleAction: {
+                            if server.supervision?.isCrashLoopStopped == true {
+                                store.startWorker(server, rearmCrashLoop: true)
+                            } else {
+                                store.toggle(server)
+                            }
+                        },
                         restartAction: { store.restart(server) },
-                        openAction: server.currentURL == nil ? nil : { store.openURL(server.currentURL) }
+                        openAction: server.currentURL == nil ? nil : { store.openURL(server.currentURL) },
+                        toggleTitle: server.supervision?.isCrashLoopStopped == true
+                            ? "Start and re-arm" : nil,
+                        toggleSystemImage: server.supervision?.isCrashLoopStopped == true
+                            ? "play.circle.fill" : nil
                     )
                 }
 
@@ -665,6 +713,7 @@ struct MenuProjectRow: View {
             }
             .padding(.leading, 8)
         }
+        .padding(.leading, indentation)
     }
 
     private var canStop: Bool {
@@ -677,6 +726,14 @@ struct MenuProjectRow: View {
 
     private var sourceCount: Int { groupOrigins.count }
     private var groupOrigin: CoordinatorOrigin? { groupOrigins.count == 1 ? groupOrigins[0] : nil }
+
+    private var temporaryProjectHelp: String {
+        var parts = ["Temporary repository"]
+        if let runID, !runID.isEmpty { parts.append("run \(runID)") }
+        if let expiresAt, !expiresAt.isEmpty { parts.append("expires \(expiresAt)") }
+        if let killAfterRun { parts.append(killAfterRun ? "removed after run" : "retained after run") }
+        return parts.joined(separator: " · ")
+    }
 
     private func projectActionAllowed(_ kind: ActionKind) -> Bool {
         store.projectMutationAvailability(kind: kind, group: group).isAllowed
@@ -696,6 +753,8 @@ struct MenuTaskRow: View {
     let toggleAction: () -> Void
     let restartAction: () -> Void
     let openAction: (() -> Void)?
+    var toggleTitle: String? = nil
+    var toggleSystemImage: String? = nil
 
     var body: some View {
         HStack(spacing: 7) {
@@ -745,8 +804,8 @@ struct MenuTaskRow: View {
                     )
                 }
                 MenuBarActionButton(
-                    title: canStop ? "Stop" : "Run",
-                    systemImage: canStop ? "stop.fill" : "play.fill",
+                    title: toggleTitle ?? (canStop ? "Stop" : "Run"),
+                    systemImage: toggleSystemImage ?? (canStop ? "stop.fill" : "play.fill"),
                     tint: canStop ? Theme.orange : Theme.green,
                     action: toggleAction,
                     disabled: !toggleAllowed
@@ -857,6 +916,18 @@ struct MenuBarTextButtonStyle: ButtonStyle {
 }
 
 func menuServerSubtitle(_ server: ManagedServer) -> String {
+    if let supervision = server.supervision, supervision.isCrashLoopStopped {
+        return supervision.crashLoopMessage
+    }
+    if server.supervision?.keepAlive == true {
+        if let url = server.currentURL, !url.isEmpty {
+            return "Keep alive · \(url)"
+        }
+        if let port = server.port {
+            return "Keep alive · Port \(port)"
+        }
+        return "Keep alive · \(normalizedStatus(server.status))"
+    }
     if let url = server.currentURL, !url.isEmpty {
         return url
     }

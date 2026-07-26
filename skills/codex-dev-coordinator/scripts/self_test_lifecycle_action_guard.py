@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -60,7 +61,26 @@ def test_temp_base() -> Path:
 
 def git_repository(path: Path) -> Path:
     private_directory(path)
-    (path / ".git").mkdir(mode=0o700)
+    git = "/usr/bin/git" if Path("/usr/bin/git").is_file() else "/bin/git"
+    environment = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": str(path.parent),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+    subprocess.run(
+        [git, "init", "-q", str(path)],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        timeout=10,
+    )
     return path.resolve()
 
 
@@ -334,6 +354,101 @@ class LifecycleActionGuardTests(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
+
+    def test_linked_worktree_lease_persists_root_and_temporary_family(self) -> None:
+        fixture = self.repository / "fixture.txt"
+        fixture.write_text("fixture\n", encoding="utf-8")
+        git = "/usr/bin/git" if Path("/usr/bin/git").is_file() else "/bin/git"
+        environment = {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": str(self.root),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+        subprocess.run(
+            [git, "-C", str(self.repository), "add", "fixture.txt"],
+            env=environment,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        subprocess.run(
+            [
+                git,
+                "-C",
+                str(self.repository),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+            env=environment,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        linked = self.root / "repo-linked"
+        subprocess.run(
+            [
+                git,
+                "-C",
+                str(self.repository),
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fixture-linked",
+                str(linked),
+            ],
+            env=environment,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+        with mock.patch.object(coordinator, "port_available", return_value=True):
+            lease = coordinator.coordinated_lease_port(
+                {
+                    "agent": "guard-test",
+                    "project": str(linked),
+                    "range": "43110-43110",
+                }
+            )
+
+        self.assertEqual(lease["project"], str(linked))
+        with AccountStore.open_default(self.home) as store:
+            with store.read_transaction() as connection:
+                scopes = [
+                    tuple(row)
+                    for row in connection.execute(
+                        """
+                        SELECT repository.canonical_root, scope.project_kind
+                        FROM repository_scopes scope
+                        JOIN repositories repository USING(repo_id)
+                        ORDER BY scope.project_kind, repository.canonical_root
+                        """
+                    )
+                ]
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM repository_families"
+                    ).fetchone()[0],
+                    1,
+                )
+        self.assertEqual(
+            scopes,
+            [(str(self.repository), "primary"), (str(linked), "temporary")],
+        )
 
     def test_guard_operation_coexists_with_actual_project_start_and_register_journals(self) -> None:
         project_result = coordinator.coordinated_project_runtime_start(

@@ -157,6 +157,9 @@ struct OpsConsoleView: View {
         .sheet(item: $store.repositoryDecommissionPrompt) { prompt in
             RepositoryDecommissionSheet(store: store, prompt: prompt)
         }
+        .sheet(item: $store.workerRemovalPrompt) { prompt in
+            WorkerRemovalSheet(store: store, prompt: prompt)
+        }
         .sheet(item: $store.resourceAttachPrompt) { prompt in
             ResourceAttachSheet(store: store, prompt: prompt)
         }
@@ -238,21 +241,62 @@ struct ServiceMapView: View {
                         .tracking(0.5)
                         .lineLimit(1)
 
-                    if groupedProjects.isEmpty {
-                        EmptyMapHint()
+                    if store.repositoryTrees.isEmpty && store.unassignedProjectGroup == nil {
+                        if store.repositoryTreeContractUnavailable {
+                            RepositoryTreeUnavailableHint()
+                        } else {
+                            EmptyMapHint()
+                        }
                     } else {
-                        ForEach(groupedProjects, id: \.id) { group in
+                        ForEach(store.repositoryTrees) { tree in
                             ProjectNode(
                                 store: store,
-                                group: group,
-                                isExpanded: expandedProjects.contains(group.id),
+                                group: tree.root.group,
+                                isExpanded: expandedProjects.contains(tree.root.group.id),
                                 toggle: {
-                                    if expandedProjects.contains(group.id) {
-                                        expandedProjects.remove(group.id)
+                                    if expandedProjects.contains(tree.root.group.id) {
+                                        expandedProjects.remove(tree.root.group.id)
                                     } else {
-                                        expandedProjects.insert(group.id)
+                                        expandedProjects.insert(tree.root.group.id)
                                     }
-                                    store.selectProject(group.id)
+                                    store.selectProject(tree.root.group.id)
+                                }
+                            )
+                            if expandedProjects.contains(tree.root.group.id) {
+                                ForEach(tree.temporaryScopes) { scope in
+                                    ProjectNode(
+                                        store: store,
+                                        group: scope.group,
+                                        isExpanded: expandedProjects.contains(scope.group.id),
+                                        indentation: 16,
+                                        projectKind: .temporary,
+                                        runID: scope.definition.runID,
+                                        expiresAt: scope.definition.expiresAt,
+                                        killAfterRun: scope.definition.killAfterRun,
+                                        toggle: {
+                                            if expandedProjects.contains(scope.group.id) {
+                                                expandedProjects.remove(scope.group.id)
+                                            } else {
+                                                expandedProjects.insert(scope.group.id)
+                                            }
+                                            store.selectProject(scope.group.id)
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                        if let unassigned = store.unassignedProjectGroup {
+                            ProjectNode(
+                                store: store,
+                                group: unassigned,
+                                isExpanded: expandedProjects.contains(unassigned.id),
+                                toggle: {
+                                    if expandedProjects.contains(unassigned.id) {
+                                        expandedProjects.remove(unassigned.id)
+                                    } else {
+                                        expandedProjects.insert(unassigned.id)
+                                    }
+                                    store.selectProject(unassigned.id)
                                 }
                             )
                         }
@@ -264,10 +308,10 @@ struct ServiceMapView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .onAppear {
                 if expandedProjects.isEmpty {
-                    expandedProjects = Set(groupedProjects.prefix(10).map(\.id))
+                    expandedProjects = Set(rootProjectIDs.prefix(10))
                 }
             }
-            .onChange(of: groupedProjects.map(\.id)) { _, names in
+            .onChange(of: rootProjectIDs) { _, names in
                 if expandedProjects.isEmpty {
                     expandedProjects = Set(names.prefix(10))
                 }
@@ -279,8 +323,8 @@ struct ServiceMapView: View {
         .background(Theme.sidebar)
     }
 
-    private var groupedProjects: [ProjectGroup] {
-        store.projectGroups
+    private var rootProjectIDs: [String] {
+        store.repositoryTrees.map { $0.root.group.id }
     }
 }
 
@@ -350,6 +394,11 @@ struct ProjectNode: View {
     @ObservedObject var store: OpsStore
     let group: ProjectGroup
     let isExpanded: Bool
+    var indentation: CGFloat = 0
+    var projectKind: RepositoryProjectKind? = nil
+    var runID: String? = nil
+    var expiresAt: String? = nil
+    var killAfterRun: Bool? = nil
     let toggle: () -> Void
 
     var body: some View {
@@ -363,6 +412,13 @@ struct ProjectNode: View {
                 }
                 .buttonStyle(.plain)
                 StatusDot(status: groupStatus)
+                if projectKind == .temporary {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Theme.blue)
+                        .help(temporaryProjectHelp)
+                        .accessibilityLabel("Temporary repository")
+                }
                 Text(group.name)
                     .font(.system(size: 14, weight: .semibold))
                     .lineLimit(1)
@@ -402,6 +458,7 @@ struct ProjectNode: View {
                 }
             }
             .padding(.horizontal, 6)
+            .padding(.leading, indentation)
             .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
             .background(store.sidebarSelection == .project(group.id) ? Theme.blue.opacity(0.18) : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -416,18 +473,30 @@ struct ProjectNode: View {
                     MapLeaf(
                         title: resourceDisplayName(server.name, inProject: group.name),
                         kind: .server,
-                        status: server.status,
+                        status: workerPresentationStatus(server),
                         isSelected: store.sidebarSelection == .server(row.id),
                         canStop: canStopServer(server),
                         toggleEnabled: serverActionAllowed(
                             store,
-                            kind: canStopServer(server) ? .stopServer : .restartServer,
+                            kind: serverToggleActionKind(server),
                             server: server
                         ),
-                        restartEnabled: serverActionAllowed(store, kind: .restartServer, server: server),
+                        restartEnabled: server.supervision?.isCrashLoopStopped != true
+                            && serverActionAllowed(store, kind: serverRestartActionKind(server), server: server),
                         selectAction: { store.selectServer(server) },
-                        toggleAction: { store.toggle(server) },
-                        restartAction: { store.restart(server) }
+                        toggleAction: {
+                            if server.supervision?.isCrashLoopStopped == true {
+                                store.startWorker(server, rearmCrashLoop: true)
+                            } else {
+                                store.toggle(server)
+                            }
+                        },
+                        restartAction: { store.restart(server) },
+                        toggleTitle: server.supervision?.isCrashLoopStopped == true
+                            ? "Start and re-arm" : nil,
+                        toggleSystemImage: server.supervision?.isCrashLoopStopped == true
+                            ? "play.circle.fill" : nil,
+                        indentation: indentation
                     )
                 }
 
@@ -446,7 +515,8 @@ struct ProjectNode: View {
                         restartEnabled: dockerActionAllowed(store, kind: .restartDocker, container: container),
                         selectAction: { store.selectDocker(container) },
                         toggleAction: { store.toggleDocker(container) },
-                        restartAction: { store.restartDocker(container) }
+                        restartAction: { store.restartDocker(container) },
+                        indentation: indentation
                     )
                 }
 
@@ -465,7 +535,8 @@ struct ProjectNode: View {
                         restartEnabled: dockerActionAllowed(store, kind: .restartDocker, container: database),
                         selectAction: { store.selectDatabase(database) },
                         toggleAction: { store.toggleDocker(database) },
-                        restartAction: { store.restartDocker(database) }
+                        restartAction: { store.restartDocker(database) },
+                        indentation: indentation
                     )
                 }
             }
@@ -479,6 +550,14 @@ struct ProjectNode: View {
 
     private var groupCanStop: Bool {
         projectGroupCanStop(group)
+    }
+
+    private var temporaryProjectHelp: String {
+        var parts = ["Temporary repository"]
+        if let runID, !runID.isEmpty { parts.append("run \(runID)") }
+        if let expiresAt, !expiresAt.isEmpty { parts.append("expires \(expiresAt)") }
+        if let killAfterRun { parts.append(killAfterRun ? "removed after run" : "retained after run") }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -578,14 +657,37 @@ struct MainBoardView: View {
 struct ProjectUsageStrip: View {
     @ObservedObject var store: OpsStore
 
-    private var rows: [ProjectUsage] {
-        store.projectGroups
-            .filter(\.isRepository)
-            .compactMap(\.usage)
-            .filter { ($0.serverCount ?? 0) > 0 || ($0.containerCount ?? 0) > 0 || ($0.cpuPercent ?? 0) > 0 || ($0.memoryBytes ?? 0) > 0 }
-            .sorted { usageRank($0) > usageRank($1) }
-            .prefix(6)
-            .map { $0 }
+    private var rows: [ProjectLoadRow] {
+        let rankedTrees = store.repositoryTrees
+            .compactMap { tree -> (RepositoryTreePresentation, ProjectUsage)? in
+                guard let usage = tree.usage, showsProjectLoad(usage) else { return nil }
+                return (tree, usage)
+            }
+            .sorted { usageRank($0.1) > usageRank($1.1) }
+
+        var result: [ProjectLoadRow] = []
+        for (tree, usage) in rankedTrees {
+            result.append(
+                ProjectLoadRow(
+                    id: "family:\(tree.familyID)",
+                    usage: usage,
+                    label: tree.root.displayName,
+                    context: tree.temporaryScopes.isEmpty ? nil : "Root repository · includes temporary repositories",
+                    indentation: 0
+                )
+            )
+            result.append(contentsOf: tree.temporaryScopes.compactMap { scope in
+                guard let usage = scope.usage, showsProjectLoad(usage) else { return nil }
+                return ProjectLoadRow(
+                    id: "scope:\(scope.definition.repoID)",
+                    usage: usage,
+                    label: scope.displayName,
+                    context: "Temporary · \(tree.root.displayName)",
+                    indentation: 14
+                )
+            })
+        }
+        return Array(result.prefix(6))
     }
 
     var body: some View {
@@ -601,7 +703,12 @@ struct ProjectUsageStrip: View {
                 }
                 VStack(spacing: 0) {
                     ForEach(rows) { row in
-                        ProjectUsageRow(usage: row)
+                        ProjectUsageRow(
+                            usage: row.usage,
+                            label: row.label,
+                            context: row.context,
+                            indentation: row.indentation
+                        )
                     }
                 }
                 .background(Theme.control)
@@ -611,19 +718,37 @@ struct ProjectUsageStrip: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
     }
+
+    private func showsProjectLoad(_ usage: ProjectUsage) -> Bool {
+        (usage.serverCount ?? 0) > 0
+            || (usage.containerCount ?? 0) > 0
+            || (usage.cpuPercent ?? 0) > 0
+            || (usage.memoryBytes ?? 0) > 0
+    }
+}
+
+private struct ProjectLoadRow: Identifiable {
+    let id: String
+    let usage: ProjectUsage
+    let label: String
+    let context: String?
+    let indentation: CGFloat
 }
 
 struct ProjectUsageRow: View {
     let usage: ProjectUsage
+    let label: String
+    let context: String?
+    let indentation: CGFloat
 
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(usage.name ?? usage.project.map(shortProject) ?? usage.projectKey ?? "Project")
+                Text(label)
                     .font(.system(size: 12, weight: .semibold))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(resourceCountText)
+                Text(context.map { "\($0) · \(resourceCountText)" } ?? resourceCountText)
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.secondary)
                     .lineLimit(1)
@@ -639,6 +764,7 @@ struct ProjectUsageRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 10)
+        .padding(.leading, indentation)
         .frame(height: 34)
         .overlay(alignment: .bottom) {
             Rectangle().fill(Color.white.opacity(0.055)).frame(height: 1)
@@ -1858,11 +1984,12 @@ struct DevServersSection: View {
                                         BulkSelectionCheckbox(
                                             store: store,
                                             identity: server.resourceIdentity,
-                                            enabled: canStopServer(server)
+                                            enabled: server.supervision == nil
+                                                && canStopServer(server)
                                                 && serverActionAllowed(store, kind: .stopServer, server: server)
                                         )
                                     }
-                                    StatusDot(status: server.status)
+                                    StatusDot(status: workerPresentationStatus(server))
                                     Text(server.name).fontWeight(.medium).lineLimit(1)
                                     ResourceSourceBadge(
                                         primary: server.origin,
@@ -1872,12 +1999,12 @@ struct DevServersSection: View {
                                 }
                             }
                             TableCell(width: widths[1]) {
-                                Text(projectDisplayLabel(server.project)).foregroundStyle(Theme.secondary).lineLimit(1)
+                                Text(store.repositoryBreadcrumb(for: server)).foregroundStyle(Theme.secondary).lineLimit(1)
                             }
                             TableCell(width: widths[2]) {
                                 URLCell(url: server.currentURL, staleURL: server.url, open: { store.openURL(server.currentURL) }, copy: { store.copyURL(server.currentURL) })
                             }
-                            TableCell(width: widths[3]) { StatusText(status: server.status) }
+                            TableCell(width: widths[3]) { StatusText(status: workerPresentationStatus(server)) }
                             TableCell(width: widths[4]) {
                                 let uptime = server.uptime(now: Date())
                                 Text(formatUptime(uptime))
@@ -1889,10 +2016,20 @@ struct DevServersSection: View {
                             }
                             TableCell(width: widths[6]) {
                                 HStack(spacing: 7) {
-                                    IconButton("Restart", "arrow.clockwise") { store.restart(server) }
-                                        .disabled(!serverActionAllowed(store, kind: .restartServer, server: server))
-                                    IconButton("Stop", "stop") { store.stop(server) }
-                                        .disabled(!canStopServer(server) || !serverActionAllowed(store, kind: .stopServer, server: server))
+                                    if server.supervision?.isCrashLoopStopped == true {
+                                        IconButton("Start and re-arm", "play.circle") {
+                                            store.startWorker(server, rearmCrashLoop: true)
+                                        }
+                                        .disabled(!serverActionAllowed(store, kind: .startWorker, server: server))
+                                    } else if server.supervision != nil && !canStopServer(server) {
+                                        IconButton("Start", "play.fill") { store.startWorker(server) }
+                                            .disabled(!serverActionAllowed(store, kind: .startWorker, server: server))
+                                    } else {
+                                        IconButton("Restart", "arrow.clockwise") { store.restart(server) }
+                                            .disabled(!serverActionAllowed(store, kind: serverRestartActionKind(server), server: server))
+                                        IconButton("Stop", "stop") { store.stop(server) }
+                                            .disabled(!canStopServer(server) || !serverActionAllowed(store, kind: serverStopActionKind(server), server: server))
+                                    }
                                     IconButton("Open", "arrow.up.forward.square") { store.openURL(server.currentURL) }
                                         .disabled(server.currentURL == nil)
                                     IconButton("Logs", "doc.text.magnifyingglass") { store.showServerLogs(server) }
@@ -1954,7 +2091,7 @@ struct DockerSection: View {
                             }
                         }
                         TableCell(width: widths[1]) {
-                            Text(projectLabel(for: container, in: store.projectGroups)).foregroundStyle(Theme.secondary).lineLimit(1)
+                            Text(store.repositoryBreadcrumb(for: container)).foregroundStyle(Theme.secondary).lineLimit(1)
                         }
                         TableCell(width: widths[2]) { StatusText(status: container.status) }
                         TableCell(width: widths[3]) {
@@ -2060,7 +2197,7 @@ struct DatabaseSection: View {
                                 )
                             }
                         }
-                        TableCell(width: widths[1]) { Text(projectLabel(for: db, in: store.projectGroups)).foregroundStyle(Theme.secondary).lineLimit(1) }
+                        TableCell(width: widths[1]) { Text(store.repositoryBreadcrumb(for: db)).foregroundStyle(Theme.secondary).lineLimit(1) }
                         TableCell(width: widths[2]) { Text(db.image ?? "postgres").foregroundStyle(Theme.secondary).lineLimit(1) }
                         TableCell(width: widths[3]) { StatusText(status: db.status) }
                         TableCell(width: widths[4]) { Text(formatDatabaseBytes(db.databaseSizeBytes)).foregroundStyle(Theme.secondary) }
@@ -2514,6 +2651,9 @@ struct SelectedServerPanel: View {
             }
             DetailLine(label: "Stopped", value: server.stoppedAt ?? "—")
             DetailLine(label: "Reason", value: server.stoppedReason ?? "—")
+            if let supervision = server.supervision {
+                WorkerSupervisionPanel(store: store, server: server, supervision: supervision)
+            }
             if let ownershipError = server.ownershipError {
                 Label(ownershipError, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 11, weight: .semibold))
@@ -2564,6 +2704,147 @@ struct SelectedServerPanel: View {
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
     }
+}
+
+struct WorkerSupervisionPanel: View {
+    @ObservedObject var store: OpsStore
+    let server: ManagedServer
+    let supervision: WorkerSupervision
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Toggle(
+                "Keep alive",
+                isOn: Binding(
+                    get: { supervision.keepAlive },
+                    set: { store.setWorkerKeepAlive(server, enabled: $0) }
+                )
+            )
+            .toggleStyle(.switch)
+            .disabled(!serverActionAllowed(store, kind: .setWorkerKeepAlive, server: server))
+            .help("Start this worker with the Coordinator and restart it after unexpected exits. Turning this off leaves a running worker running.")
+            .accessibilityIdentifier("worker-keep-alive")
+
+            Text(
+                supervision.keepAlive
+                    ? "Starts with the Coordinator and restarts after an unexpected crash."
+                    : "Automatic restart is off. A worker already running is left running."
+            )
+            .font(.system(size: 10))
+            .foregroundStyle(Theme.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            DetailLine(label: "Supervisor", value: supervision.state.replacingOccurrences(of: "_", with: " ").capitalized)
+            DetailLine(label: "Desired state", value: supervision.desiredState.capitalized)
+            DetailLine(
+                label: "Crash policy",
+                value: "\(supervision.breaker.crashLimit) crashes / \(workerDurationLabel(seconds: supervision.breaker.windowSeconds))"
+            )
+
+            if supervision.isCrashLoopStopped {
+                VStack(alignment: .leading, spacing: 7) {
+                    Label(supervision.crashLoopMessage, systemImage: "exclamationmark.octagon.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("The Coordinator will not restart this worker until its failure is fixed and Start and re-arm is explicitly selected.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        store.startWorker(server, rearmCrashLoop: true)
+                    } label: {
+                        Label("Start and re-arm", systemImage: "play.circle.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!serverActionAllowed(store, kind: .startWorker, server: server))
+                    .accessibilityIdentifier("worker-start-and-rearm")
+                }
+                .padding(9)
+                .background(Theme.red.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Theme.red.opacity(0.28)))
+                .accessibilityIdentifier("worker-crash-loop-stopped")
+            }
+
+            if !supervision.recentCrashes.isEmpty {
+                DisclosureGroup("Crash evidence (\(supervision.recentCrashes.count)\(supervision.recentCrashesTruncated ? "+" : ""))") {
+                    VStack(alignment: .leading, spacing: 7) {
+                        ForEach(Array(supervision.recentCrashes.prefix(10))) { crash in
+                            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                                Image(systemName: "exclamationmark.circle.fill")
+                                    .foregroundStyle(Theme.red)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(workerCrashSummary(crash))
+                                        .font(.system(size: 11, weight: .semibold))
+                                    Text(formatTimestamp(crash.exitedAt))
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(Theme.secondary)
+                                }
+                                Spacer()
+                                if let url = crash.log?.localURL {
+                                    Link("Open log", destination: url)
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .accessibilityIdentifier("worker-crash-log-\(safeAccessibilityID(crash.id))")
+                                } else {
+                                    Text("Log unavailable")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(Theme.secondary)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.top, 5)
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .accessibilityIdentifier("worker-crash-evidence")
+            }
+
+            InspectorActionStack {
+                if !supervision.isCrashLoopStopped {
+                    if canStopServer(server) {
+                        Button { store.stopWorker(server) } label: {
+                            Label("Stop", systemImage: "stop.fill").frame(maxWidth: .infinity)
+                        }
+                        .disabled(!serverActionAllowed(store, kind: .stopWorker, server: server))
+                    } else {
+                        Button { store.startWorker(server) } label: {
+                            Label("Start", systemImage: "play.fill").frame(maxWidth: .infinity)
+                        }
+                        .disabled(!serverActionAllowed(store, kind: .startWorker, server: server))
+                    }
+                }
+            }
+
+            Divider().overlay(Color.white.opacity(0.08))
+
+            Button(role: .destructive) {
+                store.planWorkerRemoval(server)
+            } label: {
+                Label("Remove worker…", systemImage: "trash")
+                    .frame(maxWidth: .infinity)
+            }
+            .disabled(!serverActionAllowed(store, kind: .workerRemovalPlan, server: server))
+            .accessibilityIdentifier("worker-remove")
+            Text("Removal first stops and archives this exact worker. Permanent removal is a separate reviewed step that deletes its active definition and projections. Its no-resurrection tombstone, audit history, crash traces, and log links remain.")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(Theme.control.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+        .accessibilityIdentifier("worker-supervision")
+    }
+}
+
+func workerCrashSummary(_ crash: WorkerAttemptEvidence) -> String {
+    if let code = crash.exitCode { return "Exited with code \(code)" }
+    if let signal = crash.exitSignal { return "Exited on signal \(signal)" }
+    return crash.classification?.replacingOccurrences(of: "_", with: " ").capitalized
+        ?? crash.exitKind?.replacingOccurrences(of: "_", with: " ").capitalized
+        ?? "Unexpected exit"
 }
 
 struct SelectedDockerPanel: View {
@@ -3195,6 +3476,132 @@ struct RepositoryDecommissionSheet: View {
         .background(Theme.background)
         .interactiveDismissDisabled(false)
         .accessibilityIdentifier("repository-decommission-sheet")
+    }
+}
+
+struct WorkerRemovalSheet: View {
+    @ObservedObject var store: OpsStore
+    let prompt: WorkerRemovalPrompt
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmation = ""
+
+    private var plan: WorkerRemovalPlan { prompt.plan }
+    private var phraseMatches: Bool {
+        plan.confirmationPhrase.isEmpty || confirmation == plan.confirmationPhrase
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text(plan.isPermanent ? "Permanently Remove Worker" : "Archive Worker")
+                    .font(.title2.bold())
+                Text(prompt.serverName)
+                    .font(.headline)
+                Text(prompt.context.effectiveCanonicalRoot)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Theme.secondary)
+                    .textSelection(.enabled)
+
+                if prompt.archivedInThisJourney && plan.isPermanent {
+                    Label(
+                        "Archived — the worker is stopped, fenced, and hidden from active inventory.",
+                        systemImage: "archivebox.fill"
+                    )
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.green)
+                }
+
+                Text(
+                    plan.isPermanent
+                        ? "This distinct step deletes the worker from active coordinator state. The tombstone, operation history, crash attempts, and retained crash logs remain."
+                        : "This first step stops the exact worker, disables automatic starts, and archives it. It does not yet erase the worker definition from the database."
+                )
+                .font(.system(size: 12))
+                .fixedSize(horizontal: false, vertical: true)
+
+                WorkerRemovalPlanSection(title: "EFFECTS", values: plan.effects)
+                WorkerRemovalPlanSection(title: "RETAINED", values: plan.retained)
+                WorkerRemovalPlanSection(title: "DELETED PERMANENTLY", values: plan.deleted)
+
+                if !plan.blockers.isEmpty {
+                    WorkerRemovalPlanSection(
+                        title: "BLOCKERS — RESOLVE THESE BEFORE CONTINUING",
+                        values: plan.blockers,
+                        tint: Theme.orange,
+                        emphasized: true
+                    )
+                }
+
+                if !plan.confirmationPhrase.isEmpty {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("Type this exact phrase to confirm permanent removal:")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(plan.confirmationPhrase)
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .textSelection(.enabled)
+                        TextField(plan.confirmationPhrase, text: $confirmation)
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier("worker-remove-confirmation")
+                    }
+                }
+
+                HStack {
+                    Button(prompt.archivedInThisJourney ? "Keep Archived" : "Cancel") {
+                        store.cancelWorkerRemoval()
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button(
+                        plan.isPermanent ? "Permanently Remove" : "Archive Worker",
+                        role: .destructive
+                    ) {
+                        store.applyWorkerRemoval(prompt)
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!plan.blockers.isEmpty || !phraseMatches)
+                    .accessibilityIdentifier(
+                        plan.isPermanent ? "worker-remove-permanent" : "worker-remove-archive"
+                    )
+                }
+            }
+            .padding(24)
+        }
+        .frame(width: 620, height: 690)
+        .background(Theme.background)
+        .onChange(of: prompt.plan.planID) { _, _ in confirmation = "" }
+        .accessibilityIdentifier("worker-removal-sheet")
+    }
+}
+
+struct WorkerRemovalPlanSection: View {
+    let title: String
+    let values: [WorkerRemovalPlanDetail]
+    var tint: Color = Theme.secondary
+    var emphasized = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(tint)
+            if values.isEmpty {
+                Text("None")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.secondary)
+            } else {
+                ForEach(values) { value in
+                    Label(value.message, systemImage: "circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(emphasized ? tint : Theme.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(tint.opacity(emphasized ? 0.1 : 0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -4278,6 +4685,9 @@ struct MapLeaf: View {
     let selectAction: () -> Void
     let toggleAction: () -> Void
     let restartAction: () -> Void
+    var toggleTitle: String? = nil
+    var toggleSystemImage: String? = nil
+    var indentation: CGFloat = 0
 
     var body: some View {
         HStack(spacing: 6) {
@@ -4298,8 +4708,8 @@ struct MapLeaf: View {
             .buttonStyle(.plain)
             HStack(spacing: 4) {
                 SidebarActionButton(
-                    title: canStop ? "Stop" : "Run",
-                    systemImage: canStop ? "stop.fill" : "play.fill",
+                    title: toggleTitle ?? (canStop ? "Stop" : "Run"),
+                    systemImage: toggleSystemImage ?? (canStop ? "stop.fill" : "play.fill"),
                     tint: canStop ? Theme.orange : Theme.green,
                     enabled: toggleEnabled,
                     action: toggleAction
@@ -4314,7 +4724,7 @@ struct MapLeaf: View {
             }
             .fixedSize()
         }
-        .padding(.leading, 30)
+        .padding(.leading, 30 + indentation)
         .padding(.trailing, 6)
         .foregroundStyle(Theme.primary)
         .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
@@ -4612,6 +5022,21 @@ struct EmptyMapHint: View {
     }
 }
 
+struct RepositoryTreeUnavailableHint: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Repository hierarchy unavailable", systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.orange)
+            Text("This Coordinator did not provide the authoritative repository tree. Update or reinstall it, then refresh; the Board will not infer projects from names or paths.")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityIdentifier("repository-tree-unavailable")
+    }
+}
+
 struct DetailLine: View {
     let label: String
     let value: String
@@ -4709,6 +5134,27 @@ func serverActionAllowed(_ store: OpsStore, kind: ActionKind, server: ManagedSer
         resource: identity,
         projectPath: project
     ).isAllowed
+}
+
+func workerPresentationStatus(_ server: ManagedServer) -> String? {
+    server.supervision?.isCrashLoopStopped == true
+        ? server.supervision?.crashLoopMessage
+        : server.status
+}
+
+func serverToggleActionKind(_ server: ManagedServer) -> ActionKind {
+    guard server.supervision != nil else {
+        return canStopServer(server) ? .stopServer : .restartServer
+    }
+    return canStopServer(server) ? .stopWorker : .startWorker
+}
+
+func serverRestartActionKind(_ server: ManagedServer) -> ActionKind {
+    server.supervision == nil ? .restartServer : .restartWorker
+}
+
+func serverStopActionKind(_ server: ManagedServer) -> ActionKind {
+    server.supervision == nil ? .stopServer : .stopWorker
 }
 
 @MainActor
@@ -5054,7 +5500,7 @@ func ratePairValue(inbound: Double?, outbound: Double?, inboundLabel: String, ou
 
 func statusColor(_ status: String?) -> Color {
     let value = (status ?? "").lowercased()
-    if value.contains("unhealthy") || value.contains("failed") || value.contains("dead") || value.contains("unavailable") { return Theme.red }
+    if value.contains("unhealthy") || value.contains("failed") || value.contains("dead") || value.contains("unavailable") || value.contains("crash loop") { return Theme.red }
     if value.contains("start") || value.contains("warning") || value.contains("degraded") || value.contains("partial") || value.contains("stale") { return Theme.orange }
     if value.contains("loading") || value.contains("running action") { return Theme.blue }
     if isStoppedStatus(status) || value.contains("stop") || value.isEmpty { return Theme.secondary }

@@ -299,7 +299,9 @@ class BrokerHostMutationTests(unittest.TestCase):
             host.docker_start(DockerMutationTarget("docker-resource", "friendly-name", 1, 1))
         self.assertFalse(called)
 
-    def test_docker_failure_retains_bounded_diagnostic(self) -> None:
+    def test_docker_nonzero_exit_is_outcome_uncertain_without_host_diagnostic(
+        self,
+    ) -> None:
         def runner(
             command: tuple[str, ...], timeout: float
         ) -> subprocess.CompletedProcess[str]:
@@ -308,8 +310,37 @@ class BrokerHostMutationTests(unittest.TestCase):
         host = LocalBrokerHostMutations(
             docker_executable="/trusted/docker", docker_runner=runner
         )
-        with self.assertRaisesRegex(RuntimeError, "not found"):
+        with self.assertRaises(BrokerBackendError) as raised:
             host.docker_stop(DockerMutationTarget("docker-resource", "b" * 64, 1, 1))
+        self.assertEqual(raised.exception.code, "operation_outcome_uncertain")
+        self.assertNotIn("not found", raised.exception.message)
+
+    def test_docker_timeout_is_outcome_uncertain(self) -> None:
+        def runner(command: tuple[str, ...], timeout: float):
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        host = LocalBrokerHostMutations(
+            docker_executable="/trusted/docker", docker_runner=runner
+        )
+        with self.assertRaises(BrokerBackendError) as raised:
+            host.docker_restart(
+                DockerMutationTarget("docker-resource", "c" * 64, 1, 1)
+            )
+        self.assertEqual(raised.exception.code, "operation_outcome_uncertain")
+
+    def test_docker_runner_exception_is_outcome_uncertain(self) -> None:
+        def runner(command: tuple[str, ...], timeout: float):
+            raise OSError("sensitive host diagnostic")
+
+        host = LocalBrokerHostMutations(
+            docker_executable="/trusted/docker", docker_runner=runner
+        )
+        with self.assertRaises(BrokerBackendError) as raised:
+            host.docker_start(
+                DockerMutationTarget("docker-resource", "d" * 64, 1, 1)
+            )
+        self.assertEqual(raised.exception.code, "operation_outcome_uncertain")
+        self.assertNotIn("sensitive", raised.exception.message)
 
     def test_ephemeral_image_status_requires_exact_digest_platform_proof(self) -> None:
         calls: list[tuple[str, ...]] = []

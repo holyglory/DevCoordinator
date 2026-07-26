@@ -1883,27 +1883,25 @@ def main() -> int:
     external_processes: list[subprocess.Popen[str]] = []
     try:
         skill_text = SKILL.read_text(encoding="utf-8")
+        check(
+            len(skill_text.splitlines()) <= 300,
+            "SKILL.md must remain at or below 300 lines; move detail into Python help or reference docs",
+        )
         for needle in (
-            "PROJECT_ROOT=",
+            "dev_coordinator.py runtime --help",
+            "root_repo",
+            "temporary_repo",
+            "kill_after_run",
+            "ok=false",
+            "status/start/stop/restart/remove",
             "server register",
             "docker register",
-            "Do not start dev/test servers",
             "try the default port",
-            "--argv",
-            "--compact-json",
-            "--stats-history-limit",
-            "Authorization: Bearer",
-            "non-loopback",
-            "outside write\ntransactions",
-            "legacy JSON lock and callback",
-            "/var/lib/devcoordinator/coordinator.sqlite3",
-            "DEVCOORDINATOR_AUTHORITY=account",
-            "not inventory or reservation",
-            "read/execute-only source ACLs",
-            "Direct access is reported as a non-fatal staged activation blocker",
-            "Registration-after-start\nis not a safe creation protocol",
+            "ephemeral start",
+            "test run",
+            "api.profile_changed",
         ):
-            check(needle in skill_text, f"SKILL.md should retain policy text: {needle}")
+            check(needle in skill_text, f"SKILL.md should retain the minimal runtime contract: {needle}")
 
         if str(ROOT / "scripts") not in sys.path:
             sys.path.insert(0, str(ROOT / "scripts"))

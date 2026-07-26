@@ -13,6 +13,8 @@ import pwd
 import stat
 from typing import Any
 
+from . import filesystem_acl as _filesystem_acl
+
 try:
     import yaml
     from yaml.constructor import ConstructorError
@@ -286,6 +288,15 @@ def _anchored_directory_flags() -> int:
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
+def _require_descriptor_acl(descriptor: int, *, field: str) -> None:
+    metadata = os.fstat(descriptor)
+    _filesystem_acl.require_fd_acl_trusted(
+        descriptor,
+        owner_uid=int(metadata.st_uid),
+        field=field,
+    )
+
+
 def open_anchored_compose_root(path: str) -> int:
     """Open an absolute directory without following any pathname component."""
 
@@ -301,10 +312,17 @@ def open_anchored_compose_root(path: str) -> int:
     flags = _anchored_directory_flags()
     descriptor = os.open("/", flags)
     try:
+        _require_descriptor_acl(descriptor, field="Compose repository path component /")
+        current = Path("/")
         for component in Path(path).parts[1:]:
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+            current /= component
+            _require_descriptor_acl(
+                descriptor,
+                field=f"Compose repository path component {current}",
+            )
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -321,12 +339,19 @@ def open_compose_directory_beneath(
     descriptor = os.dup(root_descriptor)
     os.set_inheritable(descriptor, False)
     try:
+        _require_descriptor_acl(
+            descriptor, field="Compose repository descendant root"
+        )
         for component in relative_parts:
             if component in {"", ".", ".."} or "/" in component:
                 raise ValueError("Compose descendant path is invalid")
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+            _require_descriptor_acl(
+                descriptor,
+                field=f"Compose repository descendant component {component}",
+            )
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -345,6 +370,16 @@ def compose_directory_identity(descriptor: int) -> ComposeDirectoryIdentity:
     )
 
 
+def stable_compose_descriptor_path(descriptor: int) -> str:
+    """Return the Linux parent-process descriptor path used by Compose."""
+
+    if type(descriptor) is not int or descriptor < 0:
+        raise ValueError("Compose directory descriptor is invalid")
+    if not Path("/proc/self/fd").is_dir():
+        raise RuntimeError("stable Compose working-directory handles are unavailable")
+    return f"/proc/{os.getpid()}/fd/{descriptor}"
+
+
 def _open_compose_file_beneath(
     root_descriptor: int,
     relative_parts: tuple[str, ...],
@@ -360,7 +395,16 @@ def _open_compose_file_beneath(
             | getattr(os, "O_NONBLOCK", 0)
             | getattr(os, "O_NOCTTY", 0)
         )
-        return os.open(relative_parts[-1], flags, dir_fd=parent)
+        descriptor = os.open(relative_parts[-1], flags, dir_fd=parent)
+        try:
+            _require_descriptor_acl(
+                descriptor,
+                field=f"Compose input component {relative_parts[-1]}",
+            )
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
     finally:
         os.close(parent)
 

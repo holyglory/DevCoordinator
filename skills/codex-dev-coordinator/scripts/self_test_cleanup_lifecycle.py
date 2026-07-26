@@ -16,7 +16,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 import unittest
 from unittest import mock
 
@@ -25,6 +25,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import devcoordinator.cleanup_lifecycle as cleanup  # noqa: E402
+from devcoordinator.broker_persistence import BrokerPersistence  # noqa: E402
 from devcoordinator.cleanup_lifecycle import (  # noqa: E402
     CleanupBlocked,
     CleanupError,
@@ -317,6 +318,66 @@ def _seed_server(store: AccountStore, project_root: Path) -> None:
             """,
             (HOST_ID, REPO_ID, now, now),
         )
+        connection.execute(
+            """
+            INSERT INTO broker_lease_links(
+                link_id, repo_id, server_definition_id, broker_lease_id,
+                local_lease_id, account_id, broker_socket,
+                broker_service_uid, broker_socket_gid, broker_socket_mode,
+                broker_database_generation, port, protocol, status,
+                broker_operation_id, created_at, updated_at
+            ) VALUES ('broker-lease-link-server', ?, ?, 'broker-lease-server',
+                      'lease-server', 'test-account', '/tmp/test-broker.sock',
+                      0, 0, 432, 'test-generation', 43111, 'tcp', 'released',
+                      'broker-lease-operation', ?, ?)
+            """,
+            (REPO_ID, SERVER_ID, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_assignment_links(
+                link_id, repo_id, server_definition_id,
+                broker_assignment_id, local_assignment_id, account_id,
+                broker_socket, broker_service_uid, broker_socket_gid,
+                broker_socket_mode, broker_database_generation, port, status,
+                broker_operation_id, created_at, updated_at
+            ) VALUES ('broker-assignment-link-server', ?, ?,
+                      'broker-assignment-server', 'assignment-server',
+                      'test-account', '/tmp/test-broker.sock', 0, 0, 432,
+                      'test-generation', 43111, 'released',
+                      'broker-assignment-operation', ?, ?)
+            """,
+            (REPO_ID, SERVER_ID, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_reconciliation_queue(
+                reconciliation_id, link_kind, link_id, repo_id, resource_id,
+                requested_action, operation_id, status, error_code,
+                error_message, attempts, created_at, updated_at, resolved_at
+            ) VALUES ('resolved-server-link', 'assignment',
+                      'broker-assignment-link-server', ?, ?, 'release',
+                      'broker-assignment-operation', 'resolved', 'recovered',
+                      'fixture reconciliation', 1, ?, ?, ?)
+            """,
+            (REPO_ID, SERVER_ID, now, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_lifecycle_links(
+                link_id, repo_id, resource_id, operation,
+                broker_operation_id, broker_plan_id, account_id,
+                broker_socket, broker_service_uid, broker_socket_gid,
+                broker_socket_mode, broker_database_generation,
+                arguments_json, result_json, status, attempts,
+                created_at, updated_at, applied_at
+            ) VALUES ('applied-server-lifecycle', ?, ?, 'resource.retire',
+                      'broker-retire-operation', NULL, 'test-account',
+                      '/tmp/test-broker.sock', 0, 0, 432, 'test-generation',
+                      '{}', '{}', 'applied', 1, ?, ?, ?)
+            """,
+            (REPO_ID, SERVER_ID, now, now, now),
+        )
         _insert_archive_operation(
             connection, operation_id=archive_operation, repo_id=REPO_ID
         )
@@ -329,6 +390,71 @@ def _seed_server(store: AccountStore, project_root: Path) -> None:
                       'archive server', 'archive-operator', ?, ?, ?)
             """,
             (SERVER_ID, archive_operation, now, now, now),
+        )
+
+
+def _seed_broker_server_projections(store: AccountStore) -> None:
+    BrokerPersistence(store.path, expected_uid=os.geteuid())
+    now = utc_timestamp()
+    uid = os.geteuid()
+    with store.immediate_transaction() as connection:
+        connection.execute(
+            """
+            INSERT INTO broker_acl_principals(
+                uid, account_id, enabled, updated_at
+            ) VALUES (?, 'test-account', 1, ?)
+            """,
+            (uid, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_resource_acl
+            VALUES (?, ?, 'server', ?, 'port.lease', 1, ?)
+            """,
+            (uid, REPO_ID, SERVER_ID, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_runtime_acl
+            VALUES (?, ?, 'service', ?, 'status', 1, ?)
+            """,
+            (uid, REPO_ID, SERVER_ID, now),
+        )
+        connection.execute(
+            "INSERT INTO broker_assignment_acl VALUES (?, ?, ?, 'port.assign', 1, ?)",
+            (uid, REPO_ID, SERVER_ID, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_assignment_owners
+            VALUES ('assignment-server', ?, 'test-account', ?, ?, ?, ?)
+            """,
+            (uid, REPO_ID, SERVER_ID, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_port_policies
+            VALUES (?, ?, ?, 'tcp', 43111, 43111, 600, 1, ?)
+            """,
+            (uid, REPO_ID, SERVER_ID, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_lease_owners
+            VALUES ('lease-server', ?, 'test-account', ?, ?, 'tcp', ?)
+            """,
+            (uid, REPO_ID, SERVER_ID, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO broker_cleanup_resource_acl(
+                uid, repo_id, resource_kind, resource_id, control_binding_id,
+                immutable_fingerprint, ownership_fingerprint, operation,
+                enabled, updated_at
+            ) VALUES (?, ?, 'server', ?, 'binding-server', 'immutable:server',
+                      'ownership:server', 'cleanup.apply', 1, ?)
+            """,
+            (uid, REPO_ID, SERVER_ID, now),
         )
 
 
@@ -436,6 +562,7 @@ def _lifecycle(
     adapter: ExactStoppedAdapter | None = None,
     docker: FakeDockerBackend | None = None,
     calls: list[tuple[str, str, str, str]] | None = None,
+    prepare_apply: Callable[[Any, str], Mapping[str, Any] | None] | None = None,
 ) -> CleanupLifecycle:
     def authorize(capability: str, kind: str, target: str, actor: str) -> None:
         if calls is not None:
@@ -446,6 +573,7 @@ def _lifecycle(
         lifecycle_adapter=adapter or ExactStoppedAdapter(),
         docker_backend=docker or FakeDockerBackend(),
         authorize=authorize,
+        prepare_apply=prepare_apply,
     )
 
 
@@ -555,6 +683,276 @@ class CleanupLifecycleTests(unittest.TestCase):
                 self.assertTrue(_apply(service, plan)["ok"])
 
             self.assertNotIn("docker", resolutions)
+
+    def test_prepare_apply_runs_after_guards_before_catalog_mutation_and_replays_evidence(
+        self,
+    ) -> None:
+        with _temporary_root(".cleanup-prepare-apply-") as root:
+            project = root / "checkout"
+            project.mkdir(mode=0o700)
+            store = _open_store(root)
+            self.addCleanup(store.close)
+            _seed_project(store, project, archived=True)
+            calls: list[tuple[str, str, str]] = []
+            expected_evidence = {
+                "worker_unregister": {
+                    "status": "unregistered",
+                    "worker_id": REPO_ID,
+                }
+            }
+
+            def prepare_apply(plan: Any, actor: str) -> Mapping[str, Any]:
+                with store.read_transaction() as connection:
+                    durable_plan = connection.execute(
+                        "SELECT status, phase FROM cleanup_plans WHERE plan_id = ?",
+                        (plan.plan_id,),
+                    ).fetchone()
+                    operation = connection.execute(
+                        "SELECT status, phase FROM operations WHERE operation_id = ?",
+                        (plan.plan_id,),
+                    ).fetchone()
+                    repository = connection.execute(
+                        "SELECT state FROM repositories WHERE repo_id = ?",
+                        (REPO_ID,),
+                    ).fetchone()
+                    tombstone = connection.execute(
+                        """
+                        SELECT 1 FROM cleanup_tombstones
+                        WHERE target_kind = 'project' AND target_id = ?
+                        """,
+                        (REPO_ID,),
+                    ).fetchone()
+                self.assertEqual((durable_plan["status"], durable_plan["phase"]), ("planned", "planned"))
+                self.assertEqual((operation["status"], operation["phase"]), ("planned", "planned"))
+                self.assertEqual(repository["state"], "active")
+                self.assertIsNone(tombstone)
+                calls.append((plan.plan_id, plan.target_id, actor))
+                return expected_evidence
+
+            service = _lifecycle(store, prepare_apply=prepare_apply)
+            plan = service.plan(
+                target_kind="project",
+                target_id=REPO_ID,
+                actor="planner",
+                reason="prepare hook ordering",
+            )
+            self.assertEqual(calls, [], "planning must never execute prepare_apply")
+
+            applied = _apply(service, plan, actor="applier")
+            self.assertEqual(
+                calls,
+                [(plan.plan_id, REPO_ID, "applier")],
+            )
+            self.assertEqual(applied["pre_apply"], expected_evidence)
+            with store.read_transaction() as connection:
+                phase = connection.execute(
+                    """
+                    SELECT status, evidence_json
+                    FROM cleanup_phase_evidence
+                    WHERE plan_id = ? AND phase = 'prepare_apply'
+                    """,
+                    (plan.plan_id,),
+                ).fetchone()
+            self.assertEqual(phase["status"], "succeeded")
+            self.assertEqual(json.loads(phase["evidence_json"]), expected_evidence)
+
+            replayed = _apply(service, plan, actor="replayer")
+            self.assertEqual(
+                calls,
+                [(plan.plan_id, REPO_ID, "applier")],
+                "a succeeded replay must not execute prepare_apply again",
+            )
+            self.assertEqual(replayed["pre_apply"], expected_evidence)
+
+    def test_prepare_apply_failure_leaves_plan_and_catalog_unapplied(self) -> None:
+        with _temporary_root(".cleanup-prepare-failure-") as root:
+            project = root / "checkout"
+            project.mkdir(mode=0o700)
+            store = _open_store(root)
+            self.addCleanup(store.close)
+            _seed_project(store, project, archived=True)
+
+            def fail_prepare(_plan: Any, _actor: str) -> Mapping[str, Any]:
+                raise RuntimeError("native unregister failed")
+
+            service = _lifecycle(store, prepare_apply=fail_prepare)
+            plan = service.plan(
+                target_kind="project",
+                target_id=REPO_ID,
+                actor="planner",
+                reason="prepare failure",
+            )
+            with self.assertRaisesRegex(RuntimeError, "native unregister failed"):
+                _apply(service, plan)
+
+            with store.read_transaction() as connection:
+                durable_plan = connection.execute(
+                    "SELECT status, phase FROM cleanup_plans WHERE plan_id = ?",
+                    (plan.plan_id,),
+                ).fetchone()
+                operation = connection.execute(
+                    "SELECT status, phase FROM operations WHERE operation_id = ?",
+                    (plan.plan_id,),
+                ).fetchone()
+                repository = connection.execute(
+                    "SELECT state FROM repositories WHERE repo_id = ?",
+                    (REPO_ID,),
+                ).fetchone()
+                prepare_phase = connection.execute(
+                    """
+                    SELECT 1 FROM cleanup_phase_evidence
+                    WHERE plan_id = ? AND phase = 'prepare_apply'
+                    """,
+                    (plan.plan_id,),
+                ).fetchone()
+                tombstone = connection.execute(
+                    """
+                    SELECT 1 FROM cleanup_tombstones
+                    WHERE target_kind = 'project' AND target_id = ?
+                    """,
+                    (REPO_ID,),
+                ).fetchone()
+            self.assertEqual((durable_plan["status"], durable_plan["phase"]), ("planned", "planned"))
+            self.assertEqual((operation["status"], operation["phase"]), ("planned", "planned"))
+            self.assertEqual(repository["state"], "active")
+            self.assertIsNone(prepare_phase)
+            self.assertIsNone(tombstone)
+
+            retry = _lifecycle(
+                store,
+                prepare_apply=lambda _plan, _actor: {"status": "unregistered"},
+            )
+            self.assertTrue(_apply(retry, plan)["ok"])
+
+    def test_prepare_apply_is_not_called_before_apply_guards_pass(self) -> None:
+        with _temporary_root(".cleanup-prepare-guards-") as root:
+            project = root / "checkout"
+            project.mkdir(mode=0o700)
+            store = _open_store(root)
+            self.addCleanup(store.close)
+            _seed_project(store, project, archived=True)
+            calls: list[str] = []
+            service = _lifecycle(
+                store,
+                prepare_apply=lambda _plan, actor: calls.append(actor) or {},
+            )
+            plan = service.plan(
+                target_kind="project",
+                target_id=REPO_ID,
+                actor="planner",
+                reason="guard ordering",
+            )
+
+            with self.assertRaisesRegex(PlanDriftError, "fingerprint"):
+                service.apply(
+                    plan_id=plan.plan_id,
+                    plan_fingerprint="sha256:" + "0" * 64,
+                    confirmation_phrase=plan.confirmation_phrase,
+                    actor="bad-fingerprint",
+                )
+            with self.assertRaisesRegex(CleanupError, "confirmation"):
+                service.apply(
+                    plan_id=plan.plan_id,
+                    plan_fingerprint=plan.plan_fingerprint,
+                    confirmation_phrase="PURGE PROJECT another target",
+                    actor="bad-confirmation",
+                )
+
+            denied = CleanupLifecycle(
+                store,
+                lifecycle_adapter=ExactStoppedAdapter(),
+                docker_backend=FakeDockerBackend(),
+                authorize=lambda capability, _kind, _target, _actor: (
+                    (_ for _ in ()).throw(CleanupError("apply denied"))
+                    if capability == "cleanup.apply"
+                    else None
+                ),
+                prepare_apply=lambda _plan, actor: calls.append(actor) or {},
+            )
+            with self.assertRaisesRegex(CleanupError, "apply denied"):
+                _apply(denied, plan, actor="denied")
+
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE repository_installations
+                    SET generation = generation + 1
+                    WHERE repo_id = ?
+                    """,
+                    (REPO_ID,),
+                )
+            with self.assertRaisesRegex(PlanDriftError, "identity changed"):
+                _apply(service, plan, actor="drifted")
+            self.assertEqual(calls, [])
+
+    def test_prepare_apply_is_not_called_when_current_blockers_exist(self) -> None:
+        with _temporary_root(".cleanup-prepare-blocked-") as root:
+            project = root / "checkout"
+            project.mkdir(mode=0o700)
+            store = _open_store(root)
+            self.addCleanup(store.close)
+            _seed_project(store, project, archived=True)
+            calls: list[str] = []
+            service = _lifecycle(
+                store,
+                prepare_apply=lambda _plan, actor: calls.append(actor) or {},
+            )
+            plan = service.plan(
+                target_kind="project",
+                target_id=REPO_ID,
+                actor="planner",
+                reason="late blocker",
+            )
+            original_snapshot = service._snapshot
+
+            def blocked_snapshot(
+                target_kind: str, target_id: str, *, allow_absent: bool = False
+            ) -> dict[str, Any]:
+                snapshot = original_snapshot(
+                    target_kind, target_id, allow_absent=allow_absent
+                )
+                if allow_absent:
+                    snapshot = dict(snapshot)
+                    snapshot["blockers"] = [
+                        {"code": "late_blocker", "message": "late blocker"}
+                    ]
+                return snapshot
+
+            with mock.patch.object(service, "_snapshot", side_effect=blocked_snapshot):
+                with self.assertRaises(CleanupBlocked):
+                    _apply(service, plan, actor="blocked")
+            self.assertEqual(calls, [])
+
+    def test_prepare_apply_requires_json_object_evidence_before_mutation(self) -> None:
+        with _temporary_root(".cleanup-prepare-evidence-") as root:
+            project = root / "checkout"
+            project.mkdir(mode=0o700)
+            store = _open_store(root)
+            self.addCleanup(store.close)
+            _seed_project(store, project, archived=True)
+            service = _lifecycle(
+                store,
+                prepare_apply=lambda _plan, _actor: ["not", "an", "object"],  # type: ignore[arg-type,return-value]
+            )
+            plan = service.plan(
+                target_kind="project",
+                target_id=REPO_ID,
+                actor="planner",
+                reason="invalid evidence",
+            )
+            with self.assertRaisesRegex(CleanupError, "JSON object"):
+                _apply(service, plan)
+            with store.read_transaction() as connection:
+                durable_plan = connection.execute(
+                    "SELECT status, phase FROM cleanup_plans WHERE plan_id = ?",
+                    (plan.plan_id,),
+                ).fetchone()
+                repository = connection.execute(
+                    "SELECT state FROM repositories WHERE repo_id = ?",
+                    (REPO_ID,),
+                ).fetchone()
+            self.assertEqual((durable_plan["status"], durable_plan["phase"]), ("planned", "planned"))
+            self.assertEqual(repository["state"], "active")
 
     def test_project_plan_binds_actor_reason_and_retains_catalog_files(self) -> None:
         with _temporary_root(".cleanup-project-") as root:
@@ -823,6 +1221,7 @@ class CleanupLifecycleTests(unittest.TestCase):
             store = _open_store(root)
             self.addCleanup(store.close)
             _seed_server(store, project)
+            _seed_broker_server_projections(store)
             adapter = ExactStoppedAdapter()
             adapter.listener_active = None
             service = _lifecycle(store, adapter=adapter)
@@ -852,6 +1251,7 @@ class CleanupLifecycleTests(unittest.TestCase):
             )
             self.assertFalse(clean.blockers)
             self.assertTrue(_apply(service, clean)["ok"])
+            self.assertTrue(_apply(service, clean, actor="idempotent-replay")["ok"])
             self.assertTrue(log.is_file())
             with store.read_transaction() as connection:
                 definition = connection.execute(
@@ -866,21 +1266,102 @@ class CleanupLifecycleTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM server_environment WHERE server_definition_id=?",
                     (SERVER_ID,),
                 ).fetchone()[0]
+                observation = connection.execute(
+                    "SELECT 1 FROM server_observations WHERE server_definition_id=?",
+                    (SERVER_ID,),
+                ).fetchone()
+                membership = connection.execute(
+                    "SELECT 1 FROM repository_memberships WHERE resource_kind='server' AND host_resource_id=?",
+                    (SERVER_ID,),
+                ).fetchone()
                 lease = connection.execute(
-                    "SELECT status FROM leases WHERE lease_id='lease-server'"
+                    "SELECT 1 FROM leases WHERE lease_id='lease-server'"
                 ).fetchone()
                 assignment = connection.execute(
-                    "SELECT status FROM port_assignments WHERE assignment_id='assignment-server'"
+                    "SELECT 1 FROM port_assignments WHERE assignment_id='assignment-server'"
                 ).fetchone()
                 binding = connection.execute(
-                    "SELECT authority_state FROM control_bindings WHERE binding_id='binding-server'"
+                    "SELECT 1 FROM control_bindings WHERE binding_id='binding-server'"
                 ).fetchone()
-            self.assertIsNotNone(definition, "server audit definition should be retained")
+                broker_links = connection.execute(
+                    """
+                    SELECT
+                      (SELECT COUNT(*) FROM broker_lease_links WHERE server_definition_id=?)
+                      +
+                      (SELECT COUNT(*) FROM broker_assignment_links WHERE server_definition_id=?)
+                      +
+                      (SELECT COUNT(*) FROM broker_reconciliation_queue WHERE resource_id=?)
+                      +
+                      (SELECT COUNT(*) FROM broker_lifecycle_links WHERE resource_id=?)
+                    """,
+                    (SERVER_ID, SERVER_ID, SERVER_ID, SERVER_ID),
+                ).fetchone()[0]
+                broker_projection_count = sum(
+                    connection.execute(statement, parameters).fetchone()[0]
+                    for statement, parameters in (
+                        (
+                            "SELECT COUNT(*) FROM broker_resource_acl WHERE resource_kind='server' AND resource_id=?",
+                            (SERVER_ID,),
+                        ),
+                        (
+                            "SELECT COUNT(*) FROM broker_runtime_acl WHERE resource_kind='service' AND resource_id=?",
+                            (SERVER_ID,),
+                        ),
+                        (
+                            "SELECT COUNT(*) FROM broker_assignment_acl WHERE server_definition_id=?",
+                            (SERVER_ID,),
+                        ),
+                        (
+                            "SELECT COUNT(*) FROM broker_assignment_owners WHERE server_definition_id=?",
+                            (SERVER_ID,),
+                        ),
+                        (
+                            "SELECT COUNT(*) FROM broker_port_policies WHERE server_definition_id=?",
+                            (SERVER_ID,),
+                        ),
+                        (
+                            "SELECT COUNT(*) FROM broker_lease_owners WHERE server_definition_id=?",
+                            (SERVER_ID,),
+                        ),
+                        (
+                            "SELECT COUNT(*) FROM broker_cleanup_resource_acl WHERE resource_kind='server' AND resource_id=?",
+                            (SERVER_ID,),
+                        ),
+                    )
+                )
+                tombstone = connection.execute(
+                    "SELECT evidence_json FROM cleanup_tombstones WHERE target_kind='server' AND target_id=?",
+                    (SERVER_ID,),
+                ).fetchone()
+                history = connection.execute(
+                    "SELECT action FROM resource_lifecycle_history WHERE resource_kind='server' AND resource_id=?",
+                    (SERVER_ID,),
+                ).fetchone()
+                operation = connection.execute(
+                    "SELECT status FROM operations WHERE operation_id=?",
+                    (clean.plan_id,),
+                ).fetchone()
+                phase_count = connection.execute(
+                    "SELECT COUNT(*) FROM cleanup_phase_evidence WHERE plan_id=?",
+                    (clean.plan_id,),
+                ).fetchone()[0]
+            self.assertIsNone(definition)
             self.assertEqual(arguments, 0)
             self.assertEqual(environment, 0)
-            self.assertEqual(lease["status"], "released")
-            self.assertEqual(assignment["status"], "inactive")
-            self.assertEqual(binding["authority_state"], "retired")
+            self.assertIsNone(observation)
+            self.assertIsNone(membership)
+            self.assertIsNone(lease)
+            self.assertIsNone(assignment)
+            self.assertIsNone(binding)
+            self.assertEqual(broker_links, 0)
+            self.assertEqual(broker_projection_count, 0)
+            self.assertIsNotNone(tombstone)
+            tombstone_evidence = json.loads(tombstone["evidence_json"])
+            self.assertTrue(tombstone_evidence["active_catalog_deleted"])
+            self.assertEqual(tombstone_evidence["retained_log_path"], str(log))
+            self.assertEqual(history["action"], "purged")
+            self.assertEqual(operation["status"], "succeeded")
+            self.assertGreater(phase_count, 0)
             server_ids = {item["id"] for item in store.inventory_v2()["servers"]}
             self.assertNotIn(SERVER_ID, server_ids, "purged server resurrected in active inventory")
             archived = service.list_archives(actor="reader")["archives"]
@@ -889,8 +1370,7 @@ class CleanupLifecycleTests(unittest.TestCase):
                 for item in archived
                 if item["target_kind"] == "server" and item["target_id"] == SERVER_ID
             ]
-            self.assertEqual(len(removed), 1)
-            self.assertEqual(removed[0]["status"], "removed")
+            self.assertEqual(removed, [])
 
     def test_project_purge_retains_secondary_worktree_until_exact_removal(self) -> None:
         with _temporary_root(".cleanup-worktree-") as root:

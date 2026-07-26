@@ -17,6 +17,9 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
 
         XCTAssertEqual(fixture.store.inventory.projectUsage.count, 6)
         XCTAssertEqual(fixture.store.projectGroups.filter(\.isRepository).count, 6)
+        XCTAssertTrue(fixture.store.repositoryTrees.isEmpty)
+        XCTAssertFalse(fixture.store.repositoryTreesAreAuthoritative)
+        XCTAssertTrue(fixture.store.repositoryTreeContractUnavailable)
         XCTAssertFalse(fixture.store.projectGroups.contains { !$0.isRepository })
         XCTAssertEqual(fixture.store.filteredServers.count, 19)
         XCTAssertNotNil(fixture.store.actionIssue)

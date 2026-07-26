@@ -351,6 +351,453 @@ class BrokerLinkStore:
             ).fetchone()
         return _assignment_link(row)
 
+    def revoke_server_materialization(
+        self,
+        *,
+        profile: BrokerClientProfile,
+        repository: BrokerRepositoryProfile,
+        server_name: str,
+        server_definition_id: str,
+        broker_operation_id: str,
+        immutable_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Mirror a completed service-owned permanent server removal.
+
+        The protected profile used to make the cleanup call may still be held
+        by another process.  Record the exact removed incarnation before
+        deleting its local active projection; ``_ensure_server`` consults this
+        fence in the same transaction as materialization.  Reinstallation is
+        intentionally unaffected because it publishes a new immutable ID.
+        """
+
+        profile_repository = profile.repository(repository.canonical_root)
+        if profile_repository.repo_id != repository.repo_id:
+            raise RuntimeError("broker profile repository identity changed")
+        enrolled_id = repository.server_ids.get(str(server_name))
+        if enrolled_id != server_definition_id:
+            raise RuntimeError(
+                "server revocation does not match the exact protected-profile identity"
+            )
+        if not broker_operation_id or not immutable_fingerprint:
+            raise ValueError(
+                "server revocation requires operation and immutable-fingerprint evidence"
+            )
+        self._ensure_repository(repository)
+        timestamp = utc_timestamp()
+        with self._store.immediate_transaction() as connection:
+            local = connection.execute(
+                """
+                SELECT repo_id, name FROM server_definitions
+                WHERE server_definition_id = ?
+                """,
+                (server_definition_id,),
+            ).fetchone()
+            if local is not None and (
+                str(local["repo_id"]) != repository.repo_id
+                or str(local["name"]) != server_name
+            ):
+                raise RuntimeError(
+                    "server revocation conflicts with the local normalized identity"
+                )
+            unresolved = connection.execute(
+                """
+                SELECT 'lease' AS source, status
+                FROM broker_lease_links
+                WHERE repo_id = ? AND server_definition_id = ?
+                  AND status != 'released'
+                UNION ALL
+                SELECT 'assignment' AS source, status
+                FROM broker_assignment_links
+                WHERE repo_id = ? AND server_definition_id = ?
+                  AND status != 'released'
+                UNION ALL
+                SELECT 'reconciliation' AS source, status
+                FROM broker_reconciliation_queue
+                WHERE repo_id = ? AND resource_id = ?
+                  AND status IN ('pending', 'operator_required')
+                UNION ALL
+                SELECT 'lifecycle' AS source, status
+                FROM broker_lifecycle_links
+                WHERE repo_id = ? AND resource_id = ?
+                  AND status IN (
+                    'pending', 'reconciliation_required', 'operator_required'
+                  )
+                LIMIT 1
+                """,
+                (
+                    repository.repo_id,
+                    server_definition_id,
+                    repository.repo_id,
+                    server_definition_id,
+                    repository.repo_id,
+                    server_definition_id,
+                    repository.repo_id,
+                    server_definition_id,
+                ),
+            ).fetchone()
+            if unresolved is not None:
+                raise RuntimeError(
+                    "permanent server revocation has unresolved local "
+                    f"{unresolved['source']} evidence ({unresolved['status']})"
+                )
+            existing = connection.execute(
+                """
+                SELECT * FROM broker_server_materialization_revocations
+                WHERE repo_id = ? AND server_definition_id = ?
+                """,
+                (repository.repo_id, server_definition_id),
+            ).fetchone()
+            expected = (
+                server_name,
+                broker_operation_id,
+                immutable_fingerprint,
+                profile.service.database_generation,
+            )
+            if existing is not None and tuple(
+                str(existing[key])
+                for key in (
+                    "server_name",
+                    "broker_operation_id",
+                    "immutable_fingerprint",
+                    "broker_database_generation",
+                )
+            ) != expected:
+                raise RuntimeError(
+                    "server revocation identity conflicts with retained evidence"
+                )
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO broker_server_materialization_revocations(
+                        repo_id, server_definition_id, server_name,
+                        broker_operation_id, immutable_fingerprint,
+                        broker_database_generation, revoked_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        repository.repo_id,
+                        server_definition_id,
+                        server_name,
+                        broker_operation_id,
+                        immutable_fingerprint,
+                        profile.service.database_generation,
+                        timestamp,
+                    ),
+                )
+
+            # Only terminal broker link evidence may be collapsed.  The exact
+            # permanent-removal operation and fingerprint remain above.
+            connection.execute(
+                "DELETE FROM broker_lease_links WHERE repo_id = ? AND server_definition_id = ? AND status = 'released'",
+                (repository.repo_id, server_definition_id),
+            )
+            connection.execute(
+                "DELETE FROM broker_assignment_links WHERE repo_id = ? AND server_definition_id = ? AND status = 'released'",
+                (repository.repo_id, server_definition_id),
+            )
+            connection.execute(
+                "DELETE FROM broker_reconciliation_queue WHERE repo_id = ? AND resource_id = ? AND status = 'resolved'",
+                (repository.repo_id, server_definition_id),
+            )
+            connection.execute(
+                "DELETE FROM broker_lifecycle_links WHERE repo_id = ? AND resource_id = ? AND status = 'applied'",
+                (repository.repo_id, server_definition_id),
+            )
+            connection.execute(
+                """
+                UPDATE leases SET status = 'released',
+                    deactivated_at = COALESCE(deactivated_at, ?), updated_at = ?
+                WHERE repo_id = ? AND server_definition_id = ?
+                  AND status = 'active'
+                """,
+                (timestamp, timestamp, repository.repo_id, server_definition_id),
+            )
+            connection.execute(
+                "DELETE FROM leases WHERE repo_id = ? AND server_definition_id = ? AND status IN ('released', 'stale')",
+                (repository.repo_id, server_definition_id),
+            )
+            connection.execute(
+                """
+                UPDATE port_assignments SET status = 'inactive',
+                    deactivated_at = COALESCE(deactivated_at, ?), updated_at = ?
+                WHERE repo_id = ? AND server_name = ? AND status = 'active'
+                """,
+                (timestamp, timestamp, repository.repo_id, server_name),
+            )
+            connection.execute(
+                "DELETE FROM port_assignments WHERE repo_id = ? AND server_name = ? AND status = 'inactive'",
+                (repository.repo_id, server_name),
+            )
+            connection.execute(
+                "DELETE FROM repository_memberships WHERE repo_id = ? AND resource_kind = 'server' AND host_resource_id = ?",
+                (repository.repo_id, server_definition_id),
+            )
+            connection.execute(
+                "DELETE FROM unassigned_resources WHERE resource_kind = 'server' AND resource_id = ?",
+                (server_definition_id,),
+            )
+            connection.execute(
+                "DELETE FROM startup_policies WHERE resource_kind = 'server' AND resource_id = ?",
+                (server_definition_id,),
+            )
+            deleted = connection.execute(
+                "DELETE FROM server_definitions WHERE repo_id = ? AND server_definition_id = ?",
+                (repository.repo_id, server_definition_id),
+            ).rowcount
+        return {
+            "status": "revoked",
+            "repo_id": repository.repo_id,
+            "server_definition_id": server_definition_id,
+            "server_name": server_name,
+            "broker_operation_id": broker_operation_id,
+            "immutable_fingerprint": immutable_fingerprint,
+            "active_projection_deleted": bool(deleted),
+            "already_revoked": existing is not None,
+        }
+
+    def revoke_repository_materialization(
+        self,
+        *,
+        profile: BrokerClientProfile,
+        repository: BrokerRepositoryProfile,
+        broker_operation_id: str,
+        immutable_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Fence one removed repository generation in the account journal."""
+
+        exact = profile.repository(repository.canonical_root)
+        if (
+            exact.repo_id != repository.repo_id
+            or exact.generation != repository.generation
+        ):
+            raise RuntimeError("repository revocation identity changed")
+        if not broker_operation_id or not immutable_fingerprint:
+            raise ValueError(
+                "repository revocation requires operation and immutable-fingerprint evidence"
+            )
+        expected = (
+            broker_operation_id,
+            immutable_fingerprint,
+            profile.service.database_generation,
+        )
+        with self._store.read_transaction() as connection:
+            retained = connection.execute(
+                """
+                SELECT * FROM broker_repository_materialization_revocations
+                WHERE repo_id = ? AND repository_generation = ?
+                """,
+                (repository.repo_id, repository.generation),
+            ).fetchone()
+            retained_repository = connection.execute(
+                """
+                SELECT canonical_root, state, generation FROM repositories
+                WHERE repo_id = ?
+                """,
+                (repository.repo_id,),
+            ).fetchone()
+        if retained is not None:
+            if tuple(
+                str(retained[key])
+                for key in (
+                    "broker_operation_id",
+                    "immutable_fingerprint",
+                    "broker_database_generation",
+                )
+            ) != expected:
+                raise RuntimeError(
+                    "repository revocation conflicts with retained evidence"
+                )
+            if (
+                retained_repository is None
+                or str(retained_repository["canonical_root"])
+                != repository.canonical_root
+                or int(retained_repository["generation"])
+                <= repository.generation
+            ):
+                raise RuntimeError(
+                    "retained repository revocation lacks its fenced local projection"
+                )
+            return {
+                "status": "already_revoked",
+                "repo_id": repository.repo_id,
+                "repository_generation": repository.generation,
+                "broker_operation_id": broker_operation_id,
+                "immutable_fingerprint": immutable_fingerprint,
+                "active_projection_removed": True,
+                "deleted_server_definitions": 0,
+                "already_revoked": True,
+            }
+        self._ensure_repository(repository)
+        timestamp = utc_timestamp()
+        with self._store.immediate_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT canonical_root, state, generation FROM repositories
+                WHERE repo_id = ?
+                """,
+                (repository.repo_id,),
+            ).fetchone()
+            if row is None or str(row["canonical_root"]) != repository.canonical_root:
+                raise RuntimeError(
+                    "repository revocation conflicts with the local normalized identity"
+                )
+            if int(row["generation"]) != repository.generation:
+                raise RuntimeError(
+                    "repository revocation generation changed before it was fenced"
+                )
+            unresolved = connection.execute(
+                """
+                SELECT 'lease' AS source, status FROM broker_lease_links
+                WHERE repo_id = ? AND status != 'released'
+                UNION ALL
+                SELECT 'assignment' AS source, status FROM broker_assignment_links
+                WHERE repo_id = ? AND status != 'released'
+                UNION ALL
+                SELECT 'reconciliation' AS source, status
+                FROM broker_reconciliation_queue
+                WHERE repo_id = ? AND status IN ('pending', 'operator_required')
+                UNION ALL
+                SELECT 'lifecycle' AS source, status FROM broker_lifecycle_links
+                WHERE repo_id = ? AND status IN (
+                    'pending', 'reconciliation_required', 'operator_required'
+                )
+                LIMIT 1
+                """,
+                (
+                    repository.repo_id,
+                    repository.repo_id,
+                    repository.repo_id,
+                    repository.repo_id,
+                ),
+            ).fetchone()
+            if unresolved is not None:
+                raise RuntimeError(
+                    "permanent repository revocation has unresolved local "
+                    f"{unresolved['source']} evidence ({unresolved['status']})"
+                )
+            existing = connection.execute(
+                """
+                SELECT * FROM broker_repository_materialization_revocations
+                WHERE repo_id = ? AND repository_generation = ?
+                """,
+                (repository.repo_id, repository.generation),
+            ).fetchone()
+            if existing is not None and tuple(
+                str(existing[key])
+                for key in (
+                    "broker_operation_id",
+                    "immutable_fingerprint",
+                    "broker_database_generation",
+                )
+            ) != expected:
+                raise RuntimeError(
+                    "repository revocation conflicts with retained evidence"
+                )
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO broker_repository_materialization_revocations(
+                        repo_id, repository_generation, broker_operation_id,
+                        immutable_fingerprint, broker_database_generation,
+                        revoked_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        repository.repo_id,
+                        repository.generation,
+                        broker_operation_id,
+                        immutable_fingerprint,
+                        profile.service.database_generation,
+                        timestamp,
+                    ),
+                )
+            connection.execute(
+                "DELETE FROM broker_lease_links WHERE repo_id = ? AND status = 'released'",
+                (repository.repo_id,),
+            )
+            connection.execute(
+                "DELETE FROM broker_assignment_links WHERE repo_id = ? AND status = 'released'",
+                (repository.repo_id,),
+            )
+            connection.execute(
+                "DELETE FROM broker_reconciliation_queue WHERE repo_id = ? AND status = 'resolved'",
+                (repository.repo_id,),
+            )
+            connection.execute(
+                "DELETE FROM broker_lifecycle_links WHERE repo_id = ? AND status = 'applied'",
+                (repository.repo_id,),
+            )
+            connection.execute(
+                """
+                UPDATE leases SET status = 'released',
+                    deactivated_at = COALESCE(deactivated_at, ?), updated_at = ?
+                WHERE repo_id = ? AND status = 'active'
+                """,
+                (timestamp, timestamp, repository.repo_id),
+            )
+            connection.execute(
+                "DELETE FROM leases WHERE repo_id = ? AND status IN ('released', 'stale')",
+                (repository.repo_id,),
+            )
+            connection.execute(
+                """
+                UPDATE port_assignments SET status = 'inactive',
+                    deactivated_at = COALESCE(deactivated_at, ?), updated_at = ?
+                WHERE repo_id = ? AND status = 'active'
+                """,
+                (timestamp, timestamp, repository.repo_id),
+            )
+            connection.execute(
+                "DELETE FROM port_assignments WHERE repo_id = ? AND status = 'inactive'",
+                (repository.repo_id,),
+            )
+            connection.execute(
+                "DELETE FROM repository_memberships WHERE repo_id = ? AND resource_kind = 'server'",
+                (repository.repo_id,),
+            )
+            deleted_servers = connection.execute(
+                "DELETE FROM server_definitions WHERE repo_id = ?",
+                (repository.repo_id,),
+            ).rowcount
+            connection.execute(
+                """
+                UPDATE repository_installations
+                SET status = 'disabled', startup_fenced = 1,
+                    generation = generation + 1,
+                    reason = 'permanent broker project removal',
+                    actor = 'broker-profile-mirror', updated_at = ?
+                WHERE repo_id = ?
+                """,
+                (timestamp, repository.repo_id),
+            )
+            changed = connection.execute(
+                """
+                UPDATE repositories SET state = 'missing', generation = ?,
+                    updated_at = ?
+                WHERE repo_id = ? AND generation = ?
+                """,
+                (
+                    repository.generation + 1,
+                    timestamp,
+                    repository.repo_id,
+                    repository.generation,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError(
+                    "repository revocation changed before active projection removal"
+                )
+        return {
+            "status": "revoked",
+            "repo_id": repository.repo_id,
+            "repository_generation": repository.generation,
+            "broker_operation_id": broker_operation_id,
+            "immutable_fingerprint": immutable_fingerprint,
+            "active_projection_removed": True,
+            "deleted_server_definitions": deleted_servers,
+            "already_revoked": existing is not None,
+        }
+
     def bind_local_assignment(
         self, link_id: str, local_assignment_id: str
     ) -> BrokerLink:
@@ -1178,6 +1625,20 @@ class BrokerLinkStore:
                 raise RuntimeError(
                     "local normalized repository does not match the root-provisioned broker enrollment"
                 )
+            revoked = connection.execute(
+                """
+                SELECT broker_operation_id
+                FROM broker_server_materialization_revocations
+                WHERE repo_id = ? AND server_definition_id = ?
+                """,
+                (repository.repo_id, server_definition_id),
+            ).fetchone()
+            if revoked is not None:
+                raise RuntimeError(
+                    "server incarnation was permanently removed and cannot be "
+                    "materialized from a stale broker profile; explicitly reinstall it "
+                    "through the Coordinator skill"
+                )
             connection.execute(
                 """
                 INSERT INTO server_definitions(
@@ -1210,10 +1671,12 @@ class BrokerLinkStore:
         host_id = self._store.ensure_local_host()
         timestamp = utc_timestamp()
         with self._store.immediate_transaction() as connection:
+            reactivated = False
             rows = list(
                 connection.execute(
                     """
-                    SELECT repo_id, canonical_root FROM repositories
+                    SELECT repo_id, canonical_root, state, generation
+                    FROM repositories
                     WHERE repo_id = ? OR canonical_root = ?
                     """,
                     (repository.repo_id, repository.canonical_root),
@@ -1246,6 +1709,56 @@ class BrokerLinkStore:
                         timestamp,
                     ),
                 )
+            else:
+                current = rows[0]
+                current_generation = int(current["generation"])
+                revoked = connection.execute(
+                    """
+                    SELECT 1
+                    FROM broker_repository_materialization_revocations
+                    WHERE repo_id = ? AND repository_generation = ?
+                    """,
+                    (repository.repo_id, repository.generation),
+                ).fetchone()
+                if revoked is not None or repository.generation < current_generation:
+                    raise RuntimeError(
+                        "repository generation was permanently removed and cannot be materialized from a stale broker profile; explicitly reinstall it through the Coordinator skill"
+                    )
+                if repository.generation == current_generation:
+                    if str(current["state"]) != "active":
+                        raise RuntimeError(
+                            "repository is permanently removed; explicitly reinstall it through the Coordinator skill"
+                        )
+                else:
+                    current_state = str(current["state"])
+                    if current_state == "missing" and (
+                        repository.generation != current_generation + 1
+                    ):
+                        raise RuntimeError(
+                            "protected repository generation is not the next explicit reinstall incarnation"
+                        )
+                    if current_state not in {"active", "missing"}:
+                        raise RuntimeError(
+                            "protected repository generation cannot reconcile the local repository state"
+                        )
+                    connection.execute(
+                        """
+                        UPDATE repositories SET state = 'active', generation = ?,
+                            display_name = ?, updated_at = ?
+                        WHERE repo_id = ? AND state = ?
+                          AND generation = ?
+                        """,
+                        (
+                            repository.generation,
+                            Path(repository.canonical_root).name
+                            or repository.canonical_root,
+                            timestamp,
+                            repository.repo_id,
+                            current_state,
+                            current_generation,
+                        ),
+                    )
+                    reactivated = current_state == "missing"
             connection.execute(
                 """
                 INSERT INTO repository_installations(
@@ -1258,6 +1771,19 @@ class BrokerLinkStore:
                 """,
                 (repository.repo_id, timestamp),
             )
+            if reactivated:
+                connection.execute(
+                    """
+                    UPDATE repository_installations
+                    SET status = 'installed', startup_fenced = 0,
+                        generation = generation + 1,
+                        actor = 'broker-profile-bootstrap',
+                        reason = 'explicit root-provisioned broker reinstall',
+                        updated_at = ?
+                    WHERE repo_id = ?
+                    """,
+                    (timestamp, repository.repo_id),
+                )
 
     def _begin_release(
         self, table: str, link_id: str, operation_id: str, converter: Any

@@ -4,7 +4,7 @@
   "generator" : "apps\/DevOpsBoard\/Tools\/MenuBarSnapshotMain.swift",
   "height" : 600,
   "schema_version" : 1,
-  "sha256" : "923c576163f1504b5bc489c634d85b3dd619cd5b8bae5e8cf52a2801d941b128",
+  "sha256" : "eba26cb11e7aa4c8b51362254823fcd380e9d7ad35e2c9086902c68109be4410",
   "source" : "isolated-test-fixture",
   "source_files" : [
     "Package.swift",
@@ -17,6 +17,6 @@
     "Tools\/MenuBarSnapshotMain.swift",
     "Tools\/SnapshotProvenance.swift"
   ],
-  "source_sha256" : "7b619e035e405efa7d28f0f5f7c761dca65ac5cbd8ec40bbeadac47988bcb23a",
+  "source_sha256" : "f8fd64184fb815f8e5d15535cbd53dc4c1901599cd27d5cd1feac4ebdf0d3398",
   "width" : 430
 }

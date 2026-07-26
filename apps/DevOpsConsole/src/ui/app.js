@@ -44,7 +44,9 @@
     logs: new Map(),       // 'srv:<id>' | 'dock:<name>' -> {loading,text,error,at}
     busy: new Set(),       // action keys currently in flight
     reveal: new Set(),     // pages currently showing their hidden items
-    treeExpanded: new Set(), // project usage_keys explicitly expanded on the Projects page
+    treeExpanded: new Set(), // repository-family IDs explicitly expanded on the Projects page
+    temporaryScopesExpanded: new Set(), // one nested temporary repo disclosure at a time
+    projectScopePages: new Map(), // bounded member page per disclosed root/temporary repo scope
     serverGroupsExpanded: new Set(), // transient Servers-page project disclosure (at most one)
     dockerGroupsExpanded: new Set(), // transient Docker-page project disclosure (at most one)
     resourcePages: { projects: 0, servers: 0, docker: 0 }, // zero-based page per large collection
@@ -1217,6 +1219,19 @@
     }, icon('archive'), compact ? null : 'Archive');
   }
 
+  function workerRemoveButton(server, { compact = false } = {}) {
+    if (state.session?.accessAdmin !== true || !server?.supervision) {
+      return compact ? ghostIconSlot() : null;
+    }
+    return h('button', {
+      class: compact ? 'iconbtn' : 'btn small', type: 'button',
+      'data-fk': `worker-remove:${server.id}`,
+      'aria-label': `Remove worker ${server.name || server.id}`,
+      title: 'Remove worker — first stop, archive and hide it; permanent deletion is a separate reviewed step',
+      onclick: (event) => openWorkerRemovalDialog(server, event.currentTarget),
+    }, icon('trash'), compact ? null : 'Remove worker');
+  }
+
   function lifecycleList(value) {
     if (!Array.isArray(value)) return [];
     return value.map((item) => {
@@ -1240,12 +1255,23 @@
     const model = ui.lifecycleDialog;
     if (!model) return;
     const { action, target, stage, plan } = model;
-    const isArchive = action === 'archive';
-    const isPurge = action === 'purge';
+    const isWorkerRemove = action === 'worker-remove';
+    const plannedAction = isWorkerRemove ? String(plan?.action || '') : action;
+    const workerPermanentStage = isWorkerRemove && (
+      model.archivedInThisJourney || ['purge', 'forget'].includes(plannedAction)
+    );
+    const isArchive = action === 'archive' || (isWorkerRemove && !workerPermanentStage);
+    const isPurge = action === 'purge' || workerPermanentStage;
     const isRestore = action === 'restore';
     const busy = stage === 'planning' || stage === 'applying';
-    const title = isArchive ? 'Archive resource' : isPurge ? 'Remove permanently' : 'Restore resource';
-    const summary = isArchive
+    const title = isWorkerRemove
+      ? (isPurge ? 'Permanently remove worker' : 'Remove worker')
+      : isArchive ? 'Archive resource' : isPurge ? 'Remove permanently' : 'Restore resource';
+    const summary = isWorkerRemove && isPurge
+      ? 'This worker is already stopped, archived and hidden. Permanent removal deletes its active definition and projections. Its no-resurrection tombstone, audit history, crash traces and log links remain.'
+      : isWorkerRemove
+        ? 'Removal first stops this worker, disables automatic restart, archives its coordinator record and hides it from active views. Permanent deletion is offered only after that succeeds.'
+        : isArchive
       ? 'Archiving stops and fences this exact coordinator resource. Its data and history are retained and it remains discoverable here.'
       : isPurge
         ? 'Permanent removal is available only after archival. Review the coordinator plan and type its exact confirmation phrase.'
@@ -1255,7 +1281,7 @@
     $('#lifecycle-target').replaceChildren(
       h('strong', null, target.display_name),
       h('span', { class: 'meta-passive' },
-        `${lifecycleKindLabel(target.target_kind)} managed by the server-wide coordinator`));
+        `${isWorkerRemove ? 'Supervised worker' : lifecycleKindLabel(target.target_kind)} managed by the server-wide coordinator`));
     const reason = $('#lifecycle-reason');
     reason.disabled = busy || stage === 'planned';
 
@@ -1268,11 +1294,15 @@
         : 'Applying the exact reviewed plan…'));
     } else if (plan) {
       planHost.replaceChildren(...[
+        isWorkerRemove && model.archivedInThisJourney
+          ? h('p', { class: 'worker-archived-note', role: 'status' },
+              'Worker archived successfully. It is stopped, automatic restart is disabled, and it is hidden from active views. Keeping it archived is safe.')
+          : null,
         lifecyclePlanSection('Effects', plan.effects),
         lifecyclePlanSection('Retained', plan.retained),
         lifecyclePlanSection('Deleted permanently', plan.deleted),
         lifecyclePlanSection('Blockers', plan.blockers, true),
-      ]);
+      ].filter(Boolean));
     } else {
       planHost.replaceChildren();
     }
@@ -1288,15 +1318,47 @@
     submit.textContent = busy
       ? (stage === 'planning' ? 'Reviewing…' : isRestore ? 'Restoring…' : 'Applying…')
       : isRestore ? 'Restore'
-        : stage === 'planned' ? (isPurge ? 'Remove permanently' : 'Archive')
-          : (isPurge ? 'Review removal' : 'Review archive');
+        : stage === 'planned' ? (isPurge ? 'Remove permanently' : (isWorkerRemove ? 'Archive worker' : 'Archive'))
+          : (isWorkerRemove ? (model.archivedInThisJourney ? 'Review permanent removal' : 'Review removal')
+            : (isPurge ? 'Review removal' : 'Review archive'));
+    $('#lifecycle-cancel').textContent = isWorkerRemove && model.archivedInThisJourney
+      ? 'Keep archived'
+      : 'Cancel';
     const blocked = lifecycleList(plan?.blockers).length > 0;
     const phraseMismatch = !!phrase && $('#lifecycle-confirm').value !== phrase;
     submit.disabled = busy || blocked || phraseMismatch;
   }
 
+  function openWorkerRemovalDialog(server, trigger) {
+    if (state.session?.accessAdmin !== true || !server?.supervision) return;
+    const inventoryProblems = authoritativeInventoryProblemsOf(state.overview);
+    if (inventoryProblems.length) {
+      showBanner('Worker removal is disabled until every active resource belongs to an authoritative repository scope.');
+      return;
+    }
+    ui.lifecycleDialog = {
+      action: 'worker-remove',
+      target: lifecycleTarget('server', server.id, server.name || 'Unnamed worker', 'servers'),
+      stage: 'intro',
+      plan: null,
+      archivedInThisJourney: false,
+      returnFocusKey: trigger?.dataset?.fk || null,
+    };
+    $('#lifecycle-form').reset();
+    $('#lifecycle-form-error').hidden = true;
+    renderLifecycleDialog();
+    const dialog = $('#lifecycle-dialog');
+    dialog.showModal();
+    queueMicrotask(() => $('#lifecycle-reason').focus());
+  }
+
   function openLifecycleDialog(action, target, trigger) {
     if (!lifecycleAvailable() || !target) return;
+    const inventoryProblems = authoritativeInventoryProblemsOf(state.overview);
+    if (inventoryProblems.length) {
+      showBanner('Lifecycle controls are disabled until every active resource belongs to an authoritative repository scope.');
+      return;
+    }
     ui.lifecycleDialog = {
       action,
       target,
@@ -1371,7 +1433,110 @@
     if (!model || ['planning', 'applying'].includes(model.stage)) return;
     const error = $('#lifecycle-form-error');
     error.hidden = true;
+    if (authoritativeInventoryProblemsOf(state.overview).length) {
+      error.textContent = 'Inventory changed: every active resource must belong to a repository scope before this action can continue.';
+      error.hidden = false;
+      return;
+    }
     try {
+      if (model.action === 'worker-remove') {
+        const workerRequest = (plan = null, confirmationPhrase = null) => {
+          const body = {
+            id: model.target.target_id,
+            action: 'remove',
+            reason: $('#lifecycle-reason').value,
+          };
+          if (plan) {
+            body.remove_plan_id = plan.plan_id;
+            body.remove_plan_fingerprint = plan.plan_fingerprint || plan.fingerprint;
+            body.remove_confirmation_phrase = confirmationPhrase == null
+              ? String(plan.confirmation_phrase || '')
+              : confirmationPhrase;
+          }
+          return api('/api/workers/action', { method: 'POST', body });
+        };
+        const checkedPlan = (response) => {
+          const runtime = response?.runtime;
+          const candidate = runtime?.result?.plan;
+          if (
+            runtime?.action !== 'remove'
+            || runtime?.target?.kind !== 'service'
+            || String(runtime?.target?.id ?? '') !== String(model.target.target_id)
+            || !candidate?.plan_id
+            || !(candidate.plan_fingerprint || candidate.fingerprint)
+            || !['archive', 'purge', 'forget'].includes(candidate.action)
+            || !['effects', 'retained', 'deleted', 'blockers'].every(
+              (field) => Array.isArray(candidate[field]),
+            )
+          ) {
+            throw new ApiError('Coordinator returned an incomplete worker removal plan', 502);
+          }
+          return candidate;
+        };
+
+        if (model.stage === 'intro') {
+          model.stage = 'planning';
+          renderLifecycleDialog();
+          model.plan = checkedPlan(await workerRequest());
+          model.stage = 'planned';
+          renderLifecycleDialog();
+          queueMicrotask(() => {
+            if (['purge', 'forget'].includes(model.plan.action)
+                && model.plan.confirmation_phrase) $('#lifecycle-confirm').focus();
+            else $('#lifecycle-submit').focus();
+          });
+          return;
+        }
+
+        const permanent = ['purge', 'forget'].includes(model.plan?.action);
+        const phrase = String(model.plan?.confirmation_phrase || '');
+        if (permanent && (!phrase || $('#lifecycle-confirm').value !== phrase)) {
+          throw new ApiError('Type the exact confirmation phrase before permanent removal', 400);
+        }
+        model.stage = 'applying';
+        renderLifecycleDialog();
+        const applied = await workerRequest(
+          model.plan,
+          permanent ? $('#lifecycle-confirm').value : '',
+        );
+        const runtime = applied?.runtime;
+        if (permanent) {
+          if (runtime?.classification !== 'worker_removed') {
+            throw new ApiError('Coordinator did not prove permanent worker removal', 409, applied);
+          }
+          closeLifecycleDialog({ restoreFocus: false });
+          await Promise.all([
+            refreshOverview({ force: true }),
+            loadArchives({ force: true }),
+          ]);
+          renderAll(true);
+          announce(`${model.target.display_name} removed permanently`);
+          return;
+        }
+        if (runtime?.classification !== 'worker_archived') {
+          throw new ApiError('Coordinator did not prove the worker was archived and stopped', 409, applied);
+        }
+
+        // Archival and permanent deletion are intentionally two distinct
+        // mutations. The only automatic follow-up is a read-only purge plan.
+        model.archivedInThisJourney = true;
+        model.plan = null;
+        model.stage = 'planning';
+        renderLifecycleDialog();
+        await Promise.all([
+          refreshOverview({ force: true }),
+          loadArchives({ force: true }),
+        ]);
+        model.plan = checkedPlan(await workerRequest());
+        if (!['purge', 'forget'].includes(model.plan.action)) {
+          throw new ApiError('Worker was archived, but the coordinator did not return a permanent-removal plan', 502);
+        }
+        model.stage = 'planned';
+        renderLifecycleDialog();
+        queueMicrotask(() => $('#lifecycle-confirm').focus());
+        announce(`${model.target.display_name} archived and hidden`);
+        return;
+      }
       if (model.action === 'restore') {
         model.stage = 'applying';
         renderLifecycleDialog();
@@ -1433,7 +1598,9 @@
     } catch (err) {
       if (!ui.lifecycleDialog || err.status === 401) return;
       model.stage = model.plan ? 'planned' : 'intro';
-      error.textContent = err.message;
+      error.textContent = model.action === 'worker-remove' && model.archivedInThisJourney && !model.plan
+        ? `Worker was archived successfully, but its permanent-removal plan is unavailable: ${err.message}`
+        : err.message;
       error.hidden = false;
       renderLifecycleDialog();
     }
@@ -1546,7 +1713,7 @@
   // Hide-gating and auto-unhide use "active" (anything not cleanly down):
   // a crash-looping "Restarting (1) …" container is very much running work
   // and must be neither hideable nor kept hidden.
-  const isContainerActive = (c) => !/^\s*(exited|created|dead)\b/i.test(String(c.status || ''));
+  const isContainerActive = (c) => !/^\s*(exited|created|dead|stopped)\b/i.test(String(c.status || ''));
 
   // ---- docker-hosted web servers ------------------------------------------
   // Mirrors src/routes.mjs parsePublishedPorts: `docker ps` Ports column
@@ -1744,6 +1911,36 @@
         }, 'Next')));
   }
 
+  function projectScopePager(scopeKey, label, info) {
+    if (info.pageCount <= 1) return null;
+    const go = (page) => {
+      ui.projectScopePages.set(scopeKey, page);
+      bump();
+      renderAll(true);
+    };
+    return h('nav', { class: 'resource-pager', 'aria-label': `${label} pages` },
+      h('span', { class: 'resource-page-status', 'aria-live': 'polite' },
+        `Showing ${info.start}–${info.end} of ${info.total} visible ${label.toLowerCase()}`),
+      h('span', { class: 'resource-page-actions' },
+        h('button', {
+          class: 'btn small', type: 'button',
+          'data-fk': `pager:projects:${scopeKey}:prev`,
+          disabled: info.page === 0 || undefined,
+          'aria-label': `Previous ${label.toLowerCase()} page`,
+          'data-disabled-focus-fallback': `pager:projects:${scopeKey}:next`,
+          onclick: () => go(info.page - 1),
+        }, 'Previous'),
+        h('span', { class: 'meta-passive' }, `Page ${info.page + 1} of ${info.pageCount}`),
+        h('button', {
+          class: 'btn small', type: 'button',
+          'data-fk': `pager:projects:${scopeKey}:next`,
+          disabled: info.page + 1 >= info.pageCount || undefined,
+          'aria-label': `Next ${label.toLowerCase()} page`,
+          'data-disabled-focus-fallback': `pager:projects:${scopeKey}:prev`,
+          onclick: () => go(info.page + 1),
+        }, 'Next')));
+  }
+
   // One disclosed project at a time keeps long operational collections
   // scannable and preserves the bounded mounted-resource contract.
   function setExclusiveExpansion(expandedKeys, key) {
@@ -1754,80 +1951,450 @@
 
   // ---------------------------------------------------------------- project grouping
 
-  // Groups come straight from the coordinator's project_usage rows. Immutable
-  // container resource IDs are authoritative when supplied; container names
-  // remain only as compatibility for older rows that omit the ID field. The
-  // UI never re-implements repo-identity heuristics.
+  // Repository families come only from the coordinator's authoritative tree.
+  // The browser joins resources by supplied immutable IDs and fails closed if
+  // the producer omits or corrupts that tree; paths, names, and flat usage rows
+  // never manufacture project membership.
+  function repositoryTreeContractProblemsOf(inv) {
+    const invalid = (name) => [{ kind: 'inventory', name }];
+    if (!inv || typeof inv !== 'object' || Array.isArray(inv)) {
+      return invalid('normalized inventory is missing or malformed');
+    }
+    if (!Array.isArray(inv.repository_trees)) {
+      return invalid('the authoritative repository tree is missing or malformed');
+    }
+    const records = (value) => Array.isArray(value)
+      && value.every((item) => item && typeof item === 'object' && !Array.isArray(item));
+    const exactIds = (value) => Array.isArray(value)
+      && value.every((item) => typeof item === 'string' && item.length > 0)
+      && new Set(value).size === value.length;
+    const repositories = inv.repositories;
+    if (!records(repositories)) return invalid('repository records are missing or malformed');
+
+    const repositoriesById = new Map();
+    const repositoryRoots = new Set();
+    for (const repository of repositories) {
+      const repoId = repository.repo_id;
+      const canonicalRoot = repository.canonical_root;
+      if (typeof repoId !== 'string' || !repoId
+          || typeof canonicalRoot !== 'string' || !canonicalRoot.startsWith('/')
+          || repositoriesById.has(repoId) || repositoryRoots.has(canonicalRoot)) {
+        return invalid('repository identities are incomplete or duplicated');
+      }
+      repositoriesById.set(repoId, repository);
+      repositoryRoots.add(canonicalRoot);
+    }
+
+    const normalizedResources = inv.resources;
+    if (!normalizedResources || typeof normalizedResources !== 'object'
+        || !records(normalizedResources.servers)
+        || !records(normalizedResources.docker)
+        || !records(normalizedResources.databases)
+        || !records(inv.memberships)
+        || !records(inv.observations?.docker)
+        || !records(inv.observations?.databases)
+        || !records(inv.unassigned_resources)
+        || !records(inv.lifecycle_violations)) {
+      return invalid('normalized repository resource evidence is missing or malformed');
+    }
+
+    // An authoritative tree can coexist with producer-reported ownership
+    // failures. Those resources remain visible as blocked diagnostics, but
+    // are not invented as repository members by this client.
+    const reportedProblems = [...inv.unassigned_resources, ...inv.lifecycle_violations];
+    const reportedUnassignedServers = new Set();
+    const reportedUnassignedContainers = new Set();
+    const reportedUnassignedDatabases = new Set();
+    const reportedLifecycleServers = new Set();
+    const reportedLifecycleContainers = new Set();
+    for (const item of reportedProblems) {
+      const kind = item.resource_kind;
+      const id = item.resource_id;
+      if (typeof kind !== 'string' || !kind || typeof id !== 'string' || !id) {
+        return invalid('an ownership problem has no immutable resource identity');
+      }
+      const lifecycle = item.lifecycle_violation === true
+        || inv.lifecycle_violations.includes(item);
+      if (kind === 'server') {
+        (lifecycle ? reportedLifecycleServers : reportedUnassignedServers).add(id);
+      } else if (kind === 'container') {
+        (lifecycle ? reportedLifecycleContainers : reportedUnassignedContainers).add(id);
+      } else if (kind === 'database') {
+        reportedUnassignedDatabases.add(id);
+      }
+    }
+
+    const serversById = new Map();
+    for (const server of normalizedResources.servers) {
+      const id = server.server_definition_id;
+      if (typeof id !== 'string' || !id) return invalid('a server has no immutable ID');
+      const matches = serversById.get(id) || [];
+      matches.push(server);
+      serversById.set(id, matches);
+    }
+    const containerMembershipsById = new Map();
+    for (const membership of inv.memberships) {
+      if (membership.resource_kind !== 'container') continue;
+      const id = membership.host_resource_id;
+      if (typeof id !== 'string' || !id) return invalid('a container membership has no immutable ID');
+      const matches = containerMembershipsById.get(id) || [];
+      matches.push(membership);
+      containerMembershipsById.set(id, matches);
+    }
+    const databasesById = new Map();
+    for (const database of normalizedResources.databases) {
+      const id = database.database_binding_id;
+      if (typeof id !== 'string' || !id) return invalid('a database has no immutable binding ID');
+      const matches = databasesById.get(id) || [];
+      matches.push(database);
+      databasesById.set(id, matches);
+    }
+
+    const familyIds = new Set();
+    const classifiedRepositoryIds = new Set();
+    const classifiedServerIds = new Set();
+    const classifiedContainerIds = new Set();
+    const classifiedDatabaseIds = new Set();
+    for (const tree of inv.repository_trees) {
+      const familyId = tree.family_id;
+      const root = tree.root_repository;
+      if (typeof familyId !== 'string' || !familyId || familyIds.has(familyId)
+          || !root || typeof root !== 'object' || Array.isArray(root)) {
+        return invalid('a repository family identity is missing or duplicated');
+      }
+      familyIds.add(familyId);
+      const rootRepository = repositoriesById.get(root.repo_id);
+      if (!rootRepository
+          || root.canonical_root !== rootRepository.canonical_root
+          || root.display_name !== rootRepository.display_name) {
+        return invalid('a repository family root contradicts its repository record');
+      }
+      if (!records(tree.scopes) || tree.scopes.length === 0) {
+        return invalid('a repository family has no valid scopes');
+      }
+      const rootScopes = tree.scopes.filter((scope) => scope.kind === 'root');
+      if (rootScopes.length !== 1 || rootScopes[0].repo_id !== root.repo_id) {
+        return invalid('a repository family must contain exactly its own root scope');
+      }
+      for (const scope of tree.scopes) {
+        if (scope.kind !== 'root' && scope.kind !== 'temporary') {
+          return invalid('a repository scope has an unknown kind');
+        }
+        const repository = repositoriesById.get(scope.repo_id);
+        if (!repository || classifiedRepositoryIds.has(scope.repo_id)
+            || repository.host_id !== rootRepository.host_id
+            || scope.canonical_root !== repository.canonical_root
+            || scope.display_name !== repository.display_name
+            || (scope.kind === 'temporary' && scope.repo_id === root.repo_id)
+            || !exactIds(scope.server_ids)
+            || !exactIds(scope.container_resource_ids)
+            || !exactIds(scope.database_binding_ids)) {
+          return invalid('a repository scope is inconsistent or duplicated');
+        }
+        classifiedRepositoryIds.add(scope.repo_id);
+        for (const serverId of scope.server_ids) {
+          const matches = serversById.get(serverId);
+          if (!matches || matches.length !== 1 || matches[0].repo_id !== scope.repo_id
+              || classifiedServerIds.has(serverId)) {
+            return invalid('a server is missing, duplicated, or assigned to the wrong repository scope');
+          }
+          classifiedServerIds.add(serverId);
+        }
+        for (const containerId of scope.container_resource_ids) {
+          const matches = containerMembershipsById.get(containerId);
+          if (!matches || matches.length !== 1 || matches[0].repo_id !== scope.repo_id
+              || classifiedContainerIds.has(containerId)) {
+            return invalid('a container is missing, duplicated, or assigned to the wrong repository scope');
+          }
+          classifiedContainerIds.add(containerId);
+        }
+        for (const databaseId of scope.database_binding_ids) {
+          const matches = databasesById.get(databaseId);
+          if (!matches || matches.length !== 1 || matches[0].repo_id !== scope.repo_id
+              || !scope.container_resource_ids.includes(matches[0].docker_resource_id)
+              || classifiedDatabaseIds.has(databaseId)) {
+            return invalid('a database is missing, duplicated, or assigned to the wrong repository scope');
+          }
+          classifiedDatabaseIds.add(databaseId);
+        }
+      }
+    }
+
+    const sameSet = (left, right) => left.size === right.size
+      && [...left].every((item) => right.has(item));
+    const observedDockerIds = new Set(inv.observations.docker
+      .map((item) => item.docker_resource_id).filter((item) => typeof item === 'string' && item));
+    const observedDatabaseIds = new Set(inv.observations.databases
+      .map((item) => item.database_binding_id).filter((item) => typeof item === 'string' && item));
+    const serverEvidenceIds = new Set([
+      ...classifiedServerIds,
+      ...reportedUnassignedServers,
+      ...reportedLifecycleServers,
+    ]);
+    const allowedObservedDockerIds = new Set([
+      ...classifiedContainerIds,
+      ...reportedUnassignedContainers,
+      ...reportedLifecycleContainers,
+    ]);
+    const allowedObservedDatabaseIds = new Set([
+      ...classifiedDatabaseIds,
+      ...reportedUnassignedDatabases,
+    ]);
+    if (!sameSet(classifiedRepositoryIds, new Set(repositoriesById.keys()))
+        || !sameSet(serverEvidenceIds, new Set(serversById.keys()))
+        || [...reportedUnassignedServers].some((item) => classifiedServerIds.has(item))
+        || [...reportedUnassignedContainers].some((item) => classifiedContainerIds.has(item))
+        || [...observedDockerIds].some((item) => !allowedObservedDockerIds.has(item))
+        || [...observedDatabaseIds].some((item) => !allowedObservedDatabaseIds.has(item))) {
+      return invalid('the repository tree and explicit ownership problems do not cover every normalized resource exactly once');
+    }
+    return [];
+  }
+
   function projectGroupsOf(o) {
     const inv = o?.inventory;
     if (!inv) return [];
+    if (repositoryTreeContractProblemsOf(inv).length) return [];
     const groups = [];
-    const claimedServers = new Set();
-    const claimedContainers = new Set();
     // Older broker projections may include enrollment-only definitions whose
     // only purpose is to bind a port lease ACL.  They have no concrete server
     // lifecycle and belong to the Ports workflow, never Servers or Projects.
     const servers = (inv.servers || []).filter(isOperationalServer);
     const containers = inv.docker?.available ? (inv.docker.containers || []) : [];
-    const dbNames = new Set((inv.docker?.postgres || []).map((c) => c.name));
-    const repositoriesByRoot = new Map(
-      (inv.repositories || [])
-        .filter((repository) => repository?.canonical_root && repository?.repo_id)
-        .map((repository) => [repository.canonical_root, repository]),
-    );
+    const containerIdOf = (container) => container?.host_resource_id ?? container?.docker_resource_id ?? null;
+    const databases = Array.isArray(inv.resources?.databases) ? inv.resources.databases : [];
+    const databaseById = new Map(databases
+      .filter((database) => database?.database_binding_id)
+      .map((database) => [String(database.database_binding_id), database]));
+    const postgresByBindingId = new Map((inv.docker?.postgres || [])
+      .filter((database) => database?.database_binding_id)
+      .map((database) => [String(database.database_binding_id), database]));
+    const scopeOf = (familyKey, rawScope, index) => {
+        const serverIds = new Set((rawScope.server_ids || []).map(String));
+        const containerResourceIds = new Set((rawScope.container_resource_ids || []).map(String));
+        const databaseBindingIds = new Set((rawScope.database_binding_ids || []).map(String));
+        const dbNames = new Set();
 
-    for (const row of inv.project_usage || []) {
-      const serverIds = new Set(row.server_ids || []);
-      const hasContainerResourceIds = Array.isArray(row.container_resource_ids);
-      const containerResourceIds = new Set(hasContainerResourceIds ? row.container_resource_ids : []);
-      const containerNames = new Set(hasContainerResourceIds ? [] : (row.container_names || []));
-      const members = {
-        servers: servers.filter((s) => serverIds.has(s.id)),
-        containers: containers.filter((c) => (hasContainerResourceIds
-          ? containerResourceIds.has(c.host_resource_id)
-          : containerNames.has(c.name))),
-      };
-      members.servers.forEach((s) => claimedServers.add(s.id));
-      // Object identity distinguishes retained same-name Docker records in
-      // this exact inventory without inventing another browser-side key.
-      members.containers.forEach((c) => claimedContainers.add(c));
-      const runningCount = members.servers.filter(isServerRunning).length
-        + members.containers.filter(isContainerActive).length;
-      groups.push({
-        key: String(row.usage_key ?? row.project_key ?? row.project ?? row.name),
-        // usage_key first: project_key is a display name and NOT unique
-        // (two repos named "app", or a repo plus a same-named container).
-        metricsKey: `proj:${row.usage_key ?? row.project_key ?? row.project ?? row.name}`,
-        name: row.name || projectTail(row.project),
-        project: row.project || null,
-        repoId: row.repo_id || repositoriesByRoot.get(row.project)?.repo_id || null,
-        row,
-        members,
-        dbNames,
-        runningCount,
-      });
-    }
+        // A database binding is independent domain evidence. Its exact ID may
+        // identify the backing Docker resource and the compatibility display
+        // row; neither names nor paths are used to establish membership.
+        for (const bindingId of databaseBindingIds) {
+          const database = databaseById.get(bindingId);
+          const postgres = postgresByBindingId.get(bindingId);
+          const dockerResourceId = database?.docker_resource_id
+            ?? postgres?.docker_resource_id
+            ?? postgres?.host_resource_id
+            ?? null;
+          if (dockerResourceId) containerResourceIds.add(String(dockerResourceId));
+          const linkedContainer = dockerResourceId
+            ? containers.find((container) => String(containerIdOf(container)) === String(dockerResourceId))
+            : null;
+          if (linkedContainer?.name) dbNames.add(linkedContainer.name);
+          else if (postgres?.name) dbNames.add(postgres.name);
+        }
 
-    // Safety net: anything the rollup did not claim still gets displayed.
-    const strayServers = servers.filter((s) => !claimedServers.has(s.id));
-    const strayContainers = containers.filter((c) => !claimedContainers.has(c));
-    if (strayServers.length || strayContainers.length) {
+        const members = {
+          servers: servers.filter((server) => serverIds.has(String(server.id))),
+          containers: containers.filter((container) => {
+            const resourceId = containerIdOf(container);
+            return resourceId != null && containerResourceIds.has(String(resourceId));
+          }),
+        };
+        const runningCount = members.servers.filter(isServerRunning).length
+          + members.containers.filter(isContainerActive).length;
+        const repoId = rawScope.repo_id == null ? null : String(rawScope.repo_id);
+        return {
+          key: `${familyKey}:${repoId ?? `scope-${index}`}`,
+          repoId,
+          kind: rawScope.kind === 'temporary' ? 'temporary' : 'root',
+          name: rawScope.display_name || projectTail(rawScope.canonical_root),
+          project: rawScope.canonical_root || null,
+          runId: rawScope.run_id ?? null,
+          expiresAt: rawScope.expires_at ?? null,
+          killAfterRun: typeof rawScope.kill_after_run === 'boolean' ? rawScope.kill_after_run : null,
+          usage: rawScope.usage || {},
+          members,
+          databaseBindingIds,
+          dbNames,
+          runningCount,
+        };
+    };
+
+    for (const [familyIndex, tree] of inv.repository_trees.entries()) {
+        const root = tree?.root_repository || {};
+        const familyKey = String(tree?.family_id ?? root.repo_id ?? `family-${familyIndex}`);
+        const scopes = (tree?.scopes || []).map((scope, index) => scopeOf(familyKey, scope, index));
+        const rootScopes = scopes.filter((scope) => scope.kind === 'root');
+        const temporaryScopes = scopes.filter((scope) => scope.kind === 'temporary');
+        const rootMembers = {
+          servers: rootScopes.flatMap((scope) => scope.members.servers),
+          containers: rootScopes.flatMap((scope) => scope.members.containers),
+        };
+        const members = {
+          servers: scopes.flatMap((scope) => scope.members.servers),
+          containers: scopes.flatMap((scope) => scope.members.containers),
+        };
+        const dbNames = new Set(scopes.flatMap((scope) => [...scope.dbNames]));
+        const runningCount = members.servers.filter(isServerRunning).length
+          + members.containers.filter(isContainerActive).length;
+        const name = root.display_name || projectTail(root.canonical_root);
+        const usage = tree?.usage || {};
+        const row = {
+          ...usage,
+          name,
+          project: root.canonical_root || null,
+          repo_id: root.repo_id || null,
+          temporary_repo_count: temporaryScopes.length,
+          server_count: members.servers.length,
+          container_count: members.containers.length,
+          process_count: usage.process_count || 0,
+        };
       groups.push({
-        key: 'other',
-        metricsKey: null,
-        name: 'Unassigned Resources',
-        project: null,
-        repoId: null,
-        row: null,
-        members: { servers: strayServers, containers: strayContainers },
-        dbNames,
-        runningCount: strayServers.filter(isServerRunning).length
-          + strayContainers.filter(isContainerActive).length,
+          key: familyKey,
+          metricsKey: `family:${familyKey}`,
+          name,
+          project: root.canonical_root || null,
+          repoId: root.repo_id || null,
+          row,
+          members,
+          dbNames,
+          runningCount,
+          authoritative: true,
+          scopes,
+          rootScope: {
+            key: `${familyKey}:root`,
+            repoId: root.repo_id || null,
+            kind: 'root',
+            name,
+            project: root.canonical_root || null,
+            usage: rootScopes[0]?.usage || {},
+            members: rootMembers,
+            dbNames: new Set(rootScopes.flatMap((scope) => [...scope.dbNames])),
+            runningCount: rootMembers.servers.filter(isServerRunning).length
+              + rootMembers.containers.filter(isContainerActive).length,
+          },
+          temporaryScopes,
       });
     }
 
     groups.sort(projectGroupOrder);
     return groups;
+  }
+
+  function authoritativeInventoryProblemsOf(o) {
+    const inv = o?.inventory;
+    if (!inv) return [];
+    const contractProblems = repositoryTreeContractProblemsOf(inv);
+    if (contractProblems.length) return contractProblems;
+    const claimedServers = new Set();
+    const claimedContainers = new Set();
+    const claimedDatabases = new Set();
+    for (const tree of inv.repository_trees) {
+      for (const scope of tree?.scopes || []) {
+        for (const id of scope.server_ids || []) claimedServers.add(String(id));
+        for (const id of scope.container_resource_ids || []) claimedContainers.add(String(id));
+        for (const id of scope.database_binding_ids || []) claimedDatabases.add(String(id));
+      }
+    }
+
+    const databases = Array.isArray(inv.resources?.databases) ? inv.resources.databases : [];
+    const databaseById = new Map(databases
+      .filter((database) => database?.database_binding_id)
+      .map((database) => [String(database.database_binding_id), database]));
+    for (const bindingId of claimedDatabases) {
+      const dockerResourceId = databaseById.get(bindingId)?.docker_resource_id;
+      if (dockerResourceId != null) claimedContainers.add(String(dockerResourceId));
+    }
+
+    const problems = [];
+    const reportedKeys = new Set();
+    const reportedResourceKeys = new Set();
+    const pushReportedProblem = (item, fallbackKind, fallbackName) => {
+      const kind = item.resource_kind || fallbackKind;
+      const resourceId = item.resource_id || item.host_resource_id || '';
+      const reasonCode = item.reason_code || '';
+      const key = `${kind}|${resourceId}|${reasonCode}`;
+      if (reportedKeys.has(key)) return;
+      reportedKeys.add(key);
+      if (resourceId) reportedResourceKeys.add(`${kind}|${resourceId}`);
+      problems.push({
+        kind,
+        name: item.display_name || fallbackName,
+        reason: item.explanation || item.reason_code || null,
+        nextStep: item.recommended_next_step
+          || `Rerun Coordinator installation for the original root repository, or attach or retire this exact ${kind}.`,
+      });
+    };
+    for (const item of inv.unassigned_resources || []) {
+      pushReportedProblem(item, 'resource', 'Unassigned resource');
+    }
+    for (const item of inv.lifecycle_violations || []) {
+      pushReportedProblem(item, 'lifecycle', 'Lifecycle violation');
+    }
+    for (const server of inv.servers || []) {
+      if (isServerRunning(server) && !claimedServers.has(String(server.id))
+          && !reportedResourceKeys.has(`server|${server.id}`)) {
+        problems.push({
+          kind: 'server', name: server.name || 'Unnamed server',
+          reason: 'The running server is absent from both the repository tree and the coordinator ownership-problem list.',
+          nextStep: 'Rerun Coordinator installation for the original root repository, or attach or retire this exact server, then refresh.',
+        });
+      }
+    }
+    const containers = inv.docker?.available ? (inv.docker.containers || []) : [];
+    const activeContainerIds = new Set();
+    for (const container of containers) {
+      const resourceId = container.host_resource_id ?? container.docker_resource_id ?? null;
+      const status = String(container.status || '').trim();
+      const active = isContainerActive(container) && !/^stopped\b/i.test(status);
+      if (active && resourceId != null) activeContainerIds.add(String(resourceId));
+      if (active && (resourceId == null || !claimedContainers.has(String(resourceId)))
+          && !reportedResourceKeys.has(`container|${resourceId}`)) {
+        problems.push({
+          kind: 'container', name: container.name || 'Unnamed container',
+          reason: 'The active container is absent from both the repository tree and the coordinator ownership-problem list.',
+          nextStep: 'Rerun Coordinator installation for the original root repository, or attach or retire this exact container, then refresh.',
+        });
+      }
+    }
+    for (const database of databases) {
+      const bindingId = database.database_binding_id == null
+        ? null : String(database.database_binding_id);
+      const lifecycle = String(database.lifecycle ?? database.status ?? '').trim();
+      const active = lifecycle
+        ? !/^(stopped|exited|removed|inactive)\b/i.test(lifecycle)
+        : activeContainerIds.has(String(database.docker_resource_id));
+      if (active && (bindingId == null || !claimedDatabases.has(bindingId))
+          && !reportedResourceKeys.has(`database|${bindingId}`)) {
+        problems.push({
+          kind: 'database', name: database.database_name || 'Unnamed database',
+          reason: 'The active database binding is absent from both the repository tree and the coordinator ownership-problem list.',
+          nextStep: 'Rerun Coordinator installation for the original root repository, or bind this exact database stack, then refresh.',
+        });
+      }
+    }
+    return problems;
+  }
+
+  function authoritativeInventoryErrorPanel(o) {
+    const problems = authoritativeInventoryProblemsOf(o);
+    if (!problems.length) return null;
+    const structural = problems.some((problem) => problem.kind === 'inventory');
+    return h('div', { class: 'degraded repository-inventory-error', role: 'alert' },
+      icon('warn'),
+      h('div', null,
+        h('p', { class: 'deg-title' }, structural
+          ? 'Repository inventory contract is invalid'
+          : 'Repository assignment is incomplete'),
+        h('p', { class: 'deg-msg' },
+          structural
+            ? 'The coordinator returned a malformed or contradictory repository tree. Lifecycle controls are disabled; refresh after correcting the producer.'
+            : `${problems.length} resource ownership problem${sfx(problems.length)} ${problems.length === 1 ? 'blocks' : 'block'} lifecycle controls. Follow the exact next step below, then refresh.`),
+        h('ul', { class: 'inventory-problem-list' },
+          problems.map((problem) => h('li', null,
+            h('strong', null, `${problem.kind}: ${problem.name}`),
+            problem.reason ? h('span', null, problem.reason) : null,
+            problem.nextStep ? h('span', { class: 'inventory-problem-next-step' }, problem.nextStep) : null)))));
   }
 
   // Stable project-group order: groups with something running first, then
@@ -1955,7 +2522,10 @@
 
   const groupsByProjectPath = (o) => {
     const map = new Map();
-    for (const g of projectGroupsOf(o)) if (g.project) map.set(g.project, g);
+    for (const g of projectGroupsOf(o)) {
+      if (g.project) map.set(g.project, g);
+      for (const scope of g.scopes || []) if (scope.project) map.set(scope.project, g);
+    }
     return map;
   };
 
@@ -2177,6 +2747,10 @@
   // ---------------------------------------------------------------- mutations
 
   async function runAction(busyKey, fn, { confirmText, onError } = {}) {
+    if (authoritativeInventoryProblemsOf(state.overview).length) {
+      showBanner('Coordinator mutation is disabled until every active resource belongs to an authoritative repository scope.');
+      return false;
+    }
     if (confirmText && !window.confirm(confirmText)) return false;
     ui.busy.add(busyKey);
     bump();
@@ -2361,8 +2935,9 @@
     if (page === 'projects') {
       setSection('projects-body',
         sig(o.inventory?.servers ?? null, o.inventory?.docker ?? null, o.inventory?.project_usage ?? null,
-          o.inventory?.repositories ?? null, o.routes ?? null, state.archives, ui.lifecycleViews.projects,
-          coordSig),
+          o.inventory?.repository_trees ?? null, o.inventory?.repositories ?? null,
+          o.inventory?.resources?.databases ?? null, o.routes ?? null, state.archives,
+          ui.lifecycleViews.projects, coordSig),
         () => ui.lifecycleViews.projects === 'archived'
           ? buildArchivedCollection('projects') : buildProjects(o), force);
     } else if (page === 'tests') {
@@ -2372,20 +2947,26 @@
     } else if (page === 'servers') {
       setSection('servers-body',
         sig(o.inventory?.servers ?? null, o.inventory?.port_assignments ?? null,
-          o.inventory?.docker ?? null, o.routes ?? null, state.archives, ui.lifecycleViews.servers,
-          coordSig),
+          o.inventory?.docker ?? null, o.inventory?.repository_trees ?? null,
+          o.inventory?.resources?.databases ?? null, o.routes ?? null, state.archives,
+          ui.lifecycleViews.servers, coordSig),
         () => ui.lifecycleViews.servers === 'archived'
           ? buildArchivedCollection('servers') : buildServers(o), force);
     } else if (page === 'docker') {
       setSection('docker-body',
-        sig(o.inventory?.docker ?? null, o.routes ?? null, state.archives, ui.lifecycleViews.docker, coordSig),
+        sig(o.inventory?.docker ?? null, o.inventory?.repository_trees ?? null,
+          o.inventory?.resources?.databases ?? null, o.routes ?? null, state.archives,
+          ui.lifecycleViews.docker, coordSig),
         () => ui.lifecycleViews.docker === 'archived'
           ? buildArchivedCollection('docker') : buildDocker(o), force);
     } else if (page === 'ports') {
       setSection('leases-body', sig(o.inventory?.leases ?? null, coordSig), () => buildLeases(o), force);
       setSection('assignments-body', sig(o.inventory?.port_assignments ?? null, coordSig), () => buildAssignments(o), force);
     } else if (page === 'performance') {
-      setSection('usage-body', sig(o.inventory?.project_usage ?? null, coordSig), () => buildUsage(o), force);
+      setSection('usage-body',
+        sig(o.inventory?.project_usage ?? null, o.inventory?.repository_trees ?? null,
+          o.inventory?.resources?.databases ?? null, coordSig),
+        () => buildUsage(o), force);
       setSection('perf-body', sig(state.metricsAt, o.inventory ? 1 : 0, coordSig), () => buildPerf(o), force);
     } else if (page === 'invites') {
       renderInvites();
@@ -2415,7 +2996,11 @@
       : o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
     setCount('leases-count', o.inventory ? (o.inventory.leases || []).length : null);
     setCount('assignments-count', o.inventory ? (o.inventory.port_assignments || []).length : null);
-    setCount('usage-count', o.inventory ? (o.inventory.project_usage || []).length : null);
+    setCount('usage-count', o.inventory
+      ? (Array.isArray(o.inventory.repository_trees)
+          ? projectGroupsOf(o).filter((group) => group.row).length
+          : (o.inventory.project_usage || []).length)
+      : null);
     setCount('perf-count', perfEntities);
     setCount('projects-active-count', projectGroups);
     setCount('servers-active-count', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
@@ -3265,9 +3850,14 @@
   }
 
   function buildArchivedCollection(page) {
+    if (state.session?.accessAdmin !== true) {
+      return [emptyState('Only configured Console owners can manage archived host resources.')];
+    }
     if (!lifecycleAvailable()) {
       return [emptyState('Archive management is not activated on this Console.')];
     }
+    const inventoryError = authoritativeInventoryErrorPanel(state.overview);
+    if (inventoryError) return [inventoryError];
     if (!state.archives) {
       return [
         h('div', { class: 'skel', 'aria-hidden': 'true' }),
@@ -3288,6 +3878,9 @@
   // ---------------------------------------------------------------- servers
 
   function serverStatusMeta(s) {
+    if (s?.supervision?.breaker?.state === 'tripped' || s?.supervision?.state === 'tripped') {
+      return { css: 'err', label: 'crash loop stopped' };
+    }
     const cls = s.health?.classification || s.status || 'unknown';
     switch (cls) {
       case 'healthy': return { css: 'ok', label: 'running' };
@@ -3302,8 +3895,93 @@
     }
   }
 
+  function workerDurationLabel(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value <= 0) return 'the configured window';
+    if (value % 3600 === 0) {
+      const hours = value / 3600;
+      return `${hours} hour${hours === 1 ? '' : 's'}`;
+    }
+    if (value % 60 === 0) {
+      const minutes = value / 60;
+      return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+    }
+    return `${value} second${value === 1 ? '' : 's'}`;
+  }
+
+  function workerCrashLoopMessage(supervision) {
+    const breaker = supervision?.breaker || {};
+    const count = Number(breaker.crash_count_in_window) || 0;
+    return `Crash loop stopped — ${count} crash${count === 1 ? '' : 'es'} in ${workerDurationLabel(breaker.window_seconds)}`;
+  }
+
+  function workerActionBody(server, action, options = {}) {
+    const body = { id: server.id, action };
+    if (Object.hasOwn(options, 'keepAlive')) body.keep_alive = options.keepAlive;
+    if (Object.hasOwn(options, 'rearmCrashLoop')) {
+      body.rearm_crash_loop = options.rearmCrashLoop;
+    }
+    return body;
+  }
+
+  function runWorkerAction(server, action, options = {}) {
+    return runAction(
+      `server:${server.id}`,
+      () => api('/api/workers/action', {
+        method: 'POST',
+        body: workerActionBody(server, action, options),
+      }),
+      options.confirmText ? { confirmText: options.confirmText } : undefined,
+    );
+  }
+
+  function workerControlButtons(server, busy, prefix = 'srv') {
+    const supervision = server.supervision;
+    const tripped = supervision?.breaker?.state === 'tripped' || supervision?.state === 'tripped';
+    const stopped = !tripped && (
+      supervision?.desired_state === 'stopped'
+      || server.status === 'stopped'
+      || supervision?.state === 'stopped'
+    );
+    const button = (action, label, iconName, options = {}) => h('button', {
+      class: `btn small act-${action}${busy ? ' is-busy' : ''}`, type: 'button',
+      'data-fk': `${prefix}-worker-${action}:${server.id}`,
+      disabled: (busy || options.disabled) || undefined,
+      title: options.title || `${label} ${server.name}`,
+      onclick: () => runWorkerAction(server, action, options),
+    }, icon(iconName), busy ? 'Working…' : label);
+
+    if (tripped) {
+      return [button('start', 'Start and re-arm', 'play', {
+        keepAlive: supervision.keep_alive === true,
+        rearmCrashLoop: true,
+        title: `Explicitly re-arm the crash breaker and start ${server.name}`,
+      })];
+    }
+    if (stopped) {
+      return [button('start', 'Start', 'play', {
+        keepAlive: supervision.keep_alive === true,
+        rearmCrashLoop: false,
+        title: `Start ${server.name}${supervision.keep_alive ? ' and keep it alive' : ''}`,
+      })];
+    }
+    return [
+      button('restart', 'Restart', 'refresh', {
+        keepAlive: supervision.keep_alive === true,
+        rearmCrashLoop: false,
+        title: `Restart ${server.name}`,
+      }),
+      button('stop', 'Stop', 'stop', {
+        confirmText: `Stop worker ${server.name}?\n\nThis sets its desired state to stopped. It will not restart until explicitly started.`,
+        title: `Stop ${server.name} and set desired state to stopped`,
+      }),
+    ];
+  }
+
   function buildServers(o) {
     if (!o.inventory) return [degradedPanel(o)];
+    const inventoryError = authoritativeInventoryErrorPanel(o);
+    if (inventoryError) return [inventoryError];
     const hidden = hiddenSet('servers');
     const hiddenDocker = hiddenSet('docker');
     const focus = ui.lifecycleFocus?.view === 'active' && ui.lifecycleFocus.page === 'servers'
@@ -3597,8 +4275,9 @@
 
     const stoppable = ['running', 'starting', 'unhealthy'].includes(s.status);
     const restartable = stoppable || s.status === 'stopped';
+    const supervised = !!s.supervision;
     const actions = h('span', { class: 'cell actions' },
-      h('button', {
+      supervised ? workerControlButtons(s, busy) : h('button', {
         class: `btn small act-restart${busy ? ' is-busy' : ''}`, type: 'button',
         'data-fk': `srv-restart:${id}`,
         disabled: (busy || s.missing_command || !restartable) || undefined,
@@ -3610,7 +4289,7 @@
         onclick: () => runAction(`server:${id}`,
           () => api('/api/servers/action', { method: 'POST', body: { id, action: 'restart' } })),
       }, icon('refresh'), busy ? 'Working…' : 'Restart'),
-      h('button', {
+      supervised ? null : h('button', {
         class: `btn small act-stop${busy ? ' is-busy' : ''}`, type: 'button',
         'data-fk': `srv-stop:${id}`,
         disabled: (busy || !stoppable) || undefined,
@@ -3621,7 +4300,9 @@
       hiddenRow
         ? unhideButton('servers', s.key, s.name || 'server')
         : (s.status === 'stopped' ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot()),
-      archiveButton(archiveTarget, { compact: true }));
+      supervised
+        ? workerRemoveButton(s, { compact: true })
+        : archiveButton(archiveTarget, { compact: true }));
 
     const row = h('div', {
       class: `row srv-grid expandable${hiddenRow ? ' is-hidden' : ''}`,
@@ -3929,12 +4610,18 @@
       kv('Health check', checkText, { mono: true }),
       kv('Command', s.cmd || s.cmd_template || '—', { mono: true }),
       kv('Project', s.project || '—', { mono: true }),
+      s.supervision ? kv('Keep alive', s.supervision.keep_alive ? 'On' : 'Off') : null,
+      s.supervision ? kv('Desired state', s.supervision.desired_state || '—') : null,
+      s.supervision ? kv('Supervisor', s.supervision.state || '—') : null,
       kv('Started', fmtWhen(s.created_at)),
       kv('Updated', fmtWhen(s.updated_at)),
       s.stopped_at ? kv('Stopped', fmtWhen(s.stopped_at)) : null,
       s.stopped_reason ? kv('Stop reason', s.stopped_reason) : null,
       s.url_is_current === false
         ? h('p', { class: 'pop-hint' }, 'Warning: the recorded URL may be stale — another process may be listening on this port.')
+        : null,
+      s.supervision?.breaker?.state === 'tripped'
+        ? h('p', { class: 'pop-hint err' }, workerCrashLoopMessage(s.supervision))
         : null);
   }
 
@@ -3967,10 +4654,74 @@
     renderAll(true);
   }
 
+  function workerSupervisionPanel(s) {
+    const supervision = s.supervision;
+    if (!supervision) return null;
+    const busy = ui.busy.has(`server:${s.id}`);
+    const tripped = supervision.breaker?.state === 'tripped' || supervision.state === 'tripped';
+    const crashes = Array.isArray(supervision.recent_crashes) ? supervision.recent_crashes : [];
+    const keepAlive = supervision.keep_alive === true;
+    const policyHelp = keepAlive
+      ? 'Starts with the coordinator supervisor and restarts after an unexpected crash.'
+      : 'Automatic restart is off. Turning this off does not stop a worker that is already running.';
+    return h('section', { class: `worker-supervision${tripped ? ' is-tripped' : ''}` },
+      h('div', { class: 'worker-supervision-head' },
+        h('div', null,
+          h('h3', null, 'Worker supervision'),
+          h('p', { class: 'meta-passive' }, policyHelp)),
+        h('button', {
+          class: 'switch', type: 'button', role: 'switch',
+          'aria-checked': String(keepAlive),
+          'aria-label': `Keep alive ${s.name}`,
+          disabled: busy || undefined,
+          title: keepAlive
+            ? 'Turn off automatic restart; the current process keeps running'
+            : 'Turn on desired-running supervision; starts this worker if stopped',
+          onclick: () => runWorkerAction(s, 'start', {
+            keepAlive: !keepAlive,
+            rearmCrashLoop: false,
+          }),
+        }, h('span', { class: 'knob', 'aria-hidden': 'true' }),
+        h('span', { class: 'sw-label' }, busy ? 'Updating…' : 'Keep alive'))),
+      h('div', { class: 'worker-state-grid' },
+        kv('Desired state', supervision.desired_state || '—'),
+        kv('Supervisor', supervision.state || '—'),
+        kv('Crash policy', `${supervision.breaker?.crash_limit ?? '—'} in ${workerDurationLabel(supervision.breaker?.window_seconds)}`)),
+      tripped ? h('div', { class: 'worker-crash-loop', role: 'alert' },
+        h('strong', null, workerCrashLoopMessage(supervision)),
+        h('p', null, 'Automatic restart is permanently paused for this incident. Fix the cause, then explicitly start and re-arm the worker.'),
+        h('div', { class: 'worker-actions' },
+          workerControlButtons(s, busy, 'panel')))
+        : null,
+      crashes.length ? h('div', { class: 'worker-crash-history' },
+        h('h4', null, 'Retained crash traces'),
+        h('ul', null, crashes.map((attempt) => {
+          const artifactId = attempt?.log?.artifact_id;
+          const exit = attempt?.exit_code != null
+            ? `exit ${attempt.exit_code}`
+            : attempt?.exit_signal != null ? `signal ${attempt.exit_signal}` : 'exit unknown';
+          return h('li', null,
+            h('span', null,
+              `${fmtWhen(attempt?.exited_at)} · ${exit}`,
+              attempt?.classification ? ` · ${attempt.classification}` : ''),
+            typeof artifactId === 'string' && artifactId
+              ? h('a', {
+                  href: `/api/runtime/artifacts/worker_attempt/${encodeURIComponent(artifactId)}`,
+                  target: '_blank', rel: 'noopener',
+                }, 'Open crash log')
+              : h('span', { class: 'meta-passive' }, 'Crash log unavailable'));
+        })))
+        : null,
+      h('div', { class: 'worker-actions' },
+        tripped ? null : workerControlButtons(s, busy, 'panel'),
+        workerRemoveButton(s)));
+  }
+
   function serverPanel(s, panelId) {
     const key = `srv:${s.id}`;
     const lg = ui.logs.get(key);
     return h('div', { class: 'panel', id: panelId },
+      workerSupervisionPanel(s),
       h('div', { class: 'panel-meta' },
         kv('PID', s.pid != null ? String(s.pid) : '—', { mono: true }),
         kv('Working dir', s.cwd || '—', { mono: true }),
@@ -4031,6 +4782,8 @@
 
   function buildDocker(o) {
     if (!o.inventory) return [degradedPanel(o)];
+    const inventoryError = authoritativeInventoryErrorPanel(o);
+    if (inventoryError) return [inventoryError];
     const docker = o.inventory.docker;
     if (!docker || docker.available === false) {
       return [h('div', { class: 'degraded' },
@@ -4500,19 +5253,28 @@
 
   function buildUsage(o) {
     if (!o.inventory) return [degradedPanel(o)];
-    const items = o.inventory.project_usage || [];
+    const inventoryError = authoritativeInventoryErrorPanel(o);
+    if (inventoryError) return [inventoryError];
+    const authoritative = Array.isArray(o.inventory.repository_trees);
+    const groups = authoritative ? projectGroupsOf(o).filter((group) => group.row) : [];
+    const items = authoritative ? groups.map((group) => ({ ...group.row, metricsKey: group.metricsKey }))
+      : (o.inventory.project_usage || []);
     if (!items.length) {
       return [emptyState('No per-project usage measured yet — start a server or container and its CPU/memory appears here.')];
     }
     const maxMem = Math.max(1, ...items.map((p) => p.memory_bytes || 0));
     const maxCpu = Math.max(100, ...items.map((p) => p.cpu_percent || 0));
     return items.map((p) => {
-      const key = `proj:${p.usage_key ?? p.project_key ?? p.project ?? p.name}`;
+      const key = p.metricsKey || `proj:${p.usage_key ?? p.project_key ?? p.project ?? p.name}`;
+      const familyLabel = p.temporary_repo_count > 0
+        ? `Family total · root + ${p.temporary_repo_count} temporary repo${sfx(p.temporary_repo_count)}`
+        : null;
       return h('div', { class: 'usage-item' },
         h('div', { class: 'usage-head' },
           h('strong', { title: p.project || '' }, p.name || projectTail(p.project)),
           sparkline(metricsEntity(key)),
           h('span', { class: 'meta-passive' },
+            familyLabel ? `${familyLabel} · ` : '',
             `${p.server_count || 0} server${sfx(p.server_count || 0)} · `
             + `${p.container_count || 0} container${sfx(p.container_count || 0)} · `
             + `${p.process_count || 0} process${(p.process_count || 0) === 1 ? '' : 'es'}`)),
@@ -4537,8 +5299,8 @@
     // repo's DECLARED runtime (dev-runtime config or its registered servers),
     // which may be narrower than everything listed under this group.
     const confirms = {
-      stop: `Stop project "${group.name}"?\n\nThe coordinator stops the runtime it manages for this repo (its declared servers and containers).`,
-      restart: `Restart project "${group.name}"?\n\nThe coordinator restarts the runtime it manages for this repo; brief downtime for each piece.`,
+      stop: `Stop root repository "${group.name}"?\n\nThe coordinator stops only the runtime declared by this root checkout. Temporary repository runs remain separate.`,
+      restart: `Restart root repository "${group.name}"?\n\nThe coordinator restarts only the runtime declared by this root checkout. Temporary repository runs remain separate.`,
     };
     runAction(`project:${group.key}`,
       () => api('/api/projects/action', { method: 'POST', body: { project: group.project, action } }),
@@ -4577,7 +5339,7 @@
       disabled: noPath,
       title: noPath
         ? 'No repo path known for this group — control its items individually'
-        : `${label} the whole project (dependencies first, pinned ports preserved)`,
+        : `${label} the root repository runtime only (temporary repository runs stay separate)`,
       onclick: () => projectAction(group, action),
     });
     return treeActionSlots({
@@ -4601,6 +5363,10 @@
     const meta = serverStatusMeta(s);
     const stopped = s.status === 'stopped';
     const running = isServerRunning(s);
+    const supervised = !!s.supervision;
+    const detail = supervised
+      ? `${s.supervision.keep_alive === true ? 'Keep alive on' : 'Keep alive off'}${s.url ? ` · ${s.url}` : ''}`
+      : (s.url || '');
     const archiveTarget = lifecycleTarget('server', s.id, s.name || 'Unnamed server', 'servers');
     const slot = (action, label, iconName, disabled, title) => ({
       fk: `tree-srv-${action}-${label}:${s.id}`,
@@ -4617,11 +5383,12 @@
       tabindex: '-1',
       'data-lifecycle-target': `${archiveTarget.target_kind}:${archiveTarget.target_id}`,
     },
-      h('span', { class: 'cell c-kind' }, h('span', { class: 'kind-tag k-srv' }, 'server')),
+      h('span', { class: 'cell c-kind' },
+        h('span', { class: 'kind-tag k-srv' }, supervised ? 'worker' : 'server')),
       h('span', { class: 'cell c-primary' },
         h('strong', null, s.name || '—'),
         h('span', { class: 'dim mono' }, s.port != null ? ` :${s.port}` : ''),
-        h('span', { class: 'tree-detail dim mono', title: s.url || '' }, s.url || '')),
+        h('span', { class: 'tree-detail dim mono', title: detail }, detail)),
       usageCellNode({
         key: `srv:${s.id}`,
         title: s.name || 'Server',
@@ -4633,7 +5400,7 @@
       h('span', { class: 'cell c-status' }, treeStatusBadge(meta.css, meta.label)),
       h('span', { class: 'cell actions' },
         // A stopped coordinator server starts through the restart action.
-        treeActionSlots({
+        supervised ? workerControlButtons(s, busy, 'tree') : treeActionSlots({
           start: slot('restart', 'Start', 'play', !stopped || s.missing_command,
             !stopped ? 'Already running'
               : (s.missing_command ? 'Registered without a start command' : `Start ${s.name} on its pinned port`)),
@@ -4646,7 +5413,9 @@
         hiddenRow
           ? unhideButton('servers', s.key, s.name || 'server')
           : (stopped ? hideButton('servers', s.key, s.name || 'server') : ghostIconSlot()),
-        archiveButton(archiveTarget, { compact: true })));
+        supervised
+          ? workerRemoveButton(s, { compact: true })
+          : archiveButton(archiveTarget, { compact: true })));
   }
 
   function treeContainerRow(o, c, isDb, hiddenRow, webish = false) {
@@ -4725,9 +5494,86 @@
               : ghostIconSlot())));
   }
 
+  function projectScopeRows(o, group, scope, revealing, hiddenServers, hiddenDocker, label) {
+    const entries = [];
+    for (const server of scope.members.servers.slice()
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
+      const isHidden = hiddenServers.has(server.key);
+      if (isHidden && !revealing) continue;
+      entries.push({ kind: 'server', item: server, isHidden });
+    }
+    for (const container of scope.members.containers.slice()
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
+      const isHidden = hiddenDocker.has(container.name);
+      if (isHidden && !revealing) continue;
+      entries.push({ kind: 'docker', item: container, isHidden });
+    }
+    if (!entries.length) {
+      const memberCount = scope.members.servers.length + scope.members.containers.length;
+      return [h('p', { class: 'inline-note' }, memberCount
+        ? 'All services in this repository are hidden.'
+        : `No services registered ${scope.kind === 'temporary' ? 'for this temporary repo' : 'directly under this root repo'}.`)];
+    }
+    const requestedPage = ui.projectScopePages.get(scope.key) || 0;
+    const paged = pageSlice(entries, requestedPage);
+    ui.projectScopePages.set(scope.key, paged.page);
+    const rows = paged.items.map((entry) => entry.kind === 'server'
+      ? treeServerRow(o, entry.item, entry.isHidden)
+      : treeContainerRow(o, entry.item, scope.dbNames.has(entry.item.name), entry.isHidden,
+          isWebServerContainer(o, { ...group, dbNames: scope.dbNames }, entry.item)));
+    const pager = projectScopePager(scope.key, label, paged);
+    if (pager) rows.push(pager);
+    return rows;
+  }
+
+  function temporaryScopeBlock(o, group, scope, revealing, hiddenServers, hiddenDocker) {
+    const expanded = ui.temporaryScopesExpanded.has(scope.key);
+    const memberCount = scope.members.servers.length + scope.members.containers.length;
+    const panelId = `temporary-scope-${encodeURIComponent(scope.key)}`;
+    const expiresAt = scope.expiresAt == null ? 'no expiry provided' : (() => {
+      const epoch = Date.parse(String(scope.expiresAt));
+      return Number.isFinite(epoch) ? `expires ${new Date(epoch).toLocaleString()}` : `expires ${scope.expiresAt}`;
+    })();
+    const usage = scope.usage || {};
+    const toggle = h('button', {
+      class: 'temporary-scope-toggle', type: 'button',
+      'data-fk': `temporary-scope:${scope.key}`,
+      'aria-expanded': String(expanded),
+      'aria-controls': panelId,
+      'aria-label': `${expanded ? 'Collapse' : 'Expand'} temporary repo ${scope.name}, ${memberCount} service${sfx(memberCount)}`,
+      onclick: () => {
+        setExclusiveExpansion(ui.temporaryScopesExpanded, scope.key);
+        ui.projectScopePages.set(scope.key, 0);
+        bump();
+        renderAll(true);
+      },
+    },
+      h('span', { class: `chev${expanded ? ' open' : ''}`, 'aria-hidden': 'true' }, icon('chevron')),
+      h('span', { class: 'kind-tag k-temp' }, 'temporary'),
+      h('strong', { class: 'proj-name' }, scope.name),
+      h('span', { class: 'meta-passive temporary-scope-count' },
+        `${scope.runningCount} of ${memberCount} running`),
+      h('span', { class: 'proj-usage mono' },
+        `${fmtCpu(usage.cpu_percent)} · ${fmtBytes(usage.memory_bytes || 0)}`),
+      h('span', { class: 'meta-passive temporary-scope-policy' },
+        `${expiresAt} · ${scope.killAfterRun === true ? 'cleanup after run'
+          : scope.killAfterRun === false ? 'retained after run' : 'cleanup policy unavailable'}`));
+    const children = expanded
+      ? projectScopeRows(o, group, scope, revealing, hiddenServers, hiddenDocker, 'Temporary repo items')
+      : [];
+    return h('section', { class: 'temporary-scope-block' },
+      h('h4', { class: `temporary-scope-head${expanded ? ' is-open' : ''}` }, toggle),
+      h('div', {
+        class: 'temporary-scope-items', id: panelId,
+        hidden: expanded ? undefined : true,
+      }, children));
+  }
+
   function projectNode(o, group, hiddenProject, revealing, hiddenServers, hiddenDocker) {
     const collapsed = !ui.treeExpanded.has(group.key);
-    const memberCount = group.members.servers.length + group.members.containers.length;
+    const rootMemberCount = group.rootScope.members.servers.length
+      + group.rootScope.members.containers.length;
+    const rootRunningCount = group.rootScope.runningCount || 0;
     const archiveTarget = lifecycleTarget('project', group.repoId, group.name, 'projects');
     const chev = h('button', {
       class: `chev${collapsed ? '' : ' open'}`, type: 'button',
@@ -4742,6 +5588,8 @@
         } else {
           ui.treeExpanded.delete(group.key);
         }
+        ui.temporaryScopesExpanded.clear();
+        ui.projectScopePages.clear();
         ui.resourcePages.projects = 0;
         bump();
         renderAll(true);
@@ -4757,19 +5605,22 @@
     },
       h('span', { class: 'cell c-kind' }, chev),
       h('span', { class: 'cell c-primary' },
-        h('strong', { class: 'proj-name' }, group.name)),
+        group.authoritative ? h('span', { class: 'kind-tag k-root' }, 'root') : null,
+        h('strong', { class: 'proj-name', title: group.name }, group.name)),
       group.metricsKey
         ? usageCellNode({
-            key: group.metricsKey,
-            title: `Project ${group.name}`,
-            cpu: group.row?.cpu_percent ?? null,
-            mem: group.row?.memory_bytes ?? null,
-            running: group.runningCount > 0,
+            key: group.authoritative
+              ? `repo:${group.rootScope.repoId ?? group.key}`
+              : group.metricsKey,
+            title: group.authoritative ? `Root repository ${group.name}` : `Project ${group.name}`,
+            cpu: group.rootScope.usage?.cpu_percent ?? null,
+            mem: group.rootScope.usage?.memory_bytes ?? null,
+            running: rootRunningCount > 0,
             scope: 'proj',
           })
         : h('span', { class: 'cell usage-cell dim' }, '—'),
       h('span', { class: 'cell c-status meta-passive tree-count' },
-        `${group.runningCount} of ${memberCount} running`),
+        `${rootRunningCount} of ${rootMemberCount} root services running`),
       h('span', { class: 'cell actions' },
         projectActionButtons(group),
         hiddenProject
@@ -4777,44 +5628,35 @@
           : (group.runningCount === 0 ? hideButton('projects', group.key, group.name) : ghostIconSlot()),
         archiveButton(archiveTarget, { compact: true })));
 
+    const familySummary = group.temporaryScopes.length
+      ? h('div', { class: 'repository-family-summary' },
+          h('strong', null, 'Family total'),
+          h('span', { class: 'meta-passive' },
+            `root + ${group.temporaryScopes.length} temporary repo${sfx(group.temporaryScopes.length)} · `
+            + `${group.runningCount} of ${group.members.servers.length + group.members.containers.length} services running`),
+          h('span', { class: 'proj-usage mono' },
+            `${fmtCpu(group.row?.cpu_percent)} · ${fmtBytes(group.row?.memory_bytes || 0)}`))
+      : null;
+
     const children = [];
     if (!collapsed) {
-      const entries = [];
-      for (const s of group.members.servers.slice().sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
-        const isHidden = hiddenServers.has(s.key);
-        if (isHidden && !revealing) continue;
-        entries.push({ kind: 'server', item: s, isHidden });
-      }
-      const containers = group.members.containers.slice().sort((a, b) => String(a.name).localeCompare(String(b.name)));
-      for (const c of containers) {
-        const isHidden = hiddenDocker.has(c.name);
-        if (isHidden && !revealing) continue;
-        entries.push({ kind: 'docker', item: c, isHidden });
-      }
-      if (entries.length) {
-        const paged = pageSlice(entries, ui.resourcePages.projects);
-        ui.resourcePages.projects = paged.page;
-        for (const entry of paged.items) {
-          children.push(entry.kind === 'server'
-            ? treeServerRow(o, entry.item, entry.isHidden)
-            : treeContainerRow(o, entry.item, group.dbNames.has(entry.item.name), entry.isHidden,
-                isWebServerContainer(o, group, entry.item)));
-        }
-        const pager = resourcePager('projects', 'Project items', paged);
-        if (pager) children.push(pager);
-      }
-      if (!children.length && memberCount > 0) {
-        children.push(h('p', { class: 'inline-note' }, 'All items in this project are hidden.'));
-      }
-      if (memberCount === 0) {
-        children.push(h('p', { class: 'inline-note' }, 'Nothing registered under this project yet.'));
+      children.push(...projectScopeRows(
+        o, group, group.rootScope, revealing, hiddenServers, hiddenDocker, 'Root repo items',
+      ));
+      for (const scope of group.temporaryScopes) {
+        children.push(temporaryScopeBlock(
+          o, group, scope, revealing, hiddenServers, hiddenDocker,
+        ));
       }
     }
-    return h('div', { class: 'item tree-node' }, header, h('div', { class: 'tree-children' }, children));
+    return h('div', { class: 'item tree-node' }, header, familySummary,
+      h('div', { class: 'tree-children' }, children));
   }
 
   function buildProjects(o) {
     if (!o.inventory) return [degradedPanel(o)];
+    const inventoryError = authoritativeInventoryErrorPanel(o);
+    if (inventoryError) return [inventoryError];
     const groups = projectGroupsOf(o);
     if (!groups.length) {
       return [emptyState('No projects yet — anything an agent starts or registers through the coordinator appears here, grouped by repo.')];

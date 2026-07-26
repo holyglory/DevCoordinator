@@ -13,14 +13,19 @@ third-party dependencies) that:
   (Projects, Servers, Routes, Docker, Port leases, Performance, Access,
   Incoming invites, Telegram; tab nav on
   desktop, a hamburger drawer on phones). The default Projects page is a tree
-  of repos with their servers, databases and containers: start/stop/restart
-  single items or whole projects, live CPU/memory everywhere, and hideable
-  idle items that automatically reappear when an agent starts them through
-  the coordinator. Other pages cover servers with per-server subdomains
-  (grouped by repo), routes, Docker containers, port leases + permanent pins,
-  history charts, owner-only per-account domain grants and incoming invite
-  decisions, plus user-owned Telegram bots for project event notifications,
-  all driven by the
+  of original root repos, their direct services, and nested temporary repos
+  with their TTL and `KillAfterRun` policy. Root actions affect only the root
+  repo runtime; temporary runs remain independently controlled. A missing or
+  contradictory repository tree is an explicit contract error that disables
+  lifecycle controls; the browser never reconstructs membership from flat
+  usage rows, paths, or names. Individual
+  servers, databases, and containers expose exact start/stop/restart actions,
+  live CPU/memory, and hideable idle items that automatically reappear when an
+  agent starts them through the coordinator. Other pages cover servers with
+  per-server subdomains (grouped by repo), routes, Docker containers, port
+  leases + permanent pins, history charts, owner-only per-account domain
+  grants and incoming invite decisions, plus user-owned Telegram bots for
+  project event notifications, all driven by the
   [codex-dev-coordinator](../../skills/codex-dev-coordinator/SKILL.md) HTTP API
   on loopback `127.0.0.1:29876`, authenticated with a private token. Production
   runs it as the dedicated `dev-coordinator.service`; optional local autostart
@@ -42,6 +47,13 @@ third-party dependencies) that:
   observation and event ingestion during restarts. The proof uses one
   authenticated inventory request with the whole remaining startup deadline;
   it never abandons a still-running broker read merely to retry it.
+
+  Supervised workers have explicit start, stop, restart, crash-loop rearm, and
+  Keep Alive controls. Keep Alive requests desired-running supervision and
+  restarts unexpected exits; turning it off leaves an already-running worker
+  running. Permanent removal is a separate review-and-confirm journey that
+  first stops and archives the worker, preserves retained crash evidence, and
+  keeps the worker absent until an explicit Coordinator reinstall.
 
   The API and server-wide broker are independently supervised. During a
   rolling deployment, the Console accepts canonical compatibility stats when

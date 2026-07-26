@@ -1,1396 +1,165 @@
 ---
 name: codex-dev-coordinator
-description: Use when coding agents (Codex, Claude Code) in one or multiple apps or sessions need coordinated test execution/statistics, port leases, shared dev-server start/stop/restart/status/health control, or Docker/Docker Compose management through a single local coordinator CLI or HTTP endpoint.
+description: Use when coding agents in one or multiple apps, sessions, or OS accounts need attributed local service, Docker/Compose, database-stack, port, health, log, telemetry, test, or temporary-runtime lifecycle control.
 ---
 
 # Codex Dev Coordinator
 
-Use this skill before starting local dev servers, allocating ports, inspecting
-running services, or managing Docker when multiple agent sessions or app
-instances (Codex, Claude Code, or both) may be working on the same machine.
+Use this skill before inspecting or changing a local development runtime.
+Python owns discovery, ownership, ports, lifecycle, telemetry, crash evidence,
+and cleanup; do not reproduce those decisions in shell or helper scripts.
 
-## Core Rule
+## Required entrypoint
 
-Do not start dev/test servers, Docker Compose services, Docker containers, or
-local database stacks directly with default ports. First run `inventory` to see
-what is already running. When the user asks to run, start, restart, check, or
-open a project's dev server, prefer the project-level runtime command:
+Resolve the canonical script from this skill directory:
 
 ```bash
-PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 scripts/dev_coordinator.py project start --agent "$USER" --project "$PROJECT_ROOT"
+COORDINATOR="scripts/dev_coordinator.py"
+python3 scripts/dev_coordinator.py runtime --help
+python3 "$COORDINATOR" runtime status \
+  --agent "$AGENT" --root-repo "$ROOT_REPO" --no-temporary-repo \
+  --target-kind service --target-id "$RESOURCE_ID" --target-name web \
+  --purpose development --no-ttl --kill-after-run false
+python3 "$COORDINATOR" runtime --request-file /absolute/request.json
 ```
 
-Use individual `server` and `docker` commands only for narrow operations on a
-specific service after the project runtime status has made the dependency
-picture clear.
+Use flags for ordinary existing-target status/start/stop/restart/remove work.
+Use a request file only for a structured definition, replacement, or bounded
+`run`; never hand-build JSON in routine Python or shell wrappers. Both forms
+enter the same validator. Every request includes:
 
-Never do the pattern "try the default port, then try another one if busy." The
-coordinator is the source of truth.
+- `schema_version: 1` and the current agent/session identity;
+- the canonical original `root_repo` and explicit nullable `temporary_repo`;
+- purpose plus target kind and immutable target ID;
+- explicit `kill_after_run`, and a positive bounded TTL for test/temporary
+  start-like work. Status and explicit stop use no TTL.
 
-Every mutating coordinator command must identify the agent and canonical repo
-path. Use `PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`
-before starting, stopping, restarting, registering, or changing dev servers,
-Docker containers, Docker Compose services, local databases, port leases, or
-destructive coordinator state. Port release is restricted to the lease-owning
-project, and destructive state reset retains attributed prior-state evidence.
+Docker and database-stack replacement currently fails before host access with
+`unsupported_safe_replace`. Do not emulate it with lower-level commands.
 
-## Shared State
+For a persistent worker, first start sets `--keep-alive true|false`. Keep Alive
+restarts traced crashes. Ten crashes in an inclusive 300-second window trip
+the default non-expiring breaker; after fixing the worker, explicitly start
+with `--rearm-crash-loop true`.
 
-Server-wide authority is the product default. Every Codex, Claude Code, and
-other enrolled agent account reads and mutates one service-owned WAL database:
+Worker `remove` is staged: obtain and then apply the Archive plan, then obtain
+and apply the distinct permanent-cleanup plan with its exact ID, fingerprint,
+and confirmation phrase. Removal unregisters native startup and active
+catalog/policy/ACL state while retaining tombstone, crash, operation, and log
+evidence. Only `broker enroll --explicit-reinstall` creates a new incarnation.
 
-```text
-/var/lib/devcoordinator/coordinator.sqlite3
-/run/devcoordinator/broker.sock
-/etc/devcoordinator/client-profiles.json
-```
+## Interpret the result
 
-Clients never open the database. The broker authenticates the kernel peer UID,
-requires a current root-owned profile, and enforces exact repository/server
-ACLs. `inventory` returns this host graph, so a server started by one UID is
-immediately visible to the DevOps Console and every other enrolled UID. If the
-profile, socket, or service is missing, system mode fails closed; it never
-silently creates a second authority below an application-specific home.
+The compact response reports `ok`, classification, readiness, operation and
+repository context, immutable resources, ports/domains, CPU/memory breakdowns
+and family totals, stale processes, crashes, cleanup, and typed log links.
+Treat `ok=false` as failure even when a URL answers. Preserve its blocker,
+operation ID, cleanup state, and artifacts.
 
-The supervised authority broker runs as root because its enrollment database
-is root-owned and it must prove or stop exact resources across UIDs. Its typed
-protocol has no user-account host-process launch operation, and service
-authority mode rejects all direct CLI server, project, Docker, port,
-repository, resource, and API commands; host-process workloads remain children
-of their enrolled non-root clients. Typed Docker lifecycle stays broker-owned.
+An unclassified active family resource is a pre-mutation error. Unknown
+listener ownership, stale fingerprints, partial mutation, and incomplete
+cleanup also fail closed.
 
-Each client has a private execution/reconciliation journal at
-`/var/lib/devcoordinator-clients/<uid>/`. That database may retain launch, log,
-rollback, and broker-link evidence, but it is not inventory or reservation
-authority. The installer creates it as the client UID with mode `0700`; normal
-agent operations then require no sudo or repeated permission prompt.
+## Rules agents retain
 
-`DEVCOORDINATOR_AUTHORITY=account` or an explicit
-`CODEX_AGENT_COORDINATOR_HOME` without an authority setting is an isolated
-compatibility/test scope. It must not be used as host-global evidence. The
-legacy JSON implementation remains available only as
-`legacy-json-test-only` for deterministic fixtures.
+- One canonical Git worktree is one project. Python proves and publishes the
+  original-root -> temporary-worktree -> service hierarchy.
+- Use immutable IDs. Names, images, ports, remotes, and path resemblance are
+  not ownership evidence.
+- Never try the default port and silently move after a collision. Durable
+  assignment and leasing belong to the Coordinator.
+- Register an already-running, provably owned resource rather than launching a
+  duplicate. Use `server register` or `docker register` only when exact
+  ownership evidence permits it.
+- Do not run package-manager servers, Docker/Compose, or local database stacks
+  directly. Use a lower-level Coordinator command only when the runtime result
+  identifies that repair and its `--help` confirms the authority.
+- Before destructive PostgreSQL-in-Docker work, invoke
+  `postgres-docker-backup` against the verified immutable container ID.
 
-Never make the service SQLite file group-writable and never point multiple
-users at it through a symlink. Symlinks are used only to install this canonical
-repository skill into Codex/Claude roots so repository updates are picked up;
-the installer gives the client group read/execute-only source ACLs, including
-defaults for future files. Unix-socket peer authentication and ACLs provide
-runtime access; neither mechanism grants database or repository write access.
+## Shared authority and profile reload
 
-SQLite foreign keys and uniqueness constraints own the normalized invariants.
-Short `BEGIN IMMEDIATE` reservation/commit phases serialize conflicts while
-WAL permits concurrent reads. Slow process launch/termination, health checks,
-Docker, Git, backup scans, and filesystem observation run outside write
-transactions and commit only against their captured fingerprints. Product
-mutations use typed normalized services; the legacy JSON lock and callback
-projection are isolated to explicit compatibility-test fixtures and fail closed
-if selected by the default SQLite backend.
+Managed hosts use one service-owned SQLite/WAL authority through an
+OS-peer-authenticated Unix socket. Clients never open its database; private
+per-user journals hold launch/log/reconciliation evidence only. Explicit
+account authority is isolated compatibility/test scope, never host-global
+evidence.
 
-Same-target lifecycle mutations are rejected while an operation is active;
-unrelated repositories continue independently. A pending project lifecycle
-also excludes direct server and Docker mutations for that repository. Only
-synchronous child work carrying the exact internal parent-operation capability
-may run inside it; callers cannot supply that capability through CLI or HTTP.
-Abandoned reservations release safe unlaunched leases. A live process whose
-operation owner disappeared remains explicit orphan/reconciliation evidence,
-and a reused PID cannot impersonate the reserving process.
+The broker rechecks peer UID, protected profile, repository generation and
+family, exact membership, and action grants. Worker-role services support
+peer-UID lifecycle and generation-checked replacement through the fixed
+runner. Enrolled Docker/database targets support exact-ID status/start/stop/
+restart. Unsupported service roles and shared TTL/`run` work fail closed; do
+not switch authority modes as a workaround.
 
-`inventory` and authenticated inventory endpoints are pure snapshot reads.
-They do not inspect Docker/processes, scan backups, prune data, advance a
-revision, or write the database. `observe` performs the bounded host sampling
-transaction. Concurrent same-scope observations join one database-backed
-single-flight ticket; full-Docker, no-Docker, and different backup-directory
-scopes are distinct so a cheaper observation cannot masquerade as complete.
+In system mode the API validates the protected profile before binding and
+watches only its publication identity. After a stable atomic replacement it
+logs one `api.profile_changed` event and exits cleanly so `Restart=always`
+reloads strict authorization. It never logs profile contents or restarts the
+broker/Public Console; malformed replacements fail the supervised startup
+gate. Authorization/schema drift must be repaired offline through the
+installer's documented plan/verify workflow before restarting the broker.
 
-The first normalized observation discovers eligible same-UID legacy homes as
-migration inputs, privately backs them up, and imports them transactionally.
-One canonical Git worktree root becomes one repository. Exact duplicates merge;
-cross-repository claims and other unsafe differences remain explicit conflicts
-or Unassigned Resources. Imported homes are no longer independently polled.
-Later legacy writes are detected and surfaced rather than silently winning.
+Inventory is a pure read. Runtime performs any required bounded observation
+before action and returns committed evidence. Board and Console consume
+Python-produced `repository_trees`; they never infer grouping.
 
-### Server-wide installation
+## Broker-owned ephemeral containers
 
-Plan and apply the system identity, tmpfiles layout, systemd unit, client group
-membership, private journals, and direct canonical Codex/Claude skill links.
-Apply is transactional for configuration and skill links and does not start the
-service before ACL enrollment:
+Server-wide temporary containers use administrator-sealed
+`.codex/dev-runtime.json` `ephemeral_containers` templates. Templates pin the
+image digest, argv/non-secret environment, TTL, loopback port range, CPU,
+memory, and repository/per-UID concurrency budgets. Agents cannot supply
+images, commands, mounts, privileges, secrets, or arbitrary Docker flags.
 
 ```bash
-python3 scripts/install_server_wide_coordinator.py plan \
-  --client-user alice --client-user console
-
-sudo python3 scripts/install_server_wide_coordinator.py apply \
-  --client-user alice --client-user console \
-  --transaction-dir /var/lib/devcoordinator-install/$(date +%Y%m%d-%H%M%S)
+python3 "$COORDINATOR" ephemeral start \
+  --agent "$AGENT" --project "$ROOT_REPO" --template artifact-db \
+  --ttl-seconds 1800 --operation-id "$OPERATION_UUID"
+python3 "$COORDINATOR" ephemeral status \
+  --project "$ROOT_REPO" --run-id "$RUN_ID"
+python3 "$COORDINATOR" ephemeral renew \
+  --agent "$AGENT" --project "$ROOT_REPO" --run-id "$RUN_ID" \
+  --ttl-seconds 1800 --operation-id "$OPERATION_UUID"
+python3 "$COORDINATOR" ephemeral finish \
+  --agent "$AGENT" --project "$ROOT_REPO" --run-id "$RUN_ID" \
+  --reason "validation complete" --operation-id "$OPERATION_UUID"
 ```
 
-The installed broker retains `ProtectSystem=strict`,
-`ProtectHome=read-only`, `PrivateTmp=true`, `NoNewPrivileges=true`, and the
-system manager's capability ceiling with no ambient capabilities. Its only
-writable base exceptions are `/var/lib/devcoordinator` and
-`/run/devcoordinator`. The installer transaction also replaces one generated
-drop-in containing only the canonical, real, directly-under-`/home` homes of
-the complete explicit `--client-user` set. Reapply with the complete current
-client list after enrollment changes; omitted homes leave the writable set
-instead of accumulating in the configured unit. A running broker retains its
-old mount namespace until it is safely drained and restarted; omission is not
-live revocation before that restart. `/home` itself, `/root`, `/etc`, other
-users' homes, and every other protected path remain read-only. Peer ACLs, the
-cleanup plan and fingerprint, exact worktree identity, and the cleanup safety
-checks still authorize each mutation. After the safe restart, verify the
-deployed boundary with
-`scripts/check_broker_shutdown_unit.py` before enabling cleanup.
+Retain one operation UUID per mutation and replay uncertain outcomes with the
+same inputs. Status/finish retain exact owner cleanup access after ordinary
+enrollment revocation; they never revive a template or broaden authority.
+Creation is precommitted and recovered only from the full sealed label set and
+immutable container identity. The optional PostgreSQL password-file policy is
+the only broker-owned secret capability; credential bytes never enter argv,
+ordinary environment, SQLite, profiles, logs, or replies.
 
-Apply records and checks the broker runtime contract before changing the host.
-The exact Docker CLI available to the service must provide a stable official
-Compose plugin in the supported ranges `>=2.17,<3` or `>=5,<6`; Compose v1,
-2.0–2.16, major 3/4 or unknown versions, and prereleases fail closed. Only the
-reviewed `-desktop.N` vendor suffix, a positive numeric Debian package revision
-such as `-4`, and SemVer `+` build metadata are accepted; arbitrary vendor,
-canary, milestone, and experimental suffixes fail closed.
-The preflight performs only a throwaway
-`docker compose config --format json`: it proves two ordered explicit
-`--env-file` inputs, second-file override, and suppression of an implicit
-`.env`. It never contacts the daemon or starts a container. The installed
-systemd unit repeats the same proof before every broker start.
+## Universal test harness
 
-Enroll each UID/repository. Repeat `--server` to give that account control of
-only those declared servers; omitting it grants no server control unless the
-administrator supplies the explicit `--all-servers` override. Re-enrollment
-atomically replaces the server allowlist and revokes omitted grants:
+When a repository declares `.codex/tests.json`, use its structured harness
+instead of invoking the underlying framework directly:
 
 ```bash
-sudo python3 scripts/dev_coordinator.py broker enroll \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --socket /run/devcoordinator/broker.sock \
-  --access-group devcoordinator-clients \
-  --client-uid NUMERIC_CLIENT_UID \
-  --account-id EXACT_CLIENT_ACCOUNT_ID \
-  --project /absolute/path/to/repository \
-  --agent "$USER" \
-  --server web \
-  --server worker \
-  --port-range 3000-3999 \
-  --grant-cleanup
-
-sudo systemctl enable --now devcoordinator-broker.service
+python3 "$COORDINATOR" test run \
+  --agent "$AGENT" --project "$ROOT_REPO" --profile all
+python3 "$COORDINATOR" test stats \
+  --project "$ROOT_REPO" --days 30 --limit 25
 ```
 
-Enrollment performs a fresh full-Docker observation, grants only exact opaque
-normalized IDs, writes the protected system client profile, and starts no
-resource. `--grant-cleanup` is an explicit administrator-only opt-in: it grants
-archive/list/restore and permanent-cleanup capabilities for that repository,
-plus separately bound `cleanup.plan` and `cleanup.apply` grants for each exact
-currently observed server/container. Ordinary enrollment never receives these
-destructive capabilities, and revocation is re-read at both plan and apply.
-Before enabling Compose, the root-owned service renders the exact
-merged `docker compose config --format json` model from sealed inputs before
-changing any authority or profile. Enrollment holds the broker lifetime lock,
-and commit-time validation repeats the exact file and model checks. The
-declared service set must equal the rendered set, every requested profile must
-exist, dependency references must stay inside that set, each service is capped
-from one through 16 replicas, and the whole project is capped at 64. Unknown
-top-level or service features fail closed until reviewed. Privileged mode,
-host/container namespaces, devices/GPUs/capabilities, bind mounts, Docker API
-sockets, external volumes/networks, published host ports, and bind-style volume
-drivers fail closed unless the administrator repeats enrollment with
-`--approve-compose-host-access`. That approval is bound to the exact definition
-and rendered-model fingerprints, records UID 0 and the bounded risk classes,
-and does not waive replica limits. Every mutation re-renders the merged model
-with the installed Compose runtime and refuses fingerprint, risk, or replica
-drift before any lifecycle command. One kernel UID is bound to one account
-identity; ordinary reenrollment cannot replace that account while retaining
-its ACLs or profile repositories. Every UID/repository enrollment has its own
-service-enforced expiry, so renewing repository B never extends repository A,
-and a raw socket request cannot bypass client-profile expiry checks. Profile
-publication uses a protected root-owned cross-process lock, and
-observation-derived grants are bound to the exact fresh snapshot plus
-still-current ownership evidence.
-To migrate an already-running listener, enroll its definition and
-run `server register` as the owning UID; the service verifies the exact UID,
-PID, repository cwd, port, and listener before publication. Preserve the old
-account store until the shared inventory and Console show the migrated server.
-Use the install transaction with the installer's `rollback` command if the
-configuration or canonical links must be restored.
-
-#### Authorization-schema upgrade gate
-
-#### Broker maintenance availability guard
-
-On a host where the server-wide broker authorizes continuing Console routes or
-production listeners, never issue a standalone
-`systemctl stop devcoordinator-broker.service`. A broker stop is one step inside
-one bounded maintenance transaction, not a terminal action or a safe point to
-end a turn.
-
-Before stopping it, prove the required private backup and the exact enabled
-unit, then run the stop, offline operation, restart, and verification from one
-foreground maintenance driver with an exit/failure handler that starts the
-broker again. Do not begin the stop if the driver cannot remain alive through
-completion, if the offline command requires an unbounded wait or later user
-input, or if another task owns broker maintenance. Do not switch repositories,
-end the task, or report progress while the broker is intentionally inactive.
-
-After every intentional stop, require all of the following before the
-maintenance transaction releases control:
-
-- `devcoordinator-broker.service` is active and its Unix socket is present;
-- the anonymous broker-adjacent API health check succeeds;
-- authenticated server-wide inventory succeeds and still proves every
-  previously running production listener current and healthy; and
-- every known public Console-managed route that was healthy before maintenance
-  has returned to its normal authenticated/login response instead of a
-  Coordinator-unavailable 502.
-
-If an inactive broker is discovered unexpectedly, preserve the stop/audit
-evidence and first check for an active offline administration process or held
-maintenance lock. When neither exists, start the enabled broker immediately
-and perform the same inventory and public-route verification. Never add a
-blind watchdog that can restart the broker in the middle of legitimate offline
-database maintenance.
-
-Before any server-wide broker restart after an authorization/schema upgrade,
-run the installer `plan` with the complete client-user set. A
-`profile_database_enrollment_drift` result is a stop condition: do not restart
-the broker, API, or Console until it is resolved. Create and verify a private
-service-store backup first, then stop and drain the broker before either
-offline repair command. Do not stop the Console or loopback API merely because
-the broker is being maintained: their production units use soft startup
-dependencies so the public TLS edge and authenticated API listener remain
-available, while broker-backed requests fail closed until the socket returns.
-Preserve their PIDs and public/listener evidence across the broker maintenance
-window. An explicit Console/API unit replacement is a separate mutation and
-must be restarted and verified on its own.
-
-Arbitrary generation drift is never ignored. For each generation issue, use
-the exact values reported by the protected profile and service database and an
-existing root-owned `0700` rollback transaction directory:
-
-```bash
-sudo python3 scripts/dev_coordinator.py broker reconcile-profile-repository-generation \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --profile /etc/devcoordinator/client-profiles.json \
-  --client-uid NUMERIC_CLIENT_UID \
-  --account-id EXACT_CLIENT_ACCOUNT_ID \
-  --repo-id EXACT_REPOSITORY_ID \
-  --canonical-root /absolute/canonical/repository \
-  --rollback-root /var/lib/devcoordinator-install/PRIVATE-TRANSACTION \
-  --from-generation OLD_GENERATION \
-  --to-generation CURRENT_GENERATION
-```
-
-This command holds the broker and profile-publication locks, proves the exact
-repository/principal/installation and unchanged enabled-ACL digest, saves a
-private rollback profile, and changes only the one generation integer. It does
-not rebuild grants. Then backfill only the missing enrollment rows from the
-protected profile:
-
-```bash
-sudo python3 scripts/dev_coordinator.py broker migrate-profile-enrollments \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --profile /etc/devcoordinator/client-profiles.json
-```
-
-Rerun the migration to prove idempotence, then rerun installer `plan` and
-`verify`. Start the broker only when the two-way profile/database check is
-exact; prove that the still-running API recovers authenticated inventory and
-that the still-running Console retained its public listener. Finish by proving
-every UID/repository inventory plus the Console's authenticated
-MainPID/listener/assignment/lease graph and public login path. If a preexisting
-host still has hard `Requires=` dependencies, treat that as unit drift: restore
-the complete previously active service set before ending the transaction, then
-install and verify the canonical soft-dependency units through their documented
-rollback-safe deployment path.
-
-### Normalized store backup, restore, and corrupt recovery
-
-Back up either an account or service authority to a private absolute directory
-outside Git:
-
-```bash
-python3 scripts/dev_coordinator.py broker store-backup \
-  --database /absolute/path/to/coordinator.sqlite3 \
-  --store-role account \
-  --output-root /private/backup/root
-
-python3 scripts/dev_coordinator.py broker store-export \
-  --database /absolute/path/to/coordinator.sqlite3 \
-  --store-role account \
-  --output-root /private/backup/root
-```
-
-For a readable current store, `store-restore` (verified binary, same database
-generation) and `store-import` (verified logical export) first take a verified
-safety backup and require `--manifest`, `--safety-root`, and `--confirm`. They
-fail closed on corruption. A logical export is not corruption recovery.
-
-If the store is unreadable, stop every service/client using it before invoking
-the separate offline path:
-
-```bash
-python3 scripts/dev_coordinator.py broker store-recover \
-  --database /absolute/path/to/coordinator.sqlite3 \
-  --store-role account \
-  --manifest /private/backup/root/VERIFIED_BINARY_MANIFEST.json \
-  --forensic-root /private/forensic/root \
-  --confirm-corrupt-recovery
-```
-
-Recovery accepts only a strongly verified binary backup for the same store
-role. It cannot infer a generation from corrupt bytes, so it first captures
-the exact database/WAL/shared-memory files and checksums, retains that forensic
-evidence, verifies the replacement, and rolls back exact bytes on publication
-failure. The command does not stop or supervise the service; the operator owns
-that quiescent boundary.
-
-## Quick Start
-
-Resolve the script path relative to this skill directory:
-
-```bash
-PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 scripts/dev_coordinator.py inventory --project "$PROJECT_ROOT"
-python3 scripts/dev_coordinator.py observe \
-  --agent "$USER" \
-  --project "$PROJECT_ROOT"
-python3 scripts/dev_coordinator.py inventory --project "$PROJECT_ROOT"
-```
-
-```bash
-python3 scripts/dev_coordinator.py port lease --agent "$USER" --project "$PROJECT_ROOT" --range 3000-3999
-```
-
-Start or verify a whole project runtime first. This uses the canonical project
-path as the stable runtime identity, starts declared dependencies before web
-processes, preserves fixed ports, and returns URLs, ports, service status,
-dependency classifications, recent logs, and previous exit reasons:
-
-```bash
-python3 scripts/dev_coordinator.py project status --project "$PROJECT_ROOT"
-python3 scripts/dev_coordinator.py project start --agent "$USER" --project "$PROJECT_ROOT"
-python3 scripts/dev_coordinator.py project restart --agent "$USER" --project "$PROJECT_ROOT"
-python3 scripts/dev_coordinator.py project stop --agent "$USER" --project "$PROJECT_ROOT"
-```
-
-## Archive, Restore, Permanently Purge, Attach, Or Retire
-
-Do not hide a repository with a Board preference or delete its state rows.
-Repository Archive is a two-step, fingerprint-bound decommission. The legacy
-`plan-remove`, `remove`, `list-removed`, and `reinstall` spellings remain exact
-compatibility aliases:
-
-```bash
-python3 scripts/dev_coordinator.py repository plan-archive \
-  --agent "$USER" \
-  --project "$PROJECT_ROOT" \
-  --reason "No longer used on this machine"
-
-python3 scripts/dev_coordinator.py repository archive \
-  --agent "$USER" \
-  --project "$PROJECT_ROOT" \
-  --plan-id EXACT_PLAN_ID \
-  --plan-fingerprint EXACT_PLAN_FINGERPRINT
-```
-
-Planning forces a current full-Docker observation. Every container target must
-have an observable immutable identity, one authoritative controller, an
-available engine, and exactly one current Docker restart policy. Apply writes a
-durable start fence before host work, captures and disables the exact automatic
-start state, stops and verifies every target, deactivates leases/assignments,
-and hides only after complete success. Any drift or partial failure retains the
-fence and per-target evidence for idempotent continuation. Files, containers,
-volumes, databases, backups, and history are never deleted by this journey.
-
-Inspect retained removal records or explicitly reinstall:
-
-```bash
-python3 scripts/dev_coordinator.py repository list-archived
-python3 scripts/dev_coordinator.py repository restore \
-  --agent "$USER" \
-  --project "$PROJECT_ROOT" \
-  --reason "Needed again" \
-  --explicit
-```
-
-Reinstall only clears the repository fence. It never starts retained resources.
-The first later explicit Start restores only the exact pre-disable policy state
-captured by removal; missing or changed capture fails closed.
-
-Unassigned Resources are physical evidence without one proved repository
-membership. Never infer ownership from a name. Use inventory's
-`host_resource_id`, `immutable_fingerprint`, `control_binding_id`, and
-`ownership_fingerprint` with `resource attach` after the operator chooses a
-validated repository. If the resource is intentionally standalone, use
-`resource plan-retire`, review the exact plan, and pass its identifier and
-fingerprint to `resource retire`. Standalone retirement applies the same fresh
-observation, policy-disable, exact-stop, verification, retained-data, and fence
-rules as repository removal.
-
-Archive/restore one exact attached managed server or Docker container with the
-service-issued immutable identity fields. Resource restore replays the captured
-startup-policy values while the resource is proved stopped, verifies a managed
-server listener remains absent, clears the archive fence last, and never starts
-the runtime:
-
-```bash
-python3 scripts/dev_coordinator.py resource plan-archive \
-  --resource-kind container \
-  --resource-id EXACT_RESOURCE_ID \
-  --control-binding-id EXACT_BINDING_ID \
-  --immutable-fingerprint sha256:EXACT_IMMUTABLE_FINGERPRINT \
-  --ownership-fingerprint sha256:EXACT_OWNERSHIP_FINGERPRINT \
-  --request-project "$PROJECT_ROOT" --agent "$USER" --reason "Archive"
-
-python3 scripts/dev_coordinator.py resource archive \
-  --resource-kind container \
-  --resource-id EXACT_RESOURCE_ID \
-  --control-binding-id EXACT_BINDING_ID \
-  --immutable-fingerprint sha256:EXACT_IMMUTABLE_FINGERPRINT \
-  --ownership-fingerprint sha256:EXACT_OWNERSHIP_FINGERPRINT \
-  --request-project "$PROJECT_ROOT" --agent "$USER" \
-  --plan-id EXACT_PLAN_ID --plan-fingerprint sha256:EXACT_PLAN_FINGERPRINT
-```
-
-List the unified archive catalogue, or plan permanent removal only after the
-target is archived. Apply requires the plan's exact generated phrase, formatted
-as `PURGE KIND human display name`:
-
-```bash
-python3 scripts/dev_coordinator.py archives list --agent "$USER"
-python3 scripts/dev_coordinator.py cleanup plan \
-  --action purge --target-kind server --target-id EXACT_SERVER_ID \
-  --agent "$USER" --reason "Permanently remove"
-python3 scripts/dev_coordinator.py cleanup apply \
-  --plan-id EXACT_PLAN_ID --plan-fingerprint sha256:EXACT_PLAN_FINGERPRINT \
-  --confirmation-phrase 'PURGE SERVER human-name' --agent "$USER"
-```
-
-Project purge removes only the Coordinator catalogue entry. Server purge
-retains logs and audit evidence. Docker purge accepts one exact stopped 64-hex
-container identity and never uses force, removes mounts/volumes/images, or
-operates on Compose/database-owned containers. Worktree purge is offered only
-after the archived project has its own catalog tombstone, so removing the
-physical source cannot leave a false Restore promise. It accepts only a clean,
-non-root-owned secondary linked worktree; binds branch, HEAD, root, and Git
-admin/common device+inode identities; fails closed when mount, process-cwd, or
-open-file discovery is unavailable; rejects observed mounts/process paths; and
-runs `git worktree remove` without `--force`. Every purge retains a tombstone
-and crash-replay phase evidence. Purge planning and apply each require a newly
-committed bounded full-Docker host observation; unavailable observation or
-Docker authority fails closed before mutation.
-
-The authenticated local HTTP surface used by DevOps Console is deliberately
-typed: `GET /v1/archives` and `POST /v1/lifecycle/plan`, `/apply`, `/restore`.
-Plan accepts exactly `action`, `target_kind`, `target_id`, and `reason`; Apply
-accepts only the durable plan ID/fingerprint and confirmation phrase. The
-service—not the browser—resolves the plan to its repository and exact resource
-controller, rechecks current grants and host truth, and dispatches Archive or
-Purge.
-
-For a single managed process inside a project, start a server and let the
-coordinator lease the port, keep the PID, store logs, and health-check it:
-
-```bash
-python3 scripts/dev_coordinator.py server start \
-  --agent "$USER" \
-  --project "$PROJECT_ROOT" \
-  --name web \
-  --cwd "$PROJECT_ROOT" \
-  --cmd 'npm run dev -- --host 127.0.0.1 --port {port}' \
-  --range 3000-3999 \
-  --health-url 'http://127.0.0.1:{port}/'
-```
-
-### Durable port assignments (ports are fixed per repo server)
-
-The first successful `server start` or `server register` for a
-`(canonical project, server name)` identity durably pins that port to the
-server. The normalized `port_assignments` row survives server stops, lease
-expiry, and stopped-observation pruning, and is removed only by an explicit
-unassign, repository decommission, or destructive state reset. Consequences
-agents can rely on:
-
-- Restarting a server — even weeks later, after its stopped record was pruned —
-  lands on the same port, so tests and tooling can hard-code where a repo's
-  servers live. Look the port up while the server is stopped:
-
-```bash
-python3 scripts/dev_coordinator.py port assignments --project "$PROJECT_ROOT"
-```
-
-- No other project can lease, start on, or register over a pinned port. Such
-  attempts fail with an error naming the owner
-  (`port N is durably assigned to server 'web' of /repo`); do not work around
-  it — pick another port or ask the owner to unassign.
-- Starting the owner without `--range` treats the pinned port as the only
-  acceptable outcome: if a foreign process squats it, the start fails loudly
-  instead of silently drifting to a new port.
-- Passing an explicit `--preferred`/`--range` that lands the owner on a
-  different port re-pins the assignment to the new port.
-- Pin a port ahead of the first start, or release one:
-
-```bash
-python3 scripts/dev_coordinator.py port assign --agent "$USER" --project "$PROJECT_ROOT" --name web --port 3210
-python3 scripts/dev_coordinator.py port unassign --agent "$USER" --project "$PROJECT_ROOT" --name web
-```
-
-`port unassign --port N --force` removes another project's pin (for example an
-orphan left by a moved or renamed repo); without `--force` foreign pins are
-protected. Legacy assignments are imported automatically. Exact duplicates
-collapse; two repositories or two materially different definitions contesting
-one port create an explicit blocking migration conflict. The importer never
-picks a winner from timestamps or source order.
-
-For an operator-approved checkout ownership migration, do not unassign and
-race to re-create the pin. Capture the exact active lease ID from inventory,
-stop and verify the old listener, privately back up the SQLite database and
-its verified control-state manifest, then transfer the assignment and reusable
-stopped server identity in one transaction:
-
-```bash
-python3 scripts/dev_coordinator.py port relocate \
-  --agent "$USER" \
-  --old-project /absolute/old/checkout \
-  --new-project /absolute/new/checkout \
-  --name devops-console \
-  --port 443 \
-  --lease-id EXACT_PRE_CUTOVER_LEASE_ID
-```
-
-`port relocate` is deliberately strict. It rejects a live listener, live
-recorded PID, pending lease/operation, wrong or ambiguous assignment/server,
-foreign active lease, destination collision, or a missing lease without exact
-retained stale-release evidence. It uses positive listener evidence and never
-tries to bind the port, because an unprivileged bind to a free port such as 443
-can fail with `EACCES`. A successful relocation clears obsolete process/launch
-fields, marks the migrated server stopped, records attributed history, and
-allows the new listener's `server register` to reuse the same server ID.
-
-`--cmd` is compatibility input. It is parsed into argv and is never evaluated
-by a shell; shell control operators such as `;`, `&&`, pipes, redirects, and
-newlines are rejected. Prefer structured argv when quoting would be ambiguous:
-
-```bash
-python3 scripts/dev_coordinator.py server start \
-  --agent "$USER" \
-  --project "$PROJECT_ROOT" \
-  --name web \
-  --cwd "$PROJECT_ROOT" \
-  --argv '["npm","run","dev","--","--host","127.0.0.1","--port","{port}"]' \
-  --range 3000-3999
-```
-
-When a preceding workflow already owns an active lease whose purpose is
-`manual`, attach that exact lease instead of releasing it and racing to lease
-the port again. Exact-lease start accepts structured argv only:
-
-```bash
-LEASE_ID="$({
-  python3 scripts/dev_coordinator.py port lease \
-    --agent "$USER" \
-    --project "$PROJECT_ROOT" \
-    --range 3000-3999 \
-    --purpose manual
-} | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-
-python3 scripts/dev_coordinator.py server start \
-  --agent "$USER" \
-  --project "$PROJECT_ROOT" \
-  --name web \
-  --cwd "$PROJECT_ROOT" \
-  --argv '["npm","run","dev","--","--host","127.0.0.1","--port","{port}"]' \
-  --lease-id "$LEASE_ID" \
-  --health-url 'http://127.0.0.1:{port}/'
-```
-
-The lease must still be active and unexpired, have purpose `manual`, be
-unbound, and belong to the same agent and canonical project. The start reserves
-the server lifecycle and exact lease in one outer operation, uses its exact ID
-and port, and never allocates a replacement lease. Port release and direct
-project/server lifecycle mutations that conflict with that attachment are
-rejected until it completes. A failure before process launch restores the
-manual lease as unbound. Once process launch has occurred, a failed health
-check or uncertain outcome keeps the lease attached as explicit failure or
-reconciliation evidence until an attributed stop or release clears it; it is
-never silently returned to the manual pool.
-
-Project runtime declarations may likewise provide `"argv": [...]` instead of
-`"cmd"`. The persisted `LaunchSpec` contains argv, cwd, declared environment,
-agent, project, and source provenance, so restart retains the explicitly
-declared environment.
-
-If a server is already running on the declared fixed port but is not registered,
-adopt it instead of starting a duplicate. Adoption is allowed only when the
-listener PID can be attributed to the canonical project root. If the occupied
-port belongs to another repo, fix the stale coordinator metadata or register
-the real owner instead of attaching that listener to the current project:
-
-```bash
-python3 scripts/dev_coordinator.py server register \
-  --agent "$USER" \
-  --project "$PROJECT_ROOT" \
-  --name web \
-  --port 3000 \
-  --url 'http://127.0.0.1:3000'
-```
-
-An explicit `--pid` is proof input, not an ownership override. Registration
-requires that PID to be alive, have a readable cwd inside the canonical
-project, and own an exact TCP LISTEN socket inode for the declared port. A
-same-project idle PID, foreign listener, dead PID, wrong port, or unreadable
-process identity is rejected.
-
-On Linux, same UID alone does not guarantee `/proc/<pid>/fd` or cwd visibility
-when the target carries capabilities. A long-lived system service that adopts
-such listeners must have the narrow matching observer capability. Before it
-can exec managed children it must clear ambient and inheritable capabilities;
-the children must receive empty inheritable, permitted, effective, and ambient
-sets. The DevCoordinator production unit and capability integration test model
-this boundary for the Console's `CAP_NET_BIND_SERVICE` listener. The
-coordinator leaves the system manager's bounding ceiling unchanged; it is not
-an active capability, and legitimate privileges attached to a child's own
-executable remain available.
-
-Check, restart, and stop:
-
-```bash
-python3 scripts/dev_coordinator.py server status --project "$PROJECT_ROOT" --name web
-python3 scripts/dev_coordinator.py server restart --agent "$USER" --project "$PROJECT_ROOT" --name web
-python3 scripts/dev_coordinator.py server stop --agent "$USER" --project "$PROJECT_ROOT" --name web
-python3 scripts/dev_coordinator.py server logs --project "$PROJECT_ROOT" --name web --tail 200
-```
-
-Direct server restart holds one outer reservation across its delegated stop and
-start children, so another stop/start/restart cannot interleave in the gap.
-
-The coordinator keeps managed server log paths and stopped server records. When
-a managed server stops or its PID exits, inventory exposes `stopped_at`,
-`stopped_reason`, and `log_path`, and `server logs` returns the requested log
-tail plus the stop metadata.
-
-Inventory also exposes real per-server process CPU/RSS and project-level
-resource rollups. For managed dev servers, the coordinator samples the launcher
-PID plus its child process tree so Node/Next/Vite child processes are counted
-under the correct canonical repo. Use `inventory --project "$PROJECT_ROOT"` or
-project `status` evidence before assuming a server is healthy when it is slow,
-GC-bound, or memory-heavy. The `project_usage` rollup lists CPU percent, memory
-bytes, process counts, and hot PIDs by repo; it must be treated as diagnostic
-evidence, not synthetic UI decoration. Each row also carries authoritative
-membership (`usage_key`, `server_ids`, `container_resource_ids`) so UIs group
-inventory rows without re-implementing repo-identity heuristics.
-`container_names` remains alongside the exact resource IDs as legacy display
-data; it is not an ownership or join key.
-
-A declared server definition is not, by itself, a server instance. Enrollment
-may retain a definition solely as the exact ACL/port-policy identity for
-`port lease` and `port assign`. Those control-only definitions remain available
-under normalized `resources.servers` and through the Ports workflow, but they
-must not appear in compatibility `servers`, `project_usage.server_ids`, server
-running counts, or server lifecycle controls until a concrete lifecycle
-observation has been published. Do not interpret `unobserved` plus an ACL,
-assignment, or port policy as a running, stopped, or temporary server.
-
-For short-lived runtime workloads, use the typed `ephemeral start/status/renew/
-finish` lifecycle below. For an actual managed process, use `server start` and
-an attributed `server stop`; its port-lease TTL is reservation lifetime, not an
-automatic process cleanup policy. Archive and permanently purge a real retained
-server only through the exact `resource plan-archive` and `cleanup plan/apply`
-journeys above. Do not create fake server rows merely to reserve validation
-ports.
-
-Display grouping and whole-project actions share one membership model: the
-same attribution that places a container in a `project_usage` row decides
-whether `project start|restart|stop` acts on it. Explicit attribution (Docker
-Compose labels, then coordinator sidecar metadata) is required; repository or
-container name similarity is only read-only evidence and never establishes
-membership. Unattributed containers remain explicit unassigned resources and
-no whole-project action touches them. A UI grouped by `project_usage`
-therefore shows exactly the blast radius of whole-project actions.
-
-Inventory must show one current row per observed logical server identity
-(`canonical project path + server name`). Repeated starts, stops, restarts, or
-adoptions of the same fixed-port service must not appear as multiple runnable
-rows with the same URL or port. If stale state records exist from older runs,
-inventory collapses them into the preferred current record and may expose
-`duplicate_count` / `duplicate_server_ids` as diagnostic metadata.
-Stopped or stale records whose ports are now reused by another project must not
-be exposed as current URLs. Inventory marks those rows with
-`url_is_current=false`, `port_reused=true`, and `port_reused_by` evidence so
-agents and UI surfaces do not open the wrong app.
-
-## HTTP Endpoint Mode
-
-Run a single coordinator endpoint when agents prefer tool-style JSON calls:
-
-```bash
-python3 scripts/dev_coordinator.py api serve --host 127.0.0.1 --port 29876
-```
-
-The API is a local capability endpoint, not a remote administration service.
-It supports `localhost` or IPv4 loopback binds such as `127.0.0.1`; wildcard,
-non-loopback, and IPv6 binds are rejected before the server is created. At first start it creates
-`~/.codex/agent-coordinator/api-token` with mode `0600` (override with
-`CODEX_AGENT_COORDINATOR_TOKEN_FILE` or `--token-file`). Only `GET /healthz` is
-anonymous. Every `/v1/*` request must send:
-
-```text
-Authorization: Bearer <contents of api-token>
-```
-
-The server validates loopback `Host`, same-origin browser requests, JSON
-content type, and a 64 KiB body limit, and bounds concurrent request workers.
-Do not print, commit, or put the token in a URL. A group/world-readable or
-symlinked token file is rejected. Concurrent first starts converge on one
-exclusively created token; every process reopens the winning credential rather
-than replacing it with a different token.
-
-Useful endpoints:
-
-- `GET /v1/inventory`
-- `GET /v1/events?after=OPAQUE_CURSOR&limit=100` — ascending durable event
-  catch-up; `limit` is bounded to 1..500 and the response never exposes
-  private diagnostic payloads. Persist `next_cursor` only after handling the
-  page; it is an insertion-order high watermark, not an event-time cursor
-- `GET /v1/inventory/no-docker` — the same observed coordinator graph with
-  Docker discovery intentionally omitted (`available: null`, empty container
-  and PostgreSQL rows); use only for authenticated service readiness where
-  Docker availability must not control the unit start transaction.
-- `GET /v1/state`
-- `GET /v1/ports`
-- `GET /v1/ports/assignments`
-- `GET /v1/servers`
-- `POST /v1/ports/lease`
-- `POST /v1/observe` — run one explicit full host observation with exactly
-  `agent` and `project`; inventory reads remain pure
-- `POST /v1/ports/release`
-- `POST /v1/ports/assign`
-- `POST /v1/ports/unassign`
-- `POST /v1/servers/start`
-- `POST /v1/servers/register`
-- `POST /v1/servers/stop`
-- `POST /v1/servers/restart`
-- `POST /v1/servers/status`
-- `POST /v1/servers/logs`
-- `POST /v1/projects/status`
-- `POST /v1/projects/start`
-- `POST /v1/projects/restart`
-- `POST /v1/projects/stop`
-- `POST /v1/docker/ps`
-- `POST /v1/docker/stats`
-- `POST /v1/docker/compose-up`
-- `POST /v1/docker/compose-down`
-- `POST /v1/docker/logs`
-- `POST /v1/docker/register`
-- `POST /v1/docker/start`
-- `POST /v1/docker/stop`
-- `POST /v1/docker/restart`
-
-POST bodies are JSON and use the same option names as the CLI without leading
-dashes. Prefer the `argv` array over a legacy `cmd` string, for example:
-
-```json
-{"agent":"codex-a","project":"/repo","name":"web","cwd":"/repo","argv":["npm","run","dev","--","--port","{port}"],"range":"3000-3999"}
-```
-
-To consume an existing manual lease through the API, include its exact
-`"lease_id"` in the same `/v1/servers/start` payload. The same ownership,
-expiry, source, binding, structured-argv, and rollback rules apply.
-
-## Docker
-
-Use Docker commands through the coordinator so agents have one visible control
-surface:
-
-```bash
-python3 scripts/dev_coordinator.py docker ps
-python3 scripts/dev_coordinator.py docker stats
-python3 scripts/dev_coordinator.py docker ps --all
-python3 scripts/dev_coordinator.py docker compose-up --agent "$USER" --project "$PROJECT_ROOT" --cwd "$PROJECT_ROOT" --file docker-compose.yml --detach
-python3 scripts/dev_coordinator.py docker compose-down --agent "$USER" --project "$PROJECT_ROOT" --cwd "$PROJECT_ROOT" --file docker-compose.yml
-python3 scripts/dev_coordinator.py docker logs --container my-container --tail 80
-python3 scripts/dev_coordinator.py docker register --agent "$USER" --project "$PROJECT_ROOT" --container my-container --role web
-python3 scripts/dev_coordinator.py docker start --agent "$USER" --project "$PROJECT_ROOT" --container my-container
-python3 scripts/dev_coordinator.py docker restart --agent "$USER" --project "$PROJECT_ROOT" --container my-container
-```
-
-Use `--dry-run` when Docker may not be installed or when validating the command
-shape without changing containers.
-
-Do not invoke raw `docker run`, `docker create`, or mutating `docker compose`
-commands from agent guidance or agent-facing helper scripts. New and ephemeral
-workloads must cross a typed coordinator admission path that records the
-repository, agent, immutable definition, leased ports, TTL, and cleanup intent
-before the container starts. Canonical coordinator internals and deterministic
-fixtures are the only reviewed source-policy exclusions.
-
-Administrator-sealed ephemeral templates are top-level entries in
-`.codex/dev-runtime.json`. Every entry requires the complete bounded shape:
-
-```json
-{
-  "ephemeral_containers": [
-    {
-      "name": "artifact-db",
-      "image_ref": "postgres@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-      "argv": ["postgres", "-c", "fsync=off"],
-      "env": {"POSTGRES_DB": "artifact_validation"},
-      "secret_policy": "postgres_initdb_password_file_v1",
-      "default_ttl_seconds": 900,
-      "max_ttl_seconds": 3600,
-      "container_tcp_port": 5432,
-      "host_port_start": 55000,
-      "host_port_end": 55010,
-      "memory_bytes": 268435456,
-      "cpu_millis": 500,
-      "max_concurrent_runs": 4,
-      "max_concurrent_runs_per_uid": 2,
-      "repo_max_active_runs": 16,
-      "repo_memory_budget_bytes": 8589934592,
-      "repo_cpu_budget_millis": 16000
-    }
-  ]
-}
-```
-
-`max_concurrent_runs` is the template-wide active-run cap and
-`max_concurrent_runs_per_uid` is the authenticated-UID cap within that
-template. `repo_max_active_runs`, `repo_memory_budget_bytes`, and
-`repo_cpu_budget_millis` are shared across all templates in one repository;
-every template there must declare the same repository limits. Admission checks
-and inserts under one database writer reservation, so concurrent requests
-cannot both pass a stale count or budget snapshot.
-
-Inline `env` is non-secret configuration only. Manifest and service-database
-persistence retain those values, so credential-looking names—passwords,
-tokens, API/private keys, and credentials—are rejected. Never put a secret
-under a less obvious variable name to bypass this boundary.
-
-The only reviewed ephemeral credential capability is optional
-`"secret_policy": "postgres_initdb_password_file_v1"`. It is not a general
-secret manager and accepts no credential value, path, token, or alternate
-policy from a manifest, client, CLI, profile, or broker request. After a
-durable, authorized run admission, the root-owned broker generates one
-password in a private volatile runtime directory and mounts only its material
-directory read-only into the exact PostgreSQL container at
-`/run/devcoordinator-credentials`. The container receives only
-`POSTGRES_PASSWORD_FILE=/run/devcoordinator-credentials/postgres-initdb-password`;
-credential bytes never enter Docker arguments, ordinary environment values,
-SQLite, profiles, logs, or JSON replies. Persisted state contains only the
-typed policy and an opaque binding ID. The ordinary CLI and generic JSON client
-cannot invoke credential delivery; the broker's internal runner path receives
-one read-only descriptor through authenticated Unix `SCM_RIGHTS`, and an
-ambiguous delivery retry fails closed as a replay. Material is removed only
-after exact container absence is proved; loss of volatile runtime material
-after a reboot leaves the run unavailable rather than regenerating a password.
-
-Use an explicit canonical project for every command. Mutations also require
-diagnostic agent metadata; the broker stores it with the durable operation, but
-the kernel UID and enrolled account remain the authorization identity:
-
-```bash
-PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 scripts/dev_coordinator.py ephemeral start \
-  --agent "$USER" --project "$PROJECT_ROOT" \
-  --template artifact-db --ttl-seconds 1800 \
-  --operation-id START_OPERATION_UUID
-python3 scripts/dev_coordinator.py ephemeral status \
-  --project "$PROJECT_ROOT" --run-id RUN_ID
-python3 scripts/dev_coordinator.py ephemeral renew \
-  --agent "$USER" --project "$PROJECT_ROOT" \
-  --run-id RUN_ID --ttl-seconds 1800 \
-  --operation-id RENEW_OPERATION_UUID
-python3 scripts/dev_coordinator.py ephemeral finish \
-  --agent "$USER" --project "$PROJECT_ROOT" \
-  --run-id RUN_ID --reason "validation complete" \
-  --operation-id FINISH_OPERATION_UUID
-```
-
-For automation, generate and retain one operation UUID before each mutation.
-If the client loses a reply or receives `operation_outcome_uncertain`, repeat
-the exact same project, resource, agent, TTL/reason, and `--operation-id`.
-Reusing the UUID with different inputs is rejected; retrying without it creates
-a distinct authorized operation and, for Start, may create another run after
-the first is recovered.
-
-The project is never inferred from cwd and a run ID is never probed across all
-enrollments. Status makes one read-only call in the named repository; start,
-renew, and finish are scoped to that same exact enrollment.
-
-Recording an ephemeral run after Docker starts is safe only as recovery of a
-precommitted run. Before `docker create`, the broker durably records an
-unguessable creation nonce and the intended repository/template definition.
-It creates the container stopped with five exact labels: run ID, creation
-nonce, repository ID, template ID, and definition fingerprint. If Docker
-created it but the reply was lost, recovery accepts exactly one all-label
-match, verifies its sealed safety profile, persists its immutable 64-hex ID,
-and only then starts or cleans it. Container name similarity is never evidence.
-
-An unrelated already-running container has no precommit and cannot enter that
-recovery path. After a full observation, attach it only as an explicit operator
-repair using every immutable field returned for its Unassigned Resources row:
-
-```bash
-python3 scripts/dev_coordinator.py resource attach \
-  --resource-kind container \
-  --resource-id EXACT_RESOURCE_ID \
-  --control-binding-id EXACT_BINDING_ID \
-  --immutable-fingerprint sha256:EXACT_IMMUTABLE_FINGERPRINT \
-  --ownership-fingerprint sha256:EXACT_OWNERSHIP_FINGERPRINT \
-  --project "$PROJECT_ROOT" --agent "$USER" \
-  --reason "Operator verified this existing container belongs to the repository"
-```
-
-This records current ownership without claiming the unsafe interval before
-attachment was protected. `docker register` remains a sidecar repair for an
-existing container that is already proved to belong to the repository, not an
-alternative ephemeral creation protocol.
-
-The server-wide installer `plan` and `verify` actions inspect each enrolled
-UID's configured supplementary groups, retained live-process groups, socket
-ACL, mode, and directory traversal for standard Docker Unix socket locations.
-Direct access is reported as a non-fatal staged activation blocker, not silently
-revoked. Do not remove group or ACL access until typed ephemeral workload parity
-has been deployed and verified; activate exclusive broker admission later in a
-separate rollback-safe administrator transaction.
-
-Docker execution does not assume an interactive-shell `PATH`. The coordinator
-resolves `CODEX_DOCKER_CLI` when it names an absolute executable, then the
-current `PATH`, then standard Homebrew, Docker Desktop, OrbStack, and per-user
-installation locations. It preserves the discovered `docker` entry-point path
-instead of canonicalizing a multicall symlink to a differently named target.
-Real Docker calls are bounded by observation and lifecycle timeouts; dry-run
-never requires a Docker installation.
-
-Project start, restart, and stop preflight Docker before mutating any managed
-process whenever the declaration includes Compose or an attributed container.
-The bounded preflight verifies the Docker executable, daemon, and—when
-declared—the Compose plugin. An unavailable capability returns a complete project report with
-`ok=false`, `classification=missing_dependency`, `actions=[]`,
-`partial=false`, and structured `action_errors[].capability` evidence instead
-of partially changing the runtime or exposing a raw `FileNotFoundError`.
-Failures after one or more successful actions return the same report shape with
-`partial=true`, the completed `actions`, and structured `action_errors`.
-
-Existing Docker labels cannot be rewritten for running containers. When Docker
-does not provide Compose project labels, register coordinator-side metadata with
-`docker register` or let `docker start/stop/restart` attach it automatically
-from `--agent` and `--project`. Inventory merges real Docker Compose labels
-first, then coordinator sidecar metadata for unlabeled containers.
-
-Compose's working-directory label may point at a `deploy` or `infra`
-subdirectory. Inventory resolves that explicit path to the deepest enrolled
-canonical Git worktree containing it; a closer nested `.git` marker remains a
-distinct repository. Container/image names are never consulted for this
-resolution.
-
-When a declared dependency is also owned by declared Compose, keep the
-dependency for health/readiness evidence and map its lifecycle explicitly with
-`"service": "<compose-service>"` (preferred), or give it a `name` that exactly
-matches an entry in `docker.services`. Compose then exclusively owns its
-start/stop/restart lifecycle, while unrelated declared containers retain direct
-container lifecycle management. Project restart safely uses `compose restart`
-for observed running services and `compose up -d` for missing or stopped
-services; recovery actions run before dependent restarts, and the coordinator
-does not force-recreate containers or risk writable-layer data.
-
-A container name or image that resembles a repository name is discovery
-evidence only. Project start, restart, and stop may mutate a container only when
-it is explicitly declared in the runtime, has a Compose working-directory label
-for the canonical project, or has prior coordinator-side registration with
-matching project and agent metadata. Name-only matches remain visible as
-`read_only_evidence=true` and `mutation_authorized=false`; they must never be
-auto-registered or passed to a Docker lifecycle command.
-
-Docker lifecycle reservations normalize container names and short IDs through
-`docker inspect` to the immutable full container ID before reserving state. Two
-aliases for the same container therefore conflict as one mutation target. If
-that immutable identity cannot be verified, lifecycle mutation and sidecar
-registration fail closed.
-
-When a project runtime declaration names an existing unlabeled container,
-`project start` adopts that container into coordinator-side metadata before it
-reports final status, and `project stop`/`project restart` record the same
-sidecar attribution for the containers they act on. This keeps databases such
-as `aerodb-pg` grouped under the repo that declared them instead of under a
-name-derived pseudo-project.
-
-The shared inventory includes stopped containers (`docker ps --all --no-trunc`)
-so agents can see containers that are available to start instead of
-accidentally creating duplicates. Both inventory and stats request untruncated
-IDs. Only exact 64-hex IDs become immutable Docker resources. If inspect is
-temporarily unavailable, the full-ID `ps` row may update name, image, and
-lifecycle, while previously proved labels, ports, health, restart policy, and
-repository attribution remain unchanged until inspection succeeds again.
-Legacy retained 12-character rows remain in normalized history; the v1
-projection hides one only when exactly one same-engine 64-hex strict-prefix row
-is a safe newer replacement. Ambiguous prefixes and attribution mismatches
-remain visible.
-
-After an explicit full-Docker `observe`, inventory includes the committed real
-telemetry for running containers. The observer samples `docker stats
---no-stream --no-trunc` once per coalesced host scope, stores a bounded rolling
-`stats_history` per immutable container, and exposes current CPU, memory,
-network I/O, and block I/O values plus per-second network/block rates. Pure
-inventory reads never resample Docker. Stopped containers remain visible but
-do not receive live stats.
-
-Machine consumers can reduce inventory transport cost without changing the
-persisted telemetry window. `--compact-json` emits the same inventory as one
-compact JSON line, while `--stats-history-limit` selects how many of the newest
-stored samples are returned for each primary Docker container:
-
-```bash
-python3 scripts/dev_coordinator.py inventory --compact-json --stats-history-limit 30
-```
-
-Both controls are opt-in. Ordinary CLI and HTTP inventory responses retain the
-full bounded 120-sample history, and ordinary CLI JSON stays pretty-printed.
-Use a limit of `0` when only the last committed `stats` sample is needed; this
-shapes the response only and never deletes persisted history. Values outside
-`0..120` are rejected.
-
-## Project Runtime Declarations
-
-Project runtime declarations live at `.codex/dev-runtime.json` by default. Use
-them when a repo needs a database, worker, Docker Compose service, fixed port,
-or meaningful readiness check. A project-level `start` must not report success
-only because the web process answers `/`; required dependencies and declared
-readiness checks must also pass.
-Default HTTP health accepts 2xx and 3xx responses. A 4xx response, including a
-foreign app's 404 on the requested health path, is unhealthy unless the repo
-declares a more specific readiness check that proves the app is actually ready.
-
-Docker Compose mutation requires an explicit runtime declaration. If a repo has
-`docker-compose.yml` but no `.codex/dev-runtime.json`, the coordinator may show
-the file as discovered evidence, but `project start` must not run `docker
-compose up` from that discovery. Add a declaration or register/adopt the
-already-running containers instead of creating a duplicate stack.
-
-The declaration must name at least one exact Compose service and every Compose
-profile and environment file that changes the effective model. Environment files must be regular, private files
-inside the canonical repository, owned by root or the repository owner, and
-free of symbolic-link components. The service persists only their canonical
-paths, sizes, and SHA-256 fingerprints—never their plaintext—and refuses a
-mutation after drift. It preserves the declared order of environment files,
-profiles, Compose files, and services when building the exact command. An
-enabled Compose project name is globally unique across enrolled repositories
-and must not collide with a differently owned project observed on the host,
-including a stopped project's retained Compose-labeled network or volume.
-Immediately before every mutation, the broker commits a fresh full-Docker
-snapshot with exhaustive container, network, and volume project evidence,
-rechecks both observed and persisted project-name ownership, and
-binds that evidence to the durable operation. It executes the already-verified
-Compose and environment bytes through sealed anonymous inputs on Linux, so a
-repository-side replacement cannot race validation. The Compose subprocess
-receives a bounded Docker-connection environment and an explicit sealed empty
-environment-file baseline before any declared sealed environment files. This
-suppresses implicit `.env` loading independently of the fixed
-`COMPOSE_DISABLE_ENV_FILE=1` compatibility switch; unrelated broker environment
-variables never become interpolation inputs. Brokered Compose files must be
-self-contained: transitive file/provider
-features such as `include`, `extends`, `build`, service `env_file`,
-`label_file`, `configs`, `secrets`, `develop`, `credential_spec`, and
-`provider` fail closed until the coordinator can fingerprint and seal their
-complete dependency graphs. The exact `/usr/bin/python3` service runtime must
-provide PyYAML 6.x (the Debian/Ubuntu package is `python3-yaml`; use the
-equivalent system package on other distributions). The same isolated
-installer/systemd preflight also resolves the exact Docker executable the
-broker will use, enforces the stable Compose version ranges `>=2.17,<3` or
-`>=5,<6`, and proves non-mutating JSON config rendering with both ordered
-explicit environment files and implicit `.env` suppression. The broker uses
-PyYAML's safe loader with aliases, custom tags, and duplicate keys rejected,
-and fails closed when that parser or the Compose capability contract is
-unavailable.
-
-The broker fixes `COMPOSE_REMOVE_ORPHANS=0`, a parallelism limit of four, and
-noninteractive plain output in the process environment, which takes precedence
-over declared env files. Detached `up` also uses `--no-deps`; dependency
-containers cannot expand beyond the complete persisted service allowlist, and
-post-action proof rejects every observed project service outside that set.
-
-Project stop uses the typed `compose.stop` operation against only the persisted
-service list; project restart uses typed `compose.restart`, which performs an
-exact stop followed by detached up under one durable broker operation. Neither
-action removes containers, networks, or volumes. `compose.down` is a separate,
-explicit destructive lifecycle operation and is never inferred from stop or
-restart. Once any Compose runner is invoked, a nonzero exit, timeout, or sealed
-input cleanup failure is recorded as an uncertain outcome that blocks every
-new operation for that definition until service reconciliation; it is never
-treated as a safe terminal failure that may be blindly retried.
-
-Inspect an uncertain operation without changing state, then reconcile it under
-the exclusive service lifetime lock with a new full-Docker observation:
-
-```bash
-sudo python3 scripts/dev_coordinator.py broker reconcile-compose \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --operation-id EXACT_OPERATION_ID --plan
-
-sudo python3 scripts/dev_coordinator.py broker reconcile-compose \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --operation-id EXACT_OPERATION_ID
-```
-
-Only when the plan proves the original service scope is unrecoverable may an
-administrator record an offline terminal failure. It never claims the desired
-host state and requires the exact displayed fingerprint:
-
-```bash
-sudo python3 scripts/dev_coordinator.py broker reconcile-compose \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --operation-id EXACT_OPERATION_ID \
-  --abandon-as-failed \
-  --confirm-definition-fingerprint EXACT_SHA256_FINGERPRINT
-```
-
-A disabled definition retains its project-name claim. Release it only after
-the project has no containers, networks, or volumes and no unresolved Compose
-operation; this command obtains its own strict new observation and records the
-old-name provenance before another repository may claim it. Release also
-atomically revokes every lifecycle ACL for the old definition, so stop/down
-authority cannot survive the name transfer:
-
-```bash
-sudo python3 scripts/dev_coordinator.py broker release-compose-project-name \
-  --database /var/lib/devcoordinator/coordinator.sqlite3 \
-  --compose-definition-id EXACT_DEFINITION_ID
-```
-
-Minimal example:
-
-```json
-{
-  "name": "example-app",
-  "docker": {
-    "compose_files": ["docker-compose.yml"],
-    "env_files": [".codex/dev.env"],
-    "profiles": ["application"],
-    "project_name": "example-app",
-    "services": ["postgres", "worker"]
-  },
-  "servers": [
-    {
-      "name": "web",
-      "role": "web",
-      "port": 3000,
-      "cmd": "npm run dev -- --host 127.0.0.1 --port {port}",
-      "health_url": "http://127.0.0.1:{port}/"
-    }
-  ],
-  "dependencies": [
-    {
-      "type": "docker",
-      "name": "postgres",
-      "container": "example-postgres",
-      "ports": [{"host": "127.0.0.1", "port": 5432}]
-    }
-  ],
-  "health_checks": [
-    {
-      "name": "app-ready",
-      "url": "http://127.0.0.1:3000/api/health",
-      "expect_status": 200,
-      "expect_text": "ok"
-    }
-  ]
-}
-```
-
-If there is no declaration, the coordinator may discover existing managed
-servers, Docker Compose files, Compose working-directory labels, and matching
-containers. Container discovery uses the same attribution as inventory's
-`project_usage` grouping: a container explicitly attributed to another project
-never joins this project's runtime, and a name match alone never claims a
-container. If the coordinator still cannot identify a complete runtime, it
-returns `ok=false` with `classification=missing_dependency` instead of
-guessing ports or reporting success.
-
-## Universal Test Harness
-
-Testing is a repository-scoped Coordinator capability. Repositories declare
-structured commands in `.codex/tests.json`; they must not open the Coordinator
-database or create a separate test-result database/dashboard. The client-side
-Python runner executes the declared argv directly under the enrolled user,
-never through a shell and never inside the privileged broker. The broker owns
-admission, exact repository attribution, durable session/group/case records,
-idempotency, and statistics. Raw commands, environment values, child output,
-credentials, and failure payloads do not enter the service journal.
-
-Run a complete declared profile:
-
-```bash
-python3 scripts/dev_coordinator.py test run \
-  --agent "$USER" --project "$PROJECT_ROOT" --profile all
-```
-
-Run one or more declared groups:
-
-```bash
-python3 scripts/dev_coordinator.py test run \
-  --agent "$USER" --project "$PROJECT_ROOT" \
-  --group unit --group ui-test
-```
-
-Run selected individual pytest node IDs. Individual selectors require exactly
-one `pytest` group:
-
-```bash
-python3 scripts/dev_coordinator.py test run \
-  --agent "$USER" --project "$PROJECT_ROOT" --group unit \
-  --select 'tests/unit/test_api.py::test_health'
-```
-
-Read repository statistics without starting tests:
-
-```bash
-python3 scripts/dev_coordinator.py test stats \
-  --project "$PROJECT_ROOT" --days 30 --limit 25
-```
-
-Manifest schema version 1 requires nonempty `groups` and `profiles`. Each group
-declares `kind` (`pytest`, `jsonl`, `trx`, or `automation`), a repository-local
-`cwd`, and structured `argv`. `{python}`, `{dotnet}`, `{events}`, and
-`{results}` are runner-owned exact-token substitutions. A pytest group may
-declare default `selectors`; an explicit `--select` replaces those defaults.
-A JSON-lines framework reporter may receive its private temporary destination
-only through a `DEVCOORDINATOR_*` `event_env`. Paths that escape the canonical
-repository, shell strings, malformed reporter output, and non-test commands in
-the manifest fail closed.
-
-Every requested selection creates a parent session before any child starts.
-Every group is admitted before subprocess launch and finished after process
-termination; pytest, Vitest-compatible JSON-lines reporters, and TRX record
-each individual case's exact identity, start, finish, duration, and outcome.
-An automation group records its own lifecycle but has no invented cases. The
-CLI returns structured summaries only. DevOps Console provides arbitrary
-bounded date windows; DevOps Board receives a bounded 30-day repo-by-repo
-projection in normalized inventory.
-
-## Agent Workflow
-
-1. Set `PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`, then
-   run `inventory --project "$PROJECT_ROOT"` before starting, stopping, or replacing any
-   local service. If the snapshot is absent or stale for the task, run one
-   explicit `observe --agent "$USER" --project "$PROJECT_ROOT"` and read
-   inventory again. In server-wide mode this is a typed full-Docker broker
-   observation against the service-owned database; it never opens or imports
-   the client's execution journal. Account-only discovery flags (`--no-docker`,
-   `--backup-dir`, `--legacy-home`, and `--legacy-backup-root`) are rejected in
-   server-wide mode, as is nonzero `--max-age-seconds`; a system observation
-   always creates or joins a new bounded service snapshot. Do not treat
-   inventory itself as a refresh mutation.
-2. For "run/start/restart/check the dev server", call `project status` or
-   `project start` with the canonical repo path. Do not manually run package
-   manager dev commands, Docker, database, worker, and web commands unless the
-   project runtime report points to a specific service-level repair.
-3. Treat `ok=false` as not ready even when a web URL exists. Report the
-   coordinator's classification: `wrong_port`, `stopped_container`,
-   `crashed_process`, `unhealthy_process`, `timeout`, `missing_dependency`, or
-   `stale_coordinator_metadata`.
-4. Keep project ports fixed. Add or update `.codex/dev-runtime.json` when a
-   repo needs a fixed web, database, or worker port. Use `--allow-port-change`
-   only when the user explicitly asks to change ports.
-   `project start` may reclaim same-project fixed-port leases that were left by
-   stopped, missing, or dead managed servers; do not manually switch to a new
-   port to work around stale coordinator metadata.
-   Durable port assignments back this policy automatically: every managed or
-   registered server keeps its port across stops, restarts, and record pruning,
-   and `port assignments --project "$PROJECT_ROOT"` answers "where does this
-   repo's server live" even while it is stopped. If a start fails because the
-   pinned port is unavailable, surface the error instead of moving the server.
-5. When a dependency is stopped or unhealthy, preserve the evidence in the
-   runtime report (`before`, recent logs, previous exit reasons), then recover
-   through `project start` or `project restart`, and report both evidence and
-   final status.
-6. Use individual `server`, `docker`, and `port` commands for explicit
-   service-level tasks only after the project runtime is understood.
-7. If an already-running server or unlabeled Docker container belongs to the
-   repo, register it. `project start` adopts healthy fixed-port servers
-   automatically; use `server register` or `docker register` for explicit
-   repairs.
-8. Before trusting or stopping an adopted process, verify listener ownership
-   through the process cwd/git root. If a registered server PID or port belongs
-   to another project, treat it as `stale_coordinator_metadata`; do not report
-   it as working and do not kill the foreign PID.
-9. For repository tests, inspect `.codex/tests.json`, then choose the smallest
-   declared profile, group set, or individual selectors that answer the task.
-   Use the universal test command above; do not invoke the underlying framework
-   directly when the repository declares the harness, because that would omit
-   its required durable run and case record. Run the full profile when the
-   change or acceptance criteria require complete coverage.
-
-## Health, Status, And State Robustness
-
-- `server status` re-checks health a few times with a short backoff before
-  concluding a server is down, so a transient blip or a still-warming server is
-  not misclassified after a single miss.
-- A live, correctly-owned server that fails its health check within its startup
-  grace window is reported as `starting`, not `unhealthy`, so a slow boot does
-  not trigger needless restart churn. After the grace window it becomes
-  `unhealthy`. `server_health` also returns a `classification` of `healthy`,
-  `starting`, `unhealthy`, `wrong-listener`, `unverified-listener`, or
-  `stopped`.
-- A CLI process that lacks permission to inspect a previously proven
-  capability-bearing listener reports `unverified-listener` with
-  `health.ok=null` and `identity.observable=false`. It preserves the recorded
-  running/unhealthy lifecycle and active lease; inability to observe is not
-  evidence that another process owns the port. Use the capability-matched,
-  authenticated production API inventory for a fresh strict ownership proof.
-- Apply the same tri-state rule to managed servers without explicit
-  registration evidence and to non-Linux lsof probes. lsof exit 1 with no
-  output is a clean no-match; permission or execution diagnostics mean
-  `observable=false`, never `wrong-listener`.
-- Treat that clean no-match as negative probe evidence only. If a managed PID
-  is still live but no concrete cwd was returned, project ownership remains
-  unverified and every mutating lifecycle path must fail closed.
-- Treat an unreaped zombie as terminated even though `kill(pid, 0)` succeeds;
-  confirm non-zombie process state before applying the live-PID ownership gate.
-- Server and project start, stop, and restart fail closed on that unknown
-  identity before recording an operation, signaling or launching a process,
-  changing a lease, acting on Docker, or writing sidecar metadata. Run the
-  mutation through a capability-matched coordinator surface; do not retry it
-  from an incapable CLI or infer that the port is safe to replace.
-- Stopped observations and high-frequency telemetry are retained under bounded
-  policies. Pruning never deletes the normalized server definition, durable
-  assignment, removal record, operation evidence, or current ownership
-  boundary merely because a status sample aged out.
-- SQLite/database validation failures fail closed; the coordinator never
-  replaces damaged normalized control state with an invented empty database.
-  Preserve the database, WAL, and shared-memory files together for diagnosis
-  and restore only from verified coordinator backup/export evidence.
-- Managed server/project and Docker lifecycle calls reserve and commit in
-  short transactions. Process spawn, health polling, termination, Docker
-  execution/inspection, project discovery, and host sampling happen outside
-  the SQLite writer transaction, so an unrelated lease is not blocked by slow
-  host work. Captured generations and immutable fingerprints prevent the slow
-  result from overwriting a newer lifecycle decision.
-- `inventory` is read-only. `observe` owns server/process/Docker/database
-  observation commits and their monotonic observation revision. An older or
-  narrower in-flight sample cannot overwrite or satisfy a newer/different
-  scope; Docker telemetry merges by sample identity and remains bounded.
-- Repository roots, branches, and short commits are read from local `.git`
-  metadata; state-critical paths do not invoke the Git executable or a Git
-  credential/network helper while holding the coordinator lock.
-- Failed process launches release their reserved leases and retain failed
-  operation evidence for coordinator-allocated leases. Exact manual-lease
-  starts instead restore the unbound manual lease only when no process was
-  launched; after launch they quarantine the lease with explicit failure
-  evidence until attributed cleanup. Generation checks keep a superseded
-  operation from overwriting a newer server record.
-
-## Safety Notes
-
-- The coordinator does not grant permissions. It runs structured argv as the
-  current OS user and invokes the local Docker CLI without a command shell.
-- Use project-specific `--name` values. Avoid generic names like `server` when a
-  repo has multiple services.
-- Set `--ttl` for short-lived port leases that are not attached to a managed
-  server. Expired leases are ignored during new allocation.
-- Leases and assignments are different things: a lease says "this port is in
-  use right now" and expires or is released on stop; a durable assignment says
-  "this port belongs to this repo's server" and never expires. Manual
-  `port lease` calls do not create assignments.
-- Use `--json` on CLI commands when another script or agent will parse output.
+Profiles select declared groups; a single pytest group may receive exact
+`--select` node IDs. The non-root client runner executes structured argv
+without a shell. The broker owns admission, attribution, idempotency, durable
+session/group/case records, and statistics; raw commands, environment values,
+child output, credentials, and failure payloads stay out of the service log.
+
+## Further help
+
+- Runtime contract: [references/runtime-api.md](references/runtime-api.md)
+- Skill overview: [README.md](README.md)
+- Current schemas and operations: `python3 scripts/dev_coordinator.py --help`
+  and the relevant subcommand `--help`
+- Installation: `python3 scripts/install_server_wide_coordinator.py --help`
+- Validation: `python3 scripts/validate.py --skip-macos-app`
+
+Keep this file below 300 lines. Put evolving detail in executable help,
+focused tests, or the linked reference.

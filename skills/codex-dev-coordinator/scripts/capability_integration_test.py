@@ -47,6 +47,30 @@ def canonical_test_temp_base() -> Path:
     raise RuntimeError("no writable test temp root exists outside every Git worktree")
 
 
+def initialize_test_repository(path: Path) -> Path:
+    """Create a real isolated Git worktree without ambient host configuration."""
+
+    path.mkdir(mode=0o700)
+    git = "/usr/bin/git" if Path("/usr/bin/git").is_file() else "/bin/git"
+    subprocess.run(
+        [git, "init", "-q", str(path)],
+        env={
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": str(path.parent),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        },
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+        timeout=10,
+    )
+    return path.resolve(strict=True)
+
+
 class FastHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -656,8 +680,7 @@ def run_normalized_relocation_preflight() -> int:
     old_project = root / "legacy"
     new_project = root / "DevCoordinator"
     for repository in (old_project, new_project):
-        repository.mkdir()
-        (repository / ".git").mkdir()
+        initialize_test_repository(repository)
     home = root / "state"
     env = os.environ.copy()
     env["CODEX_AGENT_COORDINATOR_HOME"] = str(home)
@@ -757,8 +780,7 @@ def run_integration() -> int:
     old_project = root / "legacy"
     project = root / "DevCoordinator"
     for repository in (old_project, project):
-        repository.mkdir()
-        (repository / ".git").mkdir()
+        initialize_test_repository(repository)
     home = root / "state"
     processes: list[subprocess.Popen[str]] = []
     cap_api: subprocess.Popen[str] | None = None

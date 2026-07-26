@@ -475,6 +475,119 @@ class StoreBackupTests(unittest.TestCase):
                 "after-export",
             )
 
+    def test_logical_export_restores_linked_repository_family_and_schema_triggers(self) -> None:
+        now = utc_timestamp()
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (
+                        'repo-temp', 'host', '/repo-temp', 'temporary', 'active',
+                        0, ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    UPDATE repository_scopes
+                    SET family_id = 'repo', project_kind = 'temporary',
+                        git_dir = '/repo/.git/worktrees/repo-temp',
+                        git_common_dir = '/repo/.git', updated_at = ?
+                    WHERE repo_id = 'repo-temp'
+                    """,
+                    (now,),
+                )
+                connection.execute(
+                    "DELETE FROM repository_families WHERE family_id = 'repo-temp'"
+                )
+
+        exported = create_store_export(
+            self.database, self.backups, store_role="account"
+        )
+        restored = restore_store_export(
+            self.database,
+            exported["manifest"],
+            self.safety,
+            store_role="account",
+            confirm=True,
+        )
+        self.assertEqual(restored["status"], "imported")
+
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                family = connection.execute(
+                    """
+                    SELECT family_id, root_repo_id
+                    FROM repository_families
+                    ORDER BY family_id
+                    """
+                ).fetchall()
+                scopes = connection.execute(
+                    """
+                    SELECT repo_id, family_id, project_kind
+                    FROM repository_scopes
+                    ORDER BY repo_id
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row) for row in family], [("repo", "repo")]
+                )
+                self.assertEqual(
+                    [tuple(row) for row in scopes],
+                    [
+                        ("repo", "repo", "primary"),
+                        ("repo-temp", "repo", "temporary"),
+                    ],
+                )
+
+                # Import must restore schema behavior as well as table rows.
+                connection.execute(
+                    """
+                    INSERT INTO repositories(
+                        repo_id, host_id, canonical_root, display_name, state,
+                        generation, created_at, updated_at
+                    ) VALUES (
+                        'repo-later', 'host', '/repo-later', 'later', 'active',
+                        0, ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                default_scope = connection.execute(
+                    """
+                    SELECT family_id, project_kind
+                    FROM repository_scopes WHERE repo_id = 'repo-later'
+                    """
+                ).fetchone()
+                self.assertEqual(tuple(default_scope), ("repo-later", "primary"))
+
+    def test_logical_export_trigger_restore_failure_aborts_before_publication(self) -> None:
+        exported = create_store_export(
+            self.database, self.backups, store_role="account"
+        )
+        self._mutate_display_name("trigger-restore-current")
+
+        with mock.patch.object(
+            store_backup_module,
+            "_restore_schema_triggers_after_import",
+            side_effect=RuntimeError("injected trigger restore failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "trigger restore failure"):
+                restore_store_export(
+                    self.database,
+                    exported["manifest"],
+                    self.safety,
+                    store_role="account",
+                    confirm=True,
+                )
+
+        self.assertEqual(self._display_name(), "trigger-restore-current")
+        self.assertFalse(list(self.home.glob(".coordinator.sqlite3.*.tmp")))
+
     def test_logical_export_schema_mismatch_is_rejected_before_target_change(self) -> None:
         exported = create_store_export(
             self.database, self.backups, store_role="account"

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 import sqlite3
 from typing import Iterable
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
 MINIMUM_MIGRATABLE_SCHEMA_VERSION = 1
 
 
@@ -79,6 +80,57 @@ CREATE TABLE IF NOT EXISTS repository_aliases (
     UNIQUE(host_id, canonical_alias)
 );
 
+-- A repository remains one canonical Git worktree/project. Families provide
+-- the separate, durable relationship between the primary checkout and linked
+-- temporary worktrees without collapsing either project identity.
+CREATE TABLE IF NOT EXISTS repository_families (
+    family_id TEXT PRIMARY KEY,
+    host_id TEXT NOT NULL REFERENCES hosts(host_id) ON DELETE RESTRICT,
+    root_repo_id TEXT NOT NULL UNIQUE REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    git_common_dir TEXT,
+    identity_fingerprint TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS repository_scopes (
+    repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    family_id TEXT NOT NULL REFERENCES repository_families(family_id) ON DELETE RESTRICT,
+    project_kind TEXT NOT NULL CHECK (project_kind IN ('primary', 'temporary')),
+    git_dir TEXT,
+    git_common_dir TEXT,
+    identity_fingerprint TEXT,
+    root_device INTEGER CHECK (root_device IS NULL OR root_device >= 0),
+    root_inode INTEGER CHECK (root_inode IS NULL OR root_inode > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_primary_scope_per_repository_family
+ON repository_scopes(family_id)
+WHERE project_kind = 'primary';
+
+-- New repositories start as deterministic singleton families. A later API
+-- request may move a proved linked worktree into its primary family.
+CREATE TRIGGER IF NOT EXISTS repository_default_family
+AFTER INSERT ON repositories
+BEGIN
+    INSERT OR IGNORE INTO repository_families(
+        family_id, host_id, root_repo_id, git_common_dir,
+        identity_fingerprint, created_at, updated_at
+    ) VALUES (
+        NEW.repo_id, NEW.host_id, NEW.repo_id, NULL, NULL,
+        NEW.created_at, NEW.updated_at
+    );
+    INSERT OR IGNORE INTO repository_scopes(
+        repo_id, family_id, project_kind, git_dir, git_common_dir,
+        identity_fingerprint, created_at, updated_at
+    ) VALUES (
+        NEW.repo_id, NEW.repo_id, 'primary', NULL, NULL, NULL,
+        NEW.created_at, NEW.updated_at
+    );
+END;
+
 CREATE TABLE IF NOT EXISTS operations (
     operation_id TEXT PRIMARY KEY,
     repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
@@ -98,6 +150,69 @@ CREATE TABLE IF NOT EXISTS operations (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS runtime_sessions (
+    session_id TEXT PRIMARY KEY,
+    family_id TEXT NOT NULL REFERENCES repository_families(family_id) ON DELETE RESTRICT,
+    root_repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    operation_id TEXT REFERENCES operations(operation_id) ON DELETE SET NULL,
+    action TEXT NOT NULL CHECK (action IN ('status', 'start', 'stop', 'restart', 'replace', 'run')),
+    purpose TEXT NOT NULL CHECK (purpose IN ('development', 'test', 'temporary')),
+    ttl_seconds INTEGER CHECK (ttl_seconds IS NULL OR ttl_seconds > 0),
+    expires_at TEXT,
+    kill_after_run INTEGER NOT NULL CHECK (kill_after_run IN (0, 1)),
+    status TEXT NOT NULL CHECK (
+        status IN ('planned', 'running', 'succeeded', 'failed', 'cleanup_pending', 'cleaning', 'cleaned', 'expired')
+    ),
+    actor TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT,
+    cleanup_error_json TEXT,
+    cleanup_claim_id TEXT,
+    cleanup_started_at TEXT,
+    cleanup_owner_pid INTEGER CHECK (
+        cleanup_owner_pid IS NULL OR cleanup_owner_pid > 1
+    ),
+    cleanup_owner_identity TEXT,
+    execution_owner_pid INTEGER CHECK (
+        execution_owner_pid IS NULL OR execution_owner_pid > 1
+    ),
+    execution_owner_identity TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    cleaned_at TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (purpose IN ('test', 'temporary') AND ttl_seconds IS NOT NULL AND expires_at IS NOT NULL)
+        OR (purpose = 'development')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS runtime_sessions_by_expiry
+ON runtime_sessions(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS runtime_session_resources (
+    session_id TEXT NOT NULL REFERENCES runtime_sessions(session_id) ON DELETE RESTRICT,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('service', 'docker', 'database_stack')),
+    resource_id TEXT NOT NULL,
+    immutable_fingerprint TEXT NOT NULL,
+    identity_json TEXT,
+    cleanup_disposition TEXT NOT NULL DEFAULT 'retained'
+        CHECK (cleanup_disposition IN ('removed', 'retained')),
+    cleanup_state TEXT NOT NULL CHECK (
+        cleanup_state IN ('active', 'cleanup_pending', 'cleaning', 'removed', 'retained', 'failed')
+    ),
+    cleanup_error_json TEXT,
+    linked_at TEXT NOT NULL,
+    cleaned_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(session_id, resource_kind, resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS runtime_session_resources_by_resource
+ON runtime_session_resources(resource_kind, resource_id, linked_at);
 
 CREATE TABLE IF NOT EXISTS repository_installations (
     repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE RESTRICT,
@@ -199,6 +314,218 @@ CREATE TABLE IF NOT EXISTS server_observations (
     stopped_reason TEXT,
     sampled_at TEXT NOT NULL,
     observation_fingerprint TEXT NOT NULL
+);
+
+-- Broker-authoritative worker supervision.  Policy and live supervisor state
+-- follow the current server definition, while finalized attempts deliberately
+-- retain the immutable server identity as text so purge cannot erase crash
+-- evidence.
+CREATE TABLE IF NOT EXISTS worker_policies (
+    server_definition_id TEXT PRIMARY KEY
+        REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    execution_uid INTEGER NOT NULL CHECK (execution_uid >= 0),
+    keep_alive INTEGER NOT NULL DEFAULT 0 CHECK (keep_alive IN (0, 1)),
+    desired_state TEXT NOT NULL DEFAULT 'stopped'
+        CHECK (desired_state IN ('running', 'stopped')),
+    breaker_state TEXT NOT NULL DEFAULT 'armed'
+        CHECK (breaker_state IN ('armed', 'tripped')),
+    crash_limit INTEGER NOT NULL DEFAULT 10
+        CHECK (crash_limit BETWEEN 1 AND 1000),
+    crash_window_seconds INTEGER NOT NULL DEFAULT 300
+        CHECK (crash_window_seconds BETWEEN 1 AND 86400),
+    generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+    requested_by TEXT NOT NULL,
+    request_operation_id TEXT REFERENCES operations(operation_id) ON DELETE SET NULL,
+    last_rearmed_at TEXT,
+    last_rearmed_by TEXT,
+    last_rearm_operation_id TEXT
+        REFERENCES operations(operation_id) ON DELETE SET NULL,
+    last_tripped_at TEXT,
+    last_trip_reason TEXT,
+    last_trip_attempt_id TEXT,
+    last_trip_event_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (last_rearmed_at IS NULL AND last_rearmed_by IS NULL
+            AND last_rearm_operation_id IS NULL)
+        OR (last_rearmed_at IS NOT NULL AND last_rearmed_by IS NOT NULL)
+    ),
+    CHECK (
+        (last_tripped_at IS NULL AND last_trip_reason IS NULL
+            AND last_trip_attempt_id IS NULL AND last_trip_event_id IS NULL)
+        OR (last_tripped_at IS NOT NULL AND last_trip_reason IS NOT NULL
+            AND last_trip_attempt_id IS NOT NULL AND last_trip_event_id IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS worker_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    begin_request_id TEXT NOT NULL UNIQUE,
+    server_definition_id TEXT NOT NULL,
+    repo_id TEXT NOT NULL,
+    definition_generation INTEGER NOT NULL CHECK (definition_generation >= 0),
+    policy_generation INTEGER NOT NULL CHECK (policy_generation >= 0),
+    supervisor_generation INTEGER NOT NULL CHECK (supervisor_generation >= 0),
+    supervisor_epoch TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('reserved', 'running', 'exited')),
+    launch_report_id TEXT UNIQUE,
+    exit_report_id TEXT UNIQUE,
+    pid INTEGER CHECK (pid IS NULL OR pid > 1),
+    process_start_time TEXT,
+    process_fingerprint TEXT,
+    reserved_at TEXT NOT NULL,
+    launched_at TEXT,
+    exited_at TEXT,
+    exited_at_epoch REAL CHECK (exited_at_epoch IS NULL OR exited_at_epoch >= 0),
+    exit_kind TEXT CHECK (
+        exit_kind IS NULL OR exit_kind IN (
+            'exit_code', 'signal', 'launch_failure', 'supervisor_lost', 'unknown'
+        )
+    ),
+    exit_code INTEGER,
+    exit_signal INTEGER CHECK (exit_signal IS NULL OR exit_signal > 0),
+    exit_classification TEXT CHECK (
+        exit_classification IS NULL OR exit_classification IN (
+            'intentional', 'crash', 'stale_generation', 'fenced'
+        )
+    ),
+    expected_exit INTEGER CHECK (expected_exit IN (0, 1) OR expected_exit IS NULL),
+    counts_toward_breaker INTEGER
+        CHECK (counts_toward_breaker IN (0, 1) OR counts_toward_breaker IS NULL),
+    crash_event_id TEXT REFERENCES events(event_id) ON DELETE RESTRICT,
+    log_artifact_id TEXT,
+    log_artifact_path TEXT,
+    log_artifact_sha256 TEXT,
+    exit_fingerprint TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (state = 'reserved'
+            AND launch_report_id IS NULL AND pid IS NULL
+            AND process_start_time IS NULL AND process_fingerprint IS NULL
+            AND launched_at IS NULL AND exit_report_id IS NULL
+            AND exited_at IS NULL AND exited_at_epoch IS NULL AND exit_kind IS NULL
+            AND exit_code IS NULL AND exit_signal IS NULL
+            AND exit_classification IS NULL AND expected_exit IS NULL
+            AND counts_toward_breaker IS NULL AND crash_event_id IS NULL
+            AND exit_fingerprint IS NULL)
+        OR (state = 'running'
+            AND launch_report_id IS NOT NULL AND pid IS NOT NULL
+            AND process_start_time IS NOT NULL AND process_fingerprint IS NOT NULL
+            AND launched_at IS NOT NULL AND exit_report_id IS NULL
+            AND exited_at IS NULL AND exited_at_epoch IS NULL AND exit_kind IS NULL
+            AND exit_code IS NULL AND exit_signal IS NULL
+            AND exit_classification IS NULL AND expected_exit IS NULL
+            AND counts_toward_breaker IS NULL AND crash_event_id IS NULL
+            AND exit_fingerprint IS NULL)
+        OR (state = 'exited'
+            AND exit_report_id IS NOT NULL AND exited_at IS NOT NULL
+            AND exited_at_epoch IS NOT NULL
+            AND exit_kind IS NOT NULL AND exit_classification IS NOT NULL
+            AND expected_exit IS NOT NULL AND counts_toward_breaker IS NOT NULL
+            AND exit_fingerprint IS NOT NULL
+            AND ((launch_report_id IS NOT NULL AND pid IS NOT NULL
+                    AND process_start_time IS NOT NULL
+                    AND process_fingerprint IS NOT NULL
+                    AND launched_at IS NOT NULL)
+                OR (exit_kind = 'launch_failure'
+                    AND launch_report_id IS NULL AND pid IS NULL
+                    AND process_start_time IS NULL
+                    AND process_fingerprint IS NULL AND launched_at IS NULL)))
+    ),
+    CHECK (
+        (exit_kind = 'exit_code' AND exit_code IS NOT NULL AND exit_signal IS NULL)
+        OR (exit_kind = 'signal' AND exit_code IS NULL AND exit_signal IS NOT NULL)
+        OR (exit_kind IS NULL AND exit_code IS NULL AND exit_signal IS NULL)
+        OR (exit_kind IN ('launch_failure', 'supervisor_lost', 'unknown')
+            AND exit_code IS NULL AND exit_signal IS NULL)
+    ),
+    CHECK (
+        (log_artifact_id IS NULL AND log_artifact_path IS NULL
+            AND log_artifact_sha256 IS NULL)
+        OR (log_artifact_id IS NOT NULL AND log_artifact_path IS NOT NULL
+            AND log_artifact_sha256 IS NOT NULL)
+    ),
+    CHECK (counts_toward_breaker != 1 OR crash_event_id IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_worker_attempt
+ON worker_attempts(server_definition_id)
+WHERE state IN ('reserved', 'running');
+
+CREATE INDEX IF NOT EXISTS worker_attempts_crash_window
+ON worker_attempts(
+    server_definition_id, policy_generation, counts_toward_breaker, exited_at_epoch
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_worker_attempt_per_log_artifact
+ON worker_attempts(log_artifact_id)
+WHERE log_artifact_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS finalized_worker_attempt_is_immutable
+BEFORE UPDATE ON worker_attempts
+WHEN OLD.state = 'exited'
+BEGIN
+    SELECT RAISE(ABORT, 'finalized worker attempt is immutable');
+END;
+
+-- The acknowledgement returned to a runner must survive a lost response and
+-- must not be recomputed from policy that may later be re-armed or changed.
+-- Deliberately omit live-resource foreign keys so removal retains the exact
+-- historical restart decision with the attempt evidence.
+CREATE TABLE IF NOT EXISTS worker_exit_decisions (
+    attempt_id TEXT PRIMARY KEY,
+    server_definition_id TEXT NOT NULL,
+    policy_generation INTEGER NOT NULL CHECK (policy_generation >= 0),
+    crash_limit INTEGER CHECK (crash_limit IS NULL OR crash_limit > 0),
+    crash_window_seconds INTEGER
+        CHECK (crash_window_seconds IS NULL OR crash_window_seconds > 0),
+    crash_count_in_window INTEGER NOT NULL
+        CHECK (crash_count_in_window >= 0),
+    breaker_tripped_now INTEGER NOT NULL
+        CHECK (breaker_tripped_now IN (0, 1)),
+    restart_allowed INTEGER NOT NULL CHECK (restart_allowed IN (0, 1)),
+    decided_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS worker_exit_decisions_by_server
+ON worker_exit_decisions(server_definition_id, policy_generation);
+
+CREATE TRIGGER IF NOT EXISTS worker_exit_decision_is_immutable
+BEFORE UPDATE ON worker_exit_decisions
+BEGIN
+    SELECT RAISE(ABORT, 'worker exit decision is immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS worker_supervisor_states (
+    server_definition_id TEXT PRIMARY KEY
+        REFERENCES server_definitions(server_definition_id) ON DELETE CASCADE,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'stopped', 'idle', 'launching', 'running', 'stopping',
+            'backoff', 'tripped', 'fenced'
+        )
+    ),
+    supervisor_epoch TEXT,
+    supervisor_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (supervisor_generation >= 0),
+    current_attempt_id TEXT
+        REFERENCES worker_attempts(attempt_id) ON DELETE SET NULL,
+    last_attempt_id TEXT,
+    next_restart_at TEXT,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (state IN ('launching', 'running', 'stopping')
+            AND current_attempt_id IS NOT NULL)
+        OR (state NOT IN ('launching', 'running', 'stopping') AND state != 'fenced'
+            AND current_attempt_id IS NULL)
+        OR (state = 'fenced')
+    )
 );
 
 CREATE TABLE IF NOT EXISTS port_assignments (
@@ -352,6 +679,39 @@ CREATE TABLE IF NOT EXISTS broker_lifecycle_links (
 CREATE INDEX IF NOT EXISTS pending_broker_lifecycle_reconciliation
 ON broker_lifecycle_links(status, created_at)
 WHERE status IN ('pending', 'reconciliation_required');
+
+-- An account journal may outlive the protected broker profile object that
+-- produced one of its link records.  Permanent service removal mirrors an
+-- exact-ID fence here before deleting the local active projection, so a stale
+-- in-memory profile can never materialize that incarnation again.  A later
+-- explicit reinstall has a different server_definition_id and is unaffected.
+CREATE TABLE IF NOT EXISTS broker_server_materialization_revocations (
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    server_definition_id TEXT NOT NULL,
+    server_name TEXT NOT NULL,
+    broker_operation_id TEXT NOT NULL,
+    immutable_fingerprint TEXT NOT NULL,
+    broker_database_generation TEXT NOT NULL,
+    revoked_at TEXT NOT NULL,
+    PRIMARY KEY(repo_id, server_definition_id)
+);
+
+CREATE INDEX IF NOT EXISTS broker_server_materialization_revocations_by_name
+ON broker_server_materialization_revocations(repo_id, server_name, revoked_at);
+
+-- A repository ID names one canonical worktree across lifecycle generations.
+-- Permanent project cleanup fences the exact removed generation so a stale
+-- protected profile cannot recreate its account-side project or children.
+-- Explicit reinstall advances the repository generation and is unaffected.
+CREATE TABLE IF NOT EXISTS broker_repository_materialization_revocations (
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    repository_generation INTEGER NOT NULL CHECK(repository_generation >= 0),
+    broker_operation_id TEXT NOT NULL,
+    immutable_fingerprint TEXT NOT NULL,
+    broker_database_generation TEXT NOT NULL,
+    revoked_at TEXT NOT NULL,
+    PRIMARY KEY(repo_id, repository_generation)
+);
 
 CREATE TABLE IF NOT EXISTS operation_targets (
     operation_id TEXT NOT NULL REFERENCES operations(operation_id) ON DELETE CASCADE,
@@ -533,6 +893,7 @@ CREATE TABLE IF NOT EXISTS cleanup_phase_evidence (
 CREATE TABLE IF NOT EXISTS cleanup_tombstones (
     target_kind TEXT NOT NULL CHECK(target_kind IN ('project', 'server', 'container', 'worktree')),
     target_id TEXT NOT NULL,
+    target_generation INTEGER NOT NULL DEFAULT 0 CHECK(target_generation >= 0),
     repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
     immutable_fingerprint TEXT NOT NULL,
     operation_id TEXT NOT NULL REFERENCES operations(operation_id) ON DELETE RESTRICT,
@@ -540,7 +901,7 @@ CREATE TABLE IF NOT EXISTS cleanup_tombstones (
     reason TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     removed_at TEXT NOT NULL,
-    PRIMARY KEY(target_kind, target_id)
+    PRIMARY KEY(target_kind, target_id, target_generation)
 );
 
 CREATE TABLE IF NOT EXISTS worktree_cleanup_identities (
@@ -1317,6 +1678,239 @@ def _upgrade_ephemeral_renewal_journal_to_v8(connection: sqlite3.Connection) -> 
         )
 
 
+def _backfill_repository_families_to_v5(
+    connection: sqlite3.Connection, *, timestamp: str
+) -> None:
+    """Give every pre-v5 worktree a deterministic, lossless singleton family.
+
+    Schema migration deliberately does not run Git or inspect the filesystem.
+    A later runtime request may merge a *proved* linked worktree into its
+    primary family; until then each legacy project remains independently and
+    truthfully addressable exactly as it was in v4.
+    """
+
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO repository_families(
+            family_id, host_id, root_repo_id, git_common_dir,
+            identity_fingerprint, created_at, updated_at
+        )
+        SELECT repo_id, host_id, repo_id, NULL, NULL,
+               COALESCE(created_at, ?), ?
+        FROM repositories
+        ORDER BY host_id, canonical_root, repo_id
+        """,
+        (timestamp, timestamp),
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO repository_scopes(
+            repo_id, family_id, project_kind, git_dir, git_common_dir,
+            identity_fingerprint, created_at, updated_at
+        )
+        SELECT repo_id, repo_id, 'primary', NULL, NULL, NULL,
+               COALESCE(created_at, ?), ?
+        FROM repositories
+        ORDER BY host_id, canonical_root, repo_id
+        """,
+        (timestamp, timestamp),
+    )
+
+
+def _upgrade_runtime_session_columns_to_v6(
+    connection: sqlite3.Connection,
+) -> None:
+    session_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(runtime_sessions)")
+    }
+    if "execution_owner_pid" not in session_columns:
+        connection.execute(
+            """
+            ALTER TABLE runtime_sessions
+            ADD COLUMN execution_owner_pid INTEGER CHECK (
+                execution_owner_pid IS NULL OR execution_owner_pid > 1
+            )
+            """
+        )
+    if "execution_owner_identity" not in session_columns:
+        connection.execute(
+            "ALTER TABLE runtime_sessions ADD COLUMN execution_owner_identity TEXT"
+        )
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(runtime_session_resources)")
+    }
+    if "cleanup_disposition" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE runtime_session_resources
+            ADD COLUMN cleanup_disposition TEXT NOT NULL DEFAULT 'retained'
+                CHECK (cleanup_disposition IN ('removed', 'retained'))
+            """
+        )
+    if "identity_json" not in columns:
+        connection.execute(
+            "ALTER TABLE runtime_session_resources ADD COLUMN identity_json TEXT"
+        )
+
+
+def _upgrade_runtime_cleanup_owner_columns_to_v7(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(runtime_sessions)")
+    }
+    if "cleanup_owner_pid" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE runtime_sessions
+            ADD COLUMN cleanup_owner_pid INTEGER CHECK (
+                cleanup_owner_pid IS NULL OR cleanup_owner_pid > 1
+            )
+            """
+        )
+    if "cleanup_owner_identity" not in columns:
+        connection.execute(
+            "ALTER TABLE runtime_sessions ADD COLUMN cleanup_owner_identity TEXT"
+        )
+
+
+def _upgrade_repository_scope_filesystem_identity_to_v8(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(repository_scopes)")
+    }
+    if "root_device" not in columns:
+        connection.execute(
+            "ALTER TABLE repository_scopes ADD COLUMN root_device INTEGER"
+        )
+    if "root_inode" not in columns:
+        connection.execute(
+            "ALTER TABLE repository_scopes ADD COLUMN root_inode INTEGER"
+        )
+
+
+def _upgrade_cleanup_tombstones_to_v11(
+    connection: sqlite3.Connection,
+) -> None:
+    """Make permanent project evidence repository-generation aware."""
+
+    table_info = tuple(connection.execute("PRAGMA table_info(cleanup_tombstones)"))
+    columns = {str(row[1]): row for row in table_info}
+    expected_v11_primary_key = {
+        "target_kind": 1,
+        "target_id": 2,
+        "target_generation": 3,
+    }
+    if "target_generation" in columns:
+        actual_primary_key = {
+            name: int(row[5]) for name, row in columns.items() if int(row[5]) > 0
+        }
+        generation_column = columns["target_generation"]
+        if (
+            actual_primary_key != expected_v11_primary_key
+            or str(generation_column[2]).upper() != "INTEGER"
+            or int(generation_column[3]) != 1
+        ):
+            raise RuntimeError(
+                "coordinator schema v11 migration rejected a partial cleanup "
+                "tombstone generation schema"
+            )
+        return
+    legacy_primary_key = {
+        name: int(row[5]) for name, row in columns.items() if int(row[5]) > 0
+    }
+    if legacy_primary_key != {"target_kind": 1, "target_id": 2}:
+        raise RuntimeError(
+            "coordinator schema v11 migration rejected an unsupported legacy "
+            "cleanup tombstone primary key"
+        )
+    rows = tuple(connection.execute("SELECT * FROM cleanup_tombstones"))
+    migrated: list[tuple[object, ...]] = []
+    for row in rows:
+        target_kind = str(row["target_kind"])
+        target_generation = 0
+        if target_kind == "project":
+            target_id = str(row["target_id"])
+            try:
+                evidence = json.loads(str(row["evidence_json"]))
+                snapshot = evidence["snapshot"]
+                identity = snapshot["identity"]
+                generation = identity["generation"]
+            except (json.JSONDecodeError, KeyError, TypeError) as error:
+                raise RuntimeError(
+                    "coordinator schema v11 migration rejected project cleanup "
+                    f"evidence without an exact generation for {row['target_id']}"
+                ) from error
+            if type(generation) is not int or generation < 0:
+                raise RuntimeError(
+                    "coordinator schema v11 migration rejected an invalid project "
+                    f"cleanup generation for {row['target_id']}"
+                )
+            if (
+                row["repo_id"] is None
+                or str(row["repo_id"]) != target_id
+                or str(identity.get("repo_id") or "") != target_id
+            ):
+                raise RuntimeError(
+                    "coordinator schema v11 migration rejected project cleanup "
+                    f"evidence with inconsistent repository identity for {target_id}"
+                )
+            target_generation = generation
+        migrated.append(
+            (
+                target_kind,
+                str(row["target_id"]),
+                target_generation,
+                row["repo_id"],
+                str(row["immutable_fingerprint"]),
+                str(row["operation_id"]),
+                str(row["actor"]),
+                str(row["reason"]),
+                str(row["evidence_json"]),
+                str(row["removed_at"]),
+            )
+        )
+
+    connection.execute(
+        """
+        CREATE TABLE cleanup_tombstones_v11 (
+            target_kind TEXT NOT NULL CHECK(target_kind IN (
+                'project', 'server', 'container', 'worktree'
+            )),
+            target_id TEXT NOT NULL,
+            target_generation INTEGER NOT NULL DEFAULT 0
+                CHECK(target_generation >= 0),
+            repo_id TEXT REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+            immutable_fingerprint TEXT NOT NULL,
+            operation_id TEXT NOT NULL
+                REFERENCES operations(operation_id) ON DELETE RESTRICT,
+            actor TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            removed_at TEXT NOT NULL,
+            PRIMARY KEY(target_kind, target_id, target_generation)
+        )
+        """
+    )
+    connection.executemany(
+        """
+        INSERT INTO cleanup_tombstones_v11(
+            target_kind, target_id, target_generation, repo_id,
+            immutable_fingerprint, operation_id, actor, reason,
+            evidence_json, removed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        migrated,
+    )
+    connection.execute("DROP TABLE cleanup_tombstones")
+    connection.execute(
+        "ALTER TABLE cleanup_tombstones_v11 RENAME TO cleanup_tombstones"
+    )
+
+
 def initialize_schema(
     connection: sqlite3.Connection,
     *,
@@ -1359,12 +1953,12 @@ def initialize_schema(
         )
     elif MINIMUM_MIGRATABLE_SCHEMA_VERSION <= int(row[0]) < SCHEMA_VERSION:
         # Versions 2 and 3 add only additive ledgers. Version 4 additionally
-        # tags exact legacy membership/policy digests. Version 5 adds the
-        # broker-owned write-ahead ephemeral-container catalog and run journal;
-        # version 6 seals run TTL policy and bounded reconciliation state;
-        # version 7 adds non-secret credential policy snapshots; version 8
-        # adds non-secret interrupted-renewal recovery state; version 9 adds
-        # the repository-attributed universal test-run and case journal.
+        # tags exact legacy membership/policy digests. Versions 5 through 11
+        # were developed on two compatible feature lines: broker-owned
+        # ephemeral/test journals and repository-family/runtime/worker state.
+        # Their migrations are deliberately idempotent and all run below so a
+        # database from either line reaches the merged v12 contract without
+        # guessing which same-numbered historical line produced it.
         # The caller owns one BEGIN IMMEDIATE transaction around this entire
         # function, so a malformed leftover rolls back both DDL and every
         # successfully converted fingerprint.
@@ -1373,6 +1967,11 @@ def initialize_schema(
         _upgrade_ephemeral_runs_to_v6(connection)
         _upgrade_ephemeral_secret_policy_to_v7(connection)
         _upgrade_ephemeral_renewal_journal_to_v8(connection)
+        _backfill_repository_families_to_v5(connection, timestamp=timestamp)
+        _upgrade_runtime_session_columns_to_v6(connection)
+        _upgrade_runtime_cleanup_owner_columns_to_v7(connection)
+        _upgrade_repository_scope_filesystem_identity_to_v8(connection)
+        _upgrade_cleanup_tombstones_to_v11(connection)
         connection.execute(
             """
             UPDATE schema_metadata SET schema_version = ?, updated_at = ?
@@ -1525,6 +2124,204 @@ def invariant_violations(
             WHERE status = 'passed' AND (failed_count != 0 OR error_count != 0)
             """,
             "passed test run retains failed or errored cases",
+        ),
+        (
+            "repository_missing_scope",
+            """
+            SELECT r.repo_id FROM repositories r
+            LEFT JOIN repository_scopes s USING(repo_id)
+            WHERE s.repo_id IS NULL
+            """,
+            "repository has no family scope",
+        ),
+        (
+            "repository_family_root_mismatch",
+            """
+            SELECT f.family_id
+            FROM repository_families f
+            LEFT JOIN repository_scopes s ON s.repo_id = f.root_repo_id
+            WHERE s.repo_id IS NULL OR s.family_id != f.family_id
+               OR s.project_kind != 'primary'
+            """,
+            "repository family root is not its primary scope",
+        ),
+        (
+            "repository_family_cross_host",
+            """
+            SELECT s.repo_id
+            FROM repository_scopes s
+            JOIN repositories r USING(repo_id)
+            JOIN repository_families f USING(family_id)
+            WHERE r.host_id != f.host_id
+            """,
+            "repository scope crosses host authority",
+        ),
+        (
+            "repository_scope_partial_filesystem_identity",
+            """
+            SELECT repo_id FROM repository_scopes
+            WHERE (root_device IS NULL) != (root_inode IS NULL)
+               OR root_device < 0 OR root_inode <= 0
+            """,
+            "repository scope has an incomplete filesystem identity",
+        ),
+        (
+            "repository_scope_duplicate_filesystem_identity",
+            """
+            SELECT MIN(scope.repo_id)
+            FROM repository_scopes scope
+            JOIN repositories repository USING(repo_id)
+            WHERE scope.root_device IS NOT NULL
+              AND scope.root_inode IS NOT NULL
+            GROUP BY repository.host_id, scope.root_device, scope.root_inode
+            HAVING COUNT(*) > 1
+            """,
+            "multiple repositories identify one host filesystem worktree",
+        ),
+        (
+            "runtime_session_scope_mismatch",
+            """
+            SELECT session.session_id
+            FROM runtime_sessions session
+            JOIN repository_scopes scope ON scope.repo_id = session.repo_id
+            JOIN repository_families family USING(family_id)
+            WHERE scope.family_id != session.family_id
+               OR family.root_repo_id != session.root_repo_id
+            """,
+            "runtime session repository context is inconsistent",
+        ),
+        (
+            "runtime_service_resource_scope_mismatch",
+            """
+            SELECT resource.session_id || ':' || resource.resource_id
+            FROM runtime_session_resources resource
+            JOIN runtime_sessions session USING(session_id)
+            LEFT JOIN server_definitions server
+              ON server.server_definition_id = resource.resource_id
+            WHERE resource.resource_kind = 'service'
+              AND resource.cleanup_state IN ('active', 'retained')
+              AND COALESCE(
+                  CASE WHEN json_valid(resource.identity_json)
+                       THEN json_extract(resource.identity_json, '$.state') END,
+                  ''
+              )
+                  != 'reserved'
+              AND (server.server_definition_id IS NULL
+                   OR server.repo_id != session.repo_id)
+            """,
+            "runtime service resource does not belong to its session repository",
+        ),
+        (
+            "runtime_docker_resource_scope_mismatch",
+            """
+            SELECT resource.session_id || ':' || resource.resource_id
+            FROM runtime_session_resources resource
+            JOIN runtime_sessions session USING(session_id)
+            WHERE resource.resource_kind = 'docker'
+              AND resource.cleanup_state IN ('active', 'retained')
+              AND COALESCE(
+                  CASE WHEN json_valid(resource.identity_json)
+                       THEN json_extract(resource.identity_json, '$.state') END,
+                  ''
+              )
+                  != 'reserved'
+              AND NOT EXISTS (
+                  SELECT 1 FROM repository_memberships membership
+                  WHERE membership.resource_kind = 'container'
+                    AND membership.host_resource_id = resource.resource_id
+                    AND membership.repo_id = session.repo_id
+              )
+            """,
+            "runtime Docker resource does not belong to its session repository",
+        ),
+        (
+            "runtime_database_resource_scope_mismatch",
+            """
+            SELECT resource.session_id || ':' || resource.resource_id
+            FROM runtime_session_resources resource
+            JOIN runtime_sessions session USING(session_id)
+            LEFT JOIN database_bindings binding
+              ON binding.database_binding_id = resource.resource_id
+            WHERE resource.resource_kind = 'database_stack'
+              AND resource.cleanup_state IN ('active', 'retained')
+              AND COALESCE(
+                  CASE WHEN json_valid(resource.identity_json)
+                       THEN json_extract(resource.identity_json, '$.state') END,
+                  ''
+              )
+                  != 'reserved'
+              AND (
+                  binding.database_binding_id IS NULL
+                  OR binding.repo_id != session.repo_id
+                  OR NOT EXISTS (
+                      SELECT 1 FROM repository_memberships membership
+                      WHERE membership.resource_kind = 'container'
+                        AND membership.host_resource_id = binding.docker_resource_id
+                        AND membership.repo_id = session.repo_id
+                  )
+              )
+            """,
+            "runtime database resource does not belong to its session repository",
+        ),
+        (
+            "worker_policy_repository_mismatch",
+            """
+            SELECT policy.server_definition_id
+            FROM worker_policies policy
+            JOIN server_definitions definition USING(server_definition_id)
+            WHERE definition.repo_id IS NULL OR definition.repo_id != policy.repo_id
+            """,
+            "worker policy belongs to a different repository than its definition",
+        ),
+        (
+            "worker_supervisor_repository_mismatch",
+            """
+            SELECT supervisor.server_definition_id
+            FROM worker_supervisor_states supervisor
+            JOIN server_definitions definition USING(server_definition_id)
+            WHERE definition.repo_id IS NULL OR definition.repo_id != supervisor.repo_id
+            """,
+            "worker supervisor state belongs to a different repository than its definition",
+        ),
+        (
+            "worker_current_attempt_mismatch",
+            """
+            SELECT supervisor.server_definition_id
+            FROM worker_supervisor_states supervisor
+            JOIN worker_attempts attempt
+              ON attempt.attempt_id = supervisor.current_attempt_id
+            WHERE attempt.server_definition_id != supervisor.server_definition_id
+               OR attempt.repo_id != supervisor.repo_id
+               OR attempt.state NOT IN ('reserved', 'running')
+            """,
+            "worker supervisor points to an unrelated or finalized attempt",
+        ),
+        (
+            "worker_trip_link_missing",
+            """
+            SELECT policy.server_definition_id
+            FROM worker_policies policy
+            LEFT JOIN worker_attempts attempt
+              ON attempt.attempt_id = policy.last_trip_attempt_id
+            LEFT JOIN events event
+              ON event.event_id = policy.last_trip_event_id
+            WHERE policy.last_trip_attempt_id IS NOT NULL
+              AND (attempt.attempt_id IS NULL
+                   OR event.event_id IS NULL
+                   OR attempt.server_definition_id != policy.server_definition_id
+                   OR attempt.crash_event_id != policy.last_trip_event_id)
+            """,
+            "worker circuit-breaker trip does not link exact attempt and event evidence",
+        ),
+        (
+            "worker_attempt_event_repository_mismatch",
+            """
+            SELECT attempt.attempt_id
+            FROM worker_attempts attempt
+            JOIN events event ON event.event_id = attempt.crash_event_id
+            WHERE event.repo_id IS NULL OR event.repo_id != attempt.repo_id
+            """,
+            "worker crash event belongs to a different repository",
         ),
     )
     for code, sql, prefix in checks:

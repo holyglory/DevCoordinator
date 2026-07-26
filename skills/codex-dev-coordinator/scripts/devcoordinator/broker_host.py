@@ -39,6 +39,7 @@ from .compose_contract import (
     read_anchored_compose_file,
     require_effective_compose_model,
     require_sealable_compose_payload,
+    stable_compose_descriptor_path,
 )
 from .broker_persistence import (
     ComposeMutationTarget,
@@ -793,11 +794,21 @@ class LocalBrokerHostMutations:
             )
         executable = self._docker_executable or _resolve_docker_executable()
         command = (executable, action, full_id)
-        completed = self._docker_runner(command, self._docker_timeout_seconds)
+        try:
+            completed = self._docker_runner(command, self._docker_timeout_seconds)
+        except Exception as exc:
+            # Once the runner is invoked, neither an exception nor a CLI
+            # failure proves that Docker did not accept the daemon request.
+            # Keep diagnostics in service logs and require observation-based
+            # reconciliation before the same durable operation can settle.
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "Docker lifecycle did not prove a terminal outcome after invocation; authoritative reconciliation is required.",
+            ) from exc
         if completed.returncode != 0:
-            raise RuntimeError(
-                f"exact Docker {action} failed with exit {completed.returncode}: "
-                f"{_bounded_output(completed.stderr) or 'no diagnostic output'}"
+            raise BrokerBackendError(
+                "operation_outcome_uncertain",
+                "Docker lifecycle did not prove a terminal outcome after invocation; authoritative reconciliation is required.",
             )
         return {
             "resource_id": target.docker_resource_id,
@@ -2018,11 +2029,7 @@ def _validated_compose_target(
             raise ValueError(
                 "Compose target fields do not match the persisted fingerprint"
             )
-        if not Path("/proc/self/fd").is_dir():
-            raise RuntimeError(
-                "stable Compose working-directory handles are unavailable"
-            )
-        pinned_cwd = f"/proc/{os.getpid()}/fd/{cwd_descriptor}"
+        pinned_cwd = stable_compose_descriptor_path(cwd_descriptor)
         yield (
             tuple(item[1] for item in actual_file_material),
             tuple(item[1] for item in actual_env_material),

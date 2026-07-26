@@ -127,26 +127,31 @@ def add_lifecycle_parsers(subparsers: Any) -> None:
 
     cleanup = subparsers.add_parser("cleanup", help="plan and apply permanent exact-target cleanup")
     cleanup_sub = cleanup.add_subparsers(dest="action", required=True)
-    cleanup_plan = cleanup_sub.add_parser("plan")
-    cleanup_plan.add_argument(
-        "--action",
-        dest="lifecycle_action",
-        choices=["archive", "purge"],
-        default="purge",
-    )
-    cleanup_plan.add_argument(
-        "--target-kind",
-        choices=["project", "repository", "server", "container", "worktree"],
-        required=True,
-    )
-    cleanup_plan.add_argument("--target-id", required=True)
-    cleanup_plan.add_argument("--agent", required=True)
-    cleanup_plan.add_argument("--reason", required=True)
-    cleanup_apply = cleanup_sub.add_parser("apply")
-    cleanup_apply.add_argument("--plan-id", required=True)
-    cleanup_apply.add_argument("--plan-fingerprint", required=True)
-    cleanup_apply.add_argument("--confirmation-phrase", "--confirm", required=True)
-    cleanup_apply.add_argument("--agent", required=True)
+    for action_name in ("plan", "plan-remove"):
+        cleanup_plan = cleanup_sub.add_parser(action_name)
+        if action_name == "plan":
+            cleanup_plan.add_argument(
+                "--action",
+                dest="lifecycle_action",
+                choices=["archive", "purge"],
+                default="purge",
+            )
+        else:
+            cleanup_plan.set_defaults(lifecycle_action="purge")
+        cleanup_plan.add_argument(
+            "--target-kind",
+            choices=["project", "repository", "server", "container", "worktree"],
+            required=True,
+        )
+        cleanup_plan.add_argument("--target-id", required=True)
+        cleanup_plan.add_argument("--agent", required=True)
+        cleanup_plan.add_argument("--reason", required=True)
+    for action_name in ("apply", "remove"):
+        cleanup_apply = cleanup_sub.add_parser(action_name)
+        cleanup_apply.add_argument("--plan-id", required=True)
+        cleanup_apply.add_argument("--plan-fingerprint", required=True)
+        cleanup_apply.add_argument("--confirmation-phrase", "--confirm", required=True)
+        cleanup_apply.add_argument("--agent", required=True)
 
 
 def handle_lifecycle_cli(
@@ -162,6 +167,12 @@ def handle_lifecycle_cli(
 ) -> Any:
     if args.group == "repository":
         args.action = REPOSITORY_ACTION_ALIASES[str(args.action)]
+    elif args.group == "cleanup":
+        if args.action == "plan-remove":
+            args.action = "plan"
+            args.lifecycle_action = "purge"
+        elif args.action == "remove":
+            args.action = "apply"
     # The top-level CLI injects its authority-aware resolver. Keeping the raw
     # profile loader as the default preserves this module's direct contract,
     # while explicit account/test authority cannot be redirected through an

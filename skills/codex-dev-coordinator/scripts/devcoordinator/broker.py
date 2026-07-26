@@ -20,6 +20,7 @@ import ctypes
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -80,6 +81,7 @@ _NON_TERMINAL_OPERATION_ERRORS = frozenset(
         "operation_in_progress",
         "operation_outcome_uncertain",
         "service_shutting_down",
+        "worker_operation_uncertain",
     }
 )
 
@@ -103,6 +105,12 @@ class BrokerOperation(str, Enum):
     TEST_RUN_START = "test.run_start"
     TEST_RUN_FINISH = "test.run_finish"
     TEST_STATS_READ = "test.stats_read"
+    RUNTIME_REQUEST = "runtime.request"
+    WORKER_LAUNCH_TICKET = "worker.launch_ticket"
+    WORKER_LAUNCHED = "worker.launched"
+    WORKER_EXIT = "worker.exit"
+    WORKER_POLICY_READ = "worker.policy_read"
+    WORKER_ATTEMPT_READ = "worker.attempt_read"
     SERVER_PUBLISH = "server.publish"
     EPHEMERAL_START = "ephemeral.start"
     EPHEMERAL_STATUS = "ephemeral.status"
@@ -183,6 +191,7 @@ class BrokerRequest:
     authority_generation: str
     account_id: str
     project_id: str
+    repository_generation: int
     resource_id: str
     operation: BrokerOperation
     arguments: Mapping[str, Any]
@@ -203,6 +212,7 @@ class BrokerRequest:
             "authority_generation",
             "account_id",
             "project_id",
+            "repository_generation",
             "resource_id",
             "operation",
             "arguments",
@@ -247,6 +257,13 @@ class BrokerRequest:
         project_id = _validate_identifier(
             value["project_id"], "project_id", operation_id=operation_id
         )
+        repository_generation = value["repository_generation"]
+        if not _is_exact_int(repository_generation) or repository_generation < 0:
+            raise BrokerError(
+                "invalid_request",
+                "repository_generation must be a non-negative integer.",
+                operation_id=operation_id,
+            )
         resource_id = _validate_identifier(
             value["resource_id"], "resource_id", operation_id=operation_id
         )
@@ -277,6 +294,7 @@ class BrokerRequest:
             authority_generation=authority_generation,
             account_id=account_id,
             project_id=project_id,
+            repository_generation=repository_generation,
             resource_id=resource_id,
             operation=operation,
             arguments=MappingProxyType(arguments),
@@ -293,6 +311,7 @@ class BrokerRequest:
         arguments: Optional[Mapping[str, Any]] = None,
         operation_id: Optional[str] = None,
         authority_generation: str = "unbound-static-test",
+        repository_generation: int = 0,
     ) -> "BrokerRequest":
         return cls.from_wire(
             {
@@ -301,6 +320,7 @@ class BrokerRequest:
                 "authority_generation": authority_generation,
                 "account_id": account_id,
                 "project_id": project_id,
+                "repository_generation": repository_generation,
                 "resource_id": resource_id,
                 "operation": operation.value,
                 "arguments": dict(arguments or {}),
@@ -314,6 +334,7 @@ class BrokerRequest:
             "authority_generation": self.authority_generation,
             "account_id": self.account_id,
             "project_id": self.project_id,
+            "repository_generation": self.repository_generation,
             "resource_id": self.resource_id,
             "operation": self.operation.value,
             "arguments": dict(self.arguments),
@@ -792,13 +813,19 @@ class SerializedMutationWriter:
             )
 
     def execute(self, request: AuthorizedBrokerRequest) -> dict[str, Any]:
-        if request.request.operation in {
+        read_only = request.request.operation in {
             BrokerOperation.INVENTORY_READ,
             BrokerOperation.EVENTS_READ,
             BrokerOperation.TEST_STATS_READ,
             BrokerOperation.EPHEMERAL_STATUS,
             BrokerOperation.EPHEMERAL_IMAGE_STATUS,
-        }:
+            BrokerOperation.WORKER_POLICY_READ,
+            BrokerOperation.WORKER_ATTEMPT_READ,
+        } or (
+            request.request.operation is BrokerOperation.RUNTIME_REQUEST
+            and request.request.arguments.get("action") == "status"
+        )
+        if read_only:
             # A query-only snapshot does not need the mutation lock, durable
             # idempotency journal, or completed-result cache.  Avoid retaining
             # up to one full host graph per caller in broker memory.
@@ -2213,6 +2240,493 @@ def _validate_arguments(
         normalized["agent"] = _bounded_agent(value["agent"], operation_id)
         return normalized
 
+    if operation == BrokerOperation.RUNTIME_REQUEST:
+        required = {
+            "action",
+            "agent",
+            "root_repo_id",
+            "temporary_repo_id",
+            "target_kind",
+            "purpose",
+            "ttl_seconds",
+            "kill_after_run",
+        }
+        supervision_fields = {
+            "keep_alive",
+            "rearm_crash_loop",
+            "restart_limit",
+            "restart_window_seconds",
+        }
+        replacement_fields = {
+            "expected_definition_generation",
+            "argv",
+            "cwd",
+            "environment",
+        }
+        if not required.issubset(value) or not set(value) <= (
+            required | supervision_fields | replacement_fields
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Runtime requests accept only enrolled repository/resource IDs and the typed lifecycle policy.",
+                operation_id=operation_id,
+            )
+        action = value["action"]
+        if action not in {"status", "start", "stop", "restart", "replace"}:
+            raise BrokerError(
+                "unsupported_runtime_action",
+                "The broker runtime endpoint supports status and existing-resource start, stop, restart, or typed worker replacement only; run and shell commands are forbidden.",
+                operation_id=operation_id,
+            )
+        target_kind = value["target_kind"]
+        if target_kind not in {"service", "docker", "database_stack"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "target_kind must be service, docker, or database_stack.",
+                operation_id=operation_id,
+            )
+        supplied_replacement = replacement_fields & set(value)
+        if action == "replace":
+            if target_kind != "service" or supplied_replacement != replacement_fields:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Worker replacement requires service target plus exact generation, argv, cwd, and environment.",
+                    operation_id=operation_id,
+                )
+        elif supplied_replacement:
+            raise BrokerError(
+                "invalid_arguments",
+                "Replacement definition fields are valid only for service replace.",
+                operation_id=operation_id,
+            )
+        purpose = value["purpose"]
+        if purpose not in {"development", "test", "temporary"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "purpose must be development, test, or temporary.",
+                operation_id=operation_id,
+            )
+        agent = value["agent"]
+        if (
+            not isinstance(agent, str)
+            or not agent.strip()
+            or agent != agent.strip()
+            or len(agent.encode("utf-8")) > 200
+            or "\x00" in agent
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "agent must be one bounded non-empty string.",
+                operation_id=operation_id,
+            )
+        root_repo_id = _opaque_argument(
+            value["root_repo_id"], "root_repo_id", operation_id
+        )
+        temporary_repo_id = value["temporary_repo_id"]
+        if temporary_repo_id is not None:
+            temporary_repo_id = _opaque_argument(
+                temporary_repo_id, "temporary_repo_id", operation_id
+            )
+        ttl_seconds = value["ttl_seconds"]
+        if ttl_seconds is not None and (
+            not _is_exact_int(ttl_seconds)
+            or not 1 <= ttl_seconds <= 7 * 24 * 60 * 60
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "ttl_seconds must be null or a positive integer no greater than seven days.",
+                operation_id=operation_id,
+            )
+        kill_after_run = value["kill_after_run"]
+        if type(kill_after_run) is not bool:
+            raise BrokerError(
+                "invalid_arguments",
+                "kill_after_run must be a JSON boolean.",
+                operation_id=operation_id,
+            )
+        if kill_after_run:
+            raise BrokerError(
+                "unsupported_runtime_action",
+                "kill_after_run=true is reserved for broker-owned run sessions; client-supplied run commands are forbidden.",
+                operation_id=operation_id,
+            )
+        if action == "status" and ttl_seconds is not None:
+            raise BrokerError(
+                "invalid_arguments",
+                "Runtime status requires ttl_seconds=null.",
+                operation_id=operation_id,
+            )
+        if action == "stop" and ttl_seconds is not None:
+            raise BrokerError(
+                "invalid_arguments",
+                "Explicit runtime stop requires ttl_seconds=null.",
+                operation_id=operation_id,
+            )
+        keep_alive = value.get("keep_alive")
+        if keep_alive is not None and type(keep_alive) is not bool:
+            raise BrokerError(
+                "invalid_arguments",
+                "keep_alive must be null or a JSON boolean.",
+                operation_id=operation_id,
+            )
+        rearm_crash_loop = value.get("rearm_crash_loop", False)
+        if type(rearm_crash_loop) is not bool:
+            raise BrokerError(
+                "invalid_arguments",
+                "rearm_crash_loop must be a JSON boolean.",
+                operation_id=operation_id,
+            )
+        restart_limit = value.get("restart_limit")
+        if restart_limit is not None and (
+            not _is_exact_int(restart_limit) or not 1 <= restart_limit <= 1000
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "restart_limit must be null or an integer from 1 through 1000.",
+                operation_id=operation_id,
+            )
+        restart_window_seconds = value.get("restart_window_seconds")
+        if restart_window_seconds is not None and (
+            not _is_exact_int(restart_window_seconds)
+            or not 1 <= restart_window_seconds <= 7 * 24 * 60 * 60
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "restart_window_seconds must be null or an integer from 1 through 604800.",
+                operation_id=operation_id,
+            )
+        supervision_supplied = any(
+            item is not None
+            for item in (keep_alive, restart_limit, restart_window_seconds)
+        ) or rearm_crash_loop
+        if supervision_supplied and (
+            target_kind != "service"
+            or action not in {"start", "restart", "replace"}
+            or purpose != "development"
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Worker supervision options apply only to persistent service start, restart, or replace.",
+                operation_id=operation_id,
+            )
+        if (
+            restart_limit is not None or restart_window_seconds is not None
+        ) and keep_alive is not True:
+            raise BrokerError(
+                "invalid_arguments",
+                "Worker restart limits require keep_alive=true.",
+                operation_id=operation_id,
+            )
+        if (
+            purpose in {"test", "temporary"}
+            and action in {"start", "restart", "replace"}
+            and ttl_seconds is None
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Test and temporary start-like runtime requests require a positive TTL.",
+                operation_id=operation_id,
+            )
+        normalized_runtime = {
+            "action": action,
+            "agent": agent,
+            "root_repo_id": root_repo_id,
+            "temporary_repo_id": temporary_repo_id,
+            "target_kind": target_kind,
+            "purpose": purpose,
+            "ttl_seconds": ttl_seconds,
+            "kill_after_run": False,
+        }
+        for field, normalized_value in (
+            ("keep_alive", keep_alive),
+            ("rearm_crash_loop", rearm_crash_loop),
+            ("restart_limit", restart_limit),
+            ("restart_window_seconds", restart_window_seconds),
+        ):
+            if field in value:
+                normalized_runtime[field] = normalized_value
+        if action == "replace":
+            argv = value["argv"]
+            if (
+                not isinstance(argv, list)
+                or not argv
+                or len(argv) > 256
+                or not all(
+                    isinstance(argument, str)
+                    and bool(argument)
+                    and "\x00" not in argument
+                    and len(argument.encode("utf-8")) <= 8192
+                    for argument in argv
+                )
+                or sum(len(argument.encode("utf-8")) for argument in argv) > 32768
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "argv must be a bounded non-empty array of NUL-free strings.",
+                    operation_id=operation_id,
+                )
+            environment = value["environment"]
+            if (
+                not isinstance(environment, dict)
+                or len(environment) > 128
+                or not all(
+                    isinstance(key, str)
+                    and bool(key)
+                    and "=" not in key
+                    and "\x00" not in key
+                    and len(key.encode("utf-8")) <= 256
+                    and isinstance(item, str)
+                    and "\x00" not in item
+                    and len(item.encode("utf-8")) <= 8192
+                    for key, item in environment.items()
+                )
+                or sum(
+                    len(key.encode("utf-8")) + len(item.encode("utf-8"))
+                    for key, item in environment.items()
+                )
+                > 32768
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "environment must be a bounded NUL-free string map.",
+                    operation_id=operation_id,
+                )
+            cwd = _bounded_single_line_argument(
+                value["cwd"], "cwd", operation_id, maximum_bytes=4096
+            )
+            if not cwd.startswith("/"):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "cwd must be an absolute path.",
+                    operation_id=operation_id,
+                )
+            normalized_runtime.update(
+                {
+                    "expected_definition_generation": _non_negative_generation_argument(
+                        value["expected_definition_generation"],
+                        "expected_definition_generation",
+                        operation_id,
+                    ),
+                    "argv": list(argv),
+                    "cwd": cwd,
+                    "environment": dict(sorted(environment.items())),
+                }
+            )
+        return normalized_runtime
+
+    if operation == BrokerOperation.WORKER_LAUNCH_TICKET:
+        required = {
+            "supervisor_epoch",
+            "expected_definition_generation",
+            "expected_policy_generation",
+            "expected_supervisor_generation",
+        }
+        if set(value) != required:
+            raise BrokerError(
+                "invalid_arguments",
+                "Worker launch tickets accept only the exact supervisor epoch and generation tokens.",
+                operation_id=operation_id,
+            )
+        return {
+            "supervisor_epoch": _opaque_argument(
+                value["supervisor_epoch"], "supervisor_epoch", operation_id
+            ),
+            "expected_definition_generation": _non_negative_generation_argument(
+                value["expected_definition_generation"],
+                "expected_definition_generation",
+                operation_id,
+            ),
+            "expected_policy_generation": _non_negative_generation_argument(
+                value["expected_policy_generation"],
+                "expected_policy_generation",
+                operation_id,
+            ),
+            "expected_supervisor_generation": _non_negative_generation_argument(
+                value["expected_supervisor_generation"],
+                "expected_supervisor_generation",
+                operation_id,
+            ),
+        }
+
+    if operation == BrokerOperation.WORKER_LAUNCHED:
+        required = {
+            "attempt_id",
+            "supervisor_epoch",
+            "supervisor_generation",
+            "pid",
+            "process_start_time",
+            "process_fingerprint",
+        }
+        if set(value) != required:
+            raise BrokerError(
+                "invalid_arguments",
+                "Worker launch reports accept only the exact attempt, runner token, and process identity.",
+                operation_id=operation_id,
+            )
+        pid = value["pid"]
+        if not _is_exact_int(pid) or not 2 <= pid <= 2**31 - 1:
+            raise BrokerError(
+                "invalid_arguments",
+                "pid must be an integer from 2 through 2147483647.",
+                operation_id=operation_id,
+            )
+        return {
+            "attempt_id": _opaque_argument(
+                value["attempt_id"], "attempt_id", operation_id
+            ),
+            "supervisor_epoch": _opaque_argument(
+                value["supervisor_epoch"], "supervisor_epoch", operation_id
+            ),
+            "supervisor_generation": _non_negative_generation_argument(
+                value["supervisor_generation"],
+                "supervisor_generation",
+                operation_id,
+            ),
+            "pid": pid,
+            "process_start_time": _bounded_single_line_argument(
+                value["process_start_time"],
+                "process_start_time",
+                operation_id,
+                maximum_bytes=256,
+            ),
+            "process_fingerprint": _sha256_fingerprint_argument(
+                value["process_fingerprint"], "process_fingerprint", operation_id
+            ),
+        }
+
+    if operation == BrokerOperation.WORKER_EXIT:
+        required = {
+            "attempt_id",
+            "supervisor_epoch",
+            "supervisor_generation",
+            "exit_kind",
+            "exit_code",
+            "exit_signal",
+            "log_artifact",
+            "occurred_at_epoch",
+        }
+        if set(value) != required:
+            raise BrokerError(
+                "invalid_arguments",
+                "Worker exit reports require the exact attempt, runner token, typed exit, and nullable artifact evidence.",
+                operation_id=operation_id,
+            )
+        exit_kind = value["exit_kind"]
+        if exit_kind not in {
+            "exit_code",
+            "signal",
+            "launch_failure",
+            "supervisor_lost",
+            "unknown",
+        }:
+            raise BrokerError(
+                "invalid_arguments",
+                "exit_kind is not a supported typed worker exit.",
+                operation_id=operation_id,
+            )
+        exit_code = value["exit_code"]
+        exit_signal = value["exit_signal"]
+        if exit_kind == "exit_code":
+            if (
+                not _is_exact_int(exit_code)
+                or not -(2**31) <= exit_code <= 2**31 - 1
+                or exit_signal is not None
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "exit_code exits require only one bounded integer exit_code.",
+                    operation_id=operation_id,
+                )
+        elif exit_kind == "signal":
+            if (
+                not _is_exact_int(exit_signal)
+                or not 1 <= exit_signal <= 255
+                or exit_code is not None
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "signal exits require only one signal integer from 1 through 255.",
+                    operation_id=operation_id,
+                )
+        elif exit_code is not None or exit_signal is not None:
+            raise BrokerError(
+                "invalid_arguments",
+                "This worker exit_kind requires null exit_code and exit_signal.",
+                operation_id=operation_id,
+            )
+        artifact = value["log_artifact"]
+        normalized_artifact: dict[str, str] | None = None
+        if artifact is not None:
+            if not isinstance(artifact, dict) or set(artifact) != {
+                "artifact_id",
+                "sha256",
+            }:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "log_artifact accepts only a canonical artifact UUID and SHA-256; paths are forbidden.",
+                    operation_id=operation_id,
+                )
+            normalized_artifact = {
+                "artifact_id": _canonical_uuid_argument(
+                    artifact["artifact_id"], "log_artifact.artifact_id", operation_id
+                ),
+                "sha256": _bare_sha256_argument(
+                    artifact["sha256"], "log_artifact.sha256", operation_id
+                ),
+            }
+        occurred_at = value["occurred_at_epoch"]
+        if occurred_at is not None and (
+            type(occurred_at) not in {int, float}
+            or not math.isfinite(float(occurred_at))
+            or not 0 <= float(occurred_at) <= 2**53
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "occurred_at_epoch must be null or a finite non-negative bounded number.",
+                operation_id=operation_id,
+            )
+        return {
+            "attempt_id": _opaque_argument(
+                value["attempt_id"], "attempt_id", operation_id
+            ),
+            "supervisor_epoch": _opaque_argument(
+                value["supervisor_epoch"], "supervisor_epoch", operation_id
+            ),
+            "supervisor_generation": _non_negative_generation_argument(
+                value["supervisor_generation"],
+                "supervisor_generation",
+                operation_id,
+            ),
+            "exit_kind": exit_kind,
+            "exit_code": exit_code,
+            "exit_signal": exit_signal,
+            "log_artifact": normalized_artifact,
+            "occurred_at_epoch": (
+                None if occurred_at is None else float(occurred_at)
+            ),
+        }
+
+    if operation == BrokerOperation.WORKER_POLICY_READ:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Worker policy reads accept no client-controlled arguments.",
+                operation_id=operation_id,
+            )
+        return {}
+
+    if operation == BrokerOperation.WORKER_ATTEMPT_READ:
+        if set(value) != {"attempt_id"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Worker attempt reads require exactly one opaque attempt_id.",
+                operation_id=operation_id,
+            )
+        return {
+            "attempt_id": _opaque_argument(
+                value["attempt_id"], "attempt_id", operation_id
+            )
+        }
     if operation == BrokerOperation.SERVER_PUBLISH:
         allowed = {
             "lease_id",
@@ -2655,6 +3169,54 @@ def _sha256_fingerprint_argument(value: Any, field: str, operation_id: str) -> s
         raise BrokerError(
             "invalid_arguments",
             f"{field} must be a lowercase sha256 fingerprint.",
+            operation_id=operation_id,
+        )
+    return value
+
+
+def _non_negative_generation_argument(
+    value: Any, field: str, operation_id: str
+) -> int:
+    if not _is_exact_int(value) or not 0 <= value <= 2**63 - 1:
+        raise BrokerError(
+            "invalid_arguments",
+            f"{field} must be a bounded non-negative integer.",
+            operation_id=operation_id,
+        )
+    return value
+
+
+def _bare_sha256_argument(value: Any, field: str, operation_id: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise BrokerError(
+            "invalid_arguments",
+            f"{field} must be a lowercase 64-character SHA-256 digest.",
+            operation_id=operation_id,
+        )
+    return value
+
+
+def _bounded_single_line_argument(
+    value: Any,
+    field: str,
+    operation_id: str,
+    *,
+    maximum_bytes: int,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value.encode("utf-8")) > maximum_bytes
+        or any(character in value for character in "\x00\r\n")
+    ):
+        raise BrokerError(
+            "invalid_arguments",
+            f"{field} must be one bounded non-empty line.",
             operation_id=operation_id,
         )
     return value
