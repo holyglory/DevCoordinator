@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-from pathlib import Path
+import socket
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from devcoordinator import broker_enrollment
-from devcoordinator.broker import BrokerOperation
-from devcoordinator.broker_cli import add_broker_parser, handle_broker_cli, serve_broker
+import dev_coordinator
+
 import devcoordinator.broker_cli as broker_cli_module
+from devcoordinator import broker_enrollment
+from devcoordinator.broker import BrokerError, BrokerOperation, UnixBrokerServer
+from devcoordinator.broker_cli import add_broker_parser, handle_broker_cli, serve_broker
 from devcoordinator.lifecycle_cli import add_lifecycle_parsers
 from devcoordinator.store import CoordinatorStore, utc_timestamp
-import dev_coordinator
 
 
 def parser() -> argparse.ArgumentParser:
@@ -92,7 +95,17 @@ class LifecycleParserContractTests(unittest.TestCase):
             mock.patch.object(
                 dev_coordinator,
                 "docker_compose_asset_inventory",
-                return_value={"available": True, "assets": []},
+                return_value={
+                    "available": True,
+                    "assets": [
+                        {
+                            "kind": "network",
+                            "id": "b" * 64,
+                            "project_name": "foreign-compose-project",
+                            "working_dir": "/srv/foreign-compose-project",
+                        }
+                    ],
+                },
             ),
         ):
             observed = dev_coordinator.docker_ps_inventory()
@@ -100,6 +113,66 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertFalse(observed["container_inspection_available"])
         self.assertEqual(observed["containers"][0]["full_id"], full_id)
         self.assertFalse(observed["containers"][0]["inspection_observable"])
+        self.assertFalse(observed["compose_assets_available"])
+        self.assertEqual(observed["compose_assets"], [])
+
+    def test_complete_container_inspect_preserves_compose_asset_evidence(self) -> None:
+        full_id = "a" * 64
+        asset = {
+            "kind": "network",
+            "id": "b" * 64,
+            "project_name": "foreign-compose-project",
+            "working_dir": "/srv/foreign-compose-project",
+        }
+
+        def command(arguments: list[str]) -> dict[str, object]:
+            if arguments[0] == "ps":
+                return {
+                    "ok": True,
+                    "stdout": json.dumps(
+                        {
+                            "ID": full_id,
+                            "Names": "app",
+                            "Image": "example/app",
+                            "Status": "Up",
+                            "Ports": "",
+                        }
+                    )
+                    + "\n",
+                }
+            if arguments[0] == "inspect":
+                return {
+                    "ok": True,
+                    "stdout": json.dumps(
+                        {
+                            "Id": full_id,
+                            "State": {"Running": True},
+                            "Config": {"Labels": {}},
+                            "HostConfig": {"RestartPolicy": {}},
+                            "NetworkSettings": {"Ports": {}},
+                        }
+                    )
+                    + "\n",
+                }
+            raise AssertionError(arguments)
+
+        with (
+            mock.patch.object(
+                dev_coordinator,
+                "docker_available_command",
+                side_effect=command,
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "docker_compose_asset_inventory",
+                return_value={"available": True, "assets": [asset]},
+            ),
+        ):
+            observed = dev_coordinator.docker_ps_inventory()
+
+        self.assertTrue(observed["container_inspection_available"])
+        self.assertTrue(observed["compose_assets_available"])
+        self.assertEqual(observed["compose_assets"], [asset])
 
     def test_malformed_container_listing_fails_closed(self) -> None:
         with mock.patch.object(
@@ -1489,6 +1562,264 @@ class LifecycleParserContractTests(unittest.TestCase):
             dev_coordinator.coordinated_broker_compose_project_name_release(args)
         persistence.release_compose_project_name.assert_not_called()
 
+    def test_broker_runtime_status_uses_authoritative_docker_inventory(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".broker-runtime-observation-", dir=str(Path.home().resolve())
+        ) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime_dir = root / ".codex"
+            runtime_dir.mkdir()
+            (root / "compose.yml").write_text("services: {}\n", encoding="utf-8")
+            (runtime_dir / "dev-runtime.json").write_text(
+                json.dumps(
+                    {
+                        "docker": {
+                            "compose_files": ["compose.yml"],
+                            "services": ["postgres"],
+                        },
+                        "dependencies": [
+                            {
+                                "type": "docker",
+                                "name": "postgres",
+                                "service": "postgres",
+                                "container": "globalnewstracker-postgres",
+                                "ports": [{"host": "127.0.0.1", "port": 54330}],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            broker_docker = {
+                "available": True,
+                "containers": [
+                    {
+                        "name": "globalnewstracker-postgres",
+                        "status": "running",
+                        "project": str(root),
+                        "metadata_source": "docker_labels",
+                    },
+                    {
+                        "name": "globalnewstracker-migrations",
+                        "status": "stopped",
+                        "project": str(root),
+                        "metadata_source": "docker_labels",
+                    }
+                ],
+                "postgres": [],
+            }
+            baseline = {
+                "servers": {},
+                "leases": {},
+                "port_assignments": {},
+                "docker": {"available": None, "containers": [], "postgres": []},
+            }
+            with (
+                mock.patch.object(
+                    dev_coordinator,
+                    "configured_broker_context",
+                    return_value=(object(), object()),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "broker_authority_inventory",
+                    return_value={"docker": broker_docker},
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "snapshot_runtime_observation",
+                    return_value=baseline,
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "docker_ps_inventory",
+                    side_effect=AssertionError("broker runtime status used local Docker ps"),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "docker_inspect_state",
+                    side_effect=AssertionError("broker runtime status used local Docker inspect"),
+                ),
+                mock.patch.object(
+                    dev_coordinator,
+                    "docker_log_tail",
+                    side_effect=AssertionError("broker runtime status used local Docker logs"),
+                ),
+                mock.patch.object(dev_coordinator, "port_open", return_value=True),
+                mock.patch.object(dev_coordinator, "commit_runtime_observations"),
+            ):
+                spec, report = dev_coordinator.observe_project_runtime(
+                    {"project": str(root)}, action="status"
+                )
+
+        self.assertEqual(spec["docker_observation_authority"], "host_broker")
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["docker_observation"]["status"], "broker_inventory")
+        postgres = next(
+            service for service in report["services"] if service["name"] == "postgres"
+        )
+        self.assertEqual(postgres["status"], "running")
+        self.assertTrue(postgres["ok"])
+        migrations = next(
+            service
+            for service in report["services"]
+            if service["name"] == "globalnewstracker-migrations"
+        )
+        self.assertFalse(migrations["required"])
+
+    def test_project_start_skips_compose_when_broker_inventory_is_healthy(self) -> None:
+        spec = {
+            "project": "/repo",
+            "compose": {
+                "name": "docker-compose",
+                "declared": True,
+                "autostart": True,
+                "cwd": "/repo",
+                "files": ["/repo/compose.yml"],
+                "services": ["postgres"],
+            },
+            "docker": {
+                "containers": [
+                    {
+                        "name": "globalnewstracker-postgres",
+                        "status": "running",
+                        "metadata_source": "docker_labels",
+                    }
+                ]
+            },
+            "docker_observation_authority": "host_broker",
+            "docker_dependencies": [
+                {
+                    "name": "postgres",
+                    "service": "postgres",
+                    "container": "globalnewstracker-postgres",
+                    "ports": [{"host": "127.0.0.1", "port": 54330}],
+                    "mutation_authorized": True,
+                }
+            ],
+            "servers": [],
+        }
+        after = {"action": "start", "ok": True, "classifications": []}
+        with (
+            mock.patch.object(
+                dev_coordinator,
+                "configured_broker_context",
+                return_value=(object(), object()),
+            ),
+            mock.patch.object(dev_coordinator, "port_open", return_value=True),
+            mock.patch.object(
+                dev_coordinator,
+                "docker_inspect_state",
+                side_effect=AssertionError("healthy broker runtime used local Docker inspect"),
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "coordinated_run_docker",
+            ) as docker_action,
+            mock.patch.object(
+                dev_coordinator,
+                "observe_project_runtime",
+                return_value=(spec, after),
+            ),
+        ):
+            result = dev_coordinator.execute_project_start(
+                {"project": "/repo", "agent": "codex-test"},
+                spec,
+                {"action": "pre-start", "ok": True, "classifications": []},
+            )
+
+        docker_action.assert_not_called()
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(result["action_errors"], [])
+
+    def test_project_action_error_retains_broker_reconciliation_id(self) -> None:
+        error = dev_coordinator.project_action_error_from_exception(
+            dev_coordinator.BrokerError(
+                "operation_outcome_uncertain",
+                "Compose outcome needs reconciliation.",
+                operation_id="4c6507a0-7f32-4cfd-bf5c-a196322687b3",
+            )
+        )
+
+        self.assertEqual(
+            error["operation_id"], "4c6507a0-7f32-4cfd-bf5c-a196322687b3"
+        )
+        self.assertIn("Coordinator skill", error["action_required"])
+
+    def test_source_fingerprint_health_check_matches_build_algorithm_and_detects_stale_runtime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".runtime-provenance-", dir=str(Path.home().resolve())
+        ) as raw_root:
+            root = Path(raw_root).resolve()
+            worker = root / "worker"
+            worker.mkdir()
+            (worker / "Program.cs").write_text("current source\n", encoding="utf-8")
+            (worker / "bin").mkdir()
+            (worker / "bin" / "ignored.dll").write_text("ignored", encoding="utf-8")
+
+            check = dev_coordinator.normalize_health_check(
+                {
+                    "name": "worker-source-provenance",
+                    "url": "http://127.0.0.1:5080/healthz",
+                    "source_fingerprint": {
+                        "root": "worker",
+                        "exclude_directories": ["bin", "obj"],
+                    },
+                },
+                project=str(root),
+            )
+            specification = check["source_fingerprint"]
+            self.assertIsInstance(specification, dict)
+            expected_file = hashlib.sha256(b"current source\n").hexdigest()
+            expected = hashlib.sha256(
+                f"{expected_file}  ./Program.cs\n".encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(dev_coordinator.source_tree_fingerprint(specification), expected)
+
+            verified = dev_coordinator.source_fingerprint_health_result(
+                specification,
+                json.dumps({"status": "ok", "build": {"sourceFingerprint": expected}}),
+            )
+            self.assertTrue(verified["ok"])
+            self.assertEqual(verified["provenance_status"], "verified")
+
+            stale = dev_coordinator.source_fingerprint_health_result(
+                specification,
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "build": {"sourceFingerprint": "a" * 64},
+                    }
+                ),
+            )
+            self.assertFalse(stale["ok"])
+            self.assertEqual(stale["classification"], "source_stale")
+
+            unavailable = dev_coordinator.source_fingerprint_health_result(
+                specification,
+                json.dumps({"status": "ok"}),
+            )
+            self.assertFalse(unavailable["ok"])
+            self.assertEqual(
+                unavailable["classification"], "runtime_provenance_unavailable"
+            )
+
+    def test_runtime_provenance_requires_a_confined_source_root(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".runtime-provenance-root-", dir=str(Path.home().resolve())
+        ) as raw_root:
+            root = Path(raw_root).resolve()
+            with self.assertRaisesRegex(ValueError, "source_fingerprint.root"):
+                dev_coordinator.normalize_health_check(
+                    {
+                        "url": "http://127.0.0.1:5080/healthz",
+                        "source_fingerprint": {"root": "missing"},
+                    },
+                    project=str(root),
+                )
+
 
 class BrokerCLIContractTests(unittest.TestCase):
     def test_sigterm_fences_mutations_before_serve_loop_poll(self) -> None:
@@ -1496,6 +1827,12 @@ class BrokerCLIContractTests(unittest.TestCase):
         handlers: dict[int, object] = {}
 
         class FakeServer:
+            def __init__(self, socket_path: Path | None = None) -> None:
+                self.socket_path = socket_path
+                self._expected_uid = os.geteuid()
+                self._expected_gid = os.getegid()
+                self._socket_mode = 0o660
+
             def start(self) -> None:
                 self.assert_startup_recovery_complete()
                 events.append("server-started")
@@ -1514,9 +1851,10 @@ class BrokerCLIContractTests(unittest.TestCase):
                 )
 
         class FakeRuntime:
-            def __init__(self) -> None:
-                self.server = FakeServer()
+            def __init__(self, socket_path: Path | None = None) -> None:
+                self.server = FakeServer(socket_path)
                 self.persistence = mock.Mock()
+                self.backend = mock.Mock()
                 self.fenced = False
                 self.begin_shutdown_calls = 0
 
@@ -1530,8 +1868,6 @@ class BrokerCLIContractTests(unittest.TestCase):
                 if not self.fenced:
                     raise AssertionError("runtime closed before mutation fence")
                 events.append("runtime-closed")
-
-        runtime = FakeRuntime()
 
         def install_handler(signum: int, handler: object) -> None:
             handlers[signum] = handler
@@ -1547,6 +1883,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             socket="/run/devcoordinator/broker.sock",
             max_clients=4,
         )
+        runtime = FakeRuntime()
         with (
             mock.patch.object(
                 broker_cli_module,
@@ -1578,6 +1915,8 @@ class BrokerCLIContractTests(unittest.TestCase):
         (
             runtime.persistence.recover_interrupted_docker_operations
         ).assert_called_once_with()
+        runtime.backend.recover_ephemeral_runs.assert_called_once_with()
+        runtime.backend.start_ephemeral_reaper.assert_called_once_with()
 
     def test_repeated_signal_during_shutdown_does_not_reenter_fence(self) -> None:
         events: list[str] = []
@@ -1595,6 +1934,7 @@ class BrokerCLIContractTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.server = FakeServer()
                 self.persistence = mock.Mock()
+                self.backend = mock.Mock()
                 self.begin_shutdown_calls = 0
 
             def begin_shutdown(self) -> int:
@@ -1668,6 +2008,8 @@ class BrokerCLIContractTests(unittest.TestCase):
         (
             runtime.persistence.recover_interrupted_docker_operations
         ).assert_called_once_with()
+        runtime.backend.recover_ephemeral_runs.assert_called_once_with()
+        runtime.backend.start_ephemeral_reaper.assert_called_once_with()
         self.assertEqual(
             events,
             [
@@ -1678,6 +2020,246 @@ class BrokerCLIContractTests(unittest.TestCase):
             ],
         )
 
+    def test_serve_reclaims_only_proven_dead_socket_under_real_service_lock(self) -> None:
+        events: list[str] = []
+        handlers: dict[int, object] = {}
+        with tempfile.TemporaryDirectory(
+            prefix=".broker-lexical-reclaim-",
+            dir=str(Path.home().resolve()),
+        ) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime_directory = root / "runtime"
+            runtime_directory.mkdir(mode=0o750)
+            os.chmod(runtime_directory, 0o750)
+            socket_path = runtime_directory / "broker.sock"
+            sibling = runtime_directory / "ephemeral-secrets"
+            sibling.mkdir(mode=0o700)
+            sentinel = sibling / "untouched"
+            sentinel.write_text("preserve sibling", encoding="utf-8")
+            runtime_identity = (
+                os.lstat(runtime_directory).st_dev,
+                os.lstat(runtime_directory).st_ino,
+            )
+            sibling_identity = (os.lstat(sibling).st_dev, os.lstat(sibling).st_ino)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(socket_path))
+                os.chmod(socket_path, 0o660)
+            finally:
+                listener.close()
+
+            server = UnixBrokerServer(socket_path, mock.Mock())
+            real_start = server.start
+            started_calls: list[None] = []
+
+            def started() -> None:
+                self.assertFalse(
+                    socket_path.exists(),
+                    "lexical recovery must remove only the proven dead pathname",
+                )
+                real_start()
+                started_calls.append(None)
+                events.append("server-started")
+                handlers[broker_cli_module.signal.SIGTERM](
+                    broker_cli_module.signal.SIGTERM, None
+                )
+
+            server.start = mock.Mock(side_effect=started)
+
+            class FakeRuntime:
+                def __init__(self) -> None:
+                    self.server = server
+                    self.persistence = mock.Mock()
+                    self.backend = mock.Mock()
+                    self.begin_shutdown_calls = 0
+
+                def begin_shutdown(self) -> int:
+                    self.begin_shutdown_calls += 1
+                    events.append("mutation-fenced")
+                    return 1
+
+                def close(self) -> None:
+                    server.close()
+                    events.append("runtime-closed")
+
+            runtime = FakeRuntime()
+
+            def install_handler(signum: int, handler: object) -> None:
+                handlers[signum] = handler
+
+            args = argparse.Namespace(
+                access_group=None,
+                access_gid=os.getegid(),
+                database=str(root / "coordinator.sqlite3"),
+                socket=str(socket_path),
+                max_clients=4,
+            )
+            with (
+                mock.patch.object(
+                    broker_cli_module,
+                    "build_store_backed_broker_runtime",
+                    return_value=runtime,
+                ),
+                mock.patch.object(
+                    broker_cli_module.signal,
+                    "getsignal",
+                    return_value=broker_cli_module.signal.SIG_DFL,
+                ),
+                mock.patch.object(
+                    broker_cli_module.signal,
+                    "signal",
+                    side_effect=install_handler,
+                ),
+                mock.patch("builtins.print"),
+            ):
+                serve_broker(args, host_mutations_factory=mock.Mock)
+
+            self.assertEqual(events, ["server-started", "mutation-fenced", "runtime-closed"])
+            self.assertEqual(started_calls, [None])
+            self.assertFalse(socket_path.exists())
+            self.assertEqual(
+                runtime_identity,
+                (os.lstat(runtime_directory).st_dev, os.lstat(runtime_directory).st_ino),
+            )
+            self.assertEqual(
+                sibling_identity,
+                (os.lstat(sibling).st_dev, os.lstat(sibling).st_ino),
+            )
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve sibling")
+
+    def test_serve_lexical_recovery_failure_guards_leave_paths_untouched(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix=".broker-lexical-guards-",
+            dir=str(Path.home().resolve()),
+        ) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime_directory = root / "runtime"
+            runtime_directory.mkdir(mode=0o750)
+            os.chmod(runtime_directory, 0o750)
+
+            def dead_socket(path: Path) -> None:
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    listener.bind(str(path))
+                    os.chmod(path, 0o660)
+                finally:
+                    listener.close()
+
+            def serve(path: Path, started: list[None]) -> None:
+                handlers: dict[int, object] = {}
+                server = UnixBrokerServer(path, mock.Mock())
+                real_start = server.start
+
+                def start_and_stop() -> None:
+                    real_start()
+                    started.append(None)
+                    handlers[broker_cli_module.signal.SIGTERM](
+                        broker_cli_module.signal.SIGTERM, None
+                    )
+
+                server.start = start_and_stop
+
+                class Runtime:
+                    def __init__(self) -> None:
+                        self.server = server
+                        self.persistence = mock.Mock()
+                        self.backend = mock.Mock()
+
+                    def begin_shutdown(self) -> int:
+                        return 1
+
+                    def close(self) -> None:
+                        server.close()
+
+                def install_handler(signum: int, handler: object) -> None:
+                    handlers[signum] = handler
+
+                args = argparse.Namespace(
+                    access_group=None,
+                    access_gid=os.getegid(),
+                    database=str(root / "coordinator.sqlite3"),
+                    socket=str(path),
+                    max_clients=4,
+                )
+                runtime = Runtime()
+                with (
+                    mock.patch.object(
+                        broker_cli_module,
+                        "build_store_backed_broker_runtime",
+                        return_value=runtime,
+                    ),
+                    mock.patch.object(
+                        broker_cli_module.signal,
+                        "getsignal",
+                        return_value=broker_cli_module.signal.SIG_DFL,
+                    ),
+                    mock.patch.object(
+                        broker_cli_module.signal,
+                        "signal",
+                        side_effect=install_handler,
+                    ),
+                    mock.patch("builtins.print"),
+                ):
+                    serve_broker(args, host_mutations_factory=mock.Mock)
+
+            live_path = runtime_directory / "live.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(str(live_path))
+                os.chmod(live_path, 0o660)
+                listener.listen(1)
+                started: list[None] = []
+                with self.assertRaises(BrokerError) as live:
+                    serve(live_path, started)
+                self.assertEqual(live.exception.code, "socket_path_exists")
+                self.assertEqual(started, [])
+                self.assertTrue(live_path.exists())
+            finally:
+                listener.close()
+                os.unlink(live_path)
+
+            wrong_type_path = runtime_directory / "operator-owned"
+            wrong_type_path.write_text("operator-owned", encoding="utf-8")
+            started = []
+            with self.assertRaises(BrokerError) as wrong_type:
+                serve(wrong_type_path, started)
+            self.assertEqual(wrong_type.exception.code, "unsafe_socket_path")
+            self.assertEqual(started, [])
+            self.assertEqual(wrong_type_path.read_text(encoding="utf-8"), "operator-owned")
+
+            race_path = runtime_directory / "race.sock"
+            dead_socket(race_path)
+            real_lstat = broker_cli_module.os.lstat
+            socket_lstat_calls = 0
+
+            def replace_before_recheck(path: str) -> os.stat_result:
+                nonlocal socket_lstat_calls
+                if Path(path) != race_path:
+                    return real_lstat(path)
+                socket_lstat_calls += 1
+                if socket_lstat_calls != 2:
+                    return real_lstat(path)
+                os.unlink(race_path)
+                dead_socket(race_path)
+                replacement = real_lstat(race_path)
+                values = list(replacement)
+                values[1] = int(replacement.st_ino) + 1
+                return os.stat_result(values)
+
+            started = []
+            with (
+                mock.patch.object(
+                    broker_cli_module.os,
+                    "lstat",
+                    side_effect=replace_before_recheck,
+                ),
+                self.assertRaises(BrokerError) as race,
+            ):
+                serve(race_path, started)
+            self.assertEqual(race.exception.code, "socket_path_reclaim_unproven")
+            self.assertEqual(started, [])
+            self.assertTrue(race_path.exists())
+            os.unlink(race_path)
     def test_compose_reconciliation_plan_is_read_only(self) -> None:
         args = argparse.Namespace(
             database="/service/coordinator.sqlite3",
@@ -2133,6 +2715,55 @@ class BrokerCLIContractTests(unittest.TestCase):
                     "/repo",
                 ]
             )
+
+    def test_low_level_ephemeral_call_requires_and_forwards_agent(self) -> None:
+        value = parser()
+        common = [
+            "broker",
+            "call",
+            "--socket",
+            "/run/devcoordinator/broker.sock",
+            "--expected-broker-uid",
+            "123",
+            "--account-id",
+            "account-a",
+            "--database-generation",
+            "generation-a",
+            "--project-id",
+            "repo-id",
+            "--resource-id",
+            "template-id",
+            "--operation",
+            "ephemeral.start",
+        ]
+        missing_agent = value.parse_args(common)
+        with self.assertRaisesRegex(ValueError, "require --agent"):
+            handle_broker_cli(missing_agent)
+
+        args = value.parse_args(
+            [*common, "--agent", "codex-a", "--ttl-seconds", "900"]
+        )
+        calls: list[object] = []
+
+        class FakeClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def call(self, request: object) -> dict[str, object]:
+                calls.append(request)
+                return {
+                    "version": 1,
+                    "operation_id": request.operation_id,
+                    "ok": True,
+                    "result": {"status": "running"},
+                }
+
+        with mock.patch("devcoordinator.broker_cli.BrokerClient", FakeClient):
+            handle_broker_cli(args)
+        self.assertEqual(
+            calls[0].arguments,
+            {"agent": "codex-a", "ttl_seconds": 900},
+        )
 
     def test_docker_and_port_argument_families_do_not_cross(self) -> None:
         value = parser()

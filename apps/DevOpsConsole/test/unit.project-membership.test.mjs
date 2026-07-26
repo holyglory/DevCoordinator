@@ -29,10 +29,11 @@ async function loadProjectGroupsOf() {
   const source = extractFunction(appJs, 'function projectGroupsOf(o)');
   // eslint-disable-next-line no-new-func
   const projectGroupsOf = new Function(
-    'isServerRunning', 'isContainerActive', 'projectTail', 'projectGroupOrder',
+    'isServerRunning', 'isOperationalServer', 'isContainerActive', 'projectTail', 'projectGroupOrder',
     `${source}; return projectGroupsOf;`,
   )(
-    (server) => server.status !== 'stopped',
+    (server) => ['running', 'starting', 'unhealthy'].includes(server.status),
+    (server) => ['running', 'starting', 'unhealthy', 'stopping', 'stopped'].includes(server.status),
     (container) => container.status !== 'stopped',
     (project) => String(project || '').split('/').filter(Boolean).at(-1) || '—',
     (a, b) => String(a.name).localeCompare(String(b.name)),
@@ -106,4 +107,29 @@ test('project membership detector catches same-name co-claiming', async () => {
   } });
   assert.deepEqual(groups.find((group) => group.name === 'Repo').members.containers, [live]);
   assert.deepEqual(groups.find((group) => group.name === 'Unassigned Resources').members.containers, [old]);
+});
+
+test('project membership excludes control-only port lease definitions from operational collections', async () => {
+  const { projectGroupsOf } = await loadProjectGroupsOf();
+  const live = { id: 'live', name: 'web', status: 'running' };
+  const stopped = { id: 'stopped', name: 'worker', status: 'stopped' };
+  const leaseTarget = {
+    id: 'lease-only', name: 'smoke-caddy-http', role: 'validation-port-lease',
+    status: 'unobserved', pid: null, port: null,
+  };
+  const groups = projectGroupsOf({ inventory: {
+    servers: [live, stopped, leaseTarget],
+    docker: { available: true, containers: [], postgres: [] },
+    project_usage: [{
+      usage_key: 'path:/repo', name: 'Repo', project: '/repo',
+      server_ids: ['live', 'stopped', 'lease-only'],
+      container_resource_ids: [], container_names: [],
+    }],
+  } });
+
+  const rendered = groups.flatMap((group) => group.members.servers);
+  assert.deepEqual(rendered, [live, stopped]);
+  assert.equal(groups.find((group) => group.name === 'Repo').runningCount, 1);
+  assert.equal(groups.some((group) => group.members.servers.includes(leaseTarget)), false,
+    'an ACL/port-policy target is not a server instance and must not fall into Unassigned Resources');
 });

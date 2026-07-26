@@ -44,9 +44,19 @@ from .database_backups import (
     upsert_database_backup,
 )
 from .events import list_event_page
+from .ephemeral_secrets import (
+    EphemeralSecretPolicy,
+    POSTGRES_INITDB_PASSWORD_FILE_V1,
+    deterministic_secret_binding_id,
+    normalize_ephemeral_secret_policy,
+)
 
 
 DEFAULT_PORT_LEASE_TTL_SECONDS = 600
+# Broker startup applies trusted, idempotent schema compatibility work before
+# any client can connect. Keep that one transaction bounded by the service's
+# startup envelope rather than the short per-request mutation budget.
+BROKER_INITIALIZATION_MAX_SECONDS = 60.0
 _REPOSITORY_LIFECYCLE_OPERATIONS = frozenset(
     {
         BrokerOperation.REPOSITORY_PLAN_REMOVE,
@@ -84,6 +94,52 @@ _DOCKER_OPERATIONS = frozenset(
         BrokerOperation.DOCKER_RESTART,
     }
 )
+_EPHEMERAL_BASE_OPERATIONS = (
+    BrokerOperation.EPHEMERAL_START,
+    BrokerOperation.EPHEMERAL_STATUS,
+    BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+    BrokerOperation.EPHEMERAL_RENEW,
+    BrokerOperation.EPHEMERAL_FINISH,
+)
+_EPHEMERAL_SECRET_FD_OPERATION = BrokerOperation.EPHEMERAL_SECRET_FD
+_EPHEMERAL_IMAGE_PREFETCH_OPERATION = BrokerOperation.EPHEMERAL_IMAGE_PREFETCH
+_EPHEMERAL_OPERATIONS = frozenset(
+    _EPHEMERAL_BASE_OPERATIONS
+    + (_EPHEMERAL_IMAGE_PREFETCH_OPERATION, _EPHEMERAL_SECRET_FD_OPERATION)
+)
+_EPHEMERAL_MUTATION_OPERATIONS = _EPHEMERAL_OPERATIONS - {
+    BrokerOperation.EPHEMERAL_STATUS,
+    BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+    BrokerOperation.EPHEMERAL_SECRET_FD,
+}
+
+
+def _ephemeral_acl_operations_for_policy(
+    secret_policy_kind: str | None,
+    *,
+    allow_image_prefetch: bool = False,
+) -> tuple[BrokerOperation, ...]:
+    """Return only the operations justified by one sealed template policy.
+
+    Descriptor delivery is deliberately not a general ephemeral-container
+    capability. The sole reviewed password-file policy gets it; every other
+    template receives the four ordinary lifecycle grants only.
+    """
+
+    if secret_policy_kind is None:
+        operations = _EPHEMERAL_BASE_OPERATIONS
+    elif secret_policy_kind == POSTGRES_INITDB_PASSWORD_FILE_V1:
+        operations = _EPHEMERAL_BASE_OPERATIONS + (_EPHEMERAL_SECRET_FD_OPERATION,)
+    else:
+        raise BrokerError(
+            "control_binding_unavailable",
+            "Ephemeral template has an unsupported credential policy.",
+        )
+    if allow_image_prefetch:
+        return operations + (_EPHEMERAL_IMAGE_PREFETCH_OPERATION,)
+    return operations
+
+
 _COMPOSE_OPERATIONS = frozenset(
     {
         BrokerOperation.COMPOSE_UP,
@@ -116,6 +172,25 @@ _HOST_READ_OPERATIONS = frozenset(
     {BrokerOperation.INVENTORY_READ, BrokerOperation.EVENTS_READ}
 )
 _HOST_OBSERVE_OPERATIONS = frozenset({BrokerOperation.HOST_OBSERVE})
+_TEST_OPERATIONS = frozenset(
+    {
+        BrokerOperation.TEST_RUN_START,
+        BrokerOperation.TEST_RUN_FINISH,
+        BrokerOperation.TEST_STATS_READ,
+    }
+)
+
+
+def _operation_actor(authorized: AuthorizedBrokerRequest) -> str:
+    """Build durable actor metadata while keeping kernel identity authoritative."""
+
+    request = authorized.request
+    actor = "broker:" + request.account_id
+    if request.operation in _EPHEMERAL_MUTATION_OPERATIONS:
+        client_agent = request.arguments.get("agent")
+        if client_agent is not None:
+            actor += ":client-agent:" + str(client_agent)
+    return actor
 
 
 def _service_administrator_uid() -> int:
@@ -185,6 +260,24 @@ CREATE TABLE IF NOT EXISTS broker_resource_acl (
     updated_at TEXT NOT NULL,
     PRIMARY KEY(uid, repo_id, resource_kind, resource_id, operation)
 );
+
+CREATE TABLE IF NOT EXISTS broker_ephemeral_acl (
+    uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
+    template_id TEXT NOT NULL
+        REFERENCES ephemeral_container_templates(template_id) ON DELETE CASCADE,
+    operation TEXT NOT NULL CHECK(operation IN (
+        'ephemeral.start', 'ephemeral.status', 'ephemeral.image_status',
+        'ephemeral.image_prefetch', 'ephemeral.renew', 'ephemeral.finish',
+        'ephemeral.secret_fd'
+    )),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(uid, repo_id, template_id, operation)
+);
+
+CREATE INDEX IF NOT EXISTS broker_ephemeral_acl_lookup
+ON broker_ephemeral_acl(repo_id, template_id, operation, enabled);
 
 CREATE TABLE IF NOT EXISTS broker_assignment_acl (
     uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
@@ -623,6 +716,68 @@ class DockerMutationTarget:
 
 
 @dataclass(frozen=True)
+class EphemeralContainerTarget:
+    run_id: str
+    template_id: str
+    repo_id: str
+    owner_uid: int
+    account_id: str
+    creation_nonce: str
+    container_name: str
+    image_ref: str
+    secret_policy: EphemeralSecretPolicy | None
+    command: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
+    memory_bytes: int | None
+    cpu_millis: int | None
+    container_tcp_port: int | None
+    host_port_start: int | None
+    host_port_end: int | None
+    host_port: int | None
+    lease_id: str | None
+    full_container_id: str | None
+    docker_resource_id: str | None
+    template_fingerprint: str
+    max_ttl_seconds: int
+    expires_at_epoch: int
+    credential_renewal_phase: str
+    credential_renewal_old_expires_at_epoch: int | None
+    credential_renewal_new_expires_at_epoch: int | None
+    credential_renewal_operation_id: str | None
+    next_reconcile_at_epoch: int
+    recovery_failures: int
+    cleanup_requested: bool
+    cleanup_reason: str | None
+    error_code: str | None
+    error_message: str | None
+    status: str
+    phase: str
+
+
+@dataclass(frozen=True)
+class EphemeralImageTarget:
+    """Current sealed image identity for one enabled ephemeral template."""
+
+    template_id: str
+    repo_id: str
+    image_ref: str
+    template_fingerprint: str
+
+
+@dataclass(frozen=True)
+class EphemeralSecretRunTarget:
+    """Exact non-secret run snapshot authorized for one descriptor delivery."""
+
+    run_id: str
+    template_id: str
+    repo_id: str
+    owner_uid: int
+    account_id: str
+    policy: EphemeralSecretPolicy
+    expires_at_epoch: int
+
+
+@dataclass(frozen=True)
 class DatabaseMutationTarget:
     database_binding_id: str
     docker_resource_id: str
@@ -727,11 +882,65 @@ class BrokerPersistence:
     def initialize(self) -> None:
         with self._store() as store:
             with store.immediate_transaction(
-                revision_kind=None, check_invariants=False
+                max_seconds=BROKER_INITIALIZATION_MAX_SECONDS,
+                revision_kind=None,
+                check_invariants=False,
             ) as connection:
                 for statement in BROKER_SCHEMA.split(";"):
                     if statement.strip():
                         connection.execute(statement)
+                ephemeral_acl_row = connection.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'broker_ephemeral_acl'"
+                ).fetchone()
+                ephemeral_acl_sql = str(
+                    ephemeral_acl_row[0] if ephemeral_acl_row else ""
+                )
+                if (
+                    "ephemeral.secret_fd" not in ephemeral_acl_sql
+                    or "ephemeral.image_status" not in ephemeral_acl_sql
+                    or "ephemeral.image_prefetch" not in ephemeral_acl_sql
+                ):
+                    connection.execute(
+                        "ALTER TABLE broker_ephemeral_acl "
+                        "RENAME TO broker_ephemeral_acl_pre_image_cache"
+                    )
+                    connection.execute(
+                        """
+                        CREATE TABLE broker_ephemeral_acl (
+                            uid INTEGER NOT NULL REFERENCES broker_acl_principals(uid) ON DELETE CASCADE,
+                            repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
+                            template_id TEXT NOT NULL
+                                REFERENCES ephemeral_container_templates(template_id) ON DELETE CASCADE,
+                            operation TEXT NOT NULL CHECK(operation IN (
+                                'ephemeral.start', 'ephemeral.status', 'ephemeral.image_status',
+                                'ephemeral.image_prefetch', 'ephemeral.renew', 'ephemeral.finish',
+                                'ephemeral.secret_fd'
+                            )),
+                            enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                            updated_at TEXT NOT NULL,
+                            PRIMARY KEY(uid, repo_id, template_id, operation)
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_ephemeral_acl(
+                            uid, repo_id, template_id, operation, enabled, updated_at
+                        )
+                        SELECT uid, repo_id, template_id, operation, enabled, updated_at
+                        FROM broker_ephemeral_acl_pre_image_cache
+                        WHERE operation IN (
+                            'ephemeral.start', 'ephemeral.status',
+                            'ephemeral.renew', 'ephemeral.finish', 'ephemeral.secret_fd'
+                        )
+                        """
+                    )
+                    connection.execute("DROP TABLE broker_ephemeral_acl_pre_image_cache")
+                    connection.execute(
+                        "CREATE INDEX IF NOT EXISTS broker_ephemeral_acl_lookup "
+                        "ON broker_ephemeral_acl(repo_id, template_id, operation, enabled)"
+                    )
                 cleanup_acl_sql = str(
                     connection.execute(
                         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'broker_cleanup_resource_acl'"
@@ -1098,6 +1307,627 @@ class BrokerPersistence:
                         """,
                         (now, uid, repo_id),
                     )
+
+    def provision_ephemeral_template(
+        self,
+        *,
+        template_id: str,
+        repo_id: str,
+        name: str,
+        image_ref: str,
+        command: Iterable[str] = (),
+        environment: Mapping[str, str] | None = None,
+        secret_policy_kind: str | None = None,
+        secret_binding_id: str | None = None,
+        default_ttl_seconds: int = 3600,
+        max_ttl_seconds: int = 14400,
+        container_tcp_port: int | None = None,
+        host_port_start: int | None = None,
+        host_port_end: int | None = None,
+        memory_bytes: int | None = None,
+        cpu_millis: int | None = None,
+        max_concurrent_runs: int = 4,
+        max_concurrent_runs_per_uid: int = 2,
+        repo_max_active_runs: int = 16,
+        repo_memory_budget_bytes: int = 8 * 1024 * 1024 * 1024,
+        repo_cpu_budget_millis: int = 16_000,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Seal one administrator-declared short-lived container template.
+
+        The broker wire protocol never accepts these values.  Runs copy this
+        definition into their write-ahead record before Docker is invoked, so
+        later reenrollment cannot change an in-flight recovery target.
+        """
+
+        _require_identifier(template_id, "template_id")
+        _require_identifier(repo_id, "project_id")
+        normalized_name = _require_ephemeral_template_name(name)
+        normalized_image = _require_pinned_ephemeral_image(image_ref)
+        if isinstance(command, (str, bytes)):
+            raise ValueError("ephemeral command must be an iterable of arguments")
+        normalized_command = tuple(
+            _require_ephemeral_argument(item) for item in command
+        )
+        if len(normalized_command) > 128:
+            raise ValueError("ephemeral command may contain at most 128 arguments")
+        normalized_environment = _normalize_ephemeral_environment(environment or {})
+        normalized_secret_policy_kind = normalize_ephemeral_secret_policy(
+            secret_policy_kind
+        )
+        _require_ephemeral_secret_policy_environment(
+            policy_kind=normalized_secret_policy_kind,
+            environment=normalized_environment,
+        )
+        if normalized_secret_policy_kind is None:
+            if secret_binding_id is not None:
+                raise ValueError(
+                    "ephemeral secret binding requires a typed secret policy"
+                )
+            secret_policy = None
+        else:
+            binding_id = (
+                deterministic_secret_binding_id(
+                    repository_id=repo_id,
+                    template_id=template_id,
+                    policy=normalized_secret_policy_kind,
+                )
+                if secret_binding_id is None
+                else secret_binding_id
+            )
+            secret_policy = EphemeralSecretPolicy(
+                kind=normalized_secret_policy_kind,
+                binding_id=binding_id,
+            )
+        current_secret_policy_kind = (
+            None if secret_policy is None else secret_policy.kind
+        )
+        current_secret_binding_id = (
+            None if secret_policy is None else secret_policy.binding_id
+        )
+        if (
+            type(default_ttl_seconds) is not int
+            or type(max_ttl_seconds) is not int
+            or not 60 <= default_ttl_seconds <= max_ttl_seconds <= 7 * 24 * 60 * 60
+        ):
+            raise ValueError(
+                "ephemeral TTLs must be ordered integers from one minute through seven days"
+            )
+        port_values = (container_tcp_port, host_port_start, host_port_end)
+        if all(item is None for item in port_values):
+            pass
+        elif (
+            any(type(item) is not int for item in port_values)
+            or not 1 <= int(container_tcp_port) <= 65535
+            or not 1 <= int(host_port_start) <= int(host_port_end) <= 65535
+        ):
+            raise ValueError(
+                "ephemeral TCP publication requires one container port and an ordered host range"
+            )
+        if memory_bytes is not None and (
+            type(memory_bytes) is not int or memory_bytes < 16 * 1024 * 1024
+        ):
+            raise ValueError("ephemeral memory_bytes must be at least 16 MiB")
+        if cpu_millis is not None and (
+            type(cpu_millis) is not int or not 10 <= cpu_millis <= 256_000
+        ):
+            raise ValueError("ephemeral cpu_millis must be from 10 through 256000")
+        effective_memory = memory_bytes or 512 * 1024 * 1024
+        effective_cpu = cpu_millis or 1000
+        if (
+            type(max_concurrent_runs) is not int
+            or type(max_concurrent_runs_per_uid) is not int
+            or type(repo_max_active_runs) is not int
+            or not 1
+            <= max_concurrent_runs_per_uid
+            <= max_concurrent_runs
+            <= 32
+            or not max_concurrent_runs <= repo_max_active_runs <= 64
+        ):
+            raise ValueError(
+                "ephemeral concurrency limits must be ordered positive integers within the fixed host bounds"
+            )
+        if (
+            type(repo_memory_budget_bytes) is not int
+            or repo_memory_budget_bytes < effective_memory
+            or repo_memory_budget_bytes > 64 * (1 << 50)
+            or type(repo_cpu_budget_millis) is not int
+            or repo_cpu_budget_millis < effective_cpu
+            or repo_cpu_budget_millis > 64 * 256_000
+        ):
+            raise ValueError(
+                "ephemeral repository CPU and memory budgets must cover at least one sealed run and stay within the fixed repository bounds"
+            )
+        definition = {
+            "repo_id": repo_id,
+            "template_id": template_id,
+            "name": normalized_name,
+            "image_ref": normalized_image,
+            "command": list(normalized_command),
+            "environment": dict(normalized_environment),
+            "secret_policy_kind": current_secret_policy_kind,
+            "secret_binding_id": current_secret_binding_id,
+            "default_ttl_seconds": default_ttl_seconds,
+            "max_ttl_seconds": max_ttl_seconds,
+            "container_tcp_port": container_tcp_port,
+            "host_port_start": host_port_start,
+            "host_port_end": host_port_end,
+            "memory_bytes": memory_bytes,
+            "cpu_millis": cpu_millis,
+            "max_concurrent_runs": max_concurrent_runs,
+            "max_concurrent_runs_per_uid": max_concurrent_runs_per_uid,
+            "repo_max_active_runs": repo_max_active_runs,
+            "repo_memory_budget_bytes": repo_memory_budget_bytes,
+            "repo_cpu_budget_millis": repo_cpu_budget_millis,
+        }
+        definition_fingerprint = "sha256:" + fingerprint(definition)
+        now = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                repository = connection.execute(
+                    "SELECT 1 FROM repositories WHERE repo_id = ?", (repo_id,)
+                ).fetchone()
+                if repository is None:
+                    raise BrokerError(
+                        "project_access_denied",
+                        "Ephemeral template repository is not provisioned.",
+                    )
+                previous_policy = connection.execute(
+                    """
+                    SELECT secret_policy_kind, secret_binding_id
+                    FROM ephemeral_container_templates
+                    WHERE template_id = ? AND repo_id = ?
+                    """,
+                    (template_id, repo_id),
+                ).fetchone()
+                connection.execute(
+                    """
+                    INSERT INTO ephemeral_container_templates(
+                        template_id, repo_id, name, image_ref,
+                        secret_policy_kind, secret_binding_id,
+                        definition_fingerprint, default_ttl_seconds,
+                        max_ttl_seconds, container_tcp_port, host_port_start,
+                        host_port_end, memory_bytes, cpu_millis,
+                        max_concurrent_runs, max_concurrent_runs_per_uid,
+                        repo_max_active_runs, repo_memory_budget_bytes,
+                        repo_cpu_budget_millis, enabled,
+                        generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    ON CONFLICT(template_id) DO UPDATE SET
+                        name = excluded.name,
+                        image_ref = excluded.image_ref,
+                        secret_policy_kind = excluded.secret_policy_kind,
+                        secret_binding_id = excluded.secret_binding_id,
+                        definition_fingerprint = excluded.definition_fingerprint,
+                        default_ttl_seconds = excluded.default_ttl_seconds,
+                        max_ttl_seconds = excluded.max_ttl_seconds,
+                        container_tcp_port = excluded.container_tcp_port,
+                        host_port_start = excluded.host_port_start,
+                        host_port_end = excluded.host_port_end,
+                        memory_bytes = excluded.memory_bytes,
+                        cpu_millis = excluded.cpu_millis,
+                        max_concurrent_runs = excluded.max_concurrent_runs,
+                        max_concurrent_runs_per_uid = excluded.max_concurrent_runs_per_uid,
+                        repo_max_active_runs = excluded.repo_max_active_runs,
+                        repo_memory_budget_bytes = excluded.repo_memory_budget_bytes,
+                        repo_cpu_budget_millis = excluded.repo_cpu_budget_millis,
+                        enabled = excluded.enabled,
+                        generation = CASE
+                            WHEN ephemeral_container_templates.definition_fingerprint
+                                 != excluded.definition_fingerprint
+                            THEN ephemeral_container_templates.generation + 1
+                            ELSE ephemeral_container_templates.generation
+                        END,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        template_id,
+                        repo_id,
+                        normalized_name,
+                        normalized_image,
+                        current_secret_policy_kind,
+                        current_secret_binding_id,
+                        definition_fingerprint,
+                        default_ttl_seconds,
+                        max_ttl_seconds,
+                        container_tcp_port,
+                        host_port_start,
+                        host_port_end,
+                        memory_bytes,
+                        cpu_millis,
+                        max_concurrent_runs,
+                        max_concurrent_runs_per_uid,
+                        repo_max_active_runs,
+                        repo_memory_budget_bytes,
+                        repo_cpu_budget_millis,
+                        int(enabled),
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT repo_id FROM ephemeral_container_templates WHERE template_id = ?",
+                    (template_id,),
+                ).fetchone()
+                if row is None or str(row["repo_id"]) != repo_id:
+                    raise BrokerError(
+                        "template_identity_conflict",
+                        "Ephemeral template ID already belongs to another repository.",
+                    )
+                if previous_policy is not None and (
+                    previous_policy["secret_policy_kind"]
+                    != current_secret_policy_kind
+                    or previous_policy["secret_binding_id"]
+                    != current_secret_binding_id
+                ):
+                    transition_reason = (
+                        "The administrator changed this template's credential policy; "
+                        "runs using the previous credential are fenced for cleanup."
+                    )
+                    connection.execute(
+                        """
+                        UPDATE broker_ephemeral_acl
+                        SET enabled = 0, updated_at = ?
+                        WHERE repo_id = ? AND template_id = ?
+                          AND operation = 'ephemeral.secret_fd' AND enabled = 1
+                        """,
+                        (now, repo_id, template_id),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE ephemeral_container_runs
+                        SET status = 'cleanup_pending', phase = 'secret_policy_revoked',
+                            cleanup_requested = 1,
+                            cleanup_reason = COALESCE(cleanup_reason, ?),
+                            error_code = COALESCE(
+                                error_code, 'ephemeral_secret_policy_revoked'
+                            ),
+                            error_message = COALESCE(error_message, ?),
+                            next_reconcile_at_epoch = 0,
+                            generation = generation + 1, updated_at = ?
+                        WHERE repo_id = ? AND template_id = ?
+                          AND status NOT IN ('cleaned', 'failed')
+                          AND secret_policy_kind IS NOT NULL
+                        """,
+                        (
+                            transition_reason,
+                            transition_reason,
+                            now,
+                            repo_id,
+                            template_id,
+                        ),
+                    )
+                connection.execute(
+                    "DELETE FROM ephemeral_template_arguments WHERE template_id = ?",
+                    (template_id,),
+                )
+                connection.executemany(
+                    "INSERT INTO ephemeral_template_arguments(template_id, ordinal, argument) VALUES (?, ?, ?)",
+                    [
+                        (template_id, ordinal, argument)
+                        for ordinal, argument in enumerate(normalized_command)
+                    ],
+                )
+                connection.execute(
+                    "DELETE FROM ephemeral_template_environment WHERE template_id = ?",
+                    (template_id,),
+                )
+                connection.executemany(
+                    "INSERT INTO ephemeral_template_environment(template_id, name, value) VALUES (?, ?, ?)",
+                    [
+                        (template_id, key, value)
+                        for key, value in normalized_environment
+                    ],
+                )
+        return {
+            "template_id": template_id,
+            "name": normalized_name,
+            "definition_fingerprint": definition_fingerprint,
+        }
+
+    def disable_ephemeral_templates_except(
+        self, *, repo_id: str, template_ids: Iterable[str]
+    ) -> None:
+        _require_identifier(repo_id, "project_id")
+        retained = tuple(dict.fromkeys(str(item) for item in template_ids))
+        for template_id in retained:
+            _require_identifier(template_id, "template_id")
+        now = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                if retained:
+                    placeholders = ",".join("?" for _ in retained)
+                    connection.execute(
+                        f"""
+                        UPDATE ephemeral_container_templates
+                        SET enabled = 0, updated_at = ?
+                        WHERE repo_id = ? AND template_id NOT IN ({placeholders})
+                        """,
+                        (now, repo_id, *retained),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE ephemeral_container_templates SET enabled = 0, updated_at = ? WHERE repo_id = ?",
+                        (now, repo_id),
+                    )
+                connection.execute(
+                    """
+                    UPDATE broker_ephemeral_acl
+                    SET enabled = 0, updated_at = ?
+                    WHERE repo_id = ? AND operation IN (
+                        'ephemeral.start', 'ephemeral.image_status',
+                        'ephemeral.image_prefetch', 'ephemeral.renew',
+                        'ephemeral.secret_fd'
+                    ) AND template_id IN (
+                        SELECT template_id FROM ephemeral_container_templates
+                        WHERE repo_id = ? AND enabled = 0
+                    )
+                    """,
+                    (now, repo_id, repo_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE ephemeral_container_runs
+                    SET next_reconcile_at_epoch = 0,
+                        generation = generation + 1, updated_at = ?
+                    WHERE repo_id = ? AND status NOT IN ('cleaned', 'failed')
+                      AND template_id IN (
+                          SELECT template_id FROM ephemeral_container_templates
+                          WHERE repo_id = ? AND enabled = 0
+                      )
+                    """,
+                    (now, repo_id, repo_id),
+                )
+
+    def replace_ephemeral_access(
+        self,
+        *,
+        uid: int,
+        repo_id: str,
+        template_ids: Iterable[str],
+        prefetch_template_ids: Iterable[str] = (),
+    ) -> None:
+        _require_identifier(repo_id, "project_id")
+        normalized = tuple(dict.fromkeys(str(item) for item in template_ids))
+        for template_id in normalized:
+            _require_identifier(template_id, "template_id")
+        prefetch = tuple(
+            dict.fromkeys(str(item) for item in prefetch_template_ids)
+        )
+        for template_id in prefetch:
+            _require_identifier(template_id, "template_id")
+        if not set(prefetch) <= set(normalized):
+            raise ValueError(
+                "ephemeral image prefetch grants must be a subset of enrolled templates"
+            )
+        now = utc_timestamp()
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _require_principal(connection, uid)
+                connection.execute(
+                    "UPDATE broker_ephemeral_acl SET enabled = 0, updated_at = ? WHERE uid = ? AND repo_id = ?",
+                    (now, uid, repo_id),
+                )
+                for template_id in normalized:
+                    template = connection.execute(
+                        """
+                        SELECT enabled, secret_policy_kind
+                        FROM ephemeral_container_templates
+                        WHERE template_id = ? AND repo_id = ?
+                        """,
+                        (template_id, repo_id),
+                    ).fetchone()
+                    if template is None or not bool(template["enabled"]):
+                        raise BrokerError(
+                            "control_binding_unavailable",
+                            "Ephemeral access targets a disabled or unknown template.",
+                        )
+                    policy_kind = template["secret_policy_kind"]
+                    operations = _ephemeral_acl_operations_for_policy(
+                        None if policy_kind is None else str(policy_kind),
+                        allow_image_prefetch=template_id in prefetch,
+                    )
+                    for operation in operations:
+                        connection.execute(
+                            """
+                            INSERT INTO broker_ephemeral_acl(
+                                uid, repo_id, template_id, operation, enabled, updated_at
+                            ) VALUES (?, ?, ?, ?, 1, ?)
+                            ON CONFLICT(uid, repo_id, template_id, operation)
+                            DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
+                            """,
+                            (uid, repo_id, template_id, operation.value, now),
+                        )
+                connection.execute(
+                    """
+                    UPDATE ephemeral_container_runs
+                    SET next_reconcile_at_epoch = 0,
+                        generation = generation + 1, updated_at = ?
+                    WHERE repo_id = ? AND owner_uid = ?
+                      AND status NOT IN ('cleaned', 'failed')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ephemeral_container_templates template
+                          JOIN broker_ephemeral_acl acl
+                            ON acl.template_id = template.template_id
+                           AND acl.repo_id = template.repo_id
+                          WHERE template.template_id = ephemeral_container_runs.template_id
+                            AND template.repo_id = ephemeral_container_runs.repo_id
+                            AND template.enabled = 1
+                            AND acl.uid = ephemeral_container_runs.owner_uid
+                            AND acl.operation = 'ephemeral.start'
+                            AND acl.enabled = 1
+                      )
+                    """,
+                    (now, repo_id, uid),
+                )
+
+    def ephemeral_image_target(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        require_reserved_operation: bool = False,
+    ) -> EphemeralImageTarget:
+        """Resolve only the current sealed image for one template-scoped request."""
+
+        request = authorized.request
+        if request.operation not in {
+            BrokerOperation.EPHEMERAL_START,
+            BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+            BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+        }:
+            raise ValueError("request does not target an ephemeral template image")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _authorize_connection(
+                    connection, peer=authorized.peer, request=request
+                )
+                return _ephemeral_image_target_for_request(
+                    connection,
+                    request=request,
+                    require_reserved_operation=require_reserved_operation,
+                )
+
+    def complete_ephemeral_image_prefetch(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        target: EphemeralImageTarget,
+        proof: Mapping[str, Any],
+        cache_origin: str,
+        changed: bool | None,
+    ) -> dict[str, Any]:
+        """Persist one exact, digest-proven image cache receipt."""
+
+        request = authorized.request
+        if request.operation is not BrokerOperation.EPHEMERAL_IMAGE_PREFETCH:
+            raise ValueError("request is not an ephemeral image prefetch")
+        if cache_origin not in {"already_present", "pulled", "reconciled"}:
+            raise ValueError("ephemeral image cache origin is invalid")
+        if changed is not None and type(changed) is not bool:
+            raise ValueError("ephemeral image cache changed must be boolean or null")
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                _authorize_connection(
+                    connection, peer=authorized.peer, request=request
+                )
+                current = _ephemeral_image_target_for_request(
+                    connection,
+                    request=request,
+                    require_reserved_operation=True,
+                )
+                if current != target:
+                    raise BrokerError(
+                        "operation_state_conflict",
+                        "The sealed ephemeral image target changed before its cache receipt could be recorded.",
+                        operation_id=request.operation_id,
+                    )
+                normalized_proof = _normalize_ephemeral_image_cache_proof(
+                    proof, target=current
+                )
+                result = {
+                    **normalized_proof,
+                    "cache_origin": cache_origin,
+                    "changed": changed,
+                    "template_id": current.template_id,
+                    "template_fingerprint": current.template_fingerprint,
+                }
+                _finish_operation(
+                    connection, request.operation_id, result=result
+                )
+                connection.execute(
+                    """
+                    INSERT INTO events(
+                        event_id, repo_id, source_id, operation_id,
+                        event_kind, code, message, diagnostic_json, occurred_at
+                    ) VALUES (?, ?, NULL, ?, 'ephemeral.image_prefetched',
+                              'ephemeral_image_cached', ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        current.repo_id,
+                        request.operation_id,
+                        "The sealed ephemeral image cache was verified.",
+                        json.dumps(
+                            result,
+                            ensure_ascii=True,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        utc_timestamp(),
+                    ),
+                )
+                return result
+
+    def ephemeral_secret_fd_target(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        template_id: str,
+        run_id: uuid.UUID,
+    ) -> EphemeralSecretRunTarget:
+        """Authorize one descriptor retrieval against the exact running run.
+
+        This returns only policy and opaque binding metadata; the password is
+        deliberately owned by the volatile runtime manager and never enters
+        this database transaction or the wire result.
+        """
+
+        request = authorized.request
+        if request.operation is not BrokerOperation.EPHEMERAL_SECRET_FD:
+            raise ValueError("request is not an ephemeral credential delivery")
+        canonical_run_id = str(run_id)
+        if request.resource_id != canonical_run_id:
+            raise BrokerError(
+                "resource_access_denied",
+                "Credential delivery must target the exact ephemeral run identity.",
+                operation_id=request.operation_id,
+            )
+        _require_identifier(template_id, "template_id")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                row = _authorize_connection(
+                    connection, peer=authorized.peer, request=request
+                )
+                if row is None:
+                    raise BrokerError(
+                        "resource_access_denied",
+                        "Credential delivery requires an exact running ephemeral run.",
+                        operation_id=request.operation_id,
+                    )
+                if str(row["template_id"]) != template_id:
+                    raise BrokerError(
+                        "resource_access_denied",
+                        "Credential delivery template does not match the exact run.",
+                        operation_id=request.operation_id,
+                    )
+                kind = row["secret_policy_kind"]
+                binding_id = row["secret_binding_id"]
+                if kind is None or binding_id is None:
+                    raise BrokerError(
+                        "secret_delivery_unavailable",
+                        "This ephemeral template has no broker-managed credential policy.",
+                        operation_id=request.operation_id,
+                    )
+                try:
+                    policy = EphemeralSecretPolicy(
+                        kind=str(kind), binding_id=str(binding_id)
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise BrokerError(
+                        "secret_delivery_unavailable",
+                        "This ephemeral run has an invalid credential policy snapshot.",
+                        operation_id=request.operation_id,
+                    ) from exc
+                return EphemeralSecretRunTarget(
+                    run_id=canonical_run_id,
+                    template_id=str(row["template_id"]),
+                    repo_id=request.project_id,
+                    owner_uid=int(row["owner_uid"]),
+                    account_id=str(row["account_id"]),
+                    policy=policy,
+                    expires_at_epoch=int(row["expires_at_epoch"]),
+                )
 
     def provision_compose_definition(
         self,
@@ -3099,7 +3929,7 @@ class BrokerPersistence:
                         "broker." + request.operation.value,
                         fingerprint,
                         authorized.peer.uid,
-                        "broker:" + request.account_id,
+                        _operation_actor(authorized),
                         f"pid:{os.getpid()}",
                         now,
                         now,
@@ -4679,7 +5509,25 @@ class BrokerPersistence:
             store.__class__ = _BrokerInventoryStore
             with store.read_transaction() as connection:
                 _authorize_connection(connection, peer=authorized.peer, request=request)
-                return store.inventory_v2()
+                graph = store.inventory_v2()
+        # Test statistics are repository-owned, bounded projections over the
+        # same service database. Keep them beside (not inside) runtime
+        # resources so the Board cannot confuse test activity with host state.
+        from .test_records import CoordinatorTestRecords
+
+        records = CoordinatorTestRecords(
+            self.database_path,
+            expected_uid=self.expected_uid,
+            busy_timeout_ms=self.busy_timeout_ms,
+        )
+        graph["test_statistics"] = [
+            records.stats_for_repository(
+                repo_id=str(repository["repo_id"]), days=30, limit=25
+            )
+            for repository in graph["repositories"]
+            if repository.get("installation_status") != "disabled"
+        ]
+        return graph
 
     def events(self, authorized: AuthorizedBrokerRequest) -> dict[str, Any]:
         """Page the host event journal after live peer authorization."""
@@ -5902,6 +6750,10 @@ def _authorize_connection(
     peer: PeerCredentials,
     request: BrokerRequest,
 ) -> Optional[sqlite3.Row]:
+    ephemeral_retained_access = request.operation in {
+        BrokerOperation.EPHEMERAL_STATUS,
+        BrokerOperation.EPHEMERAL_FINISH,
+    }
     generation = connection.execute(
         "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
     ).fetchone()
@@ -5915,7 +6767,9 @@ def _authorize_connection(
         "SELECT account_id, enabled FROM broker_acl_principals WHERE uid = ?",
         (peer.uid,),
     ).fetchone()
-    if principal is None or not principal["enabled"]:
+    if principal is None or (
+        not principal["enabled"] and not ephemeral_retained_access
+    ):
         raise BrokerError(
             "peer_not_authorized",
             "This operating-system account is not authorized to use the broker.",
@@ -5935,19 +6789,28 @@ def _authorize_connection(
         """,
         (peer.uid, request.project_id),
     ).fetchone()
-    if enrollment is None or not bool(enrollment["enabled"]):
+    if enrollment is None or (
+        not bool(enrollment["enabled"]) and not ephemeral_retained_access
+    ):
         raise BrokerError(
             "project_access_denied",
             "The authenticated account has no enabled enrollment for this project.",
             operation_id=request.operation_id,
         )
-    if str(enrollment["account_id"]) != request.account_id:
+    if (
+        enrollment is not None
+        and str(enrollment["account_id"]) != request.account_id
+    ):
         raise BrokerError(
             "cross_account_access_denied",
             "The repository enrollment belongs to another account.",
             operation_id=request.operation_id,
         )
-    if int(time.time()) >= int(enrollment["valid_until_epoch"]):
+    if (
+        enrollment is not None
+        and int(time.time()) >= int(enrollment["valid_until_epoch"])
+        and not ephemeral_retained_access
+    ):
         raise BrokerError(
             "repository_enrollment_expired",
             "The authenticated repository enrollment has expired; rerun Coordinator skill installation.",
@@ -5961,7 +6824,11 @@ def _authorize_connection(
         """,
         (request.project_id,),
     ).fetchone()
-    if installation is None and request.operation is not BrokerOperation.CLEANUP_APPLY:
+    if (
+        installation is None
+        and request.operation is not BrokerOperation.CLEANUP_APPLY
+        and not ephemeral_retained_access
+    ):
         raise BrokerError(
             "project_access_denied",
             "The authenticated account is not authorized for this project.",
@@ -5975,6 +6842,7 @@ def _authorize_connection(
             | _ARCHIVE_READ_OPERATIONS
             | _HOST_READ_OPERATIONS
             | _HOST_OBSERVE_OPERATIONS
+            | _TEST_OPERATIONS
         )
         and request.resource_id != request.project_id
     ):
@@ -5986,6 +6854,10 @@ def _authorize_connection(
     start_like = request.operation in {
         BrokerOperation.PORT_LEASE,
         BrokerOperation.PORT_ASSIGN,
+        BrokerOperation.EPHEMERAL_START,
+        BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+        BrokerOperation.EPHEMERAL_RENEW,
+        BrokerOperation.EPHEMERAL_SECRET_FD,
         BrokerOperation.DOCKER_START,
         BrokerOperation.DOCKER_RESTART,
         BrokerOperation.COMPOSE_UP,
@@ -5994,6 +6866,7 @@ def _authorize_connection(
         BrokerOperation.DATABASE_RESTORE,
         BrokerOperation.SERVER_PUBLISH,
         BrokerOperation.HOST_OBSERVE,
+        BrokerOperation.TEST_RUN_START,
     }
     retained_cleanup_access = request.operation in {
         BrokerOperation.ARCHIVES_READ,
@@ -6005,6 +6878,10 @@ def _authorize_connection(
         BrokerOperation.RESOURCE_RETIRE,
         BrokerOperation.RESOURCE_ARCHIVE,
         BrokerOperation.RESOURCE_RESTORE,
+        BrokerOperation.EPHEMERAL_STATUS,
+        BrokerOperation.EPHEMERAL_FINISH,
+        BrokerOperation.TEST_RUN_FINISH,
+        BrokerOperation.TEST_STATS_READ,
     }
     if installation is not None and (
         installation["state"] != "active"
@@ -6025,10 +6902,104 @@ def _authorize_connection(
     resource_id = request.resource_id
     resource_kind = "container"
     lease_row: Optional[sqlite3.Row] = None
+    if request.operation in _EPHEMERAL_OPERATIONS:
+        if request.operation in {
+            BrokerOperation.EPHEMERAL_START,
+            BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+            BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+        }:
+            template_id = request.resource_id
+            target = connection.execute(
+                """
+                SELECT template_id, enabled
+                FROM ephemeral_container_templates
+                WHERE template_id = ? AND repo_id = ?
+                """,
+                (template_id, request.project_id),
+            ).fetchone()
+            if target is None or not bool(target["enabled"]):
+                raise BrokerError(
+                    "control_binding_unavailable",
+                    "Ephemeral template is disabled or no longer belongs to this repository.",
+                    operation_id=request.operation_id,
+                )
+        else:
+            target = connection.execute(
+                """
+                SELECT run.template_id, template.enabled,
+                       run.owner_uid, run.account_id, run.status,
+                       run.expires_at_epoch, run.secret_policy_kind,
+                       run.secret_binding_id,
+                       run.credential_renewal_phase
+                FROM ephemeral_container_runs run
+                JOIN ephemeral_container_templates template USING(template_id)
+                WHERE run.run_id = ? AND run.repo_id = ?
+                """,
+                (request.resource_id, request.project_id),
+            ).fetchone()
+            if (
+                target is None
+                or int(target["owner_uid"]) != peer.uid
+                or str(target["account_id"]) != request.account_id
+            ):
+                raise BrokerError(
+                    "resource_access_denied",
+                    "Ephemeral run does not belong to the authenticated principal and project.",
+                    operation_id=request.operation_id,
+                )
+            template_id = str(target["template_id"])
+            if (
+                request.operation
+                in {
+                    BrokerOperation.EPHEMERAL_RENEW,
+                    BrokerOperation.EPHEMERAL_SECRET_FD,
+                }
+                and not bool(target["enabled"])
+            ):
+                raise BrokerError(
+                    "control_binding_unavailable",
+                    "The ephemeral template was disabled; this run may only be inspected or finished.",
+                    operation_id=request.operation_id,
+                )
+            if request.operation is BrokerOperation.EPHEMERAL_SECRET_FD:
+                arguments = request.arguments
+                if (
+                    arguments.get("run_id") != request.resource_id
+                    or arguments.get("template_id") != template_id
+                    or str(target["status"]) != "running"
+                    or int(target["expires_at_epoch"]) <= int(time.time())
+                    or str(target["credential_renewal_phase"]) != "none"
+                ):
+                    raise BrokerError(
+                        "resource_access_denied",
+                        "Credential delivery requires the exact current running ephemeral run.",
+                        operation_id=request.operation_id,
+                    )
+        if not ephemeral_retained_access:
+            grant = connection.execute(
+                """
+                SELECT enabled FROM broker_ephemeral_acl
+                WHERE uid = ? AND repo_id = ? AND template_id = ?
+                  AND operation = ?
+                """,
+                (peer.uid, request.project_id, template_id, request.operation.value),
+            ).fetchone()
+            if grant is None or not bool(grant["enabled"]):
+                raise BrokerError(
+                    "operation_access_denied",
+                    "The authenticated account is not authorized for this ephemeral-container operation.",
+                    operation_id=request.operation_id,
+                )
+        return target
     if request.operation in _HOST_READ_OPERATIONS:
         # Host inventory visibility is read-only and host-wide for every
         # enrolled principal. Observation is an authoritative mutation and
         # therefore follows the explicit exact-repository ACL below.
+        return None
+    if request.operation in _TEST_OPERATIONS:
+        # Repository enrollment is the complete authority for the universal
+        # test journal. Runs and statistics can target only that exact repo;
+        # result ownership is rechecked against the run row by the service.
         return None
     if request.operation in _HOST_OBSERVE_OPERATIONS:
         grant = connection.execute(
@@ -6081,7 +7052,7 @@ def _authorize_connection(
         if request.operation is BrokerOperation.CLEANUP_APPLY:
             plan_row = connection.execute(
                 """
-                SELECT o.repo_id, o.kind
+                SELECT o.repo_id, o.kind, c.target_kind, c.target_id
                 FROM operations o
                 LEFT JOIN cleanup_plans c ON c.plan_id = o.operation_id
                 WHERE o.operation_id = ?
@@ -6102,6 +7073,32 @@ def _authorize_connection(
                     operation_id=request.operation_id,
                 )
             acl_repo_id = str(plan_row["repo_id"])
+        project_cleanup = (
+            request.operation is BrokerOperation.CLEANUP_PLAN
+            and str(request.arguments.get("target_kind") or "") == "project"
+        ) or (
+            request.operation is BrokerOperation.CLEANUP_APPLY
+            and plan_row is not None
+            and (
+                str(plan_row["kind"]) == "repository_decommission"
+                or str(plan_row["target_kind"] or "") == "project"
+            )
+        )
+        if project_cleanup:
+            active_ephemeral = connection.execute(
+                """
+                SELECT 1 FROM ephemeral_container_runs
+                WHERE repo_id = ? AND status NOT IN ('cleaned', 'failed')
+                LIMIT 1
+                """,
+                (acl_repo_id,),
+            ).fetchone()
+            if active_ephemeral is not None:
+                raise BrokerError(
+                    "ephemeral_runs_active",
+                    "Finish active broker-owned ephemeral runs before archiving or purging this project.",
+                    operation_id=request.operation_id,
+                )
         grant = connection.execute(
             """
             SELECT enabled FROM broker_cleanup_acl
@@ -6183,6 +7180,24 @@ def _authorize_connection(
                 )
         return None
     if request.operation in _LIFECYCLE_OPERATIONS:
+        if request.operation in {
+            BrokerOperation.REPOSITORY_PLAN_REMOVE,
+            BrokerOperation.REPOSITORY_REMOVE,
+        }:
+            active_ephemeral = connection.execute(
+                """
+                SELECT 1 FROM ephemeral_container_runs
+                WHERE repo_id = ? AND status NOT IN ('cleaned', 'failed')
+                LIMIT 1
+                """,
+                (request.project_id,),
+            ).fetchone()
+            if active_ephemeral is not None:
+                raise BrokerError(
+                    "ephemeral_runs_active",
+                    "Finish active broker-owned ephemeral runs before removing this repository.",
+                    operation_id=request.operation_id,
+                )
         canonical_resource_archive = request.operation in {
             BrokerOperation.RESOURCE_PLAN_ARCHIVE,
             BrokerOperation.RESOURCE_ARCHIVE,
@@ -6255,6 +7270,7 @@ def _authorize_connection(
                   AND b.resource_kind = a.resource_kind
                   AND b.resource_id = a.resource_id
                   AND b.authority_state = 'authoritative'
+                  AND b.provenance != 'coordinator_ephemeral'
                   AND s.effective_uid = ?
                   {unassigned_clause}
                 """,
@@ -6645,6 +7661,7 @@ def _require_resource_membership(
               AND b.resource_kind = 'container'
               AND b.resource_id = m.host_resource_id
               AND b.authority_state = 'authoritative'
+              AND b.provenance != 'coordinator_ephemeral'
             """,
             (repo_id, resource_id),
         ).fetchone()
@@ -6772,6 +7789,35 @@ def _reserved_target_fingerprint(
             raise BrokerError(
                 "control_binding_unavailable",
                 "Compose definition no longer belongs to the exact repository.",
+                operation_id=request.operation_id,
+            )
+        return str(row["definition_fingerprint"])
+    if request.operation in _EPHEMERAL_OPERATIONS:
+        if request.operation in {
+            BrokerOperation.EPHEMERAL_START,
+            BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+        }:
+            row = connection.execute(
+                """
+                SELECT definition_fingerprint
+                FROM ephemeral_container_templates
+                WHERE template_id = ? AND repo_id = ? AND enabled = 1
+                """,
+                (request.resource_id, request.project_id),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                """
+                SELECT template_fingerprint AS definition_fingerprint
+                FROM ephemeral_container_runs
+                WHERE run_id = ? AND repo_id = ?
+                """,
+                (request.resource_id, request.project_id),
+            ).fetchone()
+        if row is None:
+            raise BrokerError(
+                "control_binding_unavailable",
+                "Ephemeral target no longer belongs to the exact repository authority.",
                 operation_id=request.operation_id,
             )
         return str(row["definition_fingerprint"])
@@ -8541,6 +9587,120 @@ def _finish_operation(
     )
 
 
+def _ephemeral_image_target_for_request(
+    connection: sqlite3.Connection,
+    *,
+    request: BrokerRequest,
+    require_reserved_operation: bool,
+) -> EphemeralImageTarget:
+    """Read one enabled template after authorization, never caller image input."""
+
+    row = connection.execute(
+        """
+        SELECT template_id, repo_id, image_ref, definition_fingerprint
+        FROM ephemeral_container_templates
+        WHERE template_id = ? AND repo_id = ? AND enabled = 1
+        """,
+        (request.resource_id, request.project_id),
+    ).fetchone()
+    if row is None:
+        raise BrokerError(
+            "control_binding_unavailable",
+            "Ephemeral template is disabled or unavailable.",
+            operation_id=request.operation_id,
+        )
+    try:
+        image_ref = _require_pinned_ephemeral_image(row["image_ref"])
+    except ValueError as error:
+        raise BrokerError(
+            "control_binding_unavailable",
+            "Ephemeral template does not retain an immutable image reference.",
+            operation_id=request.operation_id,
+        ) from error
+    template_fingerprint = str(row["definition_fingerprint"])
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", template_fingerprint) is None:
+        raise BrokerError(
+            "control_binding_unavailable",
+            "Ephemeral template does not retain a valid immutable definition fingerprint.",
+            operation_id=request.operation_id,
+        )
+    target = EphemeralImageTarget(
+        template_id=str(row["template_id"]),
+        repo_id=str(row["repo_id"]),
+        image_ref=image_ref,
+        template_fingerprint=template_fingerprint,
+    )
+    if require_reserved_operation:
+        reserved = connection.execute(
+            """
+            SELECT target.immutable_fingerprint
+            FROM operations operation
+            JOIN operation_targets target USING(operation_id)
+            WHERE operation.operation_id = ?
+              AND operation.status = 'running'
+              AND target.ordinal = 0
+              AND target.target_kind = 'ephemeral_template'
+              AND target.target_id = ?
+            """,
+            (request.operation_id, target.template_id),
+        ).fetchone()
+        if (
+            reserved is None
+            or str(reserved["immutable_fingerprint"])
+            != target.template_fingerprint
+        ):
+            raise BrokerError(
+                "operation_state_conflict",
+                "The sealed ephemeral template changed after the operation was reserved.",
+                operation_id=request.operation_id,
+            )
+    return target
+
+
+def _normalize_ephemeral_image_cache_proof(
+    proof: Mapping[str, Any], *, target: EphemeralImageTarget
+) -> dict[str, Any]:
+    """Allow only bounded public evidence for one exact immutable image."""
+
+    required = {
+        "cached",
+        "image_ref",
+        "image_id",
+        "repo_digest",
+        "os",
+        "architecture",
+    }
+    if not isinstance(proof, Mapping) or set(proof) != required:
+        raise BrokerError(
+            "ephemeral_image_inspect_unobservable",
+            "The service did not provide complete exact image cache evidence.",
+        )
+    image_ref = proof.get("image_ref")
+    image_id = proof.get("image_id")
+    repo_digest = proof.get("repo_digest")
+    if (
+        proof.get("cached") is not True
+        or image_ref != target.image_ref
+        or repo_digest != target.image_ref
+        or not isinstance(image_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+        or proof.get("os") != "linux"
+        or proof.get("architecture") != "amd64"
+    ):
+        raise BrokerError(
+            "ephemeral_image_inspect_unobservable",
+            "The service did not prove the exact sealed image cache identity.",
+        )
+    return {
+        "cached": True,
+        "image_ref": target.image_ref,
+        "image_id": image_id,
+        "repo_digest": target.image_ref,
+        "os": "linux",
+        "architecture": "amd64",
+    }
+
+
 def _decode_result(value: Optional[str]) -> dict[str, Any]:
     if not value:
         return {}
@@ -8570,8 +9730,115 @@ def _target_kind(operation: BrokerOperation) -> str:
         return "compose"
     if operation in _DATABASE_OPERATIONS:
         return "database"
+    if operation in {
+        BrokerOperation.EPHEMERAL_START,
+        BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+        BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+    }:
+        return "ephemeral_template"
+    if operation in {
+        BrokerOperation.EPHEMERAL_RENEW,
+        BrokerOperation.EPHEMERAL_FINISH,
+    }:
+        return "ephemeral_run"
     return "container"
 
+
+def _require_ephemeral_template_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if (
+        not 1 <= len(name) <= 96
+        or name != str(value)
+        or re.fullmatch(r"[a-z0-9](?:[a-z0-9_.-]*[a-z0-9])?", name) is None
+    ):
+        raise ValueError(
+            "ephemeral template name must be a lowercase Docker-safe identifier"
+        )
+    return name
+
+
+def _require_pinned_ephemeral_image(value: Any) -> str:
+    image = str(value or "")
+    if (
+        not 1 <= len(image) <= 512
+        or image != image.strip()
+        or any(character.isspace() or character == "\x00" for character in image)
+        or re.fullmatch(r"[^@]+@sha256:[0-9a-f]{64}", image) is None
+    ):
+        raise ValueError(
+            "ephemeral image_ref must be an immutable lowercase sha256 digest reference"
+        )
+    return image
+
+
+def _require_ephemeral_argument(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or "\x00" in value
+        or len(value.encode("utf-8")) > 4096
+    ):
+        raise ValueError("ephemeral command arguments must be bounded strings")
+    return value
+
+
+def _normalize_ephemeral_environment(
+    value: Mapping[str, str],
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, Mapping) or len(value) > 64:
+        raise ValueError("ephemeral environment must be an object with at most 64 values")
+    normalized: list[tuple[str, str]] = []
+    for raw_name, raw_value in value.items():
+        if (
+            not isinstance(raw_name, str)
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", raw_name) is None
+        ):
+            raise ValueError("ephemeral environment contains an invalid variable name")
+        if re.search(
+            r"(?:^|_)(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|CREDENTIALS?)(?:$|_)",
+            raw_name.upper(),
+        ):
+            raise ValueError(
+                "ephemeral manifest environment must not contain credentials; "
+                "use a purpose-built private credential integration"
+            )
+        if (
+            not isinstance(raw_value, str)
+            or "\x00" in raw_value
+            or len(raw_value.encode("utf-8")) > 65536
+        ):
+            raise ValueError("ephemeral environment values must be bounded strings")
+        normalized.append((raw_name, raw_value))
+    return tuple(sorted(normalized))
+
+
+def _require_ephemeral_secret_policy_environment(
+    *,
+    policy_kind: str | None,
+    environment: tuple[tuple[str, str], ...],
+) -> None:
+    """Require an authenticated PostgreSQL host policy for password-file runs.
+
+    The broker-delivered password is meaningful only when the generated
+    PostgreSQL instance actually requires SCRAM authentication. A permissive
+    ``POSTGRES_HOST_AUTH_METHOD`` overrides the image defaults, so it is
+    forbidden rather than merely ignored. The exact initdb argument is kept
+    narrow deliberately: administrator enrollment is the one trusted place
+    that declares this image contract.
+    """
+
+    if policy_kind != POSTGRES_INITDB_PASSWORD_FILE_V1:
+        return
+    values = dict(environment)
+    if "POSTGRES_HOST_AUTH_METHOD" in values:
+        raise ValueError(
+            "postgres_initdb_password_file_v1 forbids POSTGRES_HOST_AUTH_METHOD; "
+            "SCRAM must be selected through POSTGRES_INITDB_ARGS"
+        )
+    if values.get("POSTGRES_INITDB_ARGS") != "--auth-host=scram-sha-256":
+        raise ValueError(
+            "postgres_initdb_password_file_v1 requires PostgreSQL SCRAM via "
+            "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256"
+        )
 
 def _require_identifier(value: str, field: str) -> None:
     allowed = frozenset(

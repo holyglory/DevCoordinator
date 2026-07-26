@@ -629,6 +629,62 @@ def test_public_broker_dispatch_never_reaches_client_docker(tmp: Path) -> None:
     )
 
 
+def test_public_broker_enrollment_failure_is_not_masked(tmp: Path) -> None:
+    coordinator_scripts = ROOT.parent / "codex-dev-coordinator" / "scripts"
+    if not coordinator_scripts.is_dir():
+        return
+    if str(coordinator_scripts) not in sys.path:
+        sys.path.insert(0, str(coordinator_scripts))
+    import devcoordinator.broker_profile as broker_profile
+
+    module = load_production_module()
+    project = tmp / "broker-enrollment-failure"
+    project.mkdir(mode=0o700)
+
+    class Repository:
+        canonical_root = str(project)
+        repo_id = "repo-broker-enrollment-failure"
+        container_ids = {SOURCE_ID: "container-postgres"}
+
+    class Profile:
+        repositories = {str(project): Repository()}
+
+    original_loader = broker_profile.load_broker_profile
+    previous_cwd = Path.cwd()
+    broker_profile.load_broker_profile = lambda: Profile()
+    try:
+        os.chdir(project)
+        error_output = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(error_output):
+            status = module.main(
+                [
+                    "backup",
+                    "--expect-container-id",
+                    REPLACEMENT_ID,
+                    "--database",
+                    "app",
+                    "--format",
+                    "custom",
+                    "--scope",
+                    "database",
+                ]
+            )
+    finally:
+        os.chdir(previous_cwd)
+        broker_profile.load_broker_profile = original_loader
+
+    error = json.loads(error_output.getvalue())["error"]
+    check(status == 1, "unenrolled broker resource must fail closed")
+    check(
+        "not unambiguously enrolled" in error,
+        f"broker enrollment failure was masked: {error!r}",
+    )
+    check(
+        "BrokerProfileError" not in error,
+        f"broker enrollment failure leaked an implementation NameError: {error!r}",
+    )
+
+
 def main() -> int:
     p0 = subprocess.run(
         [sys.executable, str(P0_TEST)],
@@ -655,6 +711,7 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="postgres-docker-backup-self-test-")).resolve(strict=True)
     try:
         test_public_broker_dispatch_never_reaches_client_docker(tmp)
+        test_public_broker_enrollment_failure_is_not_masked(tmp)
         fake_bin = tmp / "bin"
         fake_bin.mkdir()
         make_fake_docker(fake_bin / "docker")

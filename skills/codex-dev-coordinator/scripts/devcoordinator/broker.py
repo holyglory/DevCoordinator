@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import stat
 import struct
@@ -36,7 +37,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, FrozenSet, Iterable, Mapping, Optional, Protocol
 
-
 PROTOCOL_VERSION = 1
 # Inventory is a bounded whole-host graph.  Keep the local protocol bounded,
 # but size it for a real multi-repository machine rather than a mutation-sized
@@ -46,6 +46,10 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_SOCKET_MODE = 0o660
 DEFAULT_MAX_CLIENTS = 32
 DEFAULT_COMPLETED_OPERATION_CACHE = 1024
+# POSIX guarantees an atomic pipe write of at least 512 bytes.  Keeping this
+# credential payload below that floor avoids a broker-thread write wait while
+# preserving ample room for a high-entropy service password.
+MAX_EPHEMERAL_SECRET_BYTES = 512
 # These are broker-side client and graceful-wait budgets for the PostgreSQL
 # helper calls: one dump and one strong-verification allowance, plus a minute
 # for durable result commits and the reply. They do not prove that nested
@@ -82,6 +86,7 @@ _NON_TERMINAL_OPERATION_ERRORS = frozenset(
 _IDENTIFIER_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:@-"
 )
+_SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -95,7 +100,17 @@ class BrokerOperation(str, Enum):
     INVENTORY_READ = "inventory.read"
     EVENTS_READ = "events.read"
     HOST_OBSERVE = "host.observe"
+    TEST_RUN_START = "test.run_start"
+    TEST_RUN_FINISH = "test.run_finish"
+    TEST_STATS_READ = "test.stats_read"
     SERVER_PUBLISH = "server.publish"
+    EPHEMERAL_START = "ephemeral.start"
+    EPHEMERAL_STATUS = "ephemeral.status"
+    EPHEMERAL_RENEW = "ephemeral.renew"
+    EPHEMERAL_FINISH = "ephemeral.finish"
+    EPHEMERAL_IMAGE_STATUS = "ephemeral.image_status"
+    EPHEMERAL_IMAGE_PREFETCH = "ephemeral.image_prefetch"
+    EPHEMERAL_SECRET_FD = "ephemeral.secret_fd"
     DOCKER_START = "docker.start"
     DOCKER_STOP = "docker.stop"
     DOCKER_RESTART = "docker.restart"
@@ -248,6 +263,15 @@ class BrokerRequest:
         arguments = _validate_arguments(
             operation, value["arguments"], operation_id=operation_id
         )
+        if (
+            operation is BrokerOperation.EPHEMERAL_SECRET_FD
+            and arguments["run_id"] != resource_id
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Ephemeral credential run_id must match the exact broker resource_id.",
+                operation_id=operation_id,
+            )
         return cls(
             operation_id=operation_id,
             authority_generation=authority_generation,
@@ -302,6 +326,98 @@ class AuthorizedBrokerRequest:
 
     peer: PeerCredentials
     request: BrokerRequest
+
+
+@dataclass(frozen=True)
+class EphemeralSecretFD:
+    """One read-only, close-on-exec descriptor carrying a run credential.
+
+    The descriptor is intentionally the only secret-bearing field.  Its
+    metadata is safe to return to an in-process caller and to record in a
+    diagnostic assertion, but it must never be printed as a credential value.
+    """
+
+    fd: int
+    operation_id: str
+    request_id: str
+    expires_at_epoch: int
+    _closed: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not _is_exact_int(self.fd) or self.fd < 0:
+            raise ValueError("secret descriptor must be a non-negative integer")
+        if _canonical_uuid_value(self.operation_id) is None:
+            raise ValueError("secret operation_id must be a canonical UUID")
+        if _canonical_uuid_value(self.request_id) is None:
+            raise ValueError("secret request_id must be a canonical UUID")
+        if not _is_exact_int(self.expires_at_epoch) or self.expires_at_epoch <= 0:
+            raise ValueError("secret expiry must be a positive epoch")
+
+    def close(self) -> None:
+        """Close the received descriptor after its in-memory bytes are consumed."""
+
+        if self._closed:
+            return
+        object.__setattr__(self, "_closed", True)
+        try:
+            os.close(self.fd)
+        except OSError:
+            return
+
+    def __enter__(self) -> "EphemeralSecretFD":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
+
+class EphemeralSecretMaterial(Protocol):
+    """Narrow, secret-bearing result that never enters the JSON protocol."""
+
+    value: bytes
+    expires_at_epoch: int
+    request_id: uuid.UUID
+
+
+class EphemeralSecretFdDelivery(Protocol):
+    """One secret payload plus the lock-held lifecycle release callback."""
+
+    material: EphemeralSecretMaterial
+
+    def close(self) -> None:
+        """Release the delivery boundary after local descriptor closure."""
+
+
+class EphemeralSecretFdRetriever(Protocol):
+    """Broker-local descriptor delivery after generic peer/ACL authorization.
+
+    The store-backed implementation re-proves the exact running run, consumes
+    the manager's one-time request tombstone, and holds the run mutation lock
+    until the Unix transport closes its local descriptor.
+    """
+
+    def acquire_ephemeral_secret_fd_delivery(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        template_id: str,
+        run_id: uuid.UUID,
+        request_id: uuid.UUID,
+    ) -> EphemeralSecretFdDelivery:
+        """Return one closeable transient delivery or raise a safe BrokerError."""
+
+
+@dataclass(frozen=True)
+class _BrokerTransportResponse:
+    """A redacted JSON reply with an optional one-shot ancillary descriptor."""
+
+    payload: bytes
+    secret_fd: Optional[int] = None
+    secret_delivery: Optional[EphemeralSecretFdDelivery] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -679,6 +795,9 @@ class SerializedMutationWriter:
         if request.request.operation in {
             BrokerOperation.INVENTORY_READ,
             BrokerOperation.EVENTS_READ,
+            BrokerOperation.TEST_STATS_READ,
+            BrokerOperation.EPHEMERAL_STATUS,
+            BrokerOperation.EPHEMERAL_IMAGE_STATUS,
         }:
             # A query-only snapshot does not need the mutation lock, durable
             # idempotency journal, or completed-result cache.  Avoid retaining
@@ -834,9 +953,12 @@ class BrokerService:
         self,
         authorizer: Authorizer,
         writer: SerializedMutationWriter,
+        *,
+        secret_fd_retriever: Optional[EphemeralSecretFdRetriever] = None,
     ) -> None:
         self._authorizer = authorizer
         self._writer = writer
+        self._secret_fd_retriever = secret_fd_retriever
 
     def reply_for_document(
         self, peer: PeerCredentials, document: Any
@@ -844,6 +966,12 @@ class BrokerService:
         operation_id = _valid_operation_id_or_none(document)
         try:
             request = BrokerRequest.from_wire(document)
+            if request.operation is BrokerOperation.EPHEMERAL_SECRET_FD:
+                raise BrokerError(
+                    "secret_fd_transport_required",
+                    "Ephemeral credentials are available only through the authenticated descriptor transport.",
+                    operation_id=request.operation_id,
+                )
             authorized = self._authorizer.authorize(peer, request)
             result = self._writer.execute(authorized)
             return {
@@ -869,6 +997,112 @@ class BrokerService:
                 _error_reply(exc.code, exc.message, operation_id=exc.operation_id)
             )
         return _encode_json_document(self.reply_for_document(peer, document))
+
+    def transport_response_for_payload(
+        self, peer: PeerCredentials, payload: bytes
+    ) -> _BrokerTransportResponse:
+        """Return a redacted reply and, only when authorized, one secret FD.
+
+        The ordinary JSON endpoint deliberately refuses the secret operation so
+        neither the serialized writer nor its completed-result cache can ever
+        retain credential material.  This method is called only by the Unix
+        transport that can carry a descriptor with ``SCM_RIGHTS``.
+        """
+
+        try:
+            document = _decode_json_document(payload)
+        except BrokerError as exc:
+            return _BrokerTransportResponse(
+                _encode_json_document(
+                    _error_reply(exc.code, exc.message, operation_id=exc.operation_id)
+                )
+            )
+
+        operation_id = _valid_operation_id_or_none(document)
+        secret_fd: Optional[int] = None
+        secret_delivery: Optional[EphemeralSecretFdDelivery] = None
+        try:
+            request = BrokerRequest.from_wire(document)
+            if request.operation is not BrokerOperation.EPHEMERAL_SECRET_FD:
+                return _BrokerTransportResponse(
+                    _encode_json_document(self.reply_for_document(peer, document))
+                )
+            # Consume-once material must not be requested until this process
+            # has proved it can deliver a descriptor.  Otherwise a platform
+            # without SCM_RIGHTS support could burn the only credential before
+            # the socket layer discovered it could not send the FD.
+            if not _descriptor_transport_available():
+                raise BrokerError(
+                    "secret_fd_transport_unavailable",
+                    "This platform does not provide authenticated descriptor transport.",
+                    operation_id=request.operation_id,
+                )
+            retriever = self._secret_fd_retriever
+            if retriever is None:
+                raise BrokerError(
+                    "secret_delivery_unavailable",
+                    "The broker has no configured ephemeral credential delivery boundary.",
+                    operation_id=request.operation_id,
+                )
+            authorized = self._authorizer.authorize(peer, request)
+            template_id = str(request.arguments["template_id"])
+            run_id = uuid.UUID(str(request.arguments["run_id"]))
+            request_id = uuid.UUID(str(request.arguments["request_id"]))
+            secret_delivery = retriever.acquire_ephemeral_secret_fd_delivery(
+                authorized,
+                template_id=template_id,
+                run_id=run_id,
+                request_id=request_id,
+            )
+            secret_fd, expires_at_epoch = _ephemeral_secret_pipe(
+                secret_delivery.material,
+                request_id,
+            )
+            reply = {
+                "version": PROTOCOL_VERSION,
+                "operation_id": request.operation_id,
+                "ok": True,
+                "result": {
+                    "transport": "scm_rights",
+                    "request_id": str(request_id),
+                    "expires_at_epoch": expires_at_epoch,
+                },
+            }
+            response = _BrokerTransportResponse(
+                _encode_json_document(reply),
+                secret_fd=secret_fd,
+                secret_delivery=secret_delivery,
+            )
+            secret_fd = None
+            secret_delivery = None
+            return response
+        except BrokerError as exc:
+            return _BrokerTransportResponse(
+                _encode_json_document(
+                    _error_reply(
+                        exc.code,
+                        exc.message,
+                        operation_id=exc.operation_id or operation_id,
+                    )
+                )
+            )
+        except (AttributeError, TypeError, ValueError):
+            # Material validation deliberately does not interpolate an object
+            # or exception: either could contain the secret in an unsafe repr.
+            return _BrokerTransportResponse(
+                _encode_json_document(
+                    _error_reply(
+                        "secret_delivery_invalid",
+                        "The broker could not safely prepare the ephemeral credential.",
+                        operation_id=operation_id,
+                    )
+                )
+            )
+        finally:
+            if secret_fd is not None:
+                _close_descriptor_quietly(secret_fd)
+            if secret_delivery is not None:
+                secret_delivery.close()
 
 
 def resolve_peer_credentials(connection: socket.socket) -> PeerCredentials:
@@ -1021,6 +1255,7 @@ def validate_runtime_directory(
     return info
 
 
+
 class UnixBrokerServer:
     """Concurrent Unix-socket transport around :class:`BrokerService`."""
 
@@ -1101,7 +1336,8 @@ class UnixBrokerServer:
         else:
             raise BrokerError(
                 "socket_path_exists",
-                "Broker socket path already exists; it was not replaced.",
+                "Broker socket path already exists; direct server startup never "
+                "replaces it.",
             )
 
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1296,15 +1532,29 @@ class UnixBrokerServer:
             )
             return
         try:
-            payload = _receive_frame(
+            payload = _receive_frame_rejecting_fds(
                 connection, max_message_bytes=self._max_message_bytes
             )
-            reply_payload = self._service.reply_for_payload(peer, payload)
-            _send_frame(
-                connection,
-                reply_payload,
-                max_message_bytes=self._max_message_bytes,
-            )
+            response = self._service.transport_response_for_payload(peer, payload)
+            try:
+                if response.secret_fd is None:
+                    _send_frame(
+                        connection,
+                        response.payload,
+                        max_message_bytes=self._max_message_bytes,
+                    )
+                else:
+                    _send_frame_with_fd(
+                        connection,
+                        response.payload,
+                        response.secret_fd,
+                        max_message_bytes=self._max_message_bytes,
+                    )
+            finally:
+                if response.secret_fd is not None:
+                    _close_descriptor_quietly(response.secret_fd)
+                if response.secret_delivery is not None:
+                    response.secret_delivery.close()
         except BrokerError as exc:
             _safe_send_reply(
                 connection,
@@ -1375,7 +1625,102 @@ class BrokerClient:
     def call(self, request: BrokerRequest) -> dict[str, Any]:
         if not isinstance(request, BrokerRequest):
             raise TypeError("request must be BrokerRequest")
+        if request.operation is BrokerOperation.EPHEMERAL_SECRET_FD:
+            raise TypeError(
+                "ephemeral.secret_fd requires retrieve_ephemeral_secret_fd(); "
+                "ordinary JSON broker calls never receive credential material"
+            )
         payload = _encode_json_document(request.to_wire())
+        with self._authenticated_connection(request) as connection:
+            try:
+                _send_frame(
+                    connection, payload, max_message_bytes=self._max_message_bytes
+                )
+            except (BrokenPipeError, ConnectionResetError) as send_error:
+                # A saturated broker rejects a connection before reading the
+                # request.  Unix stream sockets may surface the peer's close
+                # on our send even though its authenticated ``server_busy``
+                # frame is already queued for reading.  Consume and validate
+                # that bounded transport reply; if no complete reply exists,
+                # retain the original transport failure.
+                try:
+                    reply_payload = _receive_frame_rejecting_fds(
+                        connection, max_message_bytes=self._max_message_bytes
+                    )
+                except (BrokerError, OSError, socket.timeout):
+                    raise send_error
+            else:
+                reply_payload = _receive_frame_rejecting_fds(
+                    connection, max_message_bytes=self._max_message_bytes
+                )
+        document = _decode_json_document(reply_payload)
+        return _validate_reply(document, expected_operation_id=request.operation_id)
+
+    def retrieve_ephemeral_secret_fd(
+        self, request: BrokerRequest
+    ) -> EphemeralSecretFD:
+        """Retrieve exactly one run credential through ``SCM_RIGHTS``.
+
+        This method cannot be used through the ordinary CLI JSON result path:
+        callers receive an in-process, read-only descriptor and must consume
+        then close it.  A broken connection after manager consumption is
+        intentionally ambiguous and must be retried only as a fail-closed
+        replay check, never as a request for a second credential.
+        """
+
+        if not isinstance(request, BrokerRequest):
+            raise TypeError("request must be BrokerRequest")
+        if request.operation is not BrokerOperation.EPHEMERAL_SECRET_FD:
+            raise TypeError("request must use ephemeral.secret_fd")
+        if not _descriptor_transport_available():
+            raise BrokerError(
+                "secret_fd_transport_unavailable",
+                "This platform does not provide authenticated descriptor transport.",
+                operation_id=request.operation_id,
+            )
+        payload = _encode_json_document(request.to_wire())
+        descriptor: Optional[int] = None
+        try:
+            with self._authenticated_connection(request) as connection:
+                _send_frame(
+                    connection, payload, max_message_bytes=self._max_message_bytes
+                )
+                reply_payload, descriptor = _receive_frame_with_one_fd(
+                    connection, max_message_bytes=self._max_message_bytes
+                )
+            document = _decode_json_document(reply_payload)
+            reply = _validate_reply(
+                document, expected_operation_id=request.operation_id
+            )
+            if not bool(reply["ok"]):
+                _raise_reply_error(reply, operation_id=request.operation_id)
+            if descriptor is None:
+                raise BrokerError(
+                    "secret_fd_missing",
+                    "Broker credential reply did not carry exactly one descriptor.",
+                    operation_id=request.operation_id,
+                )
+            result = _validate_ephemeral_secret_fd_result(
+                reply["result"],
+                expected_request_id=str(request.arguments["request_id"]),
+                operation_id=request.operation_id,
+            )
+            received = EphemeralSecretFD(
+                fd=descriptor,
+                operation_id=request.operation_id,
+                request_id=result["request_id"],
+                expires_at_epoch=result["expires_at_epoch"],
+            )
+            descriptor = None
+            return received
+        finally:
+            if descriptor is not None:
+                _close_descriptor_quietly(descriptor)
+
+    @contextmanager
+    def _authenticated_connection(
+        self, request: BrokerRequest
+    ) -> Iterable[socket.socket]:
         socket_before = _validate_client_socket(
             self.socket_path,
             expected_uid=self._expected_broker_uid,
@@ -1407,29 +1752,7 @@ class BrokerClient:
                     "Broker socket identity changed while connecting.",
                     operation_id=request.operation_id,
                 )
-            try:
-                _send_frame(
-                    connection, payload, max_message_bytes=self._max_message_bytes
-                )
-            except (BrokenPipeError, ConnectionResetError) as send_error:
-                # A saturated broker rejects a connection before reading the
-                # request.  Unix stream sockets may surface the peer's close
-                # on our send even though its authenticated ``server_busy``
-                # frame is already queued for reading.  Consume and validate
-                # that bounded transport reply; if no complete reply exists,
-                # retain the original transport failure.
-                try:
-                    reply_payload = _receive_frame(
-                        connection, max_message_bytes=self._max_message_bytes
-                    )
-                except (BrokerError, OSError, socket.timeout):
-                    raise send_error
-            else:
-                reply_payload = _receive_frame(
-                    connection, max_message_bytes=self._max_message_bytes
-                )
-        document = _decode_json_document(reply_payload)
-        return _validate_reply(document, expected_operation_id=request.operation_id)
+            yield connection
 
 
 def _validate_arguments(
@@ -1586,6 +1909,309 @@ def _validate_arguments(
                 operation_id=operation_id,
             )
         return {}
+
+    if operation == BrokerOperation.TEST_RUN_START:
+        required = {
+            "agent",
+            "suite",
+            "run_kind",
+            "selection",
+            "command_fingerprint",
+            "started_at",
+        }
+        allowed = required | {"parent_run_id"}
+        if not required <= set(value) or set(value) - allowed:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test run start requires agent, suite, run_kind, selection, command_fingerprint and started_at.",
+                operation_id=operation_id,
+            )
+        suite = value["suite"]
+        if (
+            not isinstance(suite, str)
+            or not 1 <= len(suite) <= 160
+            or any(ord(character) < 32 for character in suite)
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "suite must be bounded printable text.",
+                operation_id=operation_id,
+            )
+        if value["run_kind"] not in {"session", "test", "automation"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "run_kind must be session, test or automation.",
+                operation_id=operation_id,
+            )
+        selection = value["selection"]
+        if (
+            not isinstance(selection, list)
+            or len(selection) > 2_000
+            or any(
+                not isinstance(item, str) or not 1 <= len(item) <= 2_048
+                for item in selection
+            )
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "selection must contain at most 2000 bounded test selectors.",
+                operation_id=operation_id,
+            )
+        command_fingerprint = value["command_fingerprint"]
+        if not isinstance(command_fingerprint, str) or not _SHA256_FINGERPRINT.fullmatch(
+            command_fingerprint
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "command_fingerprint must be an exact sha256 digest.",
+                operation_id=operation_id,
+            )
+        started_at = value["started_at"]
+        if not isinstance(started_at, str) or not 1 <= len(started_at) <= 64:
+            raise BrokerError(
+                "invalid_arguments",
+                "started_at must be a bounded ISO-8601 timestamp.",
+                operation_id=operation_id,
+            )
+        parent_run_id = value.get("parent_run_id")
+        if parent_run_id is not None and _canonical_uuid_value(parent_run_id) is None:
+            raise BrokerError(
+                "invalid_arguments",
+                "parent_run_id must be a canonical UUID.",
+                operation_id=operation_id,
+            )
+        return {
+            "agent": _bounded_agent(value["agent"], operation_id),
+            "suite": suite,
+            "run_kind": value["run_kind"],
+            "selection": selection,
+            "command_fingerprint": command_fingerprint,
+            "started_at": started_at,
+            **({"parent_run_id": parent_run_id} if parent_run_id is not None else {}),
+        }
+
+    if operation == BrokerOperation.TEST_RUN_FINISH:
+        required = {
+            "run_id",
+            "status",
+            "finished_at",
+            "duration_seconds",
+            "exit_code",
+            "cases",
+        }
+        if set(value) != required:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test run finish requires exactly run_id, status, finished_at, duration_seconds, exit_code and cases.",
+                operation_id=operation_id,
+            )
+        run_id = value["run_id"]
+        if _canonical_uuid_value(run_id) is None:
+            raise BrokerError(
+                "invalid_arguments", "run_id must be a canonical UUID.", operation_id=operation_id
+            )
+        status = value["status"]
+        if status not in {"passed", "failed", "cancelled", "incomplete"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "status must be passed, failed, cancelled or incomplete.",
+                operation_id=operation_id,
+            )
+        finished_at = value["finished_at"]
+        duration = value["duration_seconds"]
+        exit_code = value["exit_code"]
+        if not isinstance(finished_at, str) or not 1 <= len(finished_at) <= 64:
+            raise BrokerError(
+                "invalid_arguments",
+                "finished_at must be a bounded ISO-8601 timestamp.",
+                operation_id=operation_id,
+            )
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not 0 <= float(duration) <= 31 * 24 * 60 * 60
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "duration_seconds must be a non-negative number no greater than 31 days.",
+                operation_id=operation_id,
+            )
+        if not _is_exact_int(exit_code) or not -255 <= exit_code <= 255:
+            raise BrokerError(
+                "invalid_arguments",
+                "exit_code must be an integer from -255 through 255.",
+                operation_id=operation_id,
+            )
+        cases = value["cases"]
+        if not isinstance(cases, list) or len(cases) > 100_000:
+            raise BrokerError(
+                "invalid_arguments",
+                "cases must contain at most 100000 individual results.",
+                operation_id=operation_id,
+            )
+        normalized_cases = []
+        case_fields = {
+            "test_id",
+            "display_name",
+            "status",
+            "started_at",
+            "finished_at",
+            "duration_seconds",
+        }
+        for case in cases:
+            if not isinstance(case, dict) or set(case) != case_fields:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Each test case must use the exact structured timing result fields.",
+                    operation_id=operation_id,
+                )
+            if case["status"] not in {"passed", "failed", "skipped", "error"}:
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Individual test status is invalid.",
+                    operation_id=operation_id,
+                )
+            if any(
+                not isinstance(case[field], str) or not 1 <= len(case[field]) <= maximum
+                for field, maximum in (
+                    ("test_id", 2_048),
+                    ("display_name", 2_048),
+                    ("started_at", 64),
+                    ("finished_at", 64),
+                )
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Individual test identity and timestamps must be bounded strings.",
+                    operation_id=operation_id,
+                )
+            case_duration = case["duration_seconds"]
+            if (
+                isinstance(case_duration, bool)
+                or not isinstance(case_duration, (int, float))
+                or not 0 <= float(case_duration) <= 31 * 24 * 60 * 60
+            ):
+                raise BrokerError(
+                    "invalid_arguments",
+                    "Individual test duration is invalid.",
+                    operation_id=operation_id,
+                )
+            normalized_cases.append(dict(case))
+        return {
+            "run_id": run_id,
+            "status": status,
+            "finished_at": finished_at,
+            "duration_seconds": float(duration),
+            "exit_code": exit_code,
+            "cases": normalized_cases,
+        }
+
+    if operation == BrokerOperation.TEST_STATS_READ:
+        if set(value) - {"days", "limit"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Test statistics accept only days and limit.",
+                operation_id=operation_id,
+            )
+        days = value.get("days", 30)
+        limit = value.get("limit", 25)
+        if not _is_exact_int(days) or not 1 <= days <= 3_650:
+            raise BrokerError(
+                "invalid_arguments", "days must be from 1 through 3650.", operation_id=operation_id
+            )
+        if not _is_exact_int(limit) or not 1 <= limit <= 500:
+            raise BrokerError(
+                "invalid_arguments", "limit must be from 1 through 500.", operation_id=operation_id
+            )
+        return {"days": days, "limit": limit}
+
+    if operation in {
+        BrokerOperation.EPHEMERAL_START,
+        BrokerOperation.EPHEMERAL_RENEW,
+    }:
+        allowed = {"ttl_seconds", "agent"}
+        if "agent" not in value or (
+            operation is BrokerOperation.EPHEMERAL_RENEW
+            and "ttl_seconds" not in value
+        ):
+            raise BrokerError(
+                "invalid_arguments",
+                "Ephemeral mutations require bounded agent attribution; renewal also requires typed ttl_seconds.",
+                operation_id=operation_id,
+            )
+        unexpected = sorted(set(value) - allowed)
+        if unexpected:
+            raise BrokerError(
+                "invalid_arguments",
+                "Ephemeral container requests contain unsupported arguments: "
+                + ", ".join(unexpected)
+                + ". Images, commands, environment, mounts, and Docker options are service-owned.",
+                operation_id=operation_id,
+            )
+        normalized: dict[str, Any] = {}
+        normalized["agent"] = _bounded_agent(value["agent"], operation_id)
+        if "ttl_seconds" not in value:
+            return normalized
+        ttl = value["ttl_seconds"]
+        if not _is_exact_int(ttl) or not 60 <= ttl <= 7 * 24 * 60 * 60:
+            raise BrokerError(
+                "invalid_arguments",
+                "ttl_seconds must be an integer from one minute through seven days.",
+                operation_id=operation_id,
+            )
+        normalized["ttl_seconds"] = ttl
+        return normalized
+
+    if operation == BrokerOperation.EPHEMERAL_IMAGE_PREFETCH:
+        if set(value) != {"agent"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Ephemeral image prefetch requires bounded agent attribution and accepts no client-controlled image or Docker arguments.",
+                operation_id=operation_id,
+            )
+        return {"agent": _bounded_agent(value["agent"], operation_id)}
+
+    if operation in {
+        BrokerOperation.EPHEMERAL_STATUS,
+        BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+    }:
+        if value:
+            raise BrokerError(
+                "invalid_arguments",
+                "Ephemeral image/status reads accept no client-controlled arguments.",
+                operation_id=operation_id,
+        )
+        return {}
+
+    if operation == BrokerOperation.EPHEMERAL_SECRET_FD:
+        if set(value) != {"template_id", "run_id", "request_id"}:
+            raise BrokerError(
+                "invalid_arguments",
+                "Ephemeral credential retrieval requires exactly template_id, run_id, and request_id.",
+                operation_id=operation_id,
+            )
+        template_id = _opaque_argument(value["template_id"], "template_id", operation_id)
+        run_id = _canonical_uuid_argument(value["run_id"], "run_id", operation_id)
+        request_id = _canonical_uuid_argument(
+            value["request_id"], "request_id", operation_id
+        )
+        return {
+            "template_id": template_id,
+            "run_id": run_id,
+            "request_id": request_id,
+        }
+
+    if operation == BrokerOperation.EPHEMERAL_FINISH:
+        unexpected = sorted(set(value) - {"reason", "agent"})
+        if "reason" not in value or "agent" not in value or unexpected:
+            raise BrokerError(
+                "invalid_arguments",
+                "Ephemeral finish requires a bounded reason and bounded agent attribution.",
+                operation_id=operation_id,
+            )
+        normalized = {"reason": _bounded_reason(value["reason"], operation_id)}
+        normalized["agent"] = _bounded_agent(value["agent"], operation_id)
+        return normalized
 
     if operation == BrokerOperation.SERVER_PUBLISH:
         allowed = {
@@ -1956,6 +2582,24 @@ def _bounded_reason(value: Any, operation_id: str) -> str:
     return value.strip()
 
 
+def _bounded_agent(value: Any, operation_id: str) -> str:
+    """Validate diagnostic client-agent metadata without treating it as identity."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value.encode("utf-8")) > 128
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise BrokerError(
+            "invalid_arguments",
+            "agent must be one bounded non-empty printable identifier.",
+            operation_id=operation_id,
+        )
+    return value
+
+
 def _confirmation_phrase_argument(value: Any, operation_id: str) -> str:
     if (
         not isinstance(value, str)
@@ -2085,6 +2729,60 @@ def _validate_reply(value: Any, *, expected_operation_id: str) -> dict[str, Any]
     return value
 
 
+def _raise_reply_error(reply: Mapping[str, Any], *, operation_id: str) -> None:
+    """Raise a validated redacted broker error reply."""
+
+    error = reply.get("error")
+    if not isinstance(error, Mapping):
+        raise BrokerError(
+            "invalid_reply",
+            "Broker returned an invalid failure payload.",
+            operation_id=operation_id,
+        )
+    raise BrokerError(
+        str(error.get("code") or "invalid_reply"),
+        str(error.get("message") or "Broker credential delivery failed."),
+        operation_id=operation_id,
+    )
+
+
+def _validate_ephemeral_secret_fd_result(
+    value: Any,
+    *,
+    expected_request_id: str,
+    operation_id: str,
+) -> dict[str, Any]:
+    """Accept only the deliberately non-secret descriptor acknowledgement."""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "transport",
+        "request_id",
+        "expires_at_epoch",
+    }:
+        raise BrokerError(
+            "invalid_reply",
+            "Broker credential reply metadata is invalid.",
+            operation_id=operation_id,
+        )
+    request_id = _canonical_uuid_value(value.get("request_id"))
+    expires_at_epoch = value.get("expires_at_epoch")
+    if (
+        value.get("transport") != "scm_rights"
+        or request_id != expected_request_id
+        or not _is_exact_int(expires_at_epoch)
+        or int(expires_at_epoch) <= int(time.time())
+    ):
+        raise BrokerError(
+            "invalid_reply",
+            "Broker credential reply metadata is invalid or expired.",
+            operation_id=operation_id,
+        )
+    return {
+        "request_id": request_id,
+        "expires_at_epoch": int(expires_at_epoch),
+    }
+
+
 def _valid_operation_id_or_none(value: Any) -> Optional[str]:
     if not isinstance(value, dict):
         return None
@@ -2099,6 +2797,19 @@ def _valid_operation_id_or_none(value: Any) -> Optional[str]:
     if candidate != canonical:
         return None
     return canonical
+
+
+def _canonical_uuid_value(value: Any) -> Optional[str]:
+    """Return one lower-case canonical UUID string without exposing bad input."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None
+    canonical = str(parsed)
+    return canonical if value == canonical else None
 
 
 def _validate_identifier(
@@ -2266,6 +2977,288 @@ def _receive_exact(connection: socket.socket, size: int) -> bytes:
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def _descriptor_transport_available(connection: Optional[socket.socket] = None) -> bool:
+    """Whether this endpoint can safely use Unix ``SCM_RIGHTS`` transport.
+
+    The credential path must require both directions: the broker needs to send
+    one descriptor and the client needs to receive it with ancillary-data
+    bounds.  Ordinary JSON calls may still run without these optional socket
+    methods, but never receive credential material.
+    """
+
+    endpoint: object = socket.socket if connection is None else connection
+    return (
+        callable(getattr(endpoint, "recvmsg", None))
+        and callable(getattr(endpoint, "sendmsg", None))
+        and callable(getattr(socket, "CMSG_SPACE", None))
+        and _is_exact_int(getattr(socket, "SOL_SOCKET", None))
+        and _is_exact_int(getattr(socket, "SCM_RIGHTS", None))
+    )
+
+
+def _receive_frame_rejecting_fds(
+    connection: socket.socket, *, max_message_bytes: int
+) -> bytes:
+    """Read one normal JSON frame while rejecting all incoming descriptors."""
+
+    # Descriptor receipt is an optional hardening layer for ordinary JSON
+    # requests.  Keep existing non-secret broker operations usable on a
+    # platform without recvmsg; the FD-only credential operation separately
+    # fails closed before its one-time material is consumed.
+    if not _descriptor_transport_available(connection):
+        return _receive_frame(connection, max_message_bytes=max_message_bytes)
+    header = _receive_exact_rejecting_fds(connection, 4)
+    size = struct.unpack("!I", header)[0]
+    if size == 0:
+        raise BrokerError("empty_request", "Broker request frame is empty.")
+    if size > max_message_bytes:
+        raise BrokerError(
+            "request_too_large", "Broker request exceeds the configured size limit."
+        )
+    return _receive_exact_rejecting_fds(connection, size)
+
+
+def _receive_frame_with_one_fd(
+    connection: socket.socket, *, max_message_bytes: int
+) -> tuple[bytes, Optional[int]]:
+    """Read one redacted reply and require at most one ``SCM_RIGHTS`` FD."""
+
+    descriptors: list[int] = []
+    try:
+        header, received = _receive_exact_with_fds(connection, 4)
+        descriptors.extend(received)
+        size = struct.unpack("!I", header)[0]
+        if size == 0:
+            raise BrokerError("empty_reply", "Broker credential reply is empty.")
+        if size > max_message_bytes:
+            raise BrokerError(
+                "response_too_large",
+                "Broker credential reply exceeds the configured size limit.",
+            )
+        payload, received = _receive_exact_with_fds(connection, size)
+        descriptors.extend(received)
+        if len(descriptors) > 1:
+            raise BrokerError(
+                "secret_fd_invalid",
+                "Broker credential reply carried more than one descriptor.",
+            )
+        return payload, descriptors.pop() if descriptors else None
+    except BaseException:
+        _close_descriptors_quietly(descriptors)
+        raise
+
+
+def _receive_exact_rejecting_fds(connection: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk, descriptors = _receive_socket_chunk(connection, remaining)
+        if descriptors:
+            _close_descriptors_quietly(descriptors)
+            raise BrokerError(
+                "unexpected_file_descriptor",
+                "Broker JSON protocol does not accept incoming file descriptors.",
+            )
+        if not chunk:
+            raise BrokerError(
+                "incomplete_request", "Broker connection closed before the frame completed."
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _receive_exact_with_fds(
+    connection: socket.socket, size: int
+) -> tuple[bytes, list[int]]:
+    chunks: list[bytes] = []
+    descriptors: list[int] = []
+    remaining = size
+    try:
+        while remaining:
+            chunk, received = _receive_socket_chunk(connection, remaining)
+            descriptors.extend(received)
+            if not chunk:
+                raise BrokerError(
+                    "incomplete_reply",
+                    "Broker connection closed before the credential reply completed.",
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks), descriptors
+    except BaseException:
+        _close_descriptors_quietly(descriptors)
+        raise
+
+
+def _receive_socket_chunk(
+    connection: socket.socket, size: int
+) -> tuple[bytes, list[int]]:
+    if not _descriptor_transport_available(connection):
+        raise BrokerError(
+            "secret_fd_transport_unavailable",
+            "This platform does not provide authenticated descriptor transport.",
+        )
+    recvmsg = connection.recvmsg
+    ancillary_size = socket.CMSG_SPACE(struct.calcsize("i") * 2)
+    recv_flags = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
+    try:
+        chunk, ancillary, flags, _address = recvmsg(size, ancillary_size, recv_flags)
+    except socket.timeout:
+        raise BrokerError("request_timeout", "Broker request timed out.") from None
+    except OSError:
+        raise
+    descriptors = _descriptors_from_ancillary(ancillary, flags)
+    return chunk, descriptors
+
+
+def _descriptors_from_ancillary(
+    ancillary: Iterable[tuple[int, int, bytes]], flags: int
+) -> list[int]:
+    descriptors: list[int] = []
+    try:
+        descriptor_size = struct.calcsize("i")
+        for level, kind, data in ancillary:
+            if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                raise BrokerError(
+                    "secret_fd_invalid",
+                    "Broker descriptor ancillary data is invalid.",
+                )
+            if not data:
+                raise BrokerError(
+                    "secret_fd_invalid",
+                    "Broker descriptor ancillary data is invalid.",
+                )
+            full_descriptor_bytes = len(data) - (len(data) % descriptor_size)
+            for descriptor in struct.unpack(
+                f"{full_descriptor_bytes // descriptor_size}i",
+                data[:full_descriptor_bytes],
+            ):
+                if descriptor < 0:
+                    raise BrokerError(
+                        "secret_fd_invalid",
+                        "Broker descriptor ancillary data is invalid.",
+                    )
+                try:
+                    os.set_inheritable(descriptor, False)
+                except OSError:
+                    _close_descriptor_quietly(descriptor)
+                    raise BrokerError(
+                        "secret_fd_invalid",
+                        "Broker descriptor could not be made close-on-exec.",
+                    ) from None
+                descriptors.append(descriptor)
+            if len(data) % descriptor_size:
+                raise BrokerError(
+                    "secret_fd_invalid",
+                    "Broker descriptor ancillary data is invalid.",
+                )
+        if flags & getattr(socket, "MSG_CTRUNC", 0):
+            # Parse and close every descriptor that did arrive before rejecting
+            # the truncated remainder; leaving one open would turn malformed
+            # ancillary data into a broker-side descriptor leak.
+            raise BrokerError(
+                "secret_fd_invalid",
+                "Broker descriptor ancillary data was truncated.",
+            )
+        return descriptors
+    except BaseException:
+        _close_descriptors_quietly(descriptors)
+        raise
+
+
+def _ephemeral_secret_pipe(
+    material: EphemeralSecretMaterial, expected_request_id: uuid.UUID
+) -> tuple[int, int]:
+    """Copy bounded bytes into an anonymous read-only pipe for FD transfer."""
+
+    value = material.value
+    expires_at_epoch = material.expires_at_epoch
+    material_request_id = material.request_id
+    if (
+        type(value) is not bytes
+        or not value
+        or len(value) > MAX_EPHEMERAL_SECRET_BYTES
+        or not _is_exact_int(expires_at_epoch)
+        or int(expires_at_epoch) <= int(time.time())
+        or material_request_id != expected_request_id
+    ):
+        raise BrokerError(
+            "secret_delivery_invalid",
+            "The broker could not safely prepare the ephemeral credential.",
+        )
+    if hasattr(os, "pipe2"):
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    else:
+        read_fd, write_fd = os.pipe()
+        os.set_inheritable(read_fd, False)
+        os.set_inheritable(write_fd, False)
+    try:
+        offset = 0
+        while offset < len(value):
+            written = os.write(write_fd, value[offset:])
+            if written <= 0:
+                raise OSError("ephemeral credential pipe write made no progress")
+            offset += written
+    except BaseException:
+        _close_descriptor_quietly(read_fd)
+        raise
+    finally:
+        _close_descriptor_quietly(write_fd)
+    return read_fd, int(expires_at_epoch)
+
+
+def _send_frame_with_fd(
+    connection: socket.socket,
+    payload: bytes,
+    descriptor: int,
+    *,
+    max_message_bytes: int,
+) -> None:
+    """Send one redacted frame and one credential descriptor atomically first."""
+
+    if not payload or len(payload) > max_message_bytes:
+        raise BrokerError(
+            "response_too_large", "Broker response exceeds the configured size limit."
+        )
+    if not _is_exact_int(descriptor) or descriptor < 0:
+        raise BrokerError("secret_fd_invalid", "Broker credential descriptor is invalid.")
+    if not _descriptor_transport_available(connection):
+        raise BrokerError(
+            "secret_fd_transport_unavailable",
+            "This platform does not provide authenticated descriptor transport.",
+        )
+    sendmsg = connection.sendmsg
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        raise BrokerError("secret_fd_invalid", "Broker credential descriptor is invalid.") from None
+    frame = struct.pack("!I", len(payload)) + payload
+    sent = sendmsg(
+        [frame],
+        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", descriptor))],
+    )
+    if sent <= 0:
+        raise OSError("broker descriptor send made no progress")
+    while sent < len(frame):
+        written = connection.send(frame[sent:])
+        if written <= 0:
+            raise OSError("broker frame send made no progress")
+        sent += written
+
+
+def _close_descriptor_quietly(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        return
+
+
+def _close_descriptors_quietly(descriptors: Iterable[int]) -> None:
+    for descriptor in descriptors:
+        _close_descriptor_quietly(descriptor)
 
 
 def _send_frame(

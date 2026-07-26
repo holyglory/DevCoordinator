@@ -11,6 +11,7 @@ import pwd
 import sqlite3
 import stat
 import tempfile
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -613,6 +614,176 @@ def exercise_source_acl_transaction() -> None:
             INSTALLER.ACCESS_GROUP = original_group
 
 
+def exercise_managed_docker_source_policy() -> None:
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-docker-source-policy-") as raw:
+        skill = Path(raw).resolve(strict=True) / "codex-dev-coordinator"
+        scripts = skill / "scripts"
+        agents = skill / "agents"
+        scripts.mkdir(parents=True)
+        agents.mkdir()
+        (skill / "SKILL.md").write_text(
+            "Use the coordinator. Prose may explain why docker compose up is forbidden.\n",
+            encoding="utf-8",
+        )
+        (skill / "README.md").write_text(
+            "```bash\npython3 scripts/dev_coordinator.py docker compose-up\n```\n",
+            encoding="utf-8",
+        )
+        (agents / "openai.yaml").write_text(
+            "interface:\n  display_name: Coordinator\n",
+            encoding="utf-8",
+        )
+        policy_script = scripts / "validate_runtime_dependencies.py"
+        policy_script.write_text(
+            "import subprocess\n"
+            "subprocess.run(['docker', 'compose', 'config'])\n",
+            encoding="utf-8",
+        )
+        (scripts / "dev_coordinator.py").write_text(
+            "import subprocess\nsubprocess.run(['docker', 'run', 'internal'])\n",
+            encoding="utf-8",
+        )
+        (scripts / "self_test.py").write_text(
+            "fixture = ['docker', 'compose', 'up']\n",
+            encoding="utf-8",
+        )
+
+        safe = INSTALLER.managed_docker_source_policy_evidence(skill_root=skill)
+        expect(safe["ok"], f"safe typed coordinator source was rejected: {safe}")
+        expect(
+            "scripts/dev_coordinator.py" not in safe["checked_files"]
+            and "scripts/self_test.py" not in safe["checked_files"],
+            "coordinator internals or explicit fixtures were not excluded",
+        )
+
+        must_catch = (
+            (
+                "import subprocess\nsubprocess.run(['docker', 'run', '--rm', 'image'])\n",
+                "docker run",
+            ),
+            (
+                "import subprocess\nsubprocess.run(['docker', 'create', 'image'])\n",
+                "docker create",
+            ),
+            (
+                "import subprocess\n"
+                "docker_cli = '/usr/bin/docker'\n"
+                "subprocess.run([docker_cli, '--context', 'host', 'compose', "
+                "'-f', 'compose.yml', 'up', '-d'])\n",
+                "docker compose up",
+            ),
+        )
+        for source, operation in must_catch:
+            policy_script.write_text(source, encoding="utf-8")
+            evidence = INSTALLER.managed_docker_source_policy_evidence(
+                skill_root=skill
+            )
+            expect(
+                not evidence["ok"]
+                and any(
+                    item["operation"] == operation for item in evidence["findings"]
+                ),
+                f"managed source guard missed {operation}: {evidence}",
+            )
+
+        policy_script.write_text("SAFE = True\n", encoding="utf-8")
+        shell_helper = scripts / "agent_helper.sh"
+        shell_helper.write_text(
+            "#!/bin/sh\nDOCKER_HOST=unix:///run/docker.sock docker create image\n",
+            encoding="utf-8",
+        )
+        shell_evidence = INSTALLER.managed_docker_source_policy_evidence(
+            skill_root=skill
+        )
+        expect(
+            not shell_evidence["ok"]
+            and any(
+                item["operation"] == "docker create"
+                for item in shell_evidence["findings"]
+            ),
+            f"managed shell guard missed raw Docker creation: {shell_evidence}",
+        )
+        shell_helper.unlink()
+        (skill / "README.md").write_text(
+            "```console\n$ sudo docker compose --env-file fixture.env down\n```\n",
+            encoding="utf-8",
+        )
+        markdown = INSTALLER.managed_docker_source_policy_evidence(skill_root=skill)
+        expect(
+            not markdown["ok"]
+            and markdown["findings"][0]["operation"] == "docker compose down",
+            f"managed guidance guard missed executable fenced Docker mutation: {markdown}",
+        )
+        (skill / "README.md").unlink()
+        must_reject(
+            lambda: INSTALLER.managed_docker_source_policy_evidence(skill_root=skill),
+            "missing canonical managed-source surface",
+        )
+
+
+def exercise_docker_socket_admission_evidence() -> None:
+    parsed = INSTALLER._parse_posix_acl(
+        "user::rw-\n"
+        "user:1234:rw-\n"
+        "group::---\n"
+        "mask::r--\n"
+        "other::---\n"
+    )
+    metadata = SimpleNamespace(st_uid=0, st_gid=0, st_mode=stat.S_IFSOCK | 0o640)
+    expect(
+        INSTALLER._acl_permissions(parsed, metadata, uid=1234, gids={1234})
+        == frozenset({"r"}),
+        "ACL mask was not applied to a named-user Docker socket grant",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="devcoordinator-docker-socket-") as raw:
+        root = Path(raw).resolve(strict=True)
+        root.chmod(0o755)
+        socket_path = root / "docker.sock"
+        alias_path = root / "docker-alias.sock"
+        socket_path.write_text("fixture inode\n", encoding="utf-8")
+        socket_path.chmod(0o600)
+        alias_path.symlink_to(socket_path)
+        record = SimpleNamespace(
+            pw_name="fixture-client",
+            pw_uid=os.getuid(),
+            pw_gid=os.getgid(),
+            pw_dir=str(root),
+        )
+        # The sandbox may forbid creating AF_UNIX filesystem sockets. Patch
+        # only the type predicate; real inode, alias, ACL, mode, and traversal
+        # evidence still exercise the full read-only admission path.
+        with mock.patch.object(INSTALLER.stat, "S_ISSOCK", return_value=True):
+            evidence = INSTALLER.docker_socket_admission_evidence(
+                [(record, root)], socket_candidates=[socket_path, alias_path]
+            )
+        expect(
+            len(evidence["sockets"]) == 1
+            and set(evidence["sockets"][0]["aliases"])
+            == {str(socket_path), str(alias_path)},
+            f"socket aliases were not deduplicated by immutable inode: {evidence}",
+        )
+        expect(
+            evidence["clients"][0]["direct_socket_access"] is True
+            and evidence["activation_blockers"][0]["code"]
+            == INSTALLER.DIRECT_DOCKER_SOCKET_ACCESS,
+            f"direct owner access was not reported as an activation blocker: {evidence}",
+        )
+        expect(
+            evidence["stage"] == "observe_only"
+            and evidence["enforcement_enabled"] is False
+            and evidence["exclusive_admission_ready"] is False
+            and evidence["automatic_group_or_acl_mutation"] is False,
+            "staged admission evidence falsely claimed enforcement or mutation",
+        )
+        warnings, warning_codes = INSTALLER._docker_admission_warning_summary(evidence)
+        expect(
+            warning_codes == [INSTALLER.DIRECT_DOCKER_SOCKET_ACCESS]
+            and warnings == [evidence["activation_blockers"][0]["message"]],
+            "verify warning projection lost the staged Docker activation blocker",
+        )
+
+
 def exercise_profile_database_enrollment_guard() -> None:
     now = 2_000_000_000
     uid = 1234
@@ -634,6 +805,9 @@ def exercise_profile_database_enrollment_guard() -> None:
             enabled: bool = True,
             expires_at: int = now + 600,
             profile_issued_at: str = issued_at,
+            ephemeral_templates: dict[str, str] | None = None,
+            ephemeral_image_prefetch_templates: list[str] | None = None,
+            ephemeral_secret_policies: dict[str, dict[str, str]] | None = None,
         ) -> None:
             profile.write_text(
                 json.dumps(
@@ -659,6 +833,15 @@ def exercise_profile_database_enrollment_guard() -> None:
                                         "servers": {},
                                         "containers": {},
                                         "compose_definition_id": None,
+                                        "ephemeral_templates": dict(
+                                            ephemeral_templates or {}
+                                        ),
+                                        "ephemeral_image_prefetch_templates": list(
+                                            ephemeral_image_prefetch_templates or []
+                                        ),
+                                        "ephemeral_secret_policies": dict(
+                                            ephemeral_secret_policies or {}
+                                        ),
                                         "account_id": account_id,
                                         "enabled": enabled,
                                         "issued_at": profile_issued_at,
@@ -763,6 +946,398 @@ def exercise_profile_database_enrollment_guard() -> None:
                 and exact["checked_current_enrollments"] == 1,
                 f"an exact profile/database enrollment did not pass: {exact}",
             )
+
+            template_name = "postgres-validation"
+            template_id = "ephemeral-template-alpha"
+            write_profile(ephemeral_templates={template_name: template_id})
+            missing_ephemeral_tables = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                {
+                    "ephemeral_template_table_missing",
+                    "ephemeral_acl_table_missing",
+                }
+                <= {
+                    issue["reason"]
+                    for issue in missing_ephemeral_tables["issues"]
+                },
+                "profile ephemeral promises did not require both persistence tables",
+            )
+
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE ephemeral_container_templates(
+                    template_id TEXT PRIMARY KEY,
+                    repo_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    secret_policy_kind TEXT,
+                    secret_binding_id TEXT
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO ephemeral_container_templates(
+                    template_id, repo_id, name, enabled
+                ) VALUES(?, ?, ?, 1)
+                """,
+                (template_id, repo_id, template_name),
+            )
+            connection.commit()
+            connection.close()
+            missing_ephemeral_acl_table = (
+                INSTALLER.profile_database_enrollment_check(
+                    profile_path=profile,
+                    database_path=database,
+                    now_epoch=now,
+                )
+            )
+            expect(
+                "ephemeral_acl_table_missing"
+                in {
+                    issue["reason"]
+                    for issue in missing_ephemeral_acl_table["issues"]
+                },
+                "an enabled template promise did not require its per-UID ACL table",
+            )
+
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE broker_ephemeral_acl(
+                    uid INTEGER NOT NULL,
+                    repo_id TEXT NOT NULL,
+                    template_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    enabled INTEGER NOT NULL
+                );
+                """
+            )
+            connection.executemany(
+                "INSERT INTO broker_ephemeral_acl VALUES(?, ?, ?, ?, 1)",
+                [
+                    (uid, repo_id, template_id, operation)
+                    for operation in sorted(
+                        INSTALLER._EPHEMERAL_PROFILE_OPERATIONS
+                    )
+                ],
+            )
+            connection.commit()
+            connection.close()
+            exact_ephemeral = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                exact_ephemeral["ok"] is True
+                and exact_ephemeral["status"] == "matched"
+                and exact_ephemeral["checked_current_ephemeral_templates"] == 1
+                and exact_ephemeral[
+                    "checked_current_ephemeral_acl_bindings"
+                ]
+                == 5,
+                f"an exact ephemeral profile/template/ACL graph did not pass: {exact_ephemeral}",
+            )
+
+            # Descriptor delivery is not a generic ephemeral-container ACL.
+            # A stray fifth grant on a non-policy template must block restart.
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "INSERT INTO broker_ephemeral_acl VALUES(?, ?, ?, 'ephemeral.secret_fd', 1)",
+                (uid, repo_id, template_id),
+            )
+            connection.commit()
+            connection.close()
+            unexpected_descriptor_grant = (
+                INSTALLER.profile_database_enrollment_check(
+                    profile_path=profile,
+                    database_path=database,
+                    now_epoch=now,
+                )
+            )
+            expect(
+                "ephemeral_acl_operations_mismatch"
+                in {
+                    issue["reason"]
+                    for issue in unexpected_descriptor_grant["issues"]
+                },
+                "a descriptor grant for a non-policy template passed verification",
+            )
+
+            secret_binding_id = "11111111-1111-5111-8111-111111111111"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """
+                UPDATE ephemeral_container_templates
+                SET secret_policy_kind = ?, secret_binding_id = ?
+                WHERE template_id = ?
+                """,
+                (
+                    INSTALLER._EPHEMERAL_SECRET_FD_POLICY,
+                    secret_binding_id,
+                    template_id,
+                ),
+            )
+            connection.commit()
+            connection.close()
+            write_profile(
+                ephemeral_templates={template_name: template_id},
+                ephemeral_secret_policies={
+                    template_name: {
+                        "policy": INSTALLER._EPHEMERAL_SECRET_FD_POLICY,
+                        "binding_id": secret_binding_id,
+                    }
+                },
+            )
+            policy_descriptor_exact = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                policy_descriptor_exact["ok"] is True
+                and policy_descriptor_exact[
+                    "checked_current_ephemeral_acl_bindings"
+                ]
+                == 6,
+                f"a policy-backed descriptor grant did not pass: {policy_descriptor_exact}",
+            )
+
+            write_profile(
+                ephemeral_templates={template_name: template_id},
+                ephemeral_secret_policies={
+                    template_name: {
+                        "policy": INSTALLER._EPHEMERAL_SECRET_FD_POLICY,
+                        "binding_id": "22222222-2222-5222-8222-222222222222",
+                    }
+                },
+            )
+            mismatched_secret_binding = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                "ephemeral_secret_binding_mismatch"
+                in {
+                    issue["reason"]
+                    for issue in mismatched_secret_binding["issues"]
+                },
+                "a substituted descriptor binding passed verification",
+            )
+            write_profile(
+                ephemeral_templates={template_name: template_id},
+                ephemeral_secret_policies={
+                    template_name: {
+                        "policy": INSTALLER._EPHEMERAL_SECRET_FD_POLICY,
+                        "binding_id": secret_binding_id,
+                    }
+                },
+            )
+
+            # A profile that drops the public policy/binding promise cannot
+            # silently retain the corresponding service-side descriptor grant.
+            write_profile(ephemeral_templates={template_name: template_id})
+            missing_policy_promise = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                {
+                    "profile_ephemeral_secret_policy_missing",
+                    "ephemeral_acl_operations_mismatch",
+                }
+                <= {issue["reason"] for issue in missing_policy_promise["issues"]},
+                "a database descriptor policy absent from the protected profile passed",
+            )
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                """
+                UPDATE ephemeral_container_templates
+                SET secret_policy_kind = NULL, secret_binding_id = NULL
+                WHERE template_id = ?
+                """,
+                (template_id,),
+            )
+            connection.execute(
+                "DELETE FROM broker_ephemeral_acl WHERE operation = 'ephemeral.secret_fd'"
+            )
+            connection.commit()
+            connection.close()
+            write_profile(ephemeral_templates={template_name: template_id})
+
+            write_profile(
+                ephemeral_templates={template_name: template_id},
+                ephemeral_image_prefetch_templates=[template_id],
+            )
+            missing_prefetch_grant = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                "ephemeral_acl_operations_mismatch"
+                in {issue["reason"] for issue in missing_prefetch_grant["issues"]},
+                "a profile prefetch promise without its exact ACL grant passed verification",
+            )
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "INSERT INTO broker_ephemeral_acl VALUES(?, ?, ?, 'ephemeral.image_prefetch', 1)",
+                (uid, repo_id, template_id),
+            )
+            connection.commit()
+            connection.close()
+            exact_prefetch_grant = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                exact_prefetch_grant["ok"] is True
+                and exact_prefetch_grant[
+                    "checked_current_ephemeral_acl_bindings"
+                ]
+                == 6,
+                f"an exact explicit prefetch ACL grant did not pass: {exact_prefetch_grant}",
+            )
+            write_profile(ephemeral_templates={template_name: template_id})
+            unexpected_prefetch_grant = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                "ephemeral_acl_operations_mismatch"
+                in {issue["reason"] for issue in unexpected_prefetch_grant["issues"]},
+                "an unpromised prefetch ACL grant passed verification",
+            )
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "DELETE FROM broker_ephemeral_acl WHERE operation = 'ephemeral.image_prefetch'"
+            )
+            connection.commit()
+            connection.close()
+
+            write_profile(
+                ephemeral_templates={template_name: "ephemeral-template-wrong"}
+            )
+            mismatched_template_id = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                {
+                    "ephemeral_template_missing",
+                    "profile_ephemeral_template_missing",
+                }
+                <= {
+                    issue["reason"] for issue in mismatched_template_id["issues"]
+                },
+                "a protected profile template-ID substitution was not rejected",
+            )
+
+            write_profile(ephemeral_templates={template_name: template_id})
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE broker_ephemeral_acl SET template_id = 'ephemeral-template-other'"
+            )
+            connection.commit()
+            connection.close()
+            mismatched_acl_target = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                {
+                    "ephemeral_acl_operations_mismatch",
+                    "profile_ephemeral_acl_missing",
+                    "ephemeral_acl_template_inactive",
+                }
+                <= {issue["reason"] for issue in mismatched_acl_target["issues"]},
+                "four enabled ACLs bound to a substituted template ID passed",
+            )
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE broker_ephemeral_acl SET template_id = ?",
+                (template_id,),
+            )
+            connection.commit()
+            connection.close()
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "DELETE FROM broker_ephemeral_acl WHERE operation = 'ephemeral.finish'"
+            )
+            connection.commit()
+            connection.close()
+            incomplete_acl = INSTALLER.profile_database_enrollment_check(
+                profile_path=profile,
+                database_path=database,
+                now_epoch=now,
+            )
+            expect(
+                "ephemeral_acl_operations_mismatch"
+                in {issue["reason"] for issue in incomplete_acl["issues"]},
+                "a profile template with fewer than the exact four enabled ACLs passed",
+            )
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "INSERT INTO broker_ephemeral_acl VALUES(?, ?, ?, 'ephemeral.finish', 1)",
+                (uid, repo_id, template_id),
+            )
+            connection.commit()
+            connection.close()
+            write_profile(ephemeral_templates={})
+            reverse_ephemeral_drift = (
+                INSTALLER.profile_database_enrollment_check(
+                    profile_path=profile,
+                    database_path=database,
+                    now_epoch=now,
+                )
+            )
+            expect(
+                {
+                    "profile_ephemeral_template_missing",
+                    "profile_ephemeral_acl_missing",
+                }
+                <= {
+                    issue["reason"]
+                    for issue in reverse_ephemeral_drift["issues"]
+                },
+                "enabled database template/ACL promises missing from the profile passed",
+            )
+
+            connection = sqlite3.connect(database)
+            connection.execute("DELETE FROM broker_ephemeral_acl")
+            connection.commit()
+            connection.close()
+            write_profile()
+            template_without_uid_access = (
+                INSTALLER.profile_database_enrollment_check(
+                    profile_path=profile,
+                    database_path=database,
+                    now_epoch=now,
+                )
+            )
+            expect(
+                template_without_uid_access["ok"] is True,
+                "an enabled repository template without a profile or per-UID ACL "
+                "was incorrectly treated as an access promise",
+            )
+            connection = sqlite3.connect(database)
+            connection.execute("DELETE FROM ephemeral_container_templates")
+            connection.commit()
+            connection.close()
 
             for sql, expected_reason in (
                 (
@@ -1011,6 +1586,7 @@ def exercise_profile_database_enrollment_guard() -> None:
                 "restart_precondition": drift_result,
                 "system_files": [{"home_write_paths": ["/home/alice"]}],
                 "clients": [],
+                "docker_admission": {"activation_blockers": []},
             }
             with (
                 mock.patch.object(INSTALLER, "desired_plan", return_value=verify_plan),
@@ -1102,6 +1678,21 @@ def main() -> int:
         "installer plan restart recommendation bypasses its enrollment precondition",
     )
     expect(
+        plan["docker_admission"]["contract"]
+        == INSTALLER.DOCKER_ADMISSION_CONTRACT
+        and plan["docker_admission"]["stage"] == "observe_only"
+        and plan["docker_admission"]["enforcement_enabled"] is False
+        and plan["docker_admission"]["exclusive_admission_ready"] is False
+        and plan["docker_admission"]["automatic_group_or_acl_mutation"] is False,
+        "installer plan does not truthfully report staged Docker admission",
+    )
+    expect(
+        plan["managed_docker_source_policy"]["ok"] is True
+        and plan["managed_docker_source_policy"]["contract"]
+        == INSTALLER.DOCKER_SOURCE_POLICY_CONTRACT,
+        "installer plan omitted the canonical managed-source policy guard",
+    )
+    expect(
         plan["migration"]["legacy_authorities_preserved"] is True,
         "installer plan does not preserve legacy authority",
     )
@@ -1164,6 +1755,10 @@ def main() -> int:
     )
     expect("/run/devcoordinator/broker.sock" in unit, "broker unit selected the wrong socket")
     expect("%h" not in unit, "system unit uses manager-home expansion")
+    expect(
+        unit.splitlines().count("RuntimeDirectoryPreserve=restart") == 1,
+        "broker unit does not preserve volatile run material across a controlled restart",
+    )
     for key, directive in INSTALLER.BROKER_UNIT_REQUIRED_SANDBOX.items():
         expect(
             [line for line in unit.splitlines() if line.startswith(f"{key}=")]
@@ -1332,6 +1927,8 @@ def main() -> int:
         )
     exercise_profile_database_enrollment_guard()
     exercise_source_acl_transaction()
+    exercise_managed_docker_source_policy()
+    exercise_docker_socket_admission_evidence()
     return 0
 
 

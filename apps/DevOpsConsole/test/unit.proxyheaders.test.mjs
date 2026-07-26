@@ -132,9 +132,11 @@ async function startEdge(
     sessionCookieName = 'dc_session',
     routeAuth = 'google',
     upstreamAuthorization,
+    upstreamIdentityAssertion,
   },
 ) {
   const badGatewayCalls = [];
+  const upstreamAuthFailureCalls = [];
   const proxy = createProxy({
     log: silentLog,
     sessionCookieName,
@@ -142,6 +144,14 @@ async function startEdge(
       badGatewayCalls.push(kind);
       res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
       res.end(`bad gateway: ${kind}`);
+    },
+    renderUpstreamAuthFailure: (_req, res, { target }) => {
+      upstreamAuthFailureCalls.push(target.slug);
+      res.writeHead(502, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end('<!doctype html><title>Route authorization unavailable</title>');
     },
   });
   const target = {
@@ -151,6 +161,7 @@ async function startEdge(
     publicHost,
     route: { slug: 'slug', auth: routeAuth },
     upstreamAuthorization,
+    upstreamIdentityAssertion,
   };
   const handler = (req, res) => proxy.forward(req, res, target);
   const server = tls ? https.createServer({ cert: DEV_CERT, key: DEV_KEY }, handler) : http.createServer(handler);
@@ -160,7 +171,7 @@ async function startEdge(
     proxy.close();
     await closeServer(server);
   });
-  return { port, badGatewayCalls };
+  return { port, badGatewayCalls, upstreamAuthFailureCalls };
 }
 
 // Raw-socket exchange: full control over the exact request headers sent.
@@ -300,13 +311,15 @@ test('response direction: hop-by-hop headers stripped, incl. Connection-named ex
   JSON.parse(res.body); // body intact
 });
 
-test('Google-protected routes replace browser Authorization and suppress upstream login challenges', async (t) => {
+test('Google-protected routes replace browser Authorization and never expose upstream auth JSON', async (t) => {
   const upstream = await startUpstream(t);
   const injected = 'Bearer fixture-upstream-credential';
+  const assertion = 'fixture.console.identity.assertion';
   const edge = await startEdge(t, {
     upstreamPort: upstream.port,
     routeAuth: 'google',
     upstreamAuthorization: injected,
+    upstreamIdentityAssertion: assertion,
   });
 
   const echoed = await request({
@@ -317,10 +330,12 @@ test('Google-protected routes replace browser Authorization and suppress upstrea
       host: 'slug.vr.ae',
       connection: 'close',
       authorization: 'Basic caller-controlled-credential',
+      'x-devops-console-assertion': 'caller-controlled-assertion',
     },
   });
   assert.equal(echoed.status, 200);
   assert.equal(JSON.parse(echoed.body).headers.authorization, injected);
+  assert.equal(JSON.parse(echoed.body).headers['x-devops-console-assertion'], assertion);
 
   const challenged = await request({
     port: edge.port,
@@ -328,7 +343,10 @@ test('Google-protected routes replace browser Authorization and suppress upstrea
     path: '/resp-upstream-auth-challenge',
     headers: { host: 'slug.vr.ae', connection: 'close' },
   });
-  assert.equal(challenged.status, 401);
+  assert.equal(challenged.status, 502);
+  assert.match(challenged.headers['content-type'], /^text\/html\b/);
+  assert.match(challenged.body, /Route authorization unavailable/);
+  assert.deepEqual(edge.upstreamAuthFailureCalls, ['slug']);
   assert.equal(
     challenged.headers['www-authenticate'],
     undefined,
@@ -369,10 +387,12 @@ test('public routes preserve caller Authorization and upstream login challenges'
       host: 'slug.vr.ae',
       connection: 'close',
       authorization: callerAuthorization,
+      'x-devops-console-assertion': 'caller-controlled-assertion',
     },
   });
   assert.equal(echoed.status, 200);
   assert.equal(JSON.parse(echoed.body).headers.authorization, callerAuthorization);
+  assert.equal(JSON.parse(echoed.body).headers['x-devops-console-assertion'], undefined);
 
   const challenged = await request({
     port: edge.port,
@@ -465,10 +485,12 @@ test('X-Forwarded-Proto is https when the edge terminates TLS', async (t) => {
 test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed', async (t) => {
   const upstream = await startUpstream(t);
   const injected = 'Bearer fixture-websocket-upstream-credential';
+  const assertion = 'fixture.console.websocket.assertion';
   const edge = await startEdge(t, {
     upstreamPort: upstream.port,
     publicHost: 'slug.vr.ae',
     upstreamAuthorization: injected,
+    upstreamIdentityAssertion: assertion,
   });
 
   const raw = await rawExchange(
@@ -481,6 +503,7 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
       'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
       'Sec-WebSocket-Version: 13',
       'Authorization: Basic caller-controlled-websocket-credential',
+      'X-DevOps-Console-Assertion: caller-controlled-assertion',
       'Cookie: dc_session=real-console-session; dc_flow=real-login-flow; app_session=keep-me; dc_flow_backup=keep-too',
       'X-Hop: sneak',
       '',
@@ -504,6 +527,7 @@ test('upgrade path: Connection: Upgrade preserved, extras stripped, 101 relayed'
   assert.equal(h['sec-websocket-version'], '13');
   assert.equal(h['x-hop'], undefined, 'Connection-named extra must not reach upstream');
   assert.equal(h.authorization, injected);
+  assert.equal(h['x-devops-console-assertion'], assertion);
   assert.equal(h.cookie, 'app_session=keep-me; dc_flow_backup=keep-too');
   assert.doesNotMatch(String(h.cookie ?? ''), /real-console-session|real-login-flow/);
   assert.equal(h.host, 'slug.vr.ae');

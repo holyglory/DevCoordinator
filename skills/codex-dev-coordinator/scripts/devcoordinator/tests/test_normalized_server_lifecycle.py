@@ -968,6 +968,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "/v1/servers",
                 "/v1/archives",
                 "/v1/events",
+                "/v1/tests",
             },
         )
         self.assertEqual(set(dev_coordinator.API_POST_ROUTES), expected_post_routes)

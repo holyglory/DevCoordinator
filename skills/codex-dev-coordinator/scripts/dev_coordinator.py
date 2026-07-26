@@ -62,7 +62,18 @@ from devcoordinator.broker_cli import (
     serve_broker,
 )
 from devcoordinator.broker import BrokerError, BrokerOperation
-from devcoordinator.broker_enrollment import enroll_repository
+from devcoordinator.broker_enrollment import (
+    _normalize_ephemeral_templates,
+    enroll_repository,
+)
+from devcoordinator.image_publication import (
+    ImagePublicationError,
+    apply_publication,
+    normalize_publication_spec,
+    plan_publication,
+    publication_status,
+    rollback_publication,
+)
 from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.broker_links import BrokerLink, BrokerLinkStore
 from devcoordinator.broker_profile import (
@@ -72,6 +83,7 @@ from devcoordinator.broker_profile import (
     BrokerServiceProfile,
     SYSTEM_PROFILE_PATH,
     call_broker,
+    configured_profile_path,
     load_broker_profile,
 )
 from devcoordinator.lifecycle_cli import (
@@ -103,6 +115,12 @@ from devcoordinator.store import (
     fingerprint,
     utc_timestamp,
 )
+from devcoordinator.test_runner import (
+    TestHarnessError,
+    UniversalTestRunner,
+    test_statistics,
+)
+from devcoordinator.test_records import CoordinatorTestRecords
 from devcoordinator.observation_freshness import (
     ObservationFreshnessError,
     capture_observation_freshness_fence,
@@ -135,6 +153,8 @@ API_BODY_LIMIT_BYTES = 64 * 1024
 API_MAX_CONCURRENT_REQUESTS = 16
 API_REQUEST_TIMEOUT_SECONDS = 10
 API_TOKEN_MAX_BYTES = 4096
+API_PROFILE_RELOAD_POLL_SECONDS = 0.5
+API_PROFILE_RELOAD_STABLE_OBSERVATIONS = 2
 GRACE_SECONDS = 5
 # A server that fails its health check but was created within this window is
 # reported as "starting" rather than "unhealthy" so slow-booting servers do not
@@ -5526,13 +5546,22 @@ def docker_ps_inventory(
             "compose_assets": [],
         }
     compose_assets_result = docker_compose_asset_inventory()
+    # Compose assets alone cannot prove a safe Compose scope: a concurrently
+    # failed bulk container inspection leaves container membership and
+    # lifecycle evidence incomplete. Do not publish partial assets for the
+    # commit path to mistake for an exhaustive observation.
+    compose_assets_complete = (
+        inspection_complete and compose_assets_result.get("available") is True
+    )
     payload: dict[str, Any] = {
         "available": True,
         "containers": containers,
         "postgres": postgres,
         "container_inspection_available": inspection_complete,
-        "compose_assets_available": bool(compose_assets_result["available"]),
-        "compose_assets": list(compose_assets_result["assets"]),
+        "compose_assets_available": compose_assets_complete,
+        "compose_assets": (
+            list(compose_assets_result["assets"]) if compose_assets_complete else []
+        ),
     }
     if inspect_error:
         payload["inspection_error"] = inspect_error
@@ -5970,7 +5999,53 @@ def normalize_docker_dependency(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_health_check(raw: dict[str, Any]) -> dict[str, Any]:
+def normalize_health_check(
+    raw: dict[str, Any], *, project: str | None = None
+) -> dict[str, Any]:
+    source_fingerprint = raw.get("source_fingerprint")
+    normalized_source_fingerprint: dict[str, Any] | None = None
+    if source_fingerprint is not None:
+        if project is None:
+            raise ValueError("source_fingerprint health checks require a project root")
+        if not isinstance(source_fingerprint, dict):
+            raise ValueError("source_fingerprint must be an object")
+        raw_root = source_fingerprint.get("root")
+        if not isinstance(raw_root, str) or not raw_root.strip() or "\x00" in raw_root:
+            raise ValueError("source_fingerprint.root must be a non-empty path")
+        root = Path(
+            resolve_runtime_path(
+                project,
+                raw_root.strip(),
+                reject_symlinks=True,
+            )
+        )
+        if not root.is_dir():
+            raise ValueError("source_fingerprint.root must name an existing directory")
+        exclude_directories = runtime_string_list(
+            source_fingerprint.get("exclude_directories"),
+            field="source_fingerprint.exclude_directories",
+            maximum=16,
+        )
+        for directory in exclude_directories:
+            if Path(directory).name != directory or directory in {".", ".."}:
+                raise ValueError(
+                    "source_fingerprint.exclude_directories entries must be directory names"
+                )
+        response_path = source_fingerprint.get(
+            "response_path", "build.sourceFingerprint"
+        )
+        if not isinstance(response_path, str) or re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*",
+            response_path,
+        ) is None:
+            raise ValueError(
+                "source_fingerprint.response_path must be a dotted object path"
+            )
+        normalized_source_fingerprint = {
+            "root": str(root),
+            "exclude_directories": exclude_directories,
+            "response_path": response_path,
+        }
     return {
         "name": raw.get("name") or raw.get("url") or raw.get("port") or "health",
         "type": raw.get("type") or ("http" if raw.get("url") else "tcp"),
@@ -5981,6 +6056,137 @@ def normalize_health_check(raw: dict[str, Any]) -> dict[str, Any]:
         "expect_text": raw.get("expect_text") or raw.get("contains"),
         "required": raw.get("required", True) is not False,
         "timeout": float(raw.get("timeout") or 3),
+        "source_fingerprint": normalized_source_fingerprint,
+    }
+
+
+def source_tree_fingerprint(specification: Mapping[str, Any]) -> str:
+    """Match the worker build's sorted SHA-256 input-tree algorithm.
+
+    This is deliberately a read-only, unprivileged status check.  The source
+    root and excluded top-level directories are already bounded by runtime
+    configuration normalization, and symlinked/non-regular files follow the
+    worker Dockerfile's ``find -type f`` behavior by being ignored.
+    """
+
+    raw_root = specification.get("root")
+    if not isinstance(raw_root, str):
+        raise ValueError("source fingerprint root is invalid")
+    root = Path(raw_root)
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise ValueError("source fingerprint root is unavailable") from exc
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("source fingerprint root must be a real directory")
+
+    excluded = frozenset(
+        str(item) for item in specification.get("exclude_directories") or ()
+    )
+    records: list[tuple[bytes, bytes]] = []
+    for current_name, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        current = Path(current_name)
+        next_directories: list[str] = []
+        for directory_name in sorted(directory_names):
+            child = current / directory_name
+            try:
+                child_stat = child.lstat()
+            except OSError as exc:
+                raise ValueError("source fingerprint directory is unavailable") from exc
+            if current == root and directory_name in excluded:
+                continue
+            if stat.S_ISLNK(child_stat.st_mode):
+                continue
+            if not stat.S_ISDIR(child_stat.st_mode):
+                raise ValueError("source fingerprint tree contains an invalid directory")
+            next_directories.append(directory_name)
+        directory_names[:] = next_directories
+
+        for file_name in sorted(file_names):
+            path = current / file_name
+            try:
+                file_stat = path.lstat()
+            except OSError as exc:
+                raise ValueError("source fingerprint file is unavailable") from exc
+            if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+                continue
+            relative_path = path.relative_to(root).as_posix()
+            if "\n" in relative_path or "\\" in relative_path:
+                raise ValueError("source fingerprint paths must be newline and backslash free")
+            digest = hashlib.sha256()
+            try:
+                with path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+            except OSError as exc:
+                raise ValueError("source fingerprint file could not be read") from exc
+            relative_bytes = relative_path.encode("utf-8")
+            records.append(
+                (
+                    relative_bytes,
+                    f"{digest.hexdigest()}  ./{relative_path}\n".encode("utf-8"),
+                )
+            )
+
+    combined = hashlib.sha256()
+    for _relative_path, record in sorted(records, key=lambda item: item[0]):
+        combined.update(record)
+    return combined.hexdigest()
+
+
+def source_fingerprint_health_result(
+    specification: Mapping[str, Any], body: str
+) -> dict[str, Any]:
+    """Compare a health response's declared build fingerprint to local source."""
+
+    try:
+        expected = source_tree_fingerprint(specification)
+    except (TypeError, ValueError, OSError) as exc:
+        return {
+            "ok": False,
+            "classification": "runtime_provenance_unavailable",
+            "provenance_status": "source_fingerprint_unavailable",
+            "error": str(exc),
+        }
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = None
+    current: Any = payload
+    for part in str(specification.get("response_path") or "").split("."):
+        if not isinstance(current, Mapping):
+            current = None
+            break
+        current = current.get(part)
+    actual = current if isinstance(current, str) else None
+    result: dict[str, Any] = {
+        "expected_source_fingerprint": expected,
+        "actual_source_fingerprint": actual,
+    }
+    if actual is None or re.fullmatch(r"[a-f0-9]{64}", actual) is None:
+        return {
+            **result,
+            "ok": False,
+            "classification": "runtime_provenance_unavailable",
+            "provenance_status": "runtime_fingerprint_unavailable",
+        }
+    if actual != expected:
+        return {
+            **result,
+            "ok": False,
+            "classification": "source_stale",
+            "provenance_status": "source_fingerprint_mismatch",
+        }
+    return {
+        **result,
+        "ok": True,
+        "classification": None,
+        "provenance_status": "verified",
     }
 
 
@@ -6042,14 +6248,19 @@ def build_project_runtime_spec(
     project: str,
     runtime_file: str | None = None,
     include_docker: bool = True,
+    docker_inventory: dict[str, Any] | None = None,
+    docker_observation_authority: str | None = None,
 ) -> dict[str, Any]:
     resolved_project = canonical_project(project)
     config, config_path = load_project_runtime_config(resolved_project, runtime_file)
-    docker = (
-        docker_ps_inventory(state=state)
-        if include_docker
-        else {"available": None, "containers": [], "postgres": []}
-    )
+    if docker_inventory is not None:
+        if not isinstance(docker_inventory, dict):
+            raise ValueError("runtime Docker inventory must be an object")
+        docker = copy.deepcopy(docker_inventory)
+    elif include_docker:
+        docker = docker_ps_inventory(state=state)
+    else:
+        docker = {"available": None, "containers": [], "postgres": []}
     servers_by_name = {
         server.get("name"): dict(server)
         for server in state.get("servers", {}).values()
@@ -6191,6 +6402,9 @@ def build_project_runtime_spec(
     known_containers = {
         item.get("container") or item.get("name") for item in docker_dependencies
     }
+    declared_compose_runtime = bool(
+        compose and compose.get("declared") and compose.get("autostart")
+    )
     for container in matching_project_containers(
         resolved_project, docker.get("containers", []), state=state
     ):
@@ -6204,26 +6418,57 @@ def build_project_runtime_spec(
                 "name": name,
                 "container": name,
                 "image": container.get("image"),
-                "required": authorized,
+                "required": authorized and not declared_compose_runtime,
                 "ports": [],
                 "health_url": None,
                 "declared": False,
                 "discovered": True,
-                "mutation_authorized": authorized,
+                "mutation_authorized": authorized and not declared_compose_runtime,
                 "ownership_source": container.get("metadata_source")
                 if authorized
                 else "name_heuristic",
-                "read_only_evidence": not authorized,
+                "read_only_evidence": not authorized or declared_compose_runtime,
             }
-            if authorized:
+            if authorized and not declared_compose_runtime:
                 docker_dependencies.append(discovered)
             else:
+                # A declared Compose definition controls the full service
+                # topology. Explicit runtime dependencies decide readiness;
+                # unlisted one-shot services remain useful non-blocking
+                # evidence instead of becoming false missing dependencies.
                 docker_evidence.append(discovered)
 
     health_checks = [
-        normalize_health_check(item)
+        normalize_health_check(item, project=resolved_project)
         for item in runtime_list(config.get("health_checks"))
         if isinstance(item, dict)
+    ]
+    raw_ephemeral = config.get("ephemeral_containers", [])
+    if not isinstance(raw_ephemeral, list):
+        raise ValueError("ephemeral_containers must be a top-level list")
+    ephemeral_containers = [
+        {
+            "name": item["name"],
+            "image_ref": item["image_ref"],
+            "argv": list(item["command"]),
+            "env": dict(item["environment"]),
+            "secret_policy": item["secret_policy"],
+            "default_ttl_seconds": item["default_ttl_seconds"],
+            "max_ttl_seconds": item["max_ttl_seconds"],
+            "container_tcp_port": item["container_tcp_port"],
+            "host_port_start": item["host_port_start"],
+            "host_port_end": item["host_port_end"],
+            "memory_bytes": item["memory_bytes"],
+            "cpu_millis": item["cpu_millis"],
+            "max_concurrent_runs": item["max_concurrent_runs"],
+            "max_concurrent_runs_per_uid": item[
+                "max_concurrent_runs_per_uid"
+            ],
+            "repo_max_active_runs": item["repo_max_active_runs"],
+            "repo_memory_budget_bytes": item["repo_memory_budget_bytes"],
+            "repo_cpu_budget_millis": item["repo_cpu_budget_millis"],
+        }
+        for item in _normalize_ephemeral_templates(raw_ephemeral)
     ]
     return {
         "id": config.get("id") or resolved_project,
@@ -6237,7 +6482,9 @@ def build_project_runtime_spec(
         "docker_dependencies": docker_dependencies,
         "docker_evidence": docker_evidence,
         "health_checks": health_checks,
+        "ephemeral_containers": ephemeral_containers,
         "docker": docker,
+        "docker_observation_authority": docker_observation_authority,
     }
 
 
@@ -6298,20 +6545,24 @@ def is_stopped_container_status(status: str) -> bool:
 
 
 def docker_dependency_status(
-    dep: dict[str, Any], containers: list[dict[str, Any]]
+    dep: dict[str, Any],
+    containers: list[dict[str, Any]],
+    *,
+    allow_local_docker_inspection: bool = True,
 ) -> dict[str, Any]:
     container = docker_container_by_name(
         containers, dep.get("container") or dep.get("name")
     )
-    state = docker_inspect_state(
-        container.get("name") if container else dep.get("container")
+    inspection_target = container.get("name") if container else dep.get("container")
+    state = (
+        docker_inspect_state(inspection_target)
+        if allow_local_docker_inspection
+        else None
     )
     classification = classify_docker_dependency(dep, container)
     logs = (
-        docker_log_tail(
-            container.get("name") if container else dep.get("container"), 30
-        )
-        if classification
+        docker_log_tail(inspection_target, 30)
+        if classification and allow_local_docker_inspection
         else ""
     )
     exit_reason = None
@@ -6344,6 +6595,22 @@ def docker_dependency_status(
         "ownership_source": dep.get("ownership_source"),
         "read_only_evidence": dep.get("read_only_evidence", False),
     }
+
+
+def runtime_allows_local_docker_inspection(spec: dict[str, Any]) -> bool:
+    """Keep broker-owned Docker observation on the broker side of the boundary."""
+
+    return spec.get("docker_observation_authority") != "host_broker"
+
+
+def runtime_docker_dependency_status(
+    spec: dict[str, Any], dep: dict[str, Any]
+) -> dict[str, Any]:
+    return docker_dependency_status(
+        dep,
+        spec.get("docker", {}).get("containers", []),
+        allow_local_docker_inspection=runtime_allows_local_docker_inspection(spec),
+    )
 
 
 def server_status_for_runtime(
@@ -6437,25 +6704,36 @@ def run_health_check(check: dict[str, Any]) -> dict[str, Any]:
     path = parsed.path or "/"
     if parsed.query:
         path += f"?{parsed.query}"
+    conn: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
     try:
         conn = connection_class(
             parsed.hostname, parsed.port, timeout=float(check.get("timeout") or 3)
         )
         conn.request("GET", path)
         response = conn.getresponse()
-        body = response.read(4096).decode("utf-8", errors="replace")
+        source_fingerprint = check.get("source_fingerprint")
+        body = response.read(65_536 if source_fingerprint else 4096).decode(
+            "utf-8", errors="replace"
+        )
         expected_status = int(check.get("expect_status") or 200)
         ok = response.status == expected_status
         expected_text = check.get("expect_text")
         if expected_text:
             ok = ok and str(expected_text) in body
-        return {
+        result = {
             **check,
             "ok": ok,
             "status": response.status,
             "classification": None if ok else "unhealthy_process",
             "body_excerpt": body[:300],
         }
+        if ok and isinstance(source_fingerprint, Mapping):
+            provenance = source_fingerprint_health_result(source_fingerprint, body)
+            result.update(provenance)
+            if not provenance["ok"]:
+                result["ok"] = False
+                result["classification"] = provenance["classification"]
+        return result
     except TimeoutError:
         classification = "timeout"
     except OSError as exc:
@@ -6469,15 +6747,15 @@ def run_health_check(check: dict[str, Any]) -> dict[str, Any]:
             "error": str(exc),
         }
     finally:
-        with contextlib.suppress(Exception):
-            conn.close()  # type: ignore[name-defined]
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
     return {**check, "ok": False, "classification": classification}
 
 
 def project_runtime_report(
     state: dict[str, Any], spec: dict[str, Any], *, action: str
 ) -> dict[str, Any]:
-    containers = spec.get("docker", {}).get("containers", [])
     services: list[dict[str, Any]] = []
     concrete_services: list[dict[str, Any]] = []
     if spec.get("compose"):
@@ -6490,11 +6768,11 @@ def project_runtime_report(
         if compose.get("declared"):
             concrete_services.append(compose)
     docker_services = [
-        docker_dependency_status(dep, containers)
+        runtime_docker_dependency_status(spec, dep)
         for dep in spec.get("docker_dependencies", [])
     ]
     docker_evidence = [
-        docker_dependency_status(dep, containers)
+        runtime_docker_dependency_status(spec, dep)
         for dep in spec.get("docker_evidence", [])
     ]
     server_services = [
@@ -10764,6 +11042,81 @@ def coordinated_build_registration_inventory(
     for key in compatibility_keys:
         if key not in {"leases", "port_assignments"}:
             result[key] = copy.deepcopy(compatibility[key])
+
+    # This endpoint is a startup proof, not a second full-inventory transport.
+    # Keep only normalized rows that the registration classifier can consume
+    # for the exact target. In particular, accumulated observation snapshots
+    # and telemetry can grow past the readiness client's bounded body limit
+    # even though the one relevant server row is tiny.
+    relevant_repositories = [
+        copy.deepcopy(repository)
+        for repository in result.get("repositories", [])
+        if repository.get("canonical_root") == resolved_project
+    ]
+    relevant_repo_ids = {
+        str(repository.get("repo_id"))
+        for repository in relevant_repositories
+        if repository.get("repo_id") is not None
+    }
+    resources = result.get("resources") if isinstance(result.get("resources"), dict) else {}
+    observations = (
+        result.get("observations") if isinstance(result.get("observations"), dict) else {}
+    )
+    result["repositories"] = relevant_repositories
+    result["resources"] = {
+        "servers": [
+            copy.deepcopy(row)
+            for row in resources.get("servers", [])
+            if str(row.get("server_definition_id")) in relevant_server_ids
+        ],
+        "docker": [],
+        "docker_ports": [],
+        "databases": [],
+    }
+    result["observations"] = {
+        "servers": [
+            copy.deepcopy(row)
+            for row in observations.get("servers", [])
+            if str(row.get("server_definition_id")) in relevant_server_ids
+        ],
+        "docker": [],
+        "databases": [],
+        "telemetry": [],
+        "snapshots": [],
+    }
+    result["leases"] = [
+        copy.deepcopy(row)
+        for row in result.get("leases", [])
+        if row.get("port") == target_port
+        or str(row.get("server_definition_id")) in relevant_server_ids
+    ]
+    result["port_assignments"] = [
+        copy.deepcopy(row)
+        for row in result.get("port_assignments", [])
+        if row.get("port") == target_port
+        or (
+            str(row.get("repo_id")) in relevant_repo_ids
+            and row.get("server_name") == target_name
+        )
+    ]
+    for key in (
+        "backup_evidence",
+        "backups",
+        "control_bindings",
+        "database_backups",
+        "database_restore_events",
+        "docker_engines",
+        "events",
+        "memberships",
+        "project_usage",
+        "recent_events",
+        "unassigned_resources",
+    ):
+        if key in result:
+            result[key] = []
+    for key in ("backups", "project_usage", "recent_events"):
+        if key in compatibility:
+            compatibility[key] = []
     return result
 
 
@@ -11670,6 +12023,12 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
             port_start=start_port,
             port_end=end_port,
             profile_path=profile_output.absolute(),
+            ephemeral_containers=tuple(
+                specification.get("ephemeral_containers") or ()
+            ),
+            grant_ephemeral_image_prefetch=bool(
+                getattr(args, "grant_ephemeral_image_prefetch", False)
+            ),
             compose=compose if isinstance(compose, dict) else None,
             approve_compose_host_access=bool(args.approve_compose_host_access),
             observe_host=observe_broker_service_store_for_enrollment,
@@ -11684,6 +12043,92 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
     result["runtime_file"] = specification.get("runtime_file")
     result["agent"] = str(args.agent)
     return result
+
+
+def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]:
+    """Run the explicit root-only image publication lifecycle.
+
+    The broker process must be stopped for any mutation phase.  Holding its
+    lifetime lock prevents another coordinator lifecycle action from racing the
+    immutable snapshot, image tag, or sealed Compose recreation.
+    """
+
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "image publication requires the root coordinator administrator"
+        )
+    mode = str(args.mode)
+    project = canonical_project(str(args.project))
+    database_path = Path(str(args.database)).expanduser().absolute()
+    artifact_root = SYSTEM_AUTHORITY_ROOT / "image-publications"
+
+    if mode == "status":
+        if not args.operation_id:
+            raise ValueError("image publication status requires --operation-id")
+        return publication_status(
+            artifact_root=artifact_root,
+            operation_id=str(args.operation_id),
+            service_uid=0,
+        )
+
+    if mode == "plan":
+        if not args.publication:
+            raise ValueError("image publication plan requires --publication")
+        config, _config_path = load_project_runtime_config(project, args.runtime_file)
+        specification = normalize_publication_spec(
+            project=project,
+            runtime_config=config,
+            name=str(args.publication),
+        )
+        return plan_publication(
+            specification=specification,
+            artifact_root=artifact_root,
+            operation_id=str(args.operation_id) if args.operation_id else None,
+            service_uid=0,
+            broker_database_path=database_path,
+        )
+
+    if mode not in {"apply", "rollback"}:
+        raise ValueError("image publication mode is invalid")
+    if not args.operation_id:
+        raise ValueError(f"image publication {mode} requires --operation-id")
+    config, _config_path = load_project_runtime_config(project, args.runtime_file)
+    if not args.publication:
+        raise ValueError(f"image publication {mode} requires --publication")
+    specification = normalize_publication_spec(
+        project=project,
+        runtime_config=config,
+        name=str(args.publication),
+    )
+    # The broker service itself holds this same lock during normal operation.
+    # A failed acquisition is a deliberate stop condition, not an invitation to
+    # issue an uncoordinated raw Docker command.
+    with exclusive_broker_service_lock(database_path):
+        if mode == "apply":
+            if not args.confirm_plan_fingerprint:
+                raise ValueError(
+                    "image publication apply requires --confirm-plan-fingerprint"
+                )
+            return apply_publication(
+                specification=specification,
+                artifact_root=artifact_root,
+                operation_id=str(args.operation_id),
+                confirmation_fingerprint=str(args.confirm_plan_fingerprint),
+                service_uid=0,
+                broker_database_path=database_path,
+            )
+        if not args.confirm_previous_image_id:
+            raise ValueError(
+                "image publication rollback requires --confirm-previous-image-id"
+            )
+        return rollback_publication(
+            specification=specification,
+            artifact_root=artifact_root,
+            operation_id=str(args.operation_id),
+            previous_image_confirmation=str(args.confirm_previous_image_id),
+            service_uid=0,
+            broker_database_path=database_path,
+        )
 
 
 def coordinated_broker_compose_reconcile(
@@ -11866,21 +12311,43 @@ def observe_project_runtime(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     prepared = dict(options)
     prepared["project"] = canonical_project(str(prepared["project"]))
-    broker_configured = configured_broker_context(prepared["project"]) is not None
+    broker_context = configured_broker_context(prepared["project"])
     baseline = snapshot_runtime_observation(project=prepared["project"])
     observed = copy.deepcopy(baseline)
-    spec = build_project_runtime_spec(
-        observed,
-        project=prepared["project"],
-        runtime_file=prepared.get("runtime_file"),
-        include_docker=not broker_configured,
-    )
+    if broker_context is not None:
+        broker_inventory = broker_authority_inventory(
+            project=prepared["project"], include_docker=True
+        )
+        broker_docker = broker_inventory.get("docker")
+        if not isinstance(broker_docker, dict) or not isinstance(
+            broker_docker.get("containers"), list
+        ):
+            raise BrokerError(
+                "invalid_reply",
+                "Broker inventory omitted a valid Docker runtime observation.",
+            )
+        observed["docker"] = copy.deepcopy(broker_docker)
+        spec = build_project_runtime_spec(
+            observed,
+            project=prepared["project"],
+            runtime_file=prepared.get("runtime_file"),
+            include_docker=False,
+            docker_inventory=broker_docker,
+            docker_observation_authority="host_broker",
+        )
+    else:
+        spec = build_project_runtime_spec(
+            observed,
+            project=prepared["project"],
+            runtime_file=prepared.get("runtime_file"),
+            include_docker=True,
+        )
     report = project_runtime_report(observed, spec, action=action)
-    if broker_configured and project_docker_requirement_reasons(spec):
+    if broker_context is not None and project_docker_requirement_reasons(spec):
         report["docker_observation"] = {
             "authority": "host_broker",
             "client_docker_required": False,
-            "status": "service_observation_required",
+            "status": "broker_inventory",
         }
     commit_runtime_observations(baseline, observed)
     return spec, report
@@ -11906,6 +12373,7 @@ def begin_project_operation(
             preflight_state,
             project=project,
             runtime_file=prepared.get("runtime_file"),
+            include_docker=False,
         )
         preflight_fingerprints = require_project_server_identities_observable(
             preflight_state,
@@ -12492,6 +12960,27 @@ def mutable_runtime_docker_dependencies(
     return dependencies
 
 
+def compose_start_required(spec: dict[str, Any]) -> bool:
+    """Avoid an unnecessary full Compose mutation when its runtime is healthy."""
+
+    compose = spec.get("compose") or {}
+    if not compose.get("declared") or not compose.get("autostart"):
+        return False
+    dependencies = [
+        dependency
+        for dependency in mutable_runtime_docker_dependencies(spec)
+        if dependency_owned_by_compose(spec, dependency)
+    ]
+    # A compose-only declaration has no independent runtime health contract, so
+    # it still needs one broker-owned start attempt.
+    if not dependencies:
+        return True
+    return any(
+        not runtime_docker_dependency_status(spec, dependency).get("ok")
+        for dependency in dependencies
+    )
+
+
 def project_docker_requirement_reasons(spec: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     compose = spec.get("compose") or {}
@@ -12795,7 +13284,13 @@ def project_action_error_from_exception(
     }
     if payload.get("capability"):
         result["capability"] = copy.deepcopy(payload["capability"])
-    for key in ("command", "timeout_seconds", "docker_executable"):
+    for key in (
+        "command",
+        "timeout_seconds",
+        "docker_executable",
+        "operation_id",
+        "action_required",
+    ):
         if payload.get(key) is not None:
             result[key] = copy.deepcopy(payload[key])
     return result
@@ -12838,7 +13333,12 @@ def execute_project_start(
     actions: list[dict[str, Any]] = []
     action_errors: list[dict[str, Any]] = []
     compose = spec.get("compose")
-    if compose and compose.get("autostart") and not skip_compose_lifecycle:
+    if (
+        compose
+        and compose.get("autostart")
+        and not skip_compose_lifecycle
+        and compose_start_required(spec)
+    ):
         command = ["docker", *compose_command_prefix(compose)]
         command.extend(["up", "-d"])
         command.extend(compose.get("services") or [])
@@ -12883,7 +13383,7 @@ def execute_project_start(
             )
     containers = spec.get("docker", {}).get("containers", [])
     for dep in mutable_runtime_docker_dependencies(spec, exclude_compose_owned=True):
-        status = docker_dependency_status(dep, containers)
+        status = runtime_docker_dependency_status(spec, dep)
         if status.get("ok"):
             continue
         container_name = dep.get("container") or dep.get("name")
@@ -14071,11 +14571,156 @@ def configured_broker_context(
     return profile, profile.repository(canonical_project(project))
 
 
-def configured_broker_profile() -> BrokerClientProfile | None:
+def configured_broker_profile(
+    *, allow_expired_for_ephemeral_cleanup: bool = False
+) -> BrokerClientProfile | None:
     mode = authority_mode()
     if mode in {"account", "service"}:
         return None
-    return load_broker_profile(required=mode == "system")
+    # Keep ordinary profile resolution on the established one-argument call
+    # path.  The relaxed expiry mode is deliberately opt-in and is used only
+    # by the exact retained-owner status/finish cleanup journey.
+    if not allow_expired_for_ephemeral_cleanup:
+        return load_broker_profile(required=mode == "system")
+    return load_broker_profile(
+        required=mode == "system",
+        allow_expired_for_ephemeral_cleanup=True,
+    )
+
+
+def _ephemeral_repository(
+    profile: BrokerClientProfile,
+    project: str,
+    *,
+    retained_owner_access: bool = False,
+) -> BrokerRepositoryProfile:
+    """Resolve exactly the repository named by the caller.
+
+    Ephemeral lifecycle must never search every enrollment or infer a target
+    from the process cwd.  The explicit canonical project is part of the
+    authorization scope, including for read-only status.
+    """
+
+    requested = str(project or "").strip()
+    if not requested:
+        raise ValueError(
+            "ephemeral commands require --project with the canonical repo path"
+        )
+    canonical = canonical_project(requested)
+    if retained_owner_access:
+        return profile.retained_ephemeral_repository(canonical)
+    return profile.repository(canonical)
+
+
+def _canonical_ephemeral_operation_id(value: str) -> str:
+    """Accept only the wire protocol's exact lowercase canonical UUID form."""
+
+    try:
+        parsed = uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "ephemeral operation ID must be a canonical UUID"
+        ) from error
+    normalized = str(parsed)
+    if value != normalized:
+        raise argparse.ArgumentTypeError(
+            "ephemeral operation ID must be a lowercase canonical UUID"
+        )
+    return normalized
+
+
+def coordinated_ephemeral_action(args: argparse.Namespace) -> dict[str, Any]:
+    """Route ephemeral lifecycle only through the root-provisioned broker."""
+
+    action = str(args.action)
+    retained_owner_access = action in {"status", "finish"}
+    profile = configured_broker_profile(
+        allow_expired_for_ephemeral_cleanup=retained_owner_access
+    )
+    if profile is None:
+        raise BrokerProfileError(
+            "ephemeral containers require the server-wide root-provisioned broker; "
+            "direct Docker fallback is disabled"
+        )
+    if action == "status":
+        repository = _ephemeral_repository(
+            profile,
+            str(args.project),
+            retained_owner_access=True,
+        )
+        run_id = str(args.run_id)
+        operation_id, result = profile.call(
+            repository=repository,
+            resource_id=run_id,
+            operation=BrokerOperation.EPHEMERAL_STATUS,
+            arguments={},
+        )
+        return {"operation_id": operation_id, **result}
+
+    if action == "image-status":
+        repository = _ephemeral_repository(profile, str(args.project))
+        template_id = repository.ephemeral_template_id(str(args.template))
+        operation_id, result = profile.call(
+            repository=repository,
+            resource_id=template_id,
+            operation=BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+            arguments={},
+        )
+        return {"operation_id": operation_id, **result}
+
+    agent, project = require_identity(vars(args), f"ephemeral {action}")
+    repository = _ephemeral_repository(
+        profile,
+        project,
+        retained_owner_access=action == "finish",
+    )
+    if args.action == "start":
+        template_name = str(args.template)
+        arguments: dict[str, Any] = {"agent": agent}
+        if args.ttl_seconds is not None:
+            arguments["ttl_seconds"] = int(args.ttl_seconds)
+        operation_id, result = profile.call(
+            repository=repository,
+            resource_id=repository.ephemeral_template_id(template_name),
+            operation=BrokerOperation.EPHEMERAL_START,
+            arguments=arguments,
+            operation_id=getattr(args, "operation_id", None),
+        )
+        return {"operation_id": operation_id, **result, "agent": agent}
+
+    if args.action == "image-prefetch":
+        template_id = repository.ephemeral_image_prefetch_template_id(
+            str(args.template)
+        )
+        operation_id, result = profile.call(
+            repository=repository,
+            resource_id=template_id,
+            operation=BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+            arguments={"agent": agent},
+            operation_id=getattr(args, "operation_id", None),
+        )
+        return {"operation_id": operation_id, **result, "agent": agent}
+
+    run_id = str(args.run_id)
+    if args.action == "renew":
+        operation = BrokerOperation.EPHEMERAL_RENEW
+        arguments = {"ttl_seconds": int(args.ttl_seconds), "agent": agent}
+    elif args.action == "finish":
+        operation = BrokerOperation.EPHEMERAL_FINISH
+        arguments = {
+            "reason": str(args.reason or "finished by user"),
+            "agent": agent,
+        }
+    else:
+        raise ValueError("unsupported ephemeral action")
+    operation_id, result = profile.call(
+        repository=repository,
+        resource_id=run_id,
+        operation=operation,
+        arguments=arguments,
+        operation_id=getattr(args, "operation_id", None),
+    )
+    return {"operation_id": operation_id, **result, "agent": agent}
 
 
 def broker_authority_inventory(
@@ -14142,6 +14787,70 @@ def _validated_broker_lease_result(
         )
     expires_at = None if result.get("expires_at") is None else str(result["expires_at"])
     return lease_id, port, protocol, expires_at
+
+
+def _release_broker_only_port_lease(
+    *,
+    agent: str,
+    project: str,
+    broker_lease_id: str,
+) -> dict[str, Any]:
+    """Release one service-authoritative lease that has no local mirror.
+
+    The normal release path begins with an active local compatibility lease so
+    it can finish its paired broker-link record.  A crash before that local
+    record committed leaves an owner-authorized service lease without an ID
+    that the normal local lookup can resolve.  Route only that exact explicit
+    lease ID through the current protected profile; the broker remains the
+    authority for UID, account, repository, and lease ownership checks.
+    """
+
+    broker_context = configured_broker_context(project)
+    if broker_context is None:
+        raise KeyError("matching lease not found")
+    profile, repository = broker_context
+    operation_id, broker_result = profile.call(
+        repository=repository,
+        resource_id=broker_lease_id,
+        operation=BrokerOperation.PORT_RELEASE,
+    )
+    if (
+        str(broker_result.get("lease_id") or "") != broker_lease_id
+        or broker_result.get("status") != "released"
+    ):
+        raise BrokerError(
+            "invalid_reply",
+            "Broker port release did not confirm the exact lease as released.",
+            operation_id=operation_id,
+        )
+    try:
+        port = int(broker_result["port"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise BrokerError(
+            "invalid_reply",
+            "Broker port release omitted a valid port.",
+            operation_id=operation_id,
+        ) from error
+    protocol = str(broker_result.get("protocol") or "")
+    if not 1 <= port <= 65535 or protocol not in {"tcp", "udp"}:
+        raise BrokerError(
+            "invalid_reply",
+            "Broker port release returned invalid lease evidence.",
+            operation_id=operation_id,
+        )
+    return {
+        "id": broker_lease_id,
+        "port": port,
+        "project": project,
+        "agent": agent,
+        "status": "released",
+        "broker": {
+            "lease_id": broker_lease_id,
+            "status": "released",
+            "operation_id": operation_id,
+            "result": broker_result,
+        },
+    }
 
 
 def publish_broker_server(
@@ -14594,18 +15303,37 @@ def coordinated_release_port(options: dict[str, Any]) -> dict[str, Any]:
             resolved_lease_id = str(lease["id"])
     else:
         with AccountStore.open_default(coordinator_home()) as store:
-            leases = NormalizedPortLifecycle(store).list_leases(active_only=True)
+            leases = NormalizedPortLifecycle(store).list_leases(active_only=False)
+        local_id_matches: list[dict[str, Any]] = []
         if options.get("lease_id"):
-            matches = [
+            local_id_matches = [
                 item for item in leases if str(item["id"]) == str(options["lease_id"])
+            ]
+            matches = [
+                item
+                for item in local_id_matches
+                if str(item.get("status") or "") == "active"
             ]
         elif options.get("port") is not None:
             matches = [
-                item for item in leases if int(item["port"]) == int(options["port"])
+                item
+                for item in leases
+                if int(item["port"]) == int(options["port"])
+                and str(item.get("status") or "") == "active"
             ]
         else:
             raise ValueError("port release requires --lease-id or --port")
         if len(matches) != 1:
+            if (
+                not matches
+                and options.get("lease_id")
+                and not local_id_matches
+            ):
+                return _release_broker_only_port_lease(
+                    agent=agent,
+                    project=project,
+                    broker_lease_id=str(options["lease_id"]),
+                )
             raise KeyError("matching lease not found")
         lease = matches[0]
         if canonical_project(str(lease.get("project") or "")) != project:
@@ -15132,6 +15860,74 @@ def build_parser() -> argparse.ArgumentParser:
         project_action.add_argument("--allow-port-change", action="store_true")
         project_action.add_argument("--dry-run", action="store_true")
 
+    ephemeral = sub.add_parser(
+        "ephemeral",
+        help="run administrator-sealed short-lived containers through the host broker",
+    )
+    ephemeral_sub = ephemeral.add_subparsers(dest="action", required=True)
+    ephemeral_start = ephemeral_sub.add_parser("start")
+    ephemeral_start.add_argument("--agent", required=True)
+    ephemeral_start.add_argument("--project", required=True)
+    ephemeral_start.add_argument("--template", required=True)
+    ephemeral_start.add_argument("--ttl-seconds", type=int)
+    ephemeral_start.add_argument(
+        "--operation-id",
+        type=_canonical_ephemeral_operation_id,
+        help="reuse the exact UUID after a lost or uncertain broker reply",
+    )
+    ephemeral_status = ephemeral_sub.add_parser("status")
+    ephemeral_status.add_argument("--project", required=True)
+    ephemeral_status.add_argument("--run-id", required=True)
+    ephemeral_image_status = ephemeral_sub.add_parser("image-status")
+    ephemeral_image_status.add_argument("--project", required=True)
+    ephemeral_image_status.add_argument("--template", required=True)
+    ephemeral_image_prefetch = ephemeral_sub.add_parser("image-prefetch")
+    ephemeral_image_prefetch.add_argument("--agent", required=True)
+    ephemeral_image_prefetch.add_argument("--project", required=True)
+    ephemeral_image_prefetch.add_argument("--template", required=True)
+    ephemeral_image_prefetch.add_argument(
+        "--operation-id",
+        type=_canonical_ephemeral_operation_id,
+        required=True,
+        help="reuse the exact UUID after a lost or uncertain broker reply",
+    )
+    ephemeral_renew = ephemeral_sub.add_parser("renew")
+    ephemeral_renew.add_argument("--agent", required=True)
+    ephemeral_renew.add_argument("--project", required=True)
+    ephemeral_renew.add_argument("--run-id", required=True)
+    ephemeral_renew.add_argument("--ttl-seconds", type=int, required=True)
+    ephemeral_renew.add_argument(
+        "--operation-id",
+        type=_canonical_ephemeral_operation_id,
+        help="reuse the exact UUID after a lost or uncertain broker reply",
+    )
+    ephemeral_finish = ephemeral_sub.add_parser("finish")
+    ephemeral_finish.add_argument("--agent", required=True)
+    ephemeral_finish.add_argument("--project", required=True)
+    ephemeral_finish.add_argument("--run-id", required=True)
+    ephemeral_finish.add_argument("--reason")
+    ephemeral_finish.add_argument(
+        "--operation-id",
+        type=_canonical_ephemeral_operation_id,
+        help="reuse the exact UUID after a lost or uncertain broker reply",
+    )
+
+    tests = sub.add_parser(
+        "test", help="run and inspect repository tests through the universal harness"
+    )
+    tests_sub = tests.add_subparsers(dest="action", required=True)
+    tests_run = tests_sub.add_parser("run")
+    tests_run.add_argument("--agent", required=True)
+    tests_run.add_argument("--project", required=True)
+    tests_choice = tests_run.add_mutually_exclusive_group(required=True)
+    tests_choice.add_argument("--profile")
+    tests_choice.add_argument("--group", action="append", dest="test_groups")
+    tests_run.add_argument("--select", action="append", default=[])
+    tests_stats = tests_sub.add_parser("stats")
+    tests_stats.add_argument("--project", required=True)
+    tests_stats.add_argument("--days", type=int, default=30)
+    tests_stats.add_argument("--limit", type=int, default=25)
+
     docker = sub.add_parser("docker")
     docker_sub = docker.add_subparsers(dest="action", required=True)
     docker_ps = docker_sub.add_parser("ps")
@@ -15242,8 +16038,42 @@ def handle_cli(args: argparse.Namespace) -> Any:
         return coordinated_broker_docker_reconcile(args)
     if args.group == "broker" and args.action == "release-compose-project-name":
         return coordinated_broker_compose_project_name_release(args)
+    if args.group == "broker" and args.action == "publish-image":
+        return coordinated_broker_publish_image(args)
     if args.group == "broker":
         return handle_broker_cli(args)
+    if args.group == "ephemeral":
+        return coordinated_ephemeral_action(args)
+    if args.group == "test" and args.action == "run":
+        profile = configured_broker_profile()
+        if profile is None:
+            raise TestHarnessError(
+                "universal test execution requires the configured host broker"
+            )
+        runner = UniversalTestRunner(
+            root=Path(canonical_project(args.project)),
+            profile=profile,
+            agent=args.agent,
+        )
+        return runner.run(
+            profile_name=args.profile,
+            group_names=args.test_groups or (),
+            selectors=args.select,
+        )
+    if args.group == "test" and args.action == "stats":
+        if not 1 <= args.days <= 3650 or not 1 <= args.limit <= 500:
+            raise ValueError("test stats require days 1-3650 and limit 1-500")
+        profile = configured_broker_profile()
+        if profile is None:
+            raise TestHarnessError(
+                "universal test statistics require the configured host broker"
+            )
+        return test_statistics(
+            profile=profile,
+            project=canonical_project(args.project),
+            days=args.days,
+            limit=args.limit,
+        )
     if args.group == "observe":
         return coordinated_observe_host(namespace_to_options(args))
     if args.group == "state" and args.action == "reset":
@@ -15560,6 +16390,90 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._request_slots.release()
+
+
+def _api_profile_identity(path: Path) -> tuple[int, int, int, int, int, int, int] | None:
+    """Capture one protected-profile publication identity without reading it."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_uid),
+        int(metadata.st_gid),
+        int(stat.S_IMODE(metadata.st_mode)),
+    )
+
+
+def _validated_api_profile_identity() -> tuple[Path, tuple[int, ...]] | None:
+    """Prove the system API can parse the exact profile identity it will watch."""
+
+    if authority_mode() != "system":
+        return None
+    path = configured_profile_path().expanduser()
+    for _attempt in range(3):
+        before = _api_profile_identity(path)
+        load_broker_profile(
+            path=path,
+            required=True,
+            allow_expired_for_ephemeral_cleanup=True,
+        )
+        after = _api_profile_identity(path)
+        if before is not None and before == after:
+            return path, after
+    raise BrokerProfileError(
+        "broker profile changed repeatedly while the coordinator API validated it"
+    )
+
+
+def _watch_api_profile_changes(
+    server: BoundedThreadingHTTPServer,
+    *,
+    path: Path,
+    baseline: tuple[int, ...],
+    stop: threading.Event,
+    poll_interval_seconds: float = API_PROFILE_RELOAD_POLL_SECONDS,
+    stable_observations: int = API_PROFILE_RELOAD_STABLE_OBSERVATIONS,
+) -> None:
+    """Restart a supervised API after one stable atomic profile publication."""
+
+    candidate: tuple[int, ...] | None = None
+    observations = 0
+    while not stop.wait(poll_interval_seconds):
+        current = _api_profile_identity(path)
+        if current == baseline:
+            candidate = None
+            observations = 0
+            continue
+        if current == candidate:
+            observations += 1
+        else:
+            candidate = current
+            observations = 1
+        if observations < stable_observations:
+            continue
+        print(
+            json.dumps(
+                {
+                    "event": "api.profile_changed",
+                    "message": (
+                        "protected broker profile changed; exiting so the "
+                        "supervisor reloads the current profile reader"
+                    ),
+                    "path": str(path),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        server.shutdown()
+        return
 
 
 def _cleanup_profile_repositories(profile: BrokerClientProfile) -> tuple[BrokerRepositoryProfile, ...]:
@@ -15968,6 +16882,7 @@ API_GET_ROUTES = frozenset(
         "/v1/servers",
         "/v1/archives",
         "/v1/events",
+        "/v1/tests",
     }
 )
 API_POST_ROUTES = frozenset(
@@ -16064,6 +16979,72 @@ def parse_event_query(raw_query: str) -> dict[str, Any]:
             f"event page limit must be an integer from 1 through {MAX_EVENT_PAGE_SIZE}"
         )
     return {"after": after, "limit": limit}
+
+
+def parse_test_stats_query(raw_query: str) -> dict[str, Any]:
+    values = parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=True,
+        max_num_fields=3,
+    )
+    if set(values) - {"project", "days", "limit"} or any(
+        len(items) != 1 for items in values.values()
+    ):
+        raise ValueError("test stats accept one project, days, and limit")
+    project = values.get("project", [""])[0].strip()
+    if not project or len(project) > 4096:
+        raise ValueError("test stats require one bounded project identity")
+    raw_days = values.get("days", ["30"])[0]
+    raw_limit = values.get("limit", ["25"])[0]
+    if not raw_days.isdigit() or not raw_limit.isdigit():
+        raise ValueError("test stats days and limit must be integers")
+    days = int(raw_days)
+    limit = int(raw_limit)
+    if not 1 <= days <= 3650 or not 1 <= limit <= 500:
+        raise ValueError("test stats require days 1-3650 and limit 1-500")
+    return {"project": project, "days": days, "limit": limit}
+
+
+def coordinated_test_statistics_read(
+    *, project: str, days: int, limit: int
+) -> dict[str, Any]:
+    """Read one repository's test projection through the active authority."""
+
+    profile = configured_broker_profile()
+    if profile is not None:
+        matches = [
+            repository
+            for repository in profile.repositories.values()
+            if repository.repo_id == project
+            or repository.canonical_root == str(Path(project).expanduser().resolve())
+        ]
+        if len(matches) != 1:
+            raise ValueError("project is not uniquely enrolled for test statistics")
+        return test_statistics(
+            profile=profile,
+            project=matches[0].canonical_root,
+            days=days,
+            limit=limit,
+        )
+
+    database_path = coordinator_home() / NORMALIZED_DATABASE_NAME
+    with AccountStore.open_default_read_only(coordinator_home()) as store:
+        with store.read_transaction() as connection:
+            row = connection.execute(
+                "SELECT repo_id FROM repositories WHERE repo_id = ? OR canonical_root = ?",
+                (project, str(Path(project).expanduser().resolve())),
+            ).fetchone()
+    if row is None:
+        raise ValueError("project is not present in Coordinator authority")
+    records = CoordinatorTestRecords(
+        database_path,
+        expected_uid=os.geteuid(),
+        busy_timeout_ms=5_000,
+    )
+    return records.stats_for_repository(
+        repo_id=str(row["repo_id"]), days=days, limit=limit
+    )
 
 
 class ApiHandler(http.server.BaseHTTPRequestHandler):
@@ -16168,6 +17149,10 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 result = coordinated_list_archives()
             elif path == "/v1/events":
                 result = coordinated_list_events(**parse_event_query(raw_query))
+            elif path == "/v1/tests":
+                result = coordinated_test_statistics_read(
+                    **parse_test_stats_query(raw_query)
+                )
             elif path == "/v1/inventory/no-docker":
                 target = parse_registration_inventory_query(raw_query)
                 # An ordinary no-Docker inventory remains a pure committed
@@ -16476,11 +17461,28 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
 def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
     clear_exec_capability_inheritance()
     host = validate_api_bind_host(host)
+    profile_watch = _validated_api_profile_identity()
     token_path = (
         Path(token_file).expanduser().absolute() if token_file else api_token_path()
     )
     token = load_or_create_api_token(token_path)
     server = BoundedThreadingHTTPServer((host, port), ApiHandler, token=token)
+    profile_watch_stop = threading.Event()
+    profile_watch_thread: threading.Thread | None = None
+    if profile_watch is not None:
+        profile_path, profile_identity = profile_watch
+        profile_watch_thread = threading.Thread(
+            target=_watch_api_profile_changes,
+            kwargs={
+                "server": server,
+                "path": profile_path,
+                "baseline": profile_identity,
+                "stop": profile_watch_stop,
+            },
+            name="devcoordinator-profile-watch",
+            daemon=True,
+        )
+        profile_watch_thread.start()
     actual_port = int(server.server_address[1])
     print(
         json.dumps(
@@ -16497,6 +17499,13 @@ def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        profile_watch_stop.set()
+        server.server_close()
+        if profile_watch_thread is not None:
+            profile_watch_thread.join(
+                timeout=API_PROFILE_RELOAD_POLL_SECONDS * 2 + 1.0
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

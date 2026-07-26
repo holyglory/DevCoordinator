@@ -85,6 +85,7 @@ test('render wiring: hidden pages unmount and every inventory-heavy surface is b
   const buildServers = extractFunction(appJs, 'function buildServers(o)');
   const serverProjectBlock = extractFunction(appJs, 'function serverProjectBlock(o, entry)');
   const buildDocker = extractFunction(appJs, 'function buildDocker(o)');
+  const dockerProjectBlock = extractFunction(appJs, 'function dockerProjectBlock(o, entry)');
   const projectNode = extractFunction(appJs, 'function projectNode(o, group, hiddenProject, revealing, hiddenServers, hiddenDocker)');
 
   assert.match(renderAll, /unmountInactiveSections\(page\)/,
@@ -97,10 +98,17 @@ test('render wiring: hidden pages unmount and every inventory-heavy surface is b
     'the expanded Servers project must not mount its complete member inventory');
   assert.doesNotMatch(buildServers, /pageSlice\(entries, ui\.resourcePages\.servers\)/,
     'Servers must not page one flat cross-project list before disclosure');
-  assert.match(buildDocker, /const requestedPage = focusIndex >= 0[\s\S]*ui\.resourcePages\.docker;/,
-    'post-restore focus may select a page only from the exact bounded Docker collection');
-  assert.match(buildDocker, /pageSlice\(entries, requestedPage\)/,
-    'Docker must not mount its complete host-wide inventory');
+  assert.match(buildDocker,
+    /for \(const entry of groups\) out\.push\(dockerProjectBlock\(o, entry\)\);/,
+    'Docker must keep every nonempty project header discoverable');
+  assert.doesNotMatch(buildDocker, /pageSlice\(entries, ui\.resourcePages\.docker\)/,
+    'Docker must not page one flat cross-project list before disclosure');
+  assert.match(buildDocker,
+    /ui\.dockerGroupsExpanded\.add\(entry\.group\.key\);[\s\S]*ui\.resourcePages\.docker = Math\.floor\(index \/ RESOURCE_PAGE_SIZE\);/,
+    'post-restore focus must open the exact Docker project and bounded member page');
+  assert.match(dockerProjectBlock,
+    /pageSlice\(entry\.entries, ui\.resourcePages\.docker\)/,
+    'the expanded Docker project must not mount its complete member inventory');
   assert.match(projectNode, /const collapsed = !ui\.treeExpanded\.has\(group\.key\);/,
     'Projects must start as the promised project collection, with members disclosed on demand');
   assert.match(projectNode, /pageSlice\(entries, ui\.resourcePages\.projects\)/,

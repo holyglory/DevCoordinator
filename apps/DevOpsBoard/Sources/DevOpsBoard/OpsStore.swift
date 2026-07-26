@@ -1571,6 +1571,11 @@ final class OpsStore: ObservableObject {
             }
             return usage
         }
+        result.testStatistics = result.testStatistics.map { statistics in
+            var statistics = statistics
+            statistics.origin = origin
+            return statistics
+        }
         return result
     }
 
@@ -1587,6 +1592,7 @@ final class OpsStore: ObservableObject {
             + inventory.backups.map(\.origin)
             + inventory.projectUsage.map(\.origin)
             + inventory.projectUsage.flatMap { $0.processes ?? [] }.map(\.origin)
+            + inventory.testStatistics.map(\.origin)
         return representedOrigins.compactMap { $0 }.allSatisfy { represented in
             guard let current = currentOrigins[represented.id] else { return false }
             return represented.label == current.label
@@ -1607,6 +1613,7 @@ final class OpsStore: ObservableObject {
         first.postgres = reconcileDockerOwnership(inventories.flatMap(\.postgres))
         first.backups = inventories.flatMap(\.backups)
         first.projectUsage = mergeProjectUsage(inventories.flatMap(\.projectUsage))
+        first.testStatistics = inventories.flatMap(\.testStatistics)
         return first
     }
 

@@ -1,6 +1,6 @@
 /* DevOps Console control panel.
  * Vanilla JS, no dependencies. Talks only to same-origin /api/*.
- * Hash-routed pages (#/projects, #/servers, #/routes, #/docker, #/ports,
+ * Hash-routed pages (#/projects, #/tests, #/servers, #/routes, #/docker, #/ports,
  * #/performance, #/access, #/invites, #/telegram)
  * share one sticky status bar. Polls GET /api/overview every 6s and
  * GET /api/metrics/history every 10s (both paused while the tab is hidden),
@@ -32,6 +32,10 @@
     invites: null,       // owner-only GET /api/access/requests payload
     telegram: null,      // GET /api/telegram payload for bots manageable by this account
     archives: null,      // owner-only GET /api/lifecycle/list ({ archives })
+    tests: null,         // selected repository's Coordinator-owned test statistics
+    testsProject: null,
+    testsDays: 30,
+    testsLoading: false,
   };
 
   const ui = {
@@ -42,6 +46,7 @@
     reveal: new Set(),     // pages currently showing their hidden items
     treeExpanded: new Set(), // project usage_keys explicitly expanded on the Projects page
     serverGroupsExpanded: new Set(), // transient Servers-page project disclosure (at most one)
+    dockerGroupsExpanded: new Set(), // transient Docker-page project disclosure (at most one)
     resourcePages: { projects: 0, servers: 0, docker: 0 }, // zero-based page per large collection
     lifecycleViews: { projects: 'active', servers: 'active', docker: 'active' },
     archiveGroupsExpanded: { projects: new Set(), servers: new Set(), docker: new Set() },
@@ -123,6 +128,15 @@
 
   function fmtClock(ms) {
     return new Date(ms).toLocaleTimeString([], { hour12: false });
+  }
+
+  function fmtSeconds(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds)) return '—';
+    if (seconds < 1) return `${Math.round(seconds * 1000)} ms`;
+    if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 2 : 1)} s`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ${Math.round(seconds % 60)}s`;
   }
 
   // Accepts an ISO string, epoch-ms number, or epoch-seconds float.
@@ -313,6 +327,7 @@
 
   const PAGES = [
     { id: 'projects', title: 'Projects' },
+    { id: 'tests', title: 'Tests' },
     { id: 'servers', title: 'Servers' },
     { id: 'routes', title: 'Routes' },
     { id: 'docker', title: 'Docker' },
@@ -358,6 +373,7 @@
     if (state.overview) renderAll(true);
     // The performance page charts use a longer history window than sparklines.
     if (page === 'performance') refreshMetrics();
+    if (page === 'tests') loadTests();
     if (page === 'access' && state.session?.accessAdmin === true) loadAccess();
     if (page === 'invites' && state.session?.accessAdmin === true) loadInvites();
     if (page === 'telegram' && state.session?.email) loadTelegram();
@@ -365,6 +381,16 @@
 
   function wireNav() {
     $('#nav-toggle').addEventListener('click', () => setNavOpen(!navOpen()));
+    $('#tests-project').addEventListener('change', (event) => {
+      state.testsProject = event.currentTarget.value;
+      state.tests = null;
+      loadTests({ force: true });
+    });
+    $('#tests-days').addEventListener('change', (event) => {
+      state.testsDays = Number(event.currentTarget.value);
+      state.tests = null;
+      loadTests({ force: true });
+    });
     window.addEventListener('hashchange', applyPage);
     document.addEventListener('pointerdown', (e) => {
       if (!navOpen()) return;
@@ -1040,12 +1066,24 @@
   let archivesCurrent = false;
   let lifecycleRefreshInFlight = false;
 
+  function lifecycleAvailable() {
+    return state.session?.accessAdmin === true && state.session?.lifecycleAvailable === true;
+  }
+
   function syncLifecycleVisibility() {
     const admin = state.session?.accessAdmin === true;
+    const available = lifecycleAvailable();
     for (const filter of document.querySelectorAll('[data-lifecycle-filter]')) {
       filter.hidden = !admin;
+      for (const button of filter.querySelectorAll('[data-lifecycle-view="archived"]')) {
+        button.disabled = !available;
+        button.title = available
+          ? 'Show archived resources'
+          : 'Archive management is not activated on this Console';
+        button.setAttribute('aria-disabled', String(!available));
+      }
     }
-    if (!admin) {
+    if (!available) {
       state.archives = null;
       archivesCurrent = false;
       for (const page of ['projects', 'servers', 'docker']) ui.lifecycleViews[page] = 'active';
@@ -1081,7 +1119,7 @@
   }
 
   async function loadArchives({ force = false } = {}) {
-    if (state.session?.accessAdmin !== true) return;
+    if (!lifecycleAvailable()) return;
     if (!force && state.archives && archivesCurrent) {
       syncLifecycleFilters();
       return;
@@ -1128,6 +1166,7 @@
 
   function setLifecycleView(page, view) {
     if (state.session?.accessAdmin !== true || !['active', 'archived'].includes(view)) return;
+    if (view === 'archived' && !lifecycleAvailable()) return;
     ui.lifecycleViews[page] = view;
     ui.resourcePages[page] = 0;
     ui.archiveGroupsExpanded[page].clear();
@@ -1168,7 +1207,7 @@
   }
 
   function archiveButton(target, { compact = false } = {}) {
-    if (state.session?.accessAdmin !== true || !target) return compact ? ghostIconSlot() : null;
+    if (!lifecycleAvailable() || !target) return compact ? ghostIconSlot() : null;
     return h('button', {
       class: compact ? 'iconbtn' : 'btn small', type: 'button',
       'data-fk': `archive:${target.target_kind}:${target.target_id}`,
@@ -1257,7 +1296,7 @@
   }
 
   function openLifecycleDialog(action, target, trigger) {
-    if (state.session?.accessAdmin !== true || !target) return;
+    if (!lifecycleAvailable() || !target) return;
     ui.lifecycleDialog = {
       action,
       target,
@@ -1500,7 +1539,10 @@
     sendHiddenDelta({ unhide: { [kind]: [key] } });
   }
 
-  const isServerRunning = (s) => s.status !== 'stopped';
+  const isServerRunning = (s) => ['running', 'starting', 'unhealthy'].includes(s.status);
+  const isOperationalServer = (s) => [
+    'running', 'starting', 'unhealthy', 'stopping', 'stopped',
+  ].includes(s.status);
   // Hide-gating and auto-unhide use "active" (anything not cleanly down):
   // a crash-looping "Restarting (1) …" container is very much running work
   // and must be neither hideable nor kept hidden.
@@ -1722,7 +1764,10 @@
     const groups = [];
     const claimedServers = new Set();
     const claimedContainers = new Set();
-    const servers = inv.servers || [];
+    // Older broker projections may include enrollment-only definitions whose
+    // only purpose is to bind a port lease ACL.  They have no concrete server
+    // lifecycle and belong to the Ports workflow, never Servers or Projects.
+    const servers = (inv.servers || []).filter(isOperationalServer);
     const containers = inv.docker?.available ? (inv.docker.containers || []) : [];
     const dbNames = new Set((inv.docker?.postgres || []).map((c) => c.name));
     const repositoriesByRoot = new Map(
@@ -1794,6 +1839,118 @@
     return (b.runningCount ? 1 : 0) - (a.runningCount ? 1 : 0)
       || String(a.name).localeCompare(String(b.name))
       || String(a.key).localeCompare(String(b.key));
+  }
+
+  // Docker ownership is a mutation boundary, not a display hint. Mirror the
+  // server-side action gate exactly: ordinary lifecycle controls require
+  // Docker labels or coordinator sidecar metadata. Broker-owned ephemeral
+  // containers are also verified, but remain read-only here because their
+  // TTL/lease state machine must be changed only through ephemeral
+  // renew/finish. This deliberately never promotes a container from its name,
+  // image or Compose-project text.
+  function containerOwnershipState(c) {
+    const rawAttribution = c?.attribution && typeof c.attribution === 'object'
+      && !Array.isArray(c.attribution) ? c.attribution : null;
+    const source = c?.metadata_source;
+    const verified = Boolean(
+      c?.project
+      && ['docker_labels', 'coordinator_sidecar', 'coordinator_ephemeral'].includes(source)
+      && !rawAttribution,
+    );
+    if (verified) {
+      const ephemeral = source === 'coordinator_ephemeral';
+      return {
+        verified: true,
+        genericLifecycle: !ephemeral,
+        ephemeral,
+        attribution: null,
+      };
+    }
+
+    const explanation = typeof rawAttribution?.explanation === 'string'
+      && rawAttribution.explanation.trim()
+      ? rawAttribution.explanation.trim()
+      : 'The coordinator could not prove one repository owner for this container.';
+    const recommendedNextStep = typeof rawAttribution?.recommended_next_step === 'string'
+      && rawAttribution.recommended_next_step.trim()
+      ? rawAttribution.recommended_next_step.trim()
+      : null;
+    return {
+      verified: false,
+      genericLifecycle: false,
+      ephemeral: false,
+      attribution: {
+        ...(rawAttribution || {}),
+        reason_code: typeof rawAttribution?.reason_code === 'string'
+          && rawAttribution.reason_code.trim()
+          ? rawAttribution.reason_code.trim()
+          : 'unverified_ownership',
+        explanation,
+        recommended_next_step: recommendedNextStep,
+        can_attach: rawAttribution?.can_attach === true,
+        can_retire: rawAttribution?.can_retire === true,
+      },
+    };
+  }
+
+  function ownershipResolutionText(attribution) {
+    if (attribution.recommended_next_step) return attribution.recommended_next_step;
+    if (attribution.can_attach && attribution.can_retire) {
+      return 'Coordinator administration can attach it to a verified project or retire it as a standalone resource.';
+    }
+    if (attribution.can_attach) {
+      return 'Coordinator administration can attach it to a verified project.';
+    }
+    if (attribution.can_retire) {
+      return 'Coordinator administration can retire it as a standalone resource.';
+    }
+    return 'Refresh or repair coordinator ownership evidence before attempting a lifecycle change.';
+  }
+
+  function unverifiedOwnershipNote(ownership) {
+    if (ownership.ephemeral) {
+      return h('span', {
+        class: 'ownership-warning ownership-managed', role: 'note',
+        'data-attribution-reason': 'coordinator_ephemeral',
+      },
+        h('span', { class: 'ownership-warning-icon', 'aria-hidden': 'true' }, icon('clock')),
+        h('span', { class: 'ownership-warning-copy' },
+          h('span', { class: 'ownership-warning-title' }, 'Coordinator-managed ephemeral'),
+          h('span', { class: 'ownership-warning-detail' },
+            'Ownership is verified. Its sealed TTL, lease and exact Docker identity are managed by the coordinator.'),
+          h('span', { class: 'ownership-warning-next' },
+            'Use the coordinator ephemeral status, renew or finish command; ordinary Docker actions are disabled.')));
+    }
+    if (ownership.verified) return null;
+    const attribution = ownership.attribution;
+    return h('span', {
+      class: 'ownership-warning', role: 'note',
+      'data-attribution-reason': attribution.reason_code,
+    },
+      h('span', { class: 'ownership-warning-icon', 'aria-hidden': 'true' }, icon('warn')),
+      h('span', { class: 'ownership-warning-copy' },
+        h('span', { class: 'ownership-warning-title' }, 'Ownership not verified'),
+        h('span', { class: 'ownership-warning-detail' }, attribution.explanation),
+        h('span', { class: 'ownership-warning-next' }, ownershipResolutionText(attribution))));
+  }
+
+  function blockedContainerAction(
+    focusKey, label, iconName, { compact = false, ephemeral = false } = {},
+  ) {
+    const reason = ephemeral
+      ? 'this broker-owned ephemeral container must use its TTL-aware lifecycle'
+      : 'container ownership is not verified';
+    return h('button', {
+      class: compact ? 'iconbtn' : `btn small ${ACTION_CLS[label.toLowerCase()] || ''}`,
+      type: 'button',
+      'data-fk': focusKey,
+      disabled: true,
+      'aria-disabled': 'true',
+      'aria-label': `${label} unavailable — ${reason}`,
+      title: ephemeral
+        ? `${label} is unavailable here; use coordinator ephemeral renew or finish`
+        : `${label} is unavailable until the coordinator proves one repository owner`,
+    }, icon(iconName), compact ? null : label);
   }
 
   const groupsByProjectPath = (o) => {
@@ -1976,6 +2133,7 @@
       state.lastFetch = Date.now();
       clearBanner('overview');
       renderAll(force);
+      if (currentPage() === 'tests') loadTests();
       if (state.session?.accessAdmin === true && state.access && accessRoutesSig !== currentAccessRoutesSig()) {
         loadAccess({ force: true });
       }
@@ -1986,7 +2144,7 @@
       // A lifecycle mutation owns one generation-ordered archive refresh and
       // awaits it before revealing the result. Starting another unawaited
       // archive read here can replace the newly focused result row.
-      if (state.session?.accessAdmin === true && !lifecycleRefreshInFlight) {
+      if (lifecycleAvailable() && !lifecycleRefreshInFlight) {
         loadArchives({ force: true });
       }
     } catch (err) {
@@ -2041,10 +2199,123 @@
     }
   }
 
+  // ---------------------------------------------------------------- test statistics
+
+  function testRepositories() {
+    return (state.overview?.inventory?.repositories || [])
+      .filter((repository) => repository && repository.repo_id)
+      .slice()
+      .sort((a, b) => String(a.display_name || a.canonical_root || a.repo_id)
+        .localeCompare(String(b.display_name || b.canonical_root || b.repo_id)));
+  }
+
+  async function loadTests({ force = false } = {}) {
+    const repositories = testRepositories();
+    const select = $('#tests-project');
+    const available = new Set(repositories.map((repository) => String(repository.repo_id)));
+    if (!state.testsProject || !available.has(state.testsProject)) {
+      state.testsProject = repositories[0]?.repo_id ?? null;
+      state.tests = null;
+    }
+    select.replaceChildren(...repositories.map((repository) => h('option', {
+      value: repository.repo_id,
+      selected: repository.repo_id === state.testsProject,
+    }, repository.display_name || projectTail(repository.canonical_root) || repository.repo_id)));
+    $('#tests-days').value = String(state.testsDays);
+    if (!state.testsProject) {
+      renderTests();
+      return;
+    }
+    if (!force && state.tests?.repo_id === state.testsProject && state.tests.days === state.testsDays) {
+      renderTests();
+      return;
+    }
+    if (state.testsLoading) return;
+    state.testsLoading = true;
+    renderTests();
+    try {
+      state.tests = await api(`/api/tests?project=${encodeURIComponent(state.testsProject)}&days=${state.testsDays}&limit=50`);
+      clearBanner('tests');
+    } catch (err) {
+      showBanner(err.message, () => loadTests({ force: true }), 'tests');
+    } finally {
+      state.testsLoading = false;
+      renderTests();
+    }
+  }
+
+  function testTable(title, headers, rows) {
+    for (const row of rows) {
+      [...row.children].forEach((cell, index) => {
+        cell.dataset.label = headers[index] || '';
+        cell.setAttribute('aria-label', `${headers[index] || 'Value'}: ${cell.textContent}`);
+      });
+    }
+    return h('section', { class: 'test-panel' },
+      h('h3', null, title),
+      rows.length === 0
+        ? h('p', { class: 'empty-inline' }, 'No recorded data in this period.')
+        : h('div', { class: 'test-table-wrap' },
+          h('table', { class: 'test-table' },
+            h('thead', null, h('tr', null, headers.map((label) => h('th', { scope: 'col' }, label)))),
+            h('tbody', null, rows))));
+  }
+
+  function renderTests() {
+    if (currentPage() !== 'tests') return;
+    const host = $('#tests-body');
+    if (state.testsLoading && !state.tests) {
+      host.replaceChildren(h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' }));
+      return;
+    }
+    const stats = state.tests;
+    if (!state.testsProject) {
+      host.replaceChildren(emptyState('No enrolled repositories are available for test statistics.'));
+      return;
+    }
+    if (!stats) {
+      host.replaceChildren(emptyState('Test statistics are unavailable.'));
+      return;
+    }
+    const summary = stats.summary || {};
+    const cards = [
+      ['Tests', summary.test_count ?? 0],
+      ['Runs', summary.run_count ?? 0],
+      ['Testing time', fmtSeconds(summary.run_seconds)],
+      ['Individual time', fmtSeconds(summary.test_seconds)],
+      ['Failed', Number(summary.failed_count || 0) + Number(summary.error_count || 0)],
+      ['Running', summary.running_count ?? 0],
+    ].map(([label, value]) => h('div', { class: 'test-stat' },
+      h('span', { class: 'test-stat-value' }, value), h('span', { class: 'test-stat-label' }, label)));
+    const dailyRows = (stats.daily || []).map((row) => h('tr', null,
+      h('td', null, row.day), h('td', null, row.test_count), h('td', null, row.run_count),
+      h('td', null, fmtSeconds(row.run_seconds)), h('td', null, fmtSeconds(row.test_seconds))));
+    const suiteRows = (stats.suites || []).map((row) => h('tr', null,
+      h('td', { class: 'mono' }, row.suite), h('td', null, row.run_count),
+      h('td', null, fmtSeconds(row.total_seconds)), h('td', null, `${Number(row.percent_of_run_time || 0).toFixed(1)}%`),
+      h('td', null, fmtSeconds(row.average_seconds))));
+    const slowRows = (stats.slow_tests || []).map((row) => h('tr', null,
+      h('td', { class: 'mono test-name' }, row.display_name || row.test_id), h('td', null, row.executions),
+      h('td', null, fmtSeconds(row.total_seconds)), h('td', null, `${Number(row.percent_of_test_time || 0).toFixed(1)}%`),
+      h('td', null, fmtSeconds(row.average_seconds)), h('td', null, row.failure_count)));
+    const recentRows = (stats.recent_runs || []).map((row) => h('tr', null,
+      h('td', null, fmtWhen(row.client_started_at)), h('td', { class: 'mono' }, row.suite),
+      h('td', null, row.run_kind), h('td', null, row.status), h('td', null, fmtSeconds(row.duration_seconds)),
+      h('td', null, row.case_count)));
+    host.replaceChildren(
+      h('div', { class: 'test-stats-grid' }, cards),
+      testTable('By day', ['Date', 'Tests', 'Runs', 'Run time', 'Test time'], dailyRows),
+      testTable('Time by test set', ['Set', 'Runs', 'Time', '% run time', 'Average'], suiteRows),
+      testTable('Individual test duration', ['Test', 'Executions', 'Time', '% test time', 'Average', 'Failures'], slowRows),
+      testTable('Recent runs', ['Started', 'Set', 'Kind', 'Result', 'Duration', 'Tests'], recentRows),
+    );
+  }
+
   // ---------------------------------------------------------------- render root
 
   const SECTION_BODY_PAGES = Object.freeze({
     'projects-body': 'projects',
+    'tests-body': 'tests',
     'routes-body': 'routes',
     'servers-body': 'servers',
     'docker-body': 'docker',
@@ -2094,6 +2365,8 @@
           coordSig),
         () => ui.lifecycleViews.projects === 'archived'
           ? buildArchivedCollection('projects') : buildProjects(o), force);
+    } else if (page === 'tests') {
+      renderTests();
     } else if (page === 'routes') {
       setSection('routes-body', sig(o.routes), () => buildRoutes(o), force);
     } else if (page === 'servers') {
@@ -2132,6 +2405,7 @@
       : 0;
     setCount('projects-count', ui.lifecycleViews.projects === 'archived'
       ? (archivesCurrent ? archivesForPage('projects').length : null) : projectGroups);
+    setCount('tests-count', state.tests?.summary?.test_count ?? null);
     setCount('routes-count', (o.routes || []).length);
     setCount('servers-count', ui.lifecycleViews.servers === 'archived'
       ? (archivesCurrent ? archivesForPage('servers').length : null)
@@ -2149,6 +2423,7 @@
     syncLifecycleFilters();
 
     setNavCount('projects', projectGroups);
+    setNavCount('tests', state.tests?.summary?.test_count ?? null);
     setNavCount('servers', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
     setNavCount('routes', (o.routes || []).length);
     setNavCount('docker', o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
@@ -2259,12 +2534,12 @@
     if (!coordOk) {
       problems.push({
         severity: 'err',
-        title: 'Coordinator unreachable',
+        title: coordinatorFailureTitle(o),
         body: () => [
           kv('URL', c.url || '—', { mono: true }),
           kv('Last OK', fmtWhen(c.lastOkAt)),
           c.lastError ? kv('Error', String(c.lastError), { mono: true }) : null,
-          h('p', { class: 'pop-hint' }, 'Servers, containers and leases cannot be managed until it answers. The console keeps retrying; in production the dedicated coordinator service is restarted by systemd. Routes to fixed ports keep working meanwhile.'),
+          h('p', { class: 'pop-hint' }, coordinatorFailureHint(o)),
           h('div', { class: 'prob-actions' },
             h('button', {
               class: 'btn small', type: 'button', 'data-fk': 'hdr-coord-retry',
@@ -2422,11 +2697,24 @@
     return e ? String(e) : 'The control engine on 127.0.0.1 did not respond.';
   }
 
+  function coordinatorFailureTitle(o) {
+    return o?.coordinator?.failureKind === 'request'
+      ? 'Coordinator request failed'
+      : 'Coordinator unreachable';
+  }
+
+  function coordinatorFailureHint(o) {
+    if (o?.coordinator?.failureKind === 'request') {
+      return 'The Console could not retrieve inventory, but this was not a network connection failure. Controls remain disabled until the reported request error is resolved; the console keeps retrying. Routes to fixed ports keep working meanwhile.';
+    }
+    return 'Servers, containers and leases cannot be managed until the Coordinator answers. The console keeps retrying; in production the dedicated coordinator service is restarted by systemd. Routes to fixed ports keep working meanwhile.';
+  }
+
   function degradedPanel(o) {
     return h('div', { class: 'degraded' },
       icon('warn'),
       h('div', null,
-        h('p', { class: 'deg-title' }, 'Coordinator unreachable'),
+        h('p', { class: 'deg-title' }, coordinatorFailureTitle(o)),
         h('p', { class: 'deg-msg' }, coordErrorText(o)),
         h('button', {
           class: 'btn small', type: 'button',
@@ -2510,14 +2798,14 @@
       'data-fk': dotKey, 'aria-haspopup': 'dialog',
       'aria-expanded': popover.key === dotKey ? 'true' : 'false',
       'aria-label': live
-        ? `Route status: serving from port ${res.port} — show details`
+        ? `Route status: serving over HTTP from port ${res.port} — show details`
         : 'Route status: not reachable — show details',
-      title: live ? `Proxying to 127.0.0.1:${res.port}` : (res?.reason || 'Not resolvable'),
+      title: live ? `Proxying to http://127.0.0.1:${res.port}` : (res?.reason || 'Not resolvable'),
       onclick: (e) => popover.toggle(dotKey, e.currentTarget, () => (
         h('div', null,
           popHead(`https://${host}`),
           kv('State', live ? 'live' : 'not reachable'),
-          live ? kv('Upstream', `127.0.0.1:${res.port}`, { mono: true }) : null,
+          live ? kv('Upstream', `http://127.0.0.1:${res.port}`, { mono: true }) : null,
           res?.serverStatus ? kv('Server status', res.serverStatus) : null,
           res?.containerStatus ? kv('Container status', res.containerStatus, { mono: true }) : null,
           !live && res?.reason ? kv('Reason', res.reason, { mono: true }) : null,
@@ -2564,8 +2852,8 @@
     const targetText = r.kind === 'port'
       ? `fixed port ${r.port}`
       : r.kind === 'docker'
-        ? `${r.containerName} · container :${r.containerPort}`
-        : `${r.serverName} · ${projectTail(r.project)}`;
+        ? `${r.containerName} · HTTP container :${r.containerPort}`
+        : `${r.serverName} · HTTP · ${projectTail(r.project)}`;
 
     return h('div', { class: 'row routes-grid' },
       h('span', { class: 'cell url-cell', 'data-label': 'URL' },
@@ -2679,7 +2967,7 @@
       sel.append(h('option', {
         value,
         selected: value === prev || undefined,
-      }, `${row.name}${row.project ? ` · ${projectTail(row.project)}` : ''} · :${row.port} (host :${row.hostPort})`));
+      }, `${row.name}${row.project ? ` · ${projectTail(row.project)}` : ''} · HTTP :${row.port} (host :${row.hostPort})`));
     }
   }
 
@@ -2977,8 +3265,8 @@
   }
 
   function buildArchivedCollection(page) {
-    if (state.session?.accessAdmin !== true) {
-      return [emptyState('Only configured Console owners can manage archived host resources.')];
+    if (!lifecycleAvailable()) {
+      return [emptyState('Archive management is not activated on this Console.')];
     }
     if (!state.archives) {
       return [
@@ -3158,9 +3446,12 @@
     const busy = ui.busy.has(`docker:${name}`);
     const meta = containerStatusMeta(c);
     const panelId = `srv-dock-panel-${name}`;
-    const archiveTarget = lifecycleTarget('container', c.host_resource_id, name, 'docker', {
-      projectId: c.repo_id || null,
-    });
+    const ownership = containerOwnershipState(c);
+    const archiveTarget = ownership.genericLifecycle
+      ? lifecycleTarget('container', c.host_resource_id, name, 'docker', {
+          projectId: c.repo_id || null,
+        })
+      : null;
 
     const chev = h('button', {
       class: `chev${open ? ' open' : ''}`, type: 'button',
@@ -3188,7 +3479,11 @@
           kv('Project', c.project || c.compose_project || '—', { mono: true }),
           c.stats ? kv('CPU now', fmtCpu(c.stats.cpu_percent)) : null,
           c.stats ? kv('Memory now', fmtBytes(Number(c.stats.memory_usage_bytes) || 0)) : null,
-          h('p', { class: 'pop-hint' }, 'This server runs as a Docker container — actions start, stop and restart the container itself.'))
+          h('p', { class: 'pop-hint' }, ownership.ephemeral
+            ? 'This is a broker-owned ephemeral container. Use its TTL-aware coordinator lifecycle.'
+            : (ownership.verified
+                ? 'This server runs as a Docker container — actions start, stop and restart the container itself.'
+                : 'This container is read-only until the coordinator proves one repository owner.')))
       )),
     }, h('span', { class: 'dot', 'aria-hidden': 'true' }), meta.label);
 
@@ -3208,8 +3503,10 @@
       : '—';
 
     const row = h('div', {
-      class: `row srv-grid expandable${hiddenRow ? ' is-hidden' : ''}`,
+      class: `row srv-grid expandable${hiddenRow ? ' is-hidden' : ''}${ownership.verified ? '' : ' ownership-unverified'}`,
       tabindex: '-1',
+      'data-ownership': ownership.ephemeral
+        ? 'coordinator-ephemeral' : (ownership.verified ? 'verified' : 'unverified'),
       'data-lifecycle-target': archiveTarget
         ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
       onclick: (e) => {
@@ -3225,7 +3522,8 @@
           h('span', { class: 'kind-tag k-dock' }, 'docker'),
           ' ',
           h('span', { class: 'dim', title: c.project || '' }, projectTail(c.project || c.compose_project))),
-        dockerSubdomainControl(o, c, 'srv')),
+        ownership.genericLifecycle ? dockerSubdomainControl(o, c, 'srv') : null,
+        unverifiedOwnershipNote(ownership)),
       h('span', { class: 'cell mono', 'data-label': 'Port' }, portCell),
       usageCellNode({
         key: `dock:${name}`,
@@ -3238,14 +3536,25 @@
       h('span', { class: 'cell', 'data-label': 'Status' }, badge),
       h('span', { 'aria-hidden': 'true' }),
       h('span', { class: 'cell actions' },
-        running
+        ownership.genericLifecycle && running
           ? [act('restart', 'Restart', 'refresh'),
              act('stop', 'Stop', 'stop', `Stop container ${name}?\n\nAnything depending on it (like a database) loses its service.`)]
-          : act('start', 'Start', 'play'),
+          : (ownership.genericLifecycle
+              ? act('start', 'Start', 'play')
+              : (running
+                  ? [blockedContainerAction(`srv-dock-restart:${name}`, 'Restart', 'refresh', { ephemeral: ownership.ephemeral }),
+                     blockedContainerAction(`srv-dock-stop:${name}`, 'Stop', 'stop', { ephemeral: ownership.ephemeral })]
+                  : blockedContainerAction(`srv-dock-start:${name}`, 'Start', 'play', { ephemeral: ownership.ephemeral }))),
         hiddenRow
           ? unhideButton('docker', name, name)
           : (!isContainerActive(c) ? hideButton('docker', name, name) : ghostIconSlot()),
-        archiveButton(archiveTarget, { compact: true })));
+        ownership.genericLifecycle
+          ? archiveButton(archiveTarget, { compact: true })
+          : (lifecycleAvailable()
+              ? blockedContainerAction(`blocked-archive:${name}`, 'Archive', 'archive', {
+                  compact: true, ephemeral: ownership.ephemeral,
+                })
+              : ghostIconSlot())));
 
     return h('div', { class: 'item' }, row, open ? dockerPanel(c, panelId) : null);
   }
@@ -3287,12 +3596,15 @@
       : h('span', { 'aria-hidden': 'true' });
 
     const stoppable = ['running', 'starting', 'unhealthy'].includes(s.status);
+    const restartable = stoppable || s.status === 'stopped';
     const actions = h('span', { class: 'cell actions' },
       h('button', {
         class: `btn small act-restart${busy ? ' is-busy' : ''}`, type: 'button',
         'data-fk': `srv-restart:${id}`,
-        disabled: (busy || s.missing_command) || undefined,
-        title: s.missing_command
+        disabled: (busy || s.missing_command || !restartable) || undefined,
+        title: !restartable
+          ? 'No observed server instance is available to restart'
+          : s.missing_command
           ? 'Registered without a start command — cannot be restarted from here'
           : `Restart ${s.name} on the same port`,
         onclick: () => runAction(`server:${id}`,
@@ -3549,11 +3861,11 @@
             value: String(op.containerPort),
             selected: op.containerPort === (current ?? options[0].containerPort) || undefined,
           }, op.hostPort === null
-            ? `container port ${op.containerPort} (not published right now)`
-            : `container port ${op.containerPort} → host :${op.hostPort}`)));
+            ? `HTTP container port ${op.containerPort} (not published right now)`
+            : `HTTP container port ${op.containerPort} → host :${op.hostPort}`)));
       } else if (options.length === 1) {
         portNote = h('p', { class: 'pop-hint' },
-          `Publishes container port ${options[0].containerPort}`
+          `Forwards HTTP to container port ${options[0].containerPort}`
           + (options[0].hostPort === null ? ' (not published right now).' : ` (host :${options[0].hostPort}).`));
       }
     }
@@ -3594,6 +3906,8 @@
       portSelect ? h('div', { class: 'sub-lab' }, 'Container port') : null,
       portSelect,
       portNote,
+      spec.portOptions ? h('p', { class: 'pop-hint protocol-note' },
+        "The Console terminates public HTTPS and forwards plain HTTP. Choose the app's HTTP listener, not its HTTPS/TLS listener.") : null,
       h('div', { class: 'sub-lab' }, 'Access'),
       seg,
       h('div', { class: 'sub-actions' }, save, remove));
@@ -3735,7 +4049,7 @@
       || String(a.name).localeCompare(String(b.name)));
     let total = 0;
     let hiddenCount = 0;
-    const entries = [];
+    const groups = [];
 
     const out = [
       h('div', { class: 'grid-head dock-grid', 'aria-hidden': 'true' },
@@ -3749,6 +4063,7 @@
       total += containers.length;
       const up = containers.filter(isContainerRunning).length;
       const extraText = `${up} of ${containers.length} up`;
+      const entries = [];
       for (const c of containers) {
         const isHidden = hidden.has(c.name);
         if (isHidden) hiddenCount += 1;
@@ -3761,34 +4076,26 @@
           webish: isWebServerContainer(o, group, c),
         });
       }
+      groups.push({ group, extraText, memberCount: containers.length, entries });
+    }
+
+    if (focus) {
+      for (const entry of groups) {
+        const index = entry.entries.findIndex((member) => lifecycleIdentityMatches(
+          focus, 'container', member.item.host_resource_id,
+        ));
+        if (index < 0) continue;
+        ui.dockerGroupsExpanded.clear();
+        ui.dockerGroupsExpanded.add(entry.group.key);
+        ui.resourcePages.docker = Math.floor(index / RESOURCE_PAGE_SIZE);
+        break;
+      }
     }
 
     if (total === 0) {
       return [emptyState('No containers found — anything started with docker run or compose shows up here.')];
     }
-    if (entries.length) {
-      const focusIndex = focus
-        ? entries.findIndex((entry) => lifecycleIdentityMatches(
-            focus, 'container', entry.item.host_resource_id,
-          ))
-        : -1;
-      const requestedPage = focusIndex >= 0
-        ? Math.floor(focusIndex / RESOURCE_PAGE_SIZE) : ui.resourcePages.docker;
-      const paged = pageSlice(entries, requestedPage);
-      ui.resourcePages.docker = paged.page;
-      let lastGroupKey = null;
-      for (const entry of paged.items) {
-        if (entry.group.key !== lastGroupKey) {
-          out.push(groupHeader(entry.group, entry.extraText));
-          lastGroupKey = entry.group.key;
-        }
-        out.push(dockerItem(o, entry.item, entry.isHidden, entry.webish));
-      }
-      const pager = resourcePager('docker', 'Containers', paged);
-      if (pager) out.push(pager);
-    } else {
-      out.push(h('p', { class: 'inline-note' }, 'Every container is hidden right now. Use the control below to reveal them.'));
-    }
+    for (const entry of groups) out.push(dockerProjectBlock(o, entry));
     if (docker.stats_error) {
       out.push(h('p', { class: 'inline-note' }, `Stats unavailable: ${docker.stats_error}`));
     }
@@ -3797,15 +4104,76 @@
     return out;
   }
 
+  // Docker mirrors the Servers accordion: every project header stays visible,
+  // while only one bounded project-local member page is mounted at a time.
+  function dockerProjectBlock(o, entry) {
+    const expanded = ui.dockerGroupsExpanded.has(entry.group.key);
+    const panelId = `dock-group-panel-${encodeURIComponent(entry.group.key)}`;
+    const usage = entry.group.row
+      ? h('span', { class: 'proj-usage mono' },
+          h('span', { class: 'u-cpu' }, fmtCpu(entry.group.row.cpu_percent)),
+          ' · ',
+          h('span', { class: 'u-mem' }, fmtBytes(entry.group.row.memory_bytes || 0)))
+      : null;
+    const usageLabel = entry.group.row
+      ? `, CPU ${fmtCpu(entry.group.row.cpu_percent)}, memory ${fmtBytes(entry.group.row.memory_bytes || 0)}`
+      : '';
+    const toggle = h('button', {
+      class: 'server-project-toggle', type: 'button',
+      'data-fk': `dock-group:${entry.group.key}`,
+      'aria-expanded': String(expanded),
+      'aria-controls': panelId,
+      'aria-label': `${expanded ? 'Collapse' : 'Expand'} ${entry.group.name}, ${entry.extraText}${usageLabel}`,
+      title: expanded ? 'Collapse container group' : 'Expand container group',
+      onclick: () => {
+        setExclusiveExpansion(ui.dockerGroupsExpanded, entry.group.key);
+        ui.resourcePages.docker = 0;
+        bump();
+        renderAll(true);
+      },
+    },
+      h('span', { class: `chev${expanded ? ' open' : ''}`, 'aria-hidden': 'true' }, icon('chevron')),
+      h('strong', { class: 'proj-name' }, entry.group.name),
+      h('span', { class: 'meta-passive server-group-count' }, entry.extraText),
+      entry.group.metricsKey ? sparkline(metricsEntity(entry.group.metricsKey)) : null,
+      usage);
+
+    const children = [];
+    if (expanded) {
+      if (entry.entries.length) {
+        const paged = pageSlice(entry.entries, ui.resourcePages.docker);
+        ui.resourcePages.docker = paged.page;
+        for (const member of paged.items) {
+          children.push(dockerItem(o, member.item, member.isHidden, member.webish));
+        }
+        const pager = resourcePager('docker', 'Project containers', paged);
+        if (pager) children.push(pager);
+      } else if (entry.memberCount > 0) {
+        children.push(h('p', { class: 'inline-note' },
+          'All containers in this resource group are hidden. Use the control below to reveal them.'));
+      }
+    }
+
+    return h('div', { class: 'server-project-block docker-project-block' },
+      h('h3', { class: `proj-head${expanded ? ' is-open' : ''}`, title: entry.group.project || '' }, toggle),
+      h('div', {
+        class: 'docker-group-items', id: panelId,
+        hidden: expanded ? undefined : true,
+      }, children));
+  }
+
   function dockerItem(o, c, hiddenRow = false, webish = false) {
     const name = c.name;
     const running = isContainerRunning(c);
     const open = ui.dockerOpen.has(name);
     const busy = ui.busy.has(`docker:${name}`);
     const panelId = `dock-panel-${name}`;
-    const archiveTarget = lifecycleTarget('container', c.host_resource_id, name, 'docker', {
-      projectId: c.repo_id || null,
-    });
+    const ownership = containerOwnershipState(c);
+    const archiveTarget = ownership.genericLifecycle
+      ? lifecycleTarget('container', c.host_resource_id, name, 'docker', {
+          projectId: c.repo_id || null,
+        })
+      : null;
 
     const dotKey = `dock-dot:${name}`;
     const dot = h('button', {
@@ -3839,8 +4207,10 @@
     }, icon(iconName), busy ? 'Working…' : label);
 
     const row = h('div', {
-      class: `row dock-grid expandable${hiddenRow ? ' is-hidden' : ''}`,
+      class: `row dock-grid expandable${hiddenRow ? ' is-hidden' : ''}${ownership.verified ? '' : ' ownership-unverified'}`,
       tabindex: '-1',
+      'data-ownership': ownership.ephemeral
+        ? 'coordinator-ephemeral' : (ownership.verified ? 'verified' : 'unverified'),
       'data-lifecycle-target': archiveTarget
         ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
       onclick: (e) => {
@@ -3853,7 +4223,8 @@
         h('strong', null, name),
         ' ',
         h('span', { class: 'dim' }, running ? 'up' : 'stopped'),
-        webish ? dockerSubdomainControl(o, c, 'dock') : null),
+        webish && ownership.genericLifecycle ? dockerSubdomainControl(o, c, 'dock') : null,
+        unverifiedOwnershipNote(ownership)),
       h('span', { class: 'cell dim mono', 'data-label': 'Image' }, c.image || '—'),
       usageCellNode({
         key: `dock:${name}`,
@@ -3864,10 +4235,15 @@
       }),
       h('span', { class: 'cell dim mono', 'data-label': 'Ports' }, c.ports || '—'),
       h('span', { class: 'cell actions' },
-        running
+        ownership.genericLifecycle && running
           ? [act('restart', 'Restart', 'refresh'),
              act('stop', 'Stop', 'stop', `Stop container ${name}?\n\nAnything depending on it (like a database) loses its service.`)]
-          : act('start', 'Start', 'play'),
+          : (ownership.genericLifecycle
+              ? act('start', 'Start', 'play')
+              : (running
+                  ? [blockedContainerAction(`dock-restart:${name}`, 'Restart', 'refresh', { ephemeral: ownership.ephemeral }),
+                     blockedContainerAction(`dock-stop:${name}`, 'Stop', 'stop', { ephemeral: ownership.ephemeral })]
+                  : blockedContainerAction(`dock-start:${name}`, 'Start', 'play', { ephemeral: ownership.ephemeral }))),
         h('button', {
           class: 'btn small', type: 'button',
           'data-fk': `dock-logs:${name}`,
@@ -3879,7 +4255,13 @@
         hiddenRow
           ? unhideButton('docker', name, name)
           : (!isContainerActive(c) ? hideButton('docker', name, name) : ghostIconSlot()),
-        archiveButton(archiveTarget, { compact: true })));
+        ownership.genericLifecycle
+          ? archiveButton(archiveTarget, { compact: true })
+          : (lifecycleAvailable()
+              ? blockedContainerAction(`blocked-archive:${name}`, 'Archive', 'archive', {
+                  compact: true, ephemeral: ownership.ephemeral,
+                })
+              : ghostIconSlot())));
 
     return h('div', { class: 'item' }, row, open ? dockerPanel(c, panelId) : null);
   }
@@ -4218,6 +4600,7 @@
     const busy = ui.busy.has(`server:${s.id}`);
     const meta = serverStatusMeta(s);
     const stopped = s.status === 'stopped';
+    const running = isServerRunning(s);
     const archiveTarget = lifecycleTarget('server', s.id, s.name || 'Unnamed server', 'servers');
     const slot = (action, label, iconName, disabled, title) => ({
       fk: `tree-srv-${action}-${label}:${s.id}`,
@@ -4254,11 +4637,11 @@
           start: slot('restart', 'Start', 'play', !stopped || s.missing_command,
             !stopped ? 'Already running'
               : (s.missing_command ? 'Registered without a start command' : `Start ${s.name} on its pinned port`)),
-          restart: slot('restart', 'Restart', 'refresh', stopped || s.missing_command,
-            stopped ? 'Not running — use Start'
+          restart: slot('restart', 'Restart', 'refresh', !running || s.missing_command,
+            !running ? 'Not running — use Start'
               : (s.missing_command ? 'Registered without a start command' : `Restart ${s.name} on the same port`)),
-          stop: slot('stop', 'Stop', 'stop', stopped,
-            stopped ? 'Already stopped' : `Stop ${s.name}`),
+          stop: slot('stop', 'Stop', 'stop', !running,
+            !running ? 'Server is not running' : `Stop ${s.name}`),
         }),
         hiddenRow
           ? unhideButton('servers', s.key, s.name || 'server')
@@ -4269,21 +4652,32 @@
   function treeContainerRow(o, c, isDb, hiddenRow, webish = false) {
     const busy = ui.busy.has(`docker:${c.name}`);
     const running = isContainerRunning(c);
-    const archiveTarget = lifecycleTarget('container', c.host_resource_id, c.name, 'docker');
+    const ownership = containerOwnershipState(c);
+    const archiveTarget = ownership.genericLifecycle
+      ? lifecycleTarget('container', c.host_resource_id, c.name, 'docker')
+      : null;
     const slot = (action, label, iconName, disabled, title, confirmText) => ({
       fk: `tree-dock-${action}:${c.name}`,
       label,
       icon: iconName,
       busy,
-      disabled,
-      title,
-      onclick: () => runAction(`docker:${c.name}`,
-        () => api('/api/docker/action', { method: 'POST', body: { name: c.name, action } }),
-        confirmText ? { confirmText } : undefined),
+      disabled: !ownership.genericLifecycle || disabled,
+      title: ownership.genericLifecycle
+        ? title
+        : (ownership.ephemeral
+            ? `${label} is unavailable here; use coordinator ephemeral renew or finish`
+            : `${label} is unavailable until the coordinator proves one repository owner`),
+      onclick: ownership.genericLifecycle
+        ? () => runAction(`docker:${c.name}`,
+            () => api('/api/docker/action', { method: 'POST', body: { name: c.name, action } }),
+            confirmText ? { confirmText } : undefined)
+        : undefined,
     });
     return h('div', {
-      class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}`,
+      class: `row tree-grid tree-item${hiddenRow ? ' is-hidden' : ''}${ownership.verified ? '' : ' ownership-unverified'}`,
       tabindex: '-1',
+      'data-ownership': ownership.ephemeral
+        ? 'coordinator-ephemeral' : (ownership.verified ? 'verified' : 'unverified'),
       'data-lifecycle-target': archiveTarget
         ? `${archiveTarget.target_kind}:${archiveTarget.target_id}` : null,
     },
@@ -4294,7 +4688,9 @@
         h('span', { class: 'tree-detail dim mono', title: c.image || '' }, c.image || ''),
         // Own wrapping block: the name line is nowrap+ellipsis and would
         // otherwise clip the chip invisible.
-        webish ? h('span', { class: 'tree-sub' }, dockerSubdomainControl(o, c, 'tree')) : null),
+        webish && ownership.genericLifecycle
+          ? h('span', { class: 'tree-sub' }, dockerSubdomainControl(o, c, 'tree')) : null,
+        unverifiedOwnershipNote(ownership)),
       usageCellNode({
         key: `dock:${c.name}`,
         title: c.name,
@@ -4320,7 +4716,13 @@
         hiddenRow
           ? unhideButton('docker', c.name, c.name)
           : (!isContainerActive(c) ? hideButton('docker', c.name, c.name) : ghostIconSlot()),
-        archiveButton(archiveTarget, { compact: true })));
+        ownership.genericLifecycle
+          ? archiveButton(archiveTarget, { compact: true })
+          : (lifecycleAvailable()
+              ? blockedContainerAction(`blocked-archive:${c.name}`, 'Archive', 'archive', {
+                  compact: true, ephemeral: ownership.ephemeral,
+                })
+              : ghostIconSlot())));
   }
 
   function projectNode(o, group, hiddenProject, revealing, hiddenServers, hiddenDocker) {
@@ -4613,7 +5015,7 @@
         if (state.session?.accessAdmin === true) loadAccess({ force: true });
         if (state.session?.accessAdmin === true) loadInvites({ force: true });
         if (state.session?.email) loadTelegram({ force: true });
-        if (state.session?.accessAdmin === true) loadArchives({ force: true });
+        if (lifecycleAvailable()) loadArchives({ force: true });
       }
     });
   }
@@ -4654,6 +5056,8 @@
         if (s.accessAdmin === true) {
           loadAccess();
           loadInvites();
+        }
+        if (lifecycleAvailable()) {
           loadArchives();
         }
         loadTelegram();
@@ -4667,6 +5071,8 @@
             if (s.accessAdmin === true) {
               loadAccess();
               loadInvites();
+            }
+            if (lifecycleAvailable()) {
               loadArchives();
             }
             loadTelegram();

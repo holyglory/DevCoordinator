@@ -29,8 +29,10 @@ import { createAccessStore } from '../src/access.mjs';
 import { createConsoleApi } from '../src/api.mjs';
 import { createStaticServer } from '../src/static.mjs';
 import { createTelegramService } from '../src/telegram.mjs';
+import { createIdentityAssertionSigner } from '../src/identity-assertion.mjs';
 
 const APP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+export const PRODUCTION_BACKGROUND_START_DELAY_MS = 90_000;
 
 const USAGE = `Usage: devops-console [options]
 
@@ -192,6 +194,18 @@ function buildProxy({ log, pages, config }) {
       res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       res.end(page?.html ?? '');
     },
+    renderUpstreamAuthFailure: (_req, res, { target }) => {
+      const page = pages.renderError({
+        status: 502,
+        title: 'Route authorization unavailable',
+        detail: `The private server credential for ${target.slug}.${config.domain} was rejected. A Console owner must synchronize that route credential with the application before access can resume.`,
+      });
+      res.writeHead(502, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(page?.html ?? '');
+    },
   });
 }
 
@@ -322,6 +336,11 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
   });
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
   const proxy = buildProxy({ log, pages, config });
+  const identitySigner = createIdentityAssertionSigner({
+    stateDir: config.stateDir,
+    issuer: config.consoleOrigin,
+  });
+  await identitySigner.load();
 
   routerRef.current = createRouter({
     config,
@@ -335,6 +354,7 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     routeStore,
     accessStore,
     upstreamAuthStore,
+    identitySigner,
     coordinator,
     proxy,
   });
@@ -372,6 +392,7 @@ export async function start({ envFile, env, overrides = {}, listenPorts } = {}) 
     coordinator,
     routeStore,
     upstreamAuthStore,
+    identitySigner,
     accessStore,
     telegram,
     close,
@@ -408,9 +429,17 @@ async function main() {
   let telegram = null;
   let proxy = null;
   let servers = null;
+  let backgroundStartTimer = null;
   const lifecycle = createProcessLifecycle({
     log,
     cleanup: () => runCleanupSteps([
+      {
+        name: 'background-start-timer',
+        run: () => {
+          if (backgroundStartTimer) clearTimeout(backgroundStartTimer);
+          backgroundStartTimer = null;
+        },
+      },
       { name: 'metrics', run: () => metrics?.stop() },
       { name: 'telegram', run: () => telegram?.stop() },
       { name: 'listeners', run: () => servers?.close() },
@@ -463,7 +492,6 @@ async function main() {
   }
 
   metrics = createMetricsStore({ config, log, coordinator });
-  metrics.start();
 
   const routeStore = createRouteStore({ file: path.join(config.stateDir, 'routes.json'), config, log });
   await routeStore.load();
@@ -490,6 +518,11 @@ async function main() {
   const staticServer = createStaticServer({ dir: path.join(APP_ROOT, 'src', 'ui'), log });
 
   proxy = buildProxy({ log, pages, config });
+  const identitySigner = createIdentityAssertionSigner({
+    stateDir: config.stateDir,
+    issuer: config.consoleOrigin,
+  });
+  await identitySigner.load();
 
   const router = createRouter({
     config,
@@ -503,12 +536,12 @@ async function main() {
     routeStore,
     accessStore,
     upstreamAuthStore,
+    identitySigner,
     coordinator,
     proxy,
   });
 
   servers = await startServers({ config, log, certManager, router });
-  await telegram.start();
 
   const scheme = config.devInsecureHttp ? 'http' : 'https';
   const publicPort = config.devInsecureHttp ? config.httpPort : config.httpsPort;
@@ -540,6 +573,17 @@ async function main() {
       required: registrationPlan.required,
     });
   }
+
+  const startBackgroundServices = async () => {
+    metrics.start();
+    await telegram.start();
+    log.info('background coordinator services started', {
+      metrics: true,
+      telegram: true,
+    });
+  };
+  if (!registrationPlan.required) await startBackgroundServices();
+
   lifecycle.markReady({
     version: config.version,
     httpsPort: servers.addresses.find((entry) => entry.name === 'https')?.port,
@@ -548,6 +592,22 @@ async function main() {
       ? registrationPlan.required ? 'required' : 'optional'
       : 'skipped',
   });
+
+  if (registrationPlan.required) {
+    log.info('background coordinator services deferred', {
+      delayMs: PRODUCTION_BACKGROUND_START_DELAY_MS,
+      reason: 'external-registration-readiness-window',
+    });
+    backgroundStartTimer = setTimeout(() => {
+      backgroundStartTimer = null;
+      void startBackgroundServices().catch((error) => {
+        log.warn('background coordinator services failed to start', {
+          error: error?.message || String(error),
+        });
+      });
+    }, PRODUCTION_BACKGROUND_START_DELAY_MS);
+    backgroundStartTimer.unref?.();
+  }
 }
 
 // Run main() only when this file is the executed entry script — importing it

@@ -367,7 +367,6 @@ export function createTelegramService({
   pollTimeoutSeconds = 25,
   pollRefreshMs = 1_000,
   dispatcherIntervalMs = 1_000,
-  observationIntervalMs = 5_000,
   requestTimeoutMs = 30_000,
   maxOutbox = MAX_OUTBOX,
 } = {}) {
@@ -388,7 +387,6 @@ export function createTelegramService({
   let dispatcherPromise = null;
   const pollers = new Map();
   const chatNextSendAt = new Map();
-  let nextObservationAt = 0;
 
   function knownTokens(extra = []) {
     return [...Object.values(state.bots).map((bot) => bot.token), ...extra].filter(Boolean);
@@ -1427,16 +1425,6 @@ export function createTelegramService({
   async function dispatchLoop(signal) {
     while (!signal.aborted) {
       if (await hasEligibleEventRecipients()) {
-        if (now() >= nextObservationAt) {
-          try {
-            await observeCoordinator();
-          } catch (error) {
-            if (isAbortError(error) && signal.aborted) return;
-            logFailure('Telegram coordinator observation failed', error);
-          } finally {
-            nextObservationAt = now() + Math.max(250, observationIntervalMs);
-          }
-        }
         try {
           let page;
           do {
@@ -1460,7 +1448,6 @@ export function createTelegramService({
   async function start() {
     await ensureLoaded();
     if (controller) return false;
-    nextObservationAt = 0;
     controller = new AbortController();
     const signal = controller.signal;
     supervisorPromise = supervisePollers(signal).catch((error) => {

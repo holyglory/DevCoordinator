@@ -11,7 +11,7 @@
     "width": 1440,
     "height": 900
   },
-  "source_sha256": "69877f5be2c3233b5b7aeb8b329e88206d4fa14a16ca15d28562045060ab91a6",
+  "source_sha256": "e95c4da5ab00c033e678799b90d410dbe9dae58cd674ef4b5b81bb2fc6320b37",
   "source_files": [
     {
       "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
@@ -31,19 +31,19 @@
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.css",
-      "sha256": "f1a60b8a2d60f614248a1127cdceac87d48505c53a7fb5ab83763159544ab438"
+      "sha256": "ed2bffdef952a213c67ca7caa14f5767fc60e8283b2f507e15f050d57e7daa77"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.js",
-      "sha256": "94ebcdf476f857d0a772bef160c68cd87614b0ddf6e6d7a387caff86c5703dab"
+      "sha256": "a78fccfed0528d4a1c311ce380617004566349e353eb47574a317a4b9e6d4e78"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/index.html",
-      "sha256": "dd9499e93cd714ce07608229e58419d2cf7d2e2be729c987e52a9abab2c4eee8"
+      "sha256": "c0530f6a1d0ed406f02261d435360b585008925f1c92d687f3c30bc2e27c57e9"
     },
     {
       "path": "apps/DevOpsConsole/test/helpers/stack.mjs",
-      "sha256": "555cfdc781ed3fb0e44e4a11dc23a7932929d3c51d61f1d70fc494caba48db28"
+      "sha256": "8384b411e83b0ff2cb7c7d775030828f53a84dcc1aedb98ba705944edaba09d0"
     },
     {
       "path": "ci/playwright/package-lock.json",

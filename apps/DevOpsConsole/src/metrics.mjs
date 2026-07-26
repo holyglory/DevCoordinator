@@ -23,7 +23,7 @@ function isContainerRunning(container) {
   return isDockerContainerRunningStatus(container?.status);
 }
 
-export function createMetricsStore({ config, log, coordinator, host, maxPoints = METRICS_MAX_POINTS } = {}) {
+export function createMetricsStore({ config, log, coordinator, host, maxPoints = METRICS_MAX_POINTS, now = () => Date.now() } = {}) {
   const mlog = typeof log?.child === 'function' ? log.child({ mod: 'metrics' }) : log;
   const intervalMs = Math.max(MIN_INTERVAL_MS, Number(config?.metricsIntervalMs) || 10_000);
   const retentionMs = maxPoints * intervalMs;
@@ -38,8 +38,12 @@ export function createMetricsStore({ config, log, coordinator, host, maxPoints =
 
   let timer = null;
   let sampling = false;
+  let observationFlight = null;
   let lastSampleAt = null;
-  let lastError = null;
+  let lastInventoryError = null;
+  let observationFailures = 0;
+  let nextObservationAt = null;
+  let lastObservationError = null;
 
   function record(key, meta, t, cpu, mem, dedupe) {
     let entity = entities.get(key);
@@ -156,39 +160,86 @@ export function createMetricsStore({ config, log, coordinator, host, maxPoints =
     }
   }
 
-  /** One sampler tick: machine health, explicit host observation, then inventory. */
+  function observationErrorMessage(error) {
+    return `host observation failed; using last committed inventory: ${error?.message ?? String(error)}`;
+  }
+
+  function currentSamplerError() {
+    if (lastObservationError && lastInventoryError) {
+      return `host observation failed: ${lastObservationError?.message ?? String(lastObservationError)}; inventory read failed: ${lastInventoryError?.message ?? String(lastInventoryError)}`;
+    }
+    if (lastInventoryError) return lastInventoryError?.message ?? String(lastInventoryError);
+    if (lastObservationError) return observationErrorMessage(lastObservationError);
+    return null;
+  }
+
+  /**
+   * Start the expensive host observation when due, without holding the
+   * lightweight host/inventory sampler lock. One flight is allowed at a time;
+   * its failure backoff begins when the failure is actually observed.
+   */
+  function startObservation(tickAt) {
+    if (observationFlight) return observationFlight;
+    if (nextObservationAt !== null && tickAt < nextObservationAt) return null;
+
+    let pending;
+    try {
+      // Invoke synchronously so an observation is initiated before this tick's
+      // pure inventory read, while deliberately not awaiting its completion.
+      pending = coordinator.observeHost({
+        agent: 'devops-console:metrics',
+        project: config.projectRoot,
+      });
+    } catch (err) {
+      pending = Promise.reject(err);
+    }
+
+    const flight = Promise.resolve(pending)
+      .then(() => {
+        observationFailures = 0;
+        nextObservationAt = null;
+        lastObservationError = null;
+      })
+      .catch((err) => {
+        // A failed observation is unknown host state, not proof that retained
+        // containers disappeared. Keep sampling the last committed inventory
+        // and back off this expensive operation from failure completion.
+        observationFailures += 1;
+        const backoffMs = Math.min(
+          300_000,
+          intervalMs * (2 ** Math.min(10, observationFailures - 1)),
+        );
+        nextObservationAt = now() + backoffMs;
+        lastObservationError = err;
+      })
+      .finally(() => {
+        if (observationFlight === flight) observationFlight = null;
+      });
+    observationFlight = flight;
+    return flight;
+  }
+
+  /** One sampler tick: machine health, non-blocking observation, then inventory. */
   async function sampleOnce() {
     if (sampling) return;
     sampling = true;
-    let observationError = null;
+    const tickAt = now();
     try {
+      // Initiate or join the observation before yielding to host sampling. If
+      // an older flight completes during that await, this tick must not start
+      // a second flight at the completion boundary.
+      startObservation(tickAt);
       // The machine reading must never depend on coordinator health.
       await sampleHost();
-      try {
-        await coordinator.observeHost({
-          agent: 'devops-console:metrics',
-          project: config.projectRoot,
-        });
-      } catch (err) {
-        // A failed observation is unknown host state, not proof that retained
-        // containers disappeared. Still read and ingest the last atomically
-        // committed inventory, but keep the failure visible to the operator.
-        observationError = err;
-      }
       const inventoryData = await coordinator.inventory({
         maxAgeMs: Math.max(1000, Math.floor(intervalMs / 2)),
       });
       ingest(inventoryData);
-      lastSampleAt = Date.now();
-      lastError = observationError
-        ? `host observation failed; using last committed inventory: ${observationError?.message ?? String(observationError)}`
-        : null;
+      lastSampleAt = now();
+      lastInventoryError = null;
     } catch (err) {
       // Coordinator down: keep the buffers, note the failure, retry next tick.
-      const inventoryError = err?.message ?? String(err);
-      lastError = observationError
-        ? `host observation failed: ${observationError?.message ?? String(observationError)}; inventory read failed: ${inventoryError}`
-        : inventoryError;
+      lastInventoryError = err;
     } finally {
       sampling = false;
     }
@@ -231,13 +282,16 @@ export function createMetricsStore({ config, log, coordinator, host, maxPoints =
     }
     out.sort((a, b) => String(a.key).localeCompare(String(b.key)));
     return {
-      now: Date.now(),
+      now: now(),
       intervalMs,
       maxPoints,
       sampler: {
         running: timer !== null,
         lastSampleAt,
-        lastError,
+        lastError: currentSamplerError(),
+        observationFailures,
+        nextObservationAt,
+        observationInFlight: observationFlight !== null,
       },
       // Latest whole-machine snapshot (cpu %, mem, load, disks, uptime);
       // its cpu/mem history rides in entities as kind:'host', key 'host'.

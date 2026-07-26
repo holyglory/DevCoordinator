@@ -8,7 +8,7 @@ import sqlite3
 from typing import Iterable
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 9
 MINIMUM_MIGRATABLE_SCHEMA_VERSION = 1
 
 
@@ -624,6 +624,177 @@ CREATE TABLE IF NOT EXISTS docker_ownership_claims (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ephemeral_container_templates (
+    template_id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    image_ref TEXT NOT NULL,
+    secret_policy_kind TEXT CHECK(secret_policy_kind IS NULL OR secret_policy_kind IN (
+        'postgres_initdb_password_file_v1'
+    )),
+    secret_binding_id TEXT,
+    definition_fingerprint TEXT NOT NULL,
+    default_ttl_seconds INTEGER NOT NULL
+        CHECK(default_ttl_seconds BETWEEN 60 AND 604800),
+    max_ttl_seconds INTEGER NOT NULL
+        CHECK(max_ttl_seconds BETWEEN default_ttl_seconds AND 604800),
+    container_tcp_port INTEGER
+        CHECK(container_tcp_port IS NULL OR container_tcp_port BETWEEN 1 AND 65535),
+    host_port_start INTEGER
+        CHECK(host_port_start IS NULL OR host_port_start BETWEEN 1 AND 65535),
+    host_port_end INTEGER
+        CHECK(host_port_end IS NULL OR host_port_end BETWEEN 1 AND 65535),
+    memory_bytes INTEGER CHECK(memory_bytes IS NULL OR memory_bytes >= 16777216),
+    cpu_millis INTEGER CHECK(cpu_millis IS NULL OR cpu_millis BETWEEN 10 AND 256000),
+    max_concurrent_runs INTEGER NOT NULL
+        CHECK(max_concurrent_runs BETWEEN 1 AND 32),
+    max_concurrent_runs_per_uid INTEGER NOT NULL
+        CHECK(max_concurrent_runs_per_uid BETWEEN 1 AND max_concurrent_runs),
+    repo_max_active_runs INTEGER NOT NULL
+        CHECK(repo_max_active_runs BETWEEN max_concurrent_runs AND 64),
+    repo_memory_budget_bytes INTEGER NOT NULL
+        CHECK(repo_memory_budget_bytes BETWEEN 16777216 AND 72057594037927936),
+    repo_cpu_budget_millis INTEGER NOT NULL
+        CHECK(repo_cpu_budget_millis BETWEEN 10 AND 16384000),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(repo_id, name),
+    CHECK(
+        (secret_policy_kind IS NULL AND secret_binding_id IS NULL)
+        OR (secret_policy_kind IS NOT NULL AND secret_binding_id IS NOT NULL)
+    ),
+    CHECK(
+        (container_tcp_port IS NULL AND host_port_start IS NULL AND host_port_end IS NULL)
+        OR
+        (container_tcp_port IS NOT NULL AND host_port_start IS NOT NULL
+         AND host_port_end IS NOT NULL AND host_port_start <= host_port_end)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS ephemeral_template_arguments (
+    template_id TEXT NOT NULL
+        REFERENCES ephemeral_container_templates(template_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    argument TEXT NOT NULL,
+    PRIMARY KEY(template_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS ephemeral_template_environment (
+    template_id TEXT NOT NULL
+        REFERENCES ephemeral_container_templates(template_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY(template_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS ephemeral_container_runs (
+    run_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE RESTRICT,
+    template_id TEXT NOT NULL
+        REFERENCES ephemeral_container_templates(template_id) ON DELETE RESTRICT,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    owner_uid INTEGER NOT NULL CHECK(owner_uid >= 0),
+    account_id TEXT NOT NULL,
+    creation_nonce TEXT NOT NULL UNIQUE,
+    container_name TEXT NOT NULL UNIQUE,
+    full_container_id TEXT UNIQUE,
+    docker_resource_id TEXT UNIQUE
+        REFERENCES docker_resources(docker_resource_id) ON DELETE SET NULL,
+    lease_id TEXT UNIQUE REFERENCES leases(lease_id) ON DELETE RESTRICT,
+    host_port INTEGER CHECK(host_port IS NULL OR host_port BETWEEN 1 AND 65535),
+    image_ref TEXT NOT NULL,
+    secret_policy_kind TEXT CHECK(secret_policy_kind IS NULL OR secret_policy_kind IN (
+        'postgres_initdb_password_file_v1'
+    )),
+    secret_binding_id TEXT,
+    memory_bytes INTEGER CHECK(memory_bytes IS NULL OR memory_bytes >= 16777216),
+    cpu_millis INTEGER CHECK(cpu_millis IS NULL OR cpu_millis BETWEEN 10 AND 256000),
+    container_tcp_port INTEGER
+        CHECK(container_tcp_port IS NULL OR container_tcp_port BETWEEN 1 AND 65535),
+    host_port_start INTEGER
+        CHECK(host_port_start IS NULL OR host_port_start BETWEEN 1 AND 65535),
+    host_port_end INTEGER
+        CHECK(host_port_end IS NULL OR host_port_end BETWEEN 1 AND 65535),
+    template_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'reserved', 'creating', 'attributed', 'starting', 'running',
+        'cleanup_pending', 'stopping', 'removing', 'cleaned',
+        'failed', 'needs_attention'
+    )),
+    phase TEXT NOT NULL,
+    max_ttl_seconds INTEGER NOT NULL
+        CHECK(max_ttl_seconds BETWEEN 60 AND 604800),
+    expires_at_epoch INTEGER NOT NULL CHECK(expires_at_epoch > 0),
+    credential_renewal_phase TEXT NOT NULL DEFAULT 'none'
+        CHECK(credential_renewal_phase IN ('none', 'prepared', 'committing')),
+    credential_renewal_old_expires_at_epoch INTEGER,
+    credential_renewal_new_expires_at_epoch INTEGER,
+    credential_renewal_operation_id TEXT,
+    next_reconcile_at_epoch INTEGER NOT NULL CHECK(next_reconcile_at_epoch >= 0),
+    recovery_failures INTEGER NOT NULL DEFAULT 0 CHECK(recovery_failures >= 0),
+    create_absence_since_epoch INTEGER
+        CHECK(create_absence_since_epoch IS NULL OR create_absence_since_epoch >= 0),
+    create_absence_observations INTEGER NOT NULL DEFAULT 0
+        CHECK(create_absence_observations >= 0),
+    generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+    cleanup_requested INTEGER NOT NULL DEFAULT 0
+        CHECK(cleanup_requested IN (0, 1)),
+    cleanup_reason TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    CHECK(
+        full_container_id IS NULL
+        OR (length(full_container_id) = 64
+            AND full_container_id NOT GLOB '*[^0-9a-f]*')
+    ),
+    CHECK(
+        (secret_policy_kind IS NULL AND secret_binding_id IS NULL)
+        OR (secret_policy_kind IS NOT NULL AND secret_binding_id IS NOT NULL)
+    ),
+    CHECK((lease_id IS NULL AND host_port IS NULL) OR (lease_id IS NOT NULL AND host_port IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS ephemeral_run_arguments (
+    run_id TEXT NOT NULL
+        REFERENCES ephemeral_container_runs(run_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    argument TEXT NOT NULL,
+    PRIMARY KEY(run_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS ephemeral_run_environment (
+    run_id TEXT NOT NULL
+        REFERENCES ephemeral_container_runs(run_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY(run_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS ephemeral_runs_for_recovery
+ON ephemeral_container_runs(status, expires_at_epoch, updated_at);
+
+CREATE INDEX IF NOT EXISTS ephemeral_runs_for_quota_admission
+ON ephemeral_container_runs(repo_id, status, template_id, owner_uid);
+
+CREATE TABLE IF NOT EXISTS ephemeral_run_phases (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL
+        REFERENCES ephemeral_container_runs(run_id) ON DELETE CASCADE,
+    phase TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'failed')),
+    evidence_json TEXT,
+    error_json TEXT,
+    recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ephemeral_run_phases_by_run
+ON ephemeral_run_phases(run_id, sequence);
+
 CREATE TABLE IF NOT EXISTS database_bindings (
     database_binding_id TEXT PRIMARY KEY,
     docker_resource_id TEXT NOT NULL REFERENCES docker_resources(docker_resource_id) ON DELETE RESTRICT,
@@ -820,6 +991,65 @@ CREATE TABLE IF NOT EXISTS events (
     occurred_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS test_runs (
+    run_id TEXT PRIMARY KEY,
+    repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE RESTRICT,
+    parent_run_id TEXT REFERENCES test_runs(run_id) ON DELETE RESTRICT,
+    owner_uid INTEGER NOT NULL CHECK(owner_uid >= 0),
+    account_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    suite TEXT NOT NULL,
+    run_kind TEXT NOT NULL CHECK(run_kind IN ('session', 'test', 'automation')),
+    selection_json TEXT NOT NULL,
+    command_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'running', 'passed', 'failed', 'cancelled', 'incomplete'
+    )),
+    client_started_at TEXT NOT NULL,
+    admitted_at TEXT NOT NULL,
+    client_finished_at TEXT,
+    recorded_finished_at TEXT,
+    duration_seconds REAL CHECK(duration_seconds IS NULL OR duration_seconds >= 0),
+    exit_code INTEGER,
+    case_count INTEGER NOT NULL DEFAULT 0 CHECK(case_count >= 0),
+    passed_count INTEGER NOT NULL DEFAULT 0 CHECK(passed_count >= 0),
+    failed_count INTEGER NOT NULL DEFAULT 0 CHECK(failed_count >= 0),
+    skipped_count INTEGER NOT NULL DEFAULT 0 CHECK(skipped_count >= 0),
+    error_count INTEGER NOT NULL DEFAULT 0 CHECK(error_count >= 0),
+    finished_operation_id TEXT UNIQUE,
+    result_fingerprint TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(parent_run_id IS NULL OR parent_run_id != run_id),
+    CHECK(
+        (status = 'running' AND client_finished_at IS NULL
+         AND recorded_finished_at IS NULL AND finished_operation_id IS NULL)
+        OR
+        (status != 'running' AND client_finished_at IS NOT NULL
+         AND recorded_finished_at IS NOT NULL AND duration_seconds IS NOT NULL
+         AND exit_code IS NOT NULL AND finished_operation_id IS NOT NULL
+         AND result_fingerprint IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS test_case_results (
+    run_id TEXT NOT NULL REFERENCES test_runs(run_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    test_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('passed', 'failed', 'skipped', 'error')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    duration_seconds REAL NOT NULL CHECK(duration_seconds >= 0),
+    PRIMARY KEY(run_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS test_runs_by_repo_time
+ON test_runs(repo_id, client_started_at DESC, run_id);
+
+CREATE INDEX IF NOT EXISTS test_cases_by_identity_time
+ON test_case_results(test_id, finished_at DESC, run_id);
+
 CREATE TABLE IF NOT EXISTS event_journal_sequences (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL UNIQUE
@@ -885,6 +1115,208 @@ def _upgrade_sha256_fingerprints_to_v4(connection: sqlite3.Connection) -> None:
                 )
 
 
+def _upgrade_ephemeral_runs_to_v6(connection: sqlite3.Connection) -> None:
+    """Add crash-recovery policy snapshots to an already-created v5 run table."""
+
+    template_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(ephemeral_container_templates)")
+    }
+    template_additions = (
+        ("max_concurrent_runs", "INTEGER NOT NULL DEFAULT 4 CHECK(max_concurrent_runs BETWEEN 1 AND 32)"),
+        ("max_concurrent_runs_per_uid", "INTEGER NOT NULL DEFAULT 2 CHECK(max_concurrent_runs_per_uid BETWEEN 1 AND max_concurrent_runs)"),
+        ("repo_max_active_runs", "INTEGER NOT NULL DEFAULT 16 CHECK(repo_max_active_runs BETWEEN max_concurrent_runs AND 64)"),
+        ("repo_memory_budget_bytes", "INTEGER NOT NULL DEFAULT 8589934592 CHECK(repo_memory_budget_bytes BETWEEN 16777216 AND 72057594037927936)"),
+        ("repo_cpu_budget_millis", "INTEGER NOT NULL DEFAULT 16000 CHECK(repo_cpu_budget_millis BETWEEN 10 AND 16384000)"),
+    )
+    for name, declaration in template_additions:
+        if name not in template_columns:
+            connection.execute(
+                f"ALTER TABLE ephemeral_container_templates ADD COLUMN {name} {declaration}"
+            )
+
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(ephemeral_container_runs)")
+    }
+    additions = (
+        (
+            "max_ttl_seconds",
+            "INTEGER NOT NULL DEFAULT 604800 CHECK(max_ttl_seconds BETWEEN 60 AND 604800)",
+        ),
+        (
+            "next_reconcile_at_epoch",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(next_reconcile_at_epoch >= 0)",
+        ),
+        (
+            "recovery_failures",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(recovery_failures >= 0)",
+        ),
+        (
+            "create_absence_since_epoch",
+            "INTEGER CHECK(create_absence_since_epoch IS NULL OR create_absence_since_epoch >= 0)",
+        ),
+        (
+            "create_absence_observations",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(create_absence_observations >= 0)",
+        ),
+        (
+            "cleanup_requested",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(cleanup_requested IN (0, 1))",
+        ),
+    )
+    for name, declaration in additions:
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE ephemeral_container_runs ADD COLUMN {name} {declaration}"
+            )
+    missing_template = connection.execute(
+        """
+        SELECT run.run_id
+        FROM ephemeral_container_runs run
+        LEFT JOIN ephemeral_container_templates template
+          ON template.template_id = run.template_id
+         AND template.repo_id = run.repo_id
+        WHERE template.template_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing_template is not None:
+        raise RuntimeError(
+            "coordinator schema v6 migration cannot seal TTL policy for "
+            f"ephemeral run {missing_template[0]} without its exact template"
+        )
+    # Version 5 did not snapshot the template maximum on each run.  The
+    # additive column's seven-day default exists only to satisfy SQLite's
+    # ALTER TABLE rules; retaining it would silently widen a one-hour template
+    # into seven days after upgrade.  Bind every retained run to the exact
+    # currently sealed template maximum before the new broker can renew it.
+    connection.execute(
+        """
+        UPDATE ephemeral_container_runs
+        SET max_ttl_seconds = (
+            SELECT template.max_ttl_seconds
+            FROM ephemeral_container_templates template
+            WHERE template.template_id = ephemeral_container_runs.template_id
+              AND template.repo_id = ephemeral_container_runs.repo_id
+        )
+        """
+    )
+
+
+def _upgrade_ephemeral_secret_policy_to_v7(connection: sqlite3.Connection) -> None:
+    """Add non-secret credential policy snapshots to ephemeral definitions/runs.
+
+    The runtime password never enters SQLite.  These nullable fields retain
+    only the reviewed policy name and an opaque binding ID so a running
+    container can be recovered without allowing reenrollment to substitute a
+    new credential contract for an already admitted run.
+    """
+
+    additions = {
+        "ephemeral_container_templates": (
+            ("secret_policy_kind", "TEXT"),
+            ("secret_binding_id", "TEXT"),
+        ),
+        "ephemeral_container_runs": (
+            ("secret_policy_kind", "TEXT"),
+            ("secret_binding_id", "TEXT"),
+        ),
+    }
+    for table, columns in additions.items():
+        current = {
+            str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for name, declaration in columns:
+            if name not in current:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    for table in additions:
+        invalid = connection.execute(
+            f"""
+            SELECT 1 FROM {table}
+            WHERE (secret_policy_kind IS NULL) != (secret_binding_id IS NULL)
+               OR (secret_policy_kind IS NOT NULL
+                   AND secret_policy_kind != 'postgres_initdb_password_file_v1')
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid is not None:
+            raise RuntimeError(
+                "coordinator schema v7 migration rejected an invalid ephemeral "
+                "secret-policy pairing"
+            )
+    # Cleanup intent must survive an attention/error status written by an old
+    # broker after a stop/remove outcome became uncertain.  Recover every
+    # unambiguous legacy intent before the upgraded broker can reconcile rows.
+    connection.execute(
+        """
+        UPDATE ephemeral_container_runs
+        SET cleanup_requested = 1
+        WHERE cleanup_requested = 0
+          AND (
+              cleanup_reason IS NOT NULL
+              OR status IN ('cleanup_pending', 'stopping', 'removing')
+          )
+        """
+    )
+
+
+def _upgrade_ephemeral_renewal_journal_to_v8(connection: sqlite3.Connection) -> None:
+    """Add durable non-secret state for an interrupted credential expiry renewal."""
+
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(ephemeral_container_runs)")
+    }
+    additions = (
+        (
+            "credential_renewal_phase",
+            "TEXT NOT NULL DEFAULT 'none' "
+            "CHECK(credential_renewal_phase IN ('none', 'prepared', 'committing'))",
+        ),
+        ("credential_renewal_old_expires_at_epoch", "INTEGER"),
+        ("credential_renewal_new_expires_at_epoch", "INTEGER"),
+        ("credential_renewal_operation_id", "TEXT"),
+    )
+    for name, declaration in additions:
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE ephemeral_container_runs ADD COLUMN {name} {declaration}"
+            )
+
+    invalid = connection.execute(
+        """
+        SELECT run_id
+        FROM ephemeral_container_runs
+        WHERE credential_renewal_phase NOT IN ('none', 'prepared', 'committing')
+           OR (
+               credential_renewal_phase = 'none'
+               AND (
+                   credential_renewal_old_expires_at_epoch IS NOT NULL
+                   OR credential_renewal_new_expires_at_epoch IS NOT NULL
+                   OR credential_renewal_operation_id IS NOT NULL
+               )
+           )
+           OR (
+               credential_renewal_phase IN ('prepared', 'committing')
+               AND (
+                   credential_renewal_old_expires_at_epoch IS NULL
+                   OR credential_renewal_old_expires_at_epoch <= 0
+                   OR credential_renewal_new_expires_at_epoch IS NULL
+                   OR credential_renewal_new_expires_at_epoch <= 0
+                   OR credential_renewal_operation_id IS NULL
+               )
+           )
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid is not None:
+        raise RuntimeError(
+            "coordinator schema v8 migration rejected an invalid ephemeral "
+            f"credential-renewal journal for run {invalid[0]}"
+        )
+
+
 def initialize_schema(
     connection: sqlite3.Connection,
     *,
@@ -927,12 +1359,20 @@ def initialize_schema(
         )
     elif MINIMUM_MIGRATABLE_SCHEMA_VERSION <= int(row[0]) < SCHEMA_VERSION:
         # Versions 2 and 3 add only additive ledgers. Version 4 additionally
-        # tags exact legacy membership/policy digests before the metadata flip.
+        # tags exact legacy membership/policy digests. Version 5 adds the
+        # broker-owned write-ahead ephemeral-container catalog and run journal;
+        # version 6 seals run TTL policy and bounded reconciliation state;
+        # version 7 adds non-secret credential policy snapshots; version 8
+        # adds non-secret interrupted-renewal recovery state; version 9 adds
+        # the repository-attributed universal test-run and case journal.
         # The caller owns one BEGIN IMMEDIATE transaction around this entire
         # function, so a malformed leftover rolls back both DDL and every
         # successfully converted fingerprint.
         previous = int(row[0])
         _upgrade_sha256_fingerprints_to_v4(connection)
+        _upgrade_ephemeral_runs_to_v6(connection)
+        _upgrade_ephemeral_secret_policy_to_v7(connection)
+        _upgrade_ephemeral_renewal_journal_to_v8(connection)
         connection.execute(
             """
             UPDATE schema_metadata SET schema_version = ?, updated_at = ?
@@ -946,17 +1386,28 @@ def initialize_schema(
         )
 
 
-def invariant_violations(connection: sqlite3.Connection) -> list[InvariantViolation]:
-    """Return human-readable violations not expressible as local constraints."""
+def invariant_violations(
+    connection: sqlite3.Connection,
+    *,
+    include_foreign_keys: bool = True,
+) -> list[InvariantViolation]:
+    """Return human-readable violations not expressible as local constraints.
+
+    Foreign-key enforcement is enabled on every coordinator connection. A full
+    ``foreign_key_check`` is therefore a maintenance verifier for pre-existing
+    corruption, not a per-mutation safety primitive; callers on short write
+    paths can omit it while still evaluating the semantic consistency checks.
+    """
 
     violations: list[InvariantViolation] = []
-    for row in connection.execute("PRAGMA foreign_key_check"):
-        violations.append(
-            InvariantViolation(
-                "foreign_key",
-                f"table={row[0]} rowid={row[1]} parent={row[2]} constraint={row[3]}",
+    if include_foreign_keys:
+        for row in connection.execute("PRAGMA foreign_key_check"):
+            violations.append(
+                InvariantViolation(
+                    "foreign_key",
+                    f"table={row[0]} rowid={row[1]} parent={row[2]} constraint={row[3]}",
+                )
             )
-        )
 
     checks: Iterable[tuple[str, str, str]] = (
         (
@@ -1054,6 +1505,26 @@ def invariant_violations(connection: sqlite3.Connection) -> list[InvariantViolat
             WHERE s.event_id IS NULL
             """,
             "durable event lacks a monotonic journal sequence",
+        ),
+        (
+            "test_run_case_count_mismatch",
+            """
+            SELECT r.run_id FROM test_runs r
+            LEFT JOIN test_case_results c USING(run_id)
+            GROUP BY r.run_id
+            HAVING r.case_count != COUNT(c.ordinal)
+                OR r.case_count != r.passed_count + r.failed_count
+                    + r.skipped_count + r.error_count
+            """,
+            "test run aggregate counts do not match its case journal",
+        ),
+        (
+            "passed_test_run_has_failure",
+            """
+            SELECT run_id FROM test_runs
+            WHERE status = 'passed' AND (failed_count != 0 OR error_count != 0)
+            """,
+            "passed test run retains failed or errored cases",
         ),
     )
     for code, sql, prefix in checks:

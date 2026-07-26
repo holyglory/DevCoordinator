@@ -27,6 +27,27 @@ class ApiError extends Error {
   }
 }
 
+// Preserve the distinction between a transport failure and an HTTP response
+// from the Coordinator. The UI must not call a reachable service
+// "unreachable" merely because that service rejected or failed a request.
+export function coordinatorOverviewView(base, error = null) {
+  if (!error) {
+    return {
+      ...base,
+      failureKind: null,
+      errorStatus: null,
+    };
+  }
+  const status = Number.isInteger(error?.status) ? error.status : 0;
+  return {
+    ...base,
+    ok: false,
+    failureKind: status > 0 ? 'request' : 'transport',
+    errorStatus: status > 0 ? status : null,
+    lastError: error?.message ?? String(error),
+  };
+}
+
 export function createConsoleApi({
   config, log, coordinator, routeStore, upstreamAuthStore, accessStore, guard, certManager, metrics, prefs,
   telegram = null,
@@ -89,6 +110,14 @@ export function createConsoleApi({
       throw new ApiError(400, `tail must be an integer between 1 and ${TAIL_MAX}`);
     }
     return n;
+  }
+
+  function boundedInteger(value, fallback, minimum, maximum, field) {
+    const raw = value === null || value === undefined || value === '' ? fallback : Number(value);
+    if (!Number.isInteger(raw) || raw < minimum || raw > maximum) {
+      throw new ApiError(400, `${field} must be an integer between ${minimum} and ${maximum}`);
+    }
+    return raw;
   }
 
   function publicUrl(slug) {
@@ -155,6 +184,13 @@ export function createConsoleApi({
     }
   }
 
+  function requireLifecycleAdmin(session) {
+    requireAccessAdmin(session);
+    if (config.lifecycleEnabled !== true) {
+      throw new ApiError(503, 'Archive management is not activated on this Console');
+    }
+  }
+
   function requireLifecycleIdentity(body) {
     const targetKind = requireString(body.target_kind, 'target_kind');
     const targetId = requireString(body.target_id, 'target_id');
@@ -215,13 +251,13 @@ export function createConsoleApi({
   }
 
   async function handleLifecycleList(res, session) {
-    requireAccessAdmin(session);
+    requireLifecycleAdmin(session);
     const result = await coordinator.lifecycleArchives();
     sendJson(res, 200, { archives: archiveRows(result) });
   }
 
   async function handleLifecyclePlan(req, res, session) {
-    requireAccessAdmin(session);
+    requireLifecycleAdmin(session);
     const body = await readJsonBody(req);
     const identity = requireLifecycleIdentity(body);
     if (!LIFECYCLE_ACTIONS.has(body.action)) {
@@ -230,8 +266,18 @@ export function createConsoleApi({
 
     if (body.action === 'archive') {
       const inventory = await coordinator.inventory({ maxAgeMs: 0 });
-      if (!activeLifecycleTarget(inventory, identity)) {
+      const active = activeLifecycleTarget(inventory, identity);
+      if (!active) {
         throw new ApiError(404, 'active lifecycle target not found');
+      }
+      if (
+        identity.target_kind === 'container'
+        && active.metadata_source === 'coordinator_ephemeral'
+      ) {
+        throw new ApiError(
+          409,
+          'broker-owned ephemeral containers must use their TTL-aware finish lifecycle',
+        );
       }
     } else {
       const archives = archiveRows(await coordinator.lifecycleArchives());
@@ -257,7 +303,7 @@ export function createConsoleApi({
   }
 
   async function handleLifecycleApply(req, res, session) {
-    requireAccessAdmin(session);
+    requireLifecycleAdmin(session);
     const body = await readJsonBody(req);
     const payload = {
       plan_id: requireString(body.plan_id, 'plan_id'),
@@ -275,7 +321,7 @@ export function createConsoleApi({
   }
 
   async function handleLifecycleRestore(req, res, session) {
-    requireAccessAdmin(session);
+    requireLifecycleAdmin(session);
     const body = await readJsonBody(req);
     const identity = requireLifecycleIdentity(body);
     const archives = archiveRows(await coordinator.lifecycleArchives());
@@ -555,9 +601,7 @@ export function createConsoleApi({
       coordErr = err;
     }
     const base = coordinator.status();
-    const coordView = coordErr
-      ? { ...base, ok: false, lastError: coordErr?.message ?? String(coordErr) }
-      : base;
+    const coordView = coordinatorOverviewView(base, coordErr);
     const routes = await routeViews();
     sendJson(res, 200, {
       console: {
@@ -772,6 +816,22 @@ export function createConsoleApi({
       }
       clog?.info?.('docker subdomain removed', { container: name, slug: existing?.slug ?? null });
       return sendJson(res, 200, { route: null });
+    }
+
+    if (container.metadata_source === 'coordinator_ephemeral') {
+      throw new ApiError(
+        409,
+        'broker-owned ephemeral containers cannot receive durable routes',
+      );
+    }
+    if (
+      !container.project
+      || !['docker_labels', 'coordinator_sidecar'].includes(container.metadata_source)
+    ) {
+      throw new ApiError(
+        400,
+        'container has no verified project ownership; register it before assigning a route',
+      );
     }
 
     const authGiven = Object.hasOwn(body, 'auth') ? body.auth : undefined;
@@ -1002,6 +1062,12 @@ export function createConsoleApi({
     const inventoryData = await coordinator.inventory({ maxAgeMs: 0 });
     const container = (inventoryData?.docker?.containers || []).find((item) => item?.name === name);
     if (!container) throw new ApiError(404, 'container not found');
+    if (container.metadata_source === 'coordinator_ephemeral') {
+      throw new ApiError(
+        409,
+        'broker-owned ephemeral containers must use ephemeral status, renew or finish',
+      );
+    }
     if (!container.project || !['docker_labels', 'coordinator_sidecar'].includes(container.metadata_source)) {
       throw new ApiError(400, 'container has no verified project ownership; register it before mutation');
     }
@@ -1094,6 +1160,12 @@ export function createConsoleApi({
       if (method === 'GET' && pathname === '/api/overview') {
         return await handleOverview(res);
       }
+      if (method === 'GET' && pathname === '/api/tests') {
+        const project = requireString(searchParams.get('project'), 'project');
+        const days = boundedInteger(searchParams.get('days'), 30, 1, 3650, 'days');
+        const limit = boundedInteger(searchParams.get('limit'), 25, 1, 500, 'limit');
+        return sendJson(res, 200, await coordinator.testStats({ project, days, limit }));
+      }
       if (method === 'GET' && pathname === '/api/metrics/history') {
         return handleMetricsHistory(res, searchParams);
       }
@@ -1104,6 +1176,7 @@ export function createConsoleApi({
           pic: session.pic ?? null,
           exp: session.exp ?? null,
           accessAdmin: accessStore.isAdmin(session.email),
+          lifecycleAvailable: config.lifecycleEnabled === true,
         });
       }
       if (method === 'GET' && pathname === '/api/access') {

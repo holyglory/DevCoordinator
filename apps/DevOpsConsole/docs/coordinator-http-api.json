@@ -27,6 +27,7 @@
       "/v1/servers",
       "/v1/archives",
       "/v1/events"
+      ,"/v1/tests"
     ],
     "POST": [
       "/v1/ports/lease",
@@ -119,6 +120,7 @@
       "lifecycle_violations",
       "observations",
       "control_bindings"
+      ,"test_statistics"
     ],
     "compatibility_projection": "v1_compatibility",
     "compatibility_policy": "legacy Console rows are nested under v1_compatibility; non-colliding legacy aliases may also appear at top level, but top-level leases and port_assignments always retain normalized lease_id/assignment_id and repo_id identities",
@@ -126,6 +128,12 @@
     "project_usage": "rows include stable usage_key plus authoritative server_ids and exact container_resource_ids; container_names remain legacy display data and are not ownership keys",
     "docker_ownership": "Compose labels and verified coordinator sidecars are mutation authority; name similarity is read-only evidence",
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"
+  },
+  "test_contract": {
+    "read": "GET /v1/tests requires one enrolled repo_id or canonical repository root plus optional days (1-3650) and limit (1-500)",
+    "ownership": "the service-owned broker database stores repository-attributed sessions, group runs, and exact individual case timings; clients never receive a database handle",
+    "inventory": "server-wide normalized inventory includes a bounded 30-day test_statistics projection per active repository for DevOps Board",
+    "privacy": "run records retain command fingerprints and selectors, never raw child output, commands, environment values, credentials, or failure payloads"
   },
   "lifecycle_contract": {
     "archives": "GET /v1/archives returns {archives:[...]}; rows carry target_kind, target_id, display_name, archived_at, reason, actor and may include project_id/parent, restorable, removable, status, retained, effects, and blockers",

@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+import errno
 import fcntl
 import grp
 import json
 import os
-from pathlib import Path
 import signal
+import socket
 import stat
 import threading
-from typing import Any, Callable
 from collections.abc import Generator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Callable
 
-from .broker import BrokerClient, BrokerError, BrokerOperation, BrokerRequest
+from .broker import (
+    BrokerClient,
+    BrokerError,
+    BrokerOperation,
+    BrokerRequest,
+    UnixBrokerServer,
+    _validate_socket_path,
+    validate_runtime_directory,
+)
 from .broker_backend import build_store_backed_broker_runtime
 from .broker_host import LocalBrokerHostMutations
 from .broker_links import BrokerLinkStore
@@ -34,12 +44,13 @@ from .store_backup import (
     restore_store_export,
 )
 
-
 BROKER_SERVICE_LOCK_NAME = ".broker-service.lock"
 
 
 @contextmanager
-def exclusive_broker_service_lock(database_path: Path) -> Generator[None, None, None]:
+def exclusive_broker_service_lock(
+    database_path: Path,
+) -> Generator[None, None, None]:
     """Hold the private lifetime lock that excludes a second broker/abandoner."""
 
     database = database_path.expanduser().absolute()
@@ -144,6 +155,14 @@ def add_broker_parser(subparsers: Any) -> None:
     enroll.add_argument("--profile-output")
     enroll.add_argument("--profile-valid-days", type=int, default=30)
     enroll.add_argument("--explicit-reinstall", action="store_true")
+    enroll.add_argument(
+        "--grant-ephemeral-image-prefetch",
+        action="store_true",
+        help=(
+            "explicitly grant cache-pull authority only for this repository's "
+            "current administrator-sealed ephemeral template images"
+        ),
+    )
     enroll.add_argument(
         "--grant-cleanup",
         action="store_true",
@@ -334,6 +353,24 @@ def add_broker_parser(subparsers: Any) -> None:
         "--compose-definition-id", required=True
     )
 
+    publish_image = actions.add_parser(
+        "publish-image",
+        help=(
+            "root-only snapshot-bound image publication; this is not exposed through "
+            "the client broker socket"
+        ),
+    )
+    publish_image.add_argument(
+        "--mode", choices=("plan", "apply", "status", "rollback"), required=True
+    )
+    publish_image.add_argument("--project", required=True)
+    publish_image.add_argument("--runtime-file")
+    publish_image.add_argument("--publication")
+    publish_image.add_argument("--operation-id")
+    publish_image.add_argument("--confirm-plan-fingerprint")
+    publish_image.add_argument("--confirm-previous-image-id")
+    _database_argument(publish_image)
+
     store_backup = actions.add_parser(
         "store-backup",
         help="create a WAL-consistent verified account or service store backup",
@@ -392,6 +429,8 @@ def add_broker_parser(subparsers: Any) -> None:
     call.add_argument("--requested-port", type=int)
     call.add_argument("--protocol", choices=("tcp", "udp"))
     call.add_argument("--ttl-seconds", type=int)
+    call.add_argument("--agent")
+    call.add_argument("--reason")
     call.add_argument("--expected-observation-revision", type=int)
     call.add_argument("--database-name")
     call.add_argument("--database-backup-id")
@@ -691,6 +730,130 @@ def serve_broker(
         )
         runtime.persistence.recover_interrupted_docker_operations()
         runtime.persistence.recover_interrupted_compose_operations()
+        runtime.backend.recover_ephemeral_runs()
+        def reclaim_stale_socket_before_admission() -> None:
+            """Reclaim only a proven-dead socket while this function holds flock.
+
+            This function is intentionally lexical to the successful service-lock
+            block. There is no issuable, mutable, or replayable capability object:
+            control reaches it only after the context manager has acquired the
+            real exclusive lock.
+            """
+
+            server = runtime.server
+            socket_path = Path(server.socket_path)
+            _validate_socket_path(socket_path)
+            runtime_info = validate_runtime_directory(
+                socket_path.parent,
+                expected_uid=server._expected_uid,
+                expected_gid=server._expected_gid,
+            )
+            if server._socket_mode & 0o060 and not (
+                stat.S_IMODE(runtime_info.st_mode) & stat.S_IXGRP
+            ):
+                raise BrokerError(
+                    "unsafe_runtime_directory",
+                    "Broker runtime directory must grant traversal to its "
+                    "configured access group.",
+                )
+            try:
+                initial = os.lstat(str(socket_path))
+            except FileNotFoundError:
+                return
+            except OSError:
+                raise BrokerError(
+                    "unsafe_socket_path",
+                    "Broker socket path could not be inspected.",
+                ) from None
+            if not (
+                stat.S_ISSOCK(initial.st_mode)
+                and initial.st_uid == server._expected_uid
+                and initial.st_gid == server._expected_gid
+                and stat.S_IMODE(initial.st_mode) == server._socket_mode
+            ):
+                raise BrokerError(
+                    "unsafe_socket_path",
+                    "Existing broker socket is not an expected service-owned "
+                    "AF_UNIX socket; it was not replaced.",
+                )
+            initial_identity = (
+                initial.st_dev,
+                initial.st_ino,
+                initial.st_ctime_ns,
+            )
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.2)
+                    probe.connect(str(socket_path))
+            except socket.timeout:
+                outcome = "timeout"
+            except BlockingIOError:
+                outcome = "would_block"
+            except OSError as error:
+                if error.errno == errno.ECONNREFUSED:
+                    outcome = "refused"
+                elif error.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    outcome = "would_block"
+                else:
+                    outcome = "error"
+            else:
+                outcome = "live"
+            if outcome == "live":
+                raise BrokerError(
+                    "socket_path_exists",
+                    "Broker socket path accepted a connection; it was not replaced.",
+                )
+            if outcome != "refused":
+                raise BrokerError(
+                    "socket_path_reclaim_unproven",
+                    "Broker socket liveness could not be proven dead; it was "
+                    "not replaced.",
+                )
+            try:
+                current = os.lstat(str(socket_path))
+            except FileNotFoundError:
+                raise BrokerError(
+                    "socket_path_reclaim_unproven",
+                    "Broker socket path changed during dead-service verification.",
+                ) from None
+            except OSError:
+                raise BrokerError(
+                    "socket_path_reclaim_unproven",
+                    "Broker socket path could not be rechecked before stale recovery.",
+                ) from None
+            runtime_after = validate_runtime_directory(
+                socket_path.parent,
+                expected_uid=server._expected_uid,
+                expected_gid=server._expected_gid,
+            )
+            current_identity = (
+                current.st_dev,
+                current.st_ino,
+                current.st_ctime_ns,
+            )
+            if (
+                not (
+                    stat.S_ISSOCK(current.st_mode)
+                    and current.st_uid == server._expected_uid
+                    and current.st_gid == server._expected_gid
+                    and stat.S_IMODE(current.st_mode) == server._socket_mode
+                )
+                or current_identity != initial_identity
+                or (runtime_after.st_dev, runtime_after.st_ino)
+                != (runtime_info.st_dev, runtime_info.st_ino)
+            ):
+                raise BrokerError(
+                    "socket_path_reclaim_unproven",
+                    "Broker socket changed during dead-service verification; it "
+                    "was not removed.",
+                )
+            try:
+                os.unlink(str(socket_path))
+            except OSError:
+                raise BrokerError(
+                    "socket_path_reclaim_failed",
+                    "Broker stale socket could not be removed.",
+                ) from None
         stop = threading.Event()
         previous: dict[int, Any] = {}
         shutdown_requested = False
@@ -712,6 +875,9 @@ def serve_broker(
             previous[signum] = signal.getsignal(signum)
             signal.signal(signum, request_stop)
         try:
+            runtime.backend.start_ephemeral_reaper()
+            if isinstance(runtime.server, UnixBrokerServer):
+                reclaim_stale_socket_before_admission()
             runtime.server.start()
             print(
                 json.dumps(
@@ -762,7 +928,64 @@ def _octal_mode(raw: str) -> int:
 def _request_arguments(
     args: argparse.Namespace, operation: BrokerOperation
 ) -> dict[str, Any]:
+    if operation is BrokerOperation.EPHEMERAL_SECRET_FD:
+        raise ValueError(
+            "ephemeral.secret_fd is in-process descriptor transport only; "
+            "the generic broker CLI never prints or forwards credentials"
+        )
     port_fields = (args.requested_port, args.protocol, args.ttl_seconds)
+    if operation in {
+        BrokerOperation.EPHEMERAL_START,
+        BrokerOperation.EPHEMERAL_STATUS,
+        BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+        BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+        BrokerOperation.EPHEMERAL_RENEW,
+        BrokerOperation.EPHEMERAL_FINISH,
+    }:
+        if (
+            args.requested_port is not None
+            or args.protocol is not None
+            or args.expected_observation_revision is not None
+            or args.database_name
+            or args.database_backup_id
+            or args.explicit
+        ):
+            raise ValueError(
+                "ephemeral operations do not accept port, Docker-observation, or database arguments"
+            )
+        if operation in {
+            BrokerOperation.EPHEMERAL_STATUS,
+            BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+        }:
+            if args.agent or args.reason or args.ttl_seconds is not None:
+                raise ValueError("ephemeral status reads accept no mutation arguments")
+            return {}
+        if not args.agent:
+            raise ValueError("ephemeral mutations require --agent")
+        result: dict[str, Any] = {"agent": str(args.agent)}
+        if operation is BrokerOperation.EPHEMERAL_START:
+            if args.reason:
+                raise ValueError("ephemeral.start does not accept --reason")
+            if args.ttl_seconds is not None:
+                result["ttl_seconds"] = int(args.ttl_seconds)
+            return result
+        if operation is BrokerOperation.EPHEMERAL_IMAGE_PREFETCH:
+            if args.reason or args.ttl_seconds is not None:
+                raise ValueError(
+                    "ephemeral.image_prefetch requires only --agent"
+                )
+            return result
+        if operation is BrokerOperation.EPHEMERAL_RENEW:
+            if args.reason or args.ttl_seconds is None:
+                raise ValueError(
+                    "ephemeral.renew requires --agent and --ttl-seconds"
+                )
+            result["ttl_seconds"] = int(args.ttl_seconds)
+            return result
+        if not args.reason or args.ttl_seconds is not None:
+            raise ValueError("ephemeral.finish requires --agent and --reason")
+        result["reason"] = str(args.reason)
+        return result
     if operation is BrokerOperation.DATABASE_BACKUP:
         if not args.database_name or args.database_backup_id or args.explicit:
             raise ValueError(
@@ -785,6 +1008,8 @@ def _request_arguments(
         }
     if args.database_name or args.database_backup_id or args.explicit:
         raise ValueError("only PostgreSQL database operations accept database arguments")
+    if args.agent or args.reason:
+        raise ValueError("only ephemeral mutations accept agent or reason arguments")
     if operation is BrokerOperation.PORT_LEASE:
         if args.expected_observation_revision is not None:
             raise ValueError("port.lease does not accept a Docker observation revision")

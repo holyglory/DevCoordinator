@@ -208,8 +208,19 @@ test('production entrypoint installs lifecycle handling before async boot and ma
   const firstAsyncBoot = source.indexOf('await createCertManager(', install);
   const registration = source.indexOf('await completeProductionRegistration(', install);
   const ready = source.indexOf('lifecycle.markReady(', registration);
+  const metricsStart = source.indexOf('metrics.start();', registration);
+  const telegramStart = source.indexOf('await telegram.start();', registration);
+  const deferredStart = source.indexOf('backgroundStartTimer = setTimeout(', ready);
   assert.ok(install >= 0 && firstAsyncBoot > install, 'lifecycle handlers must precede async resource boot');
   assert.ok(registration > firstAsyncBoot && ready > registration, 'ready marker must follow registration');
+  assert.ok(metricsStart > registration && telegramStart > registration,
+    'production background broker work must not start before self-registration');
+  assert.ok(deferredStart > ready,
+    'required production background work must begin only after the external readiness window opens');
+  assert.doesNotMatch(source.slice(install, registration), /metrics\.start\(\)|await telegram\.start\(\)/,
+    'no production background broker loop may race the registration proof');
+  assert.match(source, /PRODUCTION_BACKGROUND_START_DELAY_MS = 90_000/,
+    'the deferred window must outlast the installed 80-second registration checker');
   assert.doesNotMatch(source, /process\.on\(['"](?:uncaughtException|unhandledRejection|SIGTERM|SIGINT)/);
   assert.match(source, /directRunLifecycle\.fatal\('top-level-failure', err\)/);
 });

@@ -123,6 +123,121 @@ the service lifetime lock, that no container, network, volume, or unresolved
 operation remains and then revokes the old definition's lifecycle ACLs. Exact commands and recovery modes are documented in
 `SKILL.md`.
 
+## Broker-Owned Ephemeral Containers
+
+Short-lived containers must be declared by an administrator in the repository's
+top-level `.codex/dev-runtime.json` `ephemeral_containers` list. Each template
+pins an `image_ref` by `@sha256:`, bounds its TTL, memory, CPU, optional argv and
+environment, and may publish one TCP port only through a declared loopback port
+range. Enrollment stores the sealed definition privately and publishes only a
+template name-to-opaque-ID mapping in the protected client profile.
+
+The complete sealed shape is explicit; there are no hidden defaults for
+resource admission or concurrency:
+
+```json
+{
+  "ephemeral_containers": [
+    {
+      "name": "artifact-db",
+      "image_ref": "postgres@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "argv": ["postgres", "-c", "fsync=off"],
+      "env": {"POSTGRES_DB": "artifact_validation"},
+      "secret_policy": "postgres_initdb_password_file_v1",
+      "default_ttl_seconds": 900,
+      "max_ttl_seconds": 3600,
+      "container_tcp_port": 5432,
+      "host_port_start": 55000,
+      "host_port_end": 55010,
+      "memory_bytes": 268435456,
+      "cpu_millis": 500,
+      "max_concurrent_runs": 4,
+      "max_concurrent_runs_per_uid": 2,
+      "repo_max_active_runs": 16,
+      "repo_memory_budget_bytes": 8589934592,
+      "repo_cpu_budget_millis": 16000
+    }
+  ]
+}
+```
+
+`max_concurrent_runs` caps active runs of this template;
+`max_concurrent_runs_per_uid` caps one authenticated OS account within that
+template. The three `repo_*` values are shared repository-wide limits across
+all its templates, so every template in one repository must declare the same
+values. Admission serializes the count and the sum of each active run's sealed
+memory/CPU limits before recording a new run.
+
+Template `env` is non-secret configuration only. Its values are retained in the
+repository manifest and the service database, so enrollment rejects
+credential-looking variable names such as passwords, tokens, private keys, and
+API keys. The optional, narrowly typed
+`"secret_policy": "postgres_initdb_password_file_v1"` is the sole exception
+to the lack of a general secret manager: it accepts no credential value, path,
+token, or alternate policy from an agent, manifest, client, CLI, profile, or
+broker request. After durable broker authorization, the root-owned broker
+generates one PostgreSQL password under its private volatile runtime directory
+and mounts that material directory read-only into only the admitted container.
+It sets `POSTGRES_PASSWORD_FILE` to the fixed in-container filename; it never
+places password bytes in Docker argv, ordinary environment variables, SQLite,
+profiles, logs, or JSON replies. Public state retains only the policy name and
+an opaque binding. Ordinary CLI and generic JSON calls cannot retrieve the
+credential; the broker's internal runner path gets one read-only descriptor
+over authenticated Unix `SCM_RIGHTS`, and ambiguous delivery retries fail
+closed. Exact container-absence proof precedes material removal; a reboot that
+loses volatile material leaves the run unavailable instead of regenerating it.
+
+Agents can request lifecycle changes but cannot provide images, commands,
+environment, mounts, privileges, devices, capabilities, networks, or arbitrary
+Docker flags:
+
+```bash
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 scripts/dev_coordinator.py ephemeral start --agent "$USER" --project "$PROJECT_ROOT" --template artifact-db --ttl-seconds 1800 --operation-id START_OPERATION_UUID
+python3 scripts/dev_coordinator.py ephemeral status --project "$PROJECT_ROOT" --run-id RUN_ID
+python3 scripts/dev_coordinator.py ephemeral renew --agent "$USER" --project "$PROJECT_ROOT" --run-id RUN_ID --ttl-seconds 1800 --operation-id RENEW_OPERATION_UUID
+python3 scripts/dev_coordinator.py ephemeral finish --agent "$USER" --project "$PROJECT_ROOT" --run-id RUN_ID --reason "validation complete" --operation-id FINISH_OPERATION_UUID
+```
+
+Retain one operation UUID before every mutation. After a lost or uncertain
+reply, retry with the exact same project, target, agent, TTL/reason, and
+`--operation-id`. Omitting it creates a distinct operation; changing any input
+while reusing it is rejected.
+
+These commands fail closed without the root-provisioned broker profile. The
+explicit project selects one exact enrollment even when different repositories
+reuse a template name; status makes one read-only call in that same scope.
+Mutation `--agent` is bounded diagnostic metadata stored with the durable
+operation, while the kernel-authenticated UID and enrolled account remain the
+authorization identity.
+
+The broker records the run and an unguessable creation nonce before invoking
+`docker create`, creates it stopped, records the returned immutable 64-hex
+container ID, and only then starts it. If Docker created the container but its
+reply was lost, recovery may record it afterward only when exactly one
+container matches the precommitted run ID, creation nonce, repository ID,
+template ID, and definition fingerprint. It then verifies the sealed safety
+profile and persists the immutable ID before start or cleanup. A name match is
+never recovery evidence.
+
+An unrelated container that was started outside this protocol has no such
+precommit and cannot be auto-claimed. After a full observation, an operator may
+attach that exact immutable resource to the chosen repository with `resource
+attach`, supplying the inventory row's resource ID, control binding, immutable
+fingerprint, and ownership fingerprint. That explicit repair records ownership
+without pretending the unsafe creation window never existed.
+
+```bash
+python3 scripts/dev_coordinator.py resource attach \
+  --resource-kind container \
+  --resource-id EXACT_RESOURCE_ID \
+  --control-binding-id EXACT_BINDING_ID \
+  --immutable-fingerprint sha256:EXACT_IMMUTABLE_FINGERPRINT \
+  --ownership-fingerprint sha256:EXACT_OWNERSHIP_FINGERPRINT \
+  --project "$PROJECT_ROOT" --agent "$USER" \
+  --reason "Operator verified this existing container belongs to the repository"
+```
+
 ## What It Does Not Provide
 
 - Remote orchestration, multi-host consensus, distributed locks, or a hosted
@@ -146,6 +261,16 @@ through a proxy or shared network. Token initialization is serialized and uses
 exclusive creation, so concurrent first starts all reopen the same complete
 credential. Token reads reject symlinks, non-regular files, unsafe modes, and
 oversized content without following the caller-supplied final path.
+
+In server-wide mode, API startup parses the exact protected client-profile
+identity before binding. The long-lived process watches only that file's
+publication metadata; after two stable observations of an atomic replacement,
+it logs one `api.profile_changed` event, closes cleanly, and relies on the
+production unit's `Restart=always` policy to reload the current strict reader.
+This does not restart the broker or public Console and never logs profile
+contents. A malformed replacement therefore fails the supervised startup gate
+instead of leaving anonymous health green while every authenticated request
+returns an opaque profile error.
 
 ## Minimal Workflow
 
@@ -182,6 +307,15 @@ must match the lease. The coordinator preserves the exact ID and port and does
 not allocate a second lease. Pre-launch failure restores the manual lease;
 post-launch failure keeps it attached as cleanup/reconciliation evidence rather
 than advertising the port as safely reusable.
+
+An enrolled runtime declaration may also define an exact server identity only
+so automation can lease or pin a validation port. That definition is control
+metadata, not proof that a process exists: it remains available in normalized
+`resources.servers` and the Ports workflow, while Servers and project running
+counts require a concrete running/stopping/stopped lifecycle observation. Use
+the broker-owned `ephemeral` lifecycle for short-lived containers; a normal
+managed process must be stopped explicitly because lease TTL does not terminate
+it.
 
 ## State And Privacy
 

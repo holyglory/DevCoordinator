@@ -33,13 +33,30 @@ from .broker_persistence import (
     ComposeMutationTarget,
     DatabaseMutationTarget,
     DockerMutationTarget,
+    EphemeralImageTarget,
     RegisteredDatabaseBackup,
     StoreBackedAuthorizer,
 )
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
 from .cleanup_lifecycle import CleanupLifecycle
 from .observer import observation_owner_scope
-from .broker_host import ComposeMutationOutcomeUncertain
+from .broker_host import (
+    ComposeMutationOutcomeUncertain,
+    EphemeralDockerContainerTarget,
+    EphemeralDockerCreateTarget,
+    EphemeralDockerIdentity,
+)
+from .ephemeral_containers import (
+    EphemeralContainerCoordinator,
+    EphemeralSecretDeliveryLease,
+)
+from .ephemeral_secrets import (
+    EphemeralSecretError,
+    SecretGrantExpired,
+    SecretGrantNotFound,
+    SecretGrantReplay,
+    VolatileRunSecretManager,
+)
 from .observation_freshness import (
     FULL_DOCKER_OBSERVER_DOMAIN,
     ObservationFreshnessError,
@@ -72,6 +89,7 @@ from .repository_lifecycle import (
 )
 from .sqlite_lifecycle import SQLiteLifecyclePersistence
 from .store import AccountStore, CoordinatorStore
+from .test_records import CoordinatorTestRecords
 
 
 _LIFECYCLE_OPERATIONS = frozenset(
@@ -102,6 +120,16 @@ _COMPOSE_OPERATIONS = frozenset(
         BrokerOperation.COMPOSE_DOWN,
     }
 )
+_EPHEMERAL_OPERATIONS = frozenset(
+    {
+        BrokerOperation.EPHEMERAL_START,
+        BrokerOperation.EPHEMERAL_STATUS,
+        BrokerOperation.EPHEMERAL_IMAGE_STATUS,
+        BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+        BrokerOperation.EPHEMERAL_RENEW,
+        BrokerOperation.EPHEMERAL_FINISH,
+    }
+)
 _FULL_DOCKER_OBSERVER_DOMAIN = FULL_DOCKER_OBSERVER_DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
@@ -122,6 +150,38 @@ class TypedHostMutationAPI(Protocol):
     def docker_stop(self, target: DockerMutationTarget) -> Mapping[str, Any]: ...
 
     def docker_restart(self, target: DockerMutationTarget) -> Mapping[str, Any]: ...
+
+    def docker_inspect_ephemeral_image(
+        self, target: EphemeralImageTarget
+    ) -> Mapping[str, Any]: ...
+
+    def docker_prefetch_ephemeral_image(
+        self, target: EphemeralImageTarget
+    ) -> Mapping[str, Any]: ...
+
+    def docker_create_ephemeral(
+        self, target: EphemeralDockerCreateTarget
+    ) -> Mapping[str, Any]: ...
+
+    def docker_find_ephemeral(
+        self, identity: EphemeralDockerIdentity
+    ) -> Mapping[str, Any]: ...
+
+    def docker_inspect_ephemeral(
+        self, target: EphemeralDockerContainerTarget
+    ) -> Mapping[str, Any]: ...
+
+    def docker_start_ephemeral(
+        self, target: EphemeralDockerContainerTarget
+    ) -> Mapping[str, Any]: ...
+
+    def docker_stop_ephemeral(
+        self, target: EphemeralDockerContainerTarget
+    ) -> Mapping[str, Any]: ...
+
+    def docker_remove_ephemeral(
+        self, target: EphemeralDockerContainerTarget
+    ) -> Mapping[str, Any]: ...
 
     def compose_up(self, target: ComposeMutationTarget) -> Mapping[str, Any]: ...
 
@@ -155,6 +215,7 @@ class StoreBackedMutationBackend:
             [AccountStore], Mapping[str, Any]
         ]
         | None = None,
+        secret_manager: VolatileRunSecretManager | None = None,
     ) -> None:
         self._persistence = persistence
         self._host_mutations = host_mutations
@@ -162,16 +223,31 @@ class StoreBackedMutationBackend:
         self._observe_before_lifecycle_plan = observe_before_lifecycle_plan
         self._host_observation_shutdown = threading.Event()
         self._broker_instance_id = "broker-" + uuid.uuid4().hex
+        self._secret_manager = secret_manager or VolatileRunSecretManager(
+            expected_uid=persistence.expected_uid
+        )
+        self._ephemeral = EphemeralContainerCoordinator(
+            persistence, host_mutations, secret_manager=self._secret_manager
+        )
         self._postgres_backup_root = _private_postgres_backup_root(
             persistence.database_path, expected_uid=persistence.expected_uid
+        )
+        self._test_records = CoordinatorTestRecords(
+            persistence.database_path,
+            expected_uid=persistence.expected_uid,
+            busy_timeout_ms=persistence.busy_timeout_ms,
         )
 
     def execute(self, authorized: AuthorizedBrokerRequest) -> Mapping[str, Any]:
         request = authorized.request
+        if request.operation in _EPHEMERAL_OPERATIONS:
+            return self._ephemeral.execute(authorized)
         if request.operation == BrokerOperation.INVENTORY_READ:
             return self._persistence.inventory(authorized)
         if request.operation == BrokerOperation.EVENTS_READ:
             return self._persistence.events(authorized)
+        if request.operation == BrokerOperation.TEST_STATS_READ:
+            return self._test_records.stats(authorized)
         if request.operation == BrokerOperation.HOST_OBSERVE:
             return self._observe_committed_host(request.operation_id)
         if request.operation == BrokerOperation.REPOSITORY_LIST_REMOVED:
@@ -306,7 +382,11 @@ class StoreBackedMutationBackend:
                 )
 
         try:
-            if request.operation in {
+            if request.operation == BrokerOperation.TEST_RUN_START:
+                result = self._test_records.start(authorized)
+            elif request.operation == BrokerOperation.TEST_RUN_FINISH:
+                result = self._test_records.finish(authorized)
+            elif request.operation in {
                 BrokerOperation.CLEANUP_PLAN,
                 BrokerOperation.CLEANUP_APPLY,
                 BrokerOperation.LIFECYCLE_RESTORE,
@@ -1071,6 +1151,71 @@ class StoreBackedMutationBackend:
             broker_instance_id=self._broker_instance_id
         )
 
+    def acquire_ephemeral_secret_fd_delivery(
+        self,
+        authorized: AuthorizedBrokerRequest,
+        *,
+        template_id: str,
+        run_id: uuid.UUID,
+        request_id: uuid.UUID,
+    ) -> EphemeralSecretDeliveryLease:
+        """Acquire one volatile credential under the coordinator mutation lock.
+
+        The returned lease remains held until the socket layer closes its local
+        descriptor after SCM_RIGHTS transfer. It never serializes the value,
+        records it in an operation result, or exposes a path to a client.
+        """
+
+        request = authorized.request
+        try:
+            return self._ephemeral.acquire_secret_fd_delivery(
+                authorized,
+                template_id=template_id,
+                run_id=run_id,
+                request_id=request_id,
+            )
+        except SecretGrantReplay as exc:
+            raise BrokerError(
+                "secret_delivery_replay",
+                "The runner credential delivery was already consumed; start a new isolated validation run instead of retrying.",
+                operation_id=request.operation_id,
+            ) from exc
+        except SecretGrantExpired as exc:
+            raise BrokerError(
+                "secret_delivery_expired",
+                "The ephemeral validation run expired before its credential could be delivered.",
+                operation_id=request.operation_id,
+            ) from exc
+        except SecretGrantNotFound as exc:
+            raise BrokerError(
+                "secret_delivery_unavailable",
+                "The broker no longer has volatile credential material for this run.",
+                operation_id=request.operation_id,
+            ) from exc
+        except EphemeralSecretError as exc:
+            raise BrokerError(
+                "secret_delivery_unavailable",
+                "The broker rejected volatile credential delivery for this run.",
+                operation_id=request.operation_id,
+            ) from exc
+
+    def recover_ephemeral_runs(self) -> Mapping[str, Any]:
+        return self._ephemeral.recover_startup()
+
+    def start_ephemeral_reaper(self) -> None:
+        self._ephemeral.start_reaper()
+
+    def request_ephemeral_reaper_stop(self) -> None:
+        self._ephemeral.request_reaper_stop()
+
+    def wait_ephemeral_reaper_stopped(self, timeout_seconds: float) -> None:
+        self._ephemeral.wait_reaper_stopped(timeout_seconds)
+
+    def stop_ephemeral_reaper(self, timeout_seconds: float = 10.0) -> None:
+        """Compatibility helper; production shutdown owns a shared deadline."""
+
+        self._ephemeral.stop_reaper(timeout_seconds)
+
     @staticmethod
     def _archive_plan_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(payload)
@@ -1714,9 +1859,16 @@ class StoreBackedBrokerRuntime:
     shutdown_timeout_seconds: float = BROKER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS
 
     def begin_shutdown(self) -> int:
-        """Fence mutation admission immediately when the stop signal arrives."""
+        """Fence mutation admission and request background stop without joining."""
 
-        return self.writer.begin_shutdown()
+        try:
+            return self.writer.begin_shutdown()
+        finally:
+            # begin_shutdown() runs in the Python signal turn.  It must wake
+            # the reaper, but it must never join a thread that can be blocked
+            # in a bounded Docker host call.  close() performs that join using
+            # the one broker-wide shutdown deadline.
+            self.backend.request_ephemeral_reaper_stop()
 
     def close(self) -> None:
         """Fence all mutations, drain accepted work, then clean observation ownership."""
@@ -1746,6 +1898,17 @@ class StoreBackedBrokerRuntime:
         except BaseException as error:
             failures.append(("mutation drain", error))
             _LOGGER.exception("broker mutation drain failed")
+        try:
+            # The reaper mutates the same durable lifecycle state directly;
+            # prove it has returned only after accepted request work has had a
+            # chance to drain, and charge the join to the broker's single
+            # published shutdown deadline.
+            self.backend.wait_ephemeral_reaper_stopped(
+                max(0.0, deadline - time.monotonic())
+            )
+        except BaseException as error:
+            failures.append(("ephemeral reaper drain", error))
+            _LOGGER.exception("ephemeral reaper drain failed")
         try:
             # Accepted host observations were allowed to finalize normally.
             # This idempotent cleanup now fences direct backend observation
@@ -1811,6 +1974,7 @@ def build_store_backed_broker_runtime(
     service = BrokerService(
         StoreBackedAuthorizer(persistence),
         writer,
+        secret_fd_retriever=backend,
     )
     server = UnixBrokerServer(
         Path(socket_path),

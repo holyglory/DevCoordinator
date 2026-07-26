@@ -250,6 +250,21 @@ export function loadConfig({ envFile, env = process.env } = {}) {
     }
   }
 
+  // Destructive cleanup is a separately activated broker capability. Console
+  // ownership alone must never imply that archive/restore/purge grants and
+  // their production migration are ready.
+  const rawLifecycleEnabled = get('LIFECYCLE_ENABLED').toLowerCase();
+  let lifecycleEnabled = false;
+  if (rawLifecycleEnabled === '1' || rawLifecycleEnabled === 'true') {
+    lifecycleEnabled = true;
+  } else if (
+    rawLifecycleEnabled
+    && rawLifecycleEnabled !== '0'
+    && rawLifecycleEnabled !== 'false'
+  ) {
+    fail('LIFECYCLE_ENABLED', 'must be exactly 1, true, 0, or false');
+  }
+
   // --- misc ----------------------------------------------------------------
   const stateDir = resolveConfiguredPath(get('STATE_DIR') || 'state');
 
@@ -313,6 +328,7 @@ export function loadConfig({ envFile, env = process.env } = {}) {
     coordinatorTokenFile,
     projectRoot,
     metricsIntervalMs,
+    lifecycleEnabled,
     stateDir,
     acmeWebroot,
     logLevel,

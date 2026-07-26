@@ -1900,6 +1900,8 @@ def main() -> int:
             "DEVCOORDINATOR_AUTHORITY=account",
             "not inventory or reservation",
             "read/execute-only source ACLs",
+            "Direct access is reported as a non-fatal staged activation blocker",
+            "Registration-after-start\nis not a safe creation protocol",
         ):
             check(needle in skill_text, f"SKILL.md should retain policy text: {needle}")
 

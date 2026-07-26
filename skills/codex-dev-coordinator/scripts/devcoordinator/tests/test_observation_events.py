@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import pwd
@@ -527,6 +528,35 @@ class ObservationEventTests(unittest.TestCase):
         )
         self.assertEqual(events[2]["operation_id"], "intentional-docker-stop")
         self.assertTrue(all(item["repo_id"] == self.repo_id for item in events))
+
+    def test_first_unassigned_docker_discovery_emits_one_repository_free_event(self) -> None:
+        first = self.docker_sample(
+            "2026-07-18T11:20:00Z", status="Up 1 minute"
+        )
+        container = first["inventory"]["docker"]["containers"][0]
+        container.pop("project")
+        self.observe(first)
+
+        repeated = self.docker_sample(
+            "2026-07-18T11:21:00Z", status="Up 2 minutes"
+        )
+        repeated["inventory"]["docker"]["containers"][0].pop("project")
+        self.observe(repeated)
+
+        events = self.events()
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(
+            (event["event_kind"], event["code"]),
+            ("docker.unassigned_discovered", "docker_unassigned_discovered"),
+        )
+        self.assertIsNone(event["repo_id"])
+        diagnostic = json.loads(event["diagnostic_json"])
+        self.assertEqual(diagnostic["reason_code"], "name_only")
+        self.assertEqual(diagnostic["name"], "events-worker")
+        self.assertNotIn("repo_id", diagnostic)
+        self.assertNotIn("project", diagnostic)
+        self.assertNotIn("suggested_root", diagnostic)
 
     def test_cursor_and_broker_event_read_are_bounded_and_lossless(self) -> None:
         with AccountStore.open_default(self.home) as store:

@@ -15,7 +15,7 @@
 import { execFile, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { once } from 'node:events';
-import { promises as fsp } from 'node:fs';
+import { promises as fsp, readFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import os from 'node:os';
@@ -43,10 +43,19 @@ import { DEV_CERT, DEV_KEY, ensureDevCert } from './dev-cert.mjs';
 
 const execFileAsync = promisify(execFile);
 const INVENTORY_WIRE_SCHEMA_VERSION = 2;
-// Keep the Console's real-stack authority gate pinned to the canonical store
-// schema. Schema v4 adds the durable insertion-ordered event journal consumed
-// by Telegram notifications.
-const COORDINATOR_STORE_SCHEMA_VERSION = 4;
+// The real-stack fixture runs the Coordinator from this checkout. Read its
+// canonical schema declaration so a valid migration does not strand browser
+// verification on an obsolete duplicated number.
+const COORDINATOR_SCHEMA_SOURCE = readFileSync(path.join(
+  REPO_ROOT, 'skills', 'codex-dev-coordinator', 'scripts',
+  'devcoordinator', 'schema.py',
+), 'utf8');
+const COORDINATOR_STORE_SCHEMA_VERSION = Number(
+  COORDINATOR_SCHEMA_SOURCE.match(/^SCHEMA_VERSION\s*=\s*(\d+)$/m)?.[1],
+);
+if (!Number.isInteger(COORDINATOR_STORE_SCHEMA_VERSION)) {
+  throw new Error('canonical Coordinator store schema version is unreadable');
+}
 
 async function isOutsideGitWorktree(base) {
   let cursor = path.resolve(base);

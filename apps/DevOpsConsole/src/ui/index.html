@@ -8,8 +8,8 @@
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-<link rel="stylesheet" href="/app.css?v=4639bb41a96f">
-<script src="/app.js?v=4639bb41a96f" defer></script>
+  <link rel="stylesheet" href="/app.css?v=cd419926f435">
+  <script src="/app.js?v=cd419926f435" defer></script>
 </head>
 <body>
 
@@ -26,6 +26,7 @@
     </div>
     <nav id="site-nav" class="site-nav" aria-label="Console sections">
       <a href="#/projects" data-nav="projects">Projects <span class="nav-count" id="nav-count-projects" hidden></span></a>
+      <a href="#/tests" data-nav="tests">Tests <span class="nav-count" id="nav-count-tests" hidden></span></a>
       <a href="#/servers" data-nav="servers">Servers <span class="nav-count" id="nav-count-servers" hidden></span></a>
       <a href="#/routes" data-nav="routes">Routes <span class="nav-count" id="nav-count-routes" hidden></span></a>
       <a href="#/docker" data-nav="docker">Docker <span class="nav-count" id="nav-count-docker" hidden></span></a>
@@ -55,6 +56,30 @@
     </div>
     <div id="projects-body" class="sec-body">
       <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
+  <section id="sec-tests" class="card" data-page="tests" aria-labelledby="tests-h" hidden>
+    <div class="sec-head collection-head test-head">
+      <div>
+        <h2 id="tests-h">Tests <span class="count" id="tests-count" hidden></span></h2>
+        <p class="sec-sub">Coordinator-owned run history and exact individual-test timings, scoped to one enrolled repository.</p>
+      </div>
+      <div class="test-filters">
+        <label for="tests-project">Repository</label>
+        <select id="tests-project" aria-label="Test repository"></select>
+        <label for="tests-days">Period</label>
+        <select id="tests-days" aria-label="Test statistics period">
+          <option value="7">7 days</option>
+          <option value="30" selected>30 days</option>
+          <option value="90">90 days</option>
+          <option value="365">1 year</option>
+        </select>
+      </div>
+    </div>
+    <div id="tests-body" class="sec-body" aria-live="polite">
       <div class="skel" aria-hidden="true"></div>
       <div class="skel" aria-hidden="true"></div>
     </div>
@@ -154,6 +179,7 @@
             <label class="visually-hidden" for="rf-container">Docker container and port</label>
             <select id="rf-container"><option value="">Loading containers…</option></select>
           </div>
+          <p class="target-protocol-note">The Console terminates public HTTPS, then forwards plain HTTP to this target. Choose the app's HTTP listener, not its HTTPS/TLS listener.</p>
         </fieldset>
 
         <div class="field">

@@ -1623,6 +1623,8 @@ def _brokered_database_action(
     configured = _configured_broker_repository()
     if configured is None:
         return None
+    from devcoordinator.broker_profile import BrokerProfileError  # type: ignore[import-not-found]
+
     profile, repository = configured
     from devcoordinator.broker import BrokerOperation  # type: ignore[import-not-found]
 

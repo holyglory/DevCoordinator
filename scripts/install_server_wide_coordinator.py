@@ -12,6 +12,7 @@ drop-in containing only those clients' canonical home write exceptions.
 from __future__ import annotations
 
 import argparse
+import ast
 import grp
 import hashlib
 import json
@@ -19,6 +20,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -55,6 +57,7 @@ BROKER_UNIT_REQUIRED_SANDBOX = {
     "PrivateTmp": "PrivateTmp=true",
     "ProtectSystem": "ProtectSystem=strict",
     "ProtectHome": "ProtectHome=read-only",
+    "RuntimeDirectoryPreserve": "RuntimeDirectoryPreserve=restart",
     "ReadWritePaths": f"ReadWritePaths={BASE_READ_WRITE_PATHS}",
 }
 SKILL_SOURCE = ROOT / "skills/codex-dev-coordinator"
@@ -83,6 +86,48 @@ COMPOSE_VERSION_REQUIREMENT = "stable >=2.17,<3 or >=5,<6"
 AUTHORITY_DATABASE_PATH = Path("/var/lib/devcoordinator/coordinator.sqlite3")
 CLIENT_PROFILE_PATH = Path("/etc/devcoordinator/client-profiles.json")
 PROFILE_DATABASE_ENROLLMENT_DRIFT = "profile_database_enrollment_drift"
+DIRECT_DOCKER_SOCKET_ACCESS = "direct_client_docker_socket_access"
+DOCKER_ADMISSION_CONTRACT = "devcoordinator-docker-admission-observe-v1"
+DOCKER_SOURCE_POLICY_CONTRACT = "devcoordinator-managed-docker-source-v1"
+SYSTEM_DOCKER_SOCKET_CANDIDATES = (
+    Path("/run/docker.sock"),
+    Path("/var/run/docker.sock"),
+)
+DOCKER_SOURCE_POLICY_INTERNALS = (
+    "scripts/dev_coordinator.py",
+    "scripts/devcoordinator",
+)
+DOCKER_SOURCE_POLICY_VETTED_FIXTURES = (
+    "scripts/capability_integration_test.py",
+    "scripts/self_test.py",
+    "scripts/self_test_broker_cross_uid.py",
+    "scripts/self_test_cleanup_lifecycle.py",
+    "scripts/self_test_host_lifecycle.py",
+    "scripts/self_test_lifecycle_action_guard.py",
+    "scripts/self_test_multi_runtime.py",
+    "scripts/self_test_repository_lifecycle.py",
+    "scripts/self_test_sqlite_cutover.py",
+    "scripts/self_test_sqlite_lifecycle.py",
+    "scripts/sqlite_store_test.py",
+)
+DOCKER_COMPOSE_MUTATIONS = frozenset(
+    {
+        "build",
+        "create",
+        "down",
+        "kill",
+        "pause",
+        "pull",
+        "push",
+        "restart",
+        "rm",
+        "run",
+        "start",
+        "stop",
+        "unpause",
+        "up",
+    }
+)
 
 
 class InstallError(RuntimeError):
@@ -624,6 +669,282 @@ def capture(*arguments: str) -> bytes:
     return completed.stdout
 
 
+def _docker_mutation_operation(tokens: list[str]) -> str | None:
+    """Classify a literal raw Docker creation/Compose mutation command."""
+
+    remaining = [str(token) for token in tokens if str(token)]
+    while remaining and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", remaining[0]):
+        remaining.pop(0)
+    if remaining and Path(remaining[0]).name in {"command", "exec", "sudo"}:
+        remaining.pop(0)
+    if remaining and Path(remaining[0]).name == "env":
+        remaining.pop(0)
+        while remaining and (
+            remaining[0].startswith("-")
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", remaining[0])
+        ):
+            remaining.pop(0)
+    if not remaining or Path(remaining[0]).name != "docker":
+        return None
+    arguments = remaining[1:]
+    docker_options_with_values = {
+        "--config",
+        "--context",
+        "--host",
+        "--log-level",
+        "-c",
+        "-H",
+        "-l",
+    }
+    while arguments and arguments[0].startswith("-"):
+        option = arguments.pop(0)
+        if "=" not in option and option in docker_options_with_values and arguments:
+            arguments.pop(0)
+    if not arguments:
+        return None
+    if arguments[0] in {"create", "run"}:
+        return f"docker {arguments[0]}"
+    if arguments[0] == "compose":
+        compose_arguments = arguments[1:]
+        compose_options_with_values = {
+            "--ansi",
+            "--env-file",
+            "--file",
+            "--parallel",
+            "--profile",
+            "--progress",
+            "--project-directory",
+            "--project-name",
+            "-f",
+            "-p",
+        }
+        while compose_arguments and compose_arguments[0].startswith("-"):
+            option = compose_arguments.pop(0)
+            if (
+                "=" not in option
+                and option in compose_options_with_values
+                and compose_arguments
+            ):
+                compose_arguments.pop(0)
+        if compose_arguments and compose_arguments[0] in DOCKER_COMPOSE_MUTATIONS:
+            return f"docker compose {compose_arguments[0]}"
+    return None
+
+
+def _shell_line_docker_mutations(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("$"):
+        stripped = stripped[1:].lstrip()
+    findings: list[str] = []
+    for segment in re.split(r"(?:&&|\|\||[;|])", stripped):
+        try:
+            tokens = shlex.split(segment, comments=True, posix=True)
+        except ValueError:
+            continue
+        operation = _docker_mutation_operation(tokens)
+        if operation is not None:
+            findings.append(operation)
+    return findings
+
+
+def _shell_source_raw_docker_mutations(source: str) -> list[tuple[int, str]]:
+    findings: list[tuple[int, str]] = []
+    for line_number, raw_line in enumerate(source.splitlines(), start=1):
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        for operation in _shell_line_docker_mutations(raw_line):
+            findings.append((line_number, operation))
+    return findings
+
+
+def _python_raw_docker_mutations(source: str) -> list[tuple[int, str]]:
+    tree = ast.parse(source)
+    findings: set[tuple[int, str]] = set()
+    docker_names = {
+        "docker",
+        "docker_cli",
+        "docker_command",
+        "docker_executable",
+    }
+
+    def literal_token(node: ast.AST, *, executable: bool = False) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if executable and isinstance(node, ast.Name) and node.id in docker_names:
+            return "docker"
+        return None
+
+    for node in ast.walk(tree):
+        sequences: list[tuple[int, list[ast.AST]]] = []
+        if isinstance(node, (ast.List, ast.Tuple)):
+            sequences.append((int(node.lineno), list(node.elts)))
+        elif isinstance(node, ast.Call) and len(node.args) >= 2:
+            sequences.append((int(node.lineno), list(node.args)))
+        for line, elements in sequences:
+            values = [
+                literal_token(element, executable=index == 0)
+                for index, element in enumerate(elements)
+            ]
+            if any(value is None for value in values):
+                continue
+            operation = _docker_mutation_operation([str(value) for value in values])
+            if operation is not None:
+                findings.add((line, operation))
+
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        first = node.args[0]
+        if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+            continue
+        function_name = ""
+        if isinstance(node.func, ast.Name):
+            function_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            function_name = node.func.attr
+        if function_name not in {
+            "Popen",
+            "call",
+            "check_call",
+            "check_output",
+            "run",
+            "system",
+        }:
+            continue
+        for operation in _shell_line_docker_mutations(first.value):
+            findings.add((int(node.lineno), operation))
+    return sorted(findings)
+
+
+def _fenced_raw_docker_mutations(source: str) -> list[tuple[int, str]]:
+    findings: list[tuple[int, str]] = []
+    fence: str | None = None
+    for line_number, raw_line in enumerate(source.splitlines(), start=1):
+        marker = re.match(r"^\s*(```+|~~~+)", raw_line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token[0]
+            elif token[0] == fence:
+                fence = None
+            continue
+        if fence is None:
+            continue
+        for operation in _shell_line_docker_mutations(raw_line):
+            findings.append((line_number, operation))
+    return findings
+
+
+def _yaml_raw_docker_mutations(source: str) -> list[tuple[int, str]]:
+    """Inspect only executable YAML `run` values, not descriptive prose."""
+
+    findings: list[tuple[int, str]] = []
+    block_indent: int | None = None
+    for line_number, raw_line in enumerate(source.splitlines(), start=1):
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        if block_indent is not None:
+            if indent > block_indent:
+                for operation in _shell_line_docker_mutations(raw_line):
+                    findings.append((line_number, operation))
+                continue
+            block_indent = None
+        matched = re.match(r"^\s*(?:-\s*)?run\s*:\s*(.*)$", raw_line)
+        if not matched:
+            continue
+        value = matched.group(1).strip()
+        if value in {"|", ">", "|-", ">-", "|+", ">+"}:
+            block_indent = indent
+            continue
+        for operation in _shell_line_docker_mutations(value):
+            findings.append((line_number, operation))
+    return findings
+
+
+def managed_docker_source_policy_evidence(
+    *, skill_root: Path | None = None
+) -> dict[str, Any]:
+    """Reject raw creation paths from canonical agent-facing skill surfaces."""
+
+    source_root = require_real(
+        SKILL_SOURCE if skill_root is None else skill_root,
+        directory=True,
+    )
+    candidates: list[Path] = []
+    for relative in (Path("SKILL.md"), Path("README.md"), Path("agents/openai.yaml")):
+        path = source_root / relative
+        if not path_lexists(path):
+            raise InstallError(f"managed Docker policy source is missing: {path}")
+        candidates.append(path)
+    scripts_root = require_real(source_root / "scripts", directory=True)
+    for path in sorted(scripts_root.iterdir(), key=os.fspath):
+        if path.suffix not in {".bash", ".py", ".sh"}:
+            continue
+        relative = path.relative_to(source_root).as_posix()
+        if relative in DOCKER_SOURCE_POLICY_VETTED_FIXTURES:
+            continue
+        candidates.append(path)
+
+    findings: list[dict[str, Any]] = []
+    checked: list[str] = []
+    for path in sorted(set(candidates), key=os.fspath):
+        relative = path.relative_to(source_root).as_posix()
+        if relative == DOCKER_SOURCE_POLICY_INTERNALS[0] or relative.startswith(
+            f"{DOCKER_SOURCE_POLICY_INTERNALS[1]}/"
+        ):
+            continue
+        try:
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise InstallError(f"managed Docker policy source is unsafe: {path}")
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise InstallError(
+                f"managed Docker policy source cannot be read: {path}: {error}"
+            ) from error
+        checked.append(relative)
+        try:
+            if path.suffix == ".py":
+                located = _python_raw_docker_mutations(source)
+            elif path.suffix in {".bash", ".sh"}:
+                located = _shell_source_raw_docker_mutations(source)
+            elif path.suffix in {".yaml", ".yml"}:
+                located = _yaml_raw_docker_mutations(source)
+            else:
+                located = _fenced_raw_docker_mutations(source)
+        except SyntaxError as error:
+            raise InstallError(
+                f"managed Docker policy Python source does not parse: {path}: {error}"
+            ) from error
+        for line, operation in located:
+            findings.append(
+                {"path": relative, "line": int(line), "operation": operation}
+            )
+    return {
+        "ok": not findings,
+        "contract": DOCKER_SOURCE_POLICY_CONTRACT,
+        "scope": "canonical_agent_facing_coordinator_skill",
+        "checked_files": checked,
+        "excluded_coordinator_internals": list(DOCKER_SOURCE_POLICY_INTERNALS),
+        "excluded_vetted_fixtures": list(DOCKER_SOURCE_POLICY_VETTED_FIXTURES),
+        "findings": findings,
+    }
+
+
+def require_managed_docker_source_policy() -> dict[str, Any]:
+    evidence = managed_docker_source_policy_evidence()
+    if not evidence["ok"]:
+        summary = ", ".join(
+            f"{item['path']}:{item['line']} ({item['operation']})"
+            for item in evidence["findings"]
+        )
+        raise InstallError(
+            "raw Docker creation or Compose mutation is forbidden in canonical "
+            f"agent-facing source; use a typed coordinator operation: {summary}"
+        )
+    return evidence
+
+
 def client_records(names: list[str]) -> list[Any]:
     if not names:
         raise InstallError("at least one explicit --client-user is required")
@@ -636,6 +957,387 @@ def client_records(names: list[str]) -> list[Any]:
         home = require_real(Path(record.pw_dir), directory=True)
         records.append((record, home))
     return records
+
+
+def _parse_posix_acl(payload: str) -> dict[tuple[str, str], frozenset[str]]:
+    entries: dict[tuple[str, str], frozenset[str]] = {}
+    for raw_line in payload.splitlines():
+        line = raw_line.partition("#")[0].strip()
+        if not line or line.startswith("default:"):
+            continue
+        parts = line.split(":")
+        if len(parts) != 3 or parts[0] not in {"user", "group", "mask", "other"}:
+            raise ValueError(f"unexpected ACL entry: {raw_line}")
+        tag, qualifier, permissions = parts
+        if not re.fullmatch(r"[r-][w-][x-]", permissions):
+            raise ValueError(f"unexpected ACL permissions: {raw_line}")
+        key = (tag, qualifier)
+        if key in entries:
+            raise ValueError(f"duplicate ACL entry: {raw_line}")
+        entries[key] = frozenset(value for value in permissions if value != "-")
+    for required in (("user", ""), ("group", ""), ("other", "")):
+        if required not in entries:
+            raise ValueError(f"ACL is missing {required[0]}::")
+    return entries
+
+
+def _read_posix_acl(
+    path: Path,
+) -> tuple[dict[tuple[str, str], frozenset[str]] | None, str | None]:
+    resolved = shutil.which("getfacl")
+    if not resolved:
+        return None, "getfacl_unavailable"
+    try:
+        completed = subprocess.run(
+            [resolved, "--absolute-names", "--numeric", "--omit-header", str(path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={"LC_ALL": "C", "PATH": RUNTIME_DEPENDENCY_ENVIRONMENT["PATH"]},
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "acl_observation_unavailable"
+    if completed.returncode:
+        return None, "acl_observation_failed"
+    try:
+        return _parse_posix_acl(completed.stdout), None
+    except ValueError:
+        return None, "acl_evidence_invalid"
+
+
+def _mode_permissions(
+    metadata: os.stat_result, *, uid: int, gids: set[int]
+) -> frozenset[str]:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if uid == metadata.st_uid:
+        value = (mode >> 6) & 0o7
+    elif metadata.st_gid in gids:
+        value = (mode >> 3) & 0o7
+    else:
+        value = mode & 0o7
+    return frozenset(
+        permission
+        for permission, bit in (("r", 0o4), ("w", 0o2), ("x", 0o1))
+        if value & bit
+    )
+
+
+def _acl_permissions(
+    entries: dict[tuple[str, str], frozenset[str]],
+    metadata: os.stat_result,
+    *,
+    uid: int,
+    gids: set[int],
+) -> frozenset[str]:
+    if uid == metadata.st_uid:
+        return entries[("user", "")]
+    mask = entries.get(("mask", ""), frozenset({"r", "w", "x"}))
+    named_user = entries.get(("user", str(uid)))
+    if named_user is not None:
+        return named_user & mask
+    group_permissions: set[str] = set()
+    group_matched = False
+    if metadata.st_gid in gids:
+        group_matched = True
+        group_permissions.update(entries[("group", "")])
+    for (tag, qualifier), permissions in entries.items():
+        if tag != "group" or not qualifier:
+            continue
+        try:
+            gid = int(qualifier)
+        except ValueError:
+            continue
+        if gid in gids:
+            group_matched = True
+            group_permissions.update(permissions)
+    if group_matched:
+        return frozenset(group_permissions) & mask
+    return entries[("other", "")]
+
+
+def _identity_path_permission(
+    path: Path, *, uid: int, gids: set[int], required: str
+) -> dict[str, Any]:
+    if uid == 0:
+        return {"allowed": True, "source": "root_identity", "permissions": "rwx"}
+    try:
+        metadata = path.stat()
+    except OSError as error:
+        return {
+            "allowed": None,
+            "source": "metadata_unavailable",
+            "permissions": None,
+            "detail": error.__class__.__name__,
+        }
+    acl, acl_error = _read_posix_acl(path)
+    if acl is not None:
+        permissions = _acl_permissions(acl, metadata, uid=uid, gids=gids)
+        return {
+            "allowed": required in permissions,
+            "source": "posix_acl",
+            "permissions": "".join(value for value in "rwx" if value in permissions),
+        }
+    try:
+        extended_acl = "system.posix_acl_access" in os.listxattr(path)
+    except OSError:
+        extended_acl = None
+    if extended_acl is True:
+        return {
+            "allowed": None,
+            "source": str(acl_error or "acl_observation_unavailable"),
+            "permissions": None,
+        }
+    permissions = _mode_permissions(metadata, uid=uid, gids=gids)
+    if extended_acl is None and uid != metadata.st_uid:
+        return {
+            "allowed": None,
+            "source": str(acl_error or "acl_observation_unavailable"),
+            "permissions": None,
+        }
+    return {
+        "allowed": required in permissions,
+        "source": "mode" if extended_acl is False else "owner_mode",
+        "permissions": "".join(value for value in "rwx" if value in permissions),
+    }
+
+
+def _configured_client_gids(record: Any) -> tuple[set[int], list[str]]:
+    gids = {int(record.pw_gid)}
+    names: set[str] = set()
+    try:
+        names.add(grp.getgrgid(int(record.pw_gid)).gr_name)
+    except KeyError:
+        names.add(str(record.pw_gid))
+    for group in grp.getgrall():
+        if record.pw_name in group.gr_mem:
+            gids.add(int(group.gr_gid))
+            names.add(group.gr_name)
+    return gids, sorted(names)
+
+
+def _live_effective_gids(client_uids: set[int]) -> dict[int, set[int]]:
+    """Collect retained supplementary groups from live processes read-only."""
+
+    observed = {uid: set() for uid in client_uids}
+    proc = Path("/proc")
+    if proc.is_dir():
+        for status_path in sorted(proc.glob("[0-9]*/status"), key=os.fspath):
+            try:
+                uid_values: list[int] | None = None
+                group_values: set[int] | None = None
+                with status_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.startswith("Uid:"):
+                            uid_values = [int(value) for value in line.split()[1:]]
+                        elif line.startswith("Groups:"):
+                            group_values = {
+                                int(value) for value in line.split()[1:]
+                            }
+                        if uid_values is not None and group_values is not None:
+                            break
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if not uid_values or group_values is None:
+                continue
+            effective_uid = uid_values[1] if len(uid_values) > 1 else uid_values[0]
+            if effective_uid in observed:
+                observed[effective_uid].update(group_values)
+    current_uid = os.geteuid()
+    if current_uid in observed:
+        observed[current_uid].add(os.getegid())
+        observed[current_uid].update(int(gid) for gid in os.getgroups())
+    return observed
+
+
+def _client_docker_socket_candidates(clients: list[Any]) -> list[Path]:
+    candidates = list(SYSTEM_DOCKER_SOCKET_CANDIDATES)
+    for record, home in clients:
+        candidates.extend(
+            (
+                Path(f"/run/user/{record.pw_uid}/docker.sock"),
+                home / ".docker/run/docker.sock",
+                home / ".docker/desktop/docker.sock",
+                home / ".orbstack/run/docker.sock",
+            )
+        )
+    return list(dict.fromkeys(candidates))
+
+
+def docker_socket_admission_evidence(
+    clients: list[Any], *, socket_candidates: list[Path] | None = None
+) -> dict[str, Any]:
+    """Read socket metadata only; never connect, revoke access, or change groups."""
+
+    candidates = (
+        _client_docker_socket_candidates(clients)
+        if socket_candidates is None
+        else list(dict.fromkeys(socket_candidates))
+    )
+    sockets_by_identity: dict[tuple[int, int], dict[str, Any]] = {}
+    observations: list[dict[str, Any]] = []
+    for candidate in candidates:
+        absolute = Path(os.path.abspath(os.fspath(candidate)))
+        try:
+            metadata = absolute.stat()
+        except FileNotFoundError:
+            observations.append({"path": str(absolute), "status": "absent"})
+            continue
+        except OSError as error:
+            observations.append(
+                {
+                    "path": str(absolute),
+                    "status": "unobservable",
+                    "detail": error.__class__.__name__,
+                }
+            )
+            continue
+        if not stat.S_ISSOCK(metadata.st_mode):
+            observations.append({"path": str(absolute), "status": "not_socket"})
+            continue
+        identity = (int(metadata.st_dev), int(metadata.st_ino))
+        existing = sockets_by_identity.get(identity)
+        if existing is not None:
+            existing["aliases"].append(str(absolute))
+            continue
+        canonical = Path(os.path.realpath(absolute))
+        sockets_by_identity[identity] = {
+            "path": str(canonical),
+            "aliases": [str(absolute)],
+            "device": identity[0],
+            "inode": identity[1],
+            "uid": int(metadata.st_uid),
+            "gid": int(metadata.st_gid),
+            "mode": format(stat.S_IMODE(metadata.st_mode), "04o"),
+        }
+
+    sockets = sorted(sockets_by_identity.values(), key=lambda item: str(item["path"]))
+    client_evidence: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    live_gids = _live_effective_gids(
+        {int(record.pw_uid) for record, _home in clients}
+    )
+    for record, _home in clients:
+        configured_gids, group_names = _configured_client_gids(record)
+        retained_gids = live_gids.get(int(record.pw_uid), set())
+        gids = configured_gids | retained_gids
+        access_rows: list[dict[str, Any]] = []
+        for socket_record in sockets:
+            path = Path(str(socket_record["path"]))
+            socket_access = _identity_path_permission(
+                path, uid=int(record.pw_uid), gids=gids, required="w"
+            )
+            traversal_rows: list[dict[str, Any]] = []
+            traversal_values: list[bool | None] = []
+            for parent in reversed(path.parents):
+                result = _identity_path_permission(
+                    parent, uid=int(record.pw_uid), gids=gids, required="x"
+                )
+                traversal_rows.append({"path": str(parent), **result})
+                traversal_values.append(result["allowed"])
+            if socket_access["allowed"] is False or False in traversal_values:
+                allowed: bool | None = False
+            elif socket_access["allowed"] is None or None in traversal_values:
+                allowed = None
+            else:
+                allowed = True
+            access_rows.append(
+                {
+                    "socket": str(path),
+                    "can_connect": allowed,
+                    "socket_permission": socket_access,
+                    "directory_traversal": traversal_rows,
+                }
+            )
+        values = [row["can_connect"] for row in access_rows]
+        if True in values:
+            direct_access: bool | None = True
+        elif None in values or any(
+            row["status"] == "unobservable" for row in observations
+        ):
+            direct_access = None
+        else:
+            direct_access = False
+        row = {
+            "user": record.pw_name,
+            "uid": int(record.pw_uid),
+            "configured_gids": sorted(configured_gids),
+            "configured_groups": group_names,
+            "live_effective_gids": sorted(retained_gids),
+            "evaluated_gids": sorted(gids),
+            "direct_socket_access": direct_access,
+            "sockets": access_rows,
+        }
+        client_evidence.append(row)
+        if direct_access is True:
+            blocker = {
+                "code": DIRECT_DOCKER_SOCKET_ACCESS,
+                "severity": "activation_blocker",
+                "user": record.pw_name,
+                "uid": int(record.pw_uid),
+                "sockets": [
+                    item["socket"]
+                    for item in access_rows
+                    if item["can_connect"] is True
+                ],
+                "message": (
+                    f"enrolled client {record.pw_name} can still connect directly to "
+                    "a Docker Unix socket"
+                ),
+            }
+            blockers.append(blocker)
+    return {
+        "contract": DOCKER_ADMISSION_CONTRACT,
+        "stage": "observe_only",
+        "enforcement_enabled": False,
+        "automatic_group_or_acl_mutation": False,
+        "exclusive_admission_ready": False,
+        "known_socket_exclusivity_ready": bool(sockets)
+        and not blockers
+        and all(row["direct_socket_access"] is not None for row in client_evidence),
+        "activation_blockers": blockers,
+        "clients": client_evidence,
+        "sockets": sockets,
+        "candidate_observations": observations,
+        "coverage": (
+            "system Docker sockets plus the enrolled users' standard rootless, "
+            "Docker Desktop, and OrbStack Unix socket locations; custom Docker "
+            "contexts remain outside this metadata-only check"
+        ),
+        "migration_guidance": (
+            "Do not revoke Docker socket access automatically. First deploy and "
+            "verify typed coordinator feature parity for ephemeral workloads; then "
+            "an administrator may remove direct access in a separate rollback-safe "
+            "activation transaction."
+        ),
+    }
+
+
+def _docker_admission_warning_summary(
+    evidence: dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    blockers = evidence.get("activation_blockers")
+    if not isinstance(blockers, list):
+        raise InstallError("Docker admission evidence has invalid activation blockers")
+    warnings: list[str] = []
+    codes: set[str] = set()
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            raise InstallError("Docker admission activation blocker is invalid")
+        code = blocker.get("code")
+        message = blocker.get("message")
+        if (
+            not isinstance(code, str)
+            or not code
+            or not isinstance(message, str)
+            or not message
+        ):
+            raise InstallError("Docker admission activation blocker is incomplete")
+        warnings.append(message)
+        codes.add(code)
+    return warnings, sorted(codes)
 
 
 def validate_home_write_path_tokens(paths: list[Path]) -> list[Path]:
@@ -823,6 +1525,13 @@ def _current_profile_repository_enrollments(
             repo_id = repository.get("repo_id")
             canonical_root = repository.get("canonical_root")
             generation = repository.get("generation")
+            ephemeral_templates_raw = repository.get("ephemeral_templates", {})
+            ephemeral_secret_policies_raw = repository.get(
+                "ephemeral_secret_policies", {}
+            )
+            ephemeral_image_prefetch_templates_raw = repository.get(
+                "ephemeral_image_prefetch_templates", []
+            )
             if repository_account != account_id:
                 issues.append(
                     _profile_database_issue(
@@ -856,6 +1565,137 @@ def _current_profile_repository_enrollments(
                     )
                 )
                 continue
+            ephemeral_templates: dict[str, str] = {}
+            if not isinstance(ephemeral_templates_raw, dict):
+                issues.append(
+                    _profile_database_issue(
+                        "profile_ephemeral_templates_invalid", uid=uid, repo_id=repo_id
+                    )
+                )
+            else:
+                seen_template_ids: set[str] = set()
+                for template_name, template_id in ephemeral_templates_raw.items():
+                    if (
+                        not isinstance(template_name, str)
+                        or not 1 <= len(template_name) <= 96
+                        or re.fullmatch(
+                            r"[a-z0-9](?:[a-z0-9_.-]*[a-z0-9])?",
+                            template_name,
+                        )
+                        is None
+                        or not isinstance(template_id, str)
+                        or not 1 <= len(template_id) <= 256
+                        or re.fullmatch(r"[A-Za-z0-9_.:@-]+", template_id) is None
+                    ):
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_ephemeral_template_invalid",
+                                uid=uid,
+                                repo_id=repo_id,
+                            )
+                        )
+                        continue
+                    if template_id in seen_template_ids:
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_ephemeral_template_id_duplicate",
+                                uid=uid,
+                                repo_id=repo_id,
+                                template_id=template_id,
+                            )
+                        )
+                        continue
+                    seen_template_ids.add(template_id)
+                    ephemeral_templates[template_name] = template_id
+            ephemeral_image_prefetch_templates: set[str] = set()
+            if not isinstance(ephemeral_image_prefetch_templates_raw, list):
+                issues.append(
+                    _profile_database_issue(
+                        "profile_ephemeral_image_prefetch_templates_invalid",
+                        uid=uid,
+                        repo_id=repo_id,
+                    )
+                )
+            else:
+                for template_id in ephemeral_image_prefetch_templates_raw:
+                    if (
+                        not isinstance(template_id, str)
+                        or not 1 <= len(template_id) <= 256
+                        or re.fullmatch(r"[A-Za-z0-9_.:@-]+", template_id) is None
+                        or template_id in ephemeral_image_prefetch_templates
+                        or template_id not in set(ephemeral_templates.values())
+                    ):
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_ephemeral_image_prefetch_template_invalid",
+                                uid=uid,
+                                repo_id=repo_id,
+                            )
+                        )
+                        continue
+                    ephemeral_image_prefetch_templates.add(template_id)
+            ephemeral_secret_policies: dict[str, dict[str, str]] = {}
+            if not isinstance(ephemeral_secret_policies_raw, dict):
+                issues.append(
+                    _profile_database_issue(
+                        "profile_ephemeral_secret_policies_invalid",
+                        uid=uid,
+                        repo_id=repo_id,
+                    )
+                )
+            else:
+                for template_name, raw_policy in sorted(
+                    ephemeral_secret_policies_raw.items(), key=lambda item: str(item[0])
+                ):
+                    if template_name not in ephemeral_templates:
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_ephemeral_secret_policy_unknown_template",
+                                uid=uid,
+                                repo_id=repo_id,
+                                template_name=str(template_name),
+                            )
+                        )
+                        continue
+                    if (
+                        not isinstance(raw_policy, dict)
+                        or set(raw_policy) != {"policy", "binding_id"}
+                    ):
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_ephemeral_secret_policy_invalid",
+                                uid=uid,
+                                repo_id=repo_id,
+                                template_name=template_name,
+                            )
+                        )
+                        continue
+                    policy = raw_policy.get("policy")
+                    binding_id = raw_policy.get("binding_id")
+                    if policy != _EPHEMERAL_SECRET_FD_POLICY:
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_ephemeral_secret_policy_invalid",
+                                uid=uid,
+                                repo_id=repo_id,
+                                template_name=template_name,
+                            )
+                        )
+                        continue
+                    if not _is_canonical_uuid(binding_id):
+                        issues.append(
+                            _profile_database_issue(
+                                "profile_ephemeral_secret_binding_invalid",
+                                uid=uid,
+                                repo_id=repo_id,
+                                template_name=template_name,
+                            )
+                        )
+                        continue
+                    ephemeral_secret_policies[template_name] = {
+                        "policy": policy,
+                        "binding_id": binding_id,
+                    }
             identity = (uid, repo_id)
             if identity in seen:
                 issues.append(
@@ -874,6 +1714,11 @@ def _current_profile_repository_enrollments(
                     "generation": generation,
                     "issued_at": issued_at,
                     "valid_until_epoch": valid_until_epoch,
+                    "ephemeral_templates": ephemeral_templates,
+                    "ephemeral_image_prefetch_templates": (
+                        ephemeral_image_prefetch_templates
+                    ),
+                    "ephemeral_secret_policies": ephemeral_secret_policies,
                 }
             )
     service = document.get("service")
@@ -884,6 +1729,259 @@ def _current_profile_repository_enrollments(
         issues.append(_profile_database_issue("profile_database_generation_invalid"))
         service_generation = None
     return service_generation, current, ignored, issues
+
+
+_EPHEMERAL_PROFILE_OPERATIONS = frozenset(
+    {
+        "ephemeral.start",
+        "ephemeral.status",
+        "ephemeral.image_status",
+        "ephemeral.renew",
+        "ephemeral.finish",
+    }
+)
+_EPHEMERAL_SECRET_FD_OPERATION = "ephemeral.secret_fd"
+_EPHEMERAL_IMAGE_PREFETCH_OPERATION = "ephemeral.image_prefetch"
+_EPHEMERAL_SECRET_FD_POLICY = "postgres_initdb_password_file_v1"
+
+
+def _is_canonical_uuid(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value
+    except (AttributeError, ValueError):
+        return False
+
+
+def _ephemeral_profile_operations_for_policy(
+    policy: str | None, *, allow_image_prefetch: bool
+) -> frozenset[str]:
+    """Derive exact profile ACLs without turning descriptor delivery generic."""
+
+    if policy is None:
+        operations = _EPHEMERAL_PROFILE_OPERATIONS
+    elif policy == _EPHEMERAL_SECRET_FD_POLICY:
+        operations = _EPHEMERAL_PROFILE_OPERATIONS | {_EPHEMERAL_SECRET_FD_OPERATION}
+    else:
+        raise ValueError("profile names an unsupported ephemeral secret policy")
+    if allow_image_prefetch:
+        return operations | {_EPHEMERAL_IMAGE_PREFETCH_OPERATION}
+    return operations
+
+
+def _ephemeral_profile_database_issues(
+    connection: sqlite3.Connection,
+    *,
+    repository: dict[str, Any],
+    template_table_exists: bool,
+    template_policy_columns_available: bool,
+    acl_table_exists: bool,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Prove one current profile's exact ephemeral template and ACL promises.
+
+    Older stores legitimately have neither table.  Their absence is drift only
+    when the protected profile, an enabled template row, or an enabled UID ACL
+    row makes an ephemeral-access promise for this current enrollment.
+    """
+
+    uid = int(repository["uid"])
+    repo_id = str(repository["repo_id"])
+    profile_templates = dict(repository.get("ephemeral_templates") or {})
+    profile_secret_policies = dict(
+        repository.get("ephemeral_secret_policies") or {}
+    )
+    profile_image_prefetch_template_ids = set(
+        repository.get("ephemeral_image_prefetch_templates") or ()
+    )
+    profile_by_id = {
+        str(template_id): str(name)
+        for name, template_id in profile_templates.items()
+    }
+    enabled_templates: list[sqlite3.Row] = []
+    enabled_acl_rows: list[sqlite3.Row] = []
+    if template_table_exists:
+        enabled_templates = connection.execute(
+            """
+            SELECT template_id, name
+            FROM ephemeral_container_templates
+            WHERE repo_id = ? AND enabled = 1
+            ORDER BY template_id
+            """,
+            (repo_id,),
+        ).fetchall()
+    if acl_table_exists:
+        enabled_acl_rows = connection.execute(
+            """
+            SELECT template_id, operation
+            FROM broker_ephemeral_acl
+            WHERE uid = ? AND repo_id = ? AND enabled = 1
+            ORDER BY template_id, operation
+            """,
+            (uid, repo_id),
+        ).fetchall()
+    # A repository may intentionally retain an enabled template that this UID
+    # cannot use.  Only the protected UID profile or an enabled per-UID ACL is
+    # an access promise; a template row by itself must not synthesize access.
+    if not (profile_templates or enabled_acl_rows):
+        return [], 0, 0
+
+    issues: list[dict[str, Any]] = []
+    if not template_table_exists:
+        issues.append(
+            _profile_database_issue(
+                "ephemeral_template_table_missing", uid=uid, repo_id=repo_id
+            )
+        )
+    if not acl_table_exists:
+        issues.append(
+            _profile_database_issue(
+                "ephemeral_acl_table_missing", uid=uid, repo_id=repo_id
+            )
+        )
+    if not template_table_exists or not acl_table_exists:
+        return issues, len(enabled_templates), len(enabled_acl_rows)
+    if not template_policy_columns_available:
+        issues.append(
+            _profile_database_issue(
+                "ephemeral_template_policy_columns_missing",
+                uid=uid,
+                repo_id=repo_id,
+            )
+        )
+        return issues, len(enabled_templates), len(enabled_acl_rows)
+
+    enabled_database_by_id = {
+        str(row["template_id"]): str(row["name"]) for row in enabled_templates
+    }
+    for name, template_id in sorted(profile_templates.items()):
+        row = connection.execute(
+            """
+            SELECT repo_id, name, enabled, secret_policy_kind, secret_binding_id
+            FROM ephemeral_container_templates
+            WHERE template_id = ?
+            """,
+            (template_id,),
+        ).fetchone()
+        details = {
+            "uid": uid,
+            "repo_id": repo_id,
+            "template_id": template_id,
+            "template_name": name,
+        }
+        if row is None:
+            issues.append(_profile_database_issue("ephemeral_template_missing", **details))
+            continue
+        if str(row["repo_id"]) != repo_id:
+            issues.append(
+                _profile_database_issue(
+                    "ephemeral_template_repository_mismatch", **details
+                )
+            )
+        if str(row["name"]) != name:
+            issues.append(
+                _profile_database_issue("ephemeral_template_name_mismatch", **details)
+            )
+        if not bool(row["enabled"]):
+            issues.append(
+                _profile_database_issue("ephemeral_template_disabled", **details)
+            )
+        profile_policy = profile_secret_policies.get(name)
+        database_policy = row["secret_policy_kind"]
+        database_binding = row["secret_binding_id"]
+        if profile_policy is None:
+            if database_policy is not None or database_binding is not None:
+                issues.append(
+                    _profile_database_issue(
+                        "profile_ephemeral_secret_policy_missing", **details
+                    )
+                )
+        else:
+            if database_policy != profile_policy["policy"]:
+                issues.append(
+                    _profile_database_issue(
+                        "ephemeral_secret_policy_mismatch", **details
+                    )
+                )
+            if database_binding != profile_policy["binding_id"]:
+                issues.append(
+                    _profile_database_issue(
+                        "ephemeral_secret_binding_mismatch", **details
+                    )
+                )
+
+    acl_operations_by_template: dict[str, list[str]] = {}
+    for row in enabled_acl_rows:
+        acl_operations_by_template.setdefault(str(row["template_id"]), []).append(
+            str(row["operation"])
+        )
+    promised_template_ids = set(profile_by_id) | set(acl_operations_by_template)
+    for template_id in sorted(promised_template_ids):
+        operations = acl_operations_by_template.get(template_id, [])
+        profile_template_name = profile_by_id.get(template_id)
+        profile_policy = (
+            profile_secret_policies.get(profile_template_name)
+            if profile_template_name is not None
+            else None
+        )
+        expected_operations = _ephemeral_profile_operations_for_policy(
+            None if profile_policy is None else str(profile_policy["policy"]),
+            allow_image_prefetch=template_id in profile_image_prefetch_template_ids,
+        )
+        if (
+            len(operations) != len(expected_operations)
+            or set(operations) != expected_operations
+        ):
+            issues.append(
+                _profile_database_issue(
+                    "ephemeral_acl_operations_mismatch",
+                    uid=uid,
+                    repo_id=repo_id,
+                    template_id=template_id,
+                    enabled_operations=sorted(set(operations)),
+                    expected_operations=sorted(expected_operations),
+                )
+            )
+        if template_id in acl_operations_by_template and template_id not in profile_by_id:
+            issues.append(
+                _profile_database_issue(
+                    "profile_ephemeral_acl_missing",
+                    uid=uid,
+                    repo_id=repo_id,
+                    template_id=template_id,
+                )
+            )
+        database_name = enabled_database_by_id.get(template_id)
+        if (
+            template_id in acl_operations_by_template
+            and database_name is not None
+            and profile_by_id.get(template_id) != database_name
+        ):
+            issues.append(
+                _profile_database_issue(
+                    "profile_ephemeral_template_missing",
+                    uid=uid,
+                    repo_id=repo_id,
+                    template_id=template_id,
+                    template_name=database_name,
+                )
+            )
+        if (
+            template_id in acl_operations_by_template
+            and template_id not in enabled_database_by_id
+        ):
+            issues.append(
+                _profile_database_issue(
+                    "ephemeral_acl_template_inactive",
+                    uid=uid,
+                    repo_id=repo_id,
+                    template_id=template_id,
+                )
+            )
+    checked_enabled_templates = sum(
+        1 for template_id in promised_template_ids if template_id in enabled_database_by_id
+    )
+    return issues, checked_enabled_templates, len(enabled_acl_rows)
 
 
 def profile_database_enrollment_check(
@@ -909,6 +2007,8 @@ def profile_database_enrollment_check(
         "database": os.fspath(database_path),
         "checked_current_enrollments": 0,
         "checked_current_database_enrollments": 0,
+        "checked_current_ephemeral_templates": 0,
+        "checked_current_ephemeral_acl_bindings": 0,
         "ignored_inactive_profile_enrollments": 0,
         "issues": [],
     }
@@ -931,6 +2031,8 @@ def profile_database_enrollment_check(
     if repositories and not path_lexists(database_path):
         issues.append(_profile_database_issue("database_missing"))
     database_current_enrollments = 0
+    database_current_ephemeral_templates = 0
+    database_current_ephemeral_acl_bindings = 0
     if path_lexists(database_path):
         try:
             expected_database = _protected_regular_metadata(
@@ -954,6 +2056,32 @@ def profile_database_enrollment_check(
                     WHERE type = 'table' AND name = 'broker_repository_enrollments'
                     """
                 ).fetchone()
+                ephemeral_template_table = connection.execute(
+                    """
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name = 'ephemeral_container_templates'
+                    """
+                ).fetchone()
+                ephemeral_acl_table = connection.execute(
+                    """
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name = 'broker_ephemeral_acl'
+                    """
+                ).fetchone()
+                ephemeral_template_policy_columns = False
+                if ephemeral_template_table is not None:
+                    template_columns = {
+                        str(row["name"])
+                        for row in connection.execute(
+                            "PRAGMA table_info(ephemeral_container_templates)"
+                        )
+                    }
+                    ephemeral_template_policy_columns = {
+                        "secret_policy_kind",
+                        "secret_binding_id",
+                    } <= template_columns
                 if repositories:
                     generation_row = connection.execute(
                         "SELECT database_generation FROM schema_metadata WHERE singleton = 1"
@@ -1095,6 +2223,20 @@ def profile_database_enrollment_check(
                                         repo_id=repo_id,
                                     )
                                 )
+                    (
+                        ephemeral_issues,
+                        checked_templates,
+                        checked_acl_bindings,
+                    ) = _ephemeral_profile_database_issues(
+                        connection,
+                        repository=repository,
+                        template_table_exists=ephemeral_template_table is not None,
+                        template_policy_columns_available=ephemeral_template_policy_columns,
+                        acl_table_exists=ephemeral_acl_table is not None,
+                    )
+                    issues.extend(ephemeral_issues)
+                    database_current_ephemeral_templates += checked_templates
+                    database_current_ephemeral_acl_bindings += checked_acl_bindings
                 if enrollment_table is not None:
                     profile_by_identity = {
                         (int(repository["uid"]), str(repository["repo_id"])): repository
@@ -1177,6 +2319,12 @@ def profile_database_enrollment_check(
             )
     result["checked_current_enrollments"] = len(repositories)
     result["checked_current_database_enrollments"] = database_current_enrollments
+    result["checked_current_ephemeral_templates"] = (
+        database_current_ephemeral_templates
+    )
+    result["checked_current_ephemeral_acl_bindings"] = (
+        database_current_ephemeral_acl_bindings
+    )
     if issues:
         result.update(
             {
@@ -1208,6 +2356,12 @@ def _profile_database_repair_guidance(result: dict[str, Any]) -> str:
             "run exact offline profile-generation reconciliation for every reported "
             "database or repository generation issue"
         )
+    if any("ephemeral" in reason for reason in reasons):
+        steps.append(
+            "rerun exact administrator repository enrollment to republish the "
+            "sealed ephemeral template identities and their policy-derived per-UID "
+            "grants (including descriptor delivery only for credential-policy templates)"
+        )
     if steps:
         steps.append("then run the explicit offline profile-enrollment backfill")
     else:
@@ -1237,6 +2391,8 @@ def require_profile_database_enrollment_consistency() -> dict[str, Any]:
 def desired_plan(names: list[str]) -> dict[str, Any]:
     validate_broker_unit_source()
     clients = client_records(names)
+    source_policy = require_managed_docker_source_policy()
+    docker_admission = docker_socket_admission_evidence(clients)
     home_write_paths = enrolled_home_write_paths(clients)
     restart_precondition = profile_database_enrollment_check()
     repair_guidance = _profile_database_repair_guidance(restart_precondition)
@@ -1269,6 +2425,8 @@ def desired_plan(names: list[str]) -> dict[str, Any]:
             "evidence_contract": RUNTIME_DEPENDENCY_CONTRACT,
             "preflight": str(RUNTIME_DEPENDENCY_CHECK),
         },
+        "docker_admission": docker_admission,
+        "managed_docker_source_policy": source_policy,
         "system_files": [
             {"source": str(source), "destination": str(destination)}
             for source, destination in SYSTEM_FILES.items()
@@ -1545,6 +2703,7 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
     if os.geteuid() != 0:
         raise InstallError("apply requires root once; clients require no sudo afterward")
     validate_broker_unit_source()
+    require_managed_docker_source_policy()
     restart_precondition = require_profile_database_enrollment_consistency()
     require_runtime_dependencies()
     transaction = Path(transaction_raw)
@@ -1740,6 +2899,9 @@ def verify_install(names: list[str]) -> dict[str, Any]:
     plan = desired_plan(names)
     failures: list[str] = []
     failure_codes: list[str] = []
+    warnings, warning_codes = _docker_admission_warning_summary(
+        plan["docker_admission"]
+    )
     restart_precondition = plan["restart_precondition"]
     if not restart_precondition["ok"]:
         failure_codes.append(PROFILE_DATABASE_ENROLLMENT_DRIFT)
@@ -1858,6 +3020,8 @@ def verify_install(names: list[str]) -> dict[str, Any]:
         "ok": not failures,
         "failures": failures,
         "failure_codes": failure_codes,
+        "warnings": warnings,
+        "warning_codes": warning_codes,
         "plan": plan,
         "restart_precondition": restart_precondition,
         "runtime_dependency_evidence": dependency_evidence,

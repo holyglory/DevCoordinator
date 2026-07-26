@@ -11,6 +11,9 @@ const DOCKER_ACTIONS = new Set(['start', 'stop', 'restart']);
 const PROJECT_ACTIONS = new Set(['start', 'stop', 'restart']);
 const TOKEN_MAX_BYTES = 4096;
 const FULL_DOCKER_OBSERVER_DOMAIN = 'host-runtime-v2:full-docker';
+const OPERATIONAL_SERVER_STATES = new Set([
+  'running', 'starting', 'unhealthy', 'stopping', 'stopped',
+]);
 const CONSOLE_INVENTORY_KEYS = Object.freeze([
   'coordinator_home',
   'state_path',
@@ -223,7 +226,7 @@ export function coordinatorTimeoutFor(apiPath) {
   if (apiPath.startsWith('/v1/lifecycle/')) return 300_000;
   if (apiPath.startsWith('/v1/projects/')) return 300_000; // compose up can run minutes
   if (apiPath === '/v1/inventory') return 60_000; // may read a large host snapshot
-  if (apiPath === '/v1/observe') return 60_000; // broker sampling includes Docker stats
+  if (apiPath === '/v1/observe') return 720_000; // broker serializes host-wide Docker stats
   if (apiPath.startsWith('/v1/docker/')) return 60_000;
   return 15_000;
 }
@@ -271,6 +274,23 @@ function consoleInventoryView(value, trustedObservations = new Map()) {
       ? consoleDockerProjection(value, compatibility.docker, trustedObservations)
       : compatibility[key];
   }
+  // A rolling older broker may still project enrollment-only definitions as
+  // `unobserved` servers merely because they have a port-policy ACL. Keep the
+  // untouched normalized graph and compatibility payload for exact lease
+  // consumers, but the Console read model must require lifecycle evidence.
+  const servers = Array.isArray(projected.servers)
+    ? projected.servers.filter((server) => OPERATIONAL_SERVER_STATES.has(server?.status))
+    : [];
+  const serverIds = new Set(servers.map((server) => String(server.id ?? '')));
+  projected.servers = servers;
+  projected.project_usage = Array.isArray(projected.project_usage)
+    ? projected.project_usage.map((row) => ({
+      ...row,
+      server_ids: Array.isArray(row?.server_ids)
+        ? row.server_ids.filter((id) => serverIds.has(String(id)))
+        : row?.server_ids,
+    }))
+    : projected.project_usage;
   return projected;
 }
 
@@ -291,6 +311,7 @@ export function createCoordinator({ config, log }) {
   const invCache = { value: undefined, at: 0, inflight: null, generation: 0 };
   const srvCache = { value: undefined, at: 0, inflight: null, generation: 0 };
   const trustedDockerObservations = new Map();
+  const observationFlights = new Map();
 
   function noteAlive() {
     ok = true;
@@ -645,19 +666,30 @@ export function createCoordinator({ config, log }) {
       .then((value) => consoleInventoryView(value, trustedDockerObservations));
   }
 
-  async function observeHost(body = {}) {
-    const result = await request('POST', '/v1/observe', body);
-    if (
-      result?.schema_version === 2
-      && ['completed', 'fresh'].includes(result.status)
-      && result.observer_domain === FULL_DOCKER_OBSERVER_DOMAIN
-      && result.docker_available === true
-      && typeof result.host_id === 'string'
-      && result.host_id
-    ) {
-      trustedDockerObservations.set(result.host_id, { ...result });
-    }
-    return result;
+  function observeHost(body = {}) {
+    const project = typeof body?.project === 'string' ? body.project : '';
+    const existing = observationFlights.get(project);
+    if (existing) return existing;
+
+    const flight = request('POST', '/v1/observe', body)
+      .then((result) => {
+        if (
+          result?.schema_version === 2
+          && ['completed', 'fresh'].includes(result.status)
+          && result.observer_domain === FULL_DOCKER_OBSERVER_DOMAIN
+          && result.docker_available === true
+          && typeof result.host_id === 'string'
+          && result.host_id
+        ) {
+          trustedDockerObservations.set(result.host_id, { ...result });
+        }
+        return result;
+      })
+      .finally(() => {
+        if (observationFlights.get(project) === flight) observationFlights.delete(project);
+      });
+    observationFlights.set(project, flight);
+    return flight;
   }
 
   function serversRaw({ maxAgeMs = 3000 } = {}) {
@@ -674,6 +706,20 @@ export function createCoordinator({ config, log }) {
     const query = new URLSearchParams({ limit: String(limit) });
     if (after !== null) query.set('after', after);
     return request('GET', `/v1/events?${query.toString()}`);
+  }
+
+  function testStats({ project, days = 30, limit = 25 } = {}) {
+    if (typeof project !== 'string' || !project || project.length > 4096) {
+      throw new CoordError('test statistics require one bounded project identity', { status: 400 });
+    }
+    if (!Number.isInteger(days) || days < 1 || days > 3650) {
+      throw new CoordError('test statistics days must be an integer from 1 through 3650', { status: 400 });
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new CoordError('test statistics limit must be an integer from 1 through 500', { status: 400 });
+    }
+    const query = new URLSearchParams({ project, days: String(days), limit: String(limit) });
+    return request('GET', `/v1/tests?${query.toString()}`);
   }
 
   async function dockerAction(name, action, body = {}) {
@@ -747,6 +793,7 @@ export function createCoordinator({ config, log }) {
     closed = true;
     for (const ac of pendingAborts) ac.abort();
     pendingAborts.clear();
+    observationFlights.clear();
     trustedDockerObservations.clear();
   }
 
@@ -756,6 +803,7 @@ export function createCoordinator({ config, log }) {
     inventory,
     serversRaw,
     events,
+    testStats,
     observeHost,
     request,
     leasePort: (b = {}) => request('POST', '/v1/ports/lease', b),

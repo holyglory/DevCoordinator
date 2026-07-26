@@ -8,6 +8,7 @@ import http from 'node:http';
 const LOOPBACK = '127.0.0.1';
 const CONNECT_TIMEOUT_MS = 5_000;
 const FLOW_COOKIE_NAME = 'dc_flow';
+const IDENTITY_ASSERTION_HEADER = 'x-devops-console-assertion';
 
 const HOP_BY_HOP = new Set([
   'connection',
@@ -95,7 +96,12 @@ function appendSafeRawHeaders(lines, rawHeaders, protectedNames, excludedNames =
   }
 }
 
-export function createProxy({ log, renderBadGateway, sessionCookieName }) {
+export function createProxy({
+  log,
+  renderBadGateway,
+  renderUpstreamAuthFailure,
+  sessionCookieName,
+}) {
   if (typeof sessionCookieName !== 'string' || sessionCookieName === '') {
     throw new TypeError('createProxy requires the configured Console session cookie name');
   }
@@ -106,6 +112,10 @@ export function createProxy({ log, renderBadGateway, sessionCookieName }) {
 
   function buildRequestHeaders(req, target, { upgrade }) {
     const headers = stripHopByHop(req.headers);
+    // The browser can never select an upstream identity. Public routes also
+    // strip this Console-owned header so an upstream cannot accidentally trust
+    // a caller-shaped assertion merely because its route policy later changes.
+    delete headers[IDENTITY_ASSERTION_HEADER];
     const safeCookie = filterRequestCookieHeader(headers.cookie, protectedCookieNames);
     if (safeCookie === undefined) delete headers.cookie;
     else headers.cookie = safeCookie;
@@ -124,6 +134,9 @@ export function createProxy({ log, renderBadGateway, sessionCookieName }) {
       delete headers.authorization;
       if (target.upstreamAuthorization) {
         headers.authorization = target.upstreamAuthorization;
+      }
+      if (target.upstreamIdentityAssertion) {
+        headers[IDENTITY_ASSERTION_HEADER] = target.upstreamIdentityAssertion;
       }
     }
     if (upgrade) {
@@ -189,6 +202,28 @@ export function createProxy({ log, renderBadGateway, sessionCookieName }) {
       }
       settled = true;
       clearTimeout(connectTimer);
+      if (target.route?.auth !== 'public' && r.statusCode === 401) {
+        try {
+          renderUpstreamAuthFailure(req, res, { target });
+        } catch (err) {
+          log.error('renderUpstreamAuthFailure failed', { error: err.message });
+          try {
+            res.writeHead(502, {
+              'content-type': 'text/plain; charset=utf-8',
+              'cache-control': 'no-store',
+            });
+            res.end('route authorization unavailable');
+          } catch {
+            res.destroy();
+          }
+        }
+        // The Console has already authenticated and authorized the browser.
+        // A protected upstream 401 therefore means the private server-held
+        // credential is missing or stale; its body may contain API JSON and
+        // must never become the user-facing page.
+        r.resume();
+        return;
+      }
       try {
         const excluded = target.route?.auth === 'public'
           ? new Set()

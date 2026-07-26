@@ -21,11 +21,20 @@ from .broker import BrokerOperation
 from .broker_persistence import (
     BrokerPersistence,
     _default_compose_project_name,
+    _normalize_ephemeral_environment,
+    _require_ephemeral_secret_policy_environment,
+    _require_ephemeral_argument,
+    _require_ephemeral_template_name,
+    _require_pinned_ephemeral_image,
     _require_compose_profile_name,
     _require_compose_project_name,
     _require_compose_service_name,
 )
 from .broker_profile import PROFILE_VERSION
+from .ephemeral_secrets import (
+    deterministic_secret_binding_id,
+    normalize_ephemeral_secret_policy,
+)
 from .compose_contract import (
     require_effective_compose_model,
     require_sealable_compose_payload,
@@ -66,6 +75,8 @@ def enroll_repository(
     port_start: int,
     port_end: int,
     profile_path: Path,
+    ephemeral_containers: Sequence[Mapping[str, Any]] = (),
+    grant_ephemeral_image_prefetch: bool = False,
     compose: Mapping[str, Any] | None = None,
     compose_model_renderer: Callable[..., bytes] | None = None,
     approve_compose_host_access: bool = False,
@@ -102,6 +113,9 @@ def enroll_repository(
         raise TypeError("approve_compose_host_access must be a boolean")
     if type(grant_cleanup_capabilities) is not bool:
         raise TypeError("grant_cleanup_capabilities must be a boolean")
+    if type(grant_ephemeral_image_prefetch) is not bool:
+        raise TypeError("grant_ephemeral_image_prefetch must be a boolean")
+    normalized_ephemeral = _normalize_ephemeral_templates(ephemeral_containers)
     if approve_compose_host_access and not (compose and compose.get("declared")):
         raise ValueError(
             "Compose host-access approval requires a declared Compose definition"
@@ -424,6 +438,18 @@ def enroll_repository(
         observation_snapshot_id=enrollment_snapshot_id,
         host_access_approved=approve_compose_host_access,
     )
+    ephemeral_templates = _provision_ephemeral_templates(
+        persistence,
+        repo_id=repo_id,
+        client_uid=client_uid,
+        templates=normalized_ephemeral,
+        grant_image_prefetch=grant_ephemeral_image_prefetch,
+    )
+    ephemeral_secret_policies = _ephemeral_secret_policy_profiles(
+        repo_id=repo_id,
+        template_ids=ephemeral_templates,
+        templates=normalized_ephemeral,
+    )
     persistence.provision_repository_enrollment(
         uid=client_uid,
         repo_id=repo_id,
@@ -451,6 +477,13 @@ def enroll_repository(
             "servers": granted_server_ids,
             "containers": container_ids,
             "compose_definition_id": compose_definition_id,
+            "ephemeral_templates": ephemeral_templates,
+            "ephemeral_image_prefetch_templates": (
+                sorted(ephemeral_templates.values())
+                if grant_ephemeral_image_prefetch
+                else []
+            ),
+            "ephemeral_secret_policies": ephemeral_secret_policies,
         },
         issued_at=issued_at,
         valid_until_epoch=valid_until_epoch,
@@ -464,6 +497,13 @@ def enroll_repository(
         "defined_server_ids": server_ids,
         "container_ids": container_ids,
         "compose_definition_id": compose_definition_id,
+        "ephemeral_templates": ephemeral_templates,
+        "ephemeral_image_prefetch_templates": (
+            sorted(ephemeral_templates.values())
+            if grant_ephemeral_image_prefetch
+            else []
+        ),
+        "ephemeral_secret_policies": ephemeral_secret_policies,
         "enrollment_snapshot_id": enrollment_snapshot_id,
         "grant_snapshot_id": grant_snapshot_id,
         "database_generation": database_generation,
@@ -639,9 +679,20 @@ def _grant_observed_containers(
                       ON d.docker_resource_id = observed.docker_resource_id
                     WHERE observed.snapshot_id = ?
                       AND observed.authoritative_owner_repo_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM repository_memberships membership
+                          JOIN control_bindings binding
+                            ON binding.binding_id = membership.control_binding_id
+                          WHERE membership.repo_id = ?
+                            AND membership.resource_kind = 'container'
+                            AND membership.host_resource_id = observed.docker_resource_id
+                            AND binding.authority_state = 'authoritative'
+                            AND binding.provenance = 'coordinator_ephemeral'
+                      )
                     ORDER BY d.current_name, d.full_container_id
                     """,
-                    (snapshot_id, repo_id),
+                    (snapshot_id, repo_id, repo_id),
                 )
             )
             compose_scope = connection.execute(
@@ -677,6 +728,7 @@ def _grant_observed_containers(
                         WHERE membership.repo_id = ?
                           AND membership.resource_kind = 'container'
                           AND binding.authority_state = 'authoritative'
+                          AND binding.provenance != 'coordinator_ephemeral'
                         ORDER BY d.current_name, d.full_container_id
                         """,
                         (snapshot_id, repo_id),
@@ -964,8 +1016,14 @@ def _grant_observed_cleanup_resources(
                 for row in connection.execute(
                     """
                     SELECT resource_kind, resource_id
-                    FROM observation_snapshot_resources
+                    FROM observation_snapshot_resources observed
                     WHERE snapshot_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM control_bindings binding
+                          WHERE binding.resource_kind = observed.resource_kind
+                            AND binding.resource_id = observed.resource_id
+                            AND binding.provenance = 'coordinator_ephemeral'
+                      )
                     """,
                     (snapshot_id,),
                 )
@@ -1025,6 +1083,291 @@ def _require_exact_grant_snapshot(
         raise RuntimeError(
             "enrollment grant derivation requires its exact completed full-Docker snapshot"
         )
+
+
+def _normalize_ephemeral_templates(
+    value: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Validate the complete administrator-sealed ephemeral manifest section."""
+
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("ephemeral_containers must be a list of template objects")
+    if len(value) > 64:
+        raise ValueError("ephemeral_containers may contain at most 64 templates")
+    required = {
+        "name",
+        "image_ref",
+        "default_ttl_seconds",
+        "max_ttl_seconds",
+        "memory_bytes",
+        "cpu_millis",
+        "max_concurrent_runs",
+        "max_concurrent_runs_per_uid",
+        "repo_max_active_runs",
+        "repo_memory_budget_bytes",
+        "repo_cpu_budget_millis",
+    }
+    allowed = required | {
+        "argv",
+        "env",
+        "secret_policy",
+        "container_tcp_port",
+        "host_port_start",
+        "host_port_end",
+    }
+    normalized: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    repository_budget: tuple[int, int, int] | None = None
+    for raw in value:
+        if not isinstance(raw, Mapping) or set(raw) - allowed or required - set(raw):
+            raise ValueError(
+                "each ephemeral_containers entry requires exactly the sealed "
+                "template fields"
+            )
+        name = _require_ephemeral_template_name(raw["name"])
+        if name in seen_names:
+            raise ValueError("ephemeral_containers names must be unique")
+        seen_names.add(name)
+        image_ref = _require_pinned_ephemeral_image(raw["image_ref"])
+        if re.fullmatch(
+            r"[a-z0-9][a-z0-9._/:+-]*@sha256:[0-9a-f]{64}", image_ref
+        ) is None:
+            raise ValueError(
+                "ephemeral image_ref must use a lowercase option-safe image name"
+            )
+        argv = raw.get("argv", ())
+        if not isinstance(argv, (list, tuple)) or len(argv) > 128:
+            raise ValueError("ephemeral argv must be a list of at most 128 arguments")
+        command = tuple(_require_ephemeral_argument(item) for item in argv)
+        if sum(len(item.encode("utf-8")) for item in command) > 128 * 1024:
+            raise ValueError("ephemeral argv exceeds its total size bound")
+        environment = dict(
+            _normalize_ephemeral_environment(raw.get("env", {}))
+        )
+        secret_policy = normalize_ephemeral_secret_policy(raw.get("secret_policy"))
+        _require_ephemeral_secret_policy_environment(
+            policy_kind=secret_policy,
+            environment=tuple(sorted(environment.items())),
+        )
+        if any(
+            "\r" in env_value
+            or "\n" in env_value
+            or len(env_value.encode("utf-8")) > 16 * 1024
+            for env_value in environment.values()
+        ) or sum(
+            len(env_name.encode("utf-8"))
+            + 1
+            + len(env_value.encode("utf-8"))
+            for env_name, env_value in environment.items()
+        ) > 128 * 1024:
+            raise ValueError(
+                "ephemeral environment exceeds the sealed Docker input bounds"
+            )
+        default_ttl_seconds = raw["default_ttl_seconds"]
+        max_ttl_seconds = raw["max_ttl_seconds"]
+        if (
+            type(default_ttl_seconds) is not int
+            or type(max_ttl_seconds) is not int
+            or not 60
+            <= default_ttl_seconds
+            <= max_ttl_seconds
+            <= 7 * 24 * 60 * 60
+        ):
+            raise ValueError(
+                "ephemeral TTLs must be ordered integers from one minute through seven days"
+            )
+        port_values = (
+            raw.get("container_tcp_port"),
+            raw.get("host_port_start"),
+            raw.get("host_port_end"),
+        )
+        if all(item is None for item in port_values):
+            container_tcp_port = host_port_start = host_port_end = None
+        elif (
+            any(type(item) is not int for item in port_values)
+            or not 1 <= int(port_values[0]) <= 65535
+            or not 1 <= int(port_values[1]) <= int(port_values[2]) <= 65535
+        ):
+            raise ValueError(
+                "ephemeral TCP publication requires container_tcp_port and an "
+                "ordered host_port_start/host_port_end range"
+            )
+        else:
+            container_tcp_port, host_port_start, host_port_end = port_values
+        memory_bytes = raw["memory_bytes"]
+        if (
+            type(memory_bytes) is not int
+            or not 16 * 1024 * 1024 <= memory_bytes <= 1 << 50
+        ):
+            raise ValueError(
+                "ephemeral memory_bytes must be from 16 MiB through one PiB"
+            )
+        cpu_millis = raw["cpu_millis"]
+        if type(cpu_millis) is not int or not 10 <= cpu_millis <= 256_000:
+            raise ValueError("ephemeral cpu_millis must be from 10 through 256000")
+        max_concurrent_runs = raw["max_concurrent_runs"]
+        max_concurrent_runs_per_uid = raw["max_concurrent_runs_per_uid"]
+        repo_max_active_runs = raw["repo_max_active_runs"]
+        repo_memory_budget_bytes = raw["repo_memory_budget_bytes"]
+        repo_cpu_budget_millis = raw["repo_cpu_budget_millis"]
+        if (
+            type(max_concurrent_runs) is not int
+            or type(max_concurrent_runs_per_uid) is not int
+            or type(repo_max_active_runs) is not int
+            or not 1
+            <= max_concurrent_runs_per_uid
+            <= max_concurrent_runs
+            <= 32
+            or not max_concurrent_runs <= repo_max_active_runs <= 64
+        ):
+            raise ValueError(
+                "ephemeral concurrency limits must be ordered integers within the fixed host bounds"
+            )
+        if (
+            type(repo_memory_budget_bytes) is not int
+            or repo_memory_budget_bytes < memory_bytes
+            or repo_memory_budget_bytes > 64 * (1 << 50)
+            or type(repo_cpu_budget_millis) is not int
+            or repo_cpu_budget_millis < cpu_millis
+            or repo_cpu_budget_millis > 64 * 256_000
+        ):
+            raise ValueError(
+                "ephemeral repository CPU and memory budgets must cover one sealed run and stay within the fixed repository bounds"
+            )
+        candidate_repository_budget = (
+            repo_max_active_runs,
+            repo_memory_budget_bytes,
+            repo_cpu_budget_millis,
+        )
+        if repository_budget is None:
+            repository_budget = candidate_repository_budget
+        elif candidate_repository_budget != repository_budget:
+            raise ValueError(
+                "all ephemeral templates in one repository must declare the same repo_max_active_runs, repo_memory_budget_bytes, and repo_cpu_budget_millis"
+            )
+        normalized.append(
+            {
+                "name": name,
+                "image_ref": image_ref,
+                "command": command,
+                "environment": environment,
+                "secret_policy": secret_policy,
+                "default_ttl_seconds": default_ttl_seconds,
+                "max_ttl_seconds": max_ttl_seconds,
+                "container_tcp_port": container_tcp_port,
+                "host_port_start": host_port_start,
+                "host_port_end": host_port_end,
+                "memory_bytes": memory_bytes,
+                "cpu_millis": cpu_millis,
+                "max_concurrent_runs": max_concurrent_runs,
+                "max_concurrent_runs_per_uid": max_concurrent_runs_per_uid,
+                "repo_max_active_runs": repo_max_active_runs,
+                "repo_memory_budget_bytes": repo_memory_budget_bytes,
+                "repo_cpu_budget_millis": repo_cpu_budget_millis,
+            }
+        )
+    return tuple(normalized)
+
+
+def _provision_ephemeral_templates(
+    persistence: BrokerPersistence,
+    *,
+    repo_id: str,
+    client_uid: int,
+    templates: Sequence[Mapping[str, Any]],
+    grant_image_prefetch: bool = False,
+) -> dict[str, str]:
+    """Replace one repository's exact template definitions and UID grants."""
+
+    if type(grant_image_prefetch) is not bool:
+        raise TypeError("grant_image_prefetch must be a boolean")
+    template_ids: dict[str, str] = {}
+    for template in templates:
+        name = str(template["name"])
+        template_id = deterministic_id("ephemeral-template", repo_id, name)
+        secret_policy = template.get("secret_policy")
+        secret_binding_id = (
+            None
+            if secret_policy is None
+            else deterministic_secret_binding_id(
+                repository_id=repo_id,
+                template_id=template_id,
+                policy=str(secret_policy),
+            )
+        )
+        result = persistence.provision_ephemeral_template(
+            template_id=template_id,
+            repo_id=repo_id,
+            name=name,
+            image_ref=str(template["image_ref"]),
+            command=tuple(template["command"]),
+            environment=dict(template["environment"]),
+            secret_policy_kind=(
+                None if secret_policy is None else str(secret_policy)
+            ),
+            secret_binding_id=secret_binding_id,
+            default_ttl_seconds=int(template["default_ttl_seconds"]),
+            max_ttl_seconds=int(template["max_ttl_seconds"]),
+            container_tcp_port=template.get("container_tcp_port"),
+            host_port_start=template.get("host_port_start"),
+            host_port_end=template.get("host_port_end"),
+            memory_bytes=int(template["memory_bytes"]),
+            cpu_millis=int(template["cpu_millis"]),
+            max_concurrent_runs=int(template["max_concurrent_runs"]),
+            max_concurrent_runs_per_uid=int(
+                template["max_concurrent_runs_per_uid"]
+            ),
+            repo_max_active_runs=int(template["repo_max_active_runs"]),
+            repo_memory_budget_bytes=int(template["repo_memory_budget_bytes"]),
+            repo_cpu_budget_millis=int(template["repo_cpu_budget_millis"]),
+            enabled=True,
+        )
+        if isinstance(result, Mapping) and result.get("template_id") != template_id:
+            raise RuntimeError(
+                "ephemeral template persistence substituted its immutable identity"
+            )
+        template_ids[name] = template_id
+    persistence.disable_ephemeral_templates_except(
+        repo_id=repo_id,
+        template_ids=template_ids.values(),
+    )
+    persistence.replace_ephemeral_access(
+        uid=client_uid,
+        repo_id=repo_id,
+        template_ids=template_ids.values(),
+        prefetch_template_ids=(
+            template_ids.values() if grant_image_prefetch else ()
+        ),
+    )
+    return template_ids
+
+
+def _ephemeral_secret_policy_profiles(
+    *,
+    repo_id: str,
+    template_ids: Mapping[str, str],
+    templates: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, str]]:
+    """Publish public policy/binding metadata without any credential bytes."""
+
+    result: dict[str, dict[str, str]] = {}
+    for template in templates:
+        name = str(template["name"])
+        policy = template.get("secret_policy")
+        if policy is None:
+            continue
+        template_id = template_ids.get(name)
+        if template_id is None:
+            raise RuntimeError("ephemeral template policy lost its immutable identity")
+        result[name] = {
+            "policy": str(policy),
+            "binding_id": deterministic_secret_binding_id(
+                repository_id=repo_id,
+                template_id=template_id,
+                policy=str(policy),
+            ),
+        }
+    return result
 
 
 def _provision_compose(

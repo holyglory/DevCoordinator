@@ -34,6 +34,7 @@ test('published HTTP contract describes normalized query-only inventory and its 
     'lifecycle_violations',
     'observations',
     'control_bindings',
+    'test_statistics',
   ]);
   assert.equal(contract.inventory_contract.compatibility_projection, 'v1_compatibility');
   assert.match(contract.inventory_contract.ordinary_inventory, /without runtime sampling or persistence/);
@@ -46,8 +47,29 @@ test('published HTTP contract describes normalized query-only inventory and its 
   assert.ok(contract.endpoints.POST.includes('/v1/ports/relocate'));
 });
 
+test('test statistics use one bounded repository-scoped coordinator read', async (t) => {
+  const response = { schema_version: 1, repo_id: 'repo-1', days: 30, summary: {} };
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/tests?project=repo-1&days=30&limit=25') return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(response));
+    return true;
+  };
+  const { client, requests } = await fixture(t, { responder });
+  assert.deepEqual(await client.testStats({ project: 'repo-1' }), response);
+  assert.equal(requests.at(-1).authorization, `Bearer ${TOKEN}`);
+  assert.throws(
+    () => client.testStats({ project: '', days: 30, limit: 25 }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+  assert.throws(
+    () => client.testStats({ project: 'repo-1', days: 0, limit: 25 }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+});
+
 test('host observation receives a Docker-sized deadline without widening ordinary requests', () => {
-  assert.equal(coordinatorTimeoutFor('/v1/observe'), 60_000);
+  assert.equal(coordinatorTimeoutFor('/v1/observe'), 720_000);
   assert.equal(coordinatorTimeoutFor('/v1/inventory'), 60_000);
   assert.equal(coordinatorTimeoutFor('/v1/servers/start'), 15_000);
   assert.equal(coordinatorTimeoutFor('/v1/lifecycle/apply'), 600_000);
@@ -173,6 +195,69 @@ test('event pages preserve opaque cursors and explicit host observation identity
   );
 });
 
+test('same-project host observations share one in-flight request while other projects stay isolated', async (t) => {
+  let releaseFirst;
+  const held = new Promise((resolve) => { releaseFirst = resolve; });
+  const responder = async ({ req, res, record }) => {
+    if (req.url !== '/v1/observe') return false;
+    const body = JSON.parse(record.body);
+    if (body.project === '/repo/a') await held;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, project: body.project }));
+    return true;
+  };
+  const { client, requests } = await fixture(t, { responder });
+
+  const first = client.observeHost({ agent: 'devops-console:metrics', project: '/repo/a' });
+  const second = client.observeHost({ agent: 'devops-console:telegram', project: '/repo/a' });
+  const other = client.observeHost({ agent: 'devops-console:metrics', project: '/repo/b' });
+
+  assert.deepEqual(await other, { ok: true, project: '/repo/b' });
+  const requestCountBeforeRelease = requests.filter((item) => item.path === '/v1/observe').length;
+  releaseFirst();
+  assert.deepEqual(await Promise.all([first, second]), [
+    { ok: true, project: '/repo/a' },
+    { ok: true, project: '/repo/a' },
+  ]);
+  assert.equal(requestCountBeforeRelease, 2,
+    'two local callers for /repo/a plus one for /repo/b must create exactly two requests');
+  assert.equal(requests.filter((item) => item.path === '/v1/observe').length, 2);
+  assert.equal(
+    requests.filter((item) => item.path === '/v1/observe'
+      && JSON.parse(item.body).project === '/repo/a').length,
+    1,
+    'same-project observers must join even when their diagnostic agent labels differ',
+  );
+});
+
+test('a failed host-observation flight is cleared so the next request can retry', async (t) => {
+  let attempts = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/observe') return false;
+    attempts += 1;
+    if (attempts === 1) {
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'temporary observation failure' }));
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }
+    return true;
+  };
+  const { client, requests } = await fixture(t, { responder });
+
+  await assert.rejects(
+    client.observeHost({ agent: 'metrics', project: '/repo/a' }),
+    /temporary observation failure/,
+  );
+  assert.deepEqual(
+    await client.observeHost({ agent: 'metrics', project: '/repo/a' }),
+    { ok: true },
+  );
+  assert.equal(attempts, 2);
+  assert.equal(requests.filter((item) => item.path === '/v1/observe').length, 2);
+});
+
 test('schema-v2 inventory projects only its declared v1 compatibility rows for Console consumers', async (t) => {
   const normalizedLease = {
     lease_id: 'lease-normalized',
@@ -194,7 +279,13 @@ test('schema-v2 inventory projects only its declared v1 compatibility rows for C
     state_path: '/fixture/coordinator/coordinator.sqlite3',
     project: null,
     urls: [],
-    servers: [{ id: 'server-1', key: '/repo::web', project: '/repo', name: 'web' }],
+    servers: [
+      { id: 'server-1', key: '/repo::web', project: '/repo', name: 'web', status: 'running' },
+      {
+        id: 'lease-only', key: '/repo::smoke-port', project: '/repo',
+        name: 'smoke-port', status: 'unobserved',
+      },
+    ],
     leases: [{ id: 'lease-console', project: '/repo', port: 4317, status: 'active' }],
     port_assignments: [{
       id: 'assignment-console',
@@ -208,7 +299,10 @@ test('schema-v2 inventory projects only its declared v1 compatibility rows for C
     docker: { available: true, containers: [], postgres: [] },
     postgres: [],
     backups: [],
-    project_usage: [],
+    project_usage: [{
+      usage_key: 'path:/repo', project: '/repo',
+      server_ids: ['server-1', 'lease-only'], container_resource_ids: [],
+    }],
   };
   const payload = {
     schema_version: 2,
@@ -229,7 +323,9 @@ test('schema-v2 inventory projects only its declared v1 compatibility rows for C
 
   assert.deepEqual(inventory.leases, compatibility.leases);
   assert.deepEqual(inventory.port_assignments, compatibility.port_assignments);
-  assert.deepEqual(inventory.servers, compatibility.servers);
+  assert.deepEqual(inventory.servers, [compatibility.servers[0]]);
+  assert.deepEqual(inventory.project_usage[0].server_ids, ['server-1'],
+    'control-only definitions must not enter Console project membership');
   assert.deepEqual(inventory.repositories, payload.repositories,
     'the Console projection must retain non-conflicting normalized evidence');
   assert.deepEqual(inventory.v1_compatibility, compatibility,

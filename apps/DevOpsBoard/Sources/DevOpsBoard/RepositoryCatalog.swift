@@ -585,7 +585,8 @@ private func repositoryInventorySources(from inventory: Inventory) -> [Repositor
             ),
             postgres: inventory.postgres.filter { belongs($0.origin, to: origin) },
             backups: inventory.backups.filter { belongs($0.origin, to: origin) },
-            projectUsage: inventory.projectUsage.filter { belongs($0.origin, to: origin) }
+            projectUsage: inventory.projectUsage.filter { belongs($0.origin, to: origin) },
+            testStatistics: inventory.testStatistics.filter { belongs($0.origin, to: origin) }
         )
         slice.origin = origin
         return RepositoryInventorySource(origin: origin, inventory: slice)

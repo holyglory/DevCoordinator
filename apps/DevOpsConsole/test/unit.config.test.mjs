@@ -114,6 +114,28 @@ test('degraded mode: missing Google OAuth credentials still boots', async (t) =>
   assert.equal(cfg.oidcIssuer, 'https://accounts.google.com');
 });
 
+test('cleanup lifecycle is an explicit fail-closed deployment capability', async (t) => {
+  const dir = await makeTmp(t);
+  const envFile = await emptyEnvFile(dir);
+
+  const disabled = loadConfig({ envFile, env: minimalEnv(dir) });
+  assert.equal(disabled.lifecycleEnabled, false,
+    'cleanup must remain unavailable until the broker migration and grants are activated');
+
+  const enabled = loadConfig({
+    envFile,
+    env: minimalEnv(dir, { LIFECYCLE_ENABLED: '1' }),
+  });
+  assert.equal(enabled.lifecycleEnabled, true);
+
+  assert.throws(
+    () => loadConfig({ envFile, env: minimalEnv(dir, { LIFECYCLE_ENABLED: 'yes' }) }),
+    (error) => error instanceof AggregateError
+      && error.errors.some((item) => item.key === 'LIFECYCLE_ENABLED'),
+    'ambiguous truthy strings must not activate destructive lifecycle controls',
+  );
+});
+
 test('fatal: missing DOMAIN and bad SESSION_SECRET throw one AggregateError listing ALL problems', async (t) => {
   const dir = await makeTmp(t);
   const envFile = await emptyEnvFile(dir);

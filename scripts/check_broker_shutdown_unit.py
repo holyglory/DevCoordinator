@@ -66,6 +66,7 @@ PROPERTIES = (
     "PrivateTmp",
     "ProtectSystem",
     "ProtectHome",
+    "RuntimeDirectoryPreserve",
     "ReadWritePaths",
     "ReadOnlyPaths",
     "BindPaths",
@@ -319,6 +320,7 @@ def validate_source_unit(source: str) -> None:
         "PrivateTmp": "PrivateTmp=true",
         "ProtectSystem": "ProtectSystem=strict",
         "ProtectHome": "ProtectHome=read-only",
+        "RuntimeDirectoryPreserve": "RuntimeDirectoryPreserve=restart",
         "ReadWritePaths": f"ReadWritePaths={BASE_READ_WRITE_PATHS}",
     }
     for key, directive in service_security.items():
@@ -383,6 +385,7 @@ def validate_effective_unit(
         "PrivateTmp": "yes",
         "ProtectSystem": "strict",
         "ProtectHome": "read-only",
+        "RuntimeDirectoryPreserve": "restart",
         "ReadWritePaths": (
             BASE_READ_WRITE_PATHS + " " + " ".join(expected_home_paths)
         ),

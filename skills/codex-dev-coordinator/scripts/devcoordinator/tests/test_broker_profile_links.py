@@ -9,7 +9,9 @@ from pathlib import Path
 import pwd
 import sqlite3
 import tempfile
+import threading
 import time
+from typing import Iterator
 import unittest
 import uuid
 from unittest import mock
@@ -101,6 +103,103 @@ def parsed_profile(repository_root: Path) -> BrokerClientProfile:
 
 
 class BrokerProfileTrustTests(unittest.TestCase):
+    def test_api_profile_watcher_restarts_after_stable_atomic_publication(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="api-profile-watch-") as raw:
+            root = Path(raw)
+            profile = root / "client-profiles.json"
+            profile.write_text('{"generation":1}\n', encoding="utf-8")
+            baseline = dev_coordinator._api_profile_identity(profile)
+            self.assertIsNotNone(baseline)
+
+            shutdown = threading.Event()
+            stop = threading.Event()
+            server = mock.Mock()
+            server.shutdown.side_effect = shutdown.set
+            watcher = threading.Thread(
+                target=dev_coordinator._watch_api_profile_changes,
+                kwargs={
+                    "server": server,
+                    "path": profile,
+                    "baseline": baseline,
+                    "stop": stop,
+                    "poll_interval_seconds": 0.01,
+                    "stable_observations": 2,
+                },
+            )
+            watcher.start()
+            replacement = root / "client-profiles.next"
+            replacement.write_text('{"generation":2}\n', encoding="utf-8")
+            os.replace(replacement, profile)
+
+            self.assertTrue(
+                shutdown.wait(1.0),
+                "must-catch: a stable protected-profile publication did not restart the API",
+            )
+            watcher.join(timeout=1.0)
+            self.assertFalse(watcher.is_alive())
+            server.shutdown.assert_called_once_with()
+
+    def test_api_profile_watcher_ignores_unchanged_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="api-profile-stable-") as raw:
+            profile = Path(raw) / "client-profiles.json"
+            profile.write_text('{"generation":1}\n', encoding="utf-8")
+            baseline = dev_coordinator._api_profile_identity(profile)
+            self.assertIsNotNone(baseline)
+
+            stop = threading.Event()
+            server = mock.Mock()
+            watcher = threading.Thread(
+                target=dev_coordinator._watch_api_profile_changes,
+                kwargs={
+                    "server": server,
+                    "path": profile,
+                    "baseline": baseline,
+                    "stop": stop,
+                    "poll_interval_seconds": 0.01,
+                    "stable_observations": 2,
+                },
+            )
+            watcher.start()
+            time.sleep(0.06)
+            stop.set()
+            watcher.join(timeout=1.0)
+
+            self.assertFalse(watcher.is_alive())
+            server.shutdown.assert_not_called()
+
+    def test_api_profile_preflight_retries_identity_race(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="api-profile-preflight-") as raw:
+            root = Path(raw)
+            profile = root / "client-profiles.json"
+            profile.write_text('{"generation":1}\n', encoding="utf-8")
+            replacement = root / "client-profiles.next"
+            replacement.write_text('{"generation":2}\n', encoding="utf-8")
+            loads = 0
+
+            def load(**_kwargs: object) -> object:
+                nonlocal loads
+                loads += 1
+                if loads == 1:
+                    os.replace(replacement, profile)
+                return object()
+
+            with (
+                mock.patch.object(dev_coordinator, "authority_mode", return_value="system"),
+                mock.patch.object(
+                    dev_coordinator, "configured_profile_path", return_value=profile
+                ),
+                mock.patch.object(
+                    dev_coordinator, "load_broker_profile", side_effect=load
+                ),
+            ):
+                watched_path, identity = (
+                    dev_coordinator._validated_api_profile_identity() or (None, None)
+                )
+
+            self.assertEqual(watched_path, profile)
+            self.assertEqual(identity, dev_coordinator._api_profile_identity(profile))
+            self.assertEqual(loads, 2)
+
     def test_managed_health_requires_listener_in_isolated_launcher_group(self) -> None:
         server = {
             "pid": 111,
@@ -1753,6 +1852,203 @@ class BrokerProfileTrustTests(unittest.TestCase):
                     self.assertEqual(
                         constructor[-1]["timeout_seconds"], expected_timeout
                     )
+
+
+class BrokerAwarePortReleaseFallbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="broker-port-release-")
+        self.root = Path(self._temporary.name).resolve()
+        self.repository_root = self.root / "repository"
+        self.repository_root.mkdir()
+        (self.repository_root / ".git").mkdir()
+        self.client_home = self.root / "client-journal"
+        self.profile = parsed_profile(self.repository_root)
+        self.repository = self.profile.repository(str(self.repository_root))
+
+    def tearDown(self) -> None:
+        self._temporary.cleanup()
+
+    @contextlib.contextmanager
+    def _client_journal(self) -> Iterator[None]:
+        with mock.patch.dict(
+            os.environ,
+            {
+                dev_coordinator.AUTHORITY_ENV: "account",
+                "CODEX_AGENT_COORDINATOR_HOME": str(self.client_home),
+                dev_coordinator.STATE_BACKEND_ENV: "sqlite",
+            },
+            clear=False,
+        ):
+            yield
+
+    def _release(self, lease_id: str) -> dict[str, object]:
+        return dev_coordinator.coordinated_release_port(
+            {
+                "agent": "codex-test",
+                "project": str(self.repository_root),
+                "lease_id": lease_id,
+            }
+        )
+
+    def test_broker_only_expired_lease_releases_with_the_current_profile(self) -> None:
+        broker_lease_id = "broker-expired-lease"
+        calls: list[dict[str, object]] = []
+
+        def call_broker(**kwargs: object) -> tuple[str, dict[str, object]]:
+            calls.append(dict(kwargs))
+            return (
+                "operation-release-broker-only",
+                {
+                    "lease_id": broker_lease_id,
+                    "port": 26067,
+                    "protocol": "tcp",
+                    "status": "released",
+                },
+            )
+
+        with (
+            self._client_journal(),
+            mock.patch.object(
+                dev_coordinator,
+                "configured_broker_context",
+                return_value=(self.profile, self.repository),
+            ),
+            mock.patch.object(
+                broker_profile_module,
+                "call_broker",
+                side_effect=call_broker,
+            ),
+        ):
+            result = self._release(broker_lease_id)
+
+        self.assertEqual(result["id"], broker_lease_id)
+        self.assertEqual(result["port"], 26067)
+        self.assertEqual(result["project"], str(self.repository_root))
+        self.assertEqual(result["status"], "released")
+        self.assertEqual(
+            result["broker"],
+            {
+                "lease_id": broker_lease_id,
+                "status": "released",
+                "operation_id": "operation-release-broker-only",
+                "result": {
+                    "lease_id": broker_lease_id,
+                    "port": 26067,
+                    "protocol": "tcp",
+                    "status": "released",
+                },
+            },
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["service"], self.profile.service)
+        self.assertEqual(calls[0]["account_id"], "account-alpha")
+        self.assertEqual(calls[0]["repo_id"], REPO_ID)
+        self.assertEqual(calls[0]["resource_id"], broker_lease_id)
+        self.assertEqual(calls[0]["operation"], BrokerOperation.PORT_RELEASE)
+        self.assertIsNone(calls[0]["arguments"])
+
+    def test_broker_only_release_propagates_cross_account_or_repo_denial(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def call_broker(**kwargs: object) -> tuple[str, dict[str, object]]:
+            calls.append(dict(kwargs))
+            raise BrokerError(
+                "resource_access_denied",
+                "The exact lease belongs to another account or repository.",
+            )
+
+        with (
+            self._client_journal(),
+            mock.patch.object(
+                dev_coordinator,
+                "configured_broker_context",
+                return_value=(self.profile, self.repository),
+            ),
+            mock.patch.object(
+                broker_profile_module,
+                "call_broker",
+                side_effect=call_broker,
+            ),
+            self.assertRaisesRegex(BrokerError, "another account or repository"),
+        ):
+            self._release("broker-foreign-lease")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["account_id"], "account-alpha")
+        self.assertEqual(calls[0]["repo_id"], REPO_ID)
+        self.assertEqual(calls[0]["resource_id"], "broker-foreign-lease")
+        self.assertEqual(calls[0]["operation"], BrokerOperation.PORT_RELEASE)
+        with AccountStore.open_default(self.client_home) as store:
+            self.assertEqual(
+                NormalizedPortLifecycle(store).list_leases(active_only=False), []
+            )
+
+    def test_broker_only_release_refuses_missing_or_invalid_profile(self) -> None:
+        with self._client_journal(), mock.patch.object(
+            broker_profile_module, "call_broker"
+        ) as call_broker:
+            with mock.patch.object(
+                dev_coordinator,
+                "configured_broker_context",
+                return_value=None,
+            ), self.assertRaisesRegex(KeyError, "matching lease not found"):
+                self._release("broker-missing-profile")
+            with mock.patch.object(
+                dev_coordinator,
+                "configured_broker_context",
+                side_effect=BrokerProfileError("profile owner is untrusted"),
+            ), self.assertRaisesRegex(BrokerProfileError, "untrusted"):
+                self._release("broker-invalid-profile")
+
+        call_broker.assert_not_called()
+
+    def test_local_release_never_uses_the_broker_only_fallback(self) -> None:
+        with self._client_journal():
+            with AccountStore.open_default(self.client_home) as store:
+                host_id = store.ensure_local_host()
+                timestamp = utc_timestamp()
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        INSERT INTO repositories(
+                            repo_id, host_id, canonical_root, display_name, state,
+                            generation, created_at, updated_at
+                        ) VALUES ('local-repo', ?, ?, 'Local', 'active', 0, ?, ?)
+                        """,
+                        (host_id, str(self.repository_root), timestamp, timestamp),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO repository_installations(
+                            repo_id, status, startup_fenced, generation, actor, updated_at
+                        ) VALUES ('local-repo', 'installed', 0, 0, 'fixture', ?)
+                        """,
+                        (timestamp,),
+                    )
+                lease = NormalizedPortLifecycle(store).lease(
+                    PortLeaseRequest(
+                        agent="codex-test",
+                        canonical_project=str(self.repository_root),
+                        port_start=26067,
+                        port_end=26067,
+                        preferred=26067,
+                        ttl_seconds=600,
+                        purpose="manual",
+                    ),
+                    port_available=lambda _port: True,
+                )
+
+            with mock.patch.object(
+                dev_coordinator,
+                "configured_broker_context",
+                side_effect=AssertionError("local release reached broker fallback"),
+            ):
+                released = self._release(str(lease["id"]))
+                with self.assertRaisesRegex(KeyError, "matching lease not found"):
+                    self._release(str(lease["id"]))
+
+        self.assertEqual(released["id"], lease["id"])
+        self.assertEqual(released["status"], "released")
 
 
 class BrokerLinkStoreTests(unittest.TestCase):

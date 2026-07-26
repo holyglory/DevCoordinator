@@ -15,6 +15,8 @@ function makeStore(overrides = {}) {
     log: null,
     coordinator: overrides.coordinator ?? null,
     maxPoints: overrides.maxPoints ?? METRICS_MAX_POINTS,
+    host: overrides.host,
+    now: overrides.now,
   });
 }
 
@@ -205,7 +207,7 @@ describe('metrics store: history view', () => {
 });
 
 describe('metrics store: sampler', () => {
-  it('sampleOnce observes before reading and ingests the newly committed inventory', async () => {
+  it('sampleOnce starts observation before reading the last committed inventory', async () => {
     const calls = [];
     const coordinator = {
       observeHost: async (body) => {
@@ -243,6 +245,7 @@ describe('metrics store: sampler', () => {
     const store = makeStore({ coordinator });
 
     await store.sampleOnce();
+    await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(calls, ['observe', 'inventory'],
       'a failed observation must not suppress the last committed inventory read');
     assert.ok(store.history().entities.length > 0);
@@ -270,6 +273,146 @@ describe('metrics store: sampler', () => {
     await store.sampleOnce();
     assert.match(String(store.history().sampler.lastError), /unreachable/);
     assert.ok(store.history().entities.length > 0, 'existing history survives a failed inventory read');
+  });
+
+  it('backs off failed observations while host and inventory sampling continue', async () => {
+    let clock = 1_000_000;
+    let observeAttempts = 0;
+    let inventoryReads = 0;
+    const coordinator = {
+      observeHost: async () => {
+        observeAttempts += 1;
+        if (observeAttempts <= 2) throw new Error(`observe failure ${observeAttempts}`);
+      },
+      inventory: async () => {
+        inventoryReads += 1;
+        return inventoryFixture();
+      },
+    };
+    const store = makeStore({ coordinator, now: () => clock });
+
+    await store.sampleOnce();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(observeAttempts, 1);
+    assert.equal(inventoryReads, 1);
+    assert.equal(store.history().sampler.observationFailures, 1);
+    assert.equal(store.history().sampler.nextObservationAt, clock + INTERVAL);
+
+    clock += INTERVAL / 2;
+    await store.sampleOnce();
+    assert.equal(observeAttempts, 1, 'the first backoff window must skip observation');
+    assert.equal(inventoryReads, 2, 'pure inventory fallback must continue every sampler tick');
+
+    clock += INTERVAL / 2;
+    await store.sampleOnce();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(observeAttempts, 2, 'the second attempt starts when the first backoff expires');
+    assert.equal(store.history().sampler.nextObservationAt, clock + (INTERVAL * 2));
+
+    clock += INTERVAL;
+    await store.sampleOnce();
+    assert.equal(observeAttempts, 2, 'the doubled backoff window must suppress eager retry');
+    assert.equal(inventoryReads, 4);
+
+    clock += INTERVAL;
+    await store.sampleOnce();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(observeAttempts, 3);
+    assert.equal(inventoryReads, 5);
+    assert.equal(store.history().sampler.observationFailures, 0,
+      'a successful observation must reset exponential backoff');
+    assert.equal(store.history().sampler.nextObservationAt, null);
+    assert.equal(store.history().sampler.lastError, null);
+  });
+
+  it('keeps host and inventory sampling live during a slow observation and anchors backoff to failure completion', async () => {
+    let clock = 1_000_000;
+    let rejectObservation;
+    let observeAttempts = 0;
+    let inventoryReads = 0;
+    let hostSamples = 0;
+    const coordinator = {
+      observeHost: () => {
+        observeAttempts += 1;
+        return new Promise((resolve, reject) => {
+          rejectObservation = reject;
+        });
+      },
+      inventory: async () => {
+        inventoryReads += 1;
+        return inventoryFixture();
+      },
+    };
+    const host = {
+      sample: async () => {
+        hostSamples += 1;
+        return {
+          at: clock,
+          cpuPercent: hostSamples,
+          mem: { usedBytes: 1000 + hostSamples },
+        };
+      },
+    };
+    const store = makeStore({ coordinator, host, now: () => clock });
+
+    await store.sampleOnce();
+    assert.equal(store.history().sampler.observationInFlight, true);
+    clock += INTERVAL;
+    await store.sampleOnce();
+    assert.equal(observeAttempts, 1, 'an in-flight observation must be coalesced');
+    assert.equal(inventoryReads, 2, 'pure inventory must continue on the next tick');
+    assert.equal(hostSamples, 2, 'host telemetry must continue on the next tick');
+
+    clock += 600_000;
+    rejectObservation(new Error('observation timed out'));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(store.history().sampler.observationInFlight, false);
+    assert.equal(store.history().sampler.nextObservationAt, clock + INTERVAL,
+      'backoff must begin when the slow observation fails, not when it started');
+
+    await store.sampleOnce();
+    assert.equal(observeAttempts, 1, 'retry must remain suppressed throughout the completion-anchored backoff');
+    assert.equal(inventoryReads, 3);
+    assert.equal(hostSamples, 3);
+  });
+
+  it('does not start a second observation when the prior flight finishes during host sampling', async () => {
+    let resolveObservation;
+    let releaseSecondHost;
+    let hostSamples = 0;
+    let observeAttempts = 0;
+    const coordinator = {
+      observeHost: () => {
+        observeAttempts += 1;
+        return new Promise((resolve) => {
+          resolveObservation = resolve;
+        });
+      },
+      inventory: async () => inventoryFixture(),
+    };
+    const host = {
+      sample: async () => {
+        hostSamples += 1;
+        if (hostSamples === 2) {
+          await new Promise((resolve) => {
+            releaseSecondHost = resolve;
+          });
+        }
+        return { at: 1_000_000 + hostSamples, cpuPercent: hostSamples, mem: { usedBytes: 1000 } };
+      },
+    };
+    const store = makeStore({ coordinator, host });
+
+    await store.sampleOnce();
+    const secondTick = store.sampleOnce();
+    while (!releaseSecondHost) await new Promise((resolve) => setImmediate(resolve));
+    resolveObservation();
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseSecondHost();
+    await secondTick;
+
+    assert.equal(observeAttempts, 1,
+      'a flight present at tick entry must cover that tick even when it finishes during host sampling');
   });
 });
 

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-import json
 import hashlib
+import json
 import os
 import pwd
 import socket
@@ -17,16 +16,19 @@ import threading
 import time
 import unittest
 import uuid
-from unittest import mock
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
-
+from unittest import mock
 
 SCRIPTS_ROOT = Path(__file__).resolve().parents[2]
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 import dev_coordinator  # noqa: E402
+
+import devcoordinator.broker as broker_module  # noqa: E402
+import devcoordinator.broker_persistence as broker_persistence  # noqa: E402
 from devcoordinator.broker import (  # noqa: E402
     AccountAccessPolicy,
     AuthorizedBrokerRequest,
@@ -43,27 +45,28 @@ from devcoordinator.broker import (  # noqa: E402
     resolve_peer_credentials,
     validate_runtime_directory,
 )
-import devcoordinator.broker as broker_module  # noqa: E402
-import devcoordinator.broker_persistence as broker_persistence  # noqa: E402
 from devcoordinator.broker_backend import (  # noqa: E402
     StoreBackedBrokerRuntime,
     StoreBackedMutationBackend,
     build_store_backed_broker_runtime,
 )
+from devcoordinator.broker_cli import exclusive_broker_service_lock  # noqa: E402
 from devcoordinator.broker_persistence import (  # noqa: E402
     BrokerPersistence,
     StoreBackedAuthorizer,
 )
+from devcoordinator.ephemeral_containers import (  # noqa: E402
+    EphemeralContainerCoordinator,
+)
 from devcoordinator.observer import SingleFlightObserver  # noqa: E402
 from devcoordinator.repository_lifecycle import (  # noqa: E402
     PolicyObservation,
-    ResourceObservation,
     ResourceKind,
+    ResourceObservation,
     RunningState,
 )
 from devcoordinator.sqlite_lifecycle import SQLiteLifecyclePersistence  # noqa: E402
 from devcoordinator.store import AccountStore, CoordinatorStore, utc_timestamp  # noqa: E402
-
 
 ACCOUNT_ID = "account-current"
 PROJECT_ID = "repo-alpha"
@@ -490,6 +493,23 @@ class CanonicalTemporaryDirectory:
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.cleanup()
+
+
+def create_dead_unix_socket(
+    socket_path: Path,
+    *,
+    mode: int = 0o660,
+) -> tuple[int, int]:
+    """Leave a service-owned AF_UNIX pathname with no listening process."""
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(socket_path))
+        os.chmod(socket_path, mode)
+        info = os.lstat(socket_path)
+        return (info.st_dev, info.st_ino)
+    finally:
+        listener.close()
 
 
 def seed_store_backed_broker(
@@ -1927,6 +1947,260 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
                 socket_path.read_text(encoding="utf-8"), "operator-owned sentinel"
             )
 
+    def test_direct_start_never_reclaims_dead_socket_or_runtime_siblings(self) -> None:
+        backend = RecordingBackend()
+        service, _ = service_for(backend)
+        with CanonicalTemporaryDirectory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+            create_dead_unix_socket(socket_path)
+            runtime_identity = (os.lstat(runtime).st_dev, os.lstat(runtime).st_ino)
+            secrets = runtime / "ephemeral-secrets"
+            secrets.mkdir(mode=0o700)
+            sentinel = secrets / "untouched"
+            sentinel.write_text("preserve sibling", encoding="utf-8")
+            secrets_identity = (os.lstat(secrets).st_dev, os.lstat(secrets).st_ino)
+            server = UnixBrokerServer(socket_path, service)
+
+            with self.assertRaises(BrokerError) as raised:
+                server.start()
+            self.assertEqual(raised.exception.code, "socket_path_exists")
+            current = os.lstat(socket_path)
+            self.assertTrue(stat.S_ISSOCK(current.st_mode))
+            self.assertEqual(
+                runtime_identity,
+                (os.lstat(runtime).st_dev, os.lstat(runtime).st_ino),
+            )
+            self.assertEqual(
+                secrets_identity,
+                (os.lstat(secrets).st_dev, os.lstat(secrets).st_ino),
+            )
+            self.assertEqual(
+                sentinel.read_text(encoding="utf-8"),
+                "preserve sibling",
+            )
+            os.unlink(socket_path)
+
+    def test_stale_socket_without_service_lock_is_untouched(self) -> None:
+        backend = RecordingBackend()
+        service, _ = service_for(backend)
+        with CanonicalTemporaryDirectory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+            stale_identity = create_dead_unix_socket(socket_path)
+            server = UnixBrokerServer(socket_path, service)
+
+            with self.assertRaises(BrokerError) as raised:
+                server.start()
+
+            self.assertEqual(raised.exception.code, "socket_path_exists")
+            current = os.lstat(socket_path)
+            self.assertEqual(stale_identity, (current.st_dev, current.st_ino))
+            os.unlink(socket_path)
+
+    def test_stale_socket_has_no_issuer_construction_or_replay_surface(self) -> None:
+        backend = RecordingBackend()
+        service, _ = service_for(backend)
+        with CanonicalTemporaryDirectory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+            stale_identity = create_dead_unix_socket(socket_path)
+            server = UnixBrokerServer(socket_path, service)
+
+            with self.assertRaises(AttributeError):
+                getattr(broker_module, "_issue_broker_service_lock_capability")()
+            with self.assertRaises(AttributeError):
+                getattr(broker_module, "_BrokerServiceLockCapability")()
+
+            class MutableLookalike:
+                pass
+
+            synthetic = object()
+            mutated = MutableLookalike()
+            mutated._issuer = object()
+            mutated._active = False
+            mutated._active = True
+            with exclusive_broker_service_lock(
+                root / "coordinator.sqlite3"
+            ) as captured_scope_value:
+                self.assertIsNone(captured_scope_value)
+
+            for label, candidate in (
+                ("synthetic", synthetic),
+                ("mutated_lookalike", mutated),
+                ("replayed_scope_value", captured_scope_value),
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaises(TypeError):
+                        server.start(stale_socket_recovery_capability=candidate)
+                    current = os.lstat(socket_path)
+                    self.assertEqual(stale_identity, (current.st_dev, current.st_ino))
+
+            with self.assertRaises(BrokerError) as direct:
+                server.start()
+            self.assertEqual(direct.exception.code, "socket_path_exists")
+            os.unlink(socket_path)
+
+    def test_service_locked_start_keeps_live_socket_untouched(self) -> None:
+        backend = RecordingBackend()
+        service, _ = service_for(backend)
+        with CanonicalTemporaryDirectory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            os.chmod(socket_path, 0o660)
+            listener.listen(2)
+            live_identity = (os.lstat(socket_path).st_dev, os.lstat(socket_path).st_ino)
+            server = UnixBrokerServer(socket_path, service)
+            try:
+                with exclusive_broker_service_lock(
+                    root / "coordinator.sqlite3"
+                ):
+                    with self.assertRaises(BrokerError) as raised:
+                        server.start()
+                self.assertEqual(raised.exception.code, "socket_path_exists")
+                current = os.lstat(socket_path)
+                self.assertEqual(live_identity, (current.st_dev, current.st_ino))
+            finally:
+                listener.close()
+                os.unlink(socket_path)
+
+    def test_service_locked_start_keeps_foreign_or_mismatched_paths_untouched(
+        self,
+    ) -> None:
+        backend = RecordingBackend()
+        service, _ = service_for(backend)
+        with CanonicalTemporaryDirectory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+
+            socket_path.write_text("operator-owned", encoding="utf-8")
+            with exclusive_broker_service_lock(
+                root / "coordinator.sqlite3"
+            ):
+                with self.assertRaises(BrokerError) as regular:
+                    UnixBrokerServer(socket_path, service).start()
+            self.assertEqual(regular.exception.code, "socket_path_exists")
+            self.assertEqual(socket_path.read_text(encoding="utf-8"), "operator-owned")
+            socket_path.unlink()
+
+            target = runtime / "operator-target"
+            target.write_text("symlink target", encoding="utf-8")
+            socket_path.symlink_to(target)
+            with exclusive_broker_service_lock(
+                root / "coordinator.sqlite3"
+            ):
+                with self.assertRaises(BrokerError) as symlink:
+                    UnixBrokerServer(socket_path, service).start()
+            self.assertEqual(symlink.exception.code, "socket_path_exists")
+            self.assertTrue(socket_path.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "symlink target")
+            socket_path.unlink()
+
+            wrong_mode_identity = create_dead_unix_socket(socket_path, mode=0o600)
+            with exclusive_broker_service_lock(
+                root / "coordinator.sqlite3"
+            ):
+                with self.assertRaises(BrokerError) as wrong_mode:
+                    UnixBrokerServer(socket_path, service).start()
+            self.assertEqual(wrong_mode.exception.code, "socket_path_exists")
+            current = os.lstat(socket_path)
+            self.assertEqual(wrong_mode_identity, (current.st_dev, current.st_ino))
+            os.unlink(socket_path)
+
+            wrong_owner_identity = create_dead_unix_socket(socket_path)
+            real_lstat = broker_module.os.lstat
+
+            def wrong_owner(path: str) -> os.stat_result:
+                info = real_lstat(path)
+                if Path(path) == socket_path:
+                    values = list(info)
+                    values[4] = int(info.st_uid) + 1
+                    return os.stat_result(values)
+                return info
+
+            with mock.patch.object(
+                broker_module.os,
+                "lstat",
+                side_effect=wrong_owner,
+            ):
+                with exclusive_broker_service_lock(
+                    root / "coordinator.sqlite3"
+                ):
+                    with self.assertRaises(BrokerError) as wrong_owner_error:
+                        UnixBrokerServer(socket_path, service).start()
+            self.assertEqual(wrong_owner_error.exception.code, "socket_path_exists")
+            current = os.lstat(socket_path)
+            self.assertEqual(wrong_owner_identity, (current.st_dev, current.st_ino))
+            os.unlink(socket_path)
+
+    def test_direct_start_does_not_probe_or_unlink_stale_socket(self) -> None:
+        backend = RecordingBackend()
+        service, _ = service_for(backend)
+        with CanonicalTemporaryDirectory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+            stale_identity = create_dead_unix_socket(socket_path)
+            with mock.patch.object(
+                broker_module.os,
+                "unlink",
+                side_effect=AssertionError("direct startup must not unlink"),
+            ):
+                with self.assertRaises(BrokerError) as raised:
+                    UnixBrokerServer(socket_path, service).start()
+            self.assertEqual(raised.exception.code, "socket_path_exists")
+            current = os.lstat(socket_path)
+            self.assertEqual(stale_identity, (current.st_dev, current.st_ino))
+            os.unlink(socket_path)
+
+    def test_service_locked_start_keeps_stale_socket_when_unlink_fails(self) -> None:
+        backend = RecordingBackend()
+        service, _ = service_for(backend)
+        with CanonicalTemporaryDirectory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o750)
+            os.chmod(runtime, 0o750)
+            socket_path = runtime / "broker.sock"
+            stale_identity = create_dead_unix_socket(socket_path)
+            real_unlink = broker_module.os.unlink
+
+            def reject_socket_unlink(
+                path: str,
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                if Path(path) == socket_path:
+                    raise PermissionError("injected unlink denial")
+                real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(
+                broker_module.os,
+                "unlink",
+                side_effect=reject_socket_unlink,
+            ):
+                with exclusive_broker_service_lock(
+                    root / "coordinator.sqlite3"
+                ):
+                    with self.assertRaises(BrokerError) as raised:
+                        UnixBrokerServer(socket_path, service).start()
+            self.assertEqual(raised.exception.code, "socket_path_exists")
+            current = os.lstat(socket_path)
+            self.assertEqual(stale_identity, (current.st_dev, current.st_ino))
+            os.unlink(socket_path)
+
     def test_client_rejects_a_reply_bound_to_another_operation(self) -> None:
         with CanonicalTemporaryDirectory() as root:
             socket_path = root / "malicious.sock"
@@ -2034,6 +2308,12 @@ class StoreBackedBrokerTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.calls = 0
 
+            def request_ephemeral_reaper_stop(self) -> None:
+                return None
+
+            def wait_ephemeral_reaper_stopped(self, _timeout: float) -> None:
+                raise RuntimeError("private reaper diagnostic")
+
             def begin_shutdown_host_observations(self) -> int:
                 self.calls += 1
                 raise RuntimeError(f"private cleanup diagnostic {self.calls}")
@@ -2070,11 +2350,142 @@ class StoreBackedBrokerTests(unittest.TestCase):
         message = raised.exception.message
         self.assertIn("mutation admission fence: RuntimeError", message)
         self.assertIn("mutation drain: RuntimeError", message)
+        self.assertIn("ephemeral reaper drain: RuntimeError", message)
         self.assertIn("initial observation cleanup: RuntimeError", message)
         self.assertIn("server drain: shutdown_timeout", message)
         self.assertIn("final observation cleanup: RuntimeError", message)
         self.assertNotIn("private cleanup diagnostic", message)
+        self.assertNotIn("private reaper diagnostic", message)
         self.assertEqual(backend.calls, 2)
+
+    def test_reaper_stop_request_does_not_join_a_blocked_host_call(self) -> None:
+        entered_host = threading.Event()
+        release_host = threading.Event()
+        host_calls: list[str] = []
+
+        class BlockingReaperHost:
+            @staticmethod
+            def reconcile_ephemeral_container(run_id: str) -> None:
+                host_calls.append(run_id)
+                if run_id == "run-a":
+                    entered_host.set()
+                    if not release_host.wait(timeout=3.0):
+                        raise RuntimeError("blocked host-call fixture timed out")
+
+        class Target:
+            def __init__(self, run_id: str) -> None:
+                self.run_id = run_id
+
+        class HostCallingReaper(EphemeralContainerCoordinator):
+            @staticmethod
+            def _recovery_targets(*, due_before: int | None = None):
+                del due_before
+                return (Target("run-a"), Target("run-b"))
+
+            def _recover_target(self, target: Target) -> None:
+                self._host.reconcile_ephemeral_container(target.run_id)
+
+        reaper = HostCallingReaper(
+            mock.Mock(),
+            BlockingReaperHost(),
+            reaper_interval_seconds=3600,
+        )
+        reaper.start_reaper()
+        self.assertTrue(
+            entered_host.wait(timeout=1.0),
+            "reaper did not reach the blocking host-call boundary",
+        )
+        try:
+            reaper.request_reaper_stop()
+            self.assertFalse(
+                release_host.is_set(),
+                "stop request unexpectedly controlled the host-call fixture",
+            )
+            with self.assertRaises(BrokerError) as raised:
+                reaper.wait_reaper_stopped(0.0)
+            self.assertEqual(
+                raised.exception.code, "ephemeral_reaper_shutdown_timeout"
+            )
+        finally:
+            release_host.set()
+            reaper.wait_reaper_stopped(1.0)
+        self.assertEqual(
+            host_calls,
+            ["run-a"],
+            "shutdown must not begin another bounded host call in the same pass",
+        )
+
+        stopped_before_start = HostCallingReaper(
+            mock.Mock(),
+            BlockingReaperHost(),
+            reaper_interval_seconds=3600,
+        )
+        stopped_before_start.request_reaper_stop()
+        stopped_before_start.start_reaper()
+        stopped_before_start.wait_reaper_stopped(0.0)
+        self.assertEqual(
+            host_calls,
+            ["run-a"],
+            "a signal-turn stop request must not be cleared by a late start",
+        )
+
+    def test_runtime_joins_reaper_after_transport_and_writer_drain(self) -> None:
+        events: list[str] = []
+        test_case = self
+
+        class OrderedBackend:
+            def request_ephemeral_reaper_stop(self) -> None:
+                events.append("reaper-stop-requested")
+
+            def wait_ephemeral_reaper_stopped(self, timeout: float) -> None:
+                test_case.assertGreater(timeout, 0.5)
+                test_case.assertLessEqual(timeout, 1.0)
+                test_case.assertEqual(events[-1], "writer-drained")
+                events.append("reaper-stopped")
+
+            def begin_shutdown_host_observations(self) -> int:
+                events.append("observations-cleaned")
+                return 0
+
+        class OrderedWriter:
+            def begin_shutdown(self) -> int:
+                events.append("mutation-fenced")
+                return 0
+
+            def wait_for_drain(self, timeout: float) -> bool:
+                test_case.assertGreater(timeout, 0.0)
+                events.append("writer-drained")
+                return True
+
+        class OrderedServer:
+            @staticmethod
+            def close(*, timeout_seconds: float | None = None) -> None:
+                test_case.assertIsNotNone(timeout_seconds)
+                events.append("server-drained")
+
+        runtime = StoreBackedBrokerRuntime(
+            persistence=mock.Mock(),
+            backend=OrderedBackend(),  # type: ignore[arg-type]
+            writer=OrderedWriter(),  # type: ignore[arg-type]
+            service=mock.Mock(),
+            server=OrderedServer(),  # type: ignore[arg-type]
+            shutdown_timeout_seconds=1.0,
+        )
+
+        runtime.close()
+
+        self.assertEqual(
+            events,
+            [
+                "mutation-fenced",
+                "reaper-stop-requested",
+                "server-drained",
+                "writer-drained",
+                "reaper-stopped",
+                "observations-cleaned",
+                "observations-cleaned",
+            ],
+        )
 
     def test_shutdown_fences_late_database_mutation_and_drains_accepted_result(
         self,
@@ -4867,6 +5278,32 @@ class StoreBackedBrokerTests(unittest.TestCase):
             self.assertFalse(reply["ok"], reply)
             self.assertEqual(
                 reply["error"]["code"], "repository_startup_fenced"
+            )
+            self.assertEqual(actions.calls, [])
+
+    def test_generic_docker_lifecycle_rejects_ephemeral_control_binding(self) -> None:
+        with CanonicalTemporaryDirectory() as root:
+            persistence, actions = seed_store_backed_broker(root)
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        """
+                        UPDATE control_bindings
+                        SET provenance = 'coordinator_ephemeral'
+                        WHERE binding_id = ?
+                        """,
+                        (CONTROL_ID,),
+                    )
+            service = store_backed_service(persistence, actions)
+            reply = service.reply_for_document(
+                peer_for(),
+                request_for(BrokerOperation.DOCKER_STOP).to_wire(),
+            )
+            self.assertFalse(reply["ok"], reply)
+            self.assertEqual(
+                reply["error"]["code"], "control_binding_unavailable"
             )
             self.assertEqual(actions.calls, [])
 

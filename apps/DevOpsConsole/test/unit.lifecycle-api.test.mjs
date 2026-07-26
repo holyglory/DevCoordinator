@@ -5,8 +5,15 @@ import test from 'node:test';
 import { createConsoleApi } from '../src/api.mjs';
 import { CoordError } from '../src/coordinator.mjs';
 
-async function fixture(t) {
+async function fixture(t, { lifecycleEnabled = true } = {}) {
   const calls = [];
+  const dockerContainer = {
+    host_resource_id: 'container-fixture-1',
+    name: 'fixture-container',
+    project: '/srv/fixture',
+    repo_id: 'repo-fixture-1',
+    metadata_source: 'docker_labels',
+  };
   const archives = [{
     target_kind: 'repository',
     target_id: 'repo-fixture-1',
@@ -20,7 +27,7 @@ async function fixture(t) {
       return {
         repositories: [{ repo_id: 'repo-fixture-1' }],
         servers: [{ id: 'server-fixture-1' }],
-        docker: { containers: [{ host_resource_id: 'container-fixture-1' }] },
+        docker: { containers: [dockerContainer] },
       };
     },
     lifecycleArchives: async () => {
@@ -46,12 +53,17 @@ async function fixture(t) {
       calls.push({ method: 'lifecycleRestore', body });
       return { ok: true, status: 'completed', partial: false, needs_attention: false };
     },
+    dockerAction: async (name, action, options) => {
+      calls.push({ method: 'dockerAction', body: { name, action, options } });
+      return { ok: true };
+    },
   };
   const api = createConsoleApi({
     config: {
       consoleOrigin: 'https://console.example.test',
       consoleHost: 'console.example.test',
       domain: 'example.test',
+      lifecycleEnabled,
     },
     log: null,
     coordinator,
@@ -80,8 +92,33 @@ async function fixture(t) {
     });
     return { status: response.status, json: await response.json() };
   }
-  return { archives, calls, coordinator, request };
+  return { archives, calls, coordinator, dockerContainer, request };
 }
+
+test('broker-owned ephemeral containers cannot bypass their TTL-aware lifecycle', async (t) => {
+  const { calls, dockerContainer, request } = await fixture(t);
+  dockerContainer.metadata_source = 'coordinator_ephemeral';
+
+  const dockerAction = await request('/api/docker/action', {
+    method: 'POST',
+    body: { name: dockerContainer.name, action: 'stop' },
+  });
+  assert.equal(dockerAction.status, 409);
+  assert.match(dockerAction.json.error, /ephemeral/i);
+
+  const archive = await request('/api/lifecycle/plan', {
+    method: 'POST',
+    body: {
+      target_kind: 'container',
+      target_id: dockerContainer.host_resource_id,
+      action: 'archive',
+    },
+  });
+  assert.equal(archive.status, 409);
+  assert.match(archive.json.error, /ephemeral/i);
+  assert.equal(calls.some((call) => call.method === 'dockerAction'), false);
+  assert.equal(calls.some((call) => call.method === 'lifecyclePlan'), false);
+});
 
 test('lifecycle API is owner-only and does not touch coordinator state for non-owners', async (t) => {
   const { calls, request } = await fixture(t);
@@ -98,6 +135,22 @@ test('lifecycle API is owner-only and does not touch coordinator state for non-o
   assert.equal(list.status, 403);
   assert.equal(plan.status, 403);
   assert.deepEqual(calls, [], 'authorization must fail before inventory, archive, or plan reads');
+});
+
+test('lifecycle API fails closed when cleanup activation is unavailable', async (t) => {
+  const { calls, request } = await fixture(t, { lifecycleEnabled: false });
+
+  const session = await request('/api/session');
+  assert.equal(session.status, 200);
+  assert.equal(session.json.accessAdmin, true);
+  assert.equal(session.json.lifecycleAvailable, false,
+    'Gmail ownership must not be presented as broker cleanup readiness');
+
+  const list = await request('/api/lifecycle/list');
+  assert.equal(list.status, 503);
+  assert.match(list.json.error, /not activated/);
+  assert.deepEqual(calls, [],
+    'an unavailable lifecycle must fail before any coordinator archive request');
 });
 
 test('repository compatibility input and archive rows normalize to canonical project targets', async (t) => {

@@ -9,7 +9,7 @@ cross the Unix-socket protocol.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -26,6 +26,7 @@ from .broker import (
     DATABASE_BACKUP_CLIENT_TIMEOUT_SECONDS,
     DATABASE_RESTORE_CLIENT_TIMEOUT_SECONDS,
 )
+from .ephemeral_secrets import EphemeralSecretPolicy, normalize_ephemeral_secret_policy
 
 
 PROFILE_VERSION = 1
@@ -55,6 +56,22 @@ class BrokerServiceProfile:
 
 
 @dataclass(frozen=True)
+class EphemeralSecretPolicyProfile:
+    """Public non-secret policy/binding metadata for one named template."""
+
+    policy: str
+    binding_id: str
+
+    def __post_init__(self) -> None:
+        validated = EphemeralSecretPolicy(
+            kind=normalize_ephemeral_secret_policy(self.policy),
+            binding_id=self.binding_id,
+        )
+        object.__setattr__(self, "policy", validated.kind)
+        object.__setattr__(self, "binding_id", validated.binding_id)
+
+
+@dataclass(frozen=True)
 class BrokerRepositoryProfile:
     canonical_root: str
     repo_id: str
@@ -62,19 +79,31 @@ class BrokerRepositoryProfile:
     server_ids: Mapping[str, str]
     container_ids: Mapping[str, str]
     compose_definition_id: Optional[str]
+    ephemeral_templates: Mapping[str, str] = field(default_factory=dict)
+    ephemeral_image_prefetch_template_ids: frozenset[str] = field(
+        default_factory=frozenset
+    )
+    ephemeral_secret_policies: Mapping[str, EphemeralSecretPolicyProfile] = field(
+        default_factory=dict
+    )
     account_id: Optional[str] = None
     enabled: bool = True
     issued_at: str = ""
     valid_until_epoch: int = 2**63 - 1
 
-    def require_current(self, *, account_id: str) -> None:
-        if not self.enabled:
-            raise BrokerProfileError(
-                "repository broker enrollment is disabled; rerun Coordinator skill installation"
-            )
+    def require_account(self, *, account_id: str) -> None:
+        """Bind even retained cleanup calls to the profile's exact account."""
+
         if self.account_id is not None and self.account_id != account_id:
             raise BrokerProfileError(
                 "repository broker enrollment belongs to another account"
+            )
+
+    def require_current(self, *, account_id: str) -> None:
+        self.require_account(account_id=account_id)
+        if not self.enabled:
+            raise BrokerProfileError(
+                "repository broker enrollment is disabled; rerun Coordinator skill installation"
             )
         if int(time.time()) >= self.valid_until_epoch:
             raise BrokerProfileError(
@@ -107,6 +136,35 @@ class BrokerRepositoryProfile:
             )
         return self.compose_definition_id
 
+    def ephemeral_template_id(self, name: str) -> str:
+        value = self.ephemeral_templates.get(str(name))
+        if value is None:
+            raise BrokerProfileError(
+                f"ephemeral template {name!r} is not enrolled with the host "
+                "coordinator broker; rerun Coordinator skill installation as "
+                "the host administrator"
+            )
+        return value
+
+    def ephemeral_image_prefetch_template_id(self, name: str) -> str:
+        """Return one template only when the root profile explicitly permits pull."""
+
+        value = self.ephemeral_template_id(name)
+        if value not in self.ephemeral_image_prefetch_template_ids:
+            raise BrokerProfileError(
+                f"ephemeral image prefetch for template {name!r} is not explicitly "
+                "enrolled; rerun Coordinator skill installation with the reviewed "
+                "image-prefetch grant"
+            )
+        return value
+
+    def ephemeral_secret_policy(
+        self, name: str
+    ) -> EphemeralSecretPolicyProfile | None:
+        """Return public credential-delivery policy, never credential material."""
+
+        return self.ephemeral_secret_policies.get(str(name))
+
 
 @dataclass(frozen=True)
 class BrokerClientProfile:
@@ -132,6 +190,28 @@ class BrokerClientProfile:
         value.require_current(account_id=self.account_id)
         return value
 
+    def retained_ephemeral_repository(
+        self, canonical_root: str
+    ) -> BrokerRepositoryProfile:
+        """Resolve one recorded repo for owner-only status/cleanup calls.
+
+        This deliberately does not discover repositories or revive an expired
+        enrollment.  The protected profile supplies only the exact opaque repo
+        identity; the broker still proves the run belongs to the authenticated
+        UID/account and permits only ``ephemeral.status`` or
+        ``ephemeral.finish`` after revocation.
+        """
+
+        canonical = str(Path(canonical_root).expanduser().resolve())
+        value = self.repositories.get(canonical)
+        if value is None:
+            raise BrokerProfileError(
+                f"repository {canonical} is not recorded in the configured host "
+                "broker profile; retained ephemeral cleanup cannot discover it"
+            )
+        value.require_account(account_id=self.account_id)
+        return value
+
     def call(
         self,
         *,
@@ -141,11 +221,18 @@ class BrokerClientProfile:
         arguments: Optional[Mapping[str, Any]] = None,
         operation_id: Optional[str] = None,
     ) -> tuple[str, dict[str, Any]]:
-        if int(time.time()) >= self.valid_until_epoch:
+        retained_ephemeral = operation in {
+            BrokerOperation.EPHEMERAL_STATUS,
+            BrokerOperation.EPHEMERAL_FINISH,
+        }
+        if not retained_ephemeral and int(time.time()) >= self.valid_until_epoch:
             raise BrokerProfileError(
                 "host broker enrollment has expired; rerun Coordinator skill installation"
             )
-        repository.require_current(account_id=self.account_id)
+        if retained_ephemeral:
+            repository.require_account(account_id=self.account_id)
+        else:
+            repository.require_current(account_id=self.account_id)
         return call_broker(
             service=self.service,
             account_id=self.account_id,
@@ -262,7 +349,16 @@ def call_broker(
                 else (
                     HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS
                     if operation == BrokerOperation.HOST_OBSERVE
-                    else 60.0
+                    else (
+                        5 * 60.0
+                        if operation
+                        in {
+                            BrokerOperation.EPHEMERAL_START,
+                            BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+                            BrokerOperation.EPHEMERAL_FINISH,
+                        }
+                        else 60.0
+                    )
                 )
             )
             if operation
@@ -273,6 +369,9 @@ def call_broker(
                 BrokerOperation.HOST_OBSERVE,
                 BrokerOperation.DATABASE_BACKUP,
                 BrokerOperation.DATABASE_RESTORE,
+                BrokerOperation.EPHEMERAL_START,
+                BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+                BrokerOperation.EPHEMERAL_FINISH,
             }
             else 10.0
         ),
@@ -312,6 +411,7 @@ def load_broker_profile(
     effective_uid: int | None = None,
     required: bool = False,
     trusted_owner_uid: int = 0,
+    allow_expired_for_ephemeral_cleanup: bool = False,
 ) -> BrokerClientProfile | None:
     configured_by_environment = bool(str(os.environ.get(PROFILE_PATH_ENV) or "").strip())
     explicitly_configured = path is not None or configured_by_environment
@@ -333,11 +433,18 @@ def load_broker_profile(
     after = candidate.lstat()
     if (metadata.st_dev, metadata.st_ino) != (after.st_dev, after.st_ino):
         raise BrokerProfileError("broker profile identity changed while it was read")
-    return profile_from_document(document, effective_uid=uid)
+    return profile_from_document(
+        document,
+        effective_uid=uid,
+        allow_expired_for_ephemeral_cleanup=allow_expired_for_ephemeral_cleanup,
+    )
 
 
 def profile_from_document(
-    document: Any, *, effective_uid: int
+    document: Any,
+    *,
+    effective_uid: int,
+    allow_expired_for_ephemeral_cleanup: bool = False,
 ) -> BrokerClientProfile:
     if not isinstance(document, dict) or set(document) != {
         "version",
@@ -384,7 +491,10 @@ def profile_from_document(
         )
     account_id = _identifier(raw.get("account_id"), "account id")
     valid_until = _positive_int(raw.get("valid_until_epoch"), "profile expiry")
-    if int(time.time()) >= valid_until:
+    if (
+        not allow_expired_for_ephemeral_cleanup
+        and int(time.time()) >= valid_until
+    ):
         raise BrokerProfileError("host broker enrollment has expired")
     repositories_raw = raw.get("repositories")
     if not isinstance(repositories_raw, list) or not repositories_raw:
@@ -400,7 +510,7 @@ def profile_from_document(
         if repository.canonical_root in repositories:
             raise BrokerProfileError("broker profile duplicates a canonical repository root")
         repositories[repository.canonical_root] = repository
-    if not any(
+    if not allow_expired_for_ephemeral_cleanup and not any(
         repository.enabled
         and repository.account_id == account_id
         and int(time.time()) < repository.valid_until_epoch
@@ -444,19 +554,49 @@ def _repository_from_document(
         "issued_at",
         "valid_until_epoch",
     }
-    if not isinstance(value, dict) or frozenset(value) not in {
-        frozenset(legacy_fields),
-        frozenset(repository_fields),
-    }:
+    ephemeral_fields = {
+        "ephemeral_templates",
+        "ephemeral_secret_policies",
+        "ephemeral_image_prefetch_templates",
+    }
+    accepted_fields = {
+        frozenset(base | subset)
+        for base in (legacy_fields, repository_fields)
+        for subset in (
+            set(),
+            {"ephemeral_templates"},
+            {"ephemeral_secret_policies"},
+            {"ephemeral_image_prefetch_templates"},
+            {"ephemeral_templates", "ephemeral_secret_policies"},
+            {"ephemeral_templates", "ephemeral_image_prefetch_templates"},
+            {"ephemeral_secret_policies", "ephemeral_image_prefetch_templates"},
+            ephemeral_fields,
+        )
+    }
+    if not isinstance(value, dict) or frozenset(value) not in accepted_fields:
         raise BrokerProfileError("broker repository profile fields are invalid")
     canonical_root = str(Path(str(value.get("canonical_root") or "")).expanduser().resolve())
     if not Path(canonical_root).is_absolute():
         raise BrokerProfileError("enrolled repository root must be absolute")
     servers = _identifier_mapping(value.get("servers"), "server")
     containers = _identifier_mapping(value.get("containers"), "container")
+    ephemeral_templates = _identifier_mapping(
+        value.get("ephemeral_templates", {}), "ephemeral template"
+    )
+    ephemeral_secret_policies = _ephemeral_secret_policy_mapping(
+        value.get("ephemeral_secret_policies", {})
+    )
+    ephemeral_image_prefetch_template_ids = _ephemeral_image_prefetch_template_ids(
+        value.get("ephemeral_image_prefetch_templates", []),
+        template_ids=frozenset(ephemeral_templates.values()),
+    )
+    if not set(ephemeral_secret_policies) <= set(ephemeral_templates):
+        raise BrokerProfileError(
+            "ephemeral credential policy references an unknown template"
+        )
     compose_raw = value.get("compose_definition_id")
     compose = None if compose_raw is None else _identifier(compose_raw, "Compose definition")
-    if set(value) == repository_fields:
+    if repository_fields <= set(value):
         repository_account_id = _identifier(
             value.get("account_id"), "repository account id"
         )
@@ -483,6 +623,9 @@ def _repository_from_document(
         server_ids=servers,
         container_ids=containers,
         compose_definition_id=compose,
+        ephemeral_templates=ephemeral_templates,
+        ephemeral_image_prefetch_template_ids=ephemeral_image_prefetch_template_ids,
+        ephemeral_secret_policies=ephemeral_secret_policies,
         account_id=repository_account_id,
         enabled=enabled,
         issued_at=issued_at,
@@ -500,6 +643,53 @@ def _identifier_mapping(value: Any, label: str) -> Mapping[str, str]:
             raise BrokerProfileError(f"broker {label} display identity is invalid")
         result[key] = _identifier(resource_id, f"{label} resource id")
     return result
+
+
+def _ephemeral_secret_policy_mapping(
+    value: Any,
+) -> Mapping[str, EphemeralSecretPolicyProfile]:
+    """Parse only public policy and opaque binding IDs from a root profile."""
+
+    if not isinstance(value, dict):
+        raise BrokerProfileError("broker ephemeral credential policy mapping must be an object")
+    result: dict[str, EphemeralSecretPolicyProfile] = {}
+    for template_name, raw in value.items():
+        name = str(template_name)
+        if not name or len(name.encode("utf-8")) > 512:
+            raise BrokerProfileError("ephemeral credential policy template name is invalid")
+        if not isinstance(raw, dict) or set(raw) != {"policy", "binding_id"}:
+            raise BrokerProfileError("ephemeral credential policy fields are invalid")
+        try:
+            result[name] = EphemeralSecretPolicyProfile(
+                policy=str(raw.get("policy") or ""),
+                binding_id=str(raw.get("binding_id") or ""),
+            )
+        except (TypeError, ValueError) as exc:
+            raise BrokerProfileError("ephemeral credential policy is invalid") from exc
+    return result
+
+
+def _ephemeral_image_prefetch_template_ids(
+    value: Any, *, template_ids: frozenset[str]
+) -> frozenset[str]:
+    """Parse only a root-declared subset of enrolled opaque template IDs."""
+
+    if not isinstance(value, list):
+        raise BrokerProfileError(
+            "broker ephemeral image prefetch templates must be a list"
+        )
+    result = tuple(
+        _identifier(item, "ephemeral image prefetch template id") for item in value
+    )
+    if len(set(result)) != len(result):
+        raise BrokerProfileError(
+            "broker ephemeral image prefetch template list has duplicates"
+        )
+    if not set(result) <= template_ids:
+        raise BrokerProfileError(
+            "broker ephemeral image prefetch template is not enrolled"
+        )
+    return frozenset(result)
 
 
 def _identifier(value: Any, label: str) -> str:

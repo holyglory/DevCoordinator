@@ -67,6 +67,7 @@ export function createRouter(deps) {
     routeStore,
     accessStore,
     upstreamAuthStore,
+    identitySigner,
     coordinator,
     proxy,
   } = deps;
@@ -359,6 +360,10 @@ export function createRouter(deps) {
   async function handleConsole(req, res, pathname, rawUrl, hostPort) {
     const proto = config.devInsecureHttp ? 'http' : 'https';
     const requestOrigin = `${proto}://${hostPort}`;
+    if (pathname === '/.well-known/devops-console-identity.jwks') {
+      if (req.method !== 'GET') return methodNotAllowed(res, 'GET');
+      return sendJson(res, 200, identitySigner.publicJwks());
+    }
     if (pathname === '/auth' || pathname.startsWith('/auth/')) {
       const searchParams = new URL(rawUrl, config.consoleOrigin).searchParams;
       return handleAuth(req, res, pathname, searchParams, requestOrigin, hostPort);
@@ -397,8 +402,9 @@ export function createRouter(deps) {
     // Unknown slugs behave exactly like protected ones for anonymous users so
     // route names cannot be enumerated (security invariant #2).
     const needAuth = !route || route.auth !== 'public';
+    let session = null;
     if (needAuth) {
-      const session = guard.identityFrom(req);
+      session = guard.identityFrom(req);
       if (!session) {
         const proto = config.devInsecureHttp ? 'http' : 'https';
         const fullUrl = `${proto}://${hostPort}${rawUrl}`;
@@ -438,6 +444,14 @@ export function createRouter(deps) {
       publicHost: hostPort,
       route,
       upstreamAuthorization: upstreamAuthorizationFor(route),
+      upstreamIdentityAssertion: session
+        ? identitySigner.sign({
+            subject: session.email,
+            audience: hostPort,
+            resource: routeGrant(slug),
+            method: req.method || 'GET',
+          })
+        : null,
     });
   }
 
@@ -536,9 +550,10 @@ export function createRouter(deps) {
 
     const route = routeStore.get(slug);
     const needAuth = !route || route.auth !== 'public';
+    let session = null;
     if (needAuth) {
       // Same auth checks as plain requests — an upgrade must never bypass them.
-      const session = guard.identityFrom(req);
+      session = guard.identityFrom(req);
       if (!session) return refuseUpgrade(socket, 401, 'Unauthorized');
       if (route && (!guard.isKnownEmail(session.email) || !guard.hasAccess(session, routeGrant(slug)))) {
         return refuseUpgrade(socket, 403, 'Forbidden');
@@ -561,6 +576,14 @@ export function createRouter(deps) {
       publicHost: hostPort,
       route,
       upstreamAuthorization: upstreamAuthorizationFor(route),
+      upstreamIdentityAssertion: session
+        ? identitySigner.sign({
+            subject: session.email,
+            audience: hostPort,
+            resource: routeGrant(slug),
+            method: req.method || 'GET',
+          })
+        : null,
     });
   }
 

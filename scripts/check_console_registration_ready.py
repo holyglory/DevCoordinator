@@ -1128,7 +1128,11 @@ def inventory_probe(
     name: str,
     server_port: int,
 ) -> dict[str, Any]:
-    connection = http.client.HTTPConnection(host, port, timeout=max(0.1, min(timeout, 3.0)))
+    # The caller already supplies the monotonic remainder of the global startup
+    # deadline. Do not impose a shorter per-request cap: abandoning a valid
+    # broker read leaves that work running server-side and retrying amplifies
+    # load precisely while the coordinator is recovering.
+    connection = http.client.HTTPConnection(host, port, timeout=max(0.1, timeout))
     try:
         query = urlencode(
             {

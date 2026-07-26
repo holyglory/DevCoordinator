@@ -726,7 +726,7 @@ class BrokerAssignmentTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.fixture.close()
 
-    def test_never_started_enrolled_server_is_current_but_bare_definition_is_not(self) -> None:
+    def test_never_started_enrolled_definition_is_usable_but_not_a_server_instance(self) -> None:
         orphan_id = "server-bare-orphan"
         timestamp = utc_timestamp()
         with CoordinatorStore.open(
@@ -770,7 +770,7 @@ class BrokerAssignmentTests(unittest.TestCase):
         self.assertIn(
             SERVER_ALPHA,
             server_ids,
-            "false-positive guard: exact broker enrollment keeps a never-started server usable",
+            "false-positive guard: exact broker enrollment keeps a lease target usable",
         )
         self.assertNotIn(
             orphan_id,
@@ -782,7 +782,15 @@ class BrokerAssignmentTests(unittest.TestCase):
             for item in graph["v1_compatibility"]["project_usage"]
             if item["project"] == str(self.fixture.alpha_root)
         )
-        self.assertIn(SERVER_ALPHA, usage["server_ids"])
+        visible_server_ids = {
+            item["id"] for item in graph["v1_compatibility"]["servers"]
+        }
+        self.assertNotIn(
+            SERVER_ALPHA,
+            visible_server_ids,
+            "must-catch: broker ACLs and port policy are control evidence, not a running or stopped server instance",
+        )
+        self.assertNotIn(SERVER_ALPHA, usage["server_ids"])
         self.assertNotIn(orphan_id, usage["server_ids"])
 
     def test_enrollment_compose_failure_precedes_all_authority_and_profile_mutation(
@@ -2604,7 +2612,10 @@ volumes:
             nonlocal calls
             calls += 1
             return subprocess.CompletedProcess(
-                command, 1, stdout="", stderr="compose failed"
+                command,
+                1,
+                stdout="",
+                stderr="METRICS_WORKER_ADMIN_TOKEN=redacted-test-secret",
             )
 
         service, _ = service_for(self.fixture, compose_runner=runner)
@@ -2613,9 +2624,15 @@ volumes:
             resource_id=COMPOSE_ALPHA,
             operation_id=str(uuid.uuid4()),
         )
-        first = service.reply_for_document(self.fixture.peer(), request.to_wire())
+        with self.assertLogs("devcoordinator.broker_host", level="ERROR") as logs:
+            first = service.reply_for_document(self.fixture.peer(), request.to_wire())
         self.assertFalse(first["ok"], first)
         self.assertEqual(first["error"]["code"], "operation_outcome_uncertain")
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("action=down", diagnostic)
+        self.assertIn("phase=down", diagnostic)
+        self.assertIn("returncode=1", diagnostic)
+        self.assertNotIn("redacted-test-secret", diagnostic)
         with CoordinatorStore.open(
             self.fixture.persistence.database_path,
             expected_uid=os.geteuid(),

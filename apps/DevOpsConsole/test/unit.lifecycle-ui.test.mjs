@@ -85,6 +85,31 @@ test('post-lifecycle focus waits until inventory and archive refreshes settle', 
     'result focus must be deferred until every mutation refresh has settled');
 });
 
+test('archive UI and polling require explicit backend lifecycle readiness', async () => {
+  const app = await fsp.readFile(new URL('../src/ui/app.js', import.meta.url), 'utf8');
+  const capability = extractFunction(app, 'function lifecycleAvailable()');
+  const sync = extractFunction(app, 'function syncLifecycleVisibility()');
+  const load = extractFunction(app, 'async function loadArchives({ force = false } = {})');
+  const button = extractFunction(app, 'function archiveButton(target, { compact = false } = {})');
+  const refresh = extractFunction(app, 'async function refreshOverview({ force = false } = {})');
+  const boot = extractFunction(app, 'async function boot()');
+
+  assert.match(capability, /accessAdmin === true/);
+  assert.match(capability, /lifecycleAvailable === true/,
+    'configured Gmail ownership and broker cleanup readiness are separate facts');
+  assert.match(sync, /const available = lifecycleAvailable\(\)/);
+  assert.match(sync, /button\.disabled = !available/,
+    'Archived controls must be visibly disabled while production activation is blocked');
+  assert.match(load, /if \(!lifecycleAvailable\(\)\) return;/,
+    'unavailable lifecycle must never generate archive-list traffic');
+  assert.match(button, /!lifecycleAvailable\(\)/,
+    'unavailable lifecycle must not expose per-resource Archive actions');
+  assert.match(refresh, /lifecycleAvailable\(\)[\s\S]*loadArchives\(\{ force: true \}\)/,
+    'background overview polls must not probe unavailable cleanup authorization');
+  assert.match(boot, /lifecycleAvailable\(\)[\s\S]*loadArchives\(\)/,
+    'boot must not repeatedly call a deliberately unavailable archive endpoint');
+});
+
 test('worktrees are disclosed only when the backend advertises removable archived children', async () => {
   const app = await fsp.readFile(new URL('../src/ui/app.js', import.meta.url), 'utf8');
   const groups = extractFunction(app, 'function archivedGroups(page)');

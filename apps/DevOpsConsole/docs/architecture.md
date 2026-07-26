@@ -14,7 +14,10 @@ A single Node process that is the public edge of the VPS `vr.ae`:
    SIGHUP). Plain-HTTP listener on `HTTP_PORT` (prod 80) that 301/308-redirects
    everything to `https://` (except `GET /healthz` → `200 ok`).
 2. **Host routing**: `console.vr.ae` → control-panel app (auth + API + UI).
-   `<slug>.vr.ae` → reverse proxy to `127.0.0.1:<port>` (HTTP + WebSocket/HMR).
+   `<slug>.vr.ae` → reverse proxy to `http://127.0.0.1:<port>` (HTTP + WebSocket/HMR).
+   Public TLS terminates at the Console; route targets are plaintext HTTP
+   listeners. Route creation and Docker port selection state this boundary so
+   an HTTPS/TLS-only application port is not mistaken for a usable upstream.
    Apex `vr.ae` and `www.vr.ae` → redirect to the console. Foreign hosts → 421.
 3. **Google identity (OIDC)**: authorization-code flow + PKCE against
    `https://accounts.google.com`, verified Google email identity, and one
@@ -33,7 +36,10 @@ A single Node process that is the public edge of the VPS `vr.ae`:
    an exact route grant pass, a route may replace caller `Authorization` with
    a private route-scoped Bearer or Basic credential. The credential never
    enters route/API views; public routes never receive it and retain normal
-   end-to-end HTTP authentication.
+   end-to-end HTTP authentication. A rejected injected credential is an
+   operator configuration failure: discard the upstream body and render the
+   Console's branded HTML 502 page, never upstream JSON or another browser
+   authentication prompt.
 6. **Coordinator as control engine**: all server/docker/lease state and
    mutations go through the coordinator HTTP API on `127.0.0.1:29876`
    (`docs/coordinator-http-api.json` is the authoritative endpoint map). The
@@ -609,6 +615,17 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 
 `GET /api/overview` also feeds its fresh inventory into `metrics.ingest()`.
 
+The browser mirrors the Docker mutation boundary on every surface that renders
+a container (Projects, Servers, and Docker). A row is controllable only when
+`project` is present, `metadata_source` is `docker_labels` or
+`coordinator_sidecar`, and no `attribution` exception is active. Otherwise the
+row renders the coordinator's `attribution.explanation` and recommended next
+step, omits an active lifecycle target, disables Start/Restart/Stop/Archive,
+and keeps only read-only inspection such as Docker logs. The Console has no
+attach or standalone-retire API, so `can_attach` / `can_retire` are disclosed
+as administrator guidance rather than converted into browser controls with
+invented authority.
+
 ## Static UI server (`src/static.mjs`)
 
 ```js
@@ -660,8 +677,8 @@ publishes are excluded because the proxy dials v4 loopback), or a stopped
 one that still has a route — with a `docker` kind tag,
 container status badge, published host ports, start/stop/restart via
 `/api/docker/action`, container log panel, and the same subdomain control
-saving through `/api/docker/subdomain` with a container-port picker when
-several ports are published), **Routes** (create form for
+saving through `/api/docker/subdomain` with an explicitly HTTP-labelled
+container-port picker when several ports are published), **Routes** (create form for
 fixed-port, managed-server or container targets + table: clickable URL + copy
 button, target with "view server" link for server/container-backed routes,
 public/login toggle switch, resolved status dot, delete), **Docker** (status,

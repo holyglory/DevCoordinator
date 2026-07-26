@@ -24,13 +24,24 @@ third-party dependencies) that:
   [codex-dev-coordinator](../../skills/codex-dev-coordinator/SKILL.md) HTTP API
   on loopback `127.0.0.1:29876`, authenticated with a private token. Production
   runs it as the dedicated `dev-coordinator.service`; optional local autostart
-  remains available. On each metrics tick (default every 10s,
-  `METRICS_INTERVAL_MS`), the Console explicitly requests one attributed host
-  observation and then reads the coordinator's pure inventory into in-memory
-  ring buffers. Every current running server and container row shows CPU
-  %/memory numbers plus a sparkline, and the
-  Performance page renders full history charts (history resets when the
-  console restarts).
+  remains available. The metrics loop is the one periodic host observer. On
+  each tick (default every 10s,
+  `METRICS_INTERVAL_MS`), the Console reads the coordinator's last committed
+  pure inventory into in-memory ring buffers without waiting for host-wide
+  observation. When no observation is already in flight or backed off, that
+  tick also initiates one attributed observation. Same-project observations
+  coalesce; failures back off from completion exponentially up to five minutes
+  while pure inventory reads continue every tick. Every current running server
+  and container row shows CPU %/memory
+  numbers plus a sparkline, and the Performance page renders full history
+  charts (history resets when the console restarts).
+
+  In the required production unit, metrics and Telegram broker loops start 90
+  seconds after the Console's own registration succeeds. This keeps the
+  installed 80-second independent registration proof ahead of background host
+  observation and event ingestion during restarts. The proof uses one
+  authenticated inventory request with the whole remaining startup deadline;
+  it never abandons a still-running broker read merely to retry it.
 
   The API and server-wide broker are independently supervised. During a
   rolling deployment, the Console accepts canonical compatibility stats when
@@ -39,13 +50,16 @@ third-party dependencies) that:
   current immutable resource, available engine, running observation, and
   in-window telemetry. Missing proof renders no utilization, never stale data.
 
-Configured owners also get Active/Archived views on Projects, Servers, and
-Docker. Archive prepares and applies a coordinator-authored stop-and-fence
-plan while retaining the plan's declared data and history. Archived rows can
-be restored (which clears the fence but never starts the resource) or removed
-permanently only when the coordinator advertises that capability; permanent
-removal requires typing the exact phrase returned by the fresh plan. These
-durable lifecycle controls are distinct from the cosmetic Hide preference.
+Configured owners get Active/Archived views on Projects, Servers, and Docker
+only when `LIFECYCLE_ENABLED=1` explicitly confirms that the broker schema,
+generated home access, and cleanup ACLs were migrated and verified together.
+The default is disabled and makes no archive request. Once activated, Archive
+prepares and applies a coordinator-authored stop-and-fence plan while retaining
+the plan's declared data and history. Archived rows can be restored (which
+clears the fence but never starts the resource) or removed permanently only
+when the coordinator advertises that capability; permanent removal requires
+typing the exact phrase returned by the fresh plan. These durable lifecycle
+controls are distinct from the cosmetic Hide preference.
 
 Production binds ports 80/443 on the explicit IPv4 wildcard `0.0.0.0` and
 uses `127.0.0.1` for coordinator registration and health. This deployment has
@@ -92,7 +106,8 @@ ones:
 | `COORDINATOR_TOKEN_FILE` | Private mode-0600 bearer token created by the coordinator and read only by the server-side Console client. |
 | `COORDINATOR_AUTOSTART` | Optional local fallback; production sets `0` and uses `dev-coordinator.service`. |
 | `COORDINATOR_REGISTRATION_REQUIRED` | Production-only fail-closed gate. The unit pins `1`; direct/local runs omit it and log a bounded registration failure without exiting. |
-| `METRICS_INTERVAL_MS` | CPU/memory observation cadence for the history charts (default `10000`, floor `2000`). Each tick requests an explicit coordinator host observation, then reads its committed pure inventory. A failed observation keeps the last committed inventory visible and reports the sampling error. |
+| `LIFECYCLE_ENABLED` | Explicit cleanup activation gate (default `0`). Set to `1` only after the matching broker schema, generated home access, cleanup ACLs, and live plan/apply/restore checks are ready. |
+| `METRICS_INTERVAL_MS` | CPU/memory observation cadence for the history charts (default `10000`, floor `2000`). Metrics is the sole periodic observer; same-project requests coalesce and failures back off up to five minutes while committed inventory remains readable. |
 
 Telegram bot tokens are registered from the Console UI, not from
 `console.env`. They remain server-only in private
@@ -1134,9 +1149,13 @@ The Console keeps that backend credential in private
 caller-supplied `Authorization` header after the Google/domain-grant check, and
 does not return the secret through route views, logs, URLs, or CLI output.
 Upstream `WWW-Authenticate`/`Authentication-Info` headers are suppressed on a
-Google-protected route so a wrong backend credential yields an ordinary 401,
-never a second browser login prompt. Public routes retain normal HTTP-auth
-behavior and never receive a stored private credential.
+Google-protected route. If the injected backend credential is rejected, the
+Console discards the upstream response body and renders a branded HTML 502
+configuration page—never upstream JSON or a second browser login prompt.
+Missing or expired Console identity instead redirects browser navigation to
+`/auth/login` with the exact requested URL as `rt`, and successful sign-in
+returns there. Public routes retain normal HTTP-auth behavior and never receive
+a stored private credential.
 
 Configured owners can rotate a credential live through
 `PATCH /api/routes/<slug>/upstream-auth`; non-owner Console users are denied,
@@ -1160,8 +1179,11 @@ sudo systemctl restart devops-console
 For a Basic-only upstream, use `--scheme basic --username <user>`. `list`
 prints only route/scheme metadata; `remove <slug>` deletes the credential.
 Route deletion removes its credential, server/container route renames move it,
-and changing a route to public erases it. Rotate the Console copy whenever the
-upstream token changes.
+and changing a route to public erases it. Rotate the Console copy in the same
+transaction whenever the upstream token changes, then verify the two private
+copies without printing either secret before restarting Console. Private
+rollback directories must be mode `0700` and their credential-state files mode
+`0600`; the production preflight intentionally refuses looser state.
 
 ## Exposing a dev server
 

@@ -14,6 +14,7 @@ Environment=DEVCOORDINATOR_AUTHORITY=service
 Environment=DOCKER_CONFIG=/var/lib/devcoordinator/docker
 RuntimeDirectory=devcoordinator
 RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=restart
 StateDirectory=devcoordinator
 StateDirectoryMode=0700
 UMask=0077

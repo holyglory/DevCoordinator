@@ -226,6 +226,11 @@ Prioritized: top rows are the most frequent and most important.
   `missing_command` (registered without a command — Restart is disabled with
   the reason in its tooltip); action 400s from the coordinator (verbatim in
   banner, retryable).
+- Collection boundary: enrollment-only definitions used as exact port-lease
+  or port-assignment targets are not server instances. They remain available
+  on the Ports page and in normalized coordinator resources, but never enter
+  Servers, Projects, running counts, Unassigned Resources, or server action
+  controls until the coordinator publishes a concrete lifecycle observation.
 - Primary actions: expand the project group and row; refresh logs; Restart.
 - Secondary/rare actions: Stop (leaving it down deliberately); deleting the
   route instead; consulting the docker section when the failure is a
@@ -325,16 +330,22 @@ Prioritized: top rows are the most frequent and most important.
   cold start; is it safe to stop (is anything using it)?
 - Required information per step: name, image, raw status string, published
   ports; logs on demand; CPU/mem sample in the detail popover when stats
-  exist.
+  exist. Unassigned rows also show the coordinator's exact attribution reason
+  and the available administrator repair journey.
 - Warning/flag conditions: stopping anything confirms (dependencies may
   break — Postgres especially; destructive DB operations additionally go
   through the `$postgres-docker-backup` path *outside* this UI, per repo
   policy); Docker daemon unavailable shows the error inline, not a blank
-  section.
+  section. A container without one verified Compose/sidecar repository owner
+  is read-only: Start, Restart, Stop, Archive and subdomain assignment stay
+  unavailable even when its name resembles a known project.
 - Primary actions: logs, restart, start.
 - Secondary/rare actions: stop; reading compose/project metadata in the
   popover.
-- Conditional or rare details: stats, labels, metadata source — popover only.
+- Conditional or rare details: stats, labels, metadata source — popover only;
+  read-only logs remain available for an unassigned container so an operator
+  can diagnose it before using coordinator administration to attach or retire
+  the exact immutable resource.
 - Interaction targets and feedback: same row/chevron/busy conventions as
   Servers; the status dot carries hidden text plus a visible "up/stopped"
   word by the name.
@@ -828,7 +839,7 @@ header is identical on every page):
 | Projects page (`#/projects`, default) | J8, J7 | Collapsed-by-default repo tree: per-node running counts and project CPU/mem; expanding one repo shows losslessly paged members with item CPU/mem, kind tags and subdomain chip on web-serving containers | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain. Every row (project header, server, container) renders the SAME three color-coded slots — Start (green) / Restart (blue) / Stop (red), inapplicable ones disabled, never hidden — so buttons align into columns | Expand/collapse one node; page members; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap; at most 75 members mounted |
 | Sticky header (single row) | J1 | Brand; needs-attention badge (only when something is wrong); account button | Open badge popover (facts, instructions, actions per problem) | Sign out via account popover | Coordinator error text; cert dates; renew command | ONE row on every viewport; domain label hidden <480px; sticky top |
 | Section nav | All | Page names, live counts, active page | Switch page | Hamburger open/close (≤1023px) | — | Tabs inline in the header row ≥1024px; drawer with ≥40px targets below |
-| Servers page (`#/servers`, default) | J2, J3, J7 | Every nonempty repo/resource-group header, collapsed by default, with running count and project CPU/mem; opening one shows its losslessly paged health badge, name, port, subdomain and CPU/mem rows; Docker-hosted web servers remain first-class rows | Expand one project then a server; restart; refresh logs; assign/edit subdomain (containers too, with a port picker when several are published); open history charts | Collapse/switch project; Stop; start (stopped containers); page through the open project's servers | pid/cmd/cwd/health detail; container image/ports detail | Full-width accessible project targets; compact two-line headers at 390px; log box height-capped; at most 75 server rows mounted |
+| Servers page (`#/servers`, default) | J2, J3, J7 | Every nonempty repo/resource-group header, collapsed by default, with running count and project CPU/mem; opening one shows its losslessly paged health badge, name, port, subdomain and CPU/mem rows; Docker-hosted web servers remain first-class rows | Expand one project then a server; restart; refresh logs; assign/edit subdomain (containers too, with an explicitly HTTP-labelled port picker when several are published); open history charts | Collapse/switch project; Stop; start (stopped containers); page through the open project's servers | pid/cmd/cwd/health detail; container image/ports detail | Full-width accessible project targets; compact two-line headers at 390px; from 480–719px each server uses three compact identity/facts/actions bands without redundant labels, below 480px four bounded bands; log box height-capped; at most 75 server rows mounted |
 | Routes page (`#/routes`) | J2, J4 | URL, resolved dot, access mode; targets: fixed port, managed server, docker container | Create; copy; toggle access | Delete; title; "view server" link | Timestamps | Form stacks at 390px; table rows become labelled cards |
 | Docker page (`#/docker`) | J5, J7 | Losslessly paged status, name, image, ports, CPU/mem numbers; subdomain chip on web-serving containers | Logs; restart; start; open history charts; assign/edit subdomain | Stop; page through all containers | stats/labels | Same card pattern; at most 75 containers mounted |
 | Port leases page (`#/ports`) | J6 | Port, purpose, countdown; lease form; pinned ports (port permanently owned per server, with server status) | Lease; release (confirmed); unassign pin (confirmed) | Preferred port/TTL/project | Lease id, ISO expiry, agent, pin provenance (title) | Form stacks at 390px |

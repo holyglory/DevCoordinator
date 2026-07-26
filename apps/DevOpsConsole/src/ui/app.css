@@ -402,6 +402,13 @@ a { color: var(--accent); }
 
 fieldset.field { border: 0; margin: 0; padding: 0; }
 
+.target-protocol-note {
+  margin: 1px 0 0;
+  color: var(--dim);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
 input[type="text"], input[type="email"], input[type="password"], input[type="number"], select, textarea {
   width: 100%;
   background: var(--bg);
@@ -1107,6 +1114,63 @@ select:disabled { color: var(--dim); }
 
 .perf-sec-title { margin: 4px 0 8px; font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
 
+.test-head { align-items: end; }
+.test-filters { display: grid; grid-template-columns: auto minmax(180px, 1fr) auto auto; gap: 8px; align-items: center; }
+.test-filters label { color: var(--dim); font-size: 12px; }
+.test-stats-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
+.test-stat { min-width: 0; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); }
+.test-stat-value { display: block; color: var(--text); font-size: 20px; font-weight: 700; overflow-wrap: anywhere; }
+.test-stat-label { display: block; margin-top: 4px; color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.test-panel { margin-top: 18px; }
+.test-panel h3 { margin: 0 0 8px; font-size: 13px; }
+.test-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+.test-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.test-table th, .test-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.test-table th { color: var(--dim); font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
+.test-table tr:last-child td { border-bottom: 0; }
+.test-name { min-width: 260px; max-width: 540px; overflow-wrap: anywhere; }
+.empty-inline { color: var(--dim); font-size: 12px; }
+
+@media (max-width: 900px) {
+  .test-stats-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .test-head { align-items: stretch; }
+  .test-filters { grid-template-columns: auto minmax(0, 1fr); }
+}
+
+@media (max-width: 560px) {
+  .test-stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .test-filters { grid-template-columns: minmax(0, 1fr); }
+  .test-filters label { margin-top: 4px; }
+  .test-table-wrap { overflow: visible; border: 0; }
+  .test-table, .test-table tbody, .test-table tr, .test-table td { display: block; width: 100%; }
+  .test-table thead { display: none; }
+  .test-table tr {
+    margin-bottom: 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg2);
+    overflow: hidden;
+  }
+  .test-table td {
+    display: grid;
+    grid-template-columns: minmax(92px, .7fr) minmax(0, 1.3fr);
+    gap: 10px;
+    min-width: 0;
+    max-width: none;
+    padding: 8px 10px;
+    overflow-wrap: anywhere;
+  }
+  .test-table td::before {
+    content: attr(data-label);
+    color: var(--dim);
+    font-size: 10.5px;
+    font-family: var(--sans);
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+}
+
 /* ---------- CPU/memory sparklines and history charts ---------- */
 
 .usage-cell { display: flex; align-items: center; gap: 8px; }
@@ -1248,10 +1312,41 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
 .server-project-toggle > .spark { grid-column: 4; margin-left: 0; }
 .server-project-toggle > .proj-usage { grid-column: 5; }
 .server-project-toggle:hover .chev { background: var(--bg4); color: var(--text); }
-.server-group-items { min-width: 0; }
-.server-group-items[hidden] { display: none; }
-.server-group-items > .item:first-child { border-top: 0; }
-.server-group-items > .item:nth-child(even of .item) { background: rgba(255, 255, 255, .025); }
+.server-group-items, .docker-group-items { min-width: 0; }
+.server-group-items[hidden], .docker-group-items[hidden] { display: none; }
+.server-group-items > .item:first-child, .docker-group-items > .item:first-child { border-top: 0; }
+.server-group-items > .item:nth-child(even of .item), .docker-group-items > .item:nth-child(even of .item) { background: rgba(255, 255, 255, .025); }
+
+/* Unassigned Docker resources remain inspectable but never look controllable.
+   The coordinator explanation is primary row content because the missing
+   ownership proof is the reason every mutating action is disabled. */
+.row.ownership-unverified {
+  border-left: 2px solid #6d541f;
+  background: rgba(232, 178, 62, .035);
+}
+.ownership-warning {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 6px;
+  align-items: start;
+  max-width: 100%;
+  margin-top: 7px;
+  padding: 7px 8px;
+  border: 1px solid #6d541f;
+  border-radius: 7px;
+  color: var(--warn);
+  background: var(--warn-bg);
+  font-family: var(--sans);
+  font-size: 11.5px;
+  line-height: 1.35;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.ownership-warning-icon { display: inline-flex; margin-top: 1px; }
+.ownership-warning-copy { display: block; min-width: 0; }
+.ownership-warning-title { display: block; color: var(--text); font-weight: 700; }
+.ownership-warning-detail, .ownership-warning-next { display: block; margin-top: 2px; }
+.ownership-warning-next { color: var(--muted); }
 
 .tree-node { border-top: 1px solid var(--line); padding: 4px 0 8px; }
 .tree-node:first-of-type { border-top: 0; }
@@ -1476,6 +1571,34 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   .brand-domain { display: none; }
 }
 
+/* Preserve a usable container-name column before rows become mobile cards. */
+@media (min-width: 720px) and (max-width: 1023px) {
+  /* Server rows have five fixed side concerns (port, usage, status, warning,
+     actions). Put actions above the secondary facts so those concerns cannot
+     reduce the identity track to zero before the mobile-card breakpoint. */
+  .srv-grid {
+    grid-template-columns: 26px minmax(180px, 1fr) minmax(180px, 210px) 118px;
+    grid-template-rows: auto auto;
+  }
+  .srv-grid > :nth-child(1) { grid-column: 1; grid-row: 1; align-self: start; }
+  .srv-grid > :nth-child(2) { grid-column: 2; grid-row: 1; }
+  .srv-grid > :nth-child(3) { grid-column: 2; grid-row: 2; }
+  .srv-grid > :nth-child(4) { grid-column: 3; grid-row: 2; }
+  .srv-grid > :nth-child(5) { grid-column: 4; grid-row: 2; }
+  .srv-grid > :nth-child(6) { grid-column: 1; grid-row: 2; justify-self: center; }
+  .srv-grid > :nth-child(7) { grid-column: 3 / 5; grid-row: 1; justify-self: end; }
+}
+
+@media (min-width: 720px) and (max-width: 1279px) {
+  .dock-grid { grid-template-columns: 20px minmax(220px, 1fr) 210px minmax(140px, 180px); grid-template-rows: auto auto; }
+  .dock-grid > :nth-child(1) { grid-column: 1; grid-row: 1; align-self: start; }
+  .dock-grid > :nth-child(2) { grid-column: 2; grid-row: 1; }
+  .dock-grid > :nth-child(3) { grid-column: 2; grid-row: 2; }
+  .dock-grid > :nth-child(4) { grid-column: 3; grid-row: 2; }
+  .dock-grid > :nth-child(5) { grid-column: 4; grid-row: 2; }
+  .dock-grid > :nth-child(6) { grid-column: 3 / 5; grid-row: 1; justify-self: end; }
+}
+
 /* ---------- mobile (≤719px): rows become stacked cards ---------- */
 
 @media (max-width: 719px) {
@@ -1506,14 +1629,45 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   .grid-head { display: none; }
 
   .routes-grid, .lease-grid, .assign-grid { grid-template-columns: minmax(0, 1fr); gap: 8px; }
-  .srv-grid { grid-template-columns: 26px minmax(0, 1fr); gap: 6px 8px; }
-  .srv-grid > .cell, .srv-grid > .actions { grid-column: 2; }
-  .srv-grid > .chev { grid-column: 1; grid-row: 1; }
-  .srv-grid > .c-primary { grid-column: 2; grid-row: 1; }
+  /* Server cards keep their identity, secondary facts, and actions in three
+     compact bands. The old one-field-per-row card wasted most of the first
+     viewport and separated related state from the server it described. */
+  .srv-grid {
+    grid-template-columns: 24px minmax(0, .45fr) minmax(150px, 1fr) auto;
+    grid-template-rows: auto auto auto;
+    gap: 5px 10px;
+  }
+  .srv-grid > .cell, .srv-grid > .actions { grid-column: auto; }
+  .srv-grid > :nth-child(1) { grid-column: 1; grid-row: 1; align-self: start; }
+  .srv-grid > :nth-child(2) { grid-column: 2 / 5; grid-row: 1; }
+  .srv-grid > :nth-child(3) { grid-column: 2; grid-row: 2; }
+  .srv-grid > :nth-child(4) { grid-column: 3; grid-row: 2; min-width: 0; }
+  .srv-grid > :nth-child(5) { grid-column: 4; grid-row: 2; }
+  .srv-grid > :nth-child(6) { grid-column: 1; grid-row: 2; justify-self: center; }
+  .srv-grid > :nth-child(7) {
+    grid-column: 2 / 5;
+    grid-row: 3;
+    justify-self: end;
+  }
+  .srv-grid > .cell[data-label]::before { display: none; }
+  .srv-grid .usage-btn { width: 100%; max-width: 100%; padding: 2px 0; gap: 6px; }
+  .srv-grid .usage-btn > .spark { width: 72px; height: 20px; }
+  .server-group-items .srv-grid { padding-block: 8px; }
   .dock-grid { grid-template-columns: 20px minmax(0, 1fr); gap: 6px 8px; }
   .dock-grid > .cell, .dock-grid > .actions { grid-column: 2; }
   .dock-grid > .c-dot { grid-column: 1; grid-row: 1; align-self: start; margin-top: 6px; }
   .dock-grid > .c-primary { grid-column: 2; grid-row: 1; }
+  /* The field label is a generated ::before child. Keep it above the usage
+     control instead of letting it consume horizontal flex space, then let the
+     real SVG history plot shrink inside the remaining card width. */
+  .dock-grid > .usage-cell { display: block; width: 100%; }
+  .dock-grid .usage-btn { width: 100%; max-width: 100%; }
+  .dock-grid .usage-btn > .spark {
+    width: auto;
+    min-width: 0;
+    max-width: 92px;
+    flex: 1 1 0;
+  }
 
   .row { padding: 11px 8px; }
   .item { border-top: 1px solid var(--line); }
@@ -1550,6 +1704,29 @@ span.spark-empty { border-bottom: 1px dashed var(--line2); align-self: end; marg
   .archive-actions { justify-content: flex-start; }
   .archive-actions .btn { min-height: 44px; }
   .archive-group-items .archive-row { padding-left: 22px; }
+}
+
+@media (max-width: 479px) {
+  /* At phone width the same summary becomes four short bands; charts yield to
+     the live numbers and controls retain the full remaining card width. */
+  .srv-grid {
+    grid-template-columns: 24px auto minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto;
+    gap: 5px 8px;
+  }
+  .srv-grid > :nth-child(1) { grid-column: 1; grid-row: 1; }
+  .srv-grid > :nth-child(2) { grid-column: 2 / 4; grid-row: 1; }
+  .srv-grid > :nth-child(3) { grid-column: 2; grid-row: 2; }
+  .srv-grid > :nth-child(4) { grid-column: 3; grid-row: 2; justify-self: end; }
+  .srv-grid > :nth-child(5) { grid-column: 2 / 4; grid-row: 3; }
+  .srv-grid > :nth-child(6) { grid-column: 1; grid-row: 3; }
+  .srv-grid > :nth-child(7) {
+    grid-column: 2 / 4;
+    grid-row: 4;
+    justify-self: start;
+  }
+  .srv-grid .usage-btn { justify-content: flex-end; }
+  .srv-grid .usage-btn > .spark { display: none; }
 }
 
 /* Bigger touch targets on coarse pointers */

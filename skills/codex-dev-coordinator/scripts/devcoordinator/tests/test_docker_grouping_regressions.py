@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 import dev_coordinator
+from devcoordinator.broker_host import EPHEMERAL_DOCKER_LABELS
 from devcoordinator.host_observation import commit_host_inventory_observation
 from devcoordinator.observer import SingleFlightObserver
 from devcoordinator.store import AccountStore, deterministic_id, utc_timestamp
@@ -402,6 +403,431 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
             container["project"] = str(project)
             container["metadata_source"] = "docker_labels"
         return container
+
+    @staticmethod
+    def _insert_ephemeral_run(
+        store: AccountStore,
+        *,
+        repo_id: str,
+        run_id: str,
+        creation_nonce: str,
+        template_id: str,
+        definition_fingerprint: str,
+        container_name: str,
+        full_container_id: str | None = None,
+        docker_resource_id: str | None = None,
+    ) -> dict[str, str]:
+        timestamp = utc_timestamp()
+        with store.immediate_transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO operations(
+                    operation_id, repo_id, kind, status, phase, generation,
+                    request_fingerprint, owner_uid, actor, created_at, updated_at
+                ) VALUES (?, ?, 'broker.ephemeral.start', 'running',
+                          'write_ahead_committed', 0, 'fixture-request', ?,
+                          'fixture', ?, ?)
+                """,
+                (run_id, repo_id, os.geteuid(), timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO ephemeral_container_templates(
+                    template_id, repo_id, name, image_ref,
+                    definition_fingerprint, default_ttl_seconds,
+                    max_ttl_seconds, max_concurrent_runs,
+                    max_concurrent_runs_per_uid, repo_max_active_runs,
+                    repo_memory_budget_bytes, repo_cpu_budget_millis,
+                    enabled, generation, created_at, updated_at
+                ) VALUES (?, ?, 'artifact-postgres', 'fixture:latest', ?,
+                          600, 3600, 4, 2, 16, 8589934592, 16000,
+                          1, 0, ?, ?)
+                """,
+                (template_id, repo_id, definition_fingerprint, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO ephemeral_container_runs(
+                    run_id, template_id, repo_id, owner_uid, account_id,
+                    creation_nonce, container_name, full_container_id,
+                    docker_resource_id, image_ref, template_fingerprint,
+                    status, phase, max_ttl_seconds, expires_at_epoch,
+                    next_reconcile_at_epoch, recovery_failures,
+                    create_absence_observations, cleanup_requested, generation,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'fixture-account', ?, ?, ?, ?,
+                          'fixture:latest', ?, 'creating',
+                          'docker_create_outcome_unknown', 3600, 4102444800,
+                          0, 0, 0, 0, 0, ?, ?)
+                """,
+                (
+                    run_id,
+                    template_id,
+                    repo_id,
+                    os.geteuid(),
+                    creation_nonce,
+                    container_name,
+                    full_container_id,
+                    docker_resource_id,
+                    definition_fingerprint,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return dict(
+            zip(
+                EPHEMERAL_DOCKER_LABELS,
+                (
+                    run_id,
+                    creation_nonce,
+                    repo_id,
+                    template_id,
+                    definition_fingerprint,
+                ),
+            )
+        )
+
+    def test_exact_ephemeral_identity_replaces_active_unassigned_classification(self) -> None:
+        repository = self.root / "ephemeral-owner"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "8" * 64
+        container_name = "devcoordinator-artifact-postgres-exact"
+        run_id = "12345678-1234-4234-8234-123456789abc"
+        creation_nonce = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        template_id = "ephemeral-template-exact"
+        definition_fingerprint = "f" * 64
+
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            # The first observation intentionally has only a matching display
+            # name. It must remain unassigned until immutable labels arrive.
+            self._observe(
+                store,
+                host_id,
+                [self._container(full_id, container_name)],
+            )
+            resource_id = deterministic_id(
+                "docker-resource",
+                deterministic_id("docker-engine", host_id, "default"),
+                full_id,
+            )
+            labels = self._insert_ephemeral_run(
+                store,
+                repo_id=repo_id,
+                run_id=run_id,
+                creation_nonce=creation_nonce,
+                template_id=template_id,
+                definition_fingerprint=definition_fingerprint,
+                container_name=container_name,
+                full_container_id=full_id,
+                docker_resource_id=resource_id,
+            )
+            attributed = self._container(full_id, container_name)
+            attributed["labels"] = labels
+            self._observe(store, host_id, [attributed])
+            graph = store.inventory_v2()
+            with store.read_transaction() as connection:
+                run_generation = connection.execute(
+                    """
+                    SELECT generation FROM ephemeral_container_runs
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()[0]
+                active_unassigned = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM unassigned_resources
+                    WHERE host_id = ? AND resource_kind = 'container'
+                      AND resource_id = ? AND status = 'active'
+                    """,
+                    (host_id, resource_id),
+                ).fetchone()[0]
+                source_provenance = json.loads(
+                    connection.execute(
+                        """
+                        SELECT provenance_json FROM source_resources
+                        WHERE resource_kind = 'container' AND native_id = ?
+                        """,
+                        (full_id,),
+                    ).fetchone()[0]
+                )
+
+        membership = next(
+            item for item in graph["memberships"] if item["host_resource_id"] == resource_id
+        )
+        binding = next(
+            item for item in graph["control_bindings"] if item["resource_id"] == resource_id
+        )
+        compatibility = next(
+            item
+            for item in graph["v1_compatibility"]["docker"]["containers"]
+            if item["host_resource_id"] == resource_id
+        )
+        self.assertEqual(membership["repo_id"], repo_id)
+        self.assertEqual(binding["repo_id"], repo_id)
+        self.assertEqual(binding["authority_state"], "authoritative")
+        self.assertEqual(binding["provenance"], "coordinator_ephemeral")
+        self.assertEqual(compatibility["metadata_source"], "coordinator_ephemeral")
+        self.assertEqual(source_provenance["metadata_source"], "coordinator_ephemeral")
+        self.assertEqual(
+            run_generation,
+            0,
+            "an already-complete persisted identity must not be rewritten",
+        )
+        self.assertEqual(active_unassigned, 0)
+
+    def test_post_start_ephemeral_observation_repairs_missing_persisted_ids(self) -> None:
+        repository = self.root / "ephemeral-recovery"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "7" * 64
+        container_name = "devcoordinator-artifact-postgres-recovery"
+        run_id = "22345678-1234-4234-8234-123456789abc"
+        creation_nonce = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        template_id = "ephemeral-template-recovery"
+        definition_fingerprint = "e" * 64
+
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            labels = self._insert_ephemeral_run(
+                store,
+                repo_id=repo_id,
+                run_id=run_id,
+                creation_nonce=creation_nonce,
+                template_id=template_id,
+                definition_fingerprint=definition_fingerprint,
+                container_name=container_name,
+            )
+            observed = self._container(full_id, container_name)
+            observed["labels"] = labels
+            self._observe(store, host_id, [observed])
+            self._observe(store, host_id, [observed])
+            resource_id = deterministic_id(
+                "docker-resource",
+                deterministic_id("docker-engine", host_id, "default"),
+                full_id,
+            )
+            with store.read_transaction() as connection:
+                run = connection.execute(
+                    """
+                    SELECT full_container_id, docker_resource_id, generation
+                    FROM ephemeral_container_runs WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                membership = connection.execute(
+                    """
+                    SELECT repo_id FROM repository_memberships
+                    WHERE resource_kind = 'container' AND host_resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                active_unassigned = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM unassigned_resources
+                    WHERE host_id = ? AND resource_kind = 'container'
+                      AND resource_id = ? AND status = 'active'
+                    """,
+                    (host_id, resource_id),
+                ).fetchone()[0]
+
+        self.assertEqual(run["full_container_id"], full_id)
+        self.assertEqual(run["docker_resource_id"], resource_id)
+        self.assertEqual(
+            run["generation"],
+            1,
+            "repeated exact observations must not churn recovered identity state",
+        )
+        self.assertEqual(membership["repo_id"], repo_id)
+        self.assertEqual(active_unassigned, 0)
+
+    def test_late_failed_create_reopens_only_for_durable_cleanup(self) -> None:
+        repository = self.root / "ephemeral-late-create"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "5" * 64
+        container_name = "devcoordinator-artifact-postgres-late"
+        run_id = "42345678-1234-4234-8234-123456789abc"
+        creation_nonce = "dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        template_id = "ephemeral-template-late-create"
+        definition_fingerprint = "b" * 64
+
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            labels = self._insert_ephemeral_run(
+                store,
+                repo_id=repo_id,
+                run_id=run_id,
+                creation_nonce=creation_nonce,
+                template_id=template_id,
+                definition_fingerprint=definition_fingerprint,
+                container_name=container_name,
+            )
+            timestamp = utc_timestamp()
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE ephemeral_container_runs
+                    SET status = 'failed', phase = 'create_not_observed',
+                        error_code = 'ephemeral_create_not_found',
+                        error_message = 'bounded absence window elapsed',
+                        finished_at = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (timestamp, timestamp, run_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE operations
+                    SET status = 'failed', phase = 'create_not_observed',
+                        error_code = 'ephemeral_create_not_found',
+                        error_message = 'bounded absence window elapsed',
+                        updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (timestamp, run_id),
+                )
+
+            observed = self._container(full_id, container_name)
+            observed["labels"] = labels
+            self._observe(store, host_id, [observed])
+            resource_id = deterministic_id(
+                "docker-resource",
+                deterministic_id("docker-engine", host_id, "default"),
+                full_id,
+            )
+            with store.read_transaction() as connection:
+                run = connection.execute(
+                    """
+                    SELECT status, phase, cleanup_requested, cleanup_reason,
+                           full_container_id, docker_resource_id,
+                           next_reconcile_at_epoch
+                    FROM ephemeral_container_runs WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                memberships = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM repository_memberships
+                    WHERE resource_kind = 'container' AND host_resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()[0]
+                binding = connection.execute(
+                    """
+                    SELECT repo_id, provenance FROM control_bindings
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+                unassigned = connection.execute(
+                    """
+                    SELECT status FROM unassigned_resources
+                    WHERE host_id = ? AND resource_kind = 'container'
+                      AND resource_id = ?
+                    """,
+                    (host_id, resource_id),
+                ).fetchone()
+
+        self.assertEqual(run["status"], "cleanup_pending")
+        self.assertEqual(run["phase"], "late_create_observed")
+        self.assertEqual(run["cleanup_requested"], 1)
+        self.assertIn("bounded absence window", run["cleanup_reason"])
+        self.assertEqual(run["full_container_id"], full_id)
+        self.assertEqual(run["docker_resource_id"], resource_id)
+        self.assertEqual(run["next_reconcile_at_epoch"], 0)
+        self.assertEqual(memberships, 0)
+        self.assertIsNotNone(unassigned)
+        self.assertEqual(unassigned["status"], "active")
+        self.assertTrue(
+            binding is None
+            or binding["repo_id"] is None
+            or binding["provenance"] != "coordinator_ephemeral"
+        )
+
+    def test_partial_or_mismatched_ephemeral_labels_never_infer_ownership(self) -> None:
+        repository = self.root / "ephemeral-mismatch"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "6" * 64
+        container_name = "devcoordinator-artifact-postgres-mismatch"
+        run_id = "32345678-1234-4234-8234-123456789abc"
+        creation_nonce = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        template_id = "ephemeral-template-mismatch"
+        definition_fingerprint = "d" * 64
+
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            repo_id = self._insert_repository(store, host_id, repository)
+            labels = self._insert_ephemeral_run(
+                store,
+                repo_id=repo_id,
+                run_id=run_id,
+                creation_nonce=creation_nonce,
+                template_id=template_id,
+                definition_fingerprint=definition_fingerprint,
+                container_name=container_name,
+            )
+            partial = self._container(full_id, container_name)
+            partial["labels"] = {
+                key: value
+                for key, value in labels.items()
+                if key != "io.devcoordinator.ephemeral.definition_fingerprint"
+            }
+            self._observe(store, host_id, [partial])
+            mismatched = self._container(full_id, container_name)
+            mismatched["labels"] = {
+                **labels,
+                "io.devcoordinator.ephemeral.definition_fingerprint": "c" * 64,
+            }
+            self._observe(store, host_id, [mismatched])
+            resource_id = deterministic_id(
+                "docker-resource",
+                deterministic_id("docker-engine", host_id, "default"),
+                full_id,
+            )
+            with store.read_transaction() as connection:
+                run = connection.execute(
+                    """
+                    SELECT full_container_id, docker_resource_id, generation
+                    FROM ephemeral_container_runs WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                memberships = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM repository_memberships
+                    WHERE resource_kind = 'container' AND host_resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()[0]
+                unassigned = connection.execute(
+                    """
+                    SELECT reason_code FROM unassigned_resources
+                    WHERE host_id = ? AND resource_kind = 'container'
+                      AND resource_id = ? AND status = 'active'
+                    """,
+                    (host_id, resource_id),
+                ).fetchone()
+                binding = connection.execute(
+                    """
+                    SELECT repo_id, provenance FROM control_bindings
+                    WHERE resource_kind = 'container' AND resource_id = ?
+                    """,
+                    (resource_id,),
+                ).fetchone()
+
+        self.assertIsNone(run["full_container_id"])
+        self.assertIsNone(run["docker_resource_id"])
+        self.assertEqual(run["generation"], 0)
+        self.assertEqual(memberships, 0)
+        self.assertEqual(unassigned["reason_code"], "name_only")
+        self.assertIsNone(binding["repo_id"])
+        self.assertNotEqual(binding["provenance"], "coordinator_ephemeral")
 
     def test_compatibility_container_stats_belong_to_latest_available_snapshot(self) -> None:
         first_time = "2026-07-21T00:00:05Z"
@@ -961,7 +1387,7 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
             "false-positive guard: physically running archived resources remain visible as fence violations",
         )
 
-    def test_expired_orphan_server_is_not_current_but_managed_and_running_rows_are(self) -> None:
+    def test_only_observed_server_instances_enter_compatibility_server_collections(self) -> None:
         repository = self.root / "server-owner"
         repository.mkdir()
         (repository / ".git").mkdir()
@@ -1057,11 +1483,7 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
             visible_server_ids,
             "must-catch: an unobserved orphan with only an expired lease is history",
         )
-        self.assertEqual(
-            visible_server_ids,
-            {managed_id, running_id},
-            "false-positive guards retain desired managed and physically running servers",
-        )
+        self.assertEqual(visible_server_ids, {running_id})
         self.assertEqual(graph["v1_compatibility"]["leases"], [])
         self.assertEqual(
             {
@@ -1069,13 +1491,14 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
                 for item in graph["resources"]["servers"]
             },
             {managed_id, running_id},
+            "port-assignment control definitions remain available to normalized lease consumers",
         )
         usage = next(
             item
             for item in graph["v1_compatibility"]["project_usage"]
             if item["project"] == str(repository)
         )
-        self.assertEqual(set(usage["server_ids"]), {managed_id, running_id})
+        self.assertEqual(set(usage["server_ids"]), {running_id})
 
     def test_unavailable_snapshot_preserves_last_proved_presence(self) -> None:
         full_id = "4" * 64

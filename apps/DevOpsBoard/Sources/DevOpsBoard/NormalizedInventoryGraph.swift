@@ -22,6 +22,7 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
     let lifecycleViolations: [NormalizedUnassignedResource]
     let observations: NormalizedObservations
     let controlBindings: [NormalizedControlBinding]
+    let testStatistics: [TestStatistics]
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -35,6 +36,7 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
         case unassignedResources = "unassigned_resources"
         case lifecycleViolations = "lifecycle_violations"
         case controlBindings = "control_bindings"
+        case testStatistics = "test_statistics"
     }
 
     init(from decoder: Decoder) throws {
@@ -92,6 +94,10 @@ struct NormalizedInventoryGraph: Decodable, Sendable {
         lifecycleViolations = try values.decodeIfPresent(
             [NormalizedUnassignedResource].self,
             forKey: .lifecycleViolations
+        ) ?? []
+        testStatistics = try values.decodeIfPresent(
+            [TestStatistics].self,
+            forKey: .testStatistics
         ) ?? []
     }
 }
@@ -1148,6 +1154,11 @@ extension NormalizedInventoryGraph {
             projectUsage: aggregates.map { $0.sourceObservations[0].usageRows[0] }
         )
         inventory.origin = origin
+        inventory.testStatistics = testStatistics.map { statistics in
+            var statistics = statistics
+            statistics.origin = origin
+            return statistics
+        }
         return NormalizedBoardProjection(inventory: inventory, catalog: catalog)
     }
 

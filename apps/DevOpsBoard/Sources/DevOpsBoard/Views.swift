@@ -538,6 +538,8 @@ struct MainBoardView: View {
                             DockerSection(store: store, bulkSelectionMode: bulkSelectionMode)
                         case .databases:
                             DatabaseSection(store: store, bulkSelectionMode: bulkSelectionMode)
+                        case .tests:
+                            TestStatisticsSection(store: store)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -701,8 +703,217 @@ struct ResourceTabBar: View {
         case .servers: return store.filteredServers.count
         case .docker: return store.visibleDockerContainers.count
         case .databases: return store.visiblePostgres.count
+        case .tests: return store.inventory.testStatistics.reduce(0) { $0 + $1.summary.testCount }
         }
     }
+}
+
+struct TestStatisticsSection: View {
+    @ObservedObject var store: OpsStore
+
+    private var statistics: [TestStatistics] {
+        store.inventory.testStatistics.sorted { left, right in
+            projectName(left.repoID) < projectName(right.repoID)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("TEST HISTORY")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(Theme.secondary)
+                    Text("Coordinator-owned results by repository, last 30 days")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.secondary)
+                }
+                Spacer()
+            }
+            if statistics.isEmpty {
+                Text("No test runs have been recorded for enrolled repositories.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondary)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Theme.control)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                ForEach(statistics) { item in
+                    TestRepositoryCard(name: projectName(item.repoID), statistics: item)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .accessibilityIdentifier("test-statistics-section")
+    }
+
+    private func projectName(_ repoID: String) -> String {
+        store.projectGroups.first { $0.repositoryID == repoID }?.name ?? repoID
+    }
+}
+
+struct TestRepositoryCard: View {
+    let name: String
+    let statistics: TestStatistics
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                    Text(name)
+                        .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Text("\(statistics.summary.testCount) tests")
+                        .foregroundStyle(Theme.secondary)
+                    TestResultBadge(
+                        failures: statistics.summary.failedCount + statistics.summary.errorCount,
+                        running: statistics.summary.runningCount
+                    )
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            HStack(spacing: 8) {
+                TestMetric(title: "Runs", value: "\(statistics.summary.runCount)")
+                TestMetric(title: "Run time", value: formatTestDuration(statistics.summary.runSeconds))
+                TestMetric(title: "Test time", value: formatTestDuration(statistics.summary.testSeconds))
+                TestMetric(title: "Passed", value: "\(statistics.summary.passedCount)")
+                TestMetric(title: "Skipped", value: "\(statistics.summary.skippedCount)")
+            }
+
+            if expanded {
+                TestDetailGroup(title: "BY DAY") {
+                    ForEach(statistics.daily) { day in
+                        TestDetailRow(
+                            primary: day.day,
+                            secondary: "\(day.testCount) tests / \(day.runCount) runs",
+                            trailing: formatTestDuration(day.runSeconds)
+                        )
+                    }
+                }
+                TestDetailGroup(title: "TIME BY TEST SET") {
+                    ForEach(statistics.suites) { suite in
+                        TestDetailRow(
+                            primary: suite.suite,
+                            secondary: "\(suite.runCount) runs / \(String(format: "%.1f", suite.percentOfRunTime))%",
+                            trailing: formatTestDuration(suite.totalSeconds)
+                        )
+                    }
+                }
+                TestDetailGroup(title: "INDIVIDUAL TEST DURATION") {
+                    ForEach(statistics.slowTests) { test in
+                        TestDetailRow(
+                            primary: test.displayName,
+                            secondary: "\(test.executions) runs / \(String(format: "%.1f", test.percentOfTestTime))% / \(test.failureCount) failures",
+                            trailing: formatTestDuration(test.totalSeconds)
+                        )
+                    }
+                }
+                TestDetailGroup(title: "RECENT RUNS") {
+                    ForEach(statistics.recentRuns) { run in
+                        TestDetailRow(
+                            primary: run.suite,
+                            secondary: "\(run.status) / \(run.caseCount) tests / \(formatTimestamp(run.clientStartedAt))",
+                            trailing: formatTestDuration(run.durationSeconds ?? 0)
+                        )
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(Theme.control)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
+    }
+}
+
+struct TestMetric: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(Theme.secondary)
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+        .background(Color.black.opacity(0.14))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+struct TestResultBadge: View {
+    let failures: Int
+    let running: Int
+
+    var body: some View {
+        Text(running > 0 ? "RUNNING" : failures > 0 ? "\(failures) FAILED" : "PASSING")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(running > 0 ? Theme.orange : failures > 0 ? Theme.red : Theme.green)
+            .padding(.horizontal, 7)
+            .frame(height: 22)
+            .background(Color.black.opacity(0.18))
+            .clipShape(Capsule())
+    }
+}
+
+struct TestDetailGroup<Content: View>: View {
+    let title: String
+    let content: Content
+
+    init(title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(Theme.secondary)
+                .padding(.bottom, 5)
+            content
+        }
+    }
+}
+
+struct TestDetailRow: View {
+    let primary: String
+    let secondary: String
+    let trailing: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(primary).font(.system(size: 11, design: .monospaced)).lineLimit(1)
+                Text(secondary).font(.system(size: 10)).foregroundStyle(Theme.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text(trailing).font(.system(size: 10, design: .monospaced)).foregroundStyle(Theme.secondary)
+        }
+        .padding(.vertical, 5)
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.white.opacity(0.05)).frame(height: 1) }
+    }
+}
+
+private func formatTestDuration(_ seconds: Double) -> String {
+    if seconds < 1 { return "\(Int((seconds * 1000).rounded())) ms" }
+    if seconds < 60 { return String(format: seconds < 10 ? "%.2f s" : "%.1f s", seconds) }
+    return "\(Int(seconds) / 60)m \(Int(seconds.rounded()) % 60)s"
 }
 
 struct ToolbarView: View {

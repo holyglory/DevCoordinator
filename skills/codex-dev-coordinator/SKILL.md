@@ -1,6 +1,6 @@
 ---
 name: codex-dev-coordinator
-description: Use when coding agents (Codex, Claude Code) in one or multiple apps or sessions need coordinated port leases, shared dev-server start/stop/restart/status/health control, or Docker/Docker Compose management through a single local coordinator CLI or HTTP endpoint.
+description: Use when coding agents (Codex, Claude Code) in one or multiple apps or sessions need coordinated test execution/statistics, port leases, shared dev-server start/stop/restart/status/health control, or Docker/Docker Compose management through a single local coordinator CLI or HTTP endpoint.
 ---
 
 # Codex Dev Coordinator
@@ -217,6 +217,40 @@ Use the install transaction with the installer's `rollback` command if the
 configuration or canonical links must be restored.
 
 #### Authorization-schema upgrade gate
+
+#### Broker maintenance availability guard
+
+On a host where the server-wide broker authorizes continuing Console routes or
+production listeners, never issue a standalone
+`systemctl stop devcoordinator-broker.service`. A broker stop is one step inside
+one bounded maintenance transaction, not a terminal action or a safe point to
+end a turn.
+
+Before stopping it, prove the required private backup and the exact enabled
+unit, then run the stop, offline operation, restart, and verification from one
+foreground maintenance driver with an exit/failure handler that starts the
+broker again. Do not begin the stop if the driver cannot remain alive through
+completion, if the offline command requires an unbounded wait or later user
+input, or if another task owns broker maintenance. Do not switch repositories,
+end the task, or report progress while the broker is intentionally inactive.
+
+After every intentional stop, require all of the following before the
+maintenance transaction releases control:
+
+- `devcoordinator-broker.service` is active and its Unix socket is present;
+- the anonymous broker-adjacent API health check succeeds;
+- authenticated server-wide inventory succeeds and still proves every
+  previously running production listener current and healthy; and
+- every known public Console-managed route that was healthy before maintenance
+  has returned to its normal authenticated/login response instead of a
+  Coordinator-unavailable 502.
+
+If an inactive broker is discovered unexpectedly, preserve the stop/audit
+evidence and first check for an active offline administration process or held
+maintenance lock. When neither exists, start the enabled broker immediately
+and perform the same inventory and public-route verification. Never add a
+blind watchdog that can restart the broker in the middle of legitimate offline
+database maintenance.
 
 Before any server-wide broker restart after an authorization/schema upgrade,
 run the installer `plan` with the complete client-user set. A
@@ -650,6 +684,23 @@ inventory rows without re-implementing repo-identity heuristics.
 `container_names` remains alongside the exact resource IDs as legacy display
 data; it is not an ownership or join key.
 
+A declared server definition is not, by itself, a server instance. Enrollment
+may retain a definition solely as the exact ACL/port-policy identity for
+`port lease` and `port assign`. Those control-only definitions remain available
+under normalized `resources.servers` and through the Ports workflow, but they
+must not appear in compatibility `servers`, `project_usage.server_ids`, server
+running counts, or server lifecycle controls until a concrete lifecycle
+observation has been published. Do not interpret `unobserved` plus an ACL,
+assignment, or port policy as a running, stopped, or temporary server.
+
+For short-lived runtime workloads, use the typed `ephemeral start/status/renew/
+finish` lifecycle below. For an actual managed process, use `server start` and
+an attributed `server stop`; its port-lease TTL is reservation lifetime, not an
+automatic process cleanup policy. Archive and permanently purge a real retained
+server only through the exact `resource plan-archive` and `cleanup plan/apply`
+journeys above. Do not create fake server rows merely to reserve validation
+ports.
+
 Display grouping and whole-project actions share one membership model: the
 same attribution that places a container in a `project_usage` row decides
 whether `project start|restart|stop` acts on it. Explicit attribution (Docker
@@ -659,7 +710,7 @@ membership. Unattributed containers remain explicit unassigned resources and
 no whole-project action touches them. A UI grouped by `project_usage`
 therefore shows exactly the blast radius of whole-project actions.
 
-Inventory must show one current row per logical server identity
+Inventory must show one current row per observed logical server identity
 (`canonical project path + server name`). Repeated starts, stops, restarts, or
 adoptions of the same fixed-port service must not appear as multiple runnable
 rows with the same URL or port. If stale state records exist from older runs,
@@ -767,6 +818,143 @@ python3 scripts/dev_coordinator.py docker restart --agent "$USER" --project "$PR
 
 Use `--dry-run` when Docker may not be installed or when validating the command
 shape without changing containers.
+
+Do not invoke raw `docker run`, `docker create`, or mutating `docker compose`
+commands from agent guidance or agent-facing helper scripts. New and ephemeral
+workloads must cross a typed coordinator admission path that records the
+repository, agent, immutable definition, leased ports, TTL, and cleanup intent
+before the container starts. Canonical coordinator internals and deterministic
+fixtures are the only reviewed source-policy exclusions.
+
+Administrator-sealed ephemeral templates are top-level entries in
+`.codex/dev-runtime.json`. Every entry requires the complete bounded shape:
+
+```json
+{
+  "ephemeral_containers": [
+    {
+      "name": "artifact-db",
+      "image_ref": "postgres@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "argv": ["postgres", "-c", "fsync=off"],
+      "env": {"POSTGRES_DB": "artifact_validation"},
+      "secret_policy": "postgres_initdb_password_file_v1",
+      "default_ttl_seconds": 900,
+      "max_ttl_seconds": 3600,
+      "container_tcp_port": 5432,
+      "host_port_start": 55000,
+      "host_port_end": 55010,
+      "memory_bytes": 268435456,
+      "cpu_millis": 500,
+      "max_concurrent_runs": 4,
+      "max_concurrent_runs_per_uid": 2,
+      "repo_max_active_runs": 16,
+      "repo_memory_budget_bytes": 8589934592,
+      "repo_cpu_budget_millis": 16000
+    }
+  ]
+}
+```
+
+`max_concurrent_runs` is the template-wide active-run cap and
+`max_concurrent_runs_per_uid` is the authenticated-UID cap within that
+template. `repo_max_active_runs`, `repo_memory_budget_bytes`, and
+`repo_cpu_budget_millis` are shared across all templates in one repository;
+every template there must declare the same repository limits. Admission checks
+and inserts under one database writer reservation, so concurrent requests
+cannot both pass a stale count or budget snapshot.
+
+Inline `env` is non-secret configuration only. Manifest and service-database
+persistence retain those values, so credential-looking names—passwords,
+tokens, API/private keys, and credentials—are rejected. Never put a secret
+under a less obvious variable name to bypass this boundary.
+
+The only reviewed ephemeral credential capability is optional
+`"secret_policy": "postgres_initdb_password_file_v1"`. It is not a general
+secret manager and accepts no credential value, path, token, or alternate
+policy from a manifest, client, CLI, profile, or broker request. After a
+durable, authorized run admission, the root-owned broker generates one
+password in a private volatile runtime directory and mounts only its material
+directory read-only into the exact PostgreSQL container at
+`/run/devcoordinator-credentials`. The container receives only
+`POSTGRES_PASSWORD_FILE=/run/devcoordinator-credentials/postgres-initdb-password`;
+credential bytes never enter Docker arguments, ordinary environment values,
+SQLite, profiles, logs, or JSON replies. Persisted state contains only the
+typed policy and an opaque binding ID. The ordinary CLI and generic JSON client
+cannot invoke credential delivery; the broker's internal runner path receives
+one read-only descriptor through authenticated Unix `SCM_RIGHTS`, and an
+ambiguous delivery retry fails closed as a replay. Material is removed only
+after exact container absence is proved; loss of volatile runtime material
+after a reboot leaves the run unavailable rather than regenerating a password.
+
+Use an explicit canonical project for every command. Mutations also require
+diagnostic agent metadata; the broker stores it with the durable operation, but
+the kernel UID and enrolled account remain the authorization identity:
+
+```bash
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+python3 scripts/dev_coordinator.py ephemeral start \
+  --agent "$USER" --project "$PROJECT_ROOT" \
+  --template artifact-db --ttl-seconds 1800 \
+  --operation-id START_OPERATION_UUID
+python3 scripts/dev_coordinator.py ephemeral status \
+  --project "$PROJECT_ROOT" --run-id RUN_ID
+python3 scripts/dev_coordinator.py ephemeral renew \
+  --agent "$USER" --project "$PROJECT_ROOT" \
+  --run-id RUN_ID --ttl-seconds 1800 \
+  --operation-id RENEW_OPERATION_UUID
+python3 scripts/dev_coordinator.py ephemeral finish \
+  --agent "$USER" --project "$PROJECT_ROOT" \
+  --run-id RUN_ID --reason "validation complete" \
+  --operation-id FINISH_OPERATION_UUID
+```
+
+For automation, generate and retain one operation UUID before each mutation.
+If the client loses a reply or receives `operation_outcome_uncertain`, repeat
+the exact same project, resource, agent, TTL/reason, and `--operation-id`.
+Reusing the UUID with different inputs is rejected; retrying without it creates
+a distinct authorized operation and, for Start, may create another run after
+the first is recovered.
+
+The project is never inferred from cwd and a run ID is never probed across all
+enrollments. Status makes one read-only call in the named repository; start,
+renew, and finish are scoped to that same exact enrollment.
+
+Recording an ephemeral run after Docker starts is safe only as recovery of a
+precommitted run. Before `docker create`, the broker durably records an
+unguessable creation nonce and the intended repository/template definition.
+It creates the container stopped with five exact labels: run ID, creation
+nonce, repository ID, template ID, and definition fingerprint. If Docker
+created it but the reply was lost, recovery accepts exactly one all-label
+match, verifies its sealed safety profile, persists its immutable 64-hex ID,
+and only then starts or cleans it. Container name similarity is never evidence.
+
+An unrelated already-running container has no precommit and cannot enter that
+recovery path. After a full observation, attach it only as an explicit operator
+repair using every immutable field returned for its Unassigned Resources row:
+
+```bash
+python3 scripts/dev_coordinator.py resource attach \
+  --resource-kind container \
+  --resource-id EXACT_RESOURCE_ID \
+  --control-binding-id EXACT_BINDING_ID \
+  --immutable-fingerprint sha256:EXACT_IMMUTABLE_FINGERPRINT \
+  --ownership-fingerprint sha256:EXACT_OWNERSHIP_FINGERPRINT \
+  --project "$PROJECT_ROOT" --agent "$USER" \
+  --reason "Operator verified this existing container belongs to the repository"
+```
+
+This records current ownership without claiming the unsafe interval before
+attachment was protected. `docker register` remains a sidecar repair for an
+existing container that is already proved to belong to the repository, not an
+alternative ephemeral creation protocol.
+
+The server-wide installer `plan` and `verify` actions inspect each enrolled
+UID's configured supplementary groups, retained live-process groups, socket
+ACL, mode, and directory traversal for standard Docker Unix socket locations.
+Direct access is reported as a non-fatal staged activation blocker, not silently
+revoked. Do not remove group or ACL access until typed ephemeral workload parity
+has been deployed and verified; activate exclusive broker admission later in a
+separate rollback-safe administrator transaction.
 
 Docker execution does not assume an interactive-shell `PATH`. The coordinator
 resolves `CODEX_DOCKER_CLI` when it names an absolute executable, then the
@@ -1020,6 +1208,67 @@ container. If the coordinator still cannot identify a complete runtime, it
 returns `ok=false` with `classification=missing_dependency` instead of
 guessing ports or reporting success.
 
+## Universal Test Harness
+
+Testing is a repository-scoped Coordinator capability. Repositories declare
+structured commands in `.codex/tests.json`; they must not open the Coordinator
+database or create a separate test-result database/dashboard. The client-side
+Python runner executes the declared argv directly under the enrolled user,
+never through a shell and never inside the privileged broker. The broker owns
+admission, exact repository attribution, durable session/group/case records,
+idempotency, and statistics. Raw commands, environment values, child output,
+credentials, and failure payloads do not enter the service journal.
+
+Run a complete declared profile:
+
+```bash
+python3 scripts/dev_coordinator.py test run \
+  --agent "$USER" --project "$PROJECT_ROOT" --profile all
+```
+
+Run one or more declared groups:
+
+```bash
+python3 scripts/dev_coordinator.py test run \
+  --agent "$USER" --project "$PROJECT_ROOT" \
+  --group unit --group ui-test
+```
+
+Run selected individual pytest node IDs. Individual selectors require exactly
+one `pytest` group:
+
+```bash
+python3 scripts/dev_coordinator.py test run \
+  --agent "$USER" --project "$PROJECT_ROOT" --group unit \
+  --select 'tests/unit/test_api.py::test_health'
+```
+
+Read repository statistics without starting tests:
+
+```bash
+python3 scripts/dev_coordinator.py test stats \
+  --project "$PROJECT_ROOT" --days 30 --limit 25
+```
+
+Manifest schema version 1 requires nonempty `groups` and `profiles`. Each group
+declares `kind` (`pytest`, `jsonl`, `trx`, or `automation`), a repository-local
+`cwd`, and structured `argv`. `{python}`, `{dotnet}`, `{events}`, and
+`{results}` are runner-owned exact-token substitutions. A pytest group may
+declare default `selectors`; an explicit `--select` replaces those defaults.
+A JSON-lines framework reporter may receive its private temporary destination
+only through a `DEVCOORDINATOR_*` `event_env`. Paths that escape the canonical
+repository, shell strings, malformed reporter output, and non-test commands in
+the manifest fail closed.
+
+Every requested selection creates a parent session before any child starts.
+Every group is admitted before subprocess launch and finished after process
+termination; pytest, Vitest-compatible JSON-lines reporters, and TRX record
+each individual case's exact identity, start, finish, duration, and outcome.
+An automation group records its own lifecycle but has no invented cases. The
+CLI returns structured summaries only. DevOps Console provides arbitrary
+bounded date windows; DevOps Board receives a bounded 30-day repo-by-repo
+projection in normalized inventory.
+
 ## Agent Workflow
 
 1. Set `PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`, then
@@ -1066,6 +1315,12 @@ guessing ports or reporting success.
    through the process cwd/git root. If a registered server PID or port belongs
    to another project, treat it as `stale_coordinator_metadata`; do not report
    it as working and do not kill the foreign PID.
+9. For repository tests, inspect `.codex/tests.json`, then choose the smallest
+   declared profile, group set, or individual selectors that answer the task.
+   Use the universal test command above; do not invoke the underlying framework
+   directly when the repository declares the harness, because that would omit
+   its required durable run and case record. Run the full profile when the
+   change or acceptance criteria require complete coverage.
 
 ## Health, Status, And State Robustness
 

@@ -397,6 +397,70 @@ final class CoreTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(NormalizedInventoryGraph.self, from: payload))
     }
 
+    func testNormalizedInventoryProjectsRepositoryTestStatistics() throws {
+        var object = directV2GraphJSONObject(home: codex.home)
+        object["test_statistics"] = [[
+            "repo_id": "repo-1",
+            "days": 30,
+            "summary": [
+                "run_count": 1,
+                "session_count": 1,
+                "running_count": 0,
+                "run_seconds": 2.5,
+                "test_count": 1,
+                "test_seconds": 0.25,
+                "passed_count": 1,
+                "failed_count": 0,
+                "skipped_count": 0,
+                "error_count": 0,
+            ],
+            "daily": [[
+                "day": "2026-07-26",
+                "run_count": 1,
+                "test_count": 1,
+                "run_seconds": 2.5,
+                "test_seconds": 0.25,
+            ]],
+            "suites": [[
+                "suite": "unit",
+                "run_count": 1,
+                "total_seconds": 2.5,
+                "average_seconds": 2.5,
+                "max_seconds": 2.5,
+                "percent_of_run_time": 100.0,
+            ]],
+            "slow_tests": [[
+                "test_id": "tests/test_unit.py::test_one",
+                "display_name": "test_one",
+                "executions": 1,
+                "total_seconds": 0.25,
+                "average_seconds": 0.25,
+                "max_seconds": 0.25,
+                "failure_count": 0,
+                "percent_of_test_time": 100.0,
+            ]],
+            "recent_runs": [[
+                "run_id": "run-1",
+                "parent_run_id": "session-1",
+                "suite": "unit",
+                "run_kind": "test",
+                "status": "passed",
+                "client_started_at": "2026-07-26T12:00:00Z",
+                "duration_seconds": 2.5,
+                "case_count": 1,
+                "failed_count": 0,
+                "error_count": 0,
+            ]],
+        ]]
+
+        let projection = try directV2Projection(from: object, origin: codex)
+        let statistics = try XCTUnwrap(projection.inventory.testStatistics.first)
+        XCTAssertEqual(statistics.origin, codex)
+        XCTAssertEqual(statistics.repoID, "repo-1")
+        XCTAssertEqual(statistics.summary.testCount, 1)
+        XCTAssertEqual(statistics.slowTests.first?.testID, "tests/test_unit.py::test_one")
+    }
+
     @MainActor
     func testRetiredImportedSourceProvenanceStillRoutesOneActionThroughCurrentAccountOrigin() async throws {
         let current = CoordinatorOrigin(label: "Current account", home: "/current/account-store")

@@ -732,6 +732,39 @@ class EnrollmentSnapshotScopeTests(unittest.TestCase):
         )
         self.assertEqual(active_cleanup, {self._resource_id("current")})
 
+    def test_enrollment_never_grants_generic_lifecycle_to_ephemeral_container(
+        self,
+    ) -> None:
+        with AccountStore.open_default(self.home) as store:
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    UPDATE control_bindings
+                    SET provenance = 'coordinator_ephemeral'
+                    WHERE binding_id = ?
+                    """,
+                    (self._binding_id("current"),),
+                )
+        aliases = _grant_observed_containers(
+            self.persistence,
+            repo_id=REPO_ID,
+            client_uid=self.uid,
+            snapshot_id="current-snapshot",
+        )
+        self.assertEqual(aliases, {})
+        with AccountStore.open_default(self.home) as store:
+            with store.read_transaction() as connection:
+                grants = connection.execute(
+                    """
+                    SELECT operation FROM broker_resource_acl
+                    WHERE uid = ? AND repo_id = ?
+                      AND resource_kind = 'container' AND resource_id = ?
+                      AND enabled = 1
+                    """,
+                    (self.uid, REPO_ID, self._resource_id("current")),
+                ).fetchall()
+        self.assertEqual(grants, [])
+
 
 if __name__ == "__main__":
     unittest.main()

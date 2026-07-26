@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Mapping
 
+from .broker_host import EPHEMERAL_DOCKER_LABELS
 from .database_backups import reconcile_inventory_backups
 from .events import append_observation_transition
 from .store import canonical_json, deterministic_id, fingerprint, utc_timestamp
@@ -411,6 +412,168 @@ def _repository_resolution(
 
 def _repository_id(connection: sqlite3.Connection, host_id: str, project: Any) -> str | None:
     return _repository_resolution(connection, host_id, project)[0]
+
+
+def _ephemeral_repository_attribution(
+    connection: sqlite3.Connection,
+    *,
+    host_id: str,
+    labels: Mapping[str, Any],
+    full_container_id: str,
+    docker_resource_id: str,
+    timestamp: str,
+) -> str | None:
+    """Recover one precommitted ephemeral run from its exact Docker identity.
+
+    A name, subset of labels, or approximate match is never ownership evidence.
+    The five broker-sealed labels must match one persisted run exactly.  The
+    observer transaction can then close the create-reply-loss window by
+    persisting the immutable Docker identifiers that the broker had not yet
+    recorded.
+    """
+
+    if (
+        len(full_container_id) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in full_container_id
+        )
+    ):
+        return None
+    identity_values: list[str] = []
+    for label in EPHEMERAL_DOCKER_LABELS:
+        value = labels.get(label)
+        if not isinstance(value, str) or not value:
+            return None
+        identity_values.append(value)
+    (
+        run_id,
+        creation_nonce,
+        repository_id,
+        template_id,
+        definition_fingerprint,
+    ) = identity_values
+    rows = connection.execute(
+        """
+        SELECT run.run_id, run.repo_id, run.full_container_id,
+               run.docker_resource_id, run.status, run.error_code
+        FROM ephemeral_container_runs run
+        JOIN repositories repo ON repo.repo_id = run.repo_id
+        WHERE repo.host_id = ?
+          AND run.run_id = ?
+          AND run.creation_nonce = ?
+          AND run.repo_id = ?
+          AND run.template_id = ?
+          AND run.template_fingerprint = ?
+        """,
+        (
+            host_id,
+            run_id,
+            creation_nonce,
+            repository_id,
+            template_id,
+            definition_fingerprint,
+        ),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    run = rows[0]
+    run_status = str(run["status"])
+    active_statuses = {
+        "reserved",
+        "creating",
+        "attributed",
+        "starting",
+        "running",
+        "cleanup_pending",
+        "stopping",
+        "removing",
+        "needs_attention",
+    }
+    late_failed_create = (
+        run_status == "failed"
+        and str(run["error_code"] or "") == "ephemeral_create_not_found"
+    )
+    if run_status not in active_statuses and not late_failed_create:
+        return None
+    stored_full_id = run["full_container_id"]
+    stored_resource_id = run["docker_resource_id"]
+    if stored_full_id is not None and str(stored_full_id) != full_container_id:
+        return None
+    if stored_resource_id is not None and str(stored_resource_id) != docker_resource_id:
+        return None
+    collision = connection.execute(
+        """
+        SELECT 1 FROM ephemeral_container_runs
+        WHERE run_id != ?
+          AND (full_container_id = ? OR docker_resource_id = ?)
+        LIMIT 1
+        """,
+        (run_id, full_container_id, docker_resource_id),
+    ).fetchone()
+    if collision is not None:
+        return None
+    if late_failed_create:
+        reopened = connection.execute(
+            """
+            UPDATE ephemeral_container_runs
+            SET full_container_id = ?, docker_resource_id = ?,
+                status = 'cleanup_pending', phase = 'late_create_observed',
+                cleanup_requested = 1,
+                cleanup_reason = 'Docker create appeared after the bounded absence window',
+                next_reconcile_at_epoch = 0, finished_at = NULL,
+                generation = generation + 1, updated_at = ?
+            WHERE run_id = ? AND status = 'failed'
+              AND error_code = 'ephemeral_create_not_found'
+              AND (full_container_id IS NULL OR full_container_id = ?)
+              AND (docker_resource_id IS NULL OR docker_resource_id = ?)
+            """,
+            (
+                full_container_id,
+                docker_resource_id,
+                timestamp,
+                run_id,
+                full_container_id,
+                docker_resource_id,
+            ),
+        )
+        # Keep the late container visibly unassigned while the reaper removes
+        # it; a terminal tombstone must never regain project authority.
+        if reopened.rowcount != 1:
+            return None
+        return None
+    if stored_full_id is None or stored_resource_id is None:
+        updated = connection.execute(
+            """
+            UPDATE ephemeral_container_runs
+            SET full_container_id = COALESCE(full_container_id, ?),
+                docker_resource_id = COALESCE(docker_resource_id, ?),
+                generation = generation + 1,
+                updated_at = ?
+            WHERE run_id = ?
+              AND creation_nonce = ?
+              AND repo_id = ?
+              AND template_id = ?
+              AND template_fingerprint = ?
+              AND (full_container_id IS NULL OR full_container_id = ?)
+              AND (docker_resource_id IS NULL OR docker_resource_id = ?)
+            """,
+            (
+                full_container_id,
+                docker_resource_id,
+                timestamp,
+                run_id,
+                creation_nonce,
+                repository_id,
+                template_id,
+                definition_fingerprint,
+                full_container_id,
+                docker_resource_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            return None
+    return str(run["repo_id"])
 
 
 def _normalized_source(
@@ -1012,11 +1175,28 @@ def commit_host_inventory_observation(
             effective_repo_id = None
             ownership_conflict = False
         else:
-            repo_id, suggested_root, unresolved_reason = _repository_resolution(
-                connection,
-                host_id,
-                container.get("project"),
+            ephemeral_repo_id = (
+                _ephemeral_repository_attribution(
+                    connection,
+                    host_id=host_id,
+                    labels=labels,
+                    full_container_id=full_id,
+                    docker_resource_id=resource_id,
+                    timestamp=timestamp,
+                )
+                if inspection_observable
+                else None
             )
+            if ephemeral_repo_id is not None:
+                repo_id = ephemeral_repo_id
+                suggested_root = None
+                unresolved_reason = ""
+            else:
+                repo_id, suggested_root, unresolved_reason = _repository_resolution(
+                    connection,
+                    host_id,
+                    container.get("project"),
+                )
             binding_id = deterministic_id("control-binding", "container", resource_id)
             existing_binding = connection.execute(
                 """
@@ -1034,18 +1214,38 @@ def commit_host_inventory_observation(
                 """,
                 (resource_id,),
             ).fetchone()
-            ownership_conflict = bool(
-                (
-                    repo_id is not None
-                    and existing_membership is not None
-                    and str(existing_membership["repo_id"]) != repo_id
+            if (
+                ephemeral_repo_id is not None
+                and existing_membership is not None
+                and str(existing_membership["repo_id"]) != ephemeral_repo_id
+            ):
+                # A precommitted nonce plus all five exact immutable labels is
+                # stronger evidence than an earlier path claim or manual
+                # attachment for this Docker identity.
+                connection.execute(
+                    """
+                    DELETE FROM repository_memberships
+                    WHERE resource_kind = 'container' AND host_resource_id = ?
+                    """,
+                    (resource_id,),
                 )
-                or (
-                    repo_id is None
-                    and existing_membership is None
-                    and existing_binding is not None
-                    and str(existing_binding["authority_state"]) == "conflicting"
-                    and str(existing_binding["provenance"]) == "conflicting_exact_claim"
+                existing_membership = None
+            ownership_conflict = bool(
+                ephemeral_repo_id is None
+                and (
+                    (
+                        repo_id is not None
+                        and existing_membership is not None
+                        and str(existing_membership["repo_id"]) != repo_id
+                    )
+                    or (
+                        repo_id is None
+                        and existing_membership is None
+                        and existing_binding is not None
+                        and str(existing_binding["authority_state"]) == "conflicting"
+                        and str(existing_binding["provenance"])
+                        == "conflicting_exact_claim"
+                    )
                 )
             )
             if ownership_conflict:
@@ -1106,7 +1306,11 @@ def commit_host_inventory_observation(
                     fingerprint(container),
                     canonical_json(
                         {
-                            "metadata_source": container.get("metadata_source") or "none",
+                            "metadata_source": (
+                                "coordinator_ephemeral"
+                                if ephemeral_repo_id is not None
+                                else container.get("metadata_source") or "none"
+                            ),
                             "observed_name": name,
                         }
                     ),
@@ -1120,6 +1324,8 @@ def commit_host_inventory_observation(
             binding_provenance = (
                 "conflicting_exact_claim"
                 if ownership_conflict
+                else "coordinator_ephemeral"
+                if ephemeral_repo_id is not None
                 else str(container.get("metadata_source") or "observer")
             )
             connection.execute(
@@ -1133,6 +1339,8 @@ def commit_host_inventory_observation(
                     repo_id = excluded.repo_id,
                     source_resource_id = excluded.source_resource_id,
                     provenance = CASE
+                        WHEN excluded.provenance = 'coordinator_ephemeral'
+                        THEN excluded.provenance
                         WHEN control_bindings.provenance = 'operator_attach'
                          AND excluded.authority_state = 'authoritative'
                         THEN control_bindings.provenance
@@ -1201,6 +1409,15 @@ def commit_host_inventory_observation(
                 )
 
             if effective_repo_id is None:
+                previously_classified_unassigned = connection.execute(
+                    """
+                    SELECT 1 FROM unassigned_resources
+                    WHERE host_id = ? AND resource_kind = 'container'
+                      AND resource_id = ?
+                    LIMIT 1
+                    """,
+                    (host_id, resource_id),
+                ).fetchone()
                 existing_unassigned = connection.execute(
                     """
                     SELECT reason_code FROM unassigned_resources
@@ -1263,6 +1480,28 @@ def commit_host_inventory_observation(
                             timestamp,
                             timestamp,
                         ),
+                    )
+                if previously_classified_unassigned is None:
+                    append_observation_transition(
+                        connection,
+                        snapshot_id=snapshot_id,
+                        repo_id=None,
+                        operation_id=None,
+                        resource_kind="container",
+                        resource_id=resource_id,
+                        event_kind="docker.unassigned_discovered",
+                        code="docker_unassigned_discovered",
+                        message=(
+                            f"Docker container {name} was discovered without "
+                            "verified project ownership"
+                        ),
+                        diagnostic={
+                            "docker_resource_id": resource_id,
+                            "name": name,
+                            "reason_code": reason,
+                            "observation_snapshot_id": snapshot_id,
+                        },
+                        occurred_at=timestamp,
                     )
 
             restart_policy = container.get("restart_policy")

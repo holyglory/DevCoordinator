@@ -1038,7 +1038,12 @@ class CoordinatorStore:
                     f"coordinator mutation exceeded {float(max_seconds):.3f} seconds"
                 )
             if check_invariants:
-                violations = invariant_violations(self.connection)
+                # Foreign keys are enforced for every write connection. The
+                # full database scan belongs to explicit maintenance checks
+                # and verified backups, not a bounded mutation critical path.
+                violations = invariant_violations(
+                    self.connection, include_foreign_keys=False
+                )
                 if violations:
                     raise StoreInvariantError(violations)
             if revision_kind is not None:
@@ -1293,6 +1298,56 @@ class AccountStore(CoordinatorStore):
                 if str(row["docker_resource_id"])
                 in current_docker_resource_ids
             )
+            ephemeral_recovery_fences: dict[str, dict[str, Any]] = {}
+            for row in connection.execute(
+                """
+                SELECT docker_resource_id, status, phase, cleanup_requested,
+                       credential_renewal_phase
+                FROM ephemeral_container_runs
+                WHERE docker_resource_id IS NOT NULL
+                  AND secret_policy_kind IS NOT NULL
+                ORDER BY docker_resource_id
+                """
+            ):
+                durable_status = str(row["status"])
+                cleanup_requested = bool(row["cleanup_requested"])
+                renewal_pending = str(row["credential_renewal_phase"]) != "none"
+                if (
+                    durable_status == "running"
+                    and not cleanup_requested
+                    and not renewal_pending
+                ):
+                    continue
+                projected_status = (
+                    "cleanup_pending"
+                    if cleanup_requested
+                    else (
+                        "recovery_pending"
+                        if durable_status == "running"
+                        else durable_status
+                    )
+                )
+                ephemeral_recovery_fences[str(row["docker_resource_id"])] = {
+                    "status": projected_status,
+                    "phase": str(row["phase"]),
+                    "cleanup_requested": cleanup_requested,
+                }
+
+            def project_ephemeral_recovery_fence(
+                item: dict[str, Any], *, lifecycle_key: str
+            ) -> dict[str, Any]:
+                """Overlay unavailable policy-run state without hiding host truth."""
+
+                fence = ephemeral_recovery_fences.get(
+                    str(item.get("docker_resource_id") or item.get("host_resource_id"))
+                )
+                if fence is None:
+                    return item
+                item["host_lifecycle"] = item.get(lifecycle_key)
+                item[lifecycle_key] = fence["status"]
+                item["ephemeral_recovery"] = dict(fence)
+                return item
+
             current_server_resource_ids = _current_server_resource_ids(
                 connection, observed_at=inventory_time
             )
@@ -1748,7 +1803,9 @@ class AccountStore(CoordinatorStore):
                     in current_server_resource_ids
                 ],
                 "docker": [
-                    dict(row)
+                    project_ephemeral_recovery_fence(
+                        dict(row), lifecycle_key="lifecycle"
+                    )
                     for row in connection.execute("SELECT * FROM docker_observations")
                     if str(row["docker_resource_id"])
                     in active_docker_resource_ids
@@ -1864,6 +1921,21 @@ class AccountStore(CoordinatorStore):
                     not in current_server_resource_ids
                 ):
                     continue
+                # A server definition can exist solely as the exact ACL and
+                # durable identity for a port lease.  Enrollment, assignment,
+                # or a port policy proves that control target is usable; it
+                # does not prove that a server instance has ever existed.
+                # Keep those definitions in resources.servers for typed lease
+                # consumers, but only project a compatibility server after a
+                # concrete lifecycle observation exists.
+                if row["lifecycle"] not in {
+                    "running",
+                    "starting",
+                    "unhealthy",
+                    "stopping",
+                    "stopped",
+                }:
+                    continue
                 violation = lifecycle_violation_by_key.get(
                     ("server", str(row["server_definition_id"]))
                 )
@@ -1902,6 +1974,7 @@ class AccountStore(CoordinatorStore):
                     "project": None if violation else row["canonical_root"],
                     "cwd": row["cwd"],
                     "argv": arguments,
+                    "missing_command": not bool(arguments),
                     "port": projected_port,
                     "host": row["listener_host"] or "127.0.0.1",
                     "url": endpoint,
@@ -1998,6 +2071,9 @@ class AccountStore(CoordinatorStore):
                             "rss_bytes": usage["memory_bytes"],
                         }
                 compatibility_servers.append(item)
+            compatibility_server_ids = frozenset(
+                str(item["id"]) for item in compatibility_servers
+            )
             compatibility_leases = [
                 dict(row)
                 for row in connection.execute(
@@ -2269,6 +2345,7 @@ class AccountStore(CoordinatorStore):
                     "metadata_source": row["metadata_source"] or "none",
                     "attribution": violation or unassigned_by_resource.get(resource_id),
                 }
+                item = project_ephemeral_recovery_fence(item, lifecycle_key="status")
                 usage = current_docker_stats.get(resource_id)
                 if item["status"] == "running" and usage is not None:
                     item["stats"] = {
@@ -2392,7 +2469,7 @@ class AccountStore(CoordinatorStore):
                         """,
                         (repo_id,),
                     )
-                    if str(row[0]) in current_server_resource_ids
+                    if str(row[0]) in compatibility_server_ids
                 ]
                 container_memberships = list(
                     connection.execute(

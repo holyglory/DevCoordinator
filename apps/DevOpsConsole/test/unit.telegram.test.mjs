@@ -548,7 +548,7 @@ test('background dispatch delivers system messages without observing or reading 
   assert.deepEqual(calls, { observe: 0, read: 0 });
 });
 
-test('eligible event polling is frequent while expensive host observation is independently throttled', async (t) => {
+test('eligible event polling consumes durable events without becoming a second periodic host observer', async (t) => {
   const telegram = new FakeTelegram();
   telegram.updateQueues.set(TOKEN_A, [privateStart(60)]);
   const calls = { observe: 0, read: 0 };
@@ -579,6 +579,7 @@ test('eligible event polling is frequent while expensive host observation is ind
   await service.start();
   await waitUntil(() => calls.read >= 3);
   await service.stop();
-  assert.equal(calls.observe, 1);
+  assert.equal(calls.observe, 0,
+    'metrics is the one periodic host observer; Telegram only consumes its durable event feed');
   assert.ok(calls.read >= 3);
 });

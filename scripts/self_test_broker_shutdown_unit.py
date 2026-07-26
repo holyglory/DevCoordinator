@@ -42,6 +42,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
+RuntimeDirectoryPreserve=restart
 ReadWritePaths=/var/lib/devcoordinator /run/devcoordinator /home/alice /home/bob
 ReadOnlyPaths=
 BindPaths=
@@ -169,6 +170,11 @@ def main() -> int:
             "ProtectHome=read-only",
             "ProtectHome=no",
             "writable home baseline",
+        ),
+        (
+            "RuntimeDirectoryPreserve=restart",
+            "RuntimeDirectoryPreserve=no",
+            "volatile runtime directory cleanup on restart",
         ),
         (
             "ProtectSystem=strict",

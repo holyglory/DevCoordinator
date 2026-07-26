@@ -788,10 +788,25 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
   it('7b. Google-protected route uses private upstream auth without a second browser prompt', async () => {
     const jar = await authedJar();
 
+    const jwksResponse = await fetchUrl(
+      stack,
+      'https://console.vr.ae/.well-known/devops-console-identity.jwks',
+      { headers: { accept: 'application/json' } },
+    );
+    assert.equal(jwksResponse.status, 200, jwksResponse.text);
+    const jwks = JSON.parse(jwksResponse.text);
+    assert.equal(jwks.keys.length, 1);
+    assert.equal(jwks.keys[0].d, undefined, 'the public endpoint must never expose private key material');
+
     const anonymous = await fetchUrl(stack, 'https://sso.vr.ae/requires-upstream-auth', {
       headers: { accept: 'text/html' },
     });
     assert.equal(anonymous.status, 302, 'Google remains the outer access boundary');
+    assert.equal(
+      anonymous.headers.location,
+      `${stack.consoleOrigin}/auth/login?rt=${encodeURIComponent('https://sso.vr.ae/requires-upstream-auth')}`,
+      'the login window must retain the exact requested page',
+    );
 
     const authed = await fetchUrl(stack, 'https://sso.vr.ae/requires-upstream-auth', {
       jar,
@@ -801,7 +816,39 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
       },
     });
     assert.equal(authed.status, 200, authed.text);
-    assert.equal(JSON.parse(authed.text).headers.authorization, FIXTURE_UPSTREAM_AUTHORIZATION);
+    const echoedHeaders = JSON.parse(authed.text).headers;
+    assert.equal(echoedHeaders.authorization, FIXTURE_UPSTREAM_AUTHORIZATION);
+    const assertion = echoedHeaders['x-devops-console-assertion'];
+    const [encodedHeader, encodedPayload, encodedSignature] = assertion.split('.');
+    const assertionHeader = JSON.parse(Buffer.from(encodedHeader, 'base64url').toString('utf8'));
+    const assertionPayload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
+    assert.equal(assertionHeader.kid, jwks.keys[0].kid);
+    assert.deepEqual(
+      {
+        iss: assertionPayload.iss,
+        aud: assertionPayload.aud,
+        sub: assertionPayload.sub,
+        resource: assertionPayload.resource,
+        method: assertionPayload.method,
+      },
+      {
+        iss: stack.consoleOrigin,
+        aud: 'sso.vr.ae',
+        sub: FIXTURE_EMAIL,
+        resource: 'route:sso',
+        method: 'GET',
+      },
+    );
+    assert.equal(assertionPayload.exp - assertionPayload.iat, 15);
+    assert.equal(
+      crypto.verify(
+        null,
+        Buffer.from(`${encodedHeader}.${encodedPayload}`, 'ascii'),
+        crypto.createPublicKey({ key: jwks.keys[0], format: 'jwk' }),
+        Buffer.from(encodedSignature, 'base64url'),
+      ),
+      true,
+    );
 
     const overview = await apiCall(stack, jar, 'GET', '/api/overview');
     assert.equal(overview.status, 200, overview.text);
@@ -817,7 +864,10 @@ print(json.dumps(dev_coordinator.docker_ps_inventory()))
     assert.doesNotMatch(wrong.text, /fixture-wrong-upstream-credential/);
 
     const refused = await fetchUrl(stack, 'https://sso.vr.ae/requires-upstream-auth', { jar });
-    assert.equal(refused.status, 401);
+    assert.equal(refused.status, 502);
+    assert.match(refused.headers['content-type'], /^text\/html\b/);
+    assert.match(refused.text, /Route authorization unavailable/);
+    assert.doesNotMatch(refused.text, /upstream authentication required/);
     assert.equal(
       refused.headers['www-authenticate'],
       undefined,

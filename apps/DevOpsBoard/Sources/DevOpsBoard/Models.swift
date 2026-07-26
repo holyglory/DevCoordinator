@@ -15,6 +15,7 @@ struct Inventory: Decodable, Equatable, Sendable {
     var postgres: [DockerContainer]
     var backups: [DatabaseBackup]
     var projectUsage: [ProjectUsage]
+    var testStatistics: [TestStatistics] = []
 
     enum CodingKeys: String, CodingKey {
         case coordinatorHome = "coordinator_home"
@@ -43,6 +44,137 @@ struct Inventory: Decodable, Equatable, Sendable {
         backups: [],
         projectUsage: []
     )
+}
+
+struct TestStatistics: Decodable, Equatable, Sendable, Identifiable {
+    var id: String { "\(origin?.id ?? "unknown"):\(repoID)" }
+    var origin: CoordinatorOrigin? = nil
+    let repoID: String
+    let days: Int
+    let summary: TestSummary
+    let daily: [TestDaily]
+    let suites: [TestSuiteStatistic]
+    let slowTests: [TestCaseStatistic]
+    let recentRuns: [TestRunStatistic]
+
+    enum CodingKeys: String, CodingKey {
+        case repoID = "repo_id"
+        case days, summary, daily, suites
+        case slowTests = "slow_tests"
+        case recentRuns = "recent_runs"
+    }
+}
+
+struct TestSummary: Decodable, Equatable, Sendable {
+    let runCount: Int
+    let sessionCount: Int
+    let runningCount: Int
+    let runSeconds: Double
+    let testCount: Int
+    let testSeconds: Double
+    let passedCount: Int
+    let failedCount: Int
+    let skippedCount: Int
+    let errorCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case runCount = "run_count"
+        case sessionCount = "session_count"
+        case runningCount = "running_count"
+        case runSeconds = "run_seconds"
+        case testCount = "test_count"
+        case testSeconds = "test_seconds"
+        case passedCount = "passed_count"
+        case failedCount = "failed_count"
+        case skippedCount = "skipped_count"
+        case errorCount = "error_count"
+    }
+}
+
+struct TestDaily: Decodable, Equatable, Sendable, Identifiable {
+    var id: String { day }
+    let day: String
+    let runCount: Int
+    let testCount: Int
+    let runSeconds: Double
+    let testSeconds: Double
+
+    enum CodingKeys: String, CodingKey {
+        case day
+        case runCount = "run_count"
+        case testCount = "test_count"
+        case runSeconds = "run_seconds"
+        case testSeconds = "test_seconds"
+    }
+}
+
+struct TestSuiteStatistic: Decodable, Equatable, Sendable, Identifiable {
+    var id: String { suite }
+    let suite: String
+    let runCount: Int
+    let totalSeconds: Double
+    let averageSeconds: Double
+    let maxSeconds: Double
+    let percentOfRunTime: Double
+
+    enum CodingKeys: String, CodingKey {
+        case suite
+        case runCount = "run_count"
+        case totalSeconds = "total_seconds"
+        case averageSeconds = "average_seconds"
+        case maxSeconds = "max_seconds"
+        case percentOfRunTime = "percent_of_run_time"
+    }
+}
+
+struct TestCaseStatistic: Decodable, Equatable, Sendable, Identifiable {
+    var id: String { testID }
+    let testID: String
+    let displayName: String
+    let executions: Int
+    let totalSeconds: Double
+    let averageSeconds: Double
+    let maxSeconds: Double
+    let failureCount: Int
+    let percentOfTestTime: Double
+
+    enum CodingKeys: String, CodingKey {
+        case testID = "test_id"
+        case displayName = "display_name"
+        case executions
+        case totalSeconds = "total_seconds"
+        case averageSeconds = "average_seconds"
+        case maxSeconds = "max_seconds"
+        case failureCount = "failure_count"
+        case percentOfTestTime = "percent_of_test_time"
+    }
+}
+
+struct TestRunStatistic: Decodable, Equatable, Sendable, Identifiable {
+    var id: String { runID }
+    let runID: String
+    let parentRunID: String?
+    let suite: String
+    let runKind: String
+    let status: String
+    let clientStartedAt: String
+    let durationSeconds: Double?
+    let caseCount: Int
+    let failedCount: Int
+    let errorCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case runID = "run_id"
+        case parentRunID = "parent_run_id"
+        case suite
+        case runKind = "run_kind"
+        case status
+        case clientStartedAt = "client_started_at"
+        case durationSeconds = "duration_seconds"
+        case caseCount = "case_count"
+        case failedCount = "failed_count"
+        case errorCount = "error_count"
+    }
 }
 
 struct ManagedURL: Decodable, Identifiable, Hashable, Sendable {
@@ -681,6 +813,7 @@ enum ResourceTab: String, CaseIterable, Identifiable {
     case servers = "Dev Servers"
     case docker = "Docker"
     case databases = "Databases"
+    case tests = "Tests"
 
     var id: String { rawValue }
 
@@ -689,6 +822,7 @@ enum ResourceTab: String, CaseIterable, Identifiable {
         case .servers: return "terminal"
         case .docker: return "shippingbox"
         case .databases: return "cylinder.split.1x2"
+        case .tests: return "checkmark.circle"
         }
     }
 }

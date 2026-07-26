@@ -12,6 +12,7 @@ import json
 import os
 import select
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -178,6 +179,63 @@ def schema_v2_fixture(value: dict) -> dict:
         ],
         "v1_compatibility": compatibility,
     }
+
+
+def delayed_inventory_transport_budget_test() -> None:
+    """A valid >3s read must finish once; it must not be abandoned and retried."""
+
+    encoded = json.dumps(schema_v2_fixture(ready_fixture())).encode("utf-8")
+    requests = 0
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self) -> None:
+            nonlocal requests
+            self.connection.settimeout(2)
+            while True:
+                line = self.rfile.readline()
+                if not line or line in {b"\r\n", b"\n"}:
+                    break
+            requests += 1
+            time.sleep(3.25)
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(encoded)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+                + encoded
+            )
+            try:
+                self.wfile.write(response)
+            except OSError:
+                pass
+
+    class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    server = Server(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    try:
+        result = READY.inventory_probe(
+            host="127.0.0.1",
+            port=int(server.server_address[1]),
+            token="a" * 64,
+            timeout=8.0,
+            project=FIXTURES.PROJECT,
+            name=FIXTURES.NAME,
+            server_port=FIXTURES.PORT,
+        )
+        elapsed = time.monotonic() - started
+        require(result["schema_version"] == 2, "delayed inventory lost its normalized envelope")
+        require(elapsed >= 3.0, "delayed inventory fixture did not cross the former cap")
+        require(requests == 1, "one delayed inventory probe issued more than one request")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        require(not thread.is_alive(), "delayed inventory fixture did not stop")
 
 
 def pending_current_main_pid_fixture() -> dict:
@@ -1304,6 +1362,18 @@ def normalized_producer_contract_test() -> None:
                 "_require_exact_listener_identity" not in json.dumps(inventory),
                 "private live-proof marker leaked into the public inventory",
             )
+            require(
+                all(
+                    not rows
+                    for key, rows in inventory["observations"].items()
+                    if key != "servers"
+                ),
+                "targeted registration inventory retained unrelated observation history",
+            )
+            require(
+                len(json.dumps(inventory, separators=(",", ":"))) <= 8 * 1024 * 1024,
+                "targeted registration inventory exceeded the readiness payload bound",
+            )
             with dc.AccountStore.open_default_read_only(home) as store:
                 after_read = (
                     store.metadata.state_revision,
@@ -1935,6 +2005,7 @@ def main() -> int:
         raise AssertionError("unsafe current ownership was retried")
 
     identity_and_deadline_tests()
+    delayed_inventory_transport_budget_test()
     real_listener_delayed_registration_test()
     actual_api_delayed_registration_test()
     print("Console registration readiness self-test ok")
