@@ -31,6 +31,7 @@ from .ephemeral_secrets import EphemeralSecretPolicy, normalize_ephemeral_secret
 
 PROFILE_VERSION = 1
 HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS = 11 * 60.0
+INVENTORY_READ_CLIENT_TIMEOUT_SECONDS = 60.0
 SYSTEM_PROFILE_PATH = Path(
     "/private/etc/devcoordinator/client-profiles.json"
     if sys.platform == "darwin"
@@ -414,14 +415,18 @@ def call_broker(
                     HOST_OBSERVE_CLIENT_TIMEOUT_SECONDS
                     if operation == BrokerOperation.HOST_OBSERVE
                     else (
-                        5 * 60.0
-                        if operation
-                        in {
-                            BrokerOperation.EPHEMERAL_START,
-                            BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
-                            BrokerOperation.EPHEMERAL_FINISH,
-                        }
-                        else 60.0
+                        INVENTORY_READ_CLIENT_TIMEOUT_SECONDS
+                        if operation == BrokerOperation.INVENTORY_READ
+                        else (
+                            5 * 60.0
+                            if operation
+                            in {
+                                BrokerOperation.EPHEMERAL_START,
+                                BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
+                                BrokerOperation.EPHEMERAL_FINISH,
+                            }
+                            else 60.0
+                        )
                     )
                 )
             )
@@ -433,6 +438,7 @@ def call_broker(
                 BrokerOperation.HOST_OBSERVE,
                 BrokerOperation.DATABASE_BACKUP,
                 BrokerOperation.DATABASE_RESTORE,
+                BrokerOperation.INVENTORY_READ,
                 BrokerOperation.EPHEMERAL_START,
                 BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
                 BrokerOperation.EPHEMERAL_FINISH,

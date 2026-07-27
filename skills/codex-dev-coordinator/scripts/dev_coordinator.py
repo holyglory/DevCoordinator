@@ -11073,10 +11073,16 @@ def coordinated_build_registration_inventory(
         or server.get("port") == target_port
     ]
     relevant_server_ids = {str(server["id"]) for server in relevant_servers}
+    referenced_lease_ids = {
+        str(server["lease_id"])
+        for server in relevant_servers
+        if server.get("lease_id") is not None
+    }
     relevant_leases = [
         copy.deepcopy(lease)
         for lease in source_compatibility["leases"]
-        if lease.get("port") == target_port
+        if str(lease.get("id")) in referenced_lease_ids
+        or lease.get("status") == "active"
         or lease.get("assignment_key") == target_key
         or str(lease.get("server_id")) in relevant_server_ids
     ]
@@ -11229,7 +11235,8 @@ def coordinated_build_registration_inventory(
     result["leases"] = [
         copy.deepcopy(row)
         for row in result.get("leases", [])
-        if row.get("port") == target_port
+        if str(row.get("lease_id")) in referenced_lease_ids
+        or row.get("status") == "active"
         or str(row.get("server_definition_id")) in relevant_server_ids
     ]
     result["port_assignments"] = [
