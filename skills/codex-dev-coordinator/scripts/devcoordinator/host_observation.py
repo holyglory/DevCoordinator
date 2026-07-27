@@ -11,7 +11,13 @@ from typing import Any, Mapping
 from .broker_host import EPHEMERAL_DOCKER_LABELS
 from .database_backups import reconcile_inventory_backups
 from .events import append_observation_transition
-from .store import canonical_json, deterministic_id, fingerprint, utc_timestamp
+from .store import (
+    canonical_json,
+    deterministic_id,
+    fingerprint,
+    normalize_telemetry_byte_count,
+    utc_timestamp,
+)
 
 
 def _boolean(value: Any) -> int | None:
@@ -940,7 +946,10 @@ def commit_host_inventory_observation(
                     definition_id,
                     usage_sampled_at,
                     usage.get("cpu_percent"),
-                    usage.get("memory_bytes", usage.get("rss_bytes")),
+                    normalize_telemetry_byte_count(
+                        usage.get("memory_bytes", usage.get("rss_bytes")),
+                        field="server memory_bytes",
+                    ),
                 ),
             )
 
@@ -1706,11 +1715,26 @@ def commit_host_inventory_observation(
                     resource_id,
                     str(stats["timestamp"]),
                     stats.get("cpu_percent"),
-                    stats.get("memory_usage_bytes"),
-                    stats.get("network_rx_bytes"),
-                    stats.get("network_tx_bytes"),
-                    stats.get("block_read_bytes"),
-                    stats.get("block_write_bytes"),
+                    normalize_telemetry_byte_count(
+                        stats.get("memory_usage_bytes"),
+                        field="Docker memory_usage_bytes",
+                    ),
+                    normalize_telemetry_byte_count(
+                        stats.get("network_rx_bytes"),
+                        field="Docker network_rx_bytes",
+                    ),
+                    normalize_telemetry_byte_count(
+                        stats.get("network_tx_bytes"),
+                        field="Docker network_tx_bytes",
+                    ),
+                    normalize_telemetry_byte_count(
+                        stats.get("block_read_bytes"),
+                        field="Docker block_read_bytes",
+                    ),
+                    normalize_telemetry_byte_count(
+                        stats.get("block_write_bytes"),
+                        field="Docker block_write_bytes",
+                    ),
                 ),
             )
 

@@ -36,6 +36,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -97,6 +98,7 @@ from devcoordinator.lifecycle_cli import (
 )
 from devcoordinator.normalized_server_lifecycle import (
     NormalizedLifecycleConflict,
+    NormalizedObservationConflict,
     NormalizedPortLifecycle,
     NormalizedServerLifecycle,
     PortLeaseRequest,
@@ -119,6 +121,7 @@ from devcoordinator.store import (
     AccountStore,
     deterministic_id,
     fingerprint,
+    normalize_telemetry_byte_count,
     utc_timestamp,
 )
 from devcoordinator.test_runner import (
@@ -5193,21 +5196,21 @@ def parse_percent(raw: Any) -> float | None:
 
 
 SIZE_UNITS = {
-    "b": 1.0,
-    "kb": 1000.0,
-    "mb": 1000.0**2,
-    "gb": 1000.0**3,
-    "tb": 1000.0**4,
-    "pb": 1000.0**5,
-    "kib": 1024.0,
-    "mib": 1024.0**2,
-    "gib": 1024.0**3,
-    "tib": 1024.0**4,
-    "pib": 1024.0**5,
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "tb": 1000**4,
+    "pb": 1000**5,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+    "pib": 1024**5,
 }
 
 
-def parse_size_bytes(raw: Any) -> float | None:
+def parse_size_bytes(raw: Any) -> int | None:
     if raw is None:
         return None
     value = str(raw).strip()
@@ -5216,15 +5219,18 @@ def parse_size_bytes(raw: Any) -> float | None:
     match = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)?$", value)
     if not match:
         return None
-    number = float(match.group(1))
+    number = Decimal(match.group(1))
     unit = (match.group(2) or "B").lower()
     multiplier = SIZE_UNITS.get(unit)
     if multiplier is None:
         return None
-    return number * multiplier
+    return normalize_telemetry_byte_count(
+        number * multiplier,
+        field="Docker byte measurement",
+    )
 
 
-def parse_io_pair(raw: Any) -> tuple[float | None, float | None]:
+def parse_io_pair(raw: Any) -> tuple[int | None, int | None]:
     if raw is None:
         return None, None
     left, separator, right = str(raw).partition("/")
@@ -9940,38 +9946,56 @@ def _coordinated_stop_server_normalized(options: dict[str, Any]) -> dict[str, An
     project = canonical_project(
         str(prepared.get("project") or snapshot.get("project") or "")
     )
-    if canonical_project(str(snapshot.get("project") or "")) != project:
-        raise ValueError(
-            "server stop project does not match the registered server project"
-        )
-    if broker_enrollment is not None:
-        _profile, repository, enrolled_name, enrolled_id = broker_enrollment
-        if (
-            canonical_project(str(snapshot.get("project") or ""))
-            != repository.canonical_root
-            or str(snapshot.get("name") or "") != enrolled_name
-            or str(snapshot.get("id") or "") != enrolled_id
-        ):
-            raise BrokerProfileError(
-                "client reconciliation journal does not match the exact enrolled "
-                "broker server identity"
-            )
     prime_git_head_identity(project)
-    health = server_health(snapshot)
-    require_listener_identity_observable(health, action="stop", server=snapshot)
+    # A concurrent Console metrics observation can update only the observation
+    # CAS between this call's exact listener proof and its reservation. Re-read
+    # and re-prove that identity a bounded number of times. Definition drift
+    # remains an immediate conflict and is never retried.
+    for attempt in range(3):
+        if attempt:
+            snapshot = _normalized_server_from_options(prepared)
+        if canonical_project(str(snapshot.get("project") or "")) != project:
+            raise ValueError(
+                "server stop project does not match the registered server project"
+            )
+        if broker_enrollment is not None:
+            _profile, repository, enrolled_name, enrolled_id = broker_enrollment
+            if (
+                canonical_project(str(snapshot.get("project") or ""))
+                != repository.canonical_root
+                or str(snapshot.get("name") or "") != enrolled_name
+                or str(snapshot.get("id") or "") != enrolled_id
+            ):
+                raise BrokerProfileError(
+                    "client reconciliation journal does not match the exact enrolled "
+                    "broker server identity"
+                )
+        health = server_health(snapshot)
+        require_listener_identity_observable(
+            health, action="stop", server=snapshot
+        )
+        try:
+            with AccountStore.open_default(coordinator_home()) as store:
+                reservation = NormalizedServerLifecycle(store).reserve_stop(
+                    agent=agent,
+                    server_definition_id=str(snapshot["id"]),
+                    expected_definition_generation=int(snapshot["generation"]),
+                    expected_observation_fingerprint=snapshot.get(
+                        "_observation_fingerprint"
+                    ),
+                )
+            break
+        except NormalizedObservationConflict:
+            if attempt == 2:
+                raise
+    else:  # pragma: no cover - every loop path returns, breaks, or raises
+        raise AssertionError("bounded normalized stop retry did not reserve or raise")
     requested_release = bool(prepared.get("release_port", True))
     broker_link = (
         broker_lease_link_for_local(str(snapshot.get("lease_id")))
         if requested_release and snapshot.get("lease_id")
         else None
     )
-    with AccountStore.open_default(coordinator_home()) as store:
-        reservation = NormalizedServerLifecycle(store).reserve_stop(
-            agent=agent,
-            server_definition_id=str(snapshot["id"]),
-            expected_definition_generation=int(snapshot["generation"]),
-            expected_observation_fingerprint=snapshot.get("_observation_fingerprint"),
-        )
     identity_wrong = (health.get("identity") or {}).get("ok") is False
     try:
         if not identity_wrong and snapshot.get("pid"):
@@ -10296,11 +10320,26 @@ def persist_normalized_docker_stats(
                     resource_id,
                     sampled_at,
                     sample.get("cpu_percent"),
-                    sample.get("memory_usage_bytes"),
-                    sample.get("network_rx_bytes"),
-                    sample.get("network_tx_bytes"),
-                    sample.get("block_read_bytes"),
-                    sample.get("block_write_bytes"),
+                    normalize_telemetry_byte_count(
+                        sample.get("memory_usage_bytes"),
+                        field="Docker memory_usage_bytes",
+                    ),
+                    normalize_telemetry_byte_count(
+                        sample.get("network_rx_bytes"),
+                        field="Docker network_rx_bytes",
+                    ),
+                    normalize_telemetry_byte_count(
+                        sample.get("network_tx_bytes"),
+                        field="Docker network_tx_bytes",
+                    ),
+                    normalize_telemetry_byte_count(
+                        sample.get("block_read_bytes"),
+                        field="Docker block_read_bytes",
+                    ),
+                    normalize_telemetry_byte_count(
+                        sample.get("block_write_bytes"),
+                        field="Docker block_write_bytes",
+                    ),
                 ),
             )
             inserted += int(connection.total_changes > before)
@@ -11067,7 +11106,10 @@ def coordinated_build_registration_inventory(
             include_docker=False,
         )
         if configured_broker_profile() is not None
-        else pure_normalized_inventory(include_docker=False)
+        else pure_normalized_inventory(
+            project=resolved_project,
+            include_docker=False,
+        )
     )
     source_compatibility = result["v1_compatibility"]
     target_key = f"{resolved_project}::{target_name}"

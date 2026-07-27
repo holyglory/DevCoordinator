@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import fcntl
 import hashlib
 import json
@@ -25,6 +26,53 @@ DEFAULT_DATABASE_NAME = "coordinator.sqlite3"
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_MUTATION_SECONDS = 5.0
 MAINTENANCE_LOCK_NAME = ".coordinator-maintenance.lock"
+TELEMETRY_BYTE_FIELDS = (
+    "memory_bytes",
+    "network_rx_bytes",
+    "network_tx_bytes",
+    "block_read_bytes",
+    "block_write_bytes",
+)
+MAX_SQLITE_INTEGER = (1 << 63) - 1
+
+
+def normalize_telemetry_byte_count(
+    value: Any,
+    *,
+    field: str = "telemetry byte counter",
+) -> int | None:
+    """Return one non-negative integral byte count for storage and transport.
+
+    Docker's human-readable stats can contain fractional GiB values. SQLite
+    INTEGER affinity does not reject a non-integral float, so accepting those
+    values would publish JSON numbers that integer-only clients cannot decode.
+    Normalize at every database boundary and keep the public byte contract
+    integral, including when reading rows written by older versions.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise StoreError(f"{field} must be a non-negative integer byte count")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as error:
+        raise StoreError(
+            f"{field} must be a non-negative integer byte count"
+        ) from error
+    if not number.is_finite() or number < 0 or number > MAX_SQLITE_INTEGER:
+        raise StoreError(f"{field} is outside the supported byte-count range")
+    return int(number.to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def _normalized_telemetry_row(row: Any) -> dict[str, Any]:
+    projected = dict(row)
+    for field in TELEMETRY_BYTE_FIELDS:
+        projected[field] = normalize_telemetry_byte_count(
+            projected.get(field),
+            field=field,
+        )
+    return projected
 
 
 def _retry_sqlite_busy(
@@ -159,7 +207,10 @@ def _usage_part(
         if row["cpu_percent"] is not None
     ]
     memory = [
-        int(row["memory_bytes"])
+        normalize_telemetry_byte_count(
+            row["memory_bytes"],
+            field="project memory_bytes",
+        )
         for row in material
         if row["memory_bytes"] is not None
     ]
@@ -603,7 +654,7 @@ def _current_telemetry_samples(
     samples: list[dict[str, Any]] = []
     for resource_kind, resource_id in sorted(resource_keys):
         samples.extend(
-            dict(row)
+            _normalized_telemetry_row(row)
             for row in connection.execute(
                 """
                 SELECT *
@@ -672,7 +723,10 @@ def _current_docker_stats(
         ).fetchone()
         if sample is None:
             continue
-        projected = {"docker_resource_id": resource_id, **dict(sample)}
+        projected = {
+            "docker_resource_id": resource_id,
+            **_normalized_telemetry_row(sample),
+        }
         compatibility[resource_id] = projected
         if evidence is not None:
             current[resource_id] = projected
@@ -2712,12 +2766,13 @@ class AccountStore(CoordinatorStore):
                         (row["server_definition_id"], row["definition_updated_at"]),
                     ).fetchone()
                     if usage is not None:
+                        normalized_usage = _normalized_telemetry_row(usage)
                         item["process_usage"] = {
                             "source": "normalized_observation",
-                            "sampled_at": usage["sampled_at"],
-                            "cpu_percent": usage["cpu_percent"],
-                            "memory_bytes": usage["memory_bytes"],
-                            "rss_bytes": usage["memory_bytes"],
+                            "sampled_at": normalized_usage["sampled_at"],
+                            "cpu_percent": normalized_usage["cpu_percent"],
+                            "memory_bytes": normalized_usage["memory_bytes"],
+                            "rss_bytes": normalized_usage["memory_bytes"],
                         }
                 compatibility_servers.append(item)
             compatibility_server_ids = frozenset(

@@ -42,11 +42,11 @@ inventory authority. One canonical worktree is one project; Python proves
 root/temporary relationships and publishes the `repository_trees` model used
 by Board and Console. Names and UI heuristics never establish ownership.
 
-System API authorization is loaded from the protected client profile before
-binding. A stable atomic profile replacement produces `api.profile_changed`
-and a clean supervised exit so `Restart=always` reloads it; malformed state
-fails startup without exposing profile contents. Installer-detected profile/
-database drift blocks broker restart until exact offline reconciliation passes.
+System API authorization loads the protected client profile before binding. A
+stable atomic replacement logs `api.profile_reloaded` without dropping the
+listener; each protected request validates the current profile. Malformed
+startup state fails without exposing contents. Profile/database drift blocks
+broker restart until exact offline reconciliation passes.
 
 Offline upgrades publish `/run/devcoordinator-maintenance/maintenance.json` before
 quiescing the broker. Clients check this broker-independent path before

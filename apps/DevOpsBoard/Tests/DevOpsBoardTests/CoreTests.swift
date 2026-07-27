@@ -195,6 +195,37 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(projection.inventory.backups.contains { $0.path.hasPrefix("/poison/") })
     }
 
+    func testNormalizedInventoryDecodesLargeIntegralTelemetryByteCounters() throws {
+        var object = normalizedInventoryJSONObject(
+            from: inventoryJSONObject(home: codex.home, containers: [], postgres: []),
+            home: codex.home
+        )
+        var observations = try XCTUnwrap(object["observations"] as? [String: Any])
+        observations["telemetry"] = [[
+            "sample_id": "telemetry-large-bytes",
+            "host_resource_kind": "docker",
+            "host_resource_id": "docker-large-bytes",
+            "sampled_at": "2026-07-28T00:00:00Z",
+            "cpu_percent": 1.25,
+            "memory_bytes": Int64(4_394_825_286),
+            "network_rx_bytes": Int64(1_250),
+            "network_tx_bytes": Int64(2_501),
+            "block_read_bytes": Int64(8_460_000_000),
+            "block_write_bytes": Int64(5_241_831),
+        ]]
+        object["observations"] = observations
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+
+        let graph = try JSONDecoder().decode(NormalizedInventoryGraph.self, from: data)
+        let sample = try XCTUnwrap(graph.observations.telemetry.first)
+
+        XCTAssertEqual(sample.memoryBytes, 4_394_825_286)
+        XCTAssertEqual(sample.networkRxBytes, 1_250)
+        XCTAssertEqual(sample.networkTxBytes, 2_501)
+        XCTAssertEqual(sample.blockReadBytes, 8_460_000_000)
+        XCTAssertEqual(sample.blockWriteBytes, 5_241_831)
+    }
+
     func testSupervisedWorkerDecodesExactCrashLoopAndRetainedLogEvidence() throws {
         let artifactID = "22222222-2222-4222-8222-222222222222"
         let server = try JSONDecoder().decode(

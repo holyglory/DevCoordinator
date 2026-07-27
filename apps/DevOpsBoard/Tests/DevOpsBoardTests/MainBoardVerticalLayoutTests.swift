@@ -292,11 +292,13 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
     }
 
     func testTypedStaleRetirementFailureRendersActionScopedRecoveryWorkspace() async throws {
-        let origin = CoordinatorOrigin(
-            label: "Retirement fixture",
-            home: "/fixtures/retirement/coordinator",
-            statePath: "/fixtures/retirement/coordinator/state.json"
+        let discovery = AccountCoordinatorOriginDiscovery(
+            environment: [:],
+            accountHomeResolver: POSIXAccountHomeResolver(
+                resolveAccountHome: { "/fixtures/retirement-account" }
+            )
         )
+        let origin = try XCTUnwrap(discovery.origins().first)
         let staleFailure = CommandExecution(
             stdout: "",
             stderr: #"{"ok":false,"code":"lifecycle_plan_stale","classification":"lifecycle_target_identity_changed","mutation_performed":false,"error":"Resource ownership generation changed after planning.","action_required":"Refresh authoritative inventory, review a newly generated lifecycle plan, and retry."}"#,
@@ -317,6 +319,10 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
             from: Data(firstPlan.utf8)
         )
         let service = RetirementVisualCoordinatorService(results: [
+            try retirementVisualInventoryExecution(
+                home: origin.home,
+                ownershipFingerprint: "ownership-fingerprint-1"
+            ),
             CommandExecution(stdout: firstPlan, stderr: "", exitStatus: 0),
             staleFailure,
             try retirementVisualInventoryExecution(
@@ -329,35 +335,23 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
             ),
             CommandExecution(stdout: replacementPlan, stderr: "", exitStatus: 0),
         ])
-        let now = Date(timeIntervalSince1970: 1_768_219_200)
+        let now = Date(timeIntervalSince1970: 1_785_080_400)
         let store = OpsStore(
             coordinatorService: service,
-            originDiscovery: VerticalLayoutOriginDiscovery(values: [origin]),
+            originDiscovery: discovery,
             configurationStore: VerticalLayoutConfigurationStore(),
             clock: VerticalLayoutClock(value: now)
         )
-        var container = try JSONDecoder().decode(
-            DockerContainer.self,
-            from: Data(#"{"id":"immutable-copy-pg","name":"kosttracking-prod-copy-pg","status":"running","metadata_source":"normalized_store","attribution":{"reason_code":"ambiguous_control","explanation":"Observed without one authoritative repository binding","observed_by":["host-observer"],"controller":"docker-binding-1","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","ownership_fingerprint":"ownership-fingerprint-1","can_attach":true,"can_retire":true}}"#.utf8)
-        )
-        container.origin = origin
-        var inventory = Inventory.empty
-        inventory.docker = DockerSummary(
-            available: true,
-            error: nil,
-            statsError: nil,
-            containers: [container],
-            postgres: []
-        )
-        store.inventory = inventory
-        store.sourceStates = [
-            .init(origin: origin, phase: .loaded, checkedAt: now, resourceCount: 1)
-        ]
-        store.capabilityStates = CoordinatorCapability.allCases.map {
-            .init(origin: origin, capability: $0, phase: .available, checkedAt: now, error: nil)
-        }
 
-        let target = try XCTUnwrap(container.exactUnassignedResource)
+        await store.loadInventory(force: true)
+        seedRetirementVisualHistory(store: store, origin: origin, now: now)
+        let targetRow = try XCTUnwrap(
+            store.repositoryCatalog.unassigned.docker.first {
+                $0.representative.name == "kosttracking-prod-copy-pg"
+            }
+        )
+        store.selectDocker(targetRow.representative)
+        let target = try XCTUnwrap(targetRow.representative.exactUnassignedResource)
         store.planResourceRetirement(target)
         do {
             try await waitForRetirementVisualState("retirement plan prompt") {
@@ -386,6 +380,26 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
                 }
         }
 
+        XCTAssertTrue(
+            store.repositoryTreesAreAuthoritative,
+            "the visual acceptance state must use the same authoritative repository hierarchy promised by the mockup"
+        )
+        XCTAssertGreaterThanOrEqual(
+            store.repositoryTrees.count,
+            5,
+            "a sparse empty sidebar is not a faithful full-shell comparison target"
+        )
+        XCTAssertEqual(
+            store.selectedDocker?.name,
+            "kosttracking-prod-copy-pg",
+            "the exact retirement target must remain selected so the inspector matches the reviewed workflow"
+        )
+        XCTAssertGreaterThanOrEqual(
+            store.actionResults.count,
+            8,
+            "the Activity workspace must be exercised at the operation density shown in the selected mockup"
+        )
+
         let actionID = try XCTUnwrap(store.selectedActionResultID)
         let planningActionID = try XCTUnwrap(
             store.actionResults.first {
@@ -399,12 +413,106 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         )
         XCTAssertEqual(store.actionIssue?.relatedActionID, actionID)
         XCTAssertTrue(store.actionResults[actionID]?.stderr.contains(#""code":"lifecycle_plan_stale""#) == true)
+        let failedRetirementResult = try XCTUnwrap(store.actionResults[actionID])
+        let rawDetails = store.actionResultDetails(failedRetirementResult)
+        let presentationDetails = store.actionResultPresentationDetails(failedRetirementResult)
+        XCTAssertTrue(rawDetails.contains(staleFailure.stderr))
+        XCTAssertFalse(rawDetails.contains("\n  \"code\""))
+        XCTAssertTrue(presentationDetails.contains("\n  \"code\""))
+        XCTAssertNotEqual(rawDetails, presentationDetails)
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.clearContents() }
+        store.copyActionResultDetails(failedRetirementResult, to: pasteboard)
+        XCTAssertEqual(pasteboard.string(forType: .string), rawDetails)
 
+        let inventoryIssue = OpsIssue(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000799")!,
+            kind: .inventory,
+            title: "web-before-repro",
+            summary: "Its recorded repository no longer exists; refresh after reinstalling or retiring it.",
+            details: "The coordinator retained web-before-repro, but its canonical repository path is unavailable.",
+            createdAt: now.addingTimeInterval(-720),
+            relatedActionID: nil
+        )
+        store.inventoryIssue = inventoryIssue
+
+        XCTAssertNil(store.retirementRecoveryContexts[planningActionID])
         store.showActivity(actionID: planningActionID)
-        XCTAssertNil(store.selectedRetirementRecoveryContext)
-        XCTAssertNil(store.selectedRetirementRecoveryActionTitle)
-        store.showActivity(actionID: actionID)
+        XCTAssertEqual(
+            store.selectedActionResultID,
+            actionID,
+            "a hidden preparatory result must not replace the visible incident selection"
+        )
         XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Refresh & re-plan")
+
+        let designAcceptanceView = hostMainBoard(
+            store: store,
+            width: desktopMainPaneWidth,
+            height: desktopWindowHeight
+        )
+        let incidents = activityIncidents(in: store)
+        XCTAssertEqual(incidents.count, 8)
+        let warning = try XCTUnwrap(incidents.first { $0.status == .warning })
+        XCTAssertEqual(warning.operationLabel, "web-before-repro")
+        let renderedText = descendantViews(of: NSTextField.self, in: designAcceptanceView)
+            .map(\.stringValue)
+        XCTAssertTrue(renderedText.contains(
+            "The controller fingerprint changed, indicating a modification to the host resource controller or its configuration since the plan was created. No retirement mutation was performed."
+        ))
+        XCTAssertTrue(renderedText.contains("Re-run the retirement plan once validated."))
+        XCTAssertTrue(
+            renderedText.contains { $0.contains("Stderr:\n{") && $0.contains("\n  \"code\"") },
+            "technical JSON must be readable on screen while Copy retains the original payload"
+        )
+        XCTAssertFalse(
+            descendantViews(of: NSButton.self, in: designAcceptanceView)
+                .contains { $0.title == "Details" },
+            "Activity must not repeat the technical-details action in its incident header"
+        )
+
+        store.showActivity(issueID: inventoryIssue.id)
+        let selectedInventoryWarningView = hostMainBoard(
+            store: store,
+            width: desktopMainPaneWidth,
+            height: desktopWindowHeight
+        )
+        let inventoryWarningText = descendantViews(
+            of: NSTextField.self,
+            in: selectedInventoryWarningView
+        ).map(\.stringValue)
+        XCTAssertTrue(inventoryWarningText.contains(
+            "The latest inventory contains a condition the Board cannot treat as healthy. No resource action was attempted."
+        ))
+        XCTAssertTrue(inventoryWarningText.contains(
+            "Resolve the specific condition described by the coordinator without changing unrelated resources."
+        ))
+        XCTAssertFalse(inventoryWarningText.contains {
+            $0.contains("No successful completion is being reported")
+                || $0.contains("Retry from the exact resource")
+        })
+        store.showActivity(actionID: actionID)
+
+        for (width, height) in [(mainPaneWidth, minimumWindowHeight), (desktopMainPaneWidth, desktopWindowHeight)] {
+            let hostingView = hostMainBoard(store: store, width: width, height: height)
+            XCTAssertEqual(
+                visibleVerticalScrollOwners(in: hostingView).count,
+                1,
+                "the exact stale-retirement incident must retain one vertical scroll owner at \(width)x\(height)"
+            )
+            try captureRasterIfRequested(
+                renderMainBoard(store: store, width: width, height: height),
+                name: "main-board-retirement-stale-\(width)x\(height)"
+            )
+        }
+        try captureRasterIfRequested(
+            renderOpsConsole(store: store, width: 1_592, height: 842),
+            name: "ops-console-retirement-stale-1592x842"
+        )
+        try captureRasterIfRequested(
+            renderOpsConsole(store: store, width: 1_728, height: 884),
+            name: "ops-console-retirement-stale-1728x884"
+        )
+
         let unowned = try JSONDecoder().decode(
             ManagedServer.self,
             from: Data(
@@ -422,7 +530,9 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Refresh & re-plan")
         XCTAssertTrue(
             descendantViews(of: NSTextField.self, in: selectedRetirementView)
-                .contains { $0.stringValue == "Resource ownership generation changed after planning." },
+                .contains {
+                    $0.stringValue == "The retirement failed because the host resource controller fingerprint changed after the retirement plan was reviewed but before the retire action executed."
+                },
             "the selected retirement must remain the rendered Activity detail when an unrelated alert arrives"
         )
         XCTAssertFalse(
@@ -449,23 +559,6 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         store.showActivity(actionID: actionID)
         XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Refresh & re-plan")
 
-        for (width, height) in [(mainPaneWidth, minimumWindowHeight), (desktopMainPaneWidth, desktopWindowHeight)] {
-            let hostingView = hostMainBoard(store: store, width: width, height: height)
-            XCTAssertEqual(
-                visibleVerticalScrollOwners(in: hostingView).count,
-                1,
-                "the exact stale-retirement incident must retain one vertical scroll owner at \(width)x\(height)"
-            )
-            try captureRasterIfRequested(
-                renderMainBoard(store: store, width: width, height: height),
-                name: "main-board-retirement-stale-\(width)x\(height)"
-            )
-        }
-        try captureRasterIfRequested(
-            renderOpsConsole(store: store, width: 1_592, height: 842),
-            name: "ops-console-retirement-stale-1592x842"
-        )
-
         store.recoverSelectedRetirement()
         try await waitForRetirementVisualState("replacement retirement plan") {
             store.boardWorkspace == .resources
@@ -473,17 +566,74 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
                 && store.retirementRecoveryContexts[actionID] == nil
         }
         let calls = await service.capturedCalls()
-        XCTAssertEqual(calls.count, 5)
-        XCTAssertTrue(arguments(calls[0].1, contain: ["resource", "plan-retire"]))
-        XCTAssertTrue(arguments(calls[1].1, contain: ["resource", "retire"]))
-        XCTAssertEqual(calls[2].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+        XCTAssertEqual(calls.count, 6)
+        XCTAssertEqual(calls[0].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+        XCTAssertTrue(arguments(calls[1].1, contain: ["resource", "plan-retire"]))
+        XCTAssertTrue(arguments(calls[2].1, contain: ["resource", "retire"]))
         XCTAssertEqual(calls[3].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
-        XCTAssertTrue(arguments(calls[4].1, contain: ["resource", "plan-retire"]))
+        XCTAssertEqual(calls[4].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+        XCTAssertTrue(arguments(calls[5].1, contain: ["resource", "plan-retire"]))
         XCTAssertTrue(
-            arguments(calls[4].1, contain: [
+            arguments(calls[5].1, contain: [
                 "--ownership-fingerprint", "refreshed-ownership-generation-3",
             ])
         )
+
+        store.showActivity(actionID: actionID)
+        store.dismissActionResult(failedRetirementResult)
+        let postDismissIncidents = activityIncidents(in: store)
+        if let selectedResultID = store.selectedActionResultID {
+            let selectedIncident = try XCTUnwrap(
+                postDismissIncidents.first { $0.actionID == selectedResultID }
+            )
+            XCTAssertEqual(store.selectedActivityActionResult?.id, selectedIncident.result?.id)
+        } else if let selectedIssueID = store.selectedActivityIssueID {
+            let selectedIncident = try XCTUnwrap(
+                postDismissIncidents.first { $0.issue?.id == selectedIssueID }
+            )
+            XCTAssertEqual(store.selectedActivityActionIssue?.id, selectedIncident.issue?.id)
+        } else {
+            XCTFail("dismissing the selected failure must choose another visible incident")
+        }
+        XCTAssertNotEqual(
+            store.selectedActionResultID,
+            planningActionID,
+            "a hidden planning success must never drive the Activity header after dismissal"
+        )
+    }
+
+    func testSelectedInventoryWarningTracksRefreshReplacementAndClear() {
+        let now = Date(timeIntervalSince1970: 1_785_080_400)
+        let store = OpsStore(
+            originDiscovery: VerticalLayoutOriginDiscovery(values: []),
+            configurationStore: VerticalLayoutConfigurationStore(),
+            clock: VerticalLayoutClock(value: now)
+        )
+        let firstIssue = OpsIssue(
+            kind: .inventory,
+            title: "Inventory incomplete",
+            summary: "The Docker capability could not be observed.",
+            details: "Docker socket unavailable.",
+            createdAt: now
+        )
+        store.inventoryIssue = firstIssue
+        store.showActivity(issueID: firstIssue.id)
+        XCTAssertEqual(store.selectedActivityActionIssue?.id, firstIssue.id)
+
+        let replacement = OpsIssue(
+            kind: .inventory,
+            title: "Inventory incomplete",
+            summary: "One coordinator source could not be refreshed.",
+            details: "Coordinator source timed out.",
+            createdAt: now.addingTimeInterval(1)
+        )
+        store.inventoryIssue = replacement
+        XCTAssertEqual(store.selectedActivityIssueID, replacement.id)
+        XCTAssertEqual(store.selectedActivityActionIssue?.id, replacement.id)
+
+        store.inventoryIssue = nil
+        XCTAssertNil(store.selectedActivityIssueID)
+        XCTAssertNil(store.selectedActivityActionIssue)
     }
 
     func testVerticalScrollTopologyGuardCatchesLegacyNestingWithoutCountingHorizontalOnlyScroll() {
@@ -751,7 +901,7 @@ private func retirementVisualPlanJSON(
     ownershipFingerprint: String
 ) -> String {
     """
-    {"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"\(planID)","resource_id":"docker:immutable-copy-pg","fingerprint":"\(planFingerprint)","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"docker:immutable-copy-pg","kind":"container","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","ownership_fingerprint":"\(ownershipFingerprint)","control_contract_fingerprint":"planned-controller-contract-1","display_name":"kosttracking-prod-copy-pg","current_state":"running","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}
+    {"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"\(planID)","resource_id":"docker:immutable-copy-pg","fingerprint":"\(planFingerprint)","created_at":"2026-07-26T18:39:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"docker:immutable-copy-pg","kind":"container","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","ownership_fingerprint":"\(ownershipFingerprint)","control_contract_fingerprint":"planned-controller-contract-1","display_name":"kosttracking-prod-copy-pg","current_state":"stopped","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}
     """
 }
 
@@ -759,38 +909,313 @@ private func retirementVisualInventoryExecution(
     home: String,
     ownershipFingerprint: String
 ) throws -> CommandExecution {
+    let timestamp = "2026-07-26T18:39:00Z"
+    let hostID = "host-retirement"
+    let sourceID = "retirement-source"
+    let rootSpecs: [(id: String, root: String, name: String)] = [
+        ("repo-benzovozka", "/fixtures/repos/benzovozka", "benzovozka"),
+        ("repo-globalfinance", "/fixtures/repos/GlobalFinance", "GlobalFinance"),
+        ("repo-globalnewstracker", "/fixtures/repos/globalnewstracker", "globalnewstracker"),
+        ("repo-kosttracking", "/fixtures/repos/KostTracking", "KostTracking"),
+        ("repo-nevod", "/fixtures/repos/Nevod", "Nevod"),
+        ("repo-skydive", "/fixtures/repos/SkydiveLive", "SkydiveLive"),
+    ]
+    let temporarySpec = (
+        id: "repo-benzovozka-preview",
+        root: "/fixtures/repos/benzovozka/.worktrees/preview",
+        name: "preview run"
+    )
+    let serverSpecs: [(id: String, repoID: String, name: String)] = [
+        ("server-brand-logo", "repo-benzovozka", "brand-logo-scheduler"),
+        ("server-read-cache", "repo-benzovozka", "read-cache-worker"),
+        ("server-russiabase", "repo-benzovozka", "russiabase-worker"),
+        ("server-station-imports", "repo-benzovozka", "station-imports-worker"),
+        ("server-web-bug", "repo-benzovozka", "web-bug-capture"),
+        ("server-web-prod", "repo-benzovozka", "web-prod-clone"),
+        ("server-web-preview", temporarySpec.id, "web-before-repro"),
+        ("server-gnt-web", "repo-globalnewstracker", "web"),
+        ("server-prod-copy-web", "repo-kosttracking", "prod-copy-web"),
+        ("server-nevod-worker", "repo-nevod", "telegram-worker"),
+    ]
+    let assignedDockerSpecs: [(id: String, repoID: String, name: String, image: String)] = [
+        ("docker-gf-minio", "repo-globalfinance", "gf-minio-1", "minio/minio:latest"),
+        ("docker-gnt-metrics", "repo-globalnewstracker", "metrics-worker", "metrics-worker:dev"),
+        ("docker-gnt-minio", "repo-globalnewstracker", "minio", "minio/minio:latest"),
+        ("docker-nevod-postgres", "repo-nevod", "postgres", "postgres:17-alpine"),
+        ("docker-nevod-postgres-shadow", "repo-nevod", "postgres-shadow", "postgres:17-alpine"),
+    ]
+
+    var repositories = rootSpecs.map { spec -> [String: Any] in
+        [
+            "repo_id": spec.id,
+            "host_id": hostID,
+            "canonical_root": spec.root,
+            "display_name": spec.name,
+            "state": "active",
+            "generation": 1,
+            "installation_status": "active",
+            "startup_fenced": false,
+            "installation_generation": 1,
+        ]
+    }
+    repositories.append([
+        "repo_id": temporarySpec.id,
+        "host_id": hostID,
+        "canonical_root": temporarySpec.root,
+        "display_name": temporarySpec.name,
+        "state": "active",
+        "generation": 1,
+        "installation_status": "active",
+        "startup_fenced": false,
+        "installation_generation": 1,
+    ])
+
+    let memberships: [[String: Any]] = serverSpecs.map { spec in
+        [
+            "membership_id": "membership-\(spec.id)",
+            "repo_id": spec.repoID,
+            "resource_kind": "server",
+            "host_resource_id": spec.id,
+            "immutable_fingerprint": "fingerprint-\(spec.id)",
+            "control_binding_id": "binding-\(spec.id)",
+        ]
+    } + assignedDockerSpecs.map { spec in
+        [
+            "membership_id": "membership-\(spec.id)",
+            "repo_id": spec.repoID,
+            "resource_kind": "container",
+            "host_resource_id": spec.id,
+            "immutable_fingerprint": "fingerprint-\(spec.id)",
+            "control_binding_id": "binding-\(spec.id)",
+        ]
+    }
+
+    let authoritativeBindings: [[String: Any]] = serverSpecs.map { spec in
+        [
+            "binding_id": "binding-\(spec.id)",
+            "repo_id": spec.repoID,
+            "source_resource_id": spec.id,
+            "resource_kind": "server",
+            "resource_id": spec.id,
+            "source_id": sourceID,
+            "capability": "lifecycle",
+            "provenance": "normalized_fixture",
+            "authority_state": "authoritative",
+            "priority": 100,
+            "generation": 1,
+        ]
+    } + assignedDockerSpecs.map { spec in
+        [
+            "binding_id": "binding-\(spec.id)",
+            "repo_id": spec.repoID,
+            "source_resource_id": spec.id,
+            "resource_kind": "container",
+            "resource_id": spec.id,
+            "source_id": sourceID,
+            "capability": "lifecycle",
+            "provenance": "normalized_fixture",
+            "authority_state": "authoritative",
+            "priority": 100,
+            "generation": 1,
+        ]
+    }
+
+    let serverDefinitions: [[String: Any]] = serverSpecs.map { spec in
+        let root = (rootSpecs.first { $0.id == spec.repoID }?.root) ?? temporarySpec.root
+        return [
+            "server_definition_id": spec.id,
+            "repo_id": spec.repoID,
+            "name": spec.name,
+            "role": "worker",
+            "cwd": root,
+            "log_path": "/fixtures/logs/\(spec.name).log",
+            "definition_fingerprint": "definition-\(spec.id)",
+            "generation": 1,
+            "arguments": ["fixture-service", spec.name],
+        ]
+    }
+    let dockerResources: [[String: Any]] = assignedDockerSpecs.map { spec in
+        [
+            "docker_resource_id": spec.id,
+            "engine_id": "engine-retirement",
+            "full_container_id": "container-\(spec.id)",
+            "current_name": spec.name,
+            "image": spec.image,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        ]
+    } + [[
+        "docker_resource_id": "immutable-copy-pg",
+        "engine_id": "engine-retirement",
+        "full_container_id": "container-immutable-copy-pg",
+        "current_name": "kosttracking-prod-copy-pg",
+        "image": "postgres:17-alpine",
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    ]]
+    let serverObservations: [[String: Any]] = serverSpecs.map { spec in
+        [
+            "server_definition_id": spec.id,
+            "source_resource_id": spec.id,
+            "lifecycle": "stopped",
+            "listener_observable": 1,
+            "health_classification": "stopped",
+            "stopped_at": timestamp,
+            "stopped_reason": "fixture",
+            "sampled_at": timestamp,
+        ]
+    }
+    let dockerObservations: [[String: Any]] = (assignedDockerSpecs.map(\.id) + ["immutable-copy-pg"])
+        .map { resourceID in
+            [
+                "docker_resource_id": resourceID,
+                "lifecycle": "stopped",
+                "health": "stopped",
+                "restart_policy": "no",
+                "sampled_at": timestamp,
+            ]
+        }
+
+    func scope(
+        repoID: String,
+        kind: String,
+        root: String,
+        name: String,
+        runID: Any = NSNull(),
+        expiresAt: Any = NSNull(),
+        killAfterRun: Any = NSNull()
+    ) -> [String: Any] {
+        let serverIDs = serverSpecs.filter { $0.repoID == repoID }.map(\.id)
+        let containerIDs = assignedDockerSpecs.filter { $0.repoID == repoID }.map(\.id)
+        return [
+            "repo_id": repoID,
+            "kind": kind,
+            "canonical_root": root,
+            "display_name": name,
+            "run_id": runID,
+            "expires_at": expiresAt,
+            "kill_after_run": killAfterRun,
+            "usage": [
+                "cpu_percent": 0.0,
+                "memory_bytes": 0,
+                "process_count": 0,
+                "server": ["resource_count": serverIDs.count],
+                "docker": ["resource_count": containerIDs.count],
+            ],
+            "server_ids": serverIDs,
+            "container_resource_ids": containerIDs,
+            "database_binding_ids": [],
+        ]
+    }
+    let repositoryTrees: [[String: Any]] = rootSpecs.map { spec in
+        var scopes = [scope(repoID: spec.id, kind: "root", root: spec.root, name: spec.name)]
+        if spec.id == "repo-benzovozka" {
+            scopes.append(scope(
+                repoID: temporarySpec.id,
+                kind: "temporary",
+                root: temporarySpec.root,
+                name: temporarySpec.name,
+                runID: "preview-run-1",
+                expiresAt: "2099-01-01T00:00:00Z",
+                killAfterRun: true
+            ))
+        }
+        let serverCount = scopes.compactMap { $0["server_ids"] as? [String] }.flatMap { $0 }.count
+        let containerCount = scopes.compactMap { $0["container_resource_ids"] as? [String] }.flatMap { $0 }.count
+        return [
+            "family_id": "family-\(spec.id)",
+            "root_repository": [
+                "repo_id": spec.id,
+                "canonical_root": spec.root,
+                "display_name": spec.name,
+            ],
+            "usage": [
+                "cpu_percent": 0.0,
+                "memory_bytes": 0,
+                "process_count": 0,
+                "server": ["resource_count": serverCount],
+                "docker": ["resource_count": containerCount],
+            ],
+            "scopes": scopes,
+        ]
+    }
+
     let object: [String: Any] = [
-        "coordinator_home": home,
-        "state_path": "\(home)/state.json",
-        "urls": [],
-        "servers": [],
-        "leases": [],
-        "recent_events": [],
-        "docker": [
-            "available": true,
-            "containers": [[
-                "id": "immutable-copy-pg",
-                "name": "kosttracking-prod-copy-pg",
-                "status": "running",
-                "metadata_source": "normalized_store",
-                "attribution": [
-                    "reason_code": "ambiguous_control",
-                    "explanation": "Observed without one authoritative repository binding",
-                    "observed_by": ["host-observer"],
-                    "controller": "docker-binding-1",
-                    "host_resource_id": "docker:immutable-copy-pg",
-                    "immutable_fingerprint": "container-fingerprint-1",
-                    "control_binding_id": "docker-binding-1",
-                    "ownership_fingerprint": ownershipFingerprint,
-                    "can_attach": true,
-                    "can_retire": true,
-                ],
-            ]],
-            "postgres": [],
+        "schema_version": 2,
+        "store": [
+            "database_generation": "retirement-fixture-generation",
+            "state_revision": 3,
+            "observation_revision": 3,
+            "authority_mode": "sqlite",
+            "migration_state": "complete",
+            "updated_at": timestamp,
         ],
-        "postgres": [],
-        "backups": [],
-        "project_usage": [],
+        "repositories": repositories,
+        "repository_trees": repositoryTrees,
+        "coordinator_sources": [[
+            "source_id": sourceID,
+            "canonical_home": home,
+            "effective_uid": 501,
+            "status": "imported",
+        ]],
+        "docker_engines": [[
+            "engine_id": "engine-retirement",
+            "host_id": hostID,
+            "capability_state": "available",
+        ]],
+        "memberships": memberships,
+        "resources": [
+            "servers": serverDefinitions,
+            "docker": dockerResources,
+            "docker_ports": [],
+            "databases": [],
+        ],
+        "observations": [
+            "servers": serverObservations,
+            "docker": dockerObservations,
+            "databases": [],
+            "telemetry": [],
+            "snapshots": [],
+        ],
+        "leases": [],
+        "port_assignments": [],
+        "backup_evidence": [],
+        "database_backups": [],
+        "database_restore_events": [],
+        "events": [],
+        "unassigned_resources": [[
+            "unassigned_id": "unassigned-immutable-copy-pg",
+            "resource_kind": "container",
+            "resource_id": "immutable-copy-pg",
+            "display_name": "kosttracking-prod-copy-pg",
+            "reason_code": "ambiguous_control",
+            "explanation": "Only a resource name was observed; no authoritative repository path was provided.",
+            "observed_by": ["\(home)/coordinator.sqlite3"],
+            "controller": "\(home)/coordinator.sqlite3",
+            "host_resource_id": "docker:immutable-copy-pg",
+            "immutable_fingerprint": "container-fingerprint-1",
+            "control_binding_id": "docker-binding-1",
+            "ownership_fingerprint": ownershipFingerprint,
+            "can_attach": true,
+            "can_retire": true,
+            "lifecycle_violation": false,
+            "recommended_next_step": "Attach it to its root repository, or retire it to stop and hide it without deleting data.",
+        ]],
+        "lifecycle_violations": [],
+        "control_bindings": authoritativeBindings + [[
+            "binding_id": "docker-binding-1",
+            "repo_id": NSNull(),
+            "source_resource_id": "immutable-copy-pg",
+            "resource_kind": "container",
+            "resource_id": "immutable-copy-pg",
+            "source_id": sourceID,
+            "capability": "lifecycle",
+            "provenance": "host_observation",
+            "authority_state": "observed",
+            "priority": 10,
+            "generation": 1,
+        ]],
+        "test_statistics": [],
     ]
     let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     return CommandExecution(
@@ -798,6 +1223,43 @@ private func retirementVisualInventoryExecution(
         stderr: "",
         exitStatus: 0
     )
+}
+
+@MainActor
+private func seedRetirementVisualHistory(
+    store: OpsStore,
+    origin: CoordinatorOrigin,
+    now: Date
+) {
+    let entries: [(id: String, kind: ActionKind, title: String, phase: ActionPhase, offset: TimeInterval)] = [
+        ("00000000-0000-0000-0000-000000000781", .restartDocker, "Restart aicursegmailcheck-postgres-dev", .failed, -240),
+        ("00000000-0000-0000-0000-000000000782", .restartDocker, "Restart aerodb-pg", .failed, -480),
+        ("00000000-0000-0000-0000-000000000783", .restartServer, "Restart prod-copy-web", .succeeded, -1_020),
+        ("00000000-0000-0000-0000-000000000784", .restartDocker, "Restart metrics-worker", .succeeded, -1_260),
+        ("00000000-0000-0000-0000-000000000785", .restartServer, "Restart web-bug-capture", .succeeded, -1_500),
+        ("00000000-0000-0000-0000-000000000786", .restartServer, "Restart read-cache-worker", .succeeded, -1_740),
+    ]
+    for entry in entries {
+        guard let id = UUID(uuidString: entry.id) else { continue }
+        let finishedAt = now.addingTimeInterval(entry.offset)
+        let request = ActionRequest(
+            id: id,
+            kind: entry.kind,
+            title: entry.title,
+            origin: origin
+        )
+        store.actionResults[id] = RetainedActionResult(
+            request: request,
+            phase: entry.phase,
+            queuedAt: finishedAt.addingTimeInterval(-2),
+            startedAt: finishedAt.addingTimeInterval(-1),
+            finishedAt: finishedAt,
+            exitStatus: entry.phase == .succeeded ? 0 : 1,
+            stdout: entry.phase == .succeeded ? #"{"ok":true}"# : "",
+            stderr: entry.phase == .failed ? "The fixture service did not become ready." : "",
+            failure: entry.phase == .failed ? "The service did not become ready." : nil
+        )
+    }
 }
 
 private func arguments(_ actual: [String], contain expected: [String]) -> Bool {

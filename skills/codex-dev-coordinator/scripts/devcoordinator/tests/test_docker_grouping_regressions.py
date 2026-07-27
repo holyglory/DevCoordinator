@@ -94,6 +94,34 @@ class DockerInventoryIdentityTests(unittest.TestCase):
         self.assertEqual(sampled["stats"][0]["id"], full_id)
         self.assertIn(full_id, state["docker"]["stats_history"])
 
+    def test_fractional_humanized_docker_sizes_become_integral_byte_counts(self) -> None:
+        sample = dev_coordinator.normalize_docker_stats(
+            {
+                "ID": "e" * 64,
+                "Container": "e" * 64,
+                "Name": "fixture-web",
+                "CPUPerc": "1.5%",
+                "MemPerc": "2.5%",
+                "MemUsage": "4.093GiB / 8GiB",
+                "NetIO": "1.25kB / 2.5kB",
+                "BlockIO": "3.001MiB / 4.999MiB",
+                "PIDs": "2",
+            },
+            timestamp=1_785_000_000.0,
+        )
+
+        expected = {
+            "memory_usage_bytes": 4_394_825_286,
+            "memory_limit_bytes": 8_589_934_592,
+            "network_rx_bytes": 1_250,
+            "network_tx_bytes": 2_500,
+            "block_read_bytes": 3_146_777,
+            "block_write_bytes": 5_241_831,
+        }
+        for field, value in expected.items():
+            self.assertEqual(sample[field], value)
+            self.assertIs(type(sample[field]), int, f"{field} must remain an integer")
+
     def test_bulk_inspect_failure_keeps_full_ps_identity_and_sidecar_attribution(self) -> None:
         full_id = "a" * 64
         name = "fixture-web"
@@ -961,6 +989,149 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
         )
         self.assertEqual(project_usage["cpu_percent"], 3.25)
         self.assertEqual(project_usage["memory_bytes"], 32_500)
+
+    def test_fractional_telemetry_is_stored_and_projected_as_integral_bytes(self) -> None:
+        repository = self.root / "fractional-telemetry"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "d" * 64
+        container = self._container(full_id, "fractional-web", project=repository)
+        container["stats"] = {
+            "timestamp": "2026-07-28T00:00:01Z",
+            "cpu_percent": 1.25,
+            "memory_usage_bytes": 4_394_825_285.632,
+            "network_rx_bytes": 1_250.4,
+            "network_tx_bytes": 2_500.5,
+            "block_read_bytes": 8_460_000_000.000001,
+            "block_write_bytes": 5_241_830.6,
+        }
+
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            self._insert_repository(store, host_id, repository)
+            self._observe_at(
+                store,
+                host_id,
+                [container],
+                started_at="2026-07-28T00:00:00Z",
+                sampled_at="2026-07-28T00:00:02Z",
+                completed_at="2026-07-28T00:00:10Z",
+            )
+            with store.read_transaction() as connection:
+                stored = connection.execute(
+                    """
+                    SELECT typeof(memory_bytes) AS memory_type,
+                           typeof(network_rx_bytes) AS rx_type,
+                           typeof(network_tx_bytes) AS tx_type,
+                           typeof(block_read_bytes) AS read_type,
+                           typeof(block_write_bytes) AS write_type
+                    FROM telemetry_samples
+                    WHERE host_resource_kind = 'docker'
+                    """
+                ).fetchone()
+            graph = store.inventory_v2()
+
+        self.assertEqual(
+            dict(stored),
+            {
+                "memory_type": "integer",
+                "rx_type": "integer",
+                "tx_type": "integer",
+                "read_type": "integer",
+                "write_type": "integer",
+            },
+        )
+        telemetry = graph["observations"]["telemetry"]
+        self.assertEqual(len(telemetry), 1)
+        expected = {
+            "memory_bytes": 4_394_825_286,
+            "network_rx_bytes": 1_250,
+            "network_tx_bytes": 2_501,
+            "block_read_bytes": 8_460_000_000,
+            "block_write_bytes": 5_241_831,
+        }
+        for field, value in expected.items():
+            self.assertEqual(telemetry[0][field], value)
+            self.assertIs(type(telemetry[0][field]), int)
+
+    def test_inventory_normalizes_preexisting_real_telemetry_rows(self) -> None:
+        repository = self.root / "legacy-fractional-telemetry"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "f" * 64
+        container = self._container(full_id, "legacy-fractional-web", project=repository)
+        container["stats"] = {
+            "timestamp": "2026-07-28T00:00:02Z",
+            "cpu_percent": 2.5,
+            "memory_usage_bytes": 1,
+            "network_rx_bytes": 2,
+            "network_tx_bytes": 3,
+            "block_read_bytes": 4,
+            "block_write_bytes": 5,
+        }
+
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            self._insert_repository(store, host_id, repository)
+            self._observe_at(
+                store,
+                host_id,
+                [container],
+                started_at="2026-07-28T00:00:00Z",
+                sampled_at="2026-07-28T00:00:02Z",
+                completed_at="2026-07-28T00:00:10Z",
+            )
+            with store.immediate_transaction(revision_kind="observation") as connection:
+                connection.execute(
+                    """
+                    UPDATE telemetry_samples
+                    SET memory_bytes = 4394825285.632,
+                        network_rx_bytes = 1250.4,
+                        network_tx_bytes = 2500.5,
+                        block_read_bytes = 8460000000.000001,
+                        block_write_bytes = 5241830.6
+                    WHERE host_resource_kind = 'docker'
+                    """
+                )
+                storage_types = connection.execute(
+                    """
+                    SELECT typeof(memory_bytes), typeof(network_rx_bytes),
+                           typeof(network_tx_bytes), typeof(block_read_bytes),
+                           typeof(block_write_bytes)
+                    FROM telemetry_samples
+                    WHERE host_resource_kind = 'docker'
+                    """
+                ).fetchone()
+            graph = store.inventory_v2()
+
+        self.assertEqual(tuple(storage_types), ("real", "real", "real", "real", "real"))
+        telemetry = graph["observations"]["telemetry"]
+        self.assertEqual(len(telemetry), 1)
+        for field in (
+            "memory_bytes",
+            "network_rx_bytes",
+            "network_tx_bytes",
+            "block_read_bytes",
+            "block_write_bytes",
+        ):
+            self.assertIs(
+                type(telemetry[0][field]),
+                int,
+                f"legacy {field} must be normalized before JSON transport",
+            )
+        compatibility = next(
+            item
+            for item in graph["v1_compatibility"]["docker"]["containers"]
+            if item["name"] == "legacy-fractional-web"
+        )
+        for field in (
+            "memory_usage_bytes",
+            "network_rx_bytes",
+            "network_tx_bytes",
+            "block_read_bytes",
+            "block_write_bytes",
+        ):
+            self.assertIs(type(compatibility["stats"][field]), int)
 
     def test_nested_compose_path_joins_enrolled_root_with_exact_resource_membership(self) -> None:
         repository = self.root / "GlobalFinance"

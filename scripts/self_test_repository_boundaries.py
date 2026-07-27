@@ -228,13 +228,13 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         )
         write(repo / "apps/DevOpsBoard" / safe_board_source_path, safe_board_source)
 
-        for tree, image_path, image_blob, sidecar_blob in module.KNOWN_HISTORICAL_SOURCE_DRIFT:
+        for tree, image_path, image_blob, sidecar_blob, detail in module.KNOWN_HISTORICAL_SOURCE_DRIFT:
             exact = {
                 "tree": tree,
                 "image_path": image_path,
                 "image_blob": image_blob,
                 "sidecar_blob": sidecar_blob,
-                "detail": "aggregate source hash mismatch",
+                "detail": detail,
             }
             check(
                 module.known_historical_source_drift(**exact),

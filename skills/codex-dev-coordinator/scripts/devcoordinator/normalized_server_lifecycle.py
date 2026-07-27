@@ -30,6 +30,10 @@ class NormalizedLifecycleConflict(RuntimeError):
     """A normalized lifecycle reservation conflicts with current authority."""
 
 
+class NormalizedObservationConflict(NormalizedLifecycleConflict):
+    """A host observation changed while a lifecycle action was reserving."""
+
+
 @dataclass(frozen=True)
 class PortLeaseRequest:
     agent: str
@@ -1994,10 +1998,14 @@ class NormalizedServerLifecycle:
             )
             if int(row["definition_generation"]) != int(
                 expected_definition_generation
-            ) or (row["observation_fingerprint"] or None) != (
-                expected_observation_fingerprint or None
             ):
                 raise NormalizedLifecycleConflict(
+                    "server changed while listener identity was observed; retry stop"
+                )
+            if (row["observation_fingerprint"] or None) != (
+                expected_observation_fingerprint or None
+            ):
+                raise NormalizedObservationConflict(
                     "server changed while listener identity was observed; retry stop"
                 )
             self._require_no_pending_server_operation(connection, server_definition_id)

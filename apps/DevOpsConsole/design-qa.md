@@ -2,10 +2,10 @@
 
 ## Target and implementation
 
-- Selected target: `/home/holygloryTT/.codex/generated_images/019f624f-69d2-7893-929b-d8f18000e1e8/exec-d90040e2-dd57-48a7-a69b-ebcd7be5c055.png`
-- Implemented desktop capture: `/tmp/devops-console-tests-redesign-desktop.png`
-- Implemented mobile capture: `/tmp/devops-console-tests-redesign-mobile.png`
-- Combined comparison input: `/tmp/devops-console-tests-design-comparison.png`
+- Selected target: Product Design reference `exec-d90040e2-dd57-48a7-a69b-ebcd7be5c055.png` (local QA input; not published).
+- Implemented desktop capture: `devops-console-tests-redesign-desktop.png` (local QA output; not published).
+- Implemented mobile capture: `devops-console-tests-redesign-mobile.png` (local QA output; not published).
+- Combined comparison input: `devops-console-tests-design-comparison.png` (local QA output; not published).
 - Desktop viewport/state: 1486 × 1059, populated Sample API repository, 30-day period, seven complete UTC heatmap days.
 - Mobile viewport/state: 390 × 844, same repository, period, and data.
 

@@ -1899,7 +1899,7 @@ def main() -> int:
             "try the default port",
             "ephemeral start",
             "test run",
-            "api.profile_changed",
+            "api.profile_reloaded",
         ):
             check(needle in skill_text, f"SKILL.md should retain the minimal runtime contract: {needle}")
 

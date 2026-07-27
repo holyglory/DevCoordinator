@@ -254,7 +254,30 @@ final class OpsStore: ObservableObject {
     @Published var restoreEvidence: [DatabaseIdentity: DatabaseRestoreEvidence] = [:]
     @Published var coordinatorConfiguration = CoordinatorConfiguration()
     @Published var configurationWarning: String?
-    @Published var inventoryIssue: OpsIssue?
+    @Published var inventoryIssue: OpsIssue? {
+        didSet {
+            guard let oldIssue = oldValue,
+                  selectedActivityIssueID == oldIssue.id
+            else { return }
+            if let inventoryIssue {
+                selectedActionResultID = nil
+                selectedActivityIssueID = inventoryIssue.id
+            } else if let actionIssue {
+                if let actionID = actionIssue.relatedActionID,
+                   visibleActivityActionResults.contains(where: { $0.id == actionID })
+                {
+                    selectedActionResultID = actionID
+                    selectedActivityIssueID = nil
+                } else {
+                    selectedActionResultID = nil
+                    selectedActivityIssueID = actionIssue.id
+                }
+            } else {
+                selectedActivityIssueID = nil
+                selectedActionResultID = visibleActivityActionResults.first?.id
+            }
+        }
+    }
     @Published var actionIssue: OpsIssue?
 
     private let coordinatorService: any CoordinatorServing
@@ -2086,6 +2109,17 @@ final class OpsStore: ObservableObject {
     }
 
     func actionResultDetails(_ result: RetainedActionResult) -> String {
+        actionResultDetails(result, formatPayloads: false)
+    }
+
+    func actionResultPresentationDetails(_ result: RetainedActionResult) -> String {
+        actionResultDetails(result, formatPayloads: true)
+    }
+
+    private func actionResultDetails(
+        _ result: RetainedActionResult,
+        formatPayloads: Bool
+    ) -> String {
         var lines = [
             "Action: \(result.request.title)",
             "Phase: \(result.phase.rawValue)",
@@ -2097,23 +2131,54 @@ final class OpsStore: ObservableObject {
         if let finishedAt = result.finishedAt { lines.append("Finished: \(ISO8601DateFormatter().string(from: finishedAt))") }
         if let exitStatus = result.exitStatus { lines.append("Exit status: \(exitStatus)") }
         if let failure = result.failure, !failure.isEmpty { lines.append("Failure: \(failure)") }
-        if !result.stdout.isEmpty { lines.append("Stdout:\n\(result.stdout)") }
-        if !result.stderr.isEmpty { lines.append("Stderr:\n\(result.stderr)") }
+        if !result.stdout.isEmpty {
+            let stdout = formatPayloads ? prettyPrintedJSONPayload(result.stdout) : result.stdout
+            lines.append("Stdout:\n\(stdout)")
+        }
+        if !result.stderr.isEmpty {
+            let stderr = formatPayloads ? prettyPrintedJSONPayload(result.stderr) : result.stderr
+            lines.append("Stderr:\n\(stderr)")
+        }
         if result.outputTruncated { lines.append("Output was truncated by the bounded executor.") }
         return lines.joined(separator: "\n")
     }
 
-    func copyActionResultDetails(_ result: RetainedActionResult) {
+    private func prettyPrintedJSONPayload(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = trimmed.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              JSONSerialization.isValidJSONObject(object),
+              let formatted = try? JSONSerialization.data(
+                  withJSONObject: object,
+                  options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+              )
+        else { return value }
+        return String(decoding: formatted, as: UTF8.self)
+    }
+
+    func copyActionResultDetails(
+        _ result: RetainedActionResult,
+        to pasteboard: NSPasteboard = .general
+    ) {
         let detail = actionResultDetails(result)
         guard !detail.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(detail, forType: .string)
+        pasteboard.clearContents()
+        pasteboard.setString(detail, forType: .string)
     }
 
     var sortedActionResults: [RetainedActionResult] {
         actionResults.values.sorted { lhs, rhs in
             if lhs.queuedAt != rhs.queuedAt { return lhs.queuedAt > rhs.queuedAt }
             return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    var visibleActivityActionResults: [RetainedActionResult] {
+        sortedActionResults.filter { result in
+            guard result.phase == .succeeded,
+                  result.request.kind == .retireStandaloneResource
+            else { return true }
+            return !result.request.title.hasPrefix("Plan retirement of ")
         }
     }
 
@@ -2129,23 +2194,37 @@ final class OpsStore: ObservableObject {
     /// selected action merely because one remains in retained history.
     var selectedActivityActionResult: RetainedActionResult? {
         guard selectedActivityIssueID == nil,
-              let selectedActionResultID
+              let selectedActionResultID,
+              let selected = actionResults[selectedActionResultID],
+              visibleActivityActionResults.contains(where: { $0.id == selected.id })
         else { return nil }
-        return actionResults[selectedActionResultID]
+        return selected
     }
 
     /// The issue that belongs to the Activity workspace's current selection.
     /// A newer global issue must not replace another selected action's header,
     /// details, or recovery control.
     var selectedActivityActionIssue: OpsIssue? {
-        guard let issue = actionIssue else { return nil }
         if let selectedActivityIssueID {
-            return issue.id == selectedActivityIssueID ? issue : nil
+            return activityIssues.first { $0.id == selectedActivityIssueID }
         }
         guard let selectedActionResultID,
-              issue.relatedActionID == selectedActionResultID
+              let issue = activityIssues.first(where: {
+                  $0.relatedActionID == selectedActionResultID
+              })
         else { return nil }
         return issue
+    }
+
+    var activityIssues: [OpsIssue] {
+        var issues: [OpsIssue] = []
+        var seen = Set<UUID>()
+        for issue in [actionIssue, inventoryIssue].compactMap({ $0 })
+            where seen.insert(issue.id).inserted
+        {
+            issues.append(issue)
+        }
+        return issues
     }
 
     var selectedRetirementRecoveryContext: ResourceRetirementRecoveryContext? {
@@ -2174,7 +2253,9 @@ final class OpsStore: ObservableObject {
 
     func showActivity(actionID: UUID? = nil) {
         boardWorkspace = .activity
-        if let actionID, actionResults[actionID] != nil {
+        if let actionID,
+           visibleActivityActionResults.contains(where: { $0.id == actionID })
+        {
             selectedActionResultID = actionID
             selectedActivityIssueID = nil
         } else if let issue = actionIssue,
@@ -2183,15 +2264,22 @@ final class OpsStore: ObservableObject {
         {
             selectedActivityIssueID = issue.id
             selectedActionResultID = nil
-        } else if selectedActionResultID.flatMap({ actionResults[$0] }) == nil {
-            selectedActionResultID = sortedActionResults.first?.id
-            selectedActivityIssueID = nil
+        } else if selectedActionResultID.flatMap({ selectedID in
+            visibleActivityActionResults.first { $0.id == selectedID }
+        }) == nil {
+            if let result = visibleActivityActionResults.first {
+                selectedActionResultID = result.id
+                selectedActivityIssueID = nil
+            } else if let issue = activityIssues.first {
+                selectedActionResultID = nil
+                selectedActivityIssueID = issue.id
+            }
         }
     }
 
     func showActivity(issueID: UUID) {
         boardWorkspace = .activity
-        guard let issue = actionIssue, issue.id == issueID else { return }
+        guard let issue = activityIssues.first(where: { $0.id == issueID }) else { return }
         if let actionID = issue.relatedActionID, actionResults[actionID] != nil {
             selectedActionResultID = actionID
             selectedActivityIssueID = nil
@@ -2210,7 +2298,16 @@ final class OpsStore: ObservableObject {
         actionResults.removeValue(forKey: result.id)
         retirementRecoveryContexts.removeValue(forKey: result.id)
         if selectedActionResultID == result.id {
-            selectedActionResultID = sortedActionResults.first?.id
+            if let next = visibleActivityActionResults.first {
+                selectedActionResultID = next.id
+                selectedActivityIssueID = nil
+            } else if let issue = activityIssues.first(where: { $0.relatedActionID != result.id }) {
+                selectedActionResultID = nil
+                selectedActivityIssueID = issue.id
+            } else {
+                selectedActionResultID = nil
+                selectedActivityIssueID = nil
+            }
         }
         if actionIssue?.relatedActionID == result.id {
             clearActionErrorIfPresent(actionID: result.id)
@@ -2257,8 +2354,10 @@ final class OpsStore: ObservableObject {
             }
         } else {
             selectedActivityIssueID = nil
-            if selectedActionResultID.flatMap({ actionResults[$0] }) == nil {
-                selectedActionResultID = sortedActionResults.first?.id
+            if selectedActionResultID.flatMap({ selectedID in
+                visibleActivityActionResults.first { $0.id == selectedID }
+            }) == nil {
+                selectedActionResultID = visibleActivityActionResults.first?.id
             }
         }
     }

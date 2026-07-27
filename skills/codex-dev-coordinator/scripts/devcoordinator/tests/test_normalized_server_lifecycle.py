@@ -18,6 +18,7 @@ from devcoordinator import store as store_module
 
 from devcoordinator.normalized_server_lifecycle import (
     NormalizedLifecycleConflict,
+    NormalizedObservationConflict,
     NormalizedPortLifecycle,
     NormalizedServerLifecycle,
     PortLeaseRequest,
@@ -781,6 +782,73 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(project_usage["cpu_percent"], 1.25)
         self.assertEqual(project_usage["memory_bytes"], 500)
+
+    def test_inventory_normalizes_preexisting_real_server_telemetry(self) -> None:
+        running = self.running_server(name="legacy-metrics-web", port=3213)
+        ports = self.service()
+        sample_id = deterministic_id(
+            "telemetry", "legacy-fractional-server", running["id"]
+        )
+        with ports.store.immediate_transaction() as connection:
+            current_run_boundary = str(
+                connection.execute(
+                    """
+                    SELECT updated_at FROM server_definitions
+                    WHERE server_definition_id = ?
+                    """,
+                    (running["id"],),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO telemetry_samples(
+                    sample_id, host_resource_kind, host_resource_id, sampled_at,
+                    cpu_percent, memory_bytes, network_rx_bytes, network_tx_bytes,
+                    block_read_bytes, block_write_bytes
+                ) VALUES (?, 'server', ?, ?, 2.5, ?, NULL, NULL, NULL, NULL)
+                """,
+                (
+                    sample_id,
+                    running["id"],
+                    current_run_boundary,
+                    4_394_825_285.632,
+                ),
+            )
+            stored = connection.execute(
+                """
+                SELECT typeof(memory_bytes) FROM telemetry_samples
+                WHERE sample_id = ?
+                """,
+                (sample_id,),
+            ).fetchone()[0]
+
+        graph = ports.store.inventory_v2()
+        telemetry = next(
+            item
+            for item in graph["observations"]["telemetry"]
+            if item["sample_id"] == sample_id
+        )
+        projected_server = next(
+            item
+            for item in graph["v1_compatibility"]["servers"]
+            if item["id"] == running["id"]
+        )
+        project_usage = next(
+            item
+            for item in graph["v1_compatibility"]["project_usage"]
+            if item["project"] == str(self.project)
+        )
+
+        self.assertEqual(stored, "real", "fixture must reproduce the legacy row")
+        for value in (
+            telemetry["memory_bytes"],
+            projected_server["process_usage"]["memory_bytes"],
+            projected_server["process_usage"]["rss_bytes"],
+            project_usage["memory_bytes"],
+            project_usage["usage"]["server"]["memory_bytes"],
+        ):
+            self.assertEqual(value, 4_394_825_286)
+            self.assertIs(type(value), int)
 
     def test_compatibility_docker_capability_ignores_legacy_import_placeholder(self) -> None:
         ports = self.service()
@@ -2112,6 +2180,165 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
 
         self.assertEqual(calls, 2)
         self.assertEqual(observed["status"], "running")
+
+    def test_public_stop_retries_a_concurrent_observation_cas(self) -> None:
+        running = self.running_server(name="web", port=3307)
+        healthy = {
+            "ok": True,
+            "pid_alive": True,
+            "identity": {"ok": True, "observable": True},
+            "classification": "healthy",
+        }
+        stopped = {
+            "ok": False,
+            "pid_alive": False,
+            "identity": {"ok": True, "observable": True},
+            "classification": "stopped",
+        }
+        original = NormalizedServerLifecycle.reserve_stop
+        reserve_calls = 0
+
+        def concurrent_observation(
+            service: NormalizedServerLifecycle, **kwargs: object
+        ) -> dict[str, object]:
+            nonlocal reserve_calls
+            reserve_calls += 1
+            if reserve_calls == 1:
+                current = service.server(
+                    server_definition_id=str(running["id"])
+                )
+                with mock.patch(
+                    "devcoordinator.normalized_server_lifecycle.utc_timestamp",
+                    return_value="2099-01-01T00:00:00Z",
+                ):
+                    service.commit_status(
+                        server_definition_id=str(running["id"]),
+                        expected_definition_generation=int(current["generation"]),
+                        expected_observation_fingerprint=current.get(
+                            "_observation_fingerprint"
+                        ),
+                        health=healthy,
+                        stopped_reason=None,
+                    )
+            return original(service, **kwargs)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_AGENT_COORDINATOR_HOME": str(self.home),
+                    "DEVCOORDINATOR_STATE_BACKEND": "sqlite",
+                },
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "server_health",
+                side_effect=(healthy, healthy, stopped),
+            ) as health,
+            mock.patch.object(dev_coordinator, "prime_git_head_identity"),
+            mock.patch.object(dev_coordinator, "stop_pid") as stop_pid,
+            mock.patch.object(
+                NormalizedServerLifecycle,
+                "reserve_stop",
+                autospec=True,
+                side_effect=concurrent_observation,
+            ),
+        ):
+            result = dev_coordinator.coordinated_stop_server(
+                {
+                    "agent": "codex-a",
+                    "project": str(self.project),
+                    "name": "web",
+                    "release_port": True,
+                }
+            )
+
+        self.assertEqual(reserve_calls, 2)
+        self.assertEqual(health.call_count, 3)
+        stop_pid.assert_called_once_with(44001)
+        self.assertEqual(result["status"], "stopped")
+
+    def test_stop_observation_conflict_is_typed_for_bounded_retry(self) -> None:
+        running = self.running_server(name="web-typed", port=3308)
+        service = self.server_service()
+        with mock.patch(
+            "devcoordinator.normalized_server_lifecycle.utc_timestamp",
+            return_value="2099-01-01T00:00:00Z",
+        ):
+            refreshed = service.commit_status(
+                server_definition_id=str(running["id"]),
+                expected_definition_generation=int(running["generation"]),
+                expected_observation_fingerprint=running.get(
+                    "_observation_fingerprint"
+                ),
+                health={
+                    "ok": True,
+                    "pid_alive": True,
+                    "identity": {"ok": True, "observable": True},
+                    "classification": "healthy",
+                },
+                stopped_reason=None,
+            )
+        self.assertNotEqual(
+            refreshed["_observation_fingerprint"],
+            running["_observation_fingerprint"],
+        )
+        with self.assertRaises(NormalizedObservationConflict):
+            service.reserve_stop(
+                agent="codex-a",
+                server_definition_id=str(running["id"]),
+                expected_definition_generation=int(running["generation"]),
+                expected_observation_fingerprint=running.get(
+                    "_observation_fingerprint"
+                ),
+            )
+
+    def test_public_stop_does_not_retry_definition_conflict(self) -> None:
+        self.running_server(name="web-drift", port=3309)
+        healthy = {
+            "ok": True,
+            "pid_alive": True,
+            "identity": {"ok": True, "observable": True},
+            "classification": "healthy",
+        }
+        conflict = NormalizedLifecycleConflict(
+            "server definition changed before stop reservation"
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_AGENT_COORDINATOR_HOME": str(self.home),
+                    "DEVCOORDINATOR_STATE_BACKEND": "sqlite",
+                },
+            ),
+            mock.patch.object(
+                dev_coordinator, "server_health", return_value=healthy
+            ) as health,
+            mock.patch.object(dev_coordinator, "prime_git_head_identity"),
+            mock.patch.object(dev_coordinator, "stop_pid") as stop_pid,
+            mock.patch.object(
+                NormalizedServerLifecycle,
+                "reserve_stop",
+                autospec=True,
+                side_effect=conflict,
+            ) as reserve,
+            self.assertRaisesRegex(
+                NormalizedLifecycleConflict, "definition changed"
+            ),
+        ):
+            dev_coordinator.coordinated_stop_server(
+                {
+                    "agent": "codex-a",
+                    "project": str(self.project),
+                    "name": "web-drift",
+                    "release_port": True,
+                }
+            )
+
+        reserve.assert_called_once()
+        health.assert_called_once()
+        stop_pid.assert_not_called()
 
     def test_unobservable_stop_refuses_before_operation_or_mutation(self) -> None:
         running = self.running_server(name="web", port=3304)

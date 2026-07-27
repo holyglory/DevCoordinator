@@ -2,6 +2,60 @@ import AppKit
 import Foundation
 import SwiftUI
 
+enum BoardIncidentStatus: Equatable {
+    case queued
+    case running
+    case succeeded
+    case failed
+    case timedOut
+    case cancelled
+    case warning
+
+    init(phase: ActionPhase) {
+        switch phase {
+        case .queued: self = .queued
+        case .running: self = .running
+        case .succeeded: self = .succeeded
+        case .failed: self = .failed
+        case .timedOut: self = .timedOut
+        case .cancelled: self = .cancelled
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .queued: return "Queued"
+        case .running: return "Running"
+        case .succeeded: return "Succeeded"
+        case .failed: return "Failed"
+        case .timedOut: return "Timed out"
+        case .cancelled: return "Cancelled"
+        case .warning: return "Warning"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .queued: return "clock.fill"
+        case .running: return "arrow.triangle.2.circlepath"
+        case .succeeded: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.circle.fill"
+        case .timedOut: return "clock.badge.exclamationmark.fill"
+        case .cancelled: return "xmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .queued, .running: return Theme.blue
+        case .succeeded: return Theme.green
+        case .failed, .timedOut, .cancelled: return Theme.red
+        case .warning: return Theme.orange
+        }
+    }
+}
+
 struct BoardWorkspaceTabs: View {
     @ObservedObject var store: OpsStore
 
@@ -29,7 +83,7 @@ struct BoardWorkspaceTabs: View {
             }
         } label: {
             Text(title)
-                .font(.system(size: 12, weight: store.boardWorkspace == workspace ? .semibold : .regular))
+                .font(.system(size: 13, weight: store.boardWorkspace == workspace ? .semibold : .regular))
                 .foregroundStyle(store.boardWorkspace == workspace ? Theme.primary : Theme.secondary)
                 .padding(.horizontal, 4)
                 .frame(height: 40)
@@ -127,7 +181,7 @@ struct WorkspaceAttentionHeader: View {
         if isFailedRetirement,
            selectedRecovery?.commandFailure?.isPreMutationStalePlan == true
         {
-            return "Resource identity changed after the retirement plan was reviewed."
+            return "Resource changed after the retirement plan was reviewed."
         }
         if store.boardWorkspace == .activity {
             if let contextualIssue { return contextualIssue.summary }
@@ -145,13 +199,11 @@ struct WorkspaceAttentionHeader: View {
         if isInitialLoading { return Theme.blue }
         if isFailedRetirement { return Theme.red }
         if store.boardWorkspace == .activity, let relatedResult {
-            switch relatedResult.phase {
-            case .succeeded: return Theme.green
-            case .queued, .running: return Theme.blue
-            case .failed, .timedOut, .cancelled: return Theme.red
-            }
+            return BoardIncidentStatus(phase: relatedResult.phase).tint
         }
-        if store.boardWorkspace == .activity, contextualIssue != nil { return Theme.red }
+        if store.boardWorkspace == .activity, let contextualIssue {
+            return contextualIssue.kind == .action ? Theme.red : Theme.orange
+        }
         return healthLevelColor(snapshot.level)
     }
 
@@ -162,7 +214,8 @@ struct WorkspaceAttentionHeader: View {
                 regularHeader
                 compactHeader
             }
-            .padding(11)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
             .background(tint.opacity(0.1))
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(tint.opacity(0.3)))
@@ -171,7 +224,7 @@ struct WorkspaceAttentionHeader: View {
             }
             .accessibilityIdentifier("workspace-attention-header")
             .padding(.horizontal, 10)
-            .padding(.vertical, 9)
+            .padding(.vertical, 8)
         }
     }
 
@@ -200,7 +253,7 @@ struct WorkspaceAttentionHeader: View {
         if isInitialLoading {
             ProgressView().controlSize(.small)
         } else {
-            Image(systemName: inventoryBannerIcon(snapshot.level))
+            Image(systemName: statusIconName)
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(tint)
                 .frame(width: 18)
@@ -208,13 +261,26 @@ struct WorkspaceAttentionHeader: View {
         }
     }
 
+    private var statusIconName: String {
+        if isFailedRetirement { return BoardIncidentStatus.failed.icon }
+        if store.boardWorkspace == .activity, let relatedResult {
+            return BoardIncidentStatus(phase: relatedResult.phase).icon
+        }
+        if store.boardWorkspace == .activity, let contextualIssue {
+            return contextualIssue.kind == .action
+                ? BoardIncidentStatus.failed.icon
+                : BoardIncidentStatus.warning.icon
+        }
+        return inventoryBannerIcon(snapshot.level)
+    }
+
     private var headerCopy: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
-                .font(.system(size: 13, weight: .bold))
+                .font(.system(size: 15, weight: .bold))
                 .lineLimit(1)
             Text(summary)
-                .font(.system(size: 11))
+                .font(.system(size: 12))
                 .foregroundStyle(Theme.secondary)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
@@ -235,7 +301,7 @@ struct WorkspaceAttentionHeader: View {
                     Button("Refresh") { store.refresh() }
                         .buttonStyle(.borderedProminent)
                         .disabled(store.isLoading)
-                } else if snapshot.inventoryIssue != nil {
+                } else if contextualIssue.map({ $0.kind != .action }) == true {
                     Button("Refresh") { store.refresh() }
                         .buttonStyle(.borderedProminent)
                         .disabled(store.isLoading)
@@ -267,13 +333,15 @@ struct WorkspaceAttentionHeader: View {
                 .fixedSize()
             }
 
-            if contextualIssue != nil || relatedResult != nil {
+            if store.boardWorkspace == .resources,
+               contextualIssue != nil || relatedResult != nil
+            {
                 Button("Details") { showingDetails.toggle() }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier("attention-show-details")
             }
         }
-        .controlSize(.small)
+        .controlSize(store.boardWorkspace == .activity ? .large : .small)
     }
 
     private var issueDetails: some View {
@@ -537,7 +605,7 @@ private struct CompactLeaseBar: View {
     }
 }
 
-private struct BoardIncident: Identifiable {
+struct BoardIncident: Identifiable {
     let id: String
     let actionID: UUID?
     let result: RetainedActionResult?
@@ -545,41 +613,50 @@ private struct BoardIncident: Identifiable {
     let timestamp: Date
 
     var phase: ActionPhase { result?.phase ?? .failed }
+    var status: BoardIncidentStatus {
+        if let result { return BoardIncidentStatus(phase: result.phase) }
+        return issue?.kind == .action ? .failed : .warning
+    }
     var title: String { result?.request.title ?? issue?.title ?? "Coordinator incident" }
+    var operationLabel: String {
+        let prefixes = ["Start ", "Stop ", "Restart ", "Retire "]
+        guard let prefix = prefixes.first(where: { title.hasPrefix($0) }) else { return title }
+        return String(title.dropFirst(prefix.count))
+    }
     var source: String { result?.request.origin?.label ?? "Coordinator" }
+}
+
+@MainActor
+func activityIncidents(in store: OpsStore) -> [BoardIncident] {
+    var values = store.visibleActivityActionResults.map { result in
+        BoardIncident(
+            id: "action:\(result.id.uuidString)",
+            actionID: result.id,
+            result: result,
+            issue: store.activityIssues.first { $0.relatedActionID == result.id },
+            timestamp: result.finishedAt ?? result.startedAt ?? result.queuedAt
+        )
+    }
+    let representedIssueIDs = Set(values.compactMap { $0.issue?.id })
+    for issue in store.activityIssues where !representedIssueIDs.contains(issue.id) {
+        values.append(
+            BoardIncident(
+                id: "issue:\(issue.id.uuidString)",
+                actionID: issue.relatedActionID,
+                result: nil,
+                issue: issue,
+                timestamp: issue.createdAt
+            )
+        )
+    }
+    return values.sorted { $0.timestamp > $1.timestamp }
 }
 
 struct ActivityWorkspaceView: View {
     @ObservedObject var store: OpsStore
 
-    private var unmatchedActionIssue: OpsIssue? {
-        guard let issue = store.actionIssue else { return nil }
-        guard let actionID = issue.relatedActionID else { return issue }
-        return store.actionResults[actionID] == nil ? issue : nil
-    }
-
     private var incidents: [BoardIncident] {
-        var values = store.actionResults.values.map { result in
-            BoardIncident(
-                id: "action:\(result.id.uuidString)",
-                actionID: result.id,
-                result: result,
-                issue: store.actionIssue?.relatedActionID == result.id ? store.actionIssue : nil,
-                timestamp: result.finishedAt ?? result.startedAt ?? result.queuedAt
-            )
-        }
-        if let issue = unmatchedActionIssue {
-            values.append(
-                BoardIncident(
-                    id: "issue:\(issue.id.uuidString)",
-                    actionID: issue.relatedActionID,
-                    result: nil,
-                    issue: issue,
-                    timestamp: issue.createdAt
-                )
-            )
-        }
-        return values.sorted { $0.timestamp > $1.timestamp }
+        activityIncidents(in: store)
     }
 
     private var selectedIncident: BoardIncident? {
@@ -593,7 +670,7 @@ struct ActivityWorkspaceView: View {
         {
             return selected
         }
-        if let issue = store.actionIssue,
+        if let issue = store.activityIssues.first,
            let selected = incidents.first(where: { $0.issue?.id == issue.id })
         {
             return selected
@@ -702,27 +779,27 @@ private struct ActivityOperationRow: View {
             HStack(alignment: .top, spacing: 9) {
                 Image(systemName: phaseIcon)
                     .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(actionPhaseColor(incident.phase))
+                    .foregroundStyle(incident.status.tint)
                     .frame(width: 14, height: 18)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(phaseLabel)
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(actionPhaseColor(incident.phase))
-                    Text(incident.title)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(incident.status.tint)
+                    Text(incident.operationLabel)
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(Theme.primary)
                         .lineLimit(2)
                         .multilineTextAlignment(.leading)
                 }
                 Spacer(minLength: 6)
                 Text(incident.timestamp.formatted(date: .omitted, time: .shortened))
-                    .font(.system(size: 10, design: .monospaced))
+                    .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(Theme.secondary)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, minHeight: 61, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
             .background(isSelected ? Theme.blue.opacity(0.14) : Color.clear)
             .contentShape(Rectangle())
             .overlay(alignment: .bottom) {
@@ -735,31 +812,17 @@ private struct ActivityOperationRow: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(phaseLabel), \(incident.title), \(formatDate(incident.timestamp))")
+        .accessibilityLabel("\(phaseLabel), \(incident.operationLabel), \(formatDate(incident.timestamp))")
         .accessibilityIdentifier("activity-operation-\(safeAccessibilityID(incident.id))")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     private var phaseLabel: String {
-        switch incident.phase {
-        case .queued: return "Queued"
-        case .running: return "Running"
-        case .succeeded: return "Succeeded"
-        case .failed: return "Failed"
-        case .timedOut: return "Timed out"
-        case .cancelled: return "Cancelled"
-        }
+        incident.status.label
     }
 
     private var phaseIcon: String {
-        switch incident.phase {
-        case .queued: return "clock.fill"
-        case .running: return "arrow.triangle.2.circlepath"
-        case .succeeded: return "checkmark.circle.fill"
-        case .failed: return "exclamationmark.circle.fill"
-        case .timedOut: return "clock.badge.exclamationmark.fill"
-        case .cancelled: return "xmark.circle.fill"
-        }
+        incident.status.icon
     }
 }
 
@@ -778,13 +841,13 @@ private struct CompactActivitySelector: View {
                     Button {
                         selectIncident(incident)
                     } label: {
-                        Text("\(incident.phase.rawValue.capitalized): \(incident.title)")
+                        Text("\(incident.status.label): \(incident.operationLabel)")
                     }
                 }
             } label: {
                 HStack(spacing: 7) {
-                    ActionPhaseBadge(phase: selected.phase)
-                    Text(selected.title).lineLimit(1)
+                    IncidentStatusBadge(status: selected.status)
+                    Text(selected.operationLabel).lineLimit(1)
                 }
             }
             .menuStyle(.borderlessButton)
@@ -837,19 +900,19 @@ private struct ActivityIncidentDetail: View {
     @State private var technicalDetailsExpanded = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 20) {
             HStack(alignment: .top, spacing: 10) {
-                ActionPhaseBadge(phase: incident.phase)
+                IncidentStatusBadge(status: incident.status)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(incident.title)
-                        .font(.system(size: 13, weight: .bold))
+                        .font(.system(size: 15, weight: .bold))
                         .fixedSize(horizontal: false, vertical: true)
                     Text("\(formatDate(incident.timestamp)) · \(incident.source)")
-                        .font(.system(size: 10))
+                        .font(.system(size: 11))
                         .foregroundStyle(Theme.secondary)
                 }
                 Spacer(minLength: 12)
-                if incident.result.map({ isTerminalActionPhase($0.phase) }) ?? true {
+                if canDismissIncident {
                     Button(role: .destructive) {
                         dismissIncident()
                     } label: {
@@ -876,13 +939,16 @@ private struct ActivityIncidentDetail: View {
             IncidentNextStepsSection(steps: nextSteps)
             technicalDetails
         }
-        .padding(18)
+        .padding(20)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .textSelection(.enabled)
         .accessibilityIdentifier("activity-incident-detail")
     }
 
     private var whatHappened: String {
+        if isRetirement && fingerprintChanged {
+            return "The retirement failed because the host resource controller fingerprint changed after the retirement plan was reviewed but before the retire action executed."
+        }
         if let failure = incident.result?.failure, !failure.isEmpty { return failure }
         if let issue = incident.issue { return issue.summary }
         switch incident.phase {
@@ -896,6 +962,16 @@ private struct ActivityIncidentDetail: View {
     }
 
     private var whatChanged: String {
+        if incident.result == nil, let issue = incident.issue {
+            switch issue.kind {
+            case .inventory:
+                return "The latest inventory contains a condition the Board cannot treat as healthy. No resource action was attempted."
+            case .configuration:
+                return "Coordinator configuration is incomplete or inconsistent. No resource action was attempted."
+            case .action:
+                break
+            }
+        }
         if retirementRecoveryAction == .retryConfirmedOperation {
             return "The coordinator retained the retirement fence and original confirmed plan after an incomplete attempt. Host effects may already exist, so a replacement plan would be unsafe."
         }
@@ -907,15 +983,11 @@ private struct ActivityIncidentDetail: View {
         if typedFailurePayload?.priorOperationEffectsPossible == true {
             return "The confirmed operation remains fenced and may already have host effects. Inspect retained evidence before retrying the exact operation."
         }
+        if isRetirement && fingerprintChanged {
+            return "The controller fingerprint changed, indicating a modification to the host resource controller or its configuration since the plan was created. No retirement mutation was performed."
+        }
         if typedFailurePayload?.mutationPerformed == false {
             return "No host mutation was performed. The coordinator rejected the operation before changing the resource."
-        }
-        let evidence = [incident.result?.failure, incident.issue?.summary, incident.issue?.details]
-            .compactMap { $0 }
-            .joined(separator: " ")
-            .lowercased()
-        if evidence.contains("fingerprint changed") || evidence.contains("fingerprint") && evidence.contains("refresh before acting") {
-            return "The controller fingerprint no longer matches the reviewed plan. The Board refused to act on stale identity evidence."
         }
         switch incident.phase {
         case .succeeded:
@@ -930,13 +1002,20 @@ private struct ActivityIncidentDetail: View {
     private var nextSteps: [String] {
         let requiredAction = typedFailurePayload?.actionRequired?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let isRetirement = incident.result?.request.kind == .retireStandaloneResource
-            || incident.title.localizedCaseInsensitiveContains("retire")
-        let fingerprintChanged = typedFailurePayload?.code == "lifecycle_plan_stale"
-            || typedFailurePayload?.classification == "lifecycle_target_identity_changed"
-            || whatChanged.localizedCaseInsensitiveContains("fingerprint")
         var steps: [String]
-        if retirementRecoveryAction == .retryConfirmedOperation {
+        if incident.result == nil, incident.issue?.kind == .inventory {
+            steps = [
+                "Review the technical details for the affected source, capability, or repository evidence.",
+                "Resolve the specific condition described by the coordinator without changing unrelated resources.",
+                "Refresh Resources and confirm the warning is cleared before running actions.",
+            ]
+        } else if incident.result == nil, incident.issue?.kind == .configuration {
+            steps = [
+                "Review the technical details to identify the invalid or missing coordinator setting.",
+                "Correct the coordinator configuration for the affected source.",
+                "Refresh Resources and confirm the warning is cleared before running actions.",
+            ]
+        } else if retirementRecoveryAction == .retryConfirmedOperation {
             steps = [
                 "Retry the exact confirmed operation from the action above.",
                 "Keep the original plan ID and fingerprint; do not create a replacement plan.",
@@ -944,9 +1023,9 @@ private struct ActivityIncidentDetail: View {
             ]
         } else if isRetirement && fingerprintChanged {
             steps = [
-                "Refresh the latest resource state and create a new retirement plan.",
-                "Review the exact controller identity before approving the replacement plan.",
-                "Run retirement again only after the new plan is validated.",
+                "Refresh the latest resource state and re-plan the retirement.",
+                "Review the controller fingerprint and confirm no unintended changes.",
+                "Re-run the retirement plan once validated.",
             ]
         } else if incident.phase == .succeeded {
             steps = ["Return to Resources and confirm the inventory reflects the completed operation."]
@@ -957,8 +1036,29 @@ private struct ActivityIncidentDetail: View {
                 "Retry from the exact resource only when its current identity is proven.",
             ]
         }
-        guard let requiredAction, !requiredAction.isEmpty else { return steps }
+        guard !fingerprintChanged,
+              let requiredAction,
+              !requiredAction.isEmpty
+        else { return steps }
         return [requiredAction] + steps.filter { $0 != requiredAction }
+    }
+
+    private var isRetirement: Bool {
+        incident.result?.request.kind == .retireStandaloneResource
+            || incident.title.localizedCaseInsensitiveContains("retire")
+            || incident.title.localizedCaseInsensitiveContains("retirement")
+    }
+
+    private var fingerprintChanged: Bool {
+        if typedFailurePayload?.code == "lifecycle_plan_stale"
+            || typedFailurePayload?.classification == "lifecycle_target_identity_changed"
+        {
+            return true
+        }
+        return [incident.result?.failure, incident.issue?.summary, incident.issue?.details]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .localizedCaseInsensitiveContains("fingerprint")
     }
 
     private var retirementRecoveryAction: ResourceRetirementRecoveryAction? {
@@ -974,7 +1074,7 @@ private struct ActivityIncidentDetail: View {
 
     private var technicalText: String {
         if let result = incident.result {
-            var details = store.actionResultDetails(result)
+            var details = store.actionResultPresentationDetails(result)
             if let issue = incident.issue,
                !issue.details.isEmpty,
                !details.contains(issue.details)
@@ -998,7 +1098,7 @@ private struct ActivityIncidentDetail: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(technicalDetailsExpanded ? "Hide technical details" : "Show technical details")
                 Text("Technical details")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 TechnicalEvidenceCopyButton {
                     if let result = incident.result {
@@ -1010,7 +1110,7 @@ private struct ActivityIncidentDetail: View {
                 .frame(width: 74, height: 24)
             }
             .padding(.horizontal, 11)
-            .frame(height: 36)
+            .frame(height: 40)
             .background(Color.white.opacity(0.025))
 
             if technicalDetailsExpanded {
@@ -1030,9 +1130,28 @@ private struct ActivityIncidentDetail: View {
     private func dismissIncident() {
         if let result = incident.result {
             store.dismissActionResult(result)
-        } else {
+        } else if incident.issue?.kind == .action {
             store.dismissActionIssue()
         }
+    }
+
+    private var canDismissIncident: Bool {
+        if let result = incident.result { return isTerminalActionPhase(result.phase) }
+        return incident.issue?.kind == .action
+    }
+}
+
+private struct IncidentStatusBadge: View {
+    let status: BoardIncidentStatus
+
+    var body: some View {
+        Text(status.label)
+            .font(.system(size: 11, weight: .bold))
+            .foregroundStyle(status.tint)
+            .padding(.horizontal, 9)
+            .frame(height: 24)
+            .background(status.tint.opacity(0.12))
+            .clipShape(Capsule())
     }
 }
 
@@ -1138,9 +1257,9 @@ private struct IncidentExplanationSection: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 5) {
                 Text(title)
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.system(size: 13, weight: .bold))
                 Text(text)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(Theme.primary)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
@@ -1161,14 +1280,14 @@ private struct IncidentNextStepsSection: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 5) {
                 Text("What to do next")
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.system(size: 13, weight: .bold))
                 ForEach(Array(steps.enumerated()), id: \.offset) { _, step in
                     HStack(alignment: .firstTextBaseline, spacing: 7) {
                         Text("•")
                         Text(step)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                 }
             }
         }
@@ -1185,7 +1304,7 @@ private struct ActivityEmptyState: View {
                 .foregroundStyle(Theme.green)
             Text("No retained activity")
                 .font(.system(size: 14, weight: .semibold))
-            Text("Completed and failed coordinator operations will remain available here until dismissed.")
+            Text("Retained operation outcomes and coordinator warnings appear here. Successful preparation steps are folded into the operation they prepared.")
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.secondary)
                 .multilineTextAlignment(.center)

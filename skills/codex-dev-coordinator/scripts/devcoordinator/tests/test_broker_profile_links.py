@@ -1005,11 +1005,19 @@ class BrokerProfileTrustTests(unittest.TestCase):
             "identity": {"ok": True},
         }
         with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    dev_coordinator.AUTHORITY_ENV: "account",
+                    dev_coordinator.STATE_BACKEND_ENV: "sqlite",
+                },
+                clear=False,
+            ),
             mock.patch.object(
                 dev_coordinator,
                 "pure_normalized_inventory",
                 return_value=payload,
-            ),
+            ) as pure_inventory,
             mock.patch.object(
                 dev_coordinator,
                 "server_health",
@@ -1031,6 +1039,11 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 name="web",
                 port=443,
             )
+
+        pure_inventory.assert_called_once_with(
+            project=project,
+            include_docker=False,
+        )
 
         server = result["v1_compatibility"]["servers"][0]
         self.assertEqual(server["status"], "stopped")
@@ -1103,11 +1116,19 @@ class BrokerProfileTrustTests(unittest.TestCase):
             },
         }
         with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    dev_coordinator.AUTHORITY_ENV: "account",
+                    dev_coordinator.STATE_BACKEND_ENV: "sqlite",
+                },
+                clear=False,
+            ),
             mock.patch.object(
                 dev_coordinator,
                 "pure_normalized_inventory",
                 return_value=payload,
-            ),
+            ) as pure_inventory,
             mock.patch.object(
                 dev_coordinator,
                 "server_health",
@@ -1120,10 +1141,99 @@ class BrokerProfileTrustTests(unittest.TestCase):
                 port=443,
             )
 
+        pure_inventory.assert_called_once_with(
+            project=project,
+            include_docker=False,
+        )
+
         server = result["v1_compatibility"]["servers"][0]
         self.assertEqual(server["status"], "running")
         self.assertEqual(server["health"], live_health)
         self.assertEqual(server["registration_identity"], identity)
+
+    def test_registration_inventory_uses_target_scoped_broker_in_system_mode(self) -> None:
+        project = "/repos/alpha"
+        payload = {
+            "schema_version": 2,
+            "v1_compatibility": {
+                "urls": [],
+                "servers": [],
+                "leases": [],
+                "port_assignments": [],
+                "docker": {"available": None, "containers": [], "postgres": []},
+                "postgres": [],
+            },
+        }
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    dev_coordinator.AUTHORITY_ENV: "system",
+                    dev_coordinator.STATE_BACKEND_ENV: "sqlite",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "configured_broker_profile",
+                return_value=mock.sentinel.profile,
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "broker_authority_inventory",
+                return_value=payload,
+            ) as broker_inventory,
+            mock.patch.object(
+                dev_coordinator,
+                "pure_normalized_inventory",
+                side_effect=AssertionError("system registration opened the account store"),
+            ) as pure_inventory,
+        ):
+            dev_coordinator.coordinated_build_registration_inventory(
+                project=project,
+                name="web",
+                port=443,
+            )
+
+        broker_inventory.assert_called_once_with(
+            project=project,
+            include_docker=False,
+        )
+        pure_inventory.assert_not_called()
+
+    def test_registration_inventory_missing_system_profile_never_falls_back(self) -> None:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    dev_coordinator.AUTHORITY_ENV: "system",
+                    dev_coordinator.STATE_BACKEND_ENV: "sqlite",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "configured_broker_profile",
+                side_effect=BrokerProfileError("required profile missing"),
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "broker_authority_inventory",
+            ) as broker_inventory,
+            mock.patch.object(
+                dev_coordinator,
+                "pure_normalized_inventory",
+            ) as pure_inventory,
+        ):
+            with self.assertRaisesRegex(BrokerProfileError, "required profile"):
+                dev_coordinator.coordinated_build_registration_inventory(
+                    project="/repos/alpha",
+                    name="web",
+                    port=443,
+                )
+
+        broker_inventory.assert_not_called()
+        pure_inventory.assert_not_called()
 
     def test_server_wide_observe_uses_broker_without_opening_client_database(self) -> None:
         with CanonicalTemporaryDirectory(".broker-observe-") as root:
