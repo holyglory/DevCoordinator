@@ -155,4 +155,7 @@ test('browser boot renders Performance metrics independently of a slow overview'
   assert.match(source,
     /function degradedPanel\(o\)[\s\S]{0,180}inventoryState === 'loading'/,
     'a bounded cold read must render as loading rather than falsely claiming the Coordinator is unreachable');
+  assert.match(source,
+    /inventoryState === 'loading'[\s\S]{0,180}state\.overview\?\.inventory[\s\S]{0,420}inventory: state\.overview\.inventory/,
+    'a background cold response must retain the last authoritative inventory instead of flashing an empty page');
 });

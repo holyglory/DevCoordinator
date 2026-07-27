@@ -351,12 +351,13 @@ export function createCoordinator({ config, log }) {
   let lastSpawnAt = 0; // autostart rate limit: max one spawn attempt per 30s
   let ensureInflight = null;
 
-  const invCache = { value: undefined, at: 0, inflight: null, generation: 0 };
-  const srvCache = { value: undefined, at: 0, inflight: null, generation: 0 };
+  const invCache = { value: undefined, at: 0, inflight: null, generation: 0, dirty: false };
+  const srvCache = { value: undefined, at: 0, inflight: null, generation: 0, dirty: false };
   const testRepositoryCache = { value: undefined, at: 0, inflight: null, generation: 0 };
   const testStatsCaches = new Map();
   const trustedDockerObservations = new Map();
   const observationFlights = new Map();
+  let inventoryOverviewFailure = null;
 
   function noteAlive() {
     ok = true;
@@ -595,11 +596,16 @@ export function createCoordinator({ config, log }) {
     }
   }
 
-  function invalidateCaches() {
+  function invalidateCaches({ preserveInventory = false } = {}) {
     for (const cache of [invCache, srvCache]) {
       cache.generation += 1;
-      cache.value = undefined;
-      cache.at = 0;
+      if (preserveInventory && cache === invCache && cache.value !== undefined) {
+        cache.dirty = true;
+      } else {
+        cache.value = undefined;
+        cache.at = 0;
+        cache.dirty = false;
+      }
       // Detach an older GET instead of returning it to a caller that asked
       // after the mutation committed. The request may finish normally, but
       // its captured generation prevents it from repopulating this cache.
@@ -618,7 +624,14 @@ export function createCoordinator({ config, log }) {
     if (closed) throw new CoordError('coordinator client is closed');
     const ms = timeoutMs ?? coordinatorTimeoutFor(apiPath);
     const result = await attempt(method, apiPath, body ?? null, ms, responseMode);
-    if (isMutation(method, apiPath)) invalidateCaches();
+    if (isMutation(method, apiPath)) {
+      // The periodic host observation changes telemetry, but blanking the
+      // only usable inventory snapshot makes the Console flash a cold-loading
+      // screen every sampling interval. Keep that snapshot as stale while the
+      // next read refreshes it. User-triggered mutations still invalidate
+      // strictly so their completion cannot reveal pre-mutation state.
+      invalidateCaches({ preserveInventory: apiPath === '/v1/observe' });
+    }
     return result;
   }
 
@@ -736,7 +749,7 @@ export function createCoordinator({ config, log }) {
   }
 
   function cachedGet(cache, apiPath, maxAgeMs) {
-    if (cache.value !== undefined && Date.now() - cache.at <= maxAgeMs) {
+    if (!cache.dirty && cache.value !== undefined && Date.now() - cache.at <= maxAgeMs) {
       return Promise.resolve(cache.value);
     }
     if (cache.inflight) return cache.inflight; // coalesce concurrent callers
@@ -746,6 +759,7 @@ export function createCoordinator({ config, log }) {
         if (cache.generation === generation) {
           cache.value = value;
           cache.at = Date.now();
+          cache.dirty = false;
         }
         return value;
       })
@@ -777,7 +791,41 @@ export function createCoordinator({ config, log }) {
     const now = Date.now();
     const ageMs = invCache.value === undefined ? null : Math.max(0, now - invCache.at);
     const project = (value) => consoleOverviewInventoryView(value, trustedDockerObservations);
-    if (invCache.value !== undefined && ageMs <= maxAgeMs) {
+    const failureCooldownMs = (failure) => failure?.error?.classification === 'maintenance'
+      ? Math.max(1000, Math.min(60_000, (failure.error.retryAfterSeconds ?? 30) * 1000))
+      : 1000;
+    if (
+      inventoryOverviewFailure
+      && now - inventoryOverviewFailure.at >= failureCooldownMs(inventoryOverviewFailure)
+    ) {
+      inventoryOverviewFailure = null;
+    }
+    if (inventoryOverviewFailure && (
+      invCache.value === undefined
+      || inventoryOverviewFailure.error?.classification === 'maintenance'
+    )) {
+      if (invCache.value === undefined) {
+        return {
+          inventory: null,
+          state: 'error',
+          ageMs: null,
+          refreshing: false,
+          error: inventoryOverviewFailure.error,
+        };
+      }
+      try {
+        return {
+          inventory: project(invCache.value),
+          state: 'stale',
+          ageMs,
+          refreshing: false,
+          error: inventoryOverviewFailure.error,
+        };
+      } catch (error) {
+        return { inventory: null, state: 'error', ageMs, refreshing: false, error };
+      }
+    }
+    if (!invCache.dirty && invCache.value !== undefined && ageMs <= maxAgeMs) {
       try {
         return {
           inventory: project(invCache.value), state: 'fresh', ageMs, refreshing: false, error: null,
@@ -790,8 +838,14 @@ export function createCoordinator({ config, log }) {
     }
 
     const refresh = cachedGet(invCache, '/v1/inventory', maxAgeMs)
-      .then((value) => ({ inventory: project(value), error: null }))
-      .catch((error) => ({ inventory: null, error }));
+      .then((value) => {
+        inventoryOverviewFailure = null;
+        return { inventory: project(value), error: null };
+      })
+      .catch((error) => {
+        inventoryOverviewFailure = { error, at: Date.now() };
+        return { inventory: null, error };
+      });
     if (invCache.value !== undefined && ageMs <= maxStaleMs) {
       // Observe rejection inside `refresh` even though the caller gets the
       // retained snapshot immediately.

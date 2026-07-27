@@ -2732,7 +2732,26 @@
     if (fetching) { refetchQueued = true; return; }
     fetching = true;
     try {
-      const data = await api(`/api/overview${fresh ? '?fresh=1' : ''}`);
+      let data = await api(`/api/overview${fresh ? '?fresh=1' : ''}`);
+      if (
+        data.coordinator?.inventoryState === 'loading'
+        && !data.inventory
+        && state.overview?.inventory
+      ) {
+        // A bounded cold refresh is metadata, not a reason to erase the last
+        // authoritative screen. Keep rendering that snapshot until the
+        // coalesced refresh settles, so polling never flashes an empty page.
+        data = {
+          ...data,
+          inventory: state.overview.inventory,
+          routes: state.overview.routes,
+          coordinator: {
+            ...data.coordinator,
+            inventoryState: 'stale',
+            inventoryRefreshing: true,
+          },
+        };
+      }
       state.overview = data;
       state.stale = false;
       state.lastFetch = Date.now();

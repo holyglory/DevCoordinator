@@ -100,11 +100,13 @@ not switch authority modes as a workaround.
 
 In system mode the API validates the protected profile before binding and
 watches only its publication identity. After a stable atomic replacement it
-logs one `api.profile_changed` event and exits cleanly so `Restart=always`
-reloads strict authorization. It never logs profile contents or restarts the
-broker/Public Console; malformed replacements fail the supervised startup
-gate. Authorization/schema drift must be repaired offline through the
-installer's documented plan/verify workflow before restarting the broker.
+logs one `api.profile_reloaded` event and keeps its listener available; each
+broker-backed request opens and validates the current protected profile, so no
+process restart is needed to reload authorization. It never logs profile
+contents or restarts the broker/Public Console; malformed replacements fail
+the supervised startup gate. Authorization/schema drift must be repaired
+offline through the installer's documented plan/verify workflow before
+restarting the broker.
 
 During an administrator-owned offline upgrade, every new client call first
 checks the protected broker-independent maintenance marker. A trusted active

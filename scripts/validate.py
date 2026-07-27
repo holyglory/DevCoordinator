@@ -1975,7 +1975,9 @@ def check_devops_console() -> None:
         # unknown slugs enumerable while the comment would survive.
         "no slug enumeration for anonymous users": "const needAuth = !route || route.auth !== 'public';",
         "segmented-control overlap allowance annotated": "data-ui-allow-overlap",
-        "coordinator caches invalidated on mutations": "if (isMutation(method, apiPath)) invalidateCaches();",
+        "coordinator caches invalidated on mutations while periodic observations retain stale UI data": (
+            "invalidateCaches({ preserveInventory: apiPath === '/v1/observe' });"
+        ),
         "metrics ring buffer bounded": "points.splice(0, points.length - maxPoints)",
         "metrics project series keyed by unique usage_key": "row?.usage_key ?? row?.project_key",
         "port release requires explicit lease id": "requireString(body.lease_id, 'lease_id')",

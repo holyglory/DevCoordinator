@@ -220,6 +220,73 @@ test('overview inventory obeys its cold first-byte budget and reuses the complet
   assert.equal(inventoryRequests, 1, 'the timed-out caller must leave one cache-warming refresh running');
 });
 
+test('overview inventory publishes a late maintenance failure instead of restarting cold loading', async (t) => {
+  let inventoryRequests = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/inventory') return false;
+    inventoryRequests += 1;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'internal deployment detail',
+      code: 'maintenance_in_progress',
+      classification: 'maintenance',
+      retry_after_seconds: 30,
+    }));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  const cold = await client.inventoryForOverview({ maxAgeMs: 0, maxWaitMs: 10 });
+  assert.equal(cold.state, 'loading');
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const settled = await client.inventoryForOverview({ maxAgeMs: 0, maxWaitMs: 10 });
+  assert.equal(settled.state, 'error');
+  assert.equal(settled.inventory, null);
+  assert.equal(settled.error.classification, 'maintenance');
+  assert.equal(settled.error.retryAfterSeconds, 30);
+  assert.equal(inventoryRequests, 1,
+    'the maintenance retry interval must suppress a new cold-loading request');
+});
+
+test('host observation retains the last inventory while forcing background refresh', async (t) => {
+  let inventoryRequests = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url === '/v1/observe') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return true;
+    }
+    if (req.url !== '/v1/inventory') return false;
+    inventoryRequests += 1;
+    await new Promise((resolve) => setTimeout(resolve, inventoryRequests === 1 ? 0 : 30));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      servers: [],
+      project_usage: [],
+      marker: inventoryRequests === 1 ? 'before-observation' : 'after-observation',
+    }));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  const first = await client.inventoryForOverview({ maxAgeMs: 60_000, maxWaitMs: 100 });
+  assert.equal(first.inventory.marker, 'before-observation');
+  await client.observeHost({ agent: 'devops-console:metrics', project: '/repo' });
+
+  const duringRefresh = await client.inventoryForOverview({ maxAgeMs: 60_000, maxWaitMs: 5 });
+  assert.equal(duringRefresh.state, 'stale');
+  assert.equal(duringRefresh.refreshing, true);
+  assert.equal(duringRefresh.inventory.marker, 'before-observation');
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const refreshed = await client.inventoryForOverview({ maxAgeMs: 60_000, maxWaitMs: 5 });
+  assert.equal(refreshed.state, 'fresh');
+  assert.equal(refreshed.inventory.marker, 'after-observation');
+  assert.equal(inventoryRequests, 2);
+});
+
 test('overview inventory excludes audit history after deriving the current Console view', async (t) => {
   const compatibility = {
     coordinator_home: '/fixture/coordinator',
