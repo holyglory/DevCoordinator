@@ -965,7 +965,12 @@ class Driver:
                 "migration checkout does not match the approved rollback commit"
             )
         pre_units = self.require_or_recover_preflight_services()
-        self.inventory("pre-inventory.json")
+        # A same-schema release can be introducing the bounded inventory path
+        # itself. Requiring the old in-memory API to serialize inventory here
+        # creates a circular deployment dependency. Exact registration
+        # inventory remains mandatory after target startup in verify_services.
+        if not self.args.same_schema_release:
+            self.inventory("pre-inventory.json")
         public_before = [
             self.public_get(url, require_correct_upstream_protocol=False)
             for url in self.args.public_url

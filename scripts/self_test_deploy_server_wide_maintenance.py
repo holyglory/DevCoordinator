@@ -295,6 +295,11 @@ def main() -> int:
         < deploy_source.index("backup_manifest = self.online_backup()"),
         "online backup starts before fenced operations have drained",
     )
+    expect(
+        'if not self.args.same_schema_release:\n            self.inventory("pre-inventory.json")'
+        in deploy_source,
+        "same-schema deployment still depends on the old process's inventory path",
+    )
     recovery_source = inspect.getsource(
         MODULE.Driver.require_or_recover_preflight_services
     )
