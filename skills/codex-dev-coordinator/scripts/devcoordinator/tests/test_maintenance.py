@@ -18,7 +18,9 @@ from devcoordinator.broker import (
     BrokerRequest,
 )
 from devcoordinator.maintenance import (
+    CONTROL_PLANE_MAINTENANCE_SCOPE,
     MaintenanceMarkerError,
+    PUBLIC_MAINTENANCE_MESSAGE,
     activate_maintenance,
     clear_maintenance,
     load_maintenance_state,
@@ -54,9 +56,7 @@ class MaintenanceTests(unittest.TestCase):
             "version": 1,
             "status": "active",
             "deployment_id": str(uuid.uuid4()),
-            "message": (
-                "Coordinator upgrade in progress; please wait a moment and retry."
-            ),
+            "message": PUBLIC_MAINTENANCE_MESSAGE,
             "retry_after_seconds": 30,
             "started_at": "2026-07-26T19:00:00Z",
         }
@@ -101,15 +101,43 @@ class MaintenanceTests(unittest.TestCase):
         )
 
     def test_trusted_marker_blocks_before_socket_access_with_retry(self) -> None:
-        marker = self._write(self._document())
+        marker = self._write({
+            **self._document(),
+            "message": "Refreshing GlobalFinance Coinbase capture",
+        })
         started = time.monotonic()
         with self.assertRaises(BrokerError) as caught:
             self._client().call(self._request(BrokerOperation.INVENTORY_READ))
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(caught.exception.code, "maintenance_in_progress")
         self.assertEqual(caught.exception.retry_after_seconds, 30)
-        self.assertIn("please wait", caught.exception.message)
+        self.assertEqual(caught.exception.message, PUBLIC_MAINTENANCE_MESSAGE)
+        self.assertNotIn("GlobalFinance", caught.exception.message)
         self.assertTrue(marker.exists())
+
+    def test_activation_is_reserved_for_fixed_control_plane_scope_and_copy(self) -> None:
+        document = self._document()
+        common = {
+            "expected_uid": self.uid,
+            "expected_gid": self.gid,
+            "deployment_id": str(document["deployment_id"]),
+            "retry_after_seconds": int(document["retry_after_seconds"]),
+            "started_at": str(document["started_at"]),
+            "maintenance_root": self.maintenance_runtime,
+        }
+        with self.assertRaisesRegex(MaintenanceMarkerError, "server-wide authority"):
+            activate_maintenance(
+                **common,
+                scope="project-deployment",
+                message=PUBLIC_MAINTENANCE_MESSAGE,
+            )
+        with self.assertRaisesRegex(MaintenanceMarkerError, "fixed public"):
+            activate_maintenance(
+                **common,
+                scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
+                message="Refreshing GlobalFinance Coinbase capture",
+            )
+        self.assertFalse((self.maintenance_runtime / "maintenance.json").exists())
 
     def test_untrusted_or_malformed_marker_fails_closed(self) -> None:
         cases = (
@@ -163,6 +191,7 @@ class MaintenanceTests(unittest.TestCase):
             "expected_uid": self.uid,
             "expected_gid": self.gid,
             "deployment_id": str(document["deployment_id"]),
+            "scope": CONTROL_PLANE_MAINTENANCE_SCOPE,
             "message": str(document["message"]),
             "retry_after_seconds": int(document["retry_after_seconds"]),
             "started_at": str(document["started_at"]),
@@ -203,6 +232,7 @@ class MaintenanceTests(unittest.TestCase):
             expected_uid=self.uid,
             expected_gid=self.gid,
             deployment_id=str(first["deployment_id"]),
+            scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
             message=str(first["message"]),
             retry_after_seconds=int(first["retry_after_seconds"]),
             started_at=str(first["started_at"]),
@@ -215,6 +245,7 @@ class MaintenanceTests(unittest.TestCase):
                 expected_uid=self.uid,
                 expected_gid=self.gid,
                 deployment_id=str(uuid.uuid4()),
+                scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
                 message=str(first["message"]),
                 retry_after_seconds=int(first["retry_after_seconds"]),
                 started_at=str(first["started_at"]),
@@ -234,6 +265,7 @@ class MaintenanceTests(unittest.TestCase):
             expected_uid=self.uid,
             expected_gid=self.gid,
             deployment_id=str(document["deployment_id"]),
+            scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
             message=str(document["message"]),
             retry_after_seconds=int(document["retry_after_seconds"]),
             started_at=str(document["started_at"]),

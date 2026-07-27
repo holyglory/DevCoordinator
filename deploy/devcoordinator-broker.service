@@ -22,6 +22,12 @@ ExecStartPre=/usr/bin/python3 -I /home/DevCoordinator/skills/codex-dev-coordinat
 ExecStart=/usr/bin/python3 -I /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py broker serve --database /var/lib/devcoordinator/coordinator.sqlite3 --socket /run/devcoordinator/broker.sock --access-group devcoordinator-clients
 Restart=on-failure
 RestartSec=2
+# Authority admission and committed inventory must remain schedulable while a
+# project is CPU-, I/O-, or memory-heavy. Project resources receive no claim on
+# this protected control-plane working set.
+CPUWeight=10000
+IOWeight=10000
+MemoryLow=1G
 # This 65-minute stop boundary is the broker-side graceful-wait budget plus an
 # outer margin. SIGTERM reaches only the broker main process so it can fence
 # later mutations and wait within that budget for admitted handlers. This

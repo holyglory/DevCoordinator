@@ -182,12 +182,24 @@
       super(message);
       this.status = status;
       this.data = data;
-      this.code = data && typeof data.code === 'string' ? data.code : null;
-      this.classification = data && typeof data.classification === 'string'
-        ? data.classification
+      const evidence = data?.evidence && typeof data.evidence === 'object'
+        ? data.evidence
         : null;
-      this.retryAfterSeconds = Number.isFinite(Number(data?.retryAfterSeconds))
-        ? Number(data.retryAfterSeconds)
+      this.code = typeof data?.code === 'string'
+        ? data.code
+        : typeof evidence?.code === 'string' ? evidence.code : null;
+      this.classification = typeof data?.classification === 'string'
+        ? data.classification
+        : typeof evidence?.classification === 'string' ? evidence.classification
+        : null;
+      const retryAfter = Number(
+        data?.retryAfterSeconds
+        ?? data?.retry_after_seconds
+        ?? evidence?.retryAfterSeconds
+        ?? evidence?.retry_after_seconds,
+      );
+      this.retryAfterSeconds = Number.isFinite(retryAfter)
+        ? retryAfter
         : null;
     }
   }
@@ -571,7 +583,7 @@
       input.checked = !allowed;
       input.disabled = false;
       if (err.status !== 401) {
-        showBanner(err.message, () => changeAccessGrant(email, resource, input, allowed));
+        showBanner(err, () => changeAccessGrant(email, resource, input, allowed));
       }
     }
   }
@@ -584,7 +596,7 @@
       renderAccess();
       $('#access-add').focus({ preventScroll: true });
     } catch (err) {
-      if (err.status !== 401) showBanner(err.message, () => removeAccessUser(email));
+      if (err.status !== 401) showBanner(err, () => removeAccessUser(email));
     }
   }
 
@@ -785,7 +797,7 @@
       announce(`Access request ${decision === 'approve' ? 'approved' : 'denied'}`);
       if (decision === 'approve' && !result?.access) loadAccess({ force: true });
     } catch (err) {
-      if (err.status !== 401) showBanner(err.message, () => decideInvite(request, decision), 'invites');
+      if (err.status !== 401) showBanner(err, () => decideInvite(request, decision), 'invites');
     } finally {
       ui.busy.delete(busyKey);
       bump();
@@ -977,7 +989,7 @@
       });
       announce('Telegram project assignments updated');
     } catch (err) {
-      if (err.status !== 401) showBanner(err.message, () => changeTelegramProject(bot, projectId, allowed), 'telegram');
+      if (err.status !== 401) showBanner(err, () => changeTelegramProject(bot, projectId, allowed), 'telegram');
     } finally {
       ui.busy.delete(busyKey);
       bump();
@@ -1001,7 +1013,7 @@
       announce(`Telegram user ${decision === 'approve' ? 'approved' : 'denied'}`);
     } catch (err) {
       if (err.status !== 401) showBanner(
-        err.message, () => decideTelegramAuthorization(bot, row, decision), 'telegram',
+        err, () => decideTelegramAuthorization(bot, row, decision), 'telegram',
       );
     } finally {
       ui.busy.delete(busyKey);
@@ -1022,7 +1034,7 @@
       renderTelegram();
       $('#telegram-add').focus({ preventScroll: true });
     } catch (err) {
-      if (err.status !== 401) showBanner(err.message, () => removeTelegramBot(bot), 'telegram');
+      if (err.status !== 401) showBanner(err, () => removeTelegramBot(bot), 'telegram');
     }
   }
 
@@ -1181,7 +1193,7 @@
             if (err.status !== 401 && ['projects', 'servers', 'docker'].some(
               (page) => currentPage() === page && ui.lifecycleViews[page] === 'archived',
             )) {
-              showBanner(err.message, () => loadArchives({ force: true }), 'lifecycle');
+              showBanner(err, () => loadArchives({ force: true }), 'lifecycle');
             }
           } finally {
             archivesCompletedGeneration = Math.max(
@@ -1726,7 +1738,7 @@
       bump();
       renderAll();
     } catch (err) {
-      if (err.status !== 401) showBanner(err.message, () => sendHiddenDelta(delta));
+      if (err.status !== 401) showBanner(err, () => sendHiddenDelta(delta));
     }
   }
 
@@ -2734,13 +2746,17 @@
     try {
       let data = await api(`/api/overview${fresh ? '?fresh=1' : ''}`);
       if (
-        data.coordinator?.inventoryState === 'loading'
-        && !data.inventory
+        !data.inventory
         && state.overview?.inventory
+        && (
+          data.coordinator?.inventoryState === 'loading'
+          || Boolean(data.coordinator?.failureKind)
+        )
       ) {
-        // A bounded cold refresh is metadata, not a reason to erase the last
-        // authoritative screen. Keep rendering that snapshot until the
-        // coalesced refresh settles, so polling never flashes an empty page.
+        // Loading and refresh failures are metadata, not a reason to erase
+        // the last authoritative screen. Keep rendering that snapshot until
+        // the coalesced refresh settles, so polling never flashes or blanks a
+        // healthy Console because of project or control-plane work.
         data = {
           ...data,
           inventory: state.overview.inventory,
@@ -2756,7 +2772,15 @@
       state.stale = false;
       state.lastFetch = Date.now();
       if (data.coordinator?.failureKind === 'maintenance') {
-        showBanner({ classification: 'maintenance' }, null, 'maintenance');
+        clearBanner('overview');
+        if (data.inventory) {
+          // The retained authority snapshot is still a healthy decision
+          // surface. A background control-plane fence must not turn a project
+          // page into a global incident banner or make the screen blink.
+          clearBanner('maintenance');
+        } else {
+          showBanner({ classification: 'maintenance' }, null, 'maintenance');
+        }
       } else {
         clearBanner('maintenance');
         clearBanner('overview');
@@ -2837,7 +2861,7 @@
       bump();
       renderAll(true);
       if (err.status !== 401) {
-        showBanner(err.message, () => runAction(busyKey, fn, { onError }));
+        showBanner(err, () => runAction(busyKey, fn, { onError }));
         onError?.(err);
       }
       return false;
@@ -2898,7 +2922,7 @@
       // endpoint. Retained metrics still provide canonical repository roots,
       // so test data need not wait for heavyweight inventory.
       if (err.status !== 401 && err.status !== 404 && testRepositories().length === 0) {
-        showBanner(err.message, () => loadTestRepositories({ force: true }), 'tests');
+        showBanner(err, () => loadTestRepositories({ force: true }), 'tests');
       }
     } finally {
       state.testsRepositoriesLoading = false;
@@ -2938,7 +2962,7 @@
       state.testsLoadedAt = Date.now();
       clearBanner('tests');
     } catch (err) {
-      showBanner(err.message, () => loadTests({ force: true }), 'tests');
+      showBanner(err, () => loadTests({ force: true }), 'tests');
     } finally {
       state.testsLoading = false;
       renderTests();
@@ -4145,7 +4169,7 @@
     } catch (err) {
       if (err.status !== 401) {
         fail(err.message);
-        showBanner(err.message, () => $('#route-form').requestSubmit());
+        showBanner(err, () => $('#route-form').requestSubmit());
       }
     } finally {
       btn.disabled = false;
@@ -5102,7 +5126,7 @@
     } catch (err) {
       if (err.status === 401) return;
       ui.logs.set(key, { loading: false, text: null, error: err.message, at: Date.now() });
-      showBanner(err.message, () => loadServerLogs(id));
+      showBanner(err, () => loadServerLogs(id));
     }
     bump();
     renderAll(true);
@@ -5499,7 +5523,7 @@
     } catch (err) {
       if (err.status === 401) return;
       ui.logs.set(key, { loading: false, text: null, error: err.message, at: Date.now() });
-      showBanner(err.message, () => loadDockerLogs(name));
+      showBanner(err, () => loadDockerLogs(name));
     }
     bump();
     renderAll(true);
@@ -5695,7 +5719,7 @@
     } catch (err) {
       if (err.status !== 401) {
         fail(err.message);
-        showBanner(err.message, () => $('#lease-form').requestSubmit());
+        showBanner(err, () => $('#lease-form').requestSubmit());
       }
     } finally {
       btn.disabled = false;
@@ -6360,7 +6384,7 @@
       })
       .catch((err) => {
         if (err.status !== 401) {
-          showBanner(err.message, () => api('/api/session').then((s) => {
+          showBanner(err, () => api('/api/session').then((s) => {
             state.session = s;
             syncAccessVisibility();
             renderHeader();

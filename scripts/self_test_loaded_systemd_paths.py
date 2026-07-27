@@ -39,6 +39,9 @@ Requires=system.slice sysinit.target -.mount
 Wants=network-online.target devcoordinator-broker.service
 Restart=always
 RestartUSec=3s
+CPUWeight=10000
+IOWeight=10000
+MemoryLow=536870912
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=dev-coordinator
@@ -64,6 +67,9 @@ Requires=system.slice sysinit.target -.mount
 Wants=network-online.target dev-coordinator.service tmp.mount -.mount
 Restart=always
 RestartUSec=3s
+CPUWeight=10000
+IOWeight=10000
+MemoryLow=268435456
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=devops-console
@@ -95,6 +101,8 @@ def main() -> int:
 
     must_fail(COORDINATOR.replace("User=holyglory", "User=root", 1), CONSOLE, "wrong service user")
     must_fail(COORDINATOR.replace("Type=simple", "Type=notify", 1), CONSOLE, "wrong coordinator service type")
+    must_fail(COORDINATOR.replace("CPUWeight=10000", "CPUWeight=100", 1), CONSOLE, "coordinator control-plane CPU priority")
+    must_fail(COORDINATOR, CONSOLE.replace("MemoryLow=268435456", "MemoryLow=0", 1), "Console protected working set")
     must_fail(COORDINATOR, CONSOLE.replace("Type=simple", "Type=notify", 1), "wrong Console service type")
     must_fail(COORDINATOR.replace(f"{home}/.codex", "/root/.codex"), CONSOLE, "resolved manager home")
     must_fail(COORDINATOR.replace(f"{home}/.codex", "%h/.codex"), CONSOLE, "unresolved manager home")

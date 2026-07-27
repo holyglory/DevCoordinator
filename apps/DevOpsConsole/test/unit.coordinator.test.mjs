@@ -115,6 +115,30 @@ test('maintenance responses preserve their stable classification and retry inter
   );
 });
 
+test('legacy nested evidence still preserves maintenance across rolling upgrades', async (t) => {
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/test-repositories') return false;
+    res.writeHead(503, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'Coordinator control-plane maintenance is in progress',
+      evidence: {
+        code: 'maintenance_in_progress',
+        classification: 'maintenance',
+        retry_after_seconds: 41,
+      },
+    }));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+  await assert.rejects(
+    client.testRepositories(),
+    (error) => error instanceof CoordError
+      && error.classification === 'maintenance'
+      && error.code === 'maintenance_in_progress'
+      && error.retryAfterSeconds === 41,
+  );
+});
+
 test('host observation receives a Docker-sized deadline without widening ordinary requests', () => {
   assert.equal(coordinatorTimeoutFor('/v1/observe'), 720_000);
   assert.equal(coordinatorTimeoutFor('/v1/inventory'), 60_000);

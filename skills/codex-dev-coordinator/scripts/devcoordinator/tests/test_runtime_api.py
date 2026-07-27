@@ -4794,6 +4794,95 @@ class RuntimeApiTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+    def test_http_api_preserves_generic_typed_maintenance_contract(self) -> None:
+        server = dev_coordinator.BoundedThreadingHTTPServer(
+            ("127.0.0.1", 0), dev_coordinator.ApiHandler, token="runtime-token"
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = int(server.server_address[1])
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            with mock.patch.object(
+                dev_coordinator,
+                "coordinated_build_inventory",
+                side_effect=dev_coordinator.BrokerError(
+                    "maintenance_in_progress",
+                    "Refreshing GlobalFinance Coinbase capture",
+                    operation_id="operation-maintenance",
+                    retry_after_seconds=37,
+                ),
+            ):
+                connection.request(
+                    "GET",
+                    "/v1/inventory",
+                    headers={"Authorization": "Bearer runtime-token"},
+                )
+                response = connection.getresponse()
+                body = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 503)
+            self.assertEqual(response.getheader("Retry-After"), "37")
+            self.assertEqual(body["classification"], "maintenance")
+            self.assertEqual(body["code"], "maintenance_in_progress")
+            self.assertEqual(body["retry_after_seconds"], 37)
+            self.assertEqual(
+                body["error"], dev_coordinator.PUBLIC_MAINTENANCE_MESSAGE
+            )
+            self.assertNotIn("GlobalFinance", json.dumps(body))
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_project_work_cannot_exhaust_reserved_control_plane_readiness(self) -> None:
+        server = dev_coordinator.BoundedThreadingHTTPServer(
+            ("127.0.0.1", 0), dev_coordinator.ApiHandler, token="runtime-token"
+        )
+        acquired = 0
+        while server._work_slots.acquire(blocking=False):
+            acquired += 1
+        self.assertEqual(
+            acquired,
+            dev_coordinator.API_MAX_CONCURRENT_REQUESTS
+            - dev_coordinator.API_RESERVED_CONTROL_REQUESTS,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = int(server.server_address[1])
+
+        def get(path: str) -> tuple[int, dict[str, object], str | None]:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                connection.request(
+                    "GET",
+                    path,
+                    headers={"Authorization": "Bearer runtime-token"},
+                )
+                response = connection.getresponse()
+                return (
+                    response.status,
+                    json.loads(response.read().decode("utf-8")),
+                    response.getheader("Retry-After"),
+                )
+            finally:
+                connection.close()
+
+        try:
+            ready_status, ready, _retry = get("/v1/ready")
+            self.assertEqual(ready_status, 200)
+            self.assertTrue(ready["ok"])
+            inventory_status, busy, retry = get("/v1/inventory")
+            self.assertEqual(inventory_status, 503)
+            self.assertEqual(busy["classification"], "control_plane_capacity")
+            self.assertEqual(retry, "1")
+        finally:
+            for _unused in range(acquired):
+                server._work_slots.release()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()

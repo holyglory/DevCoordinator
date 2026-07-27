@@ -28,6 +28,11 @@ MAX_MARKER_BYTES = 16 * 1024
 MAX_MESSAGE_CHARS = 256
 MIN_RETRY_AFTER_SECONDS = 1
 MAX_RETRY_AFTER_SECONDS = 3600
+CONTROL_PLANE_MAINTENANCE_SCOPE = "server-wide-authority-upgrade"
+PUBLIC_MAINTENANCE_MESSAGE = (
+    "Coordinator control-plane maintenance is in progress; live controls "
+    "will reconnect automatically."
+)
 
 
 class MaintenanceMarkerError(RuntimeError):
@@ -250,12 +255,28 @@ def activate_maintenance(
     expected_uid: int,
     expected_gid: int,
     deployment_id: str,
+    scope: str,
     message: str,
     retry_after_seconds: int,
     started_at: str,
     maintenance_root: Path = MAINTENANCE_ROOT,
 ) -> MaintenanceState:
-    """Atomically publish one exact maintenance marker."""
+    """Atomically publish one exact control-plane maintenance marker.
+
+    This fence is not a project progress channel. Requiring the explicit
+    server-wide scope and one fixed public message prevents ordinary project
+    work from impersonating a Coordinator outage or leaking operator task
+    text to every client.
+    """
+
+    if scope != CONTROL_PLANE_MAINTENANCE_SCOPE:
+        raise MaintenanceMarkerError(
+            "maintenance activation is reserved for a server-wide authority upgrade"
+        )
+    if message != PUBLIC_MAINTENANCE_MESSAGE:
+        raise MaintenanceMarkerError(
+            "maintenance message must use the fixed public control-plane text"
+        )
 
     state = _decode_state(
         {

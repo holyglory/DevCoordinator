@@ -1269,23 +1269,26 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       assert.deepEqual(browserErrors, [],
         'the normal real-asset journey must produce no browser errors before maintenance');
 
+      await page.locator('[data-lifecycle-filter="servers"] [data-lifecycle-view="active"]').click();
+      await page.locator('#servers-body .proj-head').first().waitFor();
+
       // Planned broker maintenance is one calm, decision-oriented status.
       // Unrelated background collection failures must not replace it with
       // operator task text, false urgency, or a useless Retry action.
       maintenanceMode = true;
-      await page.reload({ waitUntil: 'networkidle' });
+      await page.waitForTimeout(7_000);
       const maintenanceBanner = page.locator('#banner-slot .banner.maintenance');
-      await maintenanceBanner.waitFor();
-      assert.equal(await maintenanceBanner.getAttribute('role'), 'status');
-      assert.match(await maintenanceBanner.textContent(), /No action needed/);
-      assert.match(await maintenanceBanner.textContent(), /reconnects automatically/);
-      assert.equal(await maintenanceBanner.getByRole('button', { name: 'Retry' }).count(), 0);
+      await assert.doesNotReject(async () => {
+        await page.locator('#servers-body .proj-head').first().waitFor();
+      });
+      assert.equal(await maintenanceBanner.count(), 0,
+        'retained inventory must not be covered by a global maintenance banner');
       assert.equal(await page.locator('.hdr-alert').count(), 0,
         'planned maintenance must not increment the needs-attention badge');
       assert.doesNotMatch(await page.locator('body').innerText(), /GlobalFinance|OKX collector|fresh runtime/);
-      assert.ok(browserErrors.length >= 3 && browserErrors.every(
+      assert.ok(browserErrors.every(
         (message) => /status of 503 \(Service Unavailable\)/.test(message),
-      ), 'only the expected background maintenance responses may reach the browser console');
+      ), 'any background maintenance response must be the expected bounded 503');
       browserErrors.length = 0;
 
       await page.setViewportSize({ width: 390, height: 844 });
@@ -1752,7 +1755,10 @@ test('Tests loads repository data within one second while current inventory is s
       }
 
       await page.setViewportSize({ width: 390, height: 844 });
-      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      await page.waitForFunction(() => window.innerWidth === 390 && (
+        [...document.querySelectorAll('.test-heat-hour')]
+          .filter((node) => getComputedStyle(node).visibility === 'visible').length === 12
+      ));
       const mobileGeometry = await page.evaluate(() => {
         const heatScroll = document.querySelector('.test-heat-scroll');
         const heatRect = heatScroll?.getBoundingClientRect();

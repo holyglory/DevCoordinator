@@ -76,6 +76,7 @@ from devcoordinator.image_publication import (
 )
 from devcoordinator.maintenance import (
     MaintenanceMarkerError,
+    PUBLIC_MAINTENANCE_MESSAGE,
     load_maintenance_state,
 )
 from devcoordinator.broker_persistence import BrokerPersistence
@@ -211,6 +212,7 @@ DEFAULT_API_PORT = 29876
 API_BODY_LIMIT_BYTES = 64 * 1024
 RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024
 API_MAX_CONCURRENT_REQUESTS = 16
+API_RESERVED_CONTROL_REQUESTS = 4
 API_REQUEST_TIMEOUT_SECONDS = 10
 API_TOKEN_MAX_BYTES = 4096
 API_PROFILE_RELOAD_POLL_SECONDS = 0.5
@@ -18864,6 +18866,9 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
     ):
         self.api_token = token
         self._request_slots = threading.BoundedSemaphore(API_MAX_CONCURRENT_REQUESTS)
+        self._work_slots = threading.BoundedSemaphore(
+            API_MAX_CONCURRENT_REQUESTS - API_RESERVED_CONTROL_REQUESTS
+        )
         super().__init__(server_address, handler)
 
     def server_bind(self) -> None:
@@ -19798,6 +19803,31 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             405, {"error": "method not allowed"}, headers={"Allow": ", ".join(allowed)}
         )
 
+    def _send_exception(self, error: BaseException, *, default_status: int) -> None:
+        """Preserve the Coordinator's typed failure contract over HTTP.
+
+        The Console, Board, and other agents share this endpoint. Flattening a
+        broker failure to ``{"error": str(error)}`` makes a planned
+        control-plane fence indistinguishable from a project crash and exposes
+        operator-only text to every client.
+        """
+
+        payload = coordinator_exception_payload(error)
+        classification = str(payload.get("classification") or "")
+        headers: dict[str, str] = {}
+        status = default_status
+        if classification == "maintenance":
+            status = 503
+            payload["error"] = PUBLIC_MAINTENANCE_MESSAGE
+            retry = payload.get("retry_after_seconds")
+            if isinstance(retry, int) and not isinstance(retry, bool) and retry > 0:
+                headers["Retry-After"] = str(retry)
+        elif isinstance(error, (BrokerError, BrokerProfileError)):
+            status = 503
+        elif isinstance(error, PermissionError):
+            status = 403
+        self._send(status, payload, headers=headers)
+
     def _read_json(self) -> dict[str, Any]:
         if self.headers.get("Transfer-Encoding"):
             raise ValueError("transfer encoding is not supported")
@@ -19965,7 +19995,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             else:  # preserve the existing unrelated GET failure contract
                 self._send(500, {"error": str(exc)})
         except Exception as exc:  # pragma: no cover - defensive endpoint wrapper
-            self._send(500, {"error": str(exc)})
+            self._send_exception(exc, default_status=500)
 
     def _handle_post(self, path: str) -> None:
         try:
@@ -20144,7 +20174,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         except TypeError as exc:
             self._send(415, {"error": str(exc)})
         except Exception as exc:
-            self._send(400, {"error": str(exc)})
+            self._send_exception(exc, default_status=400)
 
     def _handle_request(self) -> None:
         if not self._request_boundary_ok():
@@ -20178,20 +20208,48 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         if not self._require_authorization():
             return
 
-        runtime_artifact = path.startswith("/v1/runtime/artifacts/")
-        if path in API_GET_ROUTES or runtime_artifact:
-            if method != "GET":
-                self._method_not_allowed(("GET",))
+        # Reserve a fixed part of the listener for liveness/readiness even if
+        # many project operations are blocked in Docker, database, or health
+        # work. Ordinary calls fail quickly and retry instead of consuming the
+        # final control-plane threads.
+        reserved_control = path == "/v1/ready" and method == "GET"
+        work_slot = False
+        if not reserved_control:
+            work_slot = self.server._work_slots.acquire(blocking=False)
+            if not work_slot:
+                self._send(
+                    503,
+                    {
+                        "error": (
+                            "Coordinator is busy with bounded project work; "
+                            "the control plane remains healthy."
+                        ),
+                        "code": "control_plane_busy",
+                        "classification": "control_plane_capacity",
+                        "retry_after_seconds": 1,
+                    },
+                    headers={"Retry-After": "1"},
+                )
                 return
-            self._handle_get(path, parsed_request.query)
-            return
-        if path in API_POST_ROUTES:
-            if method != "POST":
-                self._method_not_allowed(("POST",))
+
+        try:
+            runtime_artifact = path.startswith("/v1/runtime/artifacts/")
+            if path in API_GET_ROUTES or runtime_artifact:
+                if method != "GET":
+                    self._method_not_allowed(("GET",))
+                    return
+                self._handle_get(path, parsed_request.query)
                 return
-            self._handle_post(path)
-            return
-        self._send(404, {"error": "not found"})
+            if path in API_POST_ROUTES:
+                if method != "POST":
+                    self._method_not_allowed(("POST",))
+                    return
+                self._handle_post(path)
+                return
+            self._send(404, {"error": "not found"})
+        finally:
+            if work_slot:
+                self.server._work_slots.release()
 
     def do_GET(self) -> None:  # noqa: N802
         self._handle_request()

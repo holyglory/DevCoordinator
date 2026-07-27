@@ -31,6 +31,12 @@ RestartSec=3
 KillMode=control-group
 UMask=0077
 
+# Keep the public TLS/UI boundary responsive even when project containers are
+# saturating the host. MemoryLow is a protected working set, not a hard cap.
+CPUWeight=10000
+IOWeight=10000
+MemoryLow=256M
+
 # Journald is the sole durable service log. Pin the sink and identity instead
 # of relying on manager defaults, and retain a generous bounded burst so an
 # outage keeps its startup, fatal, cleanup, and restart evidence.

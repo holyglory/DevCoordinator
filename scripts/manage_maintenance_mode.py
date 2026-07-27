@@ -18,6 +18,8 @@ if str(MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(MODULE_ROOT))
 
 from devcoordinator.maintenance import (  # noqa: E402
+    CONTROL_PLANE_MAINTENANCE_SCOPE,
+    PUBLIC_MAINTENANCE_MESSAGE,
     activate_maintenance,
     clear_maintenance,
     load_maintenance_state,
@@ -25,11 +27,6 @@ from devcoordinator.maintenance import (  # noqa: E402
 
 
 ACCESS_GROUP = "devcoordinator-clients"
-DEFAULT_MESSAGE = (
-    "Coordinator upgrade in progress; please wait a moment and retry."
-)
-
-
 def _identity() -> tuple[int, int]:
     if os.geteuid() != 0:
         raise PermissionError("maintenance mode requires root")
@@ -54,7 +51,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     actions = parser.add_subparsers(dest="action", required=True)
     activate = actions.add_parser("activate")
     activate.add_argument("--deployment-id", required=True)
-    activate.add_argument("--message", default=DEFAULT_MESSAGE)
+    activate.add_argument(
+        "--scope",
+        required=True,
+        choices=(CONTROL_PLANE_MAINTENANCE_SCOPE,),
+        help="reserved control-plane scope; project operations must never activate this fence",
+    )
     activate.add_argument("--retry-after-seconds", type=int, default=30)
     clear = actions.add_parser("clear")
     clear.add_argument("--deployment-id", required=True)
@@ -74,7 +76,8 @@ def main(argv: list[str] | None = None) -> int:
                 expected_uid=uid,
                 expected_gid=gid,
                 deployment_id=args.deployment_id,
-                message=args.message,
+                scope=args.scope,
+                message=PUBLIC_MAINTENANCE_MESSAGE,
                 retry_after_seconds=args.retry_after_seconds,
                 started_at=datetime.now(timezone.utc)
                 .isoformat(timespec="seconds")
