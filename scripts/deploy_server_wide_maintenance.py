@@ -15,6 +15,7 @@ import pwd
 import sqlite3
 import ssl
 import stat
+import socket
 import subprocess
 import sys
 import time
@@ -347,6 +348,7 @@ class Driver:
                 )
             self.run(["/usr/bin/systemctl", "start", BROKER_UNIT], timeout=180)
             broker = self.require_active(BROKER_UNIT)
+            self.wait_broker_ready()
             recovered = True
         else:
             raise DeploymentError(
@@ -368,6 +370,36 @@ class Driver:
                 return
             time.sleep(0.2)
         raise DeploymentError(f"{unit} did not reach a stopped boundary")
+
+    def wait_broker_ready(self, *, timeout: float = 30) -> None:
+        """Wait for the exact installed Unix socket to accept connections."""
+
+        deadline = time.monotonic() + timeout
+        last_error = "broker socket absent"
+        while time.monotonic() < deadline:
+            try:
+                metadata = BROKER_SOCKET.lstat()
+                if (
+                    not stat.S_ISSOCK(metadata.st_mode)
+                    or metadata.st_uid != 0
+                    or metadata.st_gid != self.group_gid
+                    or stat.S_IMODE(metadata.st_mode) != 0o660
+                ):
+                    raise DeploymentError(
+                        "broker socket has an unsafe identity while waiting for readiness"
+                    )
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.settimeout(0.5)
+                    probe.connect(str(BROKER_SOCKET))
+                return
+            except FileNotFoundError:
+                last_error = "broker socket absent"
+            except (ConnectionRefusedError, TimeoutError, socket.timeout) as error:
+                last_error = type(error).__name__
+            time.sleep(0.1)
+        raise DeploymentError(
+            f"broker socket did not become ready before deadline: {last_error}"
+        )
 
     def public_get(
         self, url: str, *, require_correct_upstream_protocol: bool = True
@@ -901,6 +933,7 @@ class Driver:
             "start compatible broker",
             lambda: self.run(["/usr/bin/systemctl", "start", BROKER_UNIT], timeout=180),
         )
+        attempt("wait compatible broker ready", self.wait_broker_ready)
         attempt(
             "restart compatible API",
             lambda: self.run(["/usr/bin/systemctl", "restart", API_UNIT], timeout=90),
@@ -1076,6 +1109,7 @@ class Driver:
             self.journal(migrated=migrated, console_private_state=console_private_state)
             self.run(["/usr/bin/systemctl", "start", BROKER_UNIT], timeout=180)
             self.require_active(BROKER_UNIT)
+            self.wait_broker_ready()
             clear_maintenance(
                 expected_uid=0,
                 expected_gid=self.group_gid,

@@ -333,6 +333,10 @@ def main() -> int:
         < recovery_source.index('["/usr/bin/systemctl", "start", BROKER_UNIT]'),
         "preflight broker recovery can race an active maintenance transaction",
     )
+    expect(
+        source.count("wait_broker_ready") == 4,
+        "broker readiness is not required after preflight, target, and rollback starts",
+    )
     rollback_source = inspect.getsource(MODULE.Driver.rollback)
     expect(
         rollback_source.index('attempt("restore client database"')
