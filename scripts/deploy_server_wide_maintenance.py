@@ -371,7 +371,7 @@ class Driver:
             time.sleep(0.2)
         raise DeploymentError(f"{unit} did not reach a stopped boundary")
 
-    def wait_broker_ready(self, *, timeout: float = 30) -> None:
+    def wait_broker_ready(self, *, timeout: float = 120) -> None:
         """Wait for the exact installed Unix socket to accept connections."""
 
         deadline = time.monotonic() + timeout
@@ -990,6 +990,12 @@ class Driver:
             raise DeploymentError("transaction directory must be one new absolute path")
         self.transaction.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.transaction.mkdir(mode=0o700)
+        # /var/lib/devcoordinator is group-owned for the maintenance reader and
+        # can carry setgid inheritance. The nested installer rollback accepts
+        # only a root-owned transaction chain, so make that boundary explicit
+        # before any artifacts are created.
+        os.chown(self.transaction, 0, 0)
+        os.chmod(self.transaction, 0o700)
         self.phase = "preflight"
         self.journal()
         if self.git("status", "--porcelain").stdout.strip():

@@ -337,6 +337,16 @@ def main() -> int:
         source.count("wait_broker_ready") == 4,
         "broker readiness is not required after preflight, target, and rollback starts",
     )
+    expect(
+        inspect.signature(MODULE.Driver.wait_broker_ready).parameters["timeout"].default
+        >= 120,
+        "deployment does not tolerate the broker's bounded post-stop lock handoff",
+    )
+    expect(
+        deploy_source.index("os.chown(self.transaction, 0, 0)")
+        < deploy_source.index("self.journal()"),
+        "deployment artifacts can inherit a group owner that blocks installer rollback",
+    )
     rollback_source = inspect.getsource(MODULE.Driver.rollback)
     expect(
         rollback_source.index('attempt("restore client database"')
