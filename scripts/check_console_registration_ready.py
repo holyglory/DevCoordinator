@@ -1415,6 +1415,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--unit", required=True)
     parser.add_argument("--main-pid", required=True, type=int)
     parser.add_argument("--token-file", required=True, type=Path)
+    parser.add_argument("--token-owner-uid", type=int)
     parser.add_argument("--project", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--port", required=True, type=int)
@@ -1435,7 +1436,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.host != "127.0.0.1":
             raise ConsoleRegistrationError("coordinator host must be exact IPv4 loopback")
-        token = read_private_regular(args.token_file, label="coordinator token").decode("utf-8").strip()
+        token = read_private_regular(
+            args.token_file,
+            label="coordinator token",
+            expected_uid=args.token_owner_uid,
+        ).decode("utf-8").strip()
         if len(token) < 32 or any(character.isspace() for character in token):
             raise ConsoleRegistrationError("coordinator token is invalid")
         report = wait_for_console_registration(

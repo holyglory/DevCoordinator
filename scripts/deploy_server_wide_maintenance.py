@@ -815,10 +815,6 @@ class Driver:
             )
         self.run(
             [
-                "/usr/sbin/runuser",
-                "--user",
-                "holyglory",
-                "--",
                 "/usr/bin/python3",
                 str(self.repository / "scripts/check_console_registration_ready.py"),
                 "--unit",
@@ -827,6 +823,8 @@ class Driver:
                 str(console["MainPID"]),
                 "--token-file",
                 str(self.token_file),
+                "--token-owner-uid",
+                str(self.console_uid),
                 "--project",
                 str(self.repository),
                 "--name",

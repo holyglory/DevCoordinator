@@ -41,6 +41,7 @@ def load(name: str, path: Path):
 
 READY = load("check_console_registration_ready", ROOT / "check_console_registration_ready.py")
 FIXTURES = load("post_cutover_fixture", ROOT / "self_test_post_cutover_registration.py")
+SECURE = sys.modules["secure_cutover_io"]
 
 FAST_HTTP_SERVER_CODE = r"""
 import socketserver
@@ -70,6 +71,33 @@ server.serve_forever()
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def secure_token_owner_override_test() -> None:
+    original_getuid = SECURE.os.getuid
+    original_geteuid = SECURE.os.geteuid
+    try:
+        SECURE.os.getuid = lambda: 1000
+        SECURE.os.geteuid = lambda: 1000
+        require(
+            SECURE.trusted_owner_uid(None) == 1000,
+            "default private evidence owner changed",
+        )
+        try:
+            SECURE.trusted_owner_uid(1001)
+        except SECURE.SecureIOError:
+            pass
+        else:
+            raise AssertionError("non-root private evidence owner override was accepted")
+        SECURE.os.getuid = lambda: 0
+        SECURE.os.geteuid = lambda: 0
+        require(
+            SECURE.trusted_owner_uid(1000) == 1000,
+            "root could not bind private evidence to the exact service UID",
+        )
+    finally:
+        SECURE.os.getuid = original_getuid
+        SECURE.os.geteuid = original_geteuid
 
 
 def fixture_broker_listener_fingerprint() -> str:
@@ -1530,6 +1558,7 @@ def identity_and_deadline_tests() -> None:
 
 
 def main() -> int:
+    secure_token_owner_override_test()
     normalized_fixture_source_guard_test()
     normalized_producer_contract_test()
     state, report = classify(ready_fixture())

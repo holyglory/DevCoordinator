@@ -148,6 +148,12 @@ class CoordinatorFixtureHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self._reply(200, {"ok": True})
             return
+        if self.path == "/v1/ready":
+            if authorization != f"Bearer {token}":
+                self._reply(401, {"error": "unauthorized"})
+                return
+            self._reply(200, {"ok": True})
+            return
         if self.path == "/v1/inventory":
             if authorization != f"Bearer {token}":
                 self._reply(401, {"error": "unauthorized"})
@@ -505,8 +511,8 @@ def test_auth_inventory_capture(root: Path) -> None:
         report.get("statuses")
         == {
             "anonymous_health": 200,
-            "anonymous_inventory": 401,
-            "authenticated_inventory": 200,
+            "anonymous_ready": 401,
+            "authenticated_ready": 200,
         },
         "auth boundary did not prove the exact three-response contract",
     )

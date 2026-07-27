@@ -40,8 +40,18 @@ def open_directory_nofollow(path: Path) -> int:
     return descriptor
 
 
-def open_private_parent(path: Path) -> tuple[int, Path, str]:
+def trusted_owner_uid(expected_uid: int | None) -> int:
+    owner = os.getuid() if expected_uid is None else int(expected_uid)
+    if owner < 0 or (owner != os.getuid() and os.geteuid() != 0):
+        raise SecureIOError("private evidence owner override requires root")
+    return owner
+
+
+def open_private_parent(
+    path: Path, *, expected_uid: int | None = None
+) -> tuple[int, Path, str]:
     absolute = absolute_path(path)
+    owner_uid = trusted_owner_uid(expected_uid)
     if not absolute.name:
         raise SecureIOError(f"private evidence path has no filename: {path}")
     try:
@@ -50,7 +60,7 @@ def open_private_parent(path: Path) -> tuple[int, Path, str]:
         raise SecureIOError(f"private evidence parent is unavailable or contains a symlink: {absolute.parent}") from error
     metadata = os.fstat(descriptor)
     mode = stat.S_IMODE(metadata.st_mode)
-    if metadata.st_uid != os.getuid() or mode & 0o077:
+    if metadata.st_uid != owner_uid or mode & 0o077:
         os.close(descriptor)
         raise SecureIOError(
             f"private evidence parent must be owned by this user without group/world access: "
@@ -59,7 +69,14 @@ def open_private_parent(path: Path) -> tuple[int, Path, str]:
     return descriptor, absolute, absolute.name
 
 
-def read_at(parent_descriptor: int, name: str, *, label: str) -> bytes:
+def read_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    label: str,
+    expected_uid: int | None = None,
+) -> bytes:
+    owner_uid = trusted_owner_uid(expected_uid)
     flags = (
         os.O_RDONLY
         | getattr(os, "O_NOFOLLOW", 0)
@@ -75,7 +92,7 @@ def read_at(parent_descriptor: int, name: str, *, label: str) -> bytes:
         mode = stat.S_IMODE(metadata.st_mode)
         if not stat.S_ISREG(metadata.st_mode):
             raise SecureIOError(f"{label} must be a regular file: {name}")
-        if metadata.st_uid != os.getuid() or mode & 0o077:
+        if metadata.st_uid != owner_uid or mode & 0o077:
             raise SecureIOError(
                 f"{label} must be owned by this user without group/world access: {name} ({mode:04o})"
             )
@@ -89,9 +106,18 @@ def read_at(parent_descriptor: int, name: str, *, label: str) -> bytes:
         os.close(descriptor)
 
 
-def read_private_regular(path: Path, *, label: str) -> bytes:
-    parent_descriptor, _absolute, name = open_private_parent(path)
+def read_private_regular(
+    path: Path, *, label: str, expected_uid: int | None = None
+) -> bytes:
+    parent_descriptor, _absolute, name = open_private_parent(
+        path, expected_uid=expected_uid
+    )
     try:
-        return read_at(parent_descriptor, name, label=label)
+        return read_at(
+            parent_descriptor,
+            name,
+            label=label,
+            expected_uid=expected_uid,
+        )
     finally:
         os.close(parent_descriptor)

@@ -248,8 +248,12 @@ def main() -> int:
         source.count(
             '"/usr/sbin/runuser",\n                "--user",\n                "holyglory"'
         )
-        == 2,
-        "deployment does not run both private readiness checks as the service account",
+        == 1,
+        "deployment does not isolate the unprivileged auth check from root process evidence",
+    )
+    expect(
+        '"--token-owner-uid",\n                str(self.console_uid)' in source,
+        "root Console process verification does not bind the private token owner UID",
     )
     expect(
         '"project": str(self.repository)' in source
