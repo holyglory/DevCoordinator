@@ -45,12 +45,19 @@ export function coordinatorOverviewView(base, error = null) {
     };
   }
   const status = Number.isInteger(error?.status) ? error.status : 0;
+  const maintenance = error?.classification === 'maintenance';
   return {
     ...base,
     ok: false,
-    failureKind: status > 0 ? 'request' : 'transport',
+    failureKind: maintenance ? 'maintenance' : status > 0 ? 'request' : 'transport',
     errorStatus: status > 0 ? status : null,
-    lastError: error?.message ?? String(error),
+    lastError: maintenance ? null : error?.message ?? String(error),
+    ...(maintenance ? {
+      maintenance: {
+        active: true,
+        retryAfterSeconds: error.retryAfterSeconds ?? 30,
+      },
+    } : {}),
   };
 }
 
@@ -1360,8 +1367,13 @@ export function createConsoleApi({
       // incomplete HTTP-200 reports preserve 409 so the reviewed operation is
       // never mistaken for a validation typo. Anything else — unreachable,
       // timeout, 5xx — is a gateway failure and stays 502.
-      status = err.status === 409 ? 409 : err.status >= 400 && err.status < 500 ? 400 : 502;
-      message = err.message;
+      const maintenance = err.classification === 'maintenance';
+      status = maintenance
+        ? 503
+        : err.status === 409 ? 409 : err.status >= 400 && err.status < 500 ? 400 : 502;
+      message = maintenance
+        ? 'Live controls are temporarily paused for maintenance.'
+        : err.message;
     } else {
       clog?.error?.('console api internal error', { error: err?.stack ?? String(err) });
     }
@@ -1370,6 +1382,11 @@ export function createConsoleApi({
       return;
     }
     const payload = { error: message };
+    if (err instanceof CoordError && err.classification === 'maintenance') {
+      payload.code = err.code || 'maintenance_in_progress';
+      payload.classification = 'maintenance';
+      payload.retryAfterSeconds = err.retryAfterSeconds ?? 30;
+    }
     if (err instanceof TelegramServiceError && typeof err.code === 'string') payload.code = err.code;
     if (
       err instanceof TelegramServiceError

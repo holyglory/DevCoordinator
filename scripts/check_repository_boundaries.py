@@ -52,7 +52,7 @@ CROSS_DEPENDENCY_PATTERNS = (
     re.compile(r"(?:\.\./)+holyskills(?:/|\b)", re.IGNORECASE),
 )
 
-# Commits ab5141d and 8ad3312 were published on main with current canonical
+# A small set of commits was published on main with current canonical
 # image/sidecar bytes but changed renderer inputs without refreshing their
 # source bindings. Public history is immutable, so accept only those exact
 # tree/blob sets and only the resulting source-fingerprint mismatches.
@@ -107,6 +107,54 @@ KNOWN_HISTORICAL_SOURCE_DRIFT = frozenset(
             "apps/DevOpsConsole/Artifacts/Canonical/projects-mobile.png",
             "b8df5ab7fd431b4040001524fb4226fedb698fcc",
             "8faefd0f7366f7ad4a08d9686c0e5a849d2a86a9",
+        ),
+        (
+            "462d2124bb13063414fef57d7bb5ee961123772e",
+            "apps/DevOpsConsole/Artifacts/Canonical/login-desktop.png",
+            "c923e6e0cd1db244774c982484d336d4cb7d1489",
+            "1c4e714aeb8d2d7af6015a0e5992c8a199f56397",
+        ),
+        (
+            "462d2124bb13063414fef57d7bb5ee961123772e",
+            "apps/DevOpsConsole/Artifacts/Canonical/login-mobile.png",
+            "c94c0b78c7fe25d57589234a7f9731e449eefe97",
+            "2620787edb977c82070c1955f0c3fa10af4ae037",
+        ),
+        (
+            "462d2124bb13063414fef57d7bb5ee961123772e",
+            "apps/DevOpsConsole/Artifacts/Canonical/projects-desktop.png",
+            "17391fd846134764359ec073bbd64b4ed759448f",
+            "b86f092091ef19478ab81b41d49be5b9fb444536",
+        ),
+        (
+            "462d2124bb13063414fef57d7bb5ee961123772e",
+            "apps/DevOpsConsole/Artifacts/Canonical/projects-mobile.png",
+            "b8df5ab7fd431b4040001524fb4226fedb698fcc",
+            "635827bbff999a2719488b0cde77097018bb7c2d",
+        ),
+        (
+            "a715fd561c89428c5ca00688babf36b450eea11f",
+            "apps/DevOpsConsole/Artifacts/Canonical/login-desktop.png",
+            "c923e6e0cd1db244774c982484d336d4cb7d1489",
+            "1c4e714aeb8d2d7af6015a0e5992c8a199f56397",
+        ),
+        (
+            "a715fd561c89428c5ca00688babf36b450eea11f",
+            "apps/DevOpsConsole/Artifacts/Canonical/login-mobile.png",
+            "c94c0b78c7fe25d57589234a7f9731e449eefe97",
+            "2620787edb977c82070c1955f0c3fa10af4ae037",
+        ),
+        (
+            "a715fd561c89428c5ca00688babf36b450eea11f",
+            "apps/DevOpsConsole/Artifacts/Canonical/projects-desktop.png",
+            "17391fd846134764359ec073bbd64b4ed759448f",
+            "b86f092091ef19478ab81b41d49be5b9fb444536",
+        ),
+        (
+            "a715fd561c89428c5ca00688babf36b450eea11f",
+            "apps/DevOpsConsole/Artifacts/Canonical/projects-mobile.png",
+            "b8df5ab7fd431b4040001524fb4226fedb698fcc",
+            "635827bbff999a2719488b0cde77097018bb7c2d",
         ),
     }
 )
@@ -180,6 +228,7 @@ def known_historical_source_drift(
 ) -> bool:
     return detail in {
         "aggregate source hash mismatch",
+        "source hash mismatch: apps/DevOpsConsole/src/ui/app.css",
         "source hash mismatch: apps/DevOpsConsole/src/ui/app.js",
     } and (
         tree,

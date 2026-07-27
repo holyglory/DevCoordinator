@@ -183,6 +183,12 @@
       this.status = status;
       this.data = data;
       this.code = data && typeof data.code === 'string' ? data.code : null;
+      this.classification = data && typeof data.classification === 'string'
+        ? data.classification
+        : null;
+      this.retryAfterSeconds = Number.isFinite(Number(data?.retryAfterSeconds))
+        ? Number(data.retryAfterSeconds)
+        : null;
     }
   }
 
@@ -218,19 +224,31 @@
 
   let bannerKey = null;
 
-  function showBanner(message, retry, key = 'action') {
-    bannerKey = key;
+  function isMaintenanceError(value) {
+    return value?.classification === 'maintenance' || value?.code === 'maintenance_in_progress';
+  }
+
+  function showBanner(value, retry, key = 'action') {
+    const maintenance = isMaintenanceError(value);
+    const message = maintenance
+      ? 'Controls are updating. No action needed — running services stay online and live data reconnects automatically.'
+      : value?.message ?? String(value);
+    bannerKey = maintenance ? 'maintenance' : key;
     $('#banner-slot').replaceChildren(
-      h('div', { class: 'banner', role: 'alert' },
-        icon('warn'),
+      h('div', {
+        class: `banner${maintenance ? ' maintenance' : ''}`,
+        role: maintenance ? 'status' : 'alert',
+        'aria-live': maintenance ? 'polite' : null,
+      },
+        icon(maintenance ? 'refresh' : 'warn'),
         h('span', { class: 'banner-msg' }, String(message)),
-        retry ? h('button', {
+        retry && !maintenance ? h('button', {
           class: 'btn small', type: 'button',
           onclick: () => { clearBanner(); retry(); },
         }, 'Retry') : null,
         h('button', {
           class: 'iconbtn', type: 'button',
-          'aria-label': 'Dismiss error', title: 'Dismiss',
+          'aria-label': maintenance ? 'Dismiss maintenance status' : 'Dismiss error', title: 'Dismiss',
           onclick: () => clearBanner(),
         }, icon('x'))),
     );
@@ -453,9 +471,11 @@
       renderAccess();
     } catch (err) {
       if (err.status === 401) return;
-      $('#access-body').replaceChildren(
-        h('p', { class: 'empty err' }, 'Could not load the access list. Use Retry above.'));
-      showBanner(err.message, () => loadAccess({ force: true }), 'access');
+      if (currentPage() === 'access') {
+        $('#access-body').replaceChildren(
+          h('p', { class: 'empty err' }, 'Could not load the access list. Use Retry above.'));
+        showBanner(err, () => loadAccess({ force: true }), 'access');
+      }
     } finally {
       accessFetching = false;
     }
@@ -736,9 +756,11 @@
       renderInvites();
     } catch (err) {
       if (err.status !== 401) {
-        $('#invites-body').replaceChildren(
-          h('p', { class: 'empty err' }, 'Could not load incoming invites.'));
-        showBanner(err.message, () => loadInvites({ force: true }), 'invites');
+        if (currentPage() === 'invites') {
+          $('#invites-body').replaceChildren(
+            h('p', { class: 'empty err' }, 'Could not load incoming invites.'));
+          showBanner(err, () => loadInvites({ force: true }), 'invites');
+        }
       }
     } finally {
       invitesFetching = false;
@@ -930,8 +952,10 @@
       renderTelegram();
     } catch (err) {
       if (err.status !== 401) {
-        $('#telegram-body').replaceChildren(h('p', { class: 'empty err' }, 'Could not load Telegram bots.'));
-        showBanner(err.message, () => loadTelegram({ force: true }), 'telegram');
+        if (currentPage() === 'telegram') {
+          $('#telegram-body').replaceChildren(h('p', { class: 'empty err' }, 'Could not load Telegram bots.'));
+          showBanner(err, () => loadTelegram({ force: true }), 'telegram');
+        }
       }
     } finally {
       telegramFetching = false;
@@ -2712,7 +2736,12 @@
       state.overview = data;
       state.stale = false;
       state.lastFetch = Date.now();
-      clearBanner('overview');
+      if (data.coordinator?.failureKind === 'maintenance') {
+        showBanner({ classification: 'maintenance' }, null, 'maintenance');
+      } else {
+        clearBanner('maintenance');
+        clearBanner('overview');
+      }
       renderAll(force);
       if (data.coordinator?.inventoryState === 'loading' && !data.inventory) {
         inventoryWarmupStartedAt ??= Date.now();
@@ -2743,7 +2772,7 @@
     } catch (err) {
       if (err.status === 401) return;
       state.stale = true;
-      showBanner(err.message, () => refreshOverview({ force: true, fresh: true }), 'overview');
+      showBanner(err, () => refreshOverview({ force: true, fresh: true }), 'overview');
       if (!state.overview) renderFirstLoadError();
       else renderHeader();
     } finally {
@@ -3508,7 +3537,7 @@
 
     const c = o.coordinator || {};
     const coordOk = !!c.ok && !!o.inventory;
-    if (!coordOk) {
+    if (!coordOk && c.failureKind !== 'maintenance') {
       problems.push({
         severity: 'err',
         title: coordinatorFailureTitle(o),
@@ -3670,17 +3699,24 @@
   // ---------------------------------------------------------------- shared bits
 
   function coordErrorText(o) {
+    if (o?.coordinator?.failureKind === 'maintenance') {
+      return 'Live data and controls reconnect automatically. Existing services keep running.';
+    }
     const e = o?.coordinator?.lastError;
     return e ? String(e) : 'The control engine on 127.0.0.1 did not respond.';
   }
 
   function coordinatorFailureTitle(o) {
+    if (o?.coordinator?.failureKind === 'maintenance') return 'Controls temporarily paused';
     return o?.coordinator?.failureKind === 'request'
       ? 'Coordinator request failed'
       : 'Coordinator unreachable';
   }
 
   function coordinatorFailureHint(o) {
+    if (o?.coordinator?.failureKind === 'maintenance') {
+      return 'No action is needed. The Console will resume live updates as soon as the maintenance window finishes.';
+    }
     if (o?.coordinator?.failureKind === 'request') {
       return 'The Console could not retrieve inventory, but this was not a network connection failure. Controls remain disabled until the reported request error is resolved; the console keeps retrying. Routes to fixed ports keep working meanwhile.';
     }
@@ -3691,12 +3727,16 @@
     if (o?.coordinator?.inventoryState === 'loading') {
       return h('p', { class: 'empty' }, 'Loading live Coordinator inventory…');
     }
-    return h('div', { class: 'degraded' },
-      icon('warn'),
+    const maintenance = o?.coordinator?.failureKind === 'maintenance';
+    return h('div', {
+      class: `degraded${maintenance ? ' maintenance' : ''}`,
+      role: maintenance ? 'status' : null,
+    },
+      icon(maintenance ? 'refresh' : 'warn'),
       h('div', null,
         h('p', { class: 'deg-title' }, coordinatorFailureTitle(o)),
         h('p', { class: 'deg-msg' }, coordErrorText(o)),
-        h('button', {
+        maintenance ? h('p', { class: 'deg-hint' }, coordinatorFailureHint(o)) : h('button', {
           class: 'btn small', type: 'button',
           onclick: () => refreshOverview({ force: true, fresh: true }),
         }, icon('refresh'), 'Try again')));
@@ -3757,7 +3797,7 @@
         h('span', null, 'Access'), h('span', null, '')),
     ];
     for (const r of routes) out.push(h('div', { class: 'item' }, routeRow(o, r)));
-    if (o.coordinator && o.coordinator.ok === false) {
+    if (o.coordinator && o.coordinator.ok === false && o.coordinator.failureKind !== 'maintenance') {
       out.push(h('p', { class: 'inline-note warn-note' },
         'Coordinator is unreachable — live status for server-linked routes may be stale.'));
     }

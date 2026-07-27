@@ -49,6 +49,19 @@ test('overview distinguishes Coordinator HTTP failures from transport failures',
   });
 });
 
+test('planned maintenance is a typed wait state without operator-only detail', () => {
+  const base = { ok: true, url: 'http://127.0.0.1:8765', lastOkAt: '2026-07-27T22:01:53Z' };
+  const maintenance = new Error('Publishing GlobalFinance OKX collector on fresh runtime');
+  maintenance.status = 500;
+  maintenance.classification = 'maintenance';
+  maintenance.retryAfterSeconds = 30;
+
+  const view = coordinatorOverviewView(base, maintenance);
+  assert.equal(view.failureKind, 'maintenance');
+  assert.equal(view.lastError, null, 'operator task text must not cross into the browser view');
+  assert.deepEqual(view.maintenance, { active: true, retryAfterSeconds: 30 });
+});
+
 test('visible failure labels remain truthful for HTTP and transport errors', async () => {
   const app = await fsp.readFile(new URL('../src/ui/app.js', import.meta.url), 'utf8');
   const titleSource = extractFunction(app, 'function coordinatorFailureTitle(o)');
@@ -57,6 +70,7 @@ test('visible failure labels remain truthful for HTTP and transport errors', asy
 
   assert.equal(title({ coordinator: { failureKind: 'request' } }), 'Coordinator request failed');
   assert.equal(title({ coordinator: { failureKind: 'transport' } }), 'Coordinator unreachable');
+  assert.equal(title({ coordinator: { failureKind: 'maintenance' } }), 'Controls temporarily paused');
   assert.equal(title({ coordinator: {} }), 'Coordinator unreachable');
 
   const header = extractFunction(app, 'function headerProblems(o)');
@@ -67,6 +81,22 @@ test('visible failure labels remain truthful for HTTP and transport errors', asy
     'the header guidance must explain the actual failure class');
   assert.match(degraded, /coordinatorFailureTitle\(o\)/,
     'the page-level degraded panel must use the same truthful title');
+  assert.match(degraded, /role: maintenance \? 'status' : null/,
+    'planned maintenance must be an informational status, not an alert');
+  assert.match(degraded, /maintenance \? h\('p',[\s\S]*coordinatorFailureHint\(o\)/,
+    'planned maintenance must explain automatic recovery without a retry action');
+
+  const banner = extractFunction(app, 'function showBanner(value, retry, key = \'action\')');
+  assert.match(banner, /No action needed/);
+  assert.match(banner, /running services stay online/);
+  assert.match(banner, /retry && !maintenance/,
+    'Retry cannot be offered for an operation the user cannot influence');
+  assert.match(banner, /role: maintenance \? 'status' : 'alert'/,
+    'maintenance must not increment urgency by presenting as an error alert');
+
+  const problems = extractFunction(app, 'function headerProblems(o)');
+  assert.match(problems, /c\.failureKind !== 'maintenance'/,
+    'planned maintenance must not produce the red needs-attention badge');
 
   const regressed = titleSource.replace("o?.coordinator?.failureKind === 'request'", 'false');
   // eslint-disable-next-line no-new-func

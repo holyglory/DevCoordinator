@@ -549,6 +549,7 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       let overviewRevision = 0;
       let overviewRequests = 0;
       let includeUnassigned = false;
+      let maintenanceMode = false;
       const archivedServerIds = new Set();
       const removedServerIds = new Set();
       const restoredServerIds = new Set();
@@ -572,6 +573,23 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         const request = route.request();
         const pathname = new URL(request.url()).pathname;
         let body;
+        if (
+          maintenanceMode
+          && request.method() === 'GET'
+          && ['/api/access', '/api/access/requests', '/api/telegram'].includes(pathname)
+        ) {
+          await route.fulfill({
+            status: 503,
+            contentType: 'application/json',
+            body: JSON.stringify({
+              error: 'Live controls are temporarily paused for maintenance.',
+              code: 'maintenance_in_progress',
+              classification: 'maintenance',
+              retryAfterSeconds: 30,
+            }),
+          });
+          return;
+        }
         if (request.method() === 'GET' && pathname === '/api/session') {
           body = { ...CANONICAL_SESSION, accessAdmin: true, lifecycleAvailable: true };
         }
@@ -592,9 +610,25 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         else if (request.method() === 'GET' && pathname === '/api/prefs') body = CANONICAL_PREFS;
         else if (request.method() === 'GET' && pathname === '/api/overview') {
           overviewRequests += 1;
-          body = fixtureOverview(overviewRevision, {
-            archivedServerIds, removedServerIds, restoredServerIds, includeUnassigned,
-          });
+          if (maintenanceMode) {
+            body = fixtureOverview(overviewRevision, {
+              archivedServerIds, removedServerIds, restoredServerIds, includeUnassigned,
+            });
+            body.coordinator = {
+              ...body.coordinator,
+              ok: false,
+              failureKind: 'maintenance',
+              errorStatus: 500,
+              lastError: null,
+              inventoryState: 'error',
+              maintenance: { active: true, retryAfterSeconds: 30 },
+            };
+            body.inventory = null;
+          } else {
+            body = fixtureOverview(overviewRevision, {
+              archivedServerIds, removedServerIds, restoredServerIds, includeUnassigned,
+            });
+          }
         } else if (request.method() === 'GET' && pathname === '/api/metrics/history') {
           body = fixtureMetrics();
         } else if (request.method() === 'POST' && pathname === '/api/docker/logs') {
@@ -1232,6 +1266,34 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
       assert.equal(await targetRow().count(), 0);
       assert.equal(await page.locator('#servers-archived-count').textContent(), '0',
         'zero is truthful only after the authoritative collection has loaded');
+      assert.deepEqual(browserErrors, [],
+        'the normal real-asset journey must produce no browser errors before maintenance');
+
+      // Planned broker maintenance is one calm, decision-oriented status.
+      // Unrelated background collection failures must not replace it with
+      // operator task text, false urgency, or a useless Retry action.
+      maintenanceMode = true;
+      await page.reload({ waitUntil: 'networkidle' });
+      const maintenanceBanner = page.locator('#banner-slot .banner.maintenance');
+      await maintenanceBanner.waitFor();
+      assert.equal(await maintenanceBanner.getAttribute('role'), 'status');
+      assert.match(await maintenanceBanner.textContent(), /No action needed/);
+      assert.match(await maintenanceBanner.textContent(), /reconnects automatically/);
+      assert.equal(await maintenanceBanner.getByRole('button', { name: 'Retry' }).count(), 0);
+      assert.equal(await page.locator('.hdr-alert').count(), 0,
+        'planned maintenance must not increment the needs-attention badge');
+      assert.doesNotMatch(await page.locator('body').innerText(), /GlobalFinance|OKX collector|fresh runtime/);
+      assert.ok(browserErrors.length >= 3 && browserErrors.every(
+        (message) => /status of 503 \(Service Unavailable\)/.test(message),
+      ), 'only the expected background maintenance responses may reach the browser console');
+      browserErrors.length = 0;
+
+      await page.setViewportSize({ width: 390, height: 844 });
+      const horizontalOverflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      assert.ok(horizontalOverflow <= 1,
+        `maintenance status must fit the mobile viewport (overflow ${horizontalOverflow}px)`);
 
       assert.deepEqual(unexpectedRequests, [], 'the rendered journey must use only declared API fixtures');
       assert.deepEqual(browserErrors, [], 'the real Console assets must produce no browser errors');

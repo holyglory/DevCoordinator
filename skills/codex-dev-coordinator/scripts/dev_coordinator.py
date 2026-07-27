@@ -18938,7 +18938,6 @@ def _validated_api_profile_identity() -> tuple[Path, tuple[int, ...]] | None:
 
 
 def _watch_api_profile_changes(
-    server: BoundedThreadingHTTPServer,
     *,
     path: Path,
     baseline: tuple[int, ...],
@@ -18946,7 +18945,13 @@ def _watch_api_profile_changes(
     poll_interval_seconds: float = API_PROFILE_RELOAD_POLL_SECONDS,
     stable_observations: int = API_PROFILE_RELOAD_STABLE_OBSERVATIONS,
 ) -> None:
-    """Restart a supervised API after one stable atomic profile publication."""
+    """Observe stable profile publications without dropping the API listener.
+
+    Every broker-backed request opens and validates the protected profile
+    afresh.  The watcher therefore records the new stable identity only; an
+    API restart would add a guaranteed transport outage without refreshing
+    any cached authorization state.
+    """
 
     candidate: tuple[int, ...] | None = None
     observations = 0
@@ -18966,10 +18971,10 @@ def _watch_api_profile_changes(
         print(
             json.dumps(
                 {
-                    "event": "api.profile_changed",
+                    "event": "api.profile_reloaded",
                     "message": (
-                        "protected broker profile changed; exiting so the "
-                        "supervisor reloads the current profile reader"
+                        "protected broker profile changed; subsequent requests "
+                        "will use the newly published profile"
                     ),
                     "path": str(path),
                 },
@@ -18978,8 +18983,9 @@ def _watch_api_profile_changes(
             file=sys.stderr,
             flush=True,
         )
-        server.shutdown()
-        return
+        baseline = current
+        candidate = None
+        observations = 0
 
 
 def _cleanup_profile_repositories(profile: BrokerClientProfile) -> tuple[BrokerRepositoryProfile, ...]:
@@ -20233,7 +20239,6 @@ def serve_api(host: str, port: int, *, token_file: str | None = None) -> None:
         profile_watch_thread = threading.Thread(
             target=_watch_api_profile_changes,
             kwargs={
-                "server": server,
                 "path": profile_path,
                 "baseline": profile_identity,
                 "stop": profile_watch_stop,

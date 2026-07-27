@@ -3,6 +3,7 @@ import http from 'node:http';
 import test from 'node:test';
 
 import { createConsoleApi } from '../src/api.mjs';
+import { CoordError } from '../src/coordinator.mjs';
 import { TelegramServiceError } from '../src/telegram.mjs';
 
 async function fixture(t) {
@@ -115,7 +116,7 @@ async function fixture(t) {
     });
     return { status: response.status, json: await response.json() };
   }
-  return { authorizations, bots, calls, request, telegram };
+  return { authorizations, bots, calls, coordinator, request, telegram };
 }
 
 test('Telegram view is actor-scoped, uses exact repository IDs, and never returns secrets or chat IDs', async (t) => {
@@ -208,4 +209,26 @@ test('an invalid Telegram token is a form error, never a false Console-session e
   assert.equal(response.status, 400);
   assert.equal(response.json.code, 'telegram_api_error');
   assert.equal(response.json.error, 'Unauthorized');
+});
+
+test('maintenance is browser-safe and tells clients to wait instead of exposing the operator task', async (t) => {
+  const { coordinator, request } = await fixture(t);
+  coordinator.inventory = async () => {
+    throw new CoordError('Publishing GlobalFinance OKX collector on fresh runtime', {
+      status: 500,
+      body: {
+        code: 'maintenance_in_progress',
+        classification: 'maintenance',
+        retry_after_seconds: 30,
+      },
+    });
+  };
+
+  const response = await request('/api/telegram');
+  assert.equal(response.status, 503);
+  assert.equal(response.json.classification, 'maintenance');
+  assert.equal(response.json.code, 'maintenance_in_progress');
+  assert.equal(response.json.retryAfterSeconds, 30);
+  assert.match(response.json.error, /temporarily paused/);
+  assert.doesNotMatch(JSON.stringify(response.json), /GlobalFinance|OKX|collector|fresh runtime/);
 });

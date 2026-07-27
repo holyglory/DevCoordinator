@@ -15,7 +15,12 @@ test('immutable UI asset query matches the deployed CSS and JavaScript content',
     fsp.readFile(new URL('app.css', UI_URL)),
     fsp.readFile(new URL('app.js', UI_URL)),
   ]);
-  const expected = crypto.createHash('sha256').update(css).update(js).digest('hex').slice(0, 12);
+  const expected = crypto.createHash('sha256')
+    .update(css)
+    .update('\0')
+    .update(js)
+    .digest('hex')
+    .slice(0, 12);
   const cssVersion = index.match(/href="\/app\.css\?v=([a-f0-9]+)"/)?.[1];
   const jsVersion = index.match(/src="\/app\.js\?v=([a-f0-9]+)"/)?.[1];
   assert.equal(cssVersion, expected,

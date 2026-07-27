@@ -103,7 +103,7 @@ def parsed_profile(repository_root: Path) -> BrokerClientProfile:
 
 
 class BrokerProfileTrustTests(unittest.TestCase):
-    def test_api_profile_watcher_restarts_after_stable_atomic_publication(self) -> None:
+    def test_api_profile_watcher_keeps_listener_up_after_stable_atomic_publication(self) -> None:
         with tempfile.TemporaryDirectory(prefix="api-profile-watch-") as raw:
             root = Path(raw)
             profile = root / "client-profiles.json"
@@ -111,14 +111,10 @@ class BrokerProfileTrustTests(unittest.TestCase):
             baseline = dev_coordinator._api_profile_identity(profile)
             self.assertIsNotNone(baseline)
 
-            shutdown = threading.Event()
             stop = threading.Event()
-            server = mock.Mock()
-            server.shutdown.side_effect = shutdown.set
             watcher = threading.Thread(
                 target=dev_coordinator._watch_api_profile_changes,
                 kwargs={
-                    "server": server,
                     "path": profile,
                     "baseline": baseline,
                     "stop": stop,
@@ -131,13 +127,12 @@ class BrokerProfileTrustTests(unittest.TestCase):
             replacement.write_text('{"generation":2}\n', encoding="utf-8")
             os.replace(replacement, profile)
 
-            self.assertTrue(
-                shutdown.wait(1.0),
-                "must-catch: a stable protected-profile publication did not restart the API",
-            )
+            time.sleep(0.08)
+            self.assertTrue(watcher.is_alive(),
+                "a valid profile publication must not drop the API listener")
+            stop.set()
             watcher.join(timeout=1.0)
             self.assertFalse(watcher.is_alive())
-            server.shutdown.assert_called_once_with()
 
     def test_api_profile_watcher_ignores_unchanged_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="api-profile-stable-") as raw:
@@ -147,11 +142,9 @@ class BrokerProfileTrustTests(unittest.TestCase):
             self.assertIsNotNone(baseline)
 
             stop = threading.Event()
-            server = mock.Mock()
             watcher = threading.Thread(
                 target=dev_coordinator._watch_api_profile_changes,
                 kwargs={
-                    "server": server,
                     "path": profile,
                     "baseline": baseline,
                     "stop": stop,
@@ -165,7 +158,6 @@ class BrokerProfileTrustTests(unittest.TestCase):
             watcher.join(timeout=1.0)
 
             self.assertFalse(watcher.is_alive())
-            server.shutdown.assert_not_called()
 
     def test_api_profile_preflight_retries_identity_race(self) -> None:
         with tempfile.TemporaryDirectory(prefix="api-profile-preflight-") as raw:
