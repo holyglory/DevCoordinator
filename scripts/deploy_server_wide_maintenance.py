@@ -226,9 +226,7 @@ class Driver:
     def wait_for_operation_quiescence(self, *, timeout: float = 180) -> None:
         """Drain pre-fence operations without allowing a fresh admission race."""
 
-        deadline = time.monotonic() + timeout
-        last_running: list[tuple[str, str, str]] = []
-        while time.monotonic() < deadline:
+        def running_operations() -> list[tuple[str, str, str]]:
             connection = sqlite3.connect(
                 f"file:{DATABASE}?mode=ro",
                 uri=True,
@@ -237,7 +235,7 @@ class Driver:
             )
             try:
                 connection.execute("PRAGMA query_only = ON")
-                last_running = list(
+                return list(
                     connection.execute(
                         "SELECT operation_id, kind, status FROM operations "
                         "WHERE status IN ('planned', 'running') "
@@ -246,11 +244,30 @@ class Driver:
                 )
             finally:
                 connection.close()
+
+        deadline = time.monotonic() + timeout
+        last_running: list[tuple[str, str, str]] = []
+        while time.monotonic() < deadline:
+            last_running = running_operations()
+            if not last_running:
+                return
+            time.sleep(0.2)
+
+        # The fence prevents new admissions. Anything still non-terminal
+        # after the generous drain deadline is an interrupted broker request,
+        # not work that deployment may wait on forever. A controlled broker
+        # restart invokes its durable interrupted-operation recovery before it
+        # accepts clients again; then require the ledger to converge.
+        self.run(["/usr/bin/systemctl", "restart", BROKER_UNIT], timeout=180)
+        self.require_active(BROKER_UNIT)
+        recovery_deadline = time.monotonic() + 30
+        while time.monotonic() < recovery_deadline:
+            last_running = running_operations()
             if not last_running:
                 return
             time.sleep(0.2)
         raise DeploymentError(
-            "Coordinator operations did not drain behind the maintenance fence: "
+            "Coordinator operations did not recover behind the maintenance fence: "
             f"{last_running!r}"
         )
 

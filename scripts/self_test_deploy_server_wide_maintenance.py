@@ -300,6 +300,13 @@ def main() -> int:
         in deploy_source,
         "same-schema deployment still depends on the old process's inventory path",
     )
+    quiescence_source = inspect.getsource(MODULE.Driver.wait_for_operation_quiescence)
+    expect(
+        quiescence_source.index("The fence prevents new admissions")
+        < quiescence_source.index('["/usr/bin/systemctl", "restart", BROKER_UNIT]')
+        < quiescence_source.index("recovery_deadline"),
+        "orphaned pre-fence operations cannot be recovered by a controlled broker restart",
+    )
     recovery_source = inspect.getsource(
         MODULE.Driver.require_or_recover_preflight_services
     )
