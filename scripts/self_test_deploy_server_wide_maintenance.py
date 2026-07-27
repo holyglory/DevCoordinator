@@ -277,6 +277,21 @@ def main() -> int:
         "recovery-maintenance-active" in deploy_source,
         "post-clear target failure does not reactivate maintenance before rollback",
     )
+    recovery_source = inspect.getsource(
+        MODULE.Driver.require_or_recover_preflight_services
+    )
+    expect(
+        recovery_source.index("self.require_active(API_UNIT)")
+        < recovery_source.index('["/usr/bin/systemctl", "start", BROKER_UNIT]')
+        and recovery_source.index("self.require_active(CONSOLE_UNIT)")
+        < recovery_source.index('["/usr/bin/systemctl", "start", BROKER_UNIT]'),
+        "preflight broker recovery does not first prove the API and Console shape",
+    )
+    expect(
+        recovery_source.index("load_maintenance_state(")
+        < recovery_source.index('["/usr/bin/systemctl", "start", BROKER_UNIT]'),
+        "preflight broker recovery can race an active maintenance transaction",
+    )
     rollback_source = inspect.getsource(MODULE.Driver.rollback)
     expect(
         rollback_source.index('attempt("restore client database"')

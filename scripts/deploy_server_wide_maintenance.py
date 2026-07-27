@@ -33,6 +33,7 @@ from devcoordinator.maintenance import (  # noqa: E402
     MAINTENANCE_ROOT,
     activate_maintenance,
     clear_maintenance,
+    load_maintenance_state,
 )
 
 
@@ -263,6 +264,50 @@ class Driver:
         if state.get("ActiveState") != "active" or int(state.get("MainPID", "0")) <= 0:
             raise DeploymentError(f"{unit} is not active with an exact MainPID: {state}")
         return state
+
+    def require_or_recover_preflight_services(self) -> dict[str, dict[str, Any]]:
+        """Restore only the exact clean-stop broker gap before deployment.
+
+        The API and Console can remain active after a failed maintenance
+        rollback while the foundational broker is cleanly inactive.  That
+        shape cannot self-heal under Restart=on-failure.  Recover it here,
+        under the deployment lock and only when no trusted maintenance marker
+        belongs to another transaction.  Every other partial-service shape
+        remains a hard failure.
+        """
+
+        api = self.require_active(API_UNIT)
+        console = self.require_active(CONSOLE_UNIT)
+        broker = self.unit_state(BROKER_UNIT)
+        recovered = False
+        if broker.get("ActiveState") == "active" and int(
+            broker.get("MainPID", "0")
+        ) > 0:
+            pass
+        elif broker.get("ActiveState") in {"inactive", "failed"} and int(
+            broker.get("MainPID", "0")
+        ) == 0:
+            self.prepare_maintenance_root()
+            active_maintenance = load_maintenance_state(
+                expected_uid=0,
+                expected_gid=self.group_gid,
+            )
+            if active_maintenance is not None:
+                raise DeploymentError(
+                    "inactive broker belongs to an active maintenance transaction"
+                )
+            self.run(["/usr/bin/systemctl", "start", BROKER_UNIT], timeout=180)
+            broker = self.require_active(BROKER_UNIT)
+            recovered = True
+        else:
+            raise DeploymentError(
+                f"{BROKER_UNIT} is not safely recoverable before deployment: {broker}"
+            )
+        return {
+            BROKER_UNIT: {**broker, "preflight_recovered": recovered},
+            API_UNIT: api,
+            CONSOLE_UNIT: console,
+        }
 
     def wait_inactive(self, unit: str, *, timeout: float = 120) -> None:
         deadline = time.monotonic() + timeout
@@ -880,10 +925,7 @@ class Driver:
             raise DeploymentError(
                 "migration checkout does not match the approved rollback commit"
             )
-        pre_units = {
-            unit: self.require_active(unit)
-            for unit in (BROKER_UNIT, API_UNIT, CONSOLE_UNIT)
-        }
+        pre_units = self.require_or_recover_preflight_services()
         pre_schema = self.schema_evidence(expected=self.schema_before)
         pre_client_schema = self.client_schema_evidence(expected=self.schema_before)
         self.require_no_database_helpers()
