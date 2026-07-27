@@ -1627,6 +1627,20 @@ test('Tests loads repository data within one second while current inventory is s
       assert.equal(await page.locator('#tests-failed-runs').textContent(), '1');
       assert.ok(await page.locator('.test-heat-cell.has-failure').count() > 0);
       assert.match(await page.locator('.test-heat-cell').nth(6).getAttribute('title'), /180\.0 aggregate test-minutes/);
+      await page.locator('.test-heat-cell').nth(6).hover();
+      const desktopTooltip = page.locator('#test-heat-tooltip');
+      await desktopTooltip.waitFor({ state: 'visible' });
+      assert.match(await desktopTooltip.textContent(), /180\.0 test-min/);
+      assert.match(await desktopTooltip.textContent(), /10800 aggregate seconds/);
+      const desktopTooltipGeometry = await desktopTooltip.evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+      });
+      assert.ok(desktopTooltipGeometry.left >= 0
+        && desktopTooltipGeometry.right <= 1486
+        && desktopTooltipGeometry.top >= 0
+        && desktopTooltipGeometry.bottom <= 1059,
+      'the exact-value hover badge must stay inside the desktop viewport');
       const desktopGeometry = await page.evaluate(() => ({
         viewportWidth: window.innerWidth,
         documentWidth: document.documentElement.scrollWidth,
@@ -1713,6 +1727,25 @@ test('Tests loads repository data within one second while current inventory is s
         'narrow screens must retain summary facts in a compact strip');
       assert.equal(mobileGeometry.visibleHourLabels, 12,
         'mobile should label every other hour while retaining all 24 data cells');
+      await page.locator('.test-heat-cell').nth(23).hover();
+      const mobileTooltipGeometry = await page.locator('#test-heat-tooltip').evaluate((node) => {
+        const rect = node.getBoundingClientRect();
+        return {
+          hidden: node.hidden,
+          left: rect.left,
+          right: rect.right,
+          top: rect.top,
+          bottom: rect.bottom,
+          text: node.textContent,
+        };
+      });
+      assert.equal(mobileTooltipGeometry.hidden, false);
+      assert.match(mobileTooltipGeometry.text, /aggregate seconds/);
+      assert.ok(mobileTooltipGeometry.left >= 0
+        && mobileTooltipGeometry.right <= 390
+        && mobileTooltipGeometry.top >= 0
+        && mobileTooltipGeometry.bottom <= 844,
+      'the right-edge hover badge must clamp inside the mobile viewport');
 
       await page.setViewportSize({ width: 320, height: 844 });
       await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));

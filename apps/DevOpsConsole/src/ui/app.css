@@ -1176,6 +1176,25 @@ select:disabled { color: var(--dim); }
 .test-heat-cell { position: relative; height: 27px; padding: 0; border: 1px solid rgba(255, 255, 255, .09); border-radius: 2px; }
 .test-heat-cell .icon { position: absolute; inset: 50% auto auto 50%; color: #fff; transform: translate(-50%, -50%); filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .75)); }
 .test-heat-cell .icon svg { width: 10px; height: 10px; }
+.test-heat-cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.test-heat-tooltip {
+  position: fixed;
+  z-index: 3000;
+  display: grid;
+  min-width: 148px;
+  max-width: min(260px, calc(100vw - 16px));
+  gap: 1px;
+  padding: 7px 9px;
+  border: 1px solid #45627d;
+  border-radius: 6px;
+  background: #101a25;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .4);
+  color: var(--text);
+  pointer-events: none;
+}
+.test-heat-tooltip[hidden] { display: none; }
+.test-heat-tooltip-period, .test-heat-tooltip-detail { color: var(--muted); font-size: 9.5px; white-space: nowrap; }
+.test-heat-tooltip strong { color: #fff; font-size: 13px; line-height: 1.25; }
 .test-heat-legend { width: min(430px, 100%); margin-top: 10px; }
 .test-heat-scale { height: 8px; border-radius: 2px; background: linear-gradient(90deg, #142b4b 0%, #2f8cff 33.333%, #ffb020 66.666%, #ec5f67 100%); }
 .test-heat-ticks { display: flex; justify-content: space-between; margin-top: 3px; color: var(--muted); font-size: 9.5px; }

@@ -2994,7 +2994,68 @@
       h('div', null, h('dt', null, 'Busiest day'), h('dd', null, busiestDay ? testDayShortLabel(busiestDay) : '—')));
   }
 
+  let activeTestHeatTooltipTarget = null;
+
+  function testHeatTooltipNode() {
+    let tooltip = $('#test-heat-tooltip');
+    if (tooltip) return tooltip;
+    tooltip = h('div', {
+      id: 'test-heat-tooltip',
+      class: 'test-heat-tooltip',
+      role: 'tooltip',
+      hidden: true,
+    });
+    document.body.append(tooltip);
+    window.addEventListener('resize', () => {
+      if (activeTestHeatTooltipTarget?.isConnected) {
+        showTestHeatTooltip(activeTestHeatTooltipTarget);
+      } else {
+        hideTestHeatTooltip();
+      }
+    });
+    document.addEventListener('scroll', () => hideTestHeatTooltip(), true);
+    return tooltip;
+  }
+
+  function hideTestHeatTooltip(target = null) {
+    if (target && activeTestHeatTooltipTarget !== target) return;
+    activeTestHeatTooltipTarget = null;
+    const tooltip = $('#test-heat-tooltip');
+    if (tooltip) tooltip.hidden = true;
+  }
+
+  function showTestHeatTooltip(target) {
+    const tooltip = testHeatTooltipNode();
+    const seconds = Number(target.dataset.testSeconds || 0);
+    const minutes = seconds / 60;
+    const failures = Number(target.dataset.testFailures || 0);
+    activeTestHeatTooltipTarget = target;
+    tooltip.replaceChildren(
+      h('span', { class: 'test-heat-tooltip-period' }, target.dataset.testPeriod || ''),
+      h('strong', null, `${minutes.toFixed(1)} test-min`),
+      h('span', { class: 'test-heat-tooltip-detail' },
+        `${String(seconds)} aggregate seconds${failures ? ` · ${failures} failed ${failures === 1 ? 'test' : 'tests'}` : ''}`),
+    );
+    tooltip.hidden = false;
+    tooltip.style.left = '0px';
+    tooltip.style.top = '0px';
+    const targetRect = target.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const margin = 8;
+    const gap = 7;
+    const left = Math.min(
+      window.innerWidth - tooltipRect.width - margin,
+      Math.max(margin, targetRect.left + (targetRect.width / 2) - (tooltipRect.width / 2)),
+    );
+    let top = targetRect.top - tooltipRect.height - gap;
+    if (top < margin) top = targetRect.bottom + gap;
+    top = Math.min(window.innerHeight - tooltipRect.height - margin, Math.max(margin, top));
+    tooltip.style.left = `${Math.round(left)}px`;
+    tooltip.style.top = `${Math.round(top)}px`;
+  }
+
   function testHeatmap(stats) {
+    hideTestHeatTooltip();
     const cells = Array.isArray(stats.hourly) ? stats.hourly : [];
     const byDay = new Map();
     for (const cell of cells) {
@@ -3021,11 +3082,23 @@
         const cell = byDay.get(day).get(hour) || { test_seconds: 0, failure_count: 0 };
         const minutes = Number(cell.test_seconds || 0) / 60;
         const failures = Number(cell.failure_count || 0);
+        const period = `${testDayLabel(day)} · ${String(hour).padStart(2, '0')}:00 UTC`;
         const node = h('td', {
           class: `test-heat-cell${failures > 0 ? ' has-failure' : ''}`,
           style: `background-color:${testHeatColor(cell.test_seconds)}`,
-          title: `${testDayLabel(day)} ${String(hour).padStart(2, '0')}:00 UTC — ${minutes.toFixed(1)} aggregate test-minutes${failures ? `, ${failures} failed ${failures === 1 ? 'test' : 'tests'}` : ''}`,
+          title: `${period} — ${minutes.toFixed(1)} aggregate test-minutes${failures ? `, ${failures} failed ${failures === 1 ? 'test' : 'tests'}` : ''}`,
           'aria-label': `${testDayLabel(day)}, ${String(hour).padStart(2, '0')}:00 UTC: ${minutes.toFixed(1)} aggregate test-minutes${failures ? `; ${failures} failures` : ''}`,
+          tabindex: Number(cell.test_seconds || 0) > 0 || failures > 0 ? '0' : null,
+          'data-test-period': period,
+          'data-test-seconds': Number(cell.test_seconds || 0),
+          'data-test-failures': failures,
+          onpointerenter: (event) => showTestHeatTooltip(event.currentTarget),
+          onpointerleave: (event) => hideTestHeatTooltip(event.currentTarget),
+          onfocus: (event) => showTestHeatTooltip(event.currentTarget),
+          onblur: (event) => hideTestHeatTooltip(event.currentTarget),
+          onkeydown: (event) => {
+            if (event.key === 'Escape') hideTestHeatTooltip(event.currentTarget);
+          },
         });
         if (failures > 0) node.append(icon('x'));
         row.append(node);
