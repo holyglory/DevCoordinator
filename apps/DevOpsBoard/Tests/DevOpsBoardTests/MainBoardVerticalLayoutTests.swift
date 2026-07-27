@@ -232,40 +232,323 @@ final class MainBoardVerticalLayoutTests: XCTestCase {
         XCTAssertTrue(assessment.bodyHasVisibleContent)
     }
 
-    func testActivityReviewRequestIsRetainedUntilTheMainBoardConsumesIt() throws {
-        let coordinator = ActivityReviewCoordinator.shared
-        if let existing = coordinator.pendingRequestID {
-            coordinator.consume(existing)
+    func testResourcesWorkspaceOwnsExactlyOneVisibleVerticalScrollerAtCompactAndDesktopWidths() throws {
+        for (width, height) in [(mainPaneWidth, minimumWindowHeight), (desktopMainPaneWidth, desktopWindowHeight)] {
+            let fixture = try makeDenseMinimumWindowFixture()
+            fixture.store.showResources()
+
+            let hostingView = hostMainBoard(
+                store: fixture.store,
+                width: width,
+                height: height
+            )
+            let owners = visibleVerticalScrollOwners(in: hostingView)
+
+            XCTAssertEqual(
+                owners.count,
+                1,
+                "Resources at \(width)x\(height) must have one vertical scroll owner, not nested document/table drawers: \(scrollTopologyDescription(owners))"
+            )
         }
-
-        coordinator.requestReview()
-        let requestID = try XCTUnwrap(coordinator.pendingRequestID)
-
-        coordinator.consume(UUID())
-        XCTAssertEqual(coordinator.pendingRequestID, requestID)
-
-        coordinator.consume(requestID)
-        XCTAssertNil(coordinator.pendingRequestID)
     }
 
-    func testMainBoardConsumesBufferedActivityReviewWhenItAppears() throws {
-        let fixture = try makeDenseMinimumWindowFixture()
-        let coordinator = ActivityReviewCoordinator.shared
-        if let existing = coordinator.pendingRequestID {
-            coordinator.consume(existing)
-        }
-        coordinator.requestReview()
-        XCTAssertNotNil(coordinator.pendingRequestID)
+    func testActivityFailureWorkspaceOwnsExactlyOneVisibleVerticalScrollerAtCompactAndDesktopWidths() throws {
+        for (width, height) in [(mainPaneWidth, minimumWindowHeight), (desktopMainPaneWidth, desktopWindowHeight)] {
+            let fixture = try makeDenseMinimumWindowFixture()
+            fixture.store.showActivity(actionID: fixture.actionID)
 
-        _ = try renderMainBoard(
-            store: fixture.store,
+            let hostingView = hostMainBoard(
+                store: fixture.store,
+                width: width,
+                height: height
+            )
+            let owners = visibleVerticalScrollOwners(in: hostingView)
+
+            XCTAssertEqual(fixture.store.boardWorkspace, .activity)
+            XCTAssertEqual(fixture.store.selectedActionResultID, fixture.actionID)
+            XCTAssertEqual(
+                owners.count,
+                1,
+                "Activity at \(width)x\(height) must use one shared vertical scroll owner: \(scrollTopologyDescription(owners))"
+            )
+            let raster = try renderMainBoard(store: fixture.store, width: width, height: height)
+            try captureRasterIfRequested(
+                raster,
+                name: "main-board-activity-failure-\(width)x\(height)"
+            )
+        }
+
+        let fullShellFixture = try makeDenseMinimumWindowFixture()
+        fullShellFixture.store.showActivity(actionID: fullShellFixture.actionID)
+        let fullShell = try renderOpsConsole(
+            store: fullShellFixture.store,
+            width: 1_592,
+            height: 842
+        )
+        try captureRasterIfRequested(
+            fullShell,
+            name: "ops-console-activity-failure-1592x842"
+        )
+    }
+
+    func testTypedStaleRetirementFailureRendersActionScopedRecoveryWorkspace() async throws {
+        let origin = CoordinatorOrigin(
+            label: "Retirement fixture",
+            home: "/fixtures/retirement/coordinator",
+            statePath: "/fixtures/retirement/coordinator/state.json"
+        )
+        let staleFailure = CommandExecution(
+            stdout: "",
+            stderr: #"{"ok":false,"code":"lifecycle_plan_stale","classification":"lifecycle_target_identity_changed","mutation_performed":false,"error":"Resource ownership generation changed after planning.","action_required":"Refresh authoritative inventory, review a newly generated lifecycle plan, and retry."}"#,
+            exitStatus: 1
+        )
+        let firstPlan = retirementVisualPlanJSON(
+            planID: "retire-plan-visual-1",
+            planFingerprint: "retire-fingerprint-visual-1",
+            ownershipFingerprint: "planned-ownership-generation-2"
+        )
+        let replacementPlan = retirementVisualPlanJSON(
+            planID: "retire-plan-visual-2",
+            planFingerprint: "retire-fingerprint-visual-2",
+            ownershipFingerprint: "planned-ownership-generation-4"
+        )
+        _ = try JSONDecoder().decode(
+            StandaloneRetirementPlan.self,
+            from: Data(firstPlan.utf8)
+        )
+        let service = RetirementVisualCoordinatorService(results: [
+            CommandExecution(stdout: firstPlan, stderr: "", exitStatus: 0),
+            staleFailure,
+            try retirementVisualInventoryExecution(
+                home: origin.home,
+                ownershipFingerprint: "refreshed-ownership-generation-3"
+            ),
+            try retirementVisualInventoryExecution(
+                home: origin.home,
+                ownershipFingerprint: "refreshed-ownership-generation-3"
+            ),
+            CommandExecution(stdout: replacementPlan, stderr: "", exitStatus: 0),
+        ])
+        let now = Date(timeIntervalSince1970: 1_768_219_200)
+        let store = OpsStore(
+            coordinatorService: service,
+            originDiscovery: VerticalLayoutOriginDiscovery(values: [origin]),
+            configurationStore: VerticalLayoutConfigurationStore(),
+            clock: VerticalLayoutClock(value: now)
+        )
+        var container = try JSONDecoder().decode(
+            DockerContainer.self,
+            from: Data(#"{"id":"immutable-copy-pg","name":"kosttracking-prod-copy-pg","status":"running","metadata_source":"normalized_store","attribution":{"reason_code":"ambiguous_control","explanation":"Observed without one authoritative repository binding","observed_by":["host-observer"],"controller":"docker-binding-1","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","ownership_fingerprint":"ownership-fingerprint-1","can_attach":true,"can_retire":true}}"#.utf8)
+        )
+        container.origin = origin
+        var inventory = Inventory.empty
+        inventory.docker = DockerSummary(
+            available: true,
+            error: nil,
+            statsError: nil,
+            containers: [container],
+            postgres: []
+        )
+        store.inventory = inventory
+        store.sourceStates = [
+            .init(origin: origin, phase: .loaded, checkedAt: now, resourceCount: 1)
+        ]
+        store.capabilityStates = CoordinatorCapability.allCases.map {
+            .init(origin: origin, capability: $0, phase: .available, checkedAt: now, error: nil)
+        }
+
+        let target = try XCTUnwrap(container.exactUnassignedResource)
+        store.planResourceRetirement(target)
+        do {
+            try await waitForRetirementVisualState("retirement plan prompt") {
+                store.resourceRetirementPrompt != nil
+            }
+        } catch {
+            let issueDetails = store.actionIssue?.details ?? "none"
+            let resultDetails = store.actionResults.values.map {
+                "\($0.phase.rawValue):\($0.failure ?? "none")"
+            }
+            XCTFail(
+                "retirement planning did not produce a prompt; issue=\(issueDetails) results=\(resultDetails)"
+            )
+            throw error
+        }
+        store.applyResourceRetirement(try XCTUnwrap(store.resourceRetirementPrompt))
+        try await waitForRetirementVisualState("selected stale-retirement incident") {
+            store.resourceRetirementPrompt == nil
+                && store.boardWorkspace == .activity
+                && store.selectedActionResultID != nil
+                && store.actionResults[store.selectedActionResultID!]?.phase == .failed
+                && store.selectedRetirementRecoveryActionTitle == "Refresh & re-plan"
+                && store.repositoryCatalog.unassigned.docker.contains {
+                    $0.representative.exactUnassignedResource?.ownershipFingerprint
+                        == "refreshed-ownership-generation-3"
+                }
+        }
+
+        let actionID = try XCTUnwrap(store.selectedActionResultID)
+        let planningActionID = try XCTUnwrap(
+            store.actionResults.first {
+                $0.value.request.title == "Plan retirement of kosttracking-prod-copy-pg"
+                    && $0.value.phase == .succeeded
+            }?.key
+        )
+        XCTAssertEqual(
+            store.retirementRecoveryContexts[actionID]?.recoveryAction,
+            .refreshAndReplan
+        )
+        XCTAssertEqual(store.actionIssue?.relatedActionID, actionID)
+        XCTAssertTrue(store.actionResults[actionID]?.stderr.contains(#""code":"lifecycle_plan_stale""#) == true)
+
+        store.showActivity(actionID: planningActionID)
+        XCTAssertNil(store.selectedRetirementRecoveryContext)
+        XCTAssertNil(store.selectedRetirementRecoveryActionTitle)
+        store.showActivity(actionID: actionID)
+        XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Refresh & re-plan")
+        let unowned = try JSONDecoder().decode(
+            ManagedServer.self,
+            from: Data(
+                #"{"id":"unowned-rendered","name":"unowned-rendered","status":"running"}"#.utf8
+            )
+        )
+        store.restart(unowned)
+        let unmatchedIssue = try XCTUnwrap(store.actionIssue)
+
+        let selectedRetirementView = hostMainBoard(
+            store: store,
+            width: desktopMainPaneWidth,
+            height: desktopWindowHeight
+        )
+        XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Refresh & re-plan")
+        XCTAssertTrue(
+            descendantViews(of: NSTextField.self, in: selectedRetirementView)
+                .contains { $0.stringValue == "Resource ownership generation changed after planning." },
+            "the selected retirement must remain the rendered Activity detail when an unrelated alert arrives"
+        )
+        XCTAssertFalse(
+            descendantViews(of: NSTextField.self, in: selectedRetirementView)
+                .contains { $0.stringValue == unmatchedIssue.summary },
+            "an unmatched alert must not visually replace the explicitly selected retirement"
+        )
+
+        store.showActivity(issueID: unmatchedIssue.id)
+        let selectedUnmatchedIssueView = hostMainBoard(
+            store: store,
+            width: desktopMainPaneWidth,
+            height: desktopWindowHeight
+        )
+        XCTAssertNil(
+            store.selectedRetirementRecoveryActionTitle,
+            "an unmatched alert must never inherit another incident's retirement action"
+        )
+        XCTAssertTrue(
+            descendantViews(of: NSTextField.self, in: selectedUnmatchedIssueView)
+                .contains { $0.stringValue == unmatchedIssue.summary },
+            "the Activity detail must display the explicitly selected unmatched alert"
+        )
+        store.showActivity(actionID: actionID)
+        XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Refresh & re-plan")
+
+        for (width, height) in [(mainPaneWidth, minimumWindowHeight), (desktopMainPaneWidth, desktopWindowHeight)] {
+            let hostingView = hostMainBoard(store: store, width: width, height: height)
+            XCTAssertEqual(
+                visibleVerticalScrollOwners(in: hostingView).count,
+                1,
+                "the exact stale-retirement incident must retain one vertical scroll owner at \(width)x\(height)"
+            )
+            try captureRasterIfRequested(
+                renderMainBoard(store: store, width: width, height: height),
+                name: "main-board-retirement-stale-\(width)x\(height)"
+            )
+        }
+        try captureRasterIfRequested(
+            renderOpsConsole(store: store, width: 1_592, height: 842),
+            name: "ops-console-retirement-stale-1592x842"
+        )
+
+        store.recoverSelectedRetirement()
+        try await waitForRetirementVisualState("replacement retirement plan") {
+            store.boardWorkspace == .resources
+                && store.resourceRetirementPrompt?.plan.planID == "retire-plan-visual-2"
+                && store.retirementRecoveryContexts[actionID] == nil
+        }
+        let calls = await service.capturedCalls()
+        XCTAssertEqual(calls.count, 5)
+        XCTAssertTrue(arguments(calls[0].1, contain: ["resource", "plan-retire"]))
+        XCTAssertTrue(arguments(calls[1].1, contain: ["resource", "retire"]))
+        XCTAssertEqual(calls[2].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+        XCTAssertEqual(calls[3].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+        XCTAssertTrue(arguments(calls[4].1, contain: ["resource", "plan-retire"]))
+        XCTAssertTrue(
+            arguments(calls[4].1, contain: [
+                "--ownership-fingerprint", "refreshed-ownership-generation-3",
+            ])
+        )
+    }
+
+    func testVerticalScrollTopologyGuardCatchesLegacyNestingWithoutCountingHorizontalOnlyScroll() {
+        let legacy = hostView(
+            LegacyNestedVerticalScrollFixture(),
             width: mainPaneWidth,
             height: minimumWindowHeight
         )
+        let legacyOwners = visibleVerticalScrollOwners(in: legacy)
+        XCTAssertGreaterThanOrEqual(
+            legacyOwners.count,
+            2,
+            "the guard must catch the former document plus Activity/table nested vertical scroll structure"
+        )
 
-        XCTAssertNil(
-            coordinator.pendingRequestID,
-            "the main board must consume a menu-bar Activity request after it appears"
+        let horizontalControl = hostView(
+            HorizontalOnlyScrollControlFixture(),
+            width: mainPaneWidth,
+            height: minimumWindowHeight
+        )
+        let horizontalControlOwners = visibleVerticalScrollOwners(in: horizontalControl)
+        XCTAssertEqual(
+            horizontalControlOwners.count,
+            1,
+            "a horizontal resource table must not be misclassified as a second vertical scroll owner: \(scrollTopologyDescription(horizontalControlOwners))"
+        )
+    }
+
+    func testActivityTechnicalDetailsAreSelectableAndExposeAnAccessibleCopyAction() throws {
+        let fixture = try makeDenseMinimumWindowFixture()
+        fixture.store.showActivity(actionID: fixture.actionID)
+        let hostingView = hostMainBoard(
+            store: fixture.store,
+            width: desktopMainPaneWidth,
+            height: desktopWindowHeight
+        )
+
+        let selectableEvidenceFields = descendantViews(of: NSTextField.self, in: hostingView)
+            .filter { $0.stringValue.contains("Fixture health check timed out") && $0.isSelectable }
+        XCTAssertTrue(
+            !selectableEvidenceFields.isEmpty,
+            "technical failure evidence must be selectable through the native text system"
+        )
+        XCTAssertTrue(
+            selectableEvidenceFields.allSatisfy { !$0.isEditable },
+            "selectable technical evidence must remain read-only"
+        )
+
+        let copyAction = try XCTUnwrap(
+            accessibilityObject(
+                identifier: "activity-copy-technical-details",
+                in: hostingView
+            ) ?? descendantViews(of: NSButton.self, in: hostingView).first {
+                $0.title == "Copy" || $0.accessibilityLabel() == "Copy"
+            },
+            "Activity must expose a keyboard/assistive-technology reachable Copy technical details action"
+        )
+        let copyRole = try XCTUnwrap(accessibilityRole(of: copyAction))
+        XCTAssertEqual(
+            String(describing: copyRole),
+            String(describing: NSAccessibility.Role.button)
+        )
+        XCTAssertTrue(
+            accessibilityIsEnabled(copyAction),
+            "the copy action must be enabled for a selected failed operation"
         )
     }
 }
@@ -405,6 +688,9 @@ private func makeDenseMinimumWindowFixture() throws -> DenseMinimumWindowFixture
         resource: inventory.servers[0].resourceIdentity,
         projectPath: projects[0]
     )
+    let technicalFailure = (1...48)
+        .map { "Fixture health check timed out (diagnostic line \($0))." }
+        .joined(separator: "\n")
     store.actionResults[actionID] = RetainedActionResult(
         request: request,
         phase: .failed,
@@ -413,7 +699,7 @@ private func makeDenseMinimumWindowFixture() throws -> DenseMinimumWindowFixture
         finishedAt: now,
         exitStatus: 1,
         stdout: "",
-        stderr: "Fixture health check timed out.",
+        stderr: technicalFailure,
         failure: "The health check did not become ready."
     )
     store.actionIssue = OpsIssue(
@@ -427,7 +713,111 @@ private func makeDenseMinimumWindowFixture() throws -> DenseMinimumWindowFixture
     )
 
     keepFixture = true
-    return DenseMinimumWindowFixture(store: store, fixtureRoot: fixtureRoot)
+    return DenseMinimumWindowFixture(
+        store: store,
+        fixtureRoot: fixtureRoot,
+        actionID: actionID
+    )
+}
+
+private actor RetirementVisualCoordinatorService: CoordinatorServing {
+    private var results: [CommandExecution]
+    private var calls: [(CoordinatorOrigin, [String])] = []
+
+    init(results: [CommandExecution]) {
+        self.results = results
+    }
+
+    func requestProjectRoot() async throws -> String? { "/workflow/repo" }
+
+    func execute(origin: CoordinatorOrigin, arguments: [String]) async throws -> CommandExecution {
+        calls.append((origin, arguments))
+        guard !results.isEmpty else {
+            throw RuntimeError("Retirement visual fixture exhausted its coordinator responses")
+        }
+        return try normalizedInventoryExecution(
+            results.removeFirst(),
+            origin: origin,
+            arguments: arguments
+        )
+    }
+
+    func capturedCalls() -> [(CoordinatorOrigin, [String])] { calls }
+}
+
+private func retirementVisualPlanJSON(
+    planID: String,
+    planFingerprint: String,
+    ownershipFingerprint: String
+) -> String {
+    """
+    {"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"\(planID)","resource_id":"docker:immutable-copy-pg","fingerprint":"\(planFingerprint)","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"docker:immutable-copy-pg","kind":"container","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","ownership_fingerprint":"\(ownershipFingerprint)","control_contract_fingerprint":"planned-controller-contract-1","display_name":"kosttracking-prod-copy-pg","current_state":"running","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}
+    """
+}
+
+private func retirementVisualInventoryExecution(
+    home: String,
+    ownershipFingerprint: String
+) throws -> CommandExecution {
+    let object: [String: Any] = [
+        "coordinator_home": home,
+        "state_path": "\(home)/state.json",
+        "urls": [],
+        "servers": [],
+        "leases": [],
+        "recent_events": [],
+        "docker": [
+            "available": true,
+            "containers": [[
+                "id": "immutable-copy-pg",
+                "name": "kosttracking-prod-copy-pg",
+                "status": "running",
+                "metadata_source": "normalized_store",
+                "attribution": [
+                    "reason_code": "ambiguous_control",
+                    "explanation": "Observed without one authoritative repository binding",
+                    "observed_by": ["host-observer"],
+                    "controller": "docker-binding-1",
+                    "host_resource_id": "docker:immutable-copy-pg",
+                    "immutable_fingerprint": "container-fingerprint-1",
+                    "control_binding_id": "docker-binding-1",
+                    "ownership_fingerprint": ownershipFingerprint,
+                    "can_attach": true,
+                    "can_retire": true,
+                ],
+            ]],
+            "postgres": [],
+        ],
+        "postgres": [],
+        "backups": [],
+        "project_usage": [],
+    ]
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    return CommandExecution(
+        stdout: String(decoding: data, as: UTF8.self),
+        stderr: "",
+        exitStatus: 0
+    )
+}
+
+private func arguments(_ actual: [String], contain expected: [String]) -> Bool {
+    guard !expected.isEmpty, expected.count <= actual.count else { return false }
+    return (0...(actual.count - expected.count)).contains { start in
+        Array(actual[start..<(start + expected.count)]) == expected
+    }
+}
+
+@MainActor
+private func waitForRetirementVisualState(
+    _ label: String,
+    attempts: Int = 100,
+    condition: @MainActor () -> Bool
+) async throws {
+    for _ in 0..<attempts {
+        if condition() { return }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    throw RuntimeError("Timed out waiting for the retirement visual fixture: \(label)")
 }
 
 @MainActor
@@ -508,15 +898,167 @@ private func renderRaster<Content: View>(
 private final class DenseMinimumWindowFixture {
     let store: OpsStore
     let fixtureRoot: URL
+    let actionID: UUID
 
-    init(store: OpsStore, fixtureRoot: URL) {
+    init(store: OpsStore, fixtureRoot: URL, actionID: UUID) {
         self.store = store
         self.fixtureRoot = fixtureRoot
+        self.actionID = actionID
     }
 
     deinit {
         try? FileManager.default.removeItem(at: fixtureRoot)
     }
+}
+
+private struct LegacyNestedVerticalScrollFixture: View {
+    var body: some View {
+        ScrollView(.vertical) {
+            VStack(spacing: 12) {
+                Color.white.opacity(0.08)
+                    .frame(height: 720)
+                ScrollView(.vertical) {
+                    Color.white.opacity(0.12)
+                        .frame(height: 620)
+                }
+                .frame(height: 220)
+            }
+        }
+        .frame(width: 524, height: 760)
+    }
+}
+
+private struct HorizontalOnlyScrollControlFixture: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            ScrollView(.vertical) {
+                Color.white.opacity(0.08)
+                    .frame(height: 900)
+            }
+            ScrollView(.horizontal) {
+                Color.white.opacity(0.12)
+                    .frame(width: 1_200, height: 80)
+            }
+            .frame(height: 100)
+        }
+        .frame(width: 524, height: 760)
+    }
+}
+
+@MainActor
+private func hostMainBoard(store: OpsStore, width: Int, height: Int) -> NSView {
+    hostView(
+        MainBoardView(store: store)
+            .frame(width: CGFloat(width), height: CGFloat(height), alignment: .topLeading)
+            .background(Theme.background)
+            .preferredColorScheme(.dark),
+        width: width,
+        height: height
+    )
+}
+
+@MainActor
+private func hostView<Content: View>(
+    _ view: Content,
+    width: Int,
+    height: Int
+) -> NSHostingView<Content> {
+    let hostingView = NSHostingView(rootView: view)
+    hostingView.frame = NSRect(x: 0, y: 0, width: width, height: height)
+    hostingView.layoutSubtreeIfNeeded()
+    hostingView.displayIfNeeded()
+    return hostingView
+}
+
+@MainActor
+private func descendantViews<ViewType: NSView>(
+    of type: ViewType.Type,
+    in root: NSView
+) -> [ViewType] {
+    var matches = root is ViewType ? [root as! ViewType] : []
+    for subview in root.subviews {
+        matches.append(contentsOf: descendantViews(of: type, in: subview))
+    }
+    return matches
+}
+
+@MainActor
+private func visibleVerticalScrollOwners(in root: NSView) -> [NSScrollView] {
+    descendantViews(of: NSScrollView.self, in: root).filter { scrollView in
+        scrollView.hasVerticalScroller
+            && !isHiddenInHierarchy(scrollView, stoppingAt: root)
+            && scrollView.frame.width > 1
+            && scrollView.frame.height > 1
+    }
+}
+
+@MainActor
+private func isHiddenInHierarchy(_ view: NSView, stoppingAt root: NSView) -> Bool {
+    var current: NSView? = view
+    while let candidate = current {
+        if candidate.isHidden || candidate.alphaValue <= 0.001 { return true }
+        if candidate === root { return false }
+        current = candidate.superview
+    }
+    return true
+}
+
+@MainActor
+private func scrollTopologyDescription(_ scrollViews: [NSScrollView]) -> String {
+    scrollViews.map {
+        "\(String(describing: type(of: $0))) frame=\($0.frame) horizontal=\($0.hasHorizontalScroller) vertical=\($0.hasVerticalScroller)"
+    }.joined(separator: "; ")
+}
+
+@MainActor
+private func accessibilityObject(identifier: String, in root: NSView) -> NSObject? {
+    var pending: [NSObject] = [root]
+    var visited = Set<ObjectIdentifier>()
+    while let object = pending.popLast() {
+        guard visited.insert(ObjectIdentifier(object)).inserted else { continue }
+        if accessibilityIdentifier(of: object) == identifier {
+            return object
+        }
+        pending.append(contentsOf: accessibilityChildren(of: object))
+        if let view = object as? NSView {
+            pending.append(contentsOf: view.subviews)
+        }
+    }
+    return nil
+}
+
+@MainActor
+private func accessibilityIdentifier(of object: NSObject) -> String? {
+    if let view = object as? NSView { return view.accessibilityIdentifier() }
+    if let element = object as? NSAccessibilityElement { return element.accessibilityIdentifier() }
+    return nil
+}
+
+@MainActor
+private func accessibilityChildren(of object: NSObject) -> [NSObject] {
+    let children: [Any]?
+    if let view = object as? NSView {
+        children = view.accessibilityChildren()
+    } else if let element = object as? NSAccessibilityElement {
+        children = element.accessibilityChildren()
+    } else {
+        children = nil
+    }
+    return children?.compactMap { $0 as? NSObject } ?? []
+}
+
+@MainActor
+private func accessibilityRole(of object: NSObject) -> NSAccessibility.Role? {
+    if let view = object as? NSView { return view.accessibilityRole() }
+    if let element = object as? NSAccessibilityElement { return element.accessibilityRole() }
+    return nil
+}
+
+@MainActor
+private func accessibilityIsEnabled(_ object: NSObject) -> Bool {
+    if let view = object as? NSView { return view.isAccessibilityEnabled() }
+    if let element = object as? NSAccessibilityElement { return element.isAccessibilityEnabled() }
+    return false
 }
 
 private struct VerticalLayoutOriginDiscovery: CoordinatorOriginDiscovering {

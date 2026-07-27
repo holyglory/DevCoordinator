@@ -214,6 +214,9 @@ final class OpsStore: ObservableObject {
     @Published var selectedProjectName: String?
     @Published var sidebarSelection: SidebarSelection?
     @Published var activeTab: ResourceTab = .servers
+    @Published var boardWorkspace: BoardWorkspace = .resources
+    @Published var selectedActionResultID: UUID?
+    @Published var selectedActivityIssueID: UUID?
     @Published var searchText = ""
     @Published var filter: ServiceFilter = .all
     @Published var isLoading = false
@@ -229,6 +232,7 @@ final class OpsStore: ObservableObject {
     @Published var workerRemovalPrompt: WorkerRemovalPrompt?
     @Published var resourceAttachPrompt: ResourceAttachPrompt?
     @Published var resourceRetirementPrompt: ResourceRetirementPrompt?
+    @Published private(set) var retirementRecoveryContexts: [UUID: ResourceRetirementRecoveryContext] = [:]
     @Published var serverLogTitle = "Server Logs"
     @Published var serverLogText = ""
     @Published var serverLogMetadata = ""
@@ -2068,7 +2072,7 @@ final class OpsStore: ObservableObject {
     }
 
     func dismissActionIssue() {
-        actionIssue = nil
+        replaceActionIssue(with: nil)
         if lastErrorSource == "action" { clearLegacyError() }
     }
 
@@ -2106,16 +2110,115 @@ final class OpsStore: ObservableObject {
         NSPasteboard.general.setString(detail, forType: .string)
     }
 
+    var sortedActionResults: [RetainedActionResult] {
+        actionResults.values.sorted { lhs, rhs in
+            if lhs.queuedAt != rhs.queuedAt { return lhs.queuedAt > rhs.queuedAt }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    var selectedActionResult: RetainedActionResult? {
+        if let selectedActionResultID, let selected = actionResults[selectedActionResultID] {
+            return selected
+        }
+        return sortedActionResults.first
+    }
+
+    /// The retained action that owns the Activity workspace's current context.
+    /// An unmatched issue is its own context and must not inherit an older
+    /// selected action merely because one remains in retained history.
+    var selectedActivityActionResult: RetainedActionResult? {
+        guard selectedActivityIssueID == nil,
+              let selectedActionResultID
+        else { return nil }
+        return actionResults[selectedActionResultID]
+    }
+
+    /// The issue that belongs to the Activity workspace's current selection.
+    /// A newer global issue must not replace another selected action's header,
+    /// details, or recovery control.
+    var selectedActivityActionIssue: OpsIssue? {
+        guard let issue = actionIssue else { return nil }
+        if let selectedActivityIssueID {
+            return issue.id == selectedActivityIssueID ? issue : nil
+        }
+        guard let selectedActionResultID,
+              issue.relatedActionID == selectedActionResultID
+        else { return nil }
+        return issue
+    }
+
+    var selectedRetirementRecoveryContext: ResourceRetirementRecoveryContext? {
+        guard let selectedActionResultID else { return nil }
+        return retirementRecoveryContexts[selectedActionResultID]
+    }
+
+    var selectedRetirementRecoveryAction: ResourceRetirementRecoveryAction? {
+        selectedRetirementRecoveryContext?.recoveryAction
+    }
+
+    var selectedRetirementRecoveryActionTitle: String? {
+        switch selectedRetirementRecoveryAction {
+        case .refreshAndReplan: return "Refresh & re-plan"
+        case .retryConfirmedOperation: return "Retry confirmed operation"
+        case nil: return nil
+        }
+    }
+
+    /// Compatibility for the existing attention header. Recovery authority is
+    /// action-scoped; an unrelated selected incident must never expose a target.
+    var lastFailedRetirementTarget: ExactUnassignedResource? {
+        guard selectedRetirementRecoveryAction != nil else { return nil }
+        return selectedRetirementRecoveryContext?.prompt.target
+    }
+
+    func showActivity(actionID: UUID? = nil) {
+        boardWorkspace = .activity
+        if let actionID, actionResults[actionID] != nil {
+            selectedActionResultID = actionID
+            selectedActivityIssueID = nil
+        } else if let issue = actionIssue,
+                  issue.relatedActionID == nil
+                    || issue.relatedActionID.flatMap({ actionResults[$0] }) == nil
+        {
+            selectedActivityIssueID = issue.id
+            selectedActionResultID = nil
+        } else if selectedActionResultID.flatMap({ actionResults[$0] }) == nil {
+            selectedActionResultID = sortedActionResults.first?.id
+            selectedActivityIssueID = nil
+        }
+    }
+
+    func showActivity(issueID: UUID) {
+        boardWorkspace = .activity
+        guard let issue = actionIssue, issue.id == issueID else { return }
+        if let actionID = issue.relatedActionID, actionResults[actionID] != nil {
+            selectedActionResultID = actionID
+            selectedActivityIssueID = nil
+        } else {
+            selectedActionResultID = nil
+            selectedActivityIssueID = issue.id
+        }
+    }
+
+    func showResources() {
+        boardWorkspace = .resources
+    }
+
     func dismissActionResult(_ result: RetainedActionResult) {
         guard result.phase != .queued && result.phase != .running else { return }
         actionResults.removeValue(forKey: result.id)
+        retirementRecoveryContexts.removeValue(forKey: result.id)
+        if selectedActionResultID == result.id {
+            selectedActionResultID = sortedActionResults.first?.id
+        }
         if actionIssue?.relatedActionID == result.id {
             clearActionErrorIfPresent(actionID: result.id)
         }
     }
 
     func clearLastError() {
-        if lastErrorSource == "action" { actionIssue = nil }
+        if lastErrorSource == "action" { replaceActionIssue(with: nil) }
         clearLegacyError()
     }
 
@@ -2128,8 +2231,36 @@ final class OpsStore: ObservableObject {
 
     private func clearActionErrorIfPresent(actionID: UUID) {
         guard actionIssue?.relatedActionID == actionID else { return }
-        actionIssue = nil
+        replaceActionIssue(with: nil)
         if lastErrorSource == "action" { clearLegacyError() }
+    }
+
+    private func replaceActionIssue(with replacement: OpsIssue?) {
+        let replacingSelectedIssue: Bool
+        if let currentIssue = actionIssue {
+            replacingSelectedIssue = selectedActivityIssueID == currentIssue.id
+        } else {
+            replacingSelectedIssue = false
+        }
+        actionIssue = replacement
+        guard replacingSelectedIssue else { return }
+
+        if let replacement {
+            if let actionID = replacement.relatedActionID,
+               actionResults[actionID] != nil
+            {
+                selectedActionResultID = actionID
+                selectedActivityIssueID = nil
+            } else {
+                selectedActionResultID = nil
+                selectedActivityIssueID = replacement.id
+            }
+        } else {
+            selectedActivityIssueID = nil
+            if selectedActionResultID.flatMap({ actionResults[$0] }) == nil {
+                selectedActionResultID = sortedActionResults.first?.id
+            }
+        }
     }
 
     func selectProject(_ name: String) {
@@ -2303,7 +2434,11 @@ final class OpsStore: ObservableObject {
             origin: prompt.origin,
             resource: identity,
             projectPath: prompt.projectPath
-        ) else { return }
+        ) else {
+            repositoryDecommissionPrompt = nil
+            showActivity()
+            return
+        }
         let request = beginAction(
             kind: .repositoryDecommission,
             title: "Remove \(prompt.plan.displayName ?? prompt.projectPath)",
@@ -2311,6 +2446,8 @@ final class OpsStore: ObservableObject {
             resource: identity,
             projectPath: prompt.projectPath
         )
+        repositoryDecommissionPrompt = nil
+        showActivity(actionID: request.id)
         Task {
             markActionRunning(request.id)
             let arguments = [
@@ -2356,7 +2493,6 @@ final class OpsStore: ObservableObject {
                         "Coordinator did not prove the repository hidden and stopped after removal"
                     )
                 }
-                repositoryDecommissionPrompt = nil
                 finishAction(request.id, execution: execution)
                 clearActionErrorIfPresent(actionID: request.id)
                 await loadInventory(force: true)
@@ -2430,6 +2566,8 @@ final class OpsStore: ObservableObject {
             resource: identity,
             projectPath: projectPath
         )
+        resourceAttachPrompt = nil
+        showActivity(actionID: request.id)
         Task {
             markActionRunning(request.id)
             let arguments = ["resource", "attach"]
@@ -2466,7 +2604,6 @@ final class OpsStore: ObservableObject {
                 else {
                     throw RuntimeError("Coordinator did not prove this exact resource attached without starting it")
                 }
-                resourceAttachPrompt = nil
                 finishAction(request.id, execution: execution)
                 clearActionErrorIfPresent(actionID: request.id)
                 await loadInventory(force: true)
@@ -2484,7 +2621,10 @@ final class OpsStore: ObservableObject {
         }
     }
 
-    func planResourceRetirement(_ target: ExactUnassignedResource) {
+    func planResourceRetirement(
+        _ target: ExactUnassignedResource,
+        replacingRecoveryActionID: UUID? = nil
+    ) {
         let identity = resourceIdentity(for: target)
         guard requireMutationAvailability(
             title: "Plan retirement of \(target.displayName)",
@@ -2529,18 +2669,35 @@ final class OpsStore: ObservableObject {
                     StandaloneRetirementPlan.self,
                     from: Data(execution.stdout.utf8)
                 )
-                guard plan.kind == "standalone_resource_retirement",
+                guard hasSemanticLifecycleIdentity(plan.planID),
+                      hasSemanticLifecycleIdentity(plan.fingerprint),
+                      hasSemanticLifecycleIdentity(plan.resourceID),
+                      plan.kind == "standalone_resource_retirement",
                       plan.resourceID == target.hostResourceID,
                       plan.targets.count == 1,
-                      plan.targets[0].hostResourceID == target.hostResourceID
+                      hasSemanticLifecycleIdentity(plan.targets[0].targetID),
+                      hasSemanticLifecycleIdentity(plan.targets[0].hostResourceID),
+                      hasSemanticLifecycleIdentity(plan.targets[0].immutableFingerprint),
+                      hasSemanticLifecycleIdentity(plan.targets[0].controlBindingID),
+                      plan.targets[0].targetID == target.hostResourceID,
+                      plan.targets[0].hostResourceID == target.hostResourceID,
+                      plan.targets[0].kind == target.kind,
+                      plan.targets[0].immutableFingerprint == target.immutableFingerprint,
+                      plan.targets[0].controlBindingID == target.controlBindingID,
+                      plan.targets[0].controlContractFingerprint?
+                        .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+                      plan.targets[0].identityArguments != nil
                 else {
-                    throw RuntimeError("Coordinator returned a retirement plan for a different resource")
+                    throw RuntimeError("Coordinator returned a retirement plan without the exact refreshed resource identity")
                 }
                 resourceRetirementPrompt = ResourceRetirementPrompt(
                     target: target,
                     plan: plan,
                     requestProject: requestProject
                 )
+                if let replacingRecoveryActionID {
+                    retirementRecoveryContexts.removeValue(forKey: replacingRecoveryActionID)
+                }
                 finishAction(request.id, execution: execution)
                 clearActionErrorIfPresent(actionID: request.id)
             } catch {
@@ -2560,41 +2717,102 @@ final class OpsStore: ObservableObject {
         resourceRetirementPrompt = nil
     }
 
-    func applyResourceRetirement(_ prompt: ResourceRetirementPrompt) {
+    func applyResourceRetirement(
+        _ prompt: ResourceRetirementPrompt,
+        recoveringActionID: UUID? = nil
+    ) {
         let identity = resourceIdentity(for: prompt.target)
         guard requireMutationAvailability(
             title: "Retire \(prompt.target.displayName)",
             kind: .retireStandaloneResource,
             origin: prompt.target.origin,
             resource: identity
-        ) else { return }
+        ) else {
+            resourceRetirementPrompt = nil
+            showActivity()
+            return
+        }
+        guard hasSemanticLifecycleIdentity(prompt.plan.planID),
+              hasSemanticLifecycleIdentity(prompt.plan.fingerprint),
+              hasSemanticLifecycleIdentity(prompt.plan.resourceID),
+              let plannedTarget = prompt.plan.targets.first,
+              hasSemanticLifecycleIdentity(plannedTarget.targetID),
+              hasSemanticLifecycleIdentity(plannedTarget.hostResourceID),
+              hasSemanticLifecycleIdentity(plannedTarget.immutableFingerprint),
+              hasSemanticLifecycleIdentity(plannedTarget.controlBindingID),
+              plannedTarget.targetID == prompt.target.hostResourceID,
+              plannedTarget.hostResourceID == prompt.target.hostResourceID,
+              plannedTarget.kind == prompt.target.kind,
+              plannedTarget.immutableFingerprint == prompt.target.immutableFingerprint,
+              plannedTarget.controlBindingID == prompt.target.controlBindingID,
+              plannedTarget.controlContractFingerprint?
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+              let plannedIdentityArguments = plannedTarget.identityArguments
+        else {
+            resourceRetirementPrompt = nil
+            setLastError(
+                title: "Resource retirement plan is incomplete",
+                summary: "The confirmed plan does not contain the refreshed exact resource identity.",
+                details: "No resource was changed. Refresh and create a new retirement plan with the current Coordinator.",
+                source: "action"
+            )
+            showActivity()
+            return
+        }
         let request = beginAction(
             kind: .retireStandaloneResource,
             title: "Retire \(prompt.target.displayName)",
             origin: prompt.target.origin,
             resource: identity
         )
+        resourceRetirementPrompt = nil
+        clearRetirementRecoveryContexts(for: prompt)
+        showActivity(actionID: request.id)
         Task {
             markActionRunning(request.id)
             let arguments = ["resource", "retire"]
-                + prompt.target.identityArguments
+                + plannedIdentityArguments
                 + [
                     "--request-project", prompt.requestProject,
                     "--agent", agentID,
                     "--plan-id", prompt.plan.planID,
                     "--plan-fingerprint", prompt.plan.fingerprint,
                 ]
+            var retainedExecution: CommandExecution?
             do {
                 let execution = try await coordinatorService.execute(
                     origin: prompt.target.origin,
                     arguments: arguments
                 )
+                retainedExecution = execution
                 guard execution.exitStatus == 0 else {
-                    failAction(request.id, execution: execution, failure: commandFailureMessage(execution))
-                    setCommandFailure(
-                        title: "Retire \(prompt.target.displayName)",
-                        command: ["python3", "<coordinator>"] + arguments,
-                        result: execution,
+                    let commandFailure = lifecycleCommandFailure(from: execution)
+                    let failure = commandFailure?.error ?? commandFailureMessage(execution)
+                    failAction(request.id, execution: execution, failure: failure)
+                    retainRetirementRecovery(
+                        actionID: request.id,
+                        prompt: prompt,
+                        recoveryAction: {
+                            if commandFailure?.isPreMutationStalePlan == true {
+                                return .refreshAndReplan
+                            }
+                            if commandFailure?.isFencedResumeFailure == true {
+                                return .retryConfirmedOperation
+                            }
+                            return nil
+                        }(),
+                        commandFailure: commandFailure
+                    )
+                    setLastError(
+                        title: "Retire \(prompt.target.displayName) failed",
+                        summary: failure,
+                        details: retirementCommandFailureDetails(
+                            title: "Retire \(prompt.target.displayName)",
+                            command: ["python3", "<coordinator>"] + arguments,
+                            execution: execution,
+                            failure: commandFailure
+                        ),
+                        source: "action",
                         actionID: request.id
                     )
                     await loadInventory(force: true)
@@ -2604,34 +2822,291 @@ final class OpsStore: ObservableObject {
                     RepositoryLifecycleResult.self,
                     from: Data(execution.stdout.utf8)
                 )
-                guard result.resourceID == prompt.target.hostResourceID,
-                      (result.status == "succeeded" || result.status == "already_complete"),
-                      result.hidden,
-                      !result.started
-                else {
+                if let contractFailure = retirementResultContractFailure(
+                    result,
+                    prompt: prompt
+                ) {
+                    throw RuntimeError(contractFailure)
+                }
+                if result.status == "needs_attention" {
+                    guard retirementResultIsCoherentNeedsAttention(result) else {
+                        throw RuntimeError(
+                            "Coordinator did not return coherent retry evidence for the confirmed retirement"
+                        )
+                    }
                     let failures = result.errors.map(\.message)
                         + result.targets.compactMap { $0.error?.message }
+                    let failure = failures.isEmpty
+                        ? "Coordinator did not prove this exact resource retired and hidden"
+                        : failures.joined(separator: "\n")
+                    failAction(request.id, execution: execution, failure: failure)
+                    retainRetirementRecovery(
+                        actionID: request.id,
+                        prompt: prompt,
+                        recoveryAction: .retryConfirmedOperation,
+                        resultStatus: result.status
+                    )
+                    setLastError(
+                        title: "Retire \(prompt.target.displayName) needs attention",
+                        summary: failure,
+                        details: "The confirmed operation is fenced and its evidence is retained in Activity. Retry this exact confirmed plan; do not create a replacement plan.",
+                        source: "action",
+                        actionID: request.id
+                    )
+                    await loadInventory(force: true)
+                    return
+                }
+                guard retirementResultIsCoherentSuccess(result) else {
                     throw RuntimeError(
-                        failures.isEmpty
-                            ? "Coordinator did not prove this exact resource retired and hidden"
-                            : failures.joined(separator: "\n")
+                        "Coordinator did not return coherent terminal evidence for this exact retirement"
                     )
                 }
-                resourceRetirementPrompt = nil
+                clearRetirementRecoveryContexts(for: prompt)
                 finishAction(request.id, execution: execution)
+                if let recoveringActionID {
+                    clearActionErrorIfPresent(actionID: recoveringActionID)
+                }
                 clearActionErrorIfPresent(actionID: request.id)
                 await loadInventory(force: true)
             } catch {
-                failAction(request.id, error: error)
+                failAction(
+                    request.id,
+                    execution: retainedExecution,
+                    failure: error.localizedDescription,
+                    error: error
+                )
+                retainRetirementRecovery(
+                    actionID: request.id,
+                    prompt: prompt,
+                    recoveryAction: nil
+                )
                 setLastError(
                     title: "Resource retirement needs attention",
                     summary: error.localizedDescription,
-                    details: "The coordinator keeps the retirement fence after partial work. Review the retained exact-target evidence before retrying.",
+                    details: "The response could not be proved to belong to the confirmed retirement plan. Review the retained Activity evidence before taking another action.",
                     source: "action",
                     actionID: request.id
                 )
                 await loadInventory(force: true)
             }
+        }
+    }
+
+    func refreshAndReplanFailedRetirement() {
+        guard let recovery = selectedRetirementRecoveryContext,
+              let recoveryAction = recovery.recoveryAction
+        else {
+            refresh()
+            return
+        }
+        if recoveryAction == .retryConfirmedOperation {
+            applyResourceRetirement(
+                recovery.prompt,
+                recoveringActionID: recovery.actionID
+            )
+            return
+        }
+        let failedTarget = recovery.prompt.target
+        Task {
+            await loadInventory(force: true)
+            guard let refreshedTarget = refreshedUnassignedResource(matching: failedTarget) else {
+                retirementRecoveryContexts.removeValue(forKey: recovery.actionID)
+                setLastError(
+                    title: "Retirement target is no longer available",
+                    summary: "The refreshed inventory no longer contains this standalone resource.",
+                    details: "It may already be retired or assigned to a repository. Review Resources before taking another action.",
+                    source: "action"
+                )
+                showResources()
+                return
+            }
+            dismissActionIssue()
+            showResources()
+            planResourceRetirement(
+                refreshedTarget,
+                replacingRecoveryActionID: recovery.actionID
+            )
+        }
+    }
+
+    func recoverSelectedRetirement() {
+        refreshAndReplanFailedRetirement()
+    }
+
+    private func refreshedUnassignedResource(
+        matching target: ExactUnassignedResource
+    ) -> ExactUnassignedResource? {
+        if target.kind == "server" {
+            return repositoryCatalog.unassigned.servers
+                .compactMap { $0.server.exactUnassignedResource }
+                .first {
+                    $0.origin.id == target.origin.id
+                        && $0.hostResourceID == target.hostResourceID
+                }
+        }
+        return repositoryCatalog.unassigned.docker
+            .compactMap { $0.representative.exactUnassignedResource }
+            .first {
+                $0.origin.id == target.origin.id
+                    && $0.hostResourceID == target.hostResourceID
+            }
+    }
+
+    private func lifecycleCommandFailure(
+        from execution: CommandExecution
+    ) -> LifecycleCommandFailurePayload? {
+        for output in [execution.stderr, execution.stdout] {
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let data = trimmed.data(using: .utf8),
+                  let payload = try? JSONDecoder().decode(
+                    LifecycleCommandFailurePayload.self,
+                    from: data
+                  )
+            else { continue }
+            return payload
+        }
+        return nil
+    }
+
+    private func hasSemanticLifecycleIdentity(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func retirementCommandFailureDetails(
+        title: String,
+        command: [String],
+        execution: CommandExecution,
+        failure: LifecycleCommandFailurePayload?
+    ) -> String {
+        var sections: [String] = []
+        if let actionRequired = failure?.actionRequired?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ),
+           !actionRequired.isEmpty
+        {
+            sections.append(actionRequired)
+        }
+        if failure?.priorOperationEffectsPossible == true,
+           failure?.mutationPerformed == false
+        {
+            sections.append(
+                "This retry performed no additional host mutation; the original fenced operation may already have retained host effects."
+            )
+        } else if failure?.priorOperationEffectsPossible == true {
+            sections.append(
+                "The confirmed operation remains fenced and may already have host effects. Inspect the retained evidence before retrying the exact operation."
+            )
+        } else if failure?.mutationPerformed == false {
+            sections.append("The rejected call performed no host mutation.")
+        }
+        sections.append(
+            commandFailureDetails(
+                title: title,
+                command: command,
+                result: execution,
+                thrownError: nil
+            )
+        )
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func retirementResultContractFailure(
+        _ result: RepositoryLifecycleResult,
+        prompt: ResourceRetirementPrompt
+    ) -> String? {
+        guard hasSemanticLifecycleIdentity(result.operationID),
+              hasSemanticLifecycleIdentity(result.planID),
+              hasSemanticLifecycleIdentity(result.planFingerprint)
+        else {
+            return "Coordinator returned blank retirement operation or execution-plan identity"
+        }
+        guard result.kind == "standalone_resource_retirement" else {
+            return "Coordinator returned a different lifecycle operation kind"
+        }
+        guard result.resourceID == prompt.target.hostResourceID else {
+            return "Coordinator returned retirement evidence for another host resource"
+        }
+        guard let confirmed = result.confirmedPlan,
+              hasSemanticLifecycleIdentity(confirmed.planID),
+              hasSemanticLifecycleIdentity(confirmed.planFingerprint),
+              confirmed.planID == prompt.plan.planID,
+              confirmed.planFingerprint == prompt.plan.fingerprint
+        else {
+            return "Coordinator did not bind the result to the confirmed retirement plan"
+        }
+        guard let execution = result.executionPlan,
+              hasSemanticLifecycleIdentity(execution.planID),
+              hasSemanticLifecycleIdentity(execution.planFingerprint),
+              execution.planID == result.planID,
+              execution.planFingerprint == result.planFingerprint
+        else {
+            return "Coordinator returned inconsistent retirement execution-plan evidence"
+        }
+        guard result.targets.count == 1,
+              result.targets[0].targetID == prompt.target.hostResourceID,
+              result.targets[0].kind == prompt.target.kind
+        else {
+            return "Coordinator returned retirement target evidence for another resource"
+        }
+        return nil
+    }
+
+    private func retirementResultIsCoherentSuccess(
+        _ result: RepositoryLifecycleResult
+    ) -> Bool {
+        guard result.status == "succeeded" || result.status == "already_complete",
+              result.fence == "disabled",
+              result.hidden,
+              !result.started,
+              result.errors.isEmpty,
+              result.targets.count == 1
+        else { return false }
+        let target = result.targets[0]
+        return target.status == "succeeded"
+            && target.phase == "complete"
+            && target.error == nil
+    }
+
+    private func retirementResultIsCoherentNeedsAttention(
+        _ result: RepositoryLifecycleResult
+    ) -> Bool {
+        guard result.status == "needs_attention",
+              result.fence == "retained",
+              !result.hidden,
+              !result.started,
+              result.targets.count == 1
+        else { return false }
+        let target = result.targets[0]
+        return target.status == "failed"
+            && target.phase != "complete"
+            && (target.error != nil || !result.errors.isEmpty)
+    }
+
+    private func retainRetirementRecovery(
+        actionID: UUID,
+        prompt: ResourceRetirementPrompt,
+        recoveryAction: ResourceRetirementRecoveryAction?,
+        commandFailure: LifecycleCommandFailurePayload? = nil,
+        resultStatus: String? = nil
+    ) {
+        retirementRecoveryContexts[actionID] = ResourceRetirementRecoveryContext(
+            actionID: actionID,
+            prompt: prompt,
+            recoveryAction: recoveryAction,
+            commandFailure: commandFailure,
+            resultStatus: resultStatus
+        )
+    }
+
+    private func clearRetirementRecoveryContexts(
+        for prompt: ResourceRetirementPrompt
+    ) {
+        retirementRecoveryContexts = retirementRecoveryContexts.filter { entry in
+            let context = entry.value
+            return context.prompt.target.origin.id != prompt.target.origin.id
+                || context.prompt.plan.planID != prompt.plan.planID
         }
     }
 
@@ -2915,7 +3390,11 @@ final class OpsStore: ObservableObject {
             origin: prompt.origin,
             resource: identity,
             projectPath: prompt.context.effectiveCanonicalRoot
-        ) else { return }
+        ) else {
+            workerRemovalPrompt = nil
+            showActivity()
+            return
+        }
         let request = beginAction(
             kind: .workerRemovalApply,
             title: prompt.plan.isPermanent
@@ -2925,6 +3404,8 @@ final class OpsStore: ObservableObject {
             resource: identity,
             projectPath: prompt.context.effectiveCanonicalRoot
         )
+        workerRemovalPrompt = nil
+        showActivity(actionID: request.id)
         Task {
             markActionRunning(request.id)
             do {
@@ -4323,6 +4804,10 @@ final class OpsStore: ObservableObject {
             .sorted { $0.queuedAt < $1.queuedAt }
         for stale in completed.prefix(max(0, actionResults.count - 200)) {
             actionResults.removeValue(forKey: stale.id)
+            retirementRecoveryContexts.removeValue(forKey: stale.id)
+            if selectedActionResultID == stale.id {
+                selectedActionResultID = nil
+            }
         }
         return request
     }
@@ -4525,7 +5010,7 @@ final class OpsStore: ObservableObject {
             relatedActionID: source == "action" ? actionID : nil
         )
         if source == "action" {
-            actionIssue = issue
+            replaceActionIssue(with: issue)
         } else {
             inventoryIssue = issue
         }

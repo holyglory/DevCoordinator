@@ -35,6 +35,8 @@ struct RepositoryDecommissionTarget: Decodable, Hashable, Sendable, Identifiable
     let hostResourceID: String
     let immutableFingerprint: String
     let controlBindingID: String
+    let ownershipFingerprint: String?
+    let controlContractFingerprint: String?
     let displayName: String?
     let currentState: String?
     let policies: [RepositoryLifecyclePolicy]
@@ -46,10 +48,26 @@ struct RepositoryDecommissionTarget: Decodable, Hashable, Sendable, Identifiable
         case hostResourceID = "host_resource_id"
         case immutableFingerprint = "immutable_fingerprint"
         case controlBindingID = "control_binding_id"
+        case ownershipFingerprint = "ownership_fingerprint"
+        case controlContractFingerprint = "control_contract_fingerprint"
         case displayName = "display_name"
         case currentState = "current_state"
         case policies
         case allocations
+    }
+
+    var identityArguments: [String]? {
+        guard let ownershipFingerprint = ownershipFingerprint?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !ownershipFingerprint.isEmpty
+        else { return nil }
+        return [
+            "--resource-kind", kind,
+            "--resource-id", hostResourceID,
+            "--immutable-fingerprint", immutableFingerprint,
+            "--control-binding-id", controlBindingID,
+            "--ownership-fingerprint", ownershipFingerprint,
+        ]
     }
 }
 
@@ -148,6 +166,56 @@ struct RepositoryLifecycleFailure: Decodable, Hashable, Sendable {
     }
 }
 
+struct RepositoryLifecyclePlanReference: Decodable, Hashable, Sendable {
+    let planID: String
+    let planFingerprint: String
+
+    private enum CodingKeys: String, CodingKey {
+        case planID = "plan_id"
+        case planFingerprint = "plan_fingerprint"
+    }
+}
+
+struct LifecycleCommandFailurePayload: Decodable, Hashable, Sendable {
+    let error: String
+    let code: String?
+    let classification: String?
+    let mutationPerformed: Bool?
+    let priorOperationEffectsPossible: Bool?
+    let recoveryScope: String?
+    let replacementPlanAllowed: Bool?
+    let actionRequired: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case error, code, classification
+        case mutationPerformed = "mutation_performed"
+        case priorOperationEffectsPossible = "prior_operation_effects_possible"
+        case recoveryScope = "recovery_scope"
+        case replacementPlanAllowed = "replacement_plan_allowed"
+        case actionRequired = "action_required"
+    }
+
+    var isPreMutationStalePlan: Bool {
+        code == "lifecycle_plan_stale"
+            && classification == "lifecycle_target_identity_changed"
+            && mutationPerformed == false
+            && priorOperationEffectsPossible != true
+    }
+
+    var isFencedResumeStalePlan: Bool {
+        code == "lifecycle_fenced_resume_stale"
+            && classification == "lifecycle_fenced_resume_identity_changed"
+            && mutationPerformed == false
+            && isFencedResumeFailure
+    }
+
+    var isFencedResumeFailure: Bool {
+        priorOperationEffectsPossible == true
+            && recoveryScope == "exact_confirmed_operation"
+            && replacementPlanAllowed == false
+    }
+}
+
 struct RepositoryLifecycleResult: Decodable, Hashable, Sendable {
     let schemaVersion: Int
     let operationID: String
@@ -163,6 +231,8 @@ struct RepositoryLifecycleResult: Decodable, Hashable, Sendable {
     let retainedData: [String]
     let targets: [RepositoryLifecycleTargetResult]
     let errors: [RepositoryLifecycleFailure]
+    let confirmedPlan: RepositoryLifecyclePlanReference?
+    let executionPlan: RepositoryLifecyclePlanReference?
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
@@ -175,6 +245,8 @@ struct RepositoryLifecycleResult: Decodable, Hashable, Sendable {
         case status, fence, hidden, started
         case retainedData = "retained_data"
         case targets, errors
+        case confirmedPlan = "confirmed_plan"
+        case executionPlan = "execution_plan"
     }
 }
 
@@ -243,6 +315,20 @@ struct ResourceRetirementPrompt: Identifiable, Hashable, Sendable {
     let target: ExactUnassignedResource
     let plan: StandaloneRetirementPlan
     let requestProject: String
+}
+
+enum ResourceRetirementRecoveryAction: String, Hashable, Sendable {
+    case refreshAndReplan
+    case retryConfirmedOperation
+}
+
+struct ResourceRetirementRecoveryContext: Identifiable, Hashable, Sendable {
+    var id: UUID { actionID }
+    let actionID: UUID
+    let prompt: ResourceRetirementPrompt
+    let recoveryAction: ResourceRetirementRecoveryAction?
+    let commandFailure: LifecycleCommandFailurePayload?
+    let resultStatus: String?
 }
 
 struct ResourceAttachResult: Decodable, Hashable, Sendable {

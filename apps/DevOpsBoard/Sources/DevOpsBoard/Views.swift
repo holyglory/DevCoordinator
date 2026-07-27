@@ -21,7 +21,7 @@ let minimumReadableSidebarWidth: CGFloat = 320
 let defaultSidebarWidth: CGFloat = 320
 let maximumSidebarWidth: CGFloat = 520
 let minimumMainWidth: CGFloat = 420
-let minimumCompactMainWidth: CGFloat = 260
+let minimumCompactMainWidth: CGFloat = 320
 let minimumInspectorWidth: CGFloat = 320
 let maximumInspectorWidth: CGFloat = 500
 let sidebarFooterInset: CGFloat = 18
@@ -561,75 +561,32 @@ struct ProjectNode: View {
     }
 }
 
-@MainActor
-final class ActivityReviewCoordinator: ObservableObject {
-    static let shared = ActivityReviewCoordinator()
-
-    @Published private(set) var pendingRequestID: UUID?
-
-    private init() {}
-
-    func requestReview() {
-        pendingRequestID = UUID()
-    }
-
-    func consume(_ requestID: UUID) {
-        guard pendingRequestID == requestID else { return }
-        pendingRequestID = nil
-    }
-}
-
 struct MainBoardView: View {
     @ObservedObject var store: OpsStore
-    @ObservedObject private var activityReviewCoordinator = ActivityReviewCoordinator.shared
     @State private var bulkSelectionMode = false
     @State private var reviewingBulkPlan: BulkStopPlan?
-    @State private var activityExpanded = false
 
     var body: some View {
         VStack(spacing: 0) {
             ToolbarView(store: store)
             Divider().overlay(Color.white.opacity(0.07))
+            WorkspaceAttentionHeader(store: store)
+            BoardWorkspaceTabs(store: store)
 
-            ScrollView(.vertical) {
-                VStack(spacing: 12) {
-                    InventoryStateBanner(
-                        store: store,
-                        viewActivity: { activityExpanded = true }
-                    )
-                    ProjectUsageStrip(store: store)
-                    if let lease = store.latestLeaseResult {
-                        LeaseResultCard(store: store, lease: lease)
-                    }
-                    ManagedLeasesPanel(store: store)
-                    FilterRow(
+            Group {
+                switch store.boardWorkspace {
+                case .resources:
+                    ResourcesWorkspaceView(
                         store: store,
                         bulkSelectionMode: $bulkSelectionMode,
                         reviewSelection: reviewBulkSelection
                     )
-                    ResourceTabBar(store: store)
-
-                    Group {
-                        switch store.activeTab {
-                        case .servers:
-                            DevServersSection(store: store, bulkSelectionMode: bulkSelectionMode)
-                        case .docker:
-                            DockerSection(store: store, bulkSelectionMode: bulkSelectionMode)
-                        case .databases:
-                            DatabaseSection(store: store, bulkSelectionMode: bulkSelectionMode)
-                        case .tests:
-                            TestStatisticsSection(store: store)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                case .activity:
+                    ActivityWorkspaceView(store: store)
                 }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .accessibilityIdentifier("main-board-scroll-body")
 
-            ActionResultDrawer(store: store, expanded: $activityExpanded)
             Divider().overlay(Color.white.opacity(0.07))
             StatusBar(store: store)
         }
@@ -637,170 +594,10 @@ struct MainBoardView: View {
         .sheet(item: $reviewingBulkPlan) { plan in
             BulkStopReviewSheet(store: store, plan: plan)
         }
-        .onAppear(perform: consumePendingActivityReview)
-        .onChange(of: activityReviewCoordinator.pendingRequestID) {
-            consumePendingActivityReview()
-        }
     }
 
     private func reviewBulkSelection() {
         reviewingBulkPlan = store.prepareBulkStop()
-    }
-
-    private func consumePendingActivityReview() {
-        guard let requestID = activityReviewCoordinator.pendingRequestID else { return }
-        activityExpanded = true
-        activityReviewCoordinator.consume(requestID)
-    }
-}
-
-struct ProjectUsageStrip: View {
-    @ObservedObject var store: OpsStore
-
-    private var rows: [ProjectLoadRow] {
-        let rankedTrees = store.repositoryTrees
-            .compactMap { tree -> (RepositoryTreePresentation, ProjectUsage)? in
-                guard let usage = tree.usage, showsProjectLoad(usage) else { return nil }
-                return (tree, usage)
-            }
-            .sorted { usageRank($0.1) > usageRank($1.1) }
-
-        var result: [ProjectLoadRow] = []
-        for (tree, usage) in rankedTrees {
-            result.append(
-                ProjectLoadRow(
-                    id: "family:\(tree.familyID)",
-                    usage: usage,
-                    label: tree.root.displayName,
-                    context: tree.temporaryScopes.isEmpty ? nil : "Root repository · includes temporary repositories",
-                    indentation: 0
-                )
-            )
-            result.append(contentsOf: tree.temporaryScopes.compactMap { scope in
-                guard let usage = scope.usage, showsProjectLoad(usage) else { return nil }
-                return ProjectLoadRow(
-                    id: "scope:\(scope.definition.repoID)",
-                    usage: usage,
-                    label: scope.displayName,
-                    context: "Temporary · \(tree.root.displayName)",
-                    indentation: 14
-                )
-            })
-        }
-        return Array(result.prefix(6))
-    }
-
-    var body: some View {
-        if !rows.isEmpty {
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 8) {
-                    Image(systemName: "gauge.with.dots.needle.bottom.100percent")
-                        .foregroundStyle(Theme.secondary)
-                    Text("PROJECT LOAD")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(Theme.secondary)
-                    Spacer(minLength: 0)
-                }
-                VStack(spacing: 0) {
-                    ForEach(rows) { row in
-                        ProjectUsageRow(
-                            usage: row.usage,
-                            label: row.label,
-                            context: row.context,
-                            indentation: row.indentation
-                        )
-                    }
-                }
-                .background(Theme.control)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
-            }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-        }
-    }
-
-    private func showsProjectLoad(_ usage: ProjectUsage) -> Bool {
-        (usage.serverCount ?? 0) > 0
-            || (usage.containerCount ?? 0) > 0
-            || (usage.cpuPercent ?? 0) > 0
-            || (usage.memoryBytes ?? 0) > 0
-    }
-}
-
-private struct ProjectLoadRow: Identifiable {
-    let id: String
-    let usage: ProjectUsage
-    let label: String
-    let context: String?
-    let indentation: CGFloat
-}
-
-struct ProjectUsageRow: View {
-    let usage: ProjectUsage
-    let label: String
-    let context: String?
-    let indentation: CGFloat
-
-    var body: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(label)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Text(context.map { "\($0) · \(resourceCountText)" } ?? resourceCountText)
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.secondary)
-                    .lineLimit(1)
-            }
-            .frame(minWidth: 130, maxWidth: 180, alignment: .leading)
-            MetricPill(title: "CPU", value: formatCPU(usage.cpuPercent), tint: usageSeverityColor(usage))
-            MetricPill(title: "Memory", value: formatBytes(usage.memoryBytes), tint: usageSeverityColor(usage))
-            Text(hotProcessLabel(usage.hotProcesses?.first))
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(Theme.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 10)
-        .padding(.leading, indentation)
-        .frame(height: 34)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(Color.white.opacity(0.055)).frame(height: 1)
-        }
-    }
-
-    private var resourceCountText: String {
-        let processes = usage.processCount ?? 0
-        let containers = usage.containerCount ?? 0
-        if containers > 0 {
-            return "\(processes) processes / \(containers) containers"
-        }
-        return "\(processes) processes"
-    }
-}
-
-struct MetricPill: View {
-    let title: String
-    let value: String
-    let tint: Color
-
-    var body: some View {
-        HStack(spacing: 5) {
-            Text(title)
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(Theme.secondary)
-            Text(value)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundStyle(tint)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 8)
-        .frame(minWidth: 92)
-        .frame(height: 24)
-        .background(Color.black.opacity(0.16))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
 
@@ -1337,172 +1134,6 @@ struct SourceDiagnosticsPopover: View {
     }
 }
 
-struct InventoryStateBanner: View {
-    @ObservedObject var store: OpsStore
-    let viewActivity: () -> Void
-    @State private var resourceIssuesExpanded = false
-    @State private var inventoryDetailsExpanded = false
-    @State private var actionDetailsExpanded = false
-
-    var body: some View {
-        let snapshot = store.presentationSnapshot
-        let dockerUnavailable = store.explicitlyUnavailableDockerCapabilities
-        let isInitialLoading = store.isInitialInventoryLoading
-        if isInitialLoading || snapshot.level != .nominal || !dockerUnavailable.isEmpty {
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(alignment: .top, spacing: 10) {
-                    if isInitialLoading {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: inventoryBannerIcon(snapshot.level))
-                            .foregroundStyle(healthLevelColor(snapshot.level))
-                    }
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(isInitialLoading ? "Refreshing inventory" : snapshot.statusTitle)
-                            .font(.system(size: 12, weight: .bold))
-                        Text(isInitialLoading && store.sourceStates.isEmpty ? "Looking for configured coordinator sources." : snapshot.statusMessage)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if !isInitialLoading,
-                           snapshot.actionIssue == nil,
-                           snapshot.resourceAttentionItems.count == 1,
-                           let attention = snapshot.resourceAttentionItems.first
-                        {
-                            Text(attention.recommendedNextStep)
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(Theme.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .accessibilityIdentifier("resource-attention-next-step")
-                        }
-                    }
-                    Spacer()
-                    contextualAction(snapshot: snapshot, isInitialLoading: isInitialLoading)
-                }
-                if !dockerUnavailable.isEmpty {
-                    Label(
-                        "Docker is unavailable for \(dockerUnavailable.map(\.origin.label).joined(separator: ", ")). Server and port lease actions remain available.",
-                        systemImage: "shippingbox.and.arrow.backward"
-                    )
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(Theme.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("docker-unavailable-warning")
-                }
-                if shouldShowResourceList(snapshot) {
-                    DisclosureGroup(
-                        resourceDisclosureTitle(snapshot.resourceAttentionItems.count),
-                        isExpanded: $resourceIssuesExpanded
-                    ) {
-                        LazyVStack(spacing: 7) {
-                            ForEach(snapshot.resourceAttentionItems) { item in
-                                ResourceAttentionRow(store: store, item: item)
-                            }
-                        }
-                        .padding(.top, 5)
-                    }
-                    .font(.system(size: 11, weight: .semibold))
-                    .accessibilityIdentifier("resource-attention-list")
-                }
-                if let issue = snapshot.inventoryIssue {
-                    DisclosureGroup("Inventory details", isExpanded: $inventoryDetailsExpanded) {
-                        Text(issue.details)
-                            .font(.system(size: 11, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .font(.system(size: 11, weight: .semibold))
-                }
-                if let issue = snapshot.actionIssue {
-                    DisclosureGroup("Action issue", isExpanded: $actionDetailsExpanded) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(issue.details)
-                                .font(.system(size: 11, design: .monospaced))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            HStack {
-                                Button("Copy details") { store.copyIssueDetails(issue) }
-                                Button("Dismiss") { store.dismissActionIssue() }
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                    }
-                    .font(.system(size: 11, weight: .semibold))
-                    .accessibilityIdentifier("action-issue-details")
-                }
-            }
-            .padding(10)
-            .background(healthLevelColor(snapshot.level).opacity(0.1))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(healthLevelColor(snapshot.level).opacity(0.28)))
-            .accessibilityIdentifier("inventory-state-banner")
-        }
-    }
-
-    @ViewBuilder
-    private func contextualAction(
-        snapshot: OpsPresentationSnapshot,
-        isInitialLoading: Bool
-    ) -> some View {
-        if !isInitialLoading {
-            if let issue = snapshot.actionIssue {
-                if hasActivityResult(for: issue) {
-                    Button("View Activity", action: viewActivity)
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier("attention-view-activity")
-                } else {
-                    Button(actionDetailsExpanded ? "Hide details" : "View details") {
-                        actionDetailsExpanded.toggle()
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("attention-view-action-details")
-                }
-            } else if snapshot.resourceAttentionItems.count == 1,
-                      let item = snapshot.resourceAttentionItems.first
-            {
-                Button(item.reviewTarget.actionLabel) {
-                    _ = store.reviewAttentionItem(item)
-                }
-                .buttonStyle(.bordered)
-                .accessibilityIdentifier("attention-review-resource")
-            } else if snapshot.resourceAttentionItems.count > 1 {
-                Button(resourceIssuesExpanded ? "Hide issues" : "Review \(snapshot.resourceAttentionItems.count)") {
-                    resourceIssuesExpanded.toggle()
-                }
-                .buttonStyle(.bordered)
-                .accessibilityIdentifier("attention-review-resources")
-            } else if snapshot.health.runningActionCount > 0 {
-                Button("View Activity", action: viewActivity)
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("attention-view-running-activity")
-            } else if snapshot.inventoryIssue != nil
-                        || snapshot.level == .degraded
-                        || snapshot.level == .unavailable
-                        || snapshot.unavailableCapabilityCount > 0
-            {
-                Button("Refresh") { store.refresh() }
-                    .buttonStyle(.bordered)
-                    .disabled(store.isLoading)
-                    .accessibilityIdentifier("attention-refresh-inventory")
-            }
-        }
-    }
-
-    private func hasActivityResult(for issue: OpsIssue) -> Bool {
-        guard let actionID = issue.relatedActionID else { return false }
-        return store.actionResults[actionID] != nil
-    }
-
-    private func shouldShowResourceList(_ snapshot: OpsPresentationSnapshot) -> Bool {
-        snapshot.resourceAttentionItems.count > 1
-            || (snapshot.actionIssue != nil && !snapshot.resourceAttentionItems.isEmpty)
-    }
-
-    private func resourceDisclosureTitle(_ count: Int) -> String {
-        count == 1 ? "Affected resource" : "Affected resources (\(count))"
-    }
-}
-
 struct ResourceAttentionRow: View {
     @ObservedObject var store: OpsStore
     let item: ResourceAttentionItem
@@ -1546,273 +1177,6 @@ func resourceAttentionIcon(_ kind: ResourceAttentionKind) -> String {
     case .server: return "terminal"
     case .docker: return "shippingbox"
     case .projectConflict: return "point.3.connected.trianglepath.dotted"
-    }
-}
-
-struct LeaseResultCard: View {
-    @ObservedObject var store: OpsStore
-    let lease: LeaseActionResult
-
-    var body: some View {
-        HStack(spacing: 14) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("LEASED PORT")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(Theme.secondary)
-                Text(String(lease.port))
-                    .font(.system(size: 24, weight: .bold, design: .monospaced))
-                    .textSelection(.enabled)
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 7) {
-                    SourceBadge(origin: lease.identity.origin, states: store.sourceStates)
-                    StatusText(status: lease.managementStatus)
-                }
-                Text("Project \(projectDisplayLabel(lease.project)) · Expires \(formatTimestamp(lease.expiresAtISO))")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.secondary)
-                    .lineLimit(1)
-                DisclosureGroup("Lease details") {
-                    DetailLine(label: "Lease ID", value: lease.leaseID)
-                    DetailLine(label: "Project", value: lease.project ?? "Unavailable")
-                    DetailLine(label: "Agent", value: lease.agent ?? "Unavailable")
-                    if let serverID = lease.serverID { DetailLine(label: "Attached server", value: serverID) }
-                    if let operationID = lease.pendingOperationID { DetailLine(label: "Attachment operation", value: operationID) }
-                }
-                .font(.system(size: 11, weight: .semibold))
-            }
-            Spacer()
-            Button("Copy") { store.copyLeasePort(lease) }
-                .accessibilityLabel("Copy leased port \(lease.port)")
-                .accessibilityIdentifier("lease-copy-port")
-            Button("Start using lease") {
-                if store.prepareStartDraft(using: lease) { store.showingStartSheet = true }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                !lease.canStartServer
-                    || !store.mutationAvailability(
-                        kind: .startServer,
-                        origin: lease.identity.origin,
-                        resource: nil,
-                        leaseID: lease.leaseID,
-                        projectPath: lease.project
-                    ).isAllowed
-            )
-            .accessibilityIdentifier("lease-start-using")
-            Button("Release", role: .destructive) { store.releaseLease(lease) }
-                .disabled(
-                    !lease.canReleaseDirectly
-                        || !store.mutationAvailability(
-                            kind: .releasePort,
-                            origin: lease.identity.origin,
-                            resource: lease.identity,
-                            leaseID: lease.leaseID,
-                            projectPath: lease.project
-                        ).isAllowed
-                )
-                .accessibilityIdentifier("lease-release")
-            Button { store.dismissLatestLeaseResult() } label: {
-                Image(systemName: "xmark")
-            }
-            .buttonStyle(.plain)
-            .help("Dismiss lease result")
-            .accessibilityLabel("Dismiss lease result")
-            .accessibilityIdentifier("lease-dismiss")
-        }
-        .padding(11)
-        .background(Theme.blue.opacity(0.09))
-        .clipShape(RoundedRectangle(cornerRadius: 9))
-        .overlay(RoundedRectangle(cornerRadius: 9).stroke(Theme.blue.opacity(0.28)))
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("latest-lease-result")
-    }
-}
-
-struct ManagedLeasesPanel: View {
-    @ObservedObject var store: OpsStore
-    @State private var expanded = false
-
-    private var leases: [LeaseActionResult] {
-        store.manageableLeaseResults.filter { $0.identity != store.latestLeaseResult?.identity }
-    }
-
-    var body: some View {
-        if !leases.isEmpty {
-            DisclosureGroup(isExpanded: $expanded) {
-                VStack(spacing: 7) {
-                    ForEach(leases) { lease in
-                        ManagedLeaseRow(store: store, lease: lease)
-                    }
-                }
-                .padding(.top, 7)
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "network.badge.shield.half.filled")
-                        .foregroundStyle(Theme.blue)
-                    Text("Managed port leases")
-                        .font(.system(size: 12, weight: .semibold))
-                    CountBadge(count: leases.count)
-                    Spacer()
-                    Text(expanded ? "Hide" : "Review")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(Theme.blue)
-                }
-            }
-            .padding(10)
-            .background(Theme.control.opacity(0.72))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08)))
-            .accessibilityIdentifier("managed-port-leases")
-        }
-    }
-}
-
-struct ManagedLeaseRow: View {
-    @ObservedObject var store: OpsStore
-    let lease: LeaseActionResult
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(String(lease.port))
-                .font(.system(size: 14, weight: .bold, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(width: 56, alignment: .leading)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    SourceBadge(origin: lease.identity.origin, states: store.sourceStates)
-                    StatusText(status: lease.managementStatus)
-                }
-                Text("\(projectDisplayLabel(lease.project)) · expires \(formatTimestamp(lease.expiresAtISO))")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.secondary)
-                    .lineLimit(1)
-                DisclosureGroup("Lease identity") {
-                    Text(lease.leaseID)
-                        .font(.system(size: 10, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-                .font(.system(size: 10, weight: .semibold))
-            }
-            Spacer()
-            Button("Copy") { store.copyLeasePort(lease) }
-            Button("Start") {
-                if store.prepareStartDraft(using: lease) { store.showingStartSheet = true }
-            }
-            .disabled(
-                !lease.canStartServer
-                    || !store.mutationAvailability(
-                        kind: .startServer,
-                        origin: lease.identity.origin,
-                        resource: nil,
-                        leaseID: lease.leaseID,
-                        projectPath: lease.project
-                    ).isAllowed
-            )
-            Button("Release", role: .destructive) { store.releaseLease(lease) }
-                .disabled(
-                    !lease.canReleaseDirectly
-                        || !store.mutationAvailability(
-                            kind: .releasePort,
-                            origin: lease.identity.origin,
-                            resource: lease.identity,
-                            leaseID: lease.leaseID,
-                            projectPath: lease.project
-                        ).isAllowed
-                )
-        }
-        .padding(8)
-        .background(Color.white.opacity(0.035))
-        .clipShape(RoundedRectangle(cornerRadius: 7))
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Port \(lease.port), source \(lease.identity.origin.label), \(lease.managementStatus)")
-    }
-}
-
-struct ActionResultDrawer: View {
-    @ObservedObject var store: OpsStore
-    @Binding var expanded: Bool
-
-    private var results: [RetainedActionResult] {
-        store.actionResults.values.sorted { $0.queuedAt > $1.queuedAt }
-    }
-
-    var body: some View {
-        if let latest = results.first {
-            DisclosureGroup(isExpanded: $expanded) {
-                ScrollView(.vertical) {
-                    LazyVStack(spacing: 7) {
-                        ForEach(results) { result in
-                            ActionResultRow(store: store, result: result)
-                        }
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 10)
-                }
-                .frame(maxHeight: 240)
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "tray.full")
-                    Text("Activity")
-                        .fontWeight(.bold)
-                    CountBadge(count: results.count)
-                    Text(latest.request.title)
-                        .lineLimit(1)
-                    Spacer()
-                    ActionPhaseBadge(phase: latest.phase)
-                }
-                .font(.system(size: 11))
-                .padding(.horizontal, 14)
-                .frame(height: 34)
-            }
-            .background(Theme.toolbar)
-            .accessibilityIdentifier("action-result-drawer")
-        }
-    }
-}
-
-struct ActionResultRow: View {
-    @ObservedObject var store: OpsStore
-    let result: RetainedActionResult
-    @State private var showingDetails = false
-
-    var body: some View {
-        DisclosureGroup(isExpanded: $showingDetails) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(store.actionResultDetails(result))
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                HStack {
-                    if result.outputTruncated {
-                        Label("Output truncated", systemImage: "scissors")
-                            .foregroundStyle(Theme.orange)
-                    }
-                    Spacer()
-                    Button("Copy details") { store.copyActionResultDetails(result) }
-                    if isTerminalActionPhase(result.phase) {
-                        Button("Dismiss") { store.dismissActionResult(result) }
-                    }
-                }
-            }
-            .padding(.top, 7)
-        } label: {
-            HStack(spacing: 8) {
-                ActionPhaseBadge(phase: result.phase)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(result.request.title).fontWeight(.semibold).lineLimit(1)
-                    Text(result.request.origin?.label ?? "Coordinator action")
-                        .foregroundStyle(Theme.secondary)
-                }
-                Spacer()
-                Text(formatDate(result.finishedAt ?? result.queuedAt))
-                    .foregroundStyle(Theme.secondary)
-            }
-            .font(.system(size: 11))
-        }
-        .padding(9)
-        .background(Theme.control)
-        .clipShape(RoundedRectangle(cornerRadius: 7))
     }
 }
 
@@ -4109,12 +3473,13 @@ struct ResizableTable<Rows: View>: View {
                 .frame(minHeight: proxy.size.height, alignment: .topLeading)
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
+            .accessibilityIdentifier("resource-table-scroll")
             .background(Color.white.opacity(0.015))
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.07)))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .frame(minHeight: 340)
+        .frame(minHeight: 180)
     }
 
     private var totalWidth: CGFloat {

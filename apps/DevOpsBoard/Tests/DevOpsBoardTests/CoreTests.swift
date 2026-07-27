@@ -4209,7 +4209,7 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testPartialRepositoryRemovalRetainsFencePromptAndFailureEvidence() async throws {
+    func testPartialRepositoryRemovalClosesPromptAndRetainsFailureEvidenceInActivity() async throws {
         let plan = CommandExecution(stdout: repositoryRemovalPlanJSON(), stderr: "", exitStatus: 0)
         let partial = CommandExecution(
             stdout: #"{"schema_version":1,"operation_id":"operation-remove-1","plan_id":"plan-remove-1","plan_fingerprint":"plan-fingerprint-1","kind":"repository_decommission","repo_id":"repo-1","status":"needs_attention","fence":"retained","hidden":false,"started":false,"retained_data":["repository_files","volumes","databases"],"targets":[{"target_id":"container-target","kind":"docker","status":"failed","phase":"stop","error":"container remained running"}],"errors":["verification incomplete"]}"#,
@@ -4254,7 +4254,17 @@ final class CoreTests: XCTestCase {
                 $0.request.kind == .repositoryDecommission && $0.phase == .failed
             } && store.inventory.servers.first?.name == "still-visible"
         }
-        XCTAssertNotNil(store.repositoryDecommissionPrompt, "a partial removal must remain visible and retryable")
+        XCTAssertNil(
+            store.repositoryDecommissionPrompt,
+            "a submitted destructive operation must leave the confirmation sheet and retain its failure in Activity"
+        )
+        XCTAssertEqual(store.boardWorkspace, .activity)
+        let failedAction = try XCTUnwrap(
+            store.actionResults.values.first {
+                $0.request.kind == .repositoryDecommission && $0.phase == .failed
+            }
+        )
+        XCTAssertEqual(store.selectedActionResultID, failedAction.id)
         XCTAssertTrue(store.actionIssue?.summary.contains("verification incomplete") == true)
         XCTAssertTrue(store.actionIssue?.summary.contains("container remained running") == true)
     }
@@ -4447,15 +4457,51 @@ final class CoreTests: XCTestCase {
     }
 
     @MainActor
-    func testPartialStandaloneRetirementKeepsFencePromptAndRefreshesTruth() async throws {
-        let partial = CommandExecution(
-            stdout: #"{"schema_version":1,"operation_id":"retire-operation-1","plan_id":"retire-plan-1","plan_fingerprint":"retire-fingerprint-1","kind":"standalone_resource_retirement","resource_id":"docker:immutable-copy-pg","status":"needs_attention","fence":"retained","hidden":false,"started":false,"retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"docker:immutable-copy-pg","kind":"container","status":"failed","phase":"verify","error":{"code":"still_running","message":"the exact container remained running","phase":"verify"}}],"errors":[{"code":"verification_incomplete","message":"stop verification is incomplete","phase":"verify"}]}"#,
-            stderr: "",
-            exitStatus: 0
+    func testStandaloneRetirementPlanRejectsStableTargetIdentityDriftBeforePresentingPrompt() async throws {
+        let changedPlans = [
+            standaloneRetirementPlanJSON(immutableFingerprint: "changed-container-fingerprint"),
+            standaloneRetirementPlanJSON(controlBindingID: "changed-docker-binding"),
+            standaloneRetirementPlanJSON(controlContractFingerprint: ""),
+            standaloneRetirementPlanJSON(planID: ""),
+            standaloneRetirementPlanJSON(planFingerprint: "   "),
+        ]
+
+        for planJSON in changedPlans {
+            let service = ExactLifecycleCoordinatorService(
+                results: [CommandExecution(stdout: planJSON, stderr: "", exitStatus: 0)]
+            )
+            let store = makeExactLifecycleStore(service: service, origin: codex)
+            let seeded = try seedExactLifecyclePresentation(store: store, origin: codex)
+            defer { try? FileManager.default.removeItem(atPath: seeded.projectPath) }
+
+            store.planResourceRetirement(seeded.target)
+            try await waitUntil {
+                store.actionResults.values.contains {
+                    $0.request.kind == .retireStandaloneResource && $0.phase == .failed
+                }
+            }
+
+            XCTAssertNil(
+                store.resourceRetirementPrompt,
+                "a plan for a changed immutable resource or controller must never become confirmable"
+            )
+            XCTAssertNotNil(store.actionIssue)
+            let calls = await service.capturedCalls()
+            XCTAssertEqual(calls.count, 1, "stable identity drift must fail before any retirement apply call")
+            XCTAssertTrue(calls[0].1.containsSubsequence(["resource", "plan-retire"]))
+        }
+    }
+
+    @MainActor
+    func testFailedPreMutationStandaloneRetirementClosesPromptAndShowsSelectedActivityUsingPlannedIdentity() async throws {
+        let preMutationFailure = CommandExecution(
+            stdout: "",
+            stderr: #"{"ok":false,"code":"lifecycle_plan_stale","classification":"lifecycle_target_identity_changed","mutation_performed":false,"error":"Resource ownership generation changed after planning.","action_required":"Refresh authoritative inventory, review a newly generated lifecycle plan, and retry."}"#,
+            exitStatus: 1
         )
         let service = ExactLifecycleCoordinatorService(results: [
             CommandExecution(stdout: standaloneRetirementPlanJSON(), stderr: "", exitStatus: 0),
-            partial,
+            preMutationFailure,
             emptyNormalizedInventoryExecution(),
         ])
         let store = makeExactLifecycleStore(service: service, origin: codex)
@@ -4465,27 +4511,467 @@ final class CoreTests: XCTestCase {
         store.planResourceRetirement(seeded.target)
         try await waitUntil { store.resourceRetirementPrompt != nil }
         let prompt = try XCTUnwrap(store.resourceRetirementPrompt)
+        let plannedTarget = try XCTUnwrap(prompt.plan.targets.first)
+        let plannedIdentityArguments = try XCTUnwrap(plannedTarget.identityArguments)
+        XCTAssertEqual(plannedTarget.hostResourceID, "docker:immutable-copy-pg")
+        XCTAssertEqual(plannedTarget.immutableFingerprint, seeded.target.immutableFingerprint)
+        XCTAssertEqual(plannedTarget.controlBindingID, seeded.target.controlBindingID)
+        XCTAssertEqual(plannedTarget.ownershipFingerprint, "planned-ownership-generation-2")
+        XCTAssertNotEqual(
+            plannedTarget.ownershipFingerprint,
+            seeded.target.ownershipFingerprint,
+            "the apply request must use the identity frozen into the plan, not the pre-plan observation generation"
+        )
+
         store.applyResourceRetirement(prompt)
 
         try await waitUntil {
-            store.actionResults.values.contains {
-                $0.request.kind == .retireStandaloneResource && $0.phase == .failed
-            } && store.inventory.servers.isEmpty
+            store.resourceRetirementPrompt == nil
+                && store.boardWorkspace == .activity
+                && store.selectedActionResultID != nil
+                && store.actionResults[store.selectedActionResultID!]?.phase == .failed
+                && store.inventory.servers.isEmpty
         }
-        XCTAssertNotNil(
-            store.resourceRetirementPrompt,
-            "partial retirement must retain the exact plan/fence for a safe retry"
+        let failedActionID = try XCTUnwrap(store.selectedActionResultID)
+        let failedAction = try XCTUnwrap(store.actionResults[failedActionID])
+        XCTAssertEqual(failedAction.request.kind, .retireStandaloneResource)
+        XCTAssertEqual(store.actionIssue?.relatedActionID, failedActionID)
+        XCTAssertTrue(failedAction.failure?.contains("ownership generation changed") == true)
+        XCTAssertTrue(failedAction.stderr.contains(#""code":"lifecycle_plan_stale""#))
+        XCTAssertTrue(failedAction.stderr.contains(#""classification":"lifecycle_target_identity_changed""#))
+        let failurePayload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(failedAction.stderr.utf8)) as? [String: Any]
         )
-        XCTAssertTrue(store.actionIssue?.summary.contains("stop verification is incomplete") == true)
-        XCTAssertTrue(store.actionIssue?.summary.contains("the exact container remained running") == true)
+        XCTAssertEqual(failurePayload["mutation_performed"] as? Bool, false)
+        let recovery = try XCTUnwrap(store.retirementRecoveryContexts[failedActionID])
+        XCTAssertEqual(recovery.recoveryAction, .refreshAndReplan)
+        XCTAssertEqual(recovery.commandFailure?.code, "lifecycle_plan_stale")
+        XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Refresh & re-plan")
+        XCTAssertTrue(store.actionIssue?.details.contains("Refresh authoritative inventory") == true)
+        XCTAssertTrue(store.actionIssue?.details.contains("performed no host mutation") == true)
+        XCTAssertNil(
+            store.resourceRetirementPrompt,
+            "a stale pre-mutation plan must not remain presented as a retryable modal"
+        )
 
         let calls = await service.capturedCalls()
         XCTAssertEqual(calls.count, 3)
         XCTAssertTrue(calls[1].1.containsSubsequence(["resource", "retire"]))
-        XCTAssertTrue(calls[1].1.containsSubsequence(seeded.target.identityArguments))
+        XCTAssertTrue(calls[1].1.containsSubsequence(plannedIdentityArguments))
+        XCTAssertTrue(calls[1].1.contains("container-fingerprint-1"))
+        XCTAssertTrue(calls[1].1.contains("docker-binding-1"))
+        XCTAssertFalse(calls[1].1.contains("ownership-fingerprint-1"))
+        XCTAssertEqual(calls[2].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+    }
+
+    @MainActor
+    func testFencedResumeStaleRetirementKeepsExactPlanRecoveryAndPossiblePriorEffectsTruth() async throws {
+        let fencedResumeFailure = CommandExecution(
+            stdout: "",
+            stderr: #"{"ok":false,"code":"lifecycle_fenced_resume_stale","classification":"lifecycle_fenced_resume_identity_changed","mutation_performed":false,"prior_operation_effects_possible":true,"recovery_scope":"exact_confirmed_operation","replacement_plan_allowed":false,"error":"controller changed after partial retirement","action_required":"Do not create a replacement plan. Repair the controller identity, then retry the exact confirmed operation."}"#,
+            exitStatus: 1
+        )
+        let service = ExactLifecycleCoordinatorService(results: [
+            CommandExecution(stdout: standaloneRetirementPlanJSON(), stderr: "", exitStatus: 0),
+            fencedResumeFailure,
+            emptyNormalizedInventoryExecution(),
+        ])
+        let store = makeExactLifecycleStore(service: service, origin: codex)
+        let seeded = try seedExactLifecyclePresentation(store: store, origin: codex)
+        defer { try? FileManager.default.removeItem(atPath: seeded.projectPath) }
+
+        store.planResourceRetirement(seeded.target)
+        try await waitUntil { store.resourceRetirementPrompt != nil }
+        store.applyResourceRetirement(try XCTUnwrap(store.resourceRetirementPrompt))
+
+        try await waitUntil {
+            guard let selectedID = store.selectedActionResultID else { return false }
+            return store.actionResults[selectedID]?.phase == .failed
+                && store.inventory.servers.isEmpty
+        }
+
+        let failedID = try XCTUnwrap(store.selectedActionResultID)
+        let recovery = try XCTUnwrap(store.retirementRecoveryContexts[failedID])
+        XCTAssertEqual(recovery.recoveryAction, .retryConfirmedOperation)
+        XCTAssertEqual(recovery.commandFailure?.priorOperationEffectsPossible, true)
+        XCTAssertEqual(recovery.commandFailure?.recoveryScope, "exact_confirmed_operation")
+        XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Retry confirmed operation")
+        XCTAssertTrue(store.actionIssue?.details.contains("Do not create a replacement plan") == true)
+        XCTAssertTrue(store.actionIssue?.details.contains("original fenced operation may already have retained host effects") == true)
+        XCTAssertFalse(store.actionIssue?.details.contains("rejected call performed no host mutation") == true)
+    }
+
+    @MainActor
+    func testFencedResumeOperationalFailurePreservesCauseAndExactPlanRecovery() async throws {
+        let operationalFailure = CommandExecution(
+            stdout: "",
+            stderr: #"{"ok":false,"code":"docker_daemon_unavailable","classification":"missing_dependency","prior_operation_effects_possible":true,"recovery_scope":"exact_confirmed_operation","replacement_plan_allowed":false,"error":"Docker daemon is unavailable","action_required":"Start Docker Desktop. Do not create a replacement plan; retry the exact confirmed operation."}"#,
+            exitStatus: 1
+        )
+        let service = ExactLifecycleCoordinatorService(results: [
+            CommandExecution(stdout: standaloneRetirementPlanJSON(), stderr: "", exitStatus: 0),
+            operationalFailure,
+            emptyNormalizedInventoryExecution(),
+        ])
+        let store = makeExactLifecycleStore(service: service, origin: codex)
+        let seeded = try seedExactLifecyclePresentation(store: store, origin: codex)
+        defer { try? FileManager.default.removeItem(atPath: seeded.projectPath) }
+
+        store.planResourceRetirement(seeded.target)
+        try await waitUntil { store.resourceRetirementPrompt != nil }
+        store.applyResourceRetirement(try XCTUnwrap(store.resourceRetirementPrompt))
+        try await waitUntil {
+            guard let selectedID = store.selectedActionResultID else { return false }
+            return store.actionResults[selectedID]?.phase == .failed
+                && store.inventory.servers.isEmpty
+        }
+
+        let failedID = try XCTUnwrap(store.selectedActionResultID)
+        let recovery = try XCTUnwrap(store.retirementRecoveryContexts[failedID])
+        XCTAssertEqual(recovery.recoveryAction, .retryConfirmedOperation)
+        XCTAssertEqual(recovery.commandFailure?.code, "docker_daemon_unavailable")
+        XCTAssertEqual(recovery.commandFailure?.classification, "missing_dependency")
+        XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Retry confirmed operation")
+        XCTAssertTrue(store.actionIssue?.summary.contains("Docker daemon is unavailable") == true)
+        XCTAssertTrue(store.actionIssue?.details.contains("confirmed operation remains fenced and may already have host effects") == true)
+        XCTAssertFalse(store.actionIssue?.details.contains("performed no additional host mutation") == true)
+        XCTAssertFalse(store.actionIssue?.details.contains("controller identity") == true)
+    }
+
+    @MainActor
+    func testPartialStandaloneRetirementClosesPromptAndShowsSelectedActivityAfterRefreshingTruth() async throws {
+        let partial = CommandExecution(
+            stdout: standaloneRetirementResultJSON(
+                status: "needs_attention",
+                fence: "retained",
+                hidden: false,
+                targetStatus: "failed",
+                targetPhase: "verified",
+                targetErrorJSON: #"{"code":"still_running","message":"the exact container remained running","phase":"verified"}"#,
+                errorsJSON: #"[{"code":"verification_incomplete","message":"stop verification is incomplete","phase":"verified"}]"#
+            ),
+            stderr: "",
+            exitStatus: 0
+        )
+        let completed = CommandExecution(
+            stdout: standaloneRetirementResultJSON(
+                status: "succeeded",
+                fence: "disabled",
+                hidden: true,
+                targetStatus: "succeeded",
+                targetPhase: "complete"
+            ),
+            stderr: "",
+            exitStatus: 0
+        )
+        let service = ExactLifecycleCoordinatorService(results: [
+            CommandExecution(stdout: standaloneRetirementPlanJSON(), stderr: "", exitStatus: 0),
+            partial,
+            emptyNormalizedInventoryExecution(),
+            completed,
+            emptyNormalizedInventoryExecution(),
+        ])
+        let store = makeExactLifecycleStore(service: service, origin: codex)
+        let seeded = try seedExactLifecyclePresentation(store: store, origin: codex)
+        defer { try? FileManager.default.removeItem(atPath: seeded.projectPath) }
+
+        store.planResourceRetirement(seeded.target)
+        try await waitUntil { store.resourceRetirementPrompt != nil }
+        let prompt = try XCTUnwrap(store.resourceRetirementPrompt)
+        let plannedIdentityArguments = try XCTUnwrap(prompt.plan.targets.first?.identityArguments)
+        store.applyResourceRetirement(prompt)
+
+        try await waitUntil {
+            store.resourceRetirementPrompt == nil
+                && store.boardWorkspace == .activity
+                && store.selectedActionResultID != nil
+                && store.actionResults[store.selectedActionResultID!]?.phase == .failed
+                && store.inventory.servers.isEmpty
+        }
+        XCTAssertNil(
+            store.resourceRetirementPrompt,
+            "partial retirement evidence belongs in Activity, not in a stale retryable modal"
+        )
+        let failedActionID = try XCTUnwrap(store.selectedActionResultID)
+        XCTAssertEqual(store.actionResults[failedActionID]?.request.kind, .retireStandaloneResource)
+        XCTAssertEqual(store.actionIssue?.relatedActionID, failedActionID)
+        XCTAssertTrue(store.actionIssue?.summary.contains("stop verification is incomplete") == true)
+        XCTAssertTrue(store.actionIssue?.summary.contains("the exact container remained running") == true)
+        XCTAssertEqual(
+            store.retirementRecoveryContexts[failedActionID]?.recoveryAction,
+            .retryConfirmedOperation
+        )
+        XCTAssertEqual(store.selectedRetirementRecoveryActionTitle, "Retry confirmed operation")
+
+        store.recoverSelectedRetirement()
+        try await waitUntil {
+            guard let selectedID = store.selectedActionResultID else { return false }
+            return selectedID != failedActionID
+                && store.actionResults[selectedID]?.phase == .succeeded
+                && store.actionIssue == nil
+                && store.retirementRecoveryContexts.values.allSatisfy {
+                    $0.prompt.plan.planID != prompt.plan.planID
+                }
+        }
+        XCTAssertNil(
+            store.actionIssue,
+            "a successful exact-plan recovery must clear its predecessor incident"
+        )
+
+        let calls = await service.capturedCalls()
+        XCTAssertEqual(calls.count, 5)
+        XCTAssertTrue(calls[1].1.containsSubsequence(["resource", "retire"]))
+        XCTAssertTrue(calls[1].1.containsSubsequence(plannedIdentityArguments))
         XCTAssertTrue(calls[1].1.containsSubsequence(["--plan-id", "retire-plan-1"]))
         XCTAssertTrue(calls[1].1.containsSubsequence(["--plan-fingerprint", "retire-fingerprint-1"]))
         XCTAssertEqual(calls[2].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+        XCTAssertTrue(calls[3].1.containsSubsequence(["resource", "retire"]))
+        XCTAssertTrue(calls[3].1.containsSubsequence(plannedIdentityArguments))
+        XCTAssertTrue(calls[3].1.containsSubsequence(["--plan-id", "retire-plan-1"]))
+        XCTAssertTrue(calls[3].1.containsSubsequence(["--plan-fingerprint", "retire-fingerprint-1"]))
+        XCTAssertFalse(calls[3].1.contains("plan-retire"))
+        XCTAssertEqual(calls[4].1, ["inventory", "--compact-json", "--stats-history-limit", "30"])
+    }
+
+    @MainActor
+    func testStandaloneRetirementRejectsSuccessForAnotherConfirmedPlan() async throws {
+        let mismatched = CommandExecution(
+            stdout: standaloneRetirementResultJSON(
+                status: "succeeded",
+                confirmedPlanID: "another-confirmed-plan",
+                fence: "disabled",
+                hidden: true,
+                targetStatus: "succeeded",
+                targetPhase: "complete"
+            ),
+            stderr: "",
+            exitStatus: 0
+        )
+        let service = ExactLifecycleCoordinatorService(results: [
+            CommandExecution(stdout: standaloneRetirementPlanJSON(), stderr: "", exitStatus: 0),
+            mismatched,
+            emptyNormalizedInventoryExecution(),
+        ])
+        let store = makeExactLifecycleStore(service: service, origin: codex)
+        let seeded = try seedExactLifecyclePresentation(store: store, origin: codex)
+        defer { try? FileManager.default.removeItem(atPath: seeded.projectPath) }
+
+        store.planResourceRetirement(seeded.target)
+        try await waitUntil { store.resourceRetirementPrompt != nil }
+        store.applyResourceRetirement(try XCTUnwrap(store.resourceRetirementPrompt))
+
+        try await waitUntil {
+            guard let selectedID = store.selectedActionResultID else { return false }
+            return store.actionResults[selectedID]?.phase == .failed
+                && store.inventory.servers.isEmpty
+        }
+
+        let failedID = try XCTUnwrap(store.selectedActionResultID)
+        let failed = try XCTUnwrap(store.actionResults[failedID])
+        XCTAssertTrue(failed.failure?.contains("confirmed retirement plan") == true)
+        XCTAssertEqual(failed.stdout, mismatched.stdout, "untrusted evidence must remain inspectable")
+        XCTAssertNil(store.retirementRecoveryContexts[failedID]?.recoveryAction)
+        XCTAssertNil(store.lastFailedRetirementTarget)
+        XCTAssertTrue(store.actionIssue?.details.contains("could not be proved") == true)
+    }
+
+    @MainActor
+    func testStandaloneRetirementRejectsBlankResultAndExecutionIdentity() async throws {
+        let invalidResults = [
+            standaloneRetirementResultJSON(
+                status: "succeeded",
+                operationID: "",
+                fence: "disabled",
+                hidden: true,
+                targetStatus: "succeeded",
+                targetPhase: "complete"
+            ),
+            standaloneRetirementResultJSON(
+                status: "succeeded",
+                executionPlanID: " ",
+                executionPlanFingerprint: " ",
+                fence: "disabled",
+                hidden: true,
+                targetStatus: "succeeded",
+                targetPhase: "complete"
+            ),
+        ]
+
+        for invalidResult in invalidResults {
+            let service = ExactLifecycleCoordinatorService(results: [
+                CommandExecution(stdout: standaloneRetirementPlanJSON(), stderr: "", exitStatus: 0),
+                CommandExecution(stdout: invalidResult, stderr: "", exitStatus: 0),
+                emptyNormalizedInventoryExecution(),
+            ])
+            let store = makeExactLifecycleStore(service: service, origin: codex)
+            let seeded = try seedExactLifecyclePresentation(store: store, origin: codex)
+            defer { try? FileManager.default.removeItem(atPath: seeded.projectPath) }
+
+            store.planResourceRetirement(seeded.target)
+            try await waitUntil { store.resourceRetirementPrompt != nil }
+            store.applyResourceRetirement(try XCTUnwrap(store.resourceRetirementPrompt))
+            try await waitUntil {
+                guard let selectedID = store.selectedActionResultID else { return false }
+                return store.actionResults[selectedID]?.phase == .failed
+                    && store.inventory.servers.isEmpty
+            }
+
+            let failedID = try XCTUnwrap(store.selectedActionResultID)
+            XCTAssertTrue(store.actionResults[failedID]?.failure?.contains("blank retirement operation or execution-plan identity") == true)
+            XCTAssertNil(store.retirementRecoveryContexts[failedID]?.recoveryAction)
+        }
+    }
+
+    @MainActor
+    func testStandaloneRetirementKeepsConcurrentRecoveryContextsBoundToTheirActions() async throws {
+        func staleFailure(_ label: String) -> CommandExecution {
+            CommandExecution(
+                stdout: "",
+                stderr: """
+                {"code":"lifecycle_plan_stale","classification":"lifecycle_target_identity_changed","mutation_performed":false,"error":"\(label) changed","action_required":"Refresh authoritative inventory and review a new plan."}
+                """,
+                exitStatus: 1
+            )
+        }
+
+        let service = ExactLifecycleCoordinatorService(results: [
+            staleFailure("first"),
+            emptyNormalizedInventoryExecution(),
+            staleFailure("second"),
+            emptyNormalizedInventoryExecution(),
+        ])
+        let store = makeExactLifecycleStore(service: service, origin: codex)
+        markSourceLoaded(store, origin: codex, resourceCount: 2)
+
+        let firstTarget = ExactUnassignedResource(
+            origin: codex,
+            kind: "container",
+            hostResourceID: "docker:first",
+            immutableFingerprint: "first-immutable",
+            controlBindingID: "first-binding",
+            ownershipFingerprint: "first-observation",
+            displayName: "first"
+        )
+        let secondTarget = ExactUnassignedResource(
+            origin: codex,
+            kind: "container",
+            hostResourceID: "docker:second",
+            immutableFingerprint: "second-immutable",
+            controlBindingID: "second-binding",
+            ownershipFingerprint: "second-observation",
+            displayName: "second"
+        )
+        let firstPlan = try JSONDecoder().decode(
+            StandaloneRetirementPlan.self,
+            from: Data(
+                standaloneRetirementPlanJSON(
+                    planID: "first-plan",
+                    planFingerprint: "first-plan-fingerprint",
+                    resourceID: firstTarget.hostResourceID,
+                    immutableFingerprint: firstTarget.immutableFingerprint,
+                    controlBindingID: firstTarget.controlBindingID,
+                    ownershipFingerprint: "first-planned-generation",
+                    controlContractFingerprint: "first-controller-contract",
+                    displayName: firstTarget.displayName
+                ).utf8
+            )
+        )
+        let secondPlan = try JSONDecoder().decode(
+            StandaloneRetirementPlan.self,
+            from: Data(
+                standaloneRetirementPlanJSON(
+                    planID: "second-plan",
+                    planFingerprint: "second-plan-fingerprint",
+                    resourceID: secondTarget.hostResourceID,
+                    immutableFingerprint: secondTarget.immutableFingerprint,
+                    controlBindingID: secondTarget.controlBindingID,
+                    ownershipFingerprint: "second-planned-generation",
+                    controlContractFingerprint: "second-controller-contract",
+                    displayName: secondTarget.displayName
+                ).utf8
+            )
+        )
+
+        store.applyResourceRetirement(
+            ResourceRetirementPrompt(
+                target: firstTarget,
+                plan: firstPlan,
+                requestProject: "/workflow/repo"
+            )
+        )
+        try await waitUntil {
+            store.retirementRecoveryContexts.values.contains {
+                $0.prompt.plan.planID == "first-plan"
+            }
+        }
+        try await waitUntilAsync {
+            await service.capturedCalls().count >= 2
+        }
+
+        store.applyResourceRetirement(
+            ResourceRetirementPrompt(
+                target: secondTarget,
+                plan: secondPlan,
+                requestProject: "/workflow/repo"
+            )
+        )
+        try await waitUntil {
+            store.retirementRecoveryContexts.count == 2
+                && store.retirementRecoveryContexts.values.contains {
+                    $0.prompt.plan.planID == "second-plan"
+                }
+        }
+
+        let firstRecovery = try XCTUnwrap(
+            store.retirementRecoveryContexts.values.first {
+                $0.prompt.plan.planID == "first-plan"
+            }
+        )
+        let secondRecovery = try XCTUnwrap(
+            store.retirementRecoveryContexts.values.first {
+                $0.prompt.plan.planID == "second-plan"
+            }
+        )
+        XCTAssertNotEqual(firstRecovery.actionID, secondRecovery.actionID)
+        XCTAssertEqual(firstRecovery.recoveryAction, .refreshAndReplan)
+        XCTAssertEqual(secondRecovery.recoveryAction, .refreshAndReplan)
+
+        store.showActivity(actionID: firstRecovery.actionID)
+        XCTAssertEqual(store.lastFailedRetirementTarget?.hostResourceID, "docker:first")
+        XCTAssertEqual(store.selectedActivityActionResult?.id, firstRecovery.actionID)
+        XCTAssertNil(store.selectedActivityActionIssue, "retained issue B must not replace selected action A")
+        store.showActivity(actionID: secondRecovery.actionID)
+        XCTAssertEqual(store.lastFailedRetirementTarget?.hostResourceID, "docker:second")
+        let retainedIssue = try XCTUnwrap(store.actionIssue)
+        store.showActivity(issueID: retainedIssue.id)
+        XCTAssertEqual(store.selectedActivityActionResult?.id, secondRecovery.actionID)
+        XCTAssertEqual(store.selectedActivityActionIssue?.id, retainedIssue.id)
+
+        store.dismissActionIssue()
+        store.showActivity(actionID: firstRecovery.actionID)
+        let unowned = try JSONDecoder().decode(
+            ManagedServer.self,
+            from: Data(#"{"id":"unowned","name":"unowned","status":"running"}"#.utf8)
+        )
+        store.restart(unowned)
+        let unmatchedIssue = try XCTUnwrap(store.actionIssue)
+        XCTAssertEqual(
+            store.selectedActivityActionResult?.id,
+            firstRecovery.actionID,
+            "a first unrelated issue must not steal an explicitly selected action"
+        )
+        XCTAssertNil(store.selectedActivityIssueID)
+        XCTAssertNil(store.selectedActivityActionIssue)
+
+        store.showActivity(issueID: unmatchedIssue.id)
+        XCTAssertNil(store.selectedActivityActionResult)
+        XCTAssertEqual(store.selectedActivityActionIssue?.id, unmatchedIssue.id)
+        XCTAssertNil(store.selectedRetirementRecoveryActionTitle)
+
+        store.showActivity(actionID: firstRecovery.actionID)
+        XCTAssertEqual(store.selectedActivityActionResult?.id, firstRecovery.actionID)
+        XCTAssertNil(store.selectedActivityActionIssue)
+        XCTAssertEqual(store.lastFailedRetirementTarget?.hostResourceID, "docker:first")
     }
 
     @MainActor
@@ -4499,15 +4985,44 @@ final class CoreTests: XCTestCase {
         )
         store.sourceStates = [.init(origin: codex, phase: .stale, checkedAt: Date(), resourceCount: 1, error: "offline")]
         let unowned = try JSONDecoder().decode(ManagedServer.self, from: Data(#"{"id":"web","name":"web","status":"running"}"#.utf8))
+        let retainedRequest = ActionRequest(
+            kind: .refreshInventory,
+            title: "Earlier retained action"
+        )
+        store.actionResults[retainedRequest.id] = RetainedActionResult(
+            request: retainedRequest,
+            phase: .succeeded,
+            queuedAt: Date()
+        )
 
         store.restart(unowned)
-        XCTAssertNotNil(store.actionIssue)
+        let firstIssue = try XCTUnwrap(store.actionIssue)
+        store.showActivity(issueID: firstIssue.id)
+        XCTAssertEqual(store.selectedActivityIssueID, firstIssue.id)
         XCTAssertEqual(store.presentationSnapshot.level, .unhealthy)
+
+        store.restart(unowned)
+        let replacementIssue = try XCTUnwrap(store.actionIssue)
+        XCTAssertNotEqual(replacementIssue.id, firstIssue.id)
+        XCTAssertEqual(store.selectedActivityIssueID, replacementIssue.id)
+        XCTAssertEqual(store.selectedActivityActionIssue?.id, replacementIssue.id)
 
         store.dismissActionIssue()
         XCTAssertNil(store.actionIssue)
+        XCTAssertNil(store.selectedActivityIssueID)
+        XCTAssertEqual(store.selectedActionResultID, retainedRequest.id)
+        XCTAssertEqual(store.selectedActivityActionResult?.id, retainedRequest.id)
         XCTAssertEqual(store.presentationSnapshot.level, .degraded)
         XCTAssertFalse(store.presentationSnapshot.health.isComplete)
+
+        store.restart(unowned)
+        let clearIssue = try XCTUnwrap(store.actionIssue)
+        store.showActivity(issueID: clearIssue.id)
+        store.clearLastError()
+        XCTAssertNil(store.actionIssue)
+        XCTAssertNil(store.selectedActivityIssueID)
+        XCTAssertEqual(store.selectedActionResultID, retainedRequest.id)
+        XCTAssertEqual(store.selectedActivityActionResult?.id, retainedRequest.id)
 
         let nominal = HealthSummary.reduce(
             sources: [.init(origin: codex, phase: .loaded, checkedAt: Date(), resourceCount: 1)],
@@ -5359,7 +5874,7 @@ private func realisticAccumulatedInventoryPayload(home: String) throws -> Data {
 /// Keeping this adapter here lets the long-standing lifecycle/concurrency tests
 /// exercise their original scenarios through the same authoritative contract
 /// the app now consumes.
-private func normalizedInventoryExecution(
+func normalizedInventoryExecution(
     _ execution: CommandExecution,
     origin: CoordinatorOrigin,
     arguments: [String]
@@ -5888,8 +6403,37 @@ private func repositoryRemovalPlanJSON() -> String {
     #"{"schema_version":1,"kind":"repository_decommission","plan_id":"plan-remove-1","repo_id":"repo-1","repository_fingerprint":"repository-fingerprint-1","installation_generation":4,"fingerprint":"plan-fingerprint-1","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Removed from DevOps Board","canonical_root":"/repo","display_name":"Repo","retained_data":["repository_files","containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"server-target","kind":"server","host_resource_id":"server:immutable-1","immutable_fingerprint":"server-fingerprint-1","control_binding_id":"binding-1","display_name":"web","current_state":"running","policies":[{"policy_id":"policy-1","kind":"server_definition","immutable_fingerprint":"policy-fingerprint-1","disabled_value":"disabled"}],"allocations":[{"allocation_id":"lease-1","kind":"lease","immutable_fingerprint":"lease-fingerprint-1"}]}],"blockers":[]}"#
 }
 
-private func standaloneRetirementPlanJSON() -> String {
-    #"{"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"retire-plan-1","resource_id":"docker:immutable-copy-pg","fingerprint":"retire-fingerprint-1","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"docker:immutable-copy-pg","kind":"container","host_resource_id":"docker:immutable-copy-pg","immutable_fingerprint":"container-fingerprint-1","control_binding_id":"docker-binding-1","display_name":"kosttracking-prod-copy-pg","current_state":"running","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}"#
+private func standaloneRetirementPlanJSON(
+    planID: String = "retire-plan-1",
+    planFingerprint: String = "retire-fingerprint-1",
+    resourceID: String = "docker:immutable-copy-pg",
+    immutableFingerprint: String = "container-fingerprint-1",
+    controlBindingID: String = "docker-binding-1",
+    ownershipFingerprint: String = "planned-ownership-generation-2",
+    controlContractFingerprint: String = "planned-controller-contract-1",
+    displayName: String = "kosttracking-prod-copy-pg"
+) -> String {
+    #"{"schema_version":1,"kind":"standalone_resource_retirement","plan_id":"\#(planID)","resource_id":"\#(resourceID)","fingerprint":"\#(planFingerprint)","created_at":"2026-07-14T12:00:00Z","actor":"tester","reason":"Retired from DevOps Board","retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"\#(resourceID)","kind":"container","host_resource_id":"\#(resourceID)","immutable_fingerprint":"\#(immutableFingerprint)","control_binding_id":"\#(controlBindingID)","ownership_fingerprint":"\#(ownershipFingerprint)","control_contract_fingerprint":"\#(controlContractFingerprint)","display_name":"\#(displayName)","current_state":"running","policies":[{"policy_id":"docker-policy-1","kind":"restart_policy","immutable_fingerprint":"restart-policy-fingerprint-1","disabled_value":"no"}],"allocations":[]}]}"#
+}
+
+private func standaloneRetirementResultJSON(
+    status: String,
+    operationID: String = "retire-operation-1",
+    confirmedPlanID: String = "retire-plan-1",
+    confirmedPlanFingerprint: String = "retire-fingerprint-1",
+    executionPlanID: String = "retire-execution-plan-1",
+    executionPlanFingerprint: String = "retire-execution-fingerprint-1",
+    resourceID: String = "docker:immutable-copy-pg",
+    fence: String,
+    hidden: Bool,
+    targetStatus: String,
+    targetPhase: String,
+    targetErrorJSON: String = "null",
+    errorsJSON: String = "[]"
+) -> String {
+    """
+    {"schema_version":1,"operation_id":"\(operationID)","plan_id":"\(executionPlanID)","plan_fingerprint":"\(executionPlanFingerprint)","kind":"standalone_resource_retirement","resource_id":"\(resourceID)","status":"\(status)","fence":"\(fence)","hidden":\(hidden),"started":false,"retained_data":["containers","volumes","databases","backups","audit_history"],"targets":[{"target_id":"\(resourceID)","kind":"container","status":"\(targetStatus)","phase":"\(targetPhase)","error":\(targetErrorJSON)}],"errors":\(errorsJSON),"confirmed_plan":{"plan_id":"\(confirmedPlanID)","plan_fingerprint":"\(confirmedPlanFingerprint)"},"execution_plan":{"plan_id":"\(executionPlanID)","plan_fingerprint":"\(executionPlanFingerprint)"}}
+    """
 }
 
 private func emptyNormalizedInventoryExecution() -> CommandExecution {

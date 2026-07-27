@@ -96,41 +96,76 @@ class SQLiteLifecyclePersistence:
             ).fetchone()
             if unassigned is None:
                 raise LifecycleError("resource is not an active unassigned host resource")
-            binding = connection.execute(
-                """
-                SELECT * FROM control_bindings
-                WHERE binding_id = ? AND resource_kind = ? AND resource_id = ?
-                """,
-                (control_binding_id, resource_kind.value, resource_id),
-            ).fetchone()
-            if binding is None or binding["authority_state"] != "authoritative":
-                raise OwnershipError("resource has no exact authoritative control binding")
-            native_identity, conflict = self._native_identity(
-                connection, resource_kind, resource_id
+            return self._current_authoritative_resource(
+                connection,
+                resource_kind,
+                resource_id,
+                control_binding_id,
+                allow_retired=False,
             )
-            if conflict:
-                raise PlanDriftError(conflict)
-            policies = tuple(
-                self._policies_by_resource(
-                    connection,
-                    resource_kind=resource_kind.value,
-                    resource_id=resource_id,
-                ).get((resource_kind.value, resource_id), ())
+
+    def resolve_current_lifecycle_resource(
+        self,
+        resource_kind: ResourceKind,
+        resource_id: str,
+        control_binding_id: str,
+    ) -> ExactResourceRef:
+        """Resolve current controller semantics while a lifecycle fence is active."""
+
+        with self.store.read_transaction() as connection:
+            return self._current_authoritative_resource(
+                connection,
+                resource_kind,
+                resource_id,
+                control_binding_id,
+                allow_retired=True,
             )
-            immutable = _standalone_immutable_fingerprint(
-                resource_kind, resource_id, native_identity
-            )
-            return ExactResourceRef(
+
+    def _current_authoritative_resource(
+        self,
+        connection: sqlite3.Connection,
+        resource_kind: ResourceKind,
+        resource_id: str,
+        control_binding_id: str,
+        *,
+        allow_retired: bool,
+    ) -> ExactResourceRef:
+        binding = connection.execute(
+            """
+            SELECT * FROM control_bindings
+            WHERE binding_id = ? AND resource_kind = ? AND resource_id = ?
+            """,
+            (control_binding_id, resource_kind.value, resource_id),
+        ).fetchone()
+        allowed_authority = {"authoritative", "retired"} if allow_retired else {"authoritative"}
+        if binding is None or str(binding["authority_state"]) not in allowed_authority:
+            raise OwnershipError("resource has no exact authoritative control binding")
+        native_identity, conflict = self._native_identity(
+            connection, resource_kind, resource_id
+        )
+        if conflict:
+            raise PlanDriftError(conflict)
+        policies = tuple(
+            self._policies_by_resource(
+                connection,
+                resource_kind=resource_kind.value,
                 resource_id=resource_id,
-                kind=resource_kind,
-                immutable_fingerprint=immutable,
-                control_binding_id=control_binding_id,
-                ownership_fingerprint=_binding_fingerprint(binding),
-                policies=policies,
-                allocations=(),
-                native_identity=native_identity,
-                control_contract_fingerprint=_binding_control_contract(binding),
-            )
+            ).get((resource_kind.value, resource_id), ())
+        )
+        immutable = _standalone_immutable_fingerprint(
+            resource_kind, resource_id, native_identity
+        )
+        return ExactResourceRef(
+            resource_id=resource_id,
+            kind=resource_kind,
+            immutable_fingerprint=immutable,
+            control_binding_id=control_binding_id,
+            ownership_fingerprint=_binding_fingerprint(binding),
+            policies=policies,
+            allocations=(),
+            native_identity=native_identity,
+            control_contract_fingerprint=_binding_control_contract(binding),
+        )
 
     def resolve_resource(
         self,
@@ -139,13 +174,16 @@ class SQLiteLifecyclePersistence:
         control_binding_id: str,
         *,
         include_archived: bool = False,
+        current_authority: bool = False,
     ) -> tuple[ExactResourceRef, str | None]:
         """Resolve one opaque normalized resource identity without name lookup.
 
         The returned repository identity is set for attached resources.  An
-        archived standalone resource is reconstructed from its immutable
-        durable archive plan; current host observation must still revalidate
-        it before any mutation.
+        By default an archived standalone resource is reconstructed from its
+        immutable durable archive plan. Resume validation sets
+        ``current_authority`` so the current normalized binding, native
+        identity, policies, and stable controller contract are returned
+        instead of making a plan-to-plan comparison tautological.
         """
 
         with self.store.read_transaction() as connection:
@@ -180,7 +218,7 @@ class SQLiteLifecyclePersistence:
                         raise ActionFencedError("resource archive fence is active")
                 return matches[0], repo_id
 
-            if include_archived:
+            if include_archived and not current_authority:
                 retirement = connection.execute(
                     """
                     SELECT operation_id FROM resource_retirements
@@ -198,12 +236,12 @@ class SQLiteLifecyclePersistence:
                     ):
                         return plan.target, plan.repo_id
 
-        return (
-            self.resolve_standalone_resource(
-                resource_kind, resource_id, control_binding_id
-            ),
-            None,
+        resolver = (
+            self.resolve_current_lifecycle_resource
+            if current_authority
+            else self.resolve_standalone_resource
         )
+        return (resolver(resource_kind, resource_id, control_binding_id), None)
 
     def describe_resource(
         self, resource: ExactResourceRef, repo_id: str | None

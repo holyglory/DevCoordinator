@@ -102,6 +102,8 @@ from devcoordinator.normalized_server_lifecycle import (
 from devcoordinator.repository_lifecycle import (
     ActionFencedError,
     ConcurrentLifecycleError,
+    FencedRetirementResumeError,
+    LifecyclePlanStaleError,
     RepositoryDecommissionPlan,
     RepositoryAction,
     RepositoryLifecycle,
@@ -327,6 +329,51 @@ class PrivateStateWriteCleanupError(RuntimeError):
 def coordinator_exception_payload(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, StructuredCoordinatorError):
         return copy.deepcopy(exc.payload)
+    if isinstance(exc, FencedRetirementResumeError):
+        payload = coordinator_exception_payload(exc.original_error)
+        original_action = str(payload.get("action_required") or "").strip()
+        recovery_action = (
+            "Do not create a replacement plan. Keep the confirmed operation fenced, "
+            "correct the reported failure, then retry the exact confirmed operation; "
+            "if it cannot be corrected, inspect the retained evidence manually."
+        )
+        payload["prior_operation_effects_possible"] = True
+        payload["recovery_scope"] = "exact_confirmed_operation"
+        payload["replacement_plan_allowed"] = False
+        payload["action_required"] = (
+            f"{original_action}\n\n{recovery_action}"
+            if original_action
+            else recovery_action
+        )
+        return payload
+    if isinstance(exc, LifecyclePlanStaleError):
+        if exc.prior_operation_effects_possible:
+            return {
+                "error": str(exc),
+                "code": "lifecycle_fenced_resume_stale",
+                "classification": "lifecycle_fenced_resume_identity_changed",
+                "mutation_performed": False,
+                "prior_operation_effects_possible": True,
+                "recovery_scope": "exact_confirmed_operation",
+                "replacement_plan_allowed": False,
+                "action_required": (
+                    "Do not create a replacement plan. Repair the reported controller "
+                    "identity, then retry the exact confirmed operation so its retained "
+                    "fence can resume; if identity cannot be restored, leave it fenced "
+                    "and review the retained operation evidence manually."
+                ),
+            }
+        return {
+            "error": str(exc),
+            "code": "lifecycle_plan_stale",
+            "classification": "lifecycle_target_identity_changed",
+            "mutation_performed": False,
+            "prior_operation_effects_possible": False,
+            "action_required": (
+                "Refresh authoritative inventory, review a newly generated lifecycle "
+                "plan, and retry. This rejected call performed no host mutation."
+            ),
+        }
     if isinstance(exc, ActionFencedError):
         return {
             "error": str(exc),

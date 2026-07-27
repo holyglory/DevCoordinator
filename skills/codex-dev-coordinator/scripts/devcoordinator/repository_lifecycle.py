@@ -46,6 +46,28 @@ class PlanDriftError(LifecycleError):
     """The repository/resource no longer matches the immutable plan."""
 
 
+class LifecyclePlanStaleError(PlanDriftError):
+    """A confirmed plan was rejected without mutation by this invocation.
+
+    ``prior_operation_effects_possible`` distinguishes an initial stale-plan
+    refusal from a fenced resume whose earlier attempt may have changed host state.
+    """
+
+    def __init__(
+        self, message: str, *, prior_operation_effects_possible: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.prior_operation_effects_possible = prior_operation_effects_possible
+
+
+class FencedRetirementResumeError(LifecycleError):
+    """An operational failure occurred while resuming one fenced retirement."""
+
+    def __init__(self, original_error: BaseException) -> None:
+        super().__init__(str(original_error))
+        self.original_error = original_error
+
+
 class OwnershipError(LifecycleError):
     """Exact control ownership could not be proved."""
 

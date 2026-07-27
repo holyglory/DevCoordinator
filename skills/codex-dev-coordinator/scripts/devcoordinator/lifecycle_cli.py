@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, TypeVar
 
 from .broker import BrokerOperation
 from .broker_links import BrokerLinkStore
@@ -13,6 +13,8 @@ from .cleanup_lifecycle import CleanupLifecycle
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
 from .repository_lifecycle import ExactResourceRef, RepositoryLifecycle, ResourceKind
 from .repository_lifecycle import (
+    FencedRetirementResumeError,
+    LifecyclePlanStaleError,
     OperationStatus,
     PlanDriftError,
     RepositoryDecommissionPlan,
@@ -23,6 +25,7 @@ from .store import AccountStore
 
 
 FULL_DOCKER_OBSERVER_DOMAIN = "host-runtime-v2:full-docker"
+_T = TypeVar("_T")
 
 REPOSITORY_ACTION_ALIASES = {
     "plan-remove": "plan-remove",
@@ -436,17 +439,36 @@ def handle_lifecycle_cli(
             str(args.request_project if hasattr(args, "request_project") else args.project)
         )
         if args.action in {"retire", "archive"}:
-            confirmed = _confirmed_retirement_plan(
+            confirmed_plan_id = str(args.plan_id)
+            confirmed = _with_retirement_progress_context(
                 persistence,
-                plan_id=str(args.plan_id),
-                plan_fingerprint=str(args.plan_fingerprint),
-                resource_kind=ResourceKind(str(args.resource_kind)),
-                resource_id=str(args.resource_id),
-                control_binding_id=str(args.control_binding_id),
+                confirmed_plan_id,
+                lambda: _confirmed_retirement_plan(
+                    persistence,
+                    plan_id=confirmed_plan_id,
+                    plan_fingerprint=str(args.plan_fingerprint),
+                    resource_kind=ResourceKind(str(args.resource_kind)),
+                    resource_id=str(args.resource_id),
+                    control_binding_id=str(args.control_binding_id),
+                ),
             )
-            _verify_cli_exact_identity(args, confirmed.target)
-            execution = _retirement_execution_plan(persistence, confirmed)
-            progress = persistence.operation_progress(execution.plan_id)
+            _with_retirement_progress_context(
+                persistence,
+                confirmed_plan_id,
+                lambda: _verify_cli_confirmed_retirement_identity(
+                    args, confirmed.target
+                ),
+            )
+            execution = _with_retirement_progress_context(
+                persistence,
+                confirmed_plan_id,
+                lambda: _retirement_execution_plan(persistence, confirmed),
+            )
+            progress = _with_retirement_progress_context(
+                persistence,
+                confirmed_plan_id,
+                lambda: persistence.operation_progress(execution.plan_id),
+            )
             if progress.status is OperationStatus.SUCCEEDED:
                 result = lifecycle.apply_standalone_retirement(
                     execution.plan_id,
@@ -457,43 +479,87 @@ def handle_lifecycle_cli(
                     result.to_dict(), confirmed=confirmed, observation=None
                 )
             if progress.status is not OperationStatus.PLANNED:
-                current_before, current_before_repo_id = persistence.resolve_resource(
-                    execution.target.kind,
-                    execution.target.resource_id,
-                    execution.target.control_binding_id,
-                    include_archived=True,
+                current_before, current_before_repo_id = _with_retirement_progress_context(
+                    persistence,
+                    confirmed_plan_id,
+                    lambda: persistence.resolve_resource(
+                        execution.target.kind,
+                        execution.target.resource_id,
+                        execution.target.control_binding_id,
+                        include_archived=True,
+                        current_authority=True,
+                    ),
+                    known_fenced=True,
                 )
                 if current_before_repo_id != execution.repo_id:
-                    raise PlanDriftError("resource repository attachment changed")
+                    raise LifecyclePlanStaleError(
+                        "resource repository attachment changed",
+                        prior_operation_effects_possible=True,
+                    )
                 _require_target_semantically_unchanged(
-                    execution.target, current_before
+                    confirmed.target,
+                    current_before,
+                    prior_operation_effects_possible=True,
                 )
-                before_bindings = _control_binding_contract(
-                    store, (current_before,)
+                before_bindings = _with_retirement_progress_context(
+                    persistence,
+                    confirmed_plan_id,
+                    lambda: _control_binding_contract(store, (current_before,)),
+                    known_fenced=True,
                 )
-                observation = require_fresh_lifecycle_observation(
-                    store,
-                    observe_before_apply,
-                    project=request_project,
-                    agent=str(args.agent),
+                observation = _with_retirement_progress_context(
+                    persistence,
+                    confirmed_plan_id,
+                    lambda: require_fresh_lifecycle_observation(
+                        store,
+                        observe_before_apply,
+                        project=request_project,
+                        agent=str(args.agent),
+                    ),
+                    known_fenced=True,
                 )
-                current, current_repo_id = persistence.resolve_resource(
-                    execution.target.kind,
-                    execution.target.resource_id,
-                    execution.target.control_binding_id,
-                    include_archived=True,
+                current, current_repo_id = _with_retirement_progress_context(
+                    persistence,
+                    confirmed_plan_id,
+                    lambda: persistence.resolve_resource(
+                        execution.target.kind,
+                        execution.target.resource_id,
+                        execution.target.control_binding_id,
+                        include_archived=True,
+                        current_authority=True,
+                    ),
+                    known_fenced=True,
                 )
                 if current_repo_id != execution.repo_id:
-                    raise PlanDriftError("resource repository attachment changed")
-                _require_target_semantically_unchanged(execution.target, current)
-                if before_bindings != _control_binding_contract(store, (current,)):
-                    raise PlanDriftError(
-                        "standalone resource controller changed during current observation"
+                    raise LifecyclePlanStaleError(
+                        "resource repository attachment changed",
+                        prior_operation_effects_possible=True,
                     )
-                result = lifecycle.apply_standalone_retirement(
-                    execution.plan_id,
-                    execution.fingerprint,
-                    actor=str(args.agent),
+                _require_target_semantically_unchanged(
+                    confirmed.target,
+                    current,
+                    prior_operation_effects_possible=True,
+                )
+                current_bindings = _with_retirement_progress_context(
+                    persistence,
+                    confirmed_plan_id,
+                    lambda: _control_binding_contract(store, (current,)),
+                    known_fenced=True,
+                )
+                if before_bindings != current_bindings:
+                    raise LifecyclePlanStaleError(
+                        "standalone resource controller changed during current observation",
+                        prior_operation_effects_possible=True,
+                    )
+                result = _with_retirement_progress_context(
+                    persistence,
+                    confirmed_plan_id,
+                    lambda: lifecycle.apply_standalone_retirement(
+                        execution.plan_id,
+                        execution.fingerprint,
+                        actor=str(args.agent),
+                    ),
+                    known_fenced=True,
                 )
                 return _apply_result(
                     result.to_dict(),
@@ -506,10 +572,13 @@ def handle_lifecycle_cli(
                 execution.target.resource_id,
                 execution.target.control_binding_id,
                 include_archived=True,
+                current_authority=True,
             )
             if current_before_repo_id != execution.repo_id:
-                raise PlanDriftError("resource repository attachment changed")
-            _require_target_semantically_unchanged(execution.target, current_before)
+                raise LifecyclePlanStaleError(
+                    "resource repository attachment changed"
+                )
+            _require_target_semantically_unchanged(confirmed.target, current_before)
             before_bindings = _control_binding_contract(store, (current_before,))
             observation = require_fresh_lifecycle_observation(
                 store,
@@ -522,12 +591,15 @@ def handle_lifecycle_cli(
                 execution.target.resource_id,
                 execution.target.control_binding_id,
                 include_archived=True,
+                current_authority=True,
             )
             if current_repo_id != execution.repo_id:
-                raise PlanDriftError("resource repository attachment changed")
-            _require_target_semantically_unchanged(execution.target, current)
+                raise LifecyclePlanStaleError(
+                    "resource repository attachment changed"
+                )
+            _require_target_semantically_unchanged(confirmed.target, current)
             if before_bindings != _control_binding_contract(store, (current,)):
-                raise PlanDriftError(
+                raise LifecyclePlanStaleError(
                     "standalone resource controller changed during current observation"
                 )
             if confirmed.repo_id is not None or args.action == "archive":
@@ -543,7 +615,7 @@ def handle_lifecycle_cli(
                     actor=str(args.agent),
                     reason=confirmed.reason,
                 )
-            _require_retirement_refresh_matches(execution, refreshed)
+            _require_retirement_refresh_matches(confirmed, refreshed)
             persistence.bind_lifecycle_plan_successor(execution, refreshed)
             result = lifecycle.apply_standalone_retirement(
                 refreshed.plan_id,
@@ -1053,6 +1125,70 @@ def _verify_cli_exact_identity(args: argparse.Namespace, exact: ExactResourceRef
         raise RuntimeError("host resource controller fingerprint changed; refresh before acting")
 
 
+def _verify_cli_confirmed_retirement_identity(
+    args: argparse.Namespace, exact: ExactResourceRef
+) -> None:
+    """Match broker apply: a confirmed plan owns refresh-generation identity."""
+
+    # _confirmed_retirement_plan already binds kind, resource ID, controller
+    # binding, and the complete generation-bearing plan fingerprint.  The
+    # caller's ownership fingerprint came from the pre-plan inventory and a
+    # mandatory planning observation is expected to advance that generation.
+    # Broker apply deliberately checks only the stable tuple plus immutable
+    # host identity; explicit account authority must enforce the same contract.
+    if str(args.immutable_fingerprint) != exact.immutable_fingerprint:
+        raise LifecyclePlanStaleError(
+            "host resource immutable fingerprint changed; refresh before acting"
+        )
+
+
+def _retirement_execution_is_fenced(
+    persistence: SQLiteLifecyclePersistence,
+    confirmed_plan_id: str,
+) -> bool:
+    """Return durable resume context without trusting successor plan semantics."""
+
+    try:
+        execution = persistence.resolve_lifecycle_plan(confirmed_plan_id)
+        execution_plan_id = str(getattr(execution, "plan_id", "") or "")
+        if not execution_plan_id:
+            return False
+        return (
+            persistence.operation_progress(execution_plan_id).status
+            is not OperationStatus.PLANNED
+        )
+    except Exception:
+        return False
+
+
+def _with_retirement_progress_context(
+    persistence: SQLiteLifecyclePersistence,
+    confirmed_plan_id: str,
+    operation: Callable[[], _T],
+    *,
+    known_fenced: bool = False,
+) -> _T:
+    """Preserve exact-plan recovery for every failure of a fenced execution."""
+
+    try:
+        return operation()
+    except Exception as exc:
+        fenced = known_fenced or _retirement_execution_is_fenced(
+            persistence, confirmed_plan_id
+        )
+        if isinstance(exc, LifecyclePlanStaleError):
+            if exc.prior_operation_effects_possible:
+                raise
+            if fenced:
+                raise LifecyclePlanStaleError(
+                    str(exc), prior_operation_effects_possible=True
+                ) from exc
+            raise
+        if fenced:
+            raise FencedRetirementResumeError(exc) from exc
+        raise
+
+
 def _confirmed_repository_plan(
     persistence: SQLiteLifecyclePersistence,
     *,
@@ -1083,7 +1219,9 @@ def _confirmed_retirement_plan(
     if not isinstance(plan, StandaloneRetirementPlan):
         raise RuntimeError(f"plan {plan_id} is not a standalone retirement")
     if plan.fingerprint != plan_fingerprint:
-        raise PlanDriftError("plan fingerprint does not match the durable plan")
+        raise LifecyclePlanStaleError(
+            "plan fingerprint does not match the durable plan"
+        )
     if (
         plan.target.kind is not resource_kind
         or plan.target.resource_id != resource_id
@@ -1110,10 +1248,24 @@ def _retirement_execution_plan(
 ) -> StandaloneRetirementPlan:
     execution = persistence.resolve_lifecycle_plan(confirmed.plan_id)
     if not isinstance(execution, StandaloneRetirementPlan):
-        raise PlanDriftError("retirement plan successor has the wrong operation kind")
-    _require_retirement_refresh_matches(confirmed, execution)
+        raise LifecyclePlanStaleError(
+            "retirement plan successor has the wrong operation kind",
+            prior_operation_effects_possible=_retirement_execution_is_fenced(
+                persistence, confirmed.plan_id
+            ),
+        )
+    progress = persistence.operation_progress(execution.plan_id)
+    prior_operation_effects_possible = progress.status is not OperationStatus.PLANNED
+    _require_target_semantically_unchanged(
+        confirmed.target,
+        execution.target,
+        prior_operation_effects_possible=prior_operation_effects_possible,
+    )
     if execution.reason != confirmed.reason:
-        raise PlanDriftError("retirement plan successor changed the confirmed reason")
+        raise LifecyclePlanStaleError(
+            "retirement plan successor changed the confirmed reason",
+            prior_operation_effects_possible=prior_operation_effects_possible,
+        )
     return execution
 
 
@@ -1304,10 +1456,16 @@ def _require_retirement_refresh_matches(
 
 
 def _require_target_semantically_unchanged(
-    confirmed: ExactResourceRef, current: ExactResourceRef
+    confirmed: ExactResourceRef,
+    current: ExactResourceRef,
+    *,
+    prior_operation_effects_possible: bool = False,
 ) -> None:
     if _target_contract(current) != _target_contract(confirmed):
-        raise PlanDriftError("standalone resource changed during current observation")
+        raise LifecyclePlanStaleError(
+            "standalone resource changed during current observation",
+            prior_operation_effects_possible=prior_operation_effects_possible,
+        )
 
 
 def _require_plan_target_identity_unchanged(

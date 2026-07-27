@@ -8,6 +8,7 @@
   "source" : "isolated-test-fixture",
   "source_files" : [
     "Package.swift",
+    "Sources\/DevOpsBoard\/IncidentWorkspaceViews.swift",
     "Sources\/DevOpsBoard\/MenuBarViews.swift",
     "Sources\/DevOpsBoard\/Models.swift",
     "Sources\/DevOpsBoard\/OpsStore.swift",
@@ -17,6 +18,6 @@
     "Tools\/MenuBarSnapshotMain.swift",
     "Tools\/SnapshotProvenance.swift"
   ],
-  "source_sha256" : "f8fd64184fb815f8e5d15535cbd53dc4c1901599cd27d5cd1feac4ebdf0d3398",
+  "source_sha256" : "946eeafdbe61340e276d9eceb6414285340110da49c620a381ceea512e5c4a7d",
   "width" : 430
 }

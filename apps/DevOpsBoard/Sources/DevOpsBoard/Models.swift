@@ -945,6 +945,13 @@ enum ServiceFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum BoardWorkspace: String, CaseIterable, Identifiable {
+    case resources = "Resources"
+    case activity = "Activity"
+
+    var id: String { rawValue }
+}
+
 enum ResourceTab: String, CaseIterable, Identifiable {
     case servers = "Dev Servers"
     case docker = "Docker"

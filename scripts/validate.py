@@ -496,21 +496,499 @@ def source_region(source: str, start: str, end: str) -> str:
     return source[start_index:end_index]
 
 
+def optional_source_region(
+    source: str,
+    start: str,
+    end: str,
+    *,
+    label: str,
+    errors: list[str],
+) -> str:
+    """Return a bounded source region while keeping contract checks composable."""
+
+    start_index = source.find(start)
+    end_index = source.find(end, start_index + len(start))
+    if start_index < 0 or end_index <= start_index:
+        errors.append(f"missing {label} source boundary")
+        return ""
+    return source[start_index:end_index]
+
+
+def swift_code_mask(source: str) -> str:
+    """Mask Swift comments and strings while preserving source positions."""
+
+    masked = list(source)
+    index = 0
+    while index < len(source):
+        if source.startswith("//", index):
+            end = source.find("\n", index + 2)
+            end = len(source) if end < 0 else end
+        elif source.startswith("/*", index):
+            end = index + 2
+            depth = 1
+            while end < len(source) and depth:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+        elif source.startswith('"""', index):
+            closing = source.find('"""', index + 3)
+            end = len(source) if closing < 0 else closing + 3
+        elif source[index] == '"':
+            end = index + 1
+            while end < len(source):
+                if source[end] == "\\":
+                    end += 2
+                elif source[end] == '"':
+                    end += 1
+                    break
+                else:
+                    end += 1
+        else:
+            index += 1
+            continue
+
+        for masked_index in range(index, min(end, len(source))):
+            if source[masked_index] != "\n":
+                masked[masked_index] = " "
+        index = end
+
+    return "".join(masked)
+
+
+def matching_swift_delimiter(source: str, opening_index: int) -> int | None:
+    """Return the matching close-paren index in already-masked Swift source."""
+
+    depth = 0
+    for index in range(opening_index, len(source)):
+        if source[index] == "(":
+            depth += 1
+        elif source[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def first_swift_argument(arguments: str) -> str:
+    """Return the first top-level Swift call argument."""
+
+    depths = {"(": 0, "[": 0, "{": 0}
+    closing = {")": "(", "]": "[", "}": "{"}
+    for index, character in enumerate(arguments):
+        if character in depths:
+            depths[character] += 1
+        elif character in closing:
+            opener = closing[character]
+            depths[opener] = max(0, depths[opener] - 1)
+        elif character == "," and not any(depths.values()):
+            return arguments[:index]
+    return arguments
+
+
+def swiftui_vertical_scroll_count(source: str) -> int:
+    """Count ScrollView calls that are vertical or not provably horizontal-only."""
+
+    code = swift_code_mask(source)
+    vertical_count = 0
+    for match in re.finditer(r"\bScrollView\b", code):
+        cursor = match.end()
+        while cursor < len(code) and code[cursor].isspace():
+            cursor += 1
+
+        if cursor < len(code) and code[cursor] == "{":
+            vertical_count += 1
+            continue
+        if cursor >= len(code) or code[cursor] != "(":
+            continue
+
+        closing_index = matching_swift_delimiter(code, cursor)
+        if closing_index is None:
+            vertical_count += 1
+            continue
+        first_argument = re.sub(
+            r"\s+", "", first_swift_argument(code[cursor + 1 : closing_index])
+        )
+        horizontal_only_literals = {
+            ".horizontal",
+            "Axis.Set.horizontal",
+            "[.horizontal]",
+            "[Axis.Set.horizontal]",
+        }
+        if first_argument not in horizontal_only_literals:
+            vertical_count += 1
+
+    return vertical_count
+
+
+def incident_workspace_contract_errors(
+    views: str,
+    incident_views: str,
+    vertical_layout_tests: str,
+) -> list[str]:
+    """Return structural errors for the Board's single-scroll Incident Workspace."""
+
+    errors: list[str] = []
+    main_board = optional_source_region(
+        views,
+        "struct MainBoardView: View",
+        "struct ResourceTabBar: View",
+        label="MainBoardView",
+        errors=errors,
+    )
+    resources_workspace = optional_source_region(
+        incident_views,
+        "struct ResourcesWorkspaceView: View",
+        "private struct CompactProjectLoadEntry",
+        label="ResourcesWorkspaceView",
+        errors=errors,
+    )
+    activity_workspace = optional_source_region(
+        incident_views,
+        "struct ActivityWorkspaceView: View",
+        "private struct ActivityOperationList",
+        label="ActivityWorkspaceView",
+        errors=errors,
+    )
+    incident_detail = optional_source_region(
+        incident_views,
+        "private struct ActivityIncidentDetail: View",
+        "private struct IncidentExplanationSection",
+        label="ActivityIncidentDetail",
+        errors=errors,
+    )
+    resources_scroll_test = optional_source_region(
+        vertical_layout_tests,
+        "func testResourcesWorkspaceOwnsExactlyOneVisibleVerticalScrollerAtCompactAndDesktopWidths",
+        "func testActivityFailureWorkspaceOwnsExactlyOneVisibleVerticalScrollerAtCompactAndDesktopWidths",
+        label="Resources one-scroll XCTest",
+        errors=errors,
+    )
+    activity_scroll_test = optional_source_region(
+        vertical_layout_tests,
+        "func testActivityFailureWorkspaceOwnsExactlyOneVisibleVerticalScrollerAtCompactAndDesktopWidths",
+        "func testVerticalScrollTopologyGuardCatchesLegacyNestingWithoutCountingHorizontalOnlyScroll",
+        label="Activity one-scroll XCTest",
+        errors=errors,
+    )
+
+    main_order = [
+        main_board.find("ToolbarView(store: store)"),
+        main_board.find("WorkspaceAttentionHeader(store: store)"),
+        main_board.find("BoardWorkspaceTabs(store: store)"),
+        main_board.find("switch store.boardWorkspace"),
+        main_board.find("StatusBar(store: store)"),
+    ]
+    if any(index < 0 for index in main_order) or main_order != sorted(main_order):
+        errors.append(
+            "MainBoardView must order toolbar, attention, workspace tabs, selected workspace, and status"
+        )
+    for label, needle in (
+        ("Resources route", "case .resources:"),
+        ("Activity route", "case .activity:"),
+        ("Resources workspace", "ResourcesWorkspaceView("),
+        ("Activity workspace", "ActivityWorkspaceView(store: store)"),
+    ):
+        if needle not in main_board:
+            errors.append(f"MainBoardView is missing {label}")
+    if swiftui_vertical_scroll_count(main_board):
+        errors.append("MainBoardView must not own an outer vertical document scroller")
+
+    resource_body_end = resources_workspace.find("private var resourceContent")
+    resource_body = (
+        resources_workspace[:resource_body_end]
+        if resource_body_end >= 0
+        else resources_workspace
+    )
+    if swiftui_vertical_scroll_count(resource_body):
+        errors.append("ResourcesWorkspaceView must leave vertical scrolling to its active resource surface")
+    for label, needle in (
+        ("resource workspace anchor", '.accessibilityIdentifier("resources-workspace")'),
+        ("compact project load", "CompactProjectLoadBar(store: store)"),
+        ("compact managed leases", "CompactLeaseBar(store: store)"),
+        ("resource filters", "FilterRow("),
+        ("resource tabs", "ResourceTabBar(store: store)"),
+        ("active resource switch", "switch store.activeTab"),
+        ("resource scroll anchor", '.accessibilityIdentifier("resource-table-scroll")'),
+    ):
+        if needle not in resources_workspace:
+            errors.append(f"ResourcesWorkspaceView is missing {label}")
+
+    if swiftui_vertical_scroll_count(activity_workspace) != 1:
+        errors.append("ActivityWorkspaceView must own exactly one vertical scroller")
+    for label, needle in (
+        ("activity workspace anchor", '.accessibilityIdentifier("activity-workspace")'),
+        ("activity scroll anchor", '.accessibilityIdentifier("activity-workspace-scroll")'),
+        ("selected retained result route", "store.selectedActionResultID"),
+        ("wide incident list", "ActivityOperationList("),
+        ("compact incident selector", "CompactActivitySelector("),
+        ("incident detail", "ActivityIncidentDetail(store: store"),
+    ):
+        if needle not in activity_workspace:
+            errors.append(f"ActivityWorkspaceView is missing {label}")
+
+    if swiftui_vertical_scroll_count(incident_detail):
+        errors.append("ActivityIncidentDetail must share the Activity workspace scroller")
+    technical_contract = (
+        ("technical evidence", "SelectableTechnicalEvidence(text: technicalText)", incident_detail),
+        (
+            "native selectable evidence bridge",
+            "private struct SelectableTechnicalEvidence: NSViewRepresentable",
+            incident_views,
+        ),
+        ("selectable technical evidence", "view.isSelectable = true", incident_views),
+        ("read-only technical evidence", "view.isEditable = false", incident_views),
+        (
+            "technical evidence anchor",
+            '.accessibilityIdentifier("activity-technical-details")',
+            incident_detail,
+        ),
+        ("copy retained action evidence", "store.copyActionResultDetails(result)", incident_detail),
+        ("copy issue evidence", "store.copyIssueDetails(issue)", incident_detail),
+        (
+            "native copy action bridge",
+            "private struct TechnicalEvidenceCopyButton: NSViewRepresentable",
+            incident_views,
+        ),
+        (
+            "copy action anchor",
+            'button.setAccessibilityIdentifier("activity-copy-technical-details")',
+            incident_views,
+        ),
+    )
+    for label, needle, contract_source in technical_contract:
+        if needle not in contract_source:
+            errors.append(f"ActivityIncidentDetail is missing {label}")
+
+    for legacy_type in (
+        "InventoryStateBanner",
+        "ActionResultDrawer",
+        "ActivityReviewCoordinator",
+    ):
+        if legacy_type in views or legacy_type in incident_views:
+            errors.append(f"legacy center-pane type remains: {legacy_type}")
+
+    geometry_matrix = (
+        "[(mainPaneWidth, minimumWindowHeight), (desktopMainPaneWidth, desktopWindowHeight)]"
+    )
+    one_owner_assertion = "owners.count,\n                1"
+    for label, test_source in (
+        ("Resources", resources_scroll_test),
+        ("Activity", activity_scroll_test),
+    ):
+        if geometry_matrix not in test_source:
+            errors.append(f"{label} one-scroll XCTest is missing compact and desktop geometry")
+        if "let owners = visibleVerticalScrollOwners(in:" not in test_source:
+            errors.append(f"{label} one-scroll XCTest is missing the native owner detector")
+        if one_owner_assertion not in test_source:
+            errors.append(f"{label} one-scroll XCTest does not require exactly one owner")
+
+    scroll_test_contract = {
+        "native vertical-scroll detector": "scrollView.hasVerticalScroller",
+        "visible-scroll detector": "visibleVerticalScrollOwners(in:",
+        "nested-scroll must-catch": (
+            "testVerticalScrollTopologyGuardCatchesLegacyNestingWithoutCountingHorizontalOnlyScroll"
+        ),
+        "nested vertical fixture": "LegacyNestedVerticalScrollFixture()",
+        "nested-owner failure assertion": "legacyOwners.count,\n            2",
+        "horizontal false-positive control": "HorizontalOnlyScrollControlFixture()",
+        "horizontal-control assertion": "horizontalControlOwners.count,\n            1",
+    }
+    for label, needle in scroll_test_contract.items():
+        if needle not in vertical_layout_tests:
+            errors.append(f"vertical layout tests are missing {label}")
+
+    evidence_test_contract = {
+        "selectable/copyable evidence test": (
+            "testActivityTechnicalDetailsAreSelectableAndExposeAnAccessibleCopyAction"
+        ),
+        "native selectable text inspection": "NSTextField.self",
+        "selectable state assertion": "$0.isSelectable",
+        "read-only state assertion": "allSatisfy { !$0.isEditable }",
+        "real retained evidence lookup": '$0.stringValue.contains("Fixture health check timed out")',
+        "copy action test anchor": 'identifier: "activity-copy-technical-details"',
+        "copy button role assertion": "NSAccessibility.Role.button",
+        "copy enabled-state assertion": "accessibilityIsEnabled(copyAction)",
+    }
+    for label, needle in evidence_test_contract.items():
+        if needle not in vertical_layout_tests:
+            errors.append(f"vertical layout tests are missing {label}")
+
+    return errors
+
+
+def check_incident_workspace_architecture(
+    views: str,
+    incident_views: str,
+    vertical_layout_tests: str,
+) -> None:
+    """Validate the real contract and prove its detector catches representative regressions."""
+
+    scroll_detector_controls = {
+        "default trailing-closure ScrollView": ("ScrollView { EmptyView() }", 1),
+        "default parenthesized ScrollView": ("ScrollView() { EmptyView() }", 1),
+        "default-axis argument ScrollView": (
+            "ScrollView(showsIndicators: false) { EmptyView() }",
+            1,
+        ),
+        "explicit vertical ScrollView": ("ScrollView(.vertical) { EmptyView() }", 1),
+        "combined-axis ScrollView": (
+            "ScrollView([.horizontal, .vertical]) { EmptyView() }",
+            1,
+        ),
+        "explicit horizontal-only ScrollView": (
+            "ScrollView(.horizontal) { EmptyView() }",
+            0,
+        ),
+        "comment and string false-positive control": (
+            '// ScrollView { EmptyView() }\nlet label = "ScrollView(.vertical)"',
+            0,
+        ),
+    }
+    detector_failures = [
+        label
+        for label, (fixture, expected) in scroll_detector_controls.items()
+        if swiftui_vertical_scroll_count(fixture) != expected
+    ]
+    if detector_failures:
+        raise SystemExit(
+            "DevOpsBoard vertical ScrollView source detector failed controls: "
+            + ", ".join(detector_failures)
+        )
+
+    errors = incident_workspace_contract_errors(
+        views,
+        incident_views,
+        vertical_layout_tests,
+    )
+    if errors:
+        raise SystemExit("DevOpsBoard Incident Workspace guard failed: " + "; ".join(errors))
+
+    false_positive_control = incident_views.replace(
+        "VStack(spacing: 10) {",
+        "VStack(spacing: 10) {\n            ScrollView(.horizontal) { EmptyView() }",
+        1,
+    )
+    if incident_workspace_contract_errors(
+        views,
+        false_positive_control,
+        vertical_layout_tests,
+    ):
+        raise SystemExit(
+            "DevOpsBoard Incident Workspace detector rejected an intentional horizontal-only scroller"
+        )
+
+    mutations = {
+        "outer Resources vertical scroller": (
+            views,
+            incident_views.replace(
+                "VStack(spacing: 10) {",
+                "VStack(spacing: 10) {\n            ScrollView(.vertical) { EmptyView() }",
+                1,
+            ),
+            vertical_layout_tests,
+        ),
+        "default outer Resources vertical scroller": (
+            views,
+            incident_views.replace(
+                "VStack(spacing: 10) {",
+                "VStack(spacing: 10) {\n            ScrollView { EmptyView() }",
+                1,
+            ),
+            vertical_layout_tests,
+        ),
+        "nested Activity vertical scroller": (
+            views,
+            incident_views.replace(
+                "struct ActivityWorkspaceView: View {",
+                "struct ActivityWorkspaceView: View {\n    let nested = ScrollView(.vertical) { EmptyView() }",
+                1,
+            ),
+            vertical_layout_tests,
+        ),
+        "legacy action-result drawer": (
+            views.replace(
+                "ToolbarView(store: store)",
+                "ToolbarView(store: store)\n            ActionResultDrawer(store: store)",
+                1,
+            ),
+            incident_views,
+            vertical_layout_tests,
+        ),
+        "non-selectable technical evidence": (
+            views,
+            incident_views.replace("view.isSelectable = true", "view.isSelectable = false", 1),
+            vertical_layout_tests,
+        ),
+        "missing copy action": (
+            views,
+            incident_views.replace(
+                'activity-copy-technical-details',
+                'removed-copy-technical-details',
+                1,
+            ),
+            vertical_layout_tests,
+        ),
+        "missing native scroll detector": (
+            views,
+            incident_views,
+            vertical_layout_tests.replace("scrollView.hasVerticalScroller", "true", 1),
+        ),
+        "weakened Resources one-owner assertion": (
+            views,
+            incident_views,
+            vertical_layout_tests.replace(
+                "owners.count,\n                1",
+                "owners.count,\n                2",
+                1,
+            ),
+        ),
+        "missing horizontal false-positive test": (
+            views,
+            incident_views,
+            vertical_layout_tests.replace(
+                "HorizontalOnlyScrollControlFixture()",
+                "RemovedHorizontalControlFixture()",
+                1,
+            ),
+        ),
+        "missing selectable evidence test": (
+            views,
+            incident_views,
+            vertical_layout_tests.replace("$0.isSelectable", "$0.isEditable", 1),
+        ),
+    }
+    missed = [
+        label
+        for label, sources in mutations.items()
+        if not incident_workspace_contract_errors(*sources)
+    ]
+    if missed:
+        raise SystemExit(
+            "DevOpsBoard Incident Workspace detector missed must-catch fixtures: "
+            + ", ".join(missed)
+        )
+
+
 def check_devops_board_center_pane_geometry(
     views: str,
+    incident_views: str,
     split_sizing: str,
     vertical_layout_tests: str,
 ) -> None:
-    """Keep intrinsic children from widening or vertically center-cropping the main pane.
+    """Keep intrinsic children from widening or center-cropping the Incident Workspace.
 
     The reported window was 1180 points wide with a user-resized 380-point
     sidebar and the 320-point inspector. That leaves a 464-point main pane,
     rather than the 524 points produced by the default-sidebar fixture. The
     executable sizing check carries both that must-catch geometry and a wider
-    control where the same preferred maxima legitimately fit. The vertical
-    fixture models the dense six-project, 19-server, attention, and Activity
-    state that used to exceed the minimum window height and become centered
-    inside the exact-height pane before clipping.
+    control where the same preferred maxima legitimately fit. Native tests
+    enforce one visible vertical scroll owner for both Resources and Activity;
+    raster fixtures retain the earlier center-crop recall and controls.
     """
 
     split_width = 8
@@ -551,48 +1029,47 @@ def check_devops_board_center_pane_geometry(
     minimum_window_height = 760
     fixed_toolbar_height = 54
     toolbar_divider_height = 1
-    activity_height = 34
+    attention_header_height = 84
+    workspace_tabs_height = 40
     status_divider_height = 1
     status_height = 38
-    variable_body_viewport = minimum_window_height - (
+    workspace_viewport = minimum_window_height - (
         fixed_toolbar_height
         + toolbar_divider_height
-        + activity_height
+        + attention_header_height
+        + workspace_tabs_height
         + status_divider_height
         + status_height
     )
-    dense_variable_body_minimum = (
-        28  # body padding
-        + 62  # attention banner
-        + 19
-        + (6 * 34)  # project-load heading and six rows
+    resource_fixed_controls = (
+        28  # workspace padding
+        + 42  # compact project-load row
         + 32  # filters
         + 28  # resource tabs
-        + 30
-        + 340  # resource heading and table minimum
-        + (4 * 12)  # inter-section spacing
+        + (3 * 10)  # inter-control spacing
     )
-    sparse_variable_body_control = (
+    resource_table_viewport = workspace_viewport - resource_fixed_controls
+    legacy_document_body_minimum = (
         28
+        + 62  # attention banner inside the old document scroller
         + 19
-        + 34  # one project-load row, without an attention banner
+        + (6 * 34)  # six expanded project-load rows
         + 32
         + 28
         + 30
-        + 340
-        + (3 * 12)
+        + 340  # resource table minimum
+        + (4 * 12)
     )
     legacy_dense_intrinsic_height = (
         fixed_toolbar_height
         + toolbar_divider_height
-        + dense_variable_body_minimum
-        + activity_height
+        + legacy_document_body_minimum
         + status_divider_height
         + status_height
     )
     vertical_geometry_recall = {
-        "dense variable body exceeds its minimum-window viewport": (
-            dense_variable_body_minimum > variable_body_viewport
+        "legacy document body exceeds the Incident Workspace viewport": (
+            legacy_document_body_minimum > workspace_viewport
         ),
         "legacy dense intrinsic pane exceeds the minimum window": (
             legacy_dense_intrinsic_height > minimum_window_height
@@ -600,10 +1077,10 @@ def check_devops_board_center_pane_geometry(
         "centered legacy pane crops a fixed edge by more than the realistic shift": (
             (legacy_dense_intrinsic_height - minimum_window_height) / 2 > 48
         ),
-        "sparse body remains a false-positive control": (
-            sparse_variable_body_control <= variable_body_viewport
+        "new fixed controls leave a usable resource-table viewport": (
+            resource_table_viewport >= 340
         ),
-        "fixed chrome leaves a usable resource viewport": variable_body_viewport >= 340,
+        "Activity keeps a useful shared-scroll viewport": workspace_viewport >= 500,
     }
     broken_vertical_checks = [
         label for label, condition in vertical_geometry_recall.items() if not condition
@@ -681,8 +1158,6 @@ def check_devops_board_center_pane_geometry(
         )
 
     ops_console = source_region(views, "struct OpsConsoleView: View", "struct SplitHandle: View")
-    main_board = source_region(views, "struct MainBoardView: View", "struct ProjectUsageStrip: View")
-
     if "HStack(alignment: .top, spacing: 0)" not in ops_console:
         raise SystemExit(
             "DevOpsBoard split shell must lay out panes consecutively from the top; "
@@ -708,49 +1183,29 @@ def check_devops_board_center_pane_geometry(
             "top-leading alignment to prevent vertical center-cropping"
         )
 
-    scroll_start = main_board.find("ScrollView(.vertical)")
-    scroll_body_end = main_board.find('.accessibilityIdentifier("main-board-scroll-body")')
-    toolbar_index = main_board.find("ToolbarView(store: store)")
-    activity_index = main_board.find("ActionResultDrawer(")
-    status_index = main_board.find("StatusBar(store: store)")
-    fixed_chrome_order = [toolbar_index, scroll_start, scroll_body_end, activity_index, status_index]
-    if any(index < 0 for index in fixed_chrome_order) or fixed_chrome_order != sorted(fixed_chrome_order):
-        raise SystemExit(
-            "DevOpsBoard MainBoardView must keep the toolbar before, and Activity/status after, "
-            "the variable-body vertical ScrollView"
-        )
-
-    variable_body = main_board[scroll_start:scroll_body_end]
-    variable_body_contract = {
-        "inventory attention banner": "InventoryStateBanner(",
-        "project-load rows": "ProjectUsageStrip(store: store)",
-        "managed leases": "ManagedLeasesPanel(store: store)",
-        "filters": "FilterRow(",
-        "resource tabs": "ResourceTabBar(store: store)",
-        "active resource section": "switch store.activeTab",
-    }
-    missing_variable_body = [
-        label for label, needle in variable_body_contract.items() if needle not in variable_body
-    ]
-    if missing_variable_body:
-        raise SystemExit(
-            "DevOpsBoard variable-body ScrollView is missing vertically scrollable content: "
-            + ", ".join(missing_variable_body)
-        )
-
     fixed_chrome_contract = {
         "toolbar anchor": '.accessibilityIdentifier("main-board-toolbar")',
-        "scroll-body anchor": '.accessibilityIdentifier("main-board-scroll-body")',
+        "workspace tabs anchor": '.accessibilityIdentifier("board-workspace-tabs")',
+        "Resources workspace anchor": '.accessibilityIdentifier("resources-workspace")',
+        "Activity workspace anchor": '.accessibilityIdentifier("activity-workspace")',
         "status anchor": '.accessibilityIdentifier("main-board-status")',
     }
     missing_fixed_chrome = [
-        label for label, needle in fixed_chrome_contract.items() if needle not in views
+        label
+        for label, needle in fixed_chrome_contract.items()
+        if needle not in views and needle not in incident_views
     ]
     if missing_fixed_chrome:
         raise SystemExit(
             "DevOpsBoard vertical crop detector is missing stable production anchors: "
             + ", ".join(missing_fixed_chrome)
         )
+
+    check_incident_workspace_architecture(
+        views,
+        incident_views,
+        vertical_layout_tests,
+    )
 
     full_shell_test_contract = {
         "full three-pane production render": (
@@ -979,6 +1434,14 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         for path in sorted((ops_console / "Sources" / "DevOpsBoard").glob("*.swift"))
     )
     views = (ops_console / "Sources" / "DevOpsBoard" / "Views.swift").read_text(encoding="utf-8")
+    incident_views_path = (
+        ops_console / "Sources" / "DevOpsBoard" / "IncidentWorkspaceViews.swift"
+    )
+    if not incident_views_path.is_file():
+        raise SystemExit(
+            "DevOpsBoard Incident Workspace guard requires IncidentWorkspaceViews.swift"
+        )
+    incident_views = incident_views_path.read_text(encoding="utf-8")
     menu_bar_views = (
         ops_console / "Sources" / "DevOpsBoard" / "MenuBarViews.swift"
     ).read_text(encoding="utf-8")
@@ -1016,7 +1479,12 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
     coordinator_self_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "self_test.py").read_text(encoding="utf-8")
     coordinator_capability_test = (ROOT / "skills" / "codex-dev-coordinator" / "scripts" / "capability_integration_test.py").read_text(encoding="utf-8")
 
-    check_devops_board_center_pane_geometry(views, split_sizing, vertical_layout_tests)
+    check_devops_board_center_pane_geometry(
+        views,
+        incident_views,
+        split_sizing,
+        vertical_layout_tests,
+    )
     check_menu_source_summary_toggle(menu_bar_views)
 
     required = {
@@ -1064,7 +1532,16 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "docker sidebar toggle": "func toggleDocker",
         "combined presentation reducer UI": "presentationSnapshot",
         "compact source health chip": "SourceHealthChip",
-        "inventory state banner": "InventoryStateBanner",
+        "workspace attention header": "WorkspaceAttentionHeader",
+        "workspace tabs": "BoardWorkspaceTabs",
+        "store-owned workspace route": "@Published var boardWorkspace: BoardWorkspace = .resources",
+        "store-owned incident selection": "@Published var selectedActionResultID: UUID?",
+        "incident-scoped retirement recovery": "selectedRetirementRecoveryContext",
+        "selected retirement recovery action": "recoverSelectedRetirement()",
+        "stale retirement recovery label": "Refresh & re-plan",
+        "stale retirement recovery accessibility": "activity-refresh-and-replan",
+        "stale retirement recovery end-to-end regression": "testTypedStaleRetirementFailureRendersActionScopedRecoveryWorkspace",
+        "partial retirement resume label": "Retry confirmed operation",
         "partial capability warning": "Server and port lease actions remain available",
         "launch-safe command environment": "enum CommandEnvironment",
         "macOS system path discovery": "/etc/paths.d",
@@ -1080,12 +1557,12 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "complete server action gating": "serverActionAllowed",
         "complete docker action gating": "dockerActionAllowed",
         "complete database action gating": "databaseProtectionActionAllowed",
-        "retained action result drawer": "ActionResultDrawer",
-        "terminal action result dismissal": "dismissActionResult",
+        "retained Activity incident workspace": "ActivityWorkspaceView",
+        "terminal incident dismissal": "dismissActionResult",
         "action issue copy": "copyIssueDetails",
         "action issue dismissal": "dismissActionIssue",
-        "exact lease result card": "LeaseResultCard",
-        "all active lease management": "ManagedLeasesPanel",
+        "exact compact lease result": "Text(\"Port \\(latest.port)\")",
+        "all active compact lease management": "manageableLeaseResults",
         "discovered lease import": "LeaseActionResult(origin: origin, lease: lease",
         "lease attachment state": "pendingOperationID",
         "lease start eligibility": "canStartServer",
@@ -1332,7 +1809,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "http health timeout classification": "\"classification\": \"timeout\"",
         "project usage model": "struct ProjectUsage",
         "process usage model": "struct ProcessUsage",
-        "project load strip": "ProjectUsageStrip",
+        "compact project load strip": "CompactProjectLoadBar",
         "project load hot process": "hotProcessLabel(",
         "multi coordinator origin discovery": "FileSystemCoordinatorOriginDiscovery",
         "three-source repository UI regression": "testThreeSourceRepositoryPublishesOneNevodProjectAndRoutesOneProjectAction",
@@ -1358,6 +1835,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         [
             source_text,
             views,
+            incident_views,
             store,
             models,
             repository_catalog,
@@ -1370,6 +1848,7 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
             core_tests,
             repository_catalog_tests,
             project_group_presentation_tests,
+            vertical_layout_tests,
             coordinator,
             coordinator_self_test,
             coordinator_capability_test,
@@ -1393,7 +1872,10 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "action queue panel": "ACTION QUEUE",
         "recent events panel": "RECENT EVENTS",
         "synthetic recommendation queue": "visibleQueueItems",
-        "inspect recommendations": "Inspect ",
+        # Preserve the old synthetic recommendation prohibition without
+        # rejecting truthful incident guidance such as "Inspect retained
+        # evidence".
+        "inspect recommendations": "Inspect recommendations",
         "action item model": "ActionItem",
         "old action rail": "ActionRailView",
         "fake docker restarts column": "\"Restarts\"",
@@ -1420,6 +1902,10 @@ def check_ops_console_interaction_guardrails(*, run_macos_app_checks: bool = Tru
         "unattributed lease release": "arguments: [\"port\", \"release\", \"--lease-id\", lease.leaseID]",
         "blocking subprocess wait": ".waitUntilExit(",
         "blocking subprocess poll": "usleep(",
+        "legacy inventory-state banner": "InventoryStateBanner",
+        "legacy action-result drawer": "ActionResultDrawer",
+        "legacy Activity review coordinator": "ActivityReviewCoordinator",
+        "legacy main-board document scroll": "main-board-scroll-body",
     }
     prohibited_haystack = "\n".join([source_text, snapshot_main, menu_snapshot, snapshot_provenance])
     present = [label for label, needle in prohibited.items() if needle in prohibited_haystack]

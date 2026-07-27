@@ -120,7 +120,7 @@ struct MenuBarRuntimeView: View {
                     store: store,
                     issue: issue,
                     viewActivity: {
-                        ActivityReviewCoordinator.shared.requestReview()
+                        store.showActivity(issueID: issue.id)
                         openConsole()
                     }
                 )
