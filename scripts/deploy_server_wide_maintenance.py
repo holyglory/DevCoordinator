@@ -815,6 +815,10 @@ class Driver:
             )
         self.run(
             [
+                "/usr/sbin/runuser",
+                "--user",
+                "holyglory",
+                "--",
                 "/usr/bin/python3",
                 str(self.repository / "scripts/check_console_registration_ready.py"),
                 "--unit",

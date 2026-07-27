@@ -245,6 +245,13 @@ def main() -> int:
         "root deployment still runs private auth evidence as the wrong user",
     )
     expect(
+        source.count(
+            '"/usr/sbin/runuser",\n                "--user",\n                "holyglory"'
+        )
+        == 2,
+        "deployment does not run both private readiness checks as the service account",
+    )
+    expect(
         '"project": str(self.repository)' in source
         and '"name": "devops-console"' in source
         and '"port": "443"' in source,
