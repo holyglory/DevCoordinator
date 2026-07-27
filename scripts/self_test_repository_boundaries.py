@@ -228,7 +228,7 @@ Environment=ROOT_STATE=%h/.local/state/root-app
         )
         write(repo / "apps/DevOpsBoard" / safe_board_source_path, safe_board_source)
 
-        for tree, image_path, image_blob, sidecar_blob in module.KNOWN_HISTORICAL_BOARD_SOURCE_DRIFT:
+        for tree, image_path, image_blob, sidecar_blob in module.KNOWN_HISTORICAL_SOURCE_DRIFT:
             exact = {
                 "tree": tree,
                 "image_path": image_path,
@@ -237,14 +237,14 @@ Environment=ROOT_STATE=%h/.local/state/root-app
                 "detail": "aggregate source hash mismatch",
             }
             check(
-                module.known_historical_board_source_drift(**exact),
+                module.known_historical_source_drift(**exact),
                 "sealed historical repair did not accept its exact immutable tuple",
             )
             for field in ("tree", "image_path", "image_blob", "sidecar_blob", "detail"):
                 changed = dict(exact)
                 changed[field] = f"changed-{field}"
                 check(
-                    not module.known_historical_board_source_drift(**changed),
+                    not module.known_historical_source_drift(**changed),
                     f"historical repair was not exact for {field}",
                 )
 

@@ -52,12 +52,13 @@ CROSS_DEPENDENCY_PATTERNS = (
     re.compile(r"(?:\.\./)+holyskills(?:/|\b)", re.IGNORECASE),
 )
 
-# Commit ab5141d was published on main with current canonical image/sidecar
-# bytes but changed the Board renderer inputs without regenerating them. Public
-# history is immutable, so accept only that exact tree and blob set, only for
-# the resulting source-fingerprint mismatch. Current-tip provenance remains a
-# mandatory check and the repaired successor replaces all four artifacts.
-KNOWN_HISTORICAL_BOARD_SOURCE_DRIFT = frozenset(
+# Commits ab5141d and 8ad3312 were published on main with current canonical
+# image/sidecar bytes but changed renderer inputs without refreshing their
+# source bindings. Public history is immutable, so accept only those exact
+# tree/blob sets and only the resulting source-fingerprint mismatches.
+# Current-tip provenance remains mandatory and repaired successors replace the
+# stale bindings.
+KNOWN_HISTORICAL_SOURCE_DRIFT = frozenset(
     {
         (
             "24179f8205f339066ea3bd1a37c53fd96714e129",
@@ -82,6 +83,30 @@ KNOWN_HISTORICAL_BOARD_SOURCE_DRIFT = frozenset(
             "apps/DevOpsBoard/Artifacts/Canonical/menu-action-error.png",
             "842876ee2db927833c0f2d0f494fa27796c3cbac",
             "8770bdb3053dccadb33a6e199a3a036eeb261aa4",
+        ),
+        (
+            "944edc8e7cd6f08beebe9ea7169395aeac335df2",
+            "apps/DevOpsConsole/Artifacts/Canonical/login-desktop.png",
+            "c923e6e0cd1db244774c982484d336d4cb7d1489",
+            "70c86f525098959061b3710e93800b10b3af9d1e",
+        ),
+        (
+            "944edc8e7cd6f08beebe9ea7169395aeac335df2",
+            "apps/DevOpsConsole/Artifacts/Canonical/login-mobile.png",
+            "c94c0b78c7fe25d57589234a7f9731e449eefe97",
+            "39189e448ab2c9689783f3ee00b326247db20b22",
+        ),
+        (
+            "944edc8e7cd6f08beebe9ea7169395aeac335df2",
+            "apps/DevOpsConsole/Artifacts/Canonical/projects-desktop.png",
+            "17391fd846134764359ec073bbd64b4ed759448f",
+            "4ad77eb85a90ebc614b9ff51b5b3e7f153edb59b",
+        ),
+        (
+            "944edc8e7cd6f08beebe9ea7169395aeac335df2",
+            "apps/DevOpsConsole/Artifacts/Canonical/projects-mobile.png",
+            "b8df5ab7fd431b4040001524fb4226fedb698fcc",
+            "8faefd0f7366f7ad4a08d9686c0e5a849d2a86a9",
         ),
     }
 )
@@ -145,7 +170,7 @@ def forbidden_history_path(path: str) -> str | None:
     return None
 
 
-def known_historical_board_source_drift(
+def known_historical_source_drift(
     *,
     tree: str,
     image_path: str,
@@ -153,12 +178,15 @@ def known_historical_board_source_drift(
     sidecar_blob: str,
     detail: str,
 ) -> bool:
-    return detail == "aggregate source hash mismatch" and (
+    return detail in {
+        "aggregate source hash mismatch",
+        "source hash mismatch: apps/DevOpsConsole/src/ui/app.js",
+    } and (
         tree,
         image_path,
         image_blob,
         sidecar_blob,
-    ) in KNOWN_HISTORICAL_BOARD_SOURCE_DRIFT
+    ) in KNOWN_HISTORICAL_SOURCE_DRIFT
 
 
 def production_dependency_paths(paths: list[str]) -> list[str]:
@@ -728,7 +756,7 @@ def scan_history(repo: Path) -> list[Finding]:
                 image_blob = git(repo, "rev-parse", f"{commit}:{image_path}")
                 sidecar_blob = git(repo, "rev-parse", f"{commit}:{sidecar_path}")
                 assert isinstance(image_blob, str) and isinstance(sidecar_blob, str)
-                if known_historical_board_source_drift(
+                if known_historical_source_drift(
                     tree=tree,
                     image_path=image_path,
                     image_blob=image_blob.strip(),

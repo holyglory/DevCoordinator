@@ -128,6 +128,70 @@ class StoreTests(unittest.TestCase):
         home = self.store_home if name == "store" else private_directory(self.root / name)
         return AccountStore.open_default(home)
 
+    def test_current_telemetry_read_is_bounded_by_active_resources(self) -> None:
+        store = self.open_store()
+        try:
+            with store.immediate_transaction(revision_kind="observation") as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO telemetry_samples(
+                        sample_id, host_resource_kind, host_resource_id,
+                        sampled_at, cpu_percent
+                    ) VALUES (?, 'server', 'retired-server', ?, ?)
+                    """,
+                    (
+                        (
+                            f"retired-sample-{index:05d}",
+                            f"2026-07-{1 + index // 1440:02d}T"
+                            f"{index // 60 % 24:02d}:{index % 60:02d}:00Z",
+                            float(index),
+                        )
+                        for index in range(20_000)
+                    ),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO telemetry_samples(
+                        sample_id, host_resource_kind, host_resource_id,
+                        sampled_at, cpu_percent
+                    ) VALUES (?, 'server', 'active-server', ?, ?)
+                    """,
+                    (
+                        (
+                            f"active-sample-{index:02d}",
+                            f"2026-07-27T12:{index:02d}:00Z",
+                            float(index),
+                        )
+                        for index in range(40)
+                    ),
+                )
+
+            progress_calls = 0
+
+            def reject_historical_scan() -> int:
+                nonlocal progress_calls
+                progress_calls += 1
+                return int(progress_calls > 500)
+
+            with store.read_transaction() as connection:
+                connection.set_progress_handler(reject_historical_scan, 100)
+                try:
+                    samples = store_module._current_telemetry_samples(
+                        connection,
+                        server_resource_ids={"active-server"},
+                        docker_resource_ids=set(),
+                        database_resource_ids=set(),
+                    )
+                finally:
+                    connection.set_progress_handler(None, 0)
+
+            self.assertEqual(len(samples), 30)
+            self.assertEqual(samples[0]["sample_id"], "active-sample-39")
+            self.assertEqual(samples[-1]["sample_id"], "active-sample-10")
+            self.assertLess(progress_calls, 500)
+        finally:
+            store.close()
+
     def test_private_wal_foreign_keys_and_schema_contract(self) -> None:
         store = self.open_store()
         try:

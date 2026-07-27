@@ -535,6 +535,53 @@ def _latest_available_docker_presence(
     return {host_id: frozenset(resources) for host_id, resources in present.items()}
 
 
+def _current_telemetry_samples(
+    connection: sqlite3.Connection,
+    *,
+    server_resource_ids: Iterable[str],
+    docker_resource_ids: Iterable[str],
+    database_resource_ids: Iterable[str],
+    samples_per_resource: int = 30,
+) -> list[dict[str, Any]]:
+    """Read bounded telemetry only for resources in the current inventory.
+
+    Telemetry is durable history and can contain millions of samples for
+    resources that are no longer active. Ranking the whole table before
+    filtering current resources defeats ``telemetry_by_resource_time`` and
+    makes every inventory request grow slower forever. Exact indexed lookups
+    keep the read proportional to the current inventory instead of history.
+    """
+
+    limit = int(samples_per_resource)
+    if limit <= 0:
+        return []
+    server_ids = {str(resource_id) for resource_id in server_resource_ids}
+    docker_ids = {str(resource_id) for resource_id in docker_resource_ids}
+    database_ids = {str(resource_id) for resource_id in database_resource_ids}
+    resource_keys = {
+        *(("server", resource_id) for resource_id in server_ids),
+        *(("docker", resource_id) for resource_id in docker_ids),
+        *(("container", resource_id) for resource_id in docker_ids),
+        *(("database", resource_id) for resource_id in database_ids),
+    }
+    samples: list[dict[str, Any]] = []
+    for resource_kind, resource_id in sorted(resource_keys):
+        samples.extend(
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT *
+                FROM telemetry_samples
+                WHERE host_resource_kind = ? AND host_resource_id = ?
+                ORDER BY sampled_at DESC, sample_id DESC
+                LIMIT ?
+                """,
+                (resource_kind, resource_id, limit),
+            )
+        )
+    return samples
+
+
 def _current_server_resource_ids(
     connection: sqlite3.Connection, *, observed_at: str
 ) -> frozenset[str]:
@@ -2284,43 +2331,12 @@ class AccountStore(CoordinatorStore):
                     if str(row["database_binding_id"])
                     in current_database_binding_ids
                 ],
-                "telemetry": [
-                    {
-                        key: value
-                        for key, value in dict(row).items()
-                        if key != "resource_sample_ordinal"
-                    }
-                    for row in connection.execute(
-                        """
-                        SELECT * FROM (
-                            SELECT t.*,
-                                   ROW_NUMBER() OVER (
-                                       PARTITION BY host_resource_kind, host_resource_id
-                                       ORDER BY sampled_at DESC, sample_id DESC
-                                   ) AS resource_sample_ordinal
-                            FROM telemetry_samples t
-                        )
-                        WHERE resource_sample_ordinal <= 30
-                        ORDER BY host_resource_kind, host_resource_id,
-                                 sampled_at DESC, sample_id DESC
-                        """
-                    )
-                    if (
-                        row["host_resource_kind"] == "server"
-                        and str(row["host_resource_id"])
-                        in current_server_resource_ids
-                    )
-                    or (
-                        row["host_resource_kind"] in {"docker", "container"}
-                        and str(row["host_resource_id"])
-                        in active_docker_resource_ids
-                    )
-                    or (
-                        row["host_resource_kind"] == "database"
-                        and str(row["host_resource_id"])
-                        in current_database_binding_ids
-                    )
-                ],
+                "telemetry": _current_telemetry_samples(
+                    connection,
+                    server_resource_ids=current_server_resource_ids,
+                    docker_resource_ids=active_docker_resource_ids,
+                    database_resource_ids=current_database_binding_ids,
+                ),
                 # Inventory is a current-state projection, not the durable
                 # observation audit log.  Publishing every historical
                 # snapshot made the host inventory grow without bound (and
