@@ -41,6 +41,7 @@ from typing import Any, Callable, FrozenSet, Iterable, Mapping, Optional, Protoc
 from .maintenance import (
     MAINTENANCE_ROOT,
     MaintenanceMarkerError,
+    PUBLIC_MAINTENANCE_MESSAGE,
     load_maintenance_state,
 )
 
@@ -1688,7 +1689,7 @@ class BrokerClient:
         if maintenance is not None:
             raise BrokerError(
                 "maintenance_in_progress",
-                maintenance.message,
+                PUBLIC_MAINTENANCE_MESSAGE,
                 operation_id=operation_id,
                 retry_after_seconds=maintenance.retry_after_seconds,
             )

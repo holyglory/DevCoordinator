@@ -49,11 +49,22 @@ export class CoordError extends Error {
     this.name = 'CoordError';
     this.status = status; // 0 = transport-level failure (unreachable/timeout)
     this.body = body;
-    this.code = body && typeof body.code === 'string' ? body.code : null;
-    this.classification = body && typeof body.classification === 'string'
-      ? body.classification
+    const evidence = body?.evidence && typeof body.evidence === 'object'
+      ? body.evidence
       : null;
-    const retryAfter = Number(body?.retry_after_seconds ?? body?.retryAfterSeconds);
+    this.code = typeof body?.code === 'string'
+      ? body.code
+      : typeof evidence?.code === 'string' ? evidence.code : null;
+    this.classification = typeof body?.classification === 'string'
+      ? body.classification
+      : typeof evidence?.classification === 'string' ? evidence.classification
+      : null;
+    const retryAfter = Number(
+      body?.retry_after_seconds
+      ?? body?.retryAfterSeconds
+      ?? evidence?.retry_after_seconds
+      ?? evidence?.retryAfterSeconds,
+    );
     this.retryAfterSeconds = Number.isFinite(retryAfter) && retryAfter > 0
       ? Math.ceil(retryAfter)
       : null;

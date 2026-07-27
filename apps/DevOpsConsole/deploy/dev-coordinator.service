@@ -22,6 +22,13 @@ TimeoutStartSec=20
 Restart=always
 RestartSec=3
 
+# Project workloads share the host but not the control-plane availability
+# budget. Prefer this listener under CPU, storage, and memory contention so a
+# busy container fleet cannot starve health, inventory, or lifecycle control.
+CPUWeight=10000
+IOWeight=10000
+MemoryLow=512M
+
 # Use one durable, queryable sink with a stable identity and a generous bounded
 # burst so startup/auth failures and restart evidence are retained together.
 StandardOutput=journal

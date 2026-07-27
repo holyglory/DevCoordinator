@@ -74,8 +74,15 @@ cleanup also fail closed.
 - Do not run package-manager servers, Docker/Compose, or local database stacks
   directly. Use a lower-level Coordinator command only when the runtime result
   identifies that repair and its `--help` confirms the authority.
-- For root-only `broker publish-image` apply/rollback, activate the shared
-  maintenance marker first and stop **only** `devcoordinator-broker.service`.
+- The shared maintenance marker is reserved exclusively for a reviewed
+  server-wide authority/schema upgrade. Project builds, captures, tests,
+  profile enrollment, Docker/Compose work, runtime publication, and ordinary
+  `broker publish-image` planning must never activate it. The activation CLI
+  requires the exact `server-wide-authority-upgrade` scope and publishes only
+  fixed public copy; never put a project name or task description in it.
+- For root-only `broker publish-image` apply/rollback that actually replaces
+  the server-wide broker implementation, activate the shared maintenance
+  marker first and stop **only** `devcoordinator-broker.service`.
   Keep `dev-coordinator.service` and `devops-console.service` running so every
   Console and agent receives the bounded maintenance response. Always restart
   the broker and clear the exact maintenance deployment ID in a `finally`
@@ -117,6 +124,13 @@ and retry through this skill; never bypass the fence with direct state, Docker,
 database, process, or socket access. The marker remains available when systemd
 removes the broker's separate runtime directory and only its deployment owner
 may clear it after service and registration verification or healthy rollback.
+
+Project failures are data-plane state, not Coordinator availability. They may
+change only their attributed resource rows and events. Console and Board keep
+their last committed inventory while a refresh is unavailable; the loopback
+API and public Console listener remain supervised independently. A project
+operation must never restart, stop, replace, fence, or publish progress through
+the Coordinator API, broker, Console, Board, or their global maintenance state.
 
 Inventory is a pure read. Runtime performs any required bounded observation
 before action and returns committed evidence. Board and Console consume

@@ -32,7 +32,9 @@ if str(MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(MODULE_ROOT))
 
 from devcoordinator.maintenance import (  # noqa: E402
+    CONTROL_PLANE_MAINTENANCE_SCOPE,
     MAINTENANCE_ROOT,
+    PUBLIC_MAINTENANCE_MESSAGE,
     activate_maintenance,
     clear_maintenance,
     load_maintenance_state,
@@ -1039,7 +1041,8 @@ class Driver:
             expected_uid=0,
             expected_gid=self.group_gid,
             deployment_id=self.deployment_id,
-            message="Coordinator upgrade in progress; please wait a moment and retry.",
+            scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
+            message=PUBLIC_MAINTENANCE_MESSAGE,
             retry_after_seconds=30,
             started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
@@ -1153,10 +1156,8 @@ class Driver:
                         expected_uid=0,
                         expected_gid=self.group_gid,
                         deployment_id=self.deployment_id,
-                        message=(
-                            "Coordinator recovery in progress; please wait a moment "
-                            "and retry."
-                        ),
+                        scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
+                        message=PUBLIC_MAINTENANCE_MESSAGE,
                         retry_after_seconds=30,
                         started_at=time.strftime(
                             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()

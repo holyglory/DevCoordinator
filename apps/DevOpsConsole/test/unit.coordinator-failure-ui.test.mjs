@@ -97,6 +97,10 @@ test('visible failure labels remain truthful for HTTP and transport errors', asy
   const problems = extractFunction(app, 'function headerProblems(o)');
   assert.match(problems, /c\.failureKind !== 'maintenance'/,
     'planned maintenance must not produce the red needs-attention badge');
+  assert.doesNotMatch(app, /showBanner\(err\.message/,
+    'typed Coordinator failures must never be flattened before banner classification');
+  assert.match(app, /if \(data\.inventory\)[\s\S]*clearBanner\('maintenance'\)/,
+    'a retained healthy inventory must not be covered by a global maintenance banner');
 
   const regressed = titleSource.replace("o?.coordinator?.failureKind === 'request'", 'false');
   // eslint-disable-next-line no-new-func
