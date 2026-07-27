@@ -277,6 +277,17 @@ def main() -> int:
         "recovery-maintenance-active" in deploy_source,
         "post-clear target failure does not reactivate maintenance before rollback",
     )
+    expect(
+        deploy_source.index("activate_maintenance(")
+        < deploy_source.index("self.wait_for_operation_quiescence()")
+        < deploy_source.index("pre_schema = self.schema_evidence"),
+        "deployment still admits a new operation between quiescence proof and maintenance",
+    )
+    expect(
+        deploy_source.index("self.wait_for_operation_quiescence()")
+        < deploy_source.index("backup_manifest = self.online_backup()"),
+        "online backup starts before fenced operations have drained",
+    )
     recovery_source = inspect.getsource(
         MODULE.Driver.require_or_recover_preflight_services
     )

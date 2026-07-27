@@ -222,6 +222,37 @@ class Driver:
     def schema_evidence(self, *, expected: int) -> dict[str, Any]:
         return self._schema_evidence(DATABASE, expected=expected)
 
+    def wait_for_operation_quiescence(self, *, timeout: float = 180) -> None:
+        """Drain pre-fence operations without allowing a fresh admission race."""
+
+        deadline = time.monotonic() + timeout
+        last_running: list[tuple[str, str, str]] = []
+        while time.monotonic() < deadline:
+            connection = sqlite3.connect(
+                f"file:{DATABASE}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                timeout=5,
+            )
+            try:
+                connection.execute("PRAGMA query_only = ON")
+                last_running = list(
+                    connection.execute(
+                        "SELECT operation_id, kind, status FROM operations "
+                        "WHERE status IN ('planned', 'running') "
+                        "ORDER BY operation_id"
+                    ).fetchall()
+                )
+            finally:
+                connection.close()
+            if not last_running:
+                return
+            time.sleep(0.2)
+        raise DeploymentError(
+            "Coordinator operations did not drain behind the maintenance fence: "
+            f"{last_running!r}"
+        )
+
     def client_schema_evidence(self, *, expected: int) -> dict[str, Any]:
         return self._schema_evidence(self.client_database, expected=expected)
 
@@ -926,15 +957,11 @@ class Driver:
                 "migration checkout does not match the approved rollback commit"
             )
         pre_units = self.require_or_recover_preflight_services()
-        pre_schema = self.schema_evidence(expected=self.schema_before)
-        pre_client_schema = self.client_schema_evidence(expected=self.schema_before)
-        self.require_no_database_helpers()
         self.inventory("pre-inventory.json")
         public_before = [
             self.public_get(url, require_correct_upstream_protocol=False)
             for url in self.args.public_url
         ]
-        backup_manifest = self.online_backup()
         self.capture_units()
         self.prepare_maintenance_root()
         activate_maintenance(
@@ -946,15 +973,22 @@ class Driver:
             started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         )
         self.marker_active = True
-        self.phase = "maintenance-active"
-        self.journal(
-            pre_units=pre_units,
-            pre_schema=pre_schema,
-            pre_client_schema=pre_client_schema,
-            public_before=public_before,
-            online_backup_manifest=str(backup_manifest),
-        )
         try:
+            self.phase = "maintenance-draining"
+            self.journal(pre_units=pre_units, public_before=public_before)
+            self.wait_for_operation_quiescence()
+            pre_schema = self.schema_evidence(expected=self.schema_before)
+            pre_client_schema = self.client_schema_evidence(expected=self.schema_before)
+            self.require_no_database_helpers()
+            backup_manifest = self.online_backup()
+            self.phase = "maintenance-active"
+            self.journal(
+                pre_units=pre_units,
+                pre_schema=pre_schema,
+                pre_client_schema=pre_client_schema,
+                public_before=public_before,
+                online_backup_manifest=str(backup_manifest),
+            )
             self.checkout("main")
             self.checkout_changed = True
             self.phase = "target-source-active"
