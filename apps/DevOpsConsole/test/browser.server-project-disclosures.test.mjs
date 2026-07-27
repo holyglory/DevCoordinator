@@ -1485,3 +1485,201 @@ test('Performance paints retained metrics within one second while current invent
       await fs.promises.rm(fakeDockerDir, { recursive: true, force: true });
     }
   });
+
+test('Tests loads repository data within one second while current inventory is slow',
+  { timeout: 120_000 }, async () => {
+    const { chromium } = loadLockedPlaywright();
+    const fakeDockerDir = await canonicalTempDir('devops-console-browser-tests-performance-');
+    await writeEmptyDockerFixture(fakeDockerDir);
+    let stack;
+    let browser;
+    let context;
+    try {
+      stack = await startStack({
+        allowedEmails: ['operator@example.test'],
+        claims: { email: 'operator@example.test', name: 'Fixture Operator' },
+        coordinatorEnv: { PATH: `${fakeDockerDir}${path.delimiter}${process.env.PATH ?? ''}` },
+      });
+      const jar = makeJar();
+      assert.equal((await login(stack, jar)).status, 200);
+      const sessionCookie = jar.get('dc_session');
+      assert.ok(sessionCookie);
+
+      browser = await launchChromium(
+        chromium,
+        [`--host-resolver-rules=MAP ${stack.consoleHost} 127.0.0.1`],
+      );
+      context = await browser.newContext({
+        viewport: { width: 1486, height: 1059 },
+        ignoreHTTPSErrors: true,
+        colorScheme: 'dark',
+        reducedMotion: 'reduce',
+      });
+      await context.addCookies([{
+        name: sessionCookie.name,
+        value: sessionCookie.value,
+        domain: sessionCookie.hostOnly ? sessionCookie.domain : `.${sessionCookie.domain}`,
+        path: sessionCookie.path,
+        secure: sessionCookie.secure,
+        httpOnly: sessionCookie.httpOnly,
+        sameSite: 'Lax',
+      }]);
+
+      const page = await context.newPage();
+      let overviewCompleted = false;
+      let testsStartedBeforeOverview = false;
+      const utcDay = (offset) => {
+        const date = new Date();
+        date.setUTCHours(0, 0, 0, 0);
+        date.setUTCDate(date.getUTCDate() + offset);
+        return date.toISOString().slice(0, 10);
+      };
+      const hourly = Array.from({ length: 7 }, (_, dayIndex) => (
+        Array.from({ length: 24 }, (_, hour) => ({
+          day: utcDay(dayIndex - 6),
+          hour,
+          test_seconds: [0, 720, 1_800, 3_600, 5_400, 7_200, 10_800][
+            (dayIndex * 3 + hour) % 7
+          ],
+          failure_count: (dayIndex + hour) % 19 === 0 ? 1 : 0,
+        }))
+      )).flat();
+      const daily = Array.from({ length: 30 }, (_, index) => ({
+        day: utcDay(index - 29),
+        test_seconds: 7_200 + ((index * 2_137) % 18_000),
+      }));
+      const previousDaily = Array.from({ length: 30 }, (_, index) => ({
+        day: utcDay(index - 59),
+        test_seconds: 6_400 + ((index * 1_743) % 14_000),
+      }));
+      const testStats = {
+        schema_version: 1,
+        repo_id: 'repo-tests',
+        days: 30,
+        summary: {
+          test_count: 12,
+          run_count: 2,
+          run_seconds: 4,
+          test_seconds: 10_800,
+          passed_count: 10,
+          failed_count: 2,
+          error_count: 0,
+          running_count: 0,
+          failed_run_count: 1,
+        },
+        comparison_summary: { test_seconds: 7_200 },
+        hourly,
+        daily,
+        previous_daily: previousDaily,
+        dynamics: [
+          ['visual-regression', 48_600, 32_400, 50, 2],
+          ['integration', 37_800, 46_200, -18.2, 0],
+          ['unit', 28_200, 25_800, 9.3, 1],
+          ['lint-and-contracts', 12_900, 18_300, -29.5, 0],
+        ].map(([suite, current_seconds, previous_seconds, change_percent, failure_count]) => ({
+          suite,
+          current_seconds,
+          previous_seconds,
+          change_percent,
+          failure_count,
+          last_run: `${utcDay(-1)}T11:30:00Z`,
+        })),
+      };
+      await page.route('**/api/**', async (route) => {
+        const pathname = new URL(route.request().url()).pathname;
+        let body;
+        let status = 200;
+        if (pathname === '/api/overview') {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          overviewCompleted = true;
+          body = CANONICAL_OVERVIEW;
+        } else if (pathname === '/api/tests/repositories') {
+          // Prove the rolling-deployment fallback works against the currently
+          // running Console process before its new backend endpoint is active.
+          status = 404;
+          body = { error: 'not found' };
+        } else if (pathname === '/api/tests') {
+          testsStartedBeforeOverview = !overviewCompleted;
+          body = testStats;
+        } else if (pathname === '/api/metrics/history') body = CANONICAL_METRICS;
+        else if (pathname === '/api/session') {
+          body = { ...CANONICAL_SESSION, accessAdmin: false, lifecycleAvailable: false };
+        } else if (pathname === '/api/prefs') body = CANONICAL_PREFS;
+        else if (pathname === '/api/telegram') {
+          body = { bots: [], pendingAuthorizations: [], authorizedChats: [] };
+        } else body = {};
+        await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
+      });
+
+      const startedAt = Date.now();
+      await page.goto(`https://${stack.consoleHost}:${stack.httpsPort}/#/tests`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.getByRole('heading', { name: 'Testing time by hour' }).waitFor({ state: 'visible' });
+      const meaningfulPaintMs = Date.now() - startedAt;
+
+      assert.ok(meaningfulPaintMs < 1000,
+        `Tests data became visible after ${meaningfulPaintMs}ms`);
+      assert.equal(testsStartedBeforeOverview, true,
+        'Tests must request repository statistics before heavyweight inventory completes');
+      assert.equal(await page.locator('#tests-project option').count(), 1);
+      assert.equal(await page.locator('#tests-pass-rate').textContent(), '83.3%');
+      assert.equal(await page.locator('#tests-failed-runs').textContent(), '1');
+      assert.ok(await page.locator('.test-heat-cell.has-failure').count() > 0);
+      assert.match(await page.locator('.test-heat-cell').nth(6).getAttribute('title'), /180\.0 aggregate test-minutes/);
+      const desktopGeometry = await page.evaluate(() => ({
+        viewportWidth: window.innerWidth,
+        documentWidth: document.documentElement.scrollWidth,
+        sections: [...document.querySelectorAll('#tests-body > section, #tests-body > div')].map((node) => {
+          const rect = node.getBoundingClientRect();
+          return { left: rect.left, right: rect.right };
+        }),
+        overflowers: [...document.querySelectorAll('body *')].flatMap((node) => {
+          const rect = node.getBoundingClientRect();
+          return rect.right > window.innerWidth + 1
+            ? [{ tag: node.tagName, className: node.className?.baseVal ?? node.className, right: rect.right }]
+            : [];
+        }).slice(0, 12),
+      }));
+      if (process.env.TESTS_DESIGN_SCREENSHOT) {
+        await page.screenshot({ path: process.env.TESTS_DESIGN_SCREENSHOT, fullPage: true });
+      }
+      assert.ok(desktopGeometry.documentWidth <= desktopGeometry.viewportWidth,
+        `Tests dashboard overflowed desktop by ${desktopGeometry.documentWidth - desktopGeometry.viewportWidth}px: ${JSON.stringify(desktopGeometry.overflowers)}`);
+      assert.ok(desktopGeometry.sections.every((section) => (
+        section.left >= 0 && section.right <= desktopGeometry.viewportWidth
+      )), 'every Tests panel must stay inside the desktop viewport');
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const mobileGeometry = await page.evaluate(() => {
+        const heatScroll = document.querySelector('.test-heat-scroll');
+        const heatRect = heatScroll?.getBoundingClientRect();
+        return {
+          viewportWidth: window.innerWidth,
+          documentWidth: document.documentElement.scrollWidth,
+          heatScroll: heatScroll ? {
+            left: heatRect.left,
+            right: heatRect.right,
+            clientWidth: heatScroll.clientWidth,
+            scrollWidth: heatScroll.scrollWidth,
+          } : null,
+        };
+      });
+      assert.ok(mobileGeometry.documentWidth <= mobileGeometry.viewportWidth,
+        `Tests dashboard overflowed mobile by ${mobileGeometry.documentWidth - mobileGeometry.viewportWidth}px`);
+      assert.ok(mobileGeometry.heatScroll);
+      assert.ok(mobileGeometry.heatScroll.left >= 0
+        && mobileGeometry.heatScroll.right <= mobileGeometry.viewportWidth,
+      'the intentionally scrollable heatmap viewport must stay on screen');
+      assert.ok(mobileGeometry.heatScroll.scrollWidth > mobileGeometry.heatScroll.clientWidth,
+        'the 24-hour heatmap should scroll inside its own bounded mobile viewport');
+      if (process.env.TESTS_DESIGN_MOBILE_SCREENSHOT) {
+        await page.screenshot({ path: process.env.TESTS_DESIGN_MOBILE_SCREENSHOT, fullPage: true });
+      }
+    } finally {
+      await context?.close();
+      await browser?.close();
+      await stack?.close();
+      await fs.promises.rm(fakeDockerDir, { recursive: true, force: true });
+    }
+  });

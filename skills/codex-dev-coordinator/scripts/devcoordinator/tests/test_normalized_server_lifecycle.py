@@ -1144,6 +1144,58 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
             )
             self.assertEqual(forced["status"], "unassigned")
 
+    def test_test_repository_catalog_uses_only_the_protected_profile(self) -> None:
+        enabled = mock.Mock(
+            repo_id="repo-b",
+            canonical_root="/srv/Beta",
+            enabled=True,
+        )
+        earlier = mock.Mock(
+            repo_id="repo-a",
+            canonical_root="/srv/alpha",
+            enabled=True,
+        )
+        disabled = mock.Mock(
+            repo_id="repo-disabled",
+            canonical_root="/srv/disabled",
+            enabled=False,
+        )
+        profile = mock.Mock(
+            repositories={
+                enabled.canonical_root: enabled,
+                disabled.canonical_root: disabled,
+                earlier.canonical_root: earlier,
+            }
+        )
+        with (
+            mock.patch.object(
+                dev_coordinator, "configured_broker_profile", return_value=profile
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "coordinated_build_inventory",
+                side_effect=AssertionError("catalog must not build inventory"),
+            ),
+        ):
+            result = dev_coordinator.coordinated_test_repository_list()
+
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(
+            result["repositories"],
+            [
+                {
+                    "repo_id": "repo-a",
+                    "canonical_root": "/srv/alpha",
+                    "display_name": "alpha",
+                },
+                {
+                    "repo_id": "repo-b",
+                    "canonical_root": "/srv/Beta",
+                    "display_name": "Beta",
+                },
+            ],
+        )
+
     def test_locked_state_is_legacy_only_and_has_no_sqlite_projection(self) -> None:
         source = inspect.getsource(dev_coordinator.locked_state)
         self.assertNotIn("load_legacy_state_projection", source)
@@ -1304,6 +1356,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "/v1/archives",
                 "/v1/events",
                 "/v1/tests",
+                "/v1/test-repositories",
             },
         )
         self.assertEqual(set(dev_coordinator.API_POST_ROUTES), expected_post_routes)

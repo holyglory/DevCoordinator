@@ -1,53 +1,50 @@
-# Design QA — DevOps Console
+# Tests dashboard design QA
 
-The source visual truth is the implemented UI contract in
-`docs/architecture.md` and the journeys in `docs/journeys.md`. There is no
-separate image mockup for this application.
+## Target and implementation
 
-## Canonical evidence
+- Selected target: `/home/holygloryTT/.codex/generated_images/019f624f-69d2-7893-929b-d8f18000e1e8/exec-d90040e2-dd57-48a7-a69b-ebcd7be5c055.png`
+- Implemented desktop capture: `/tmp/devops-console-tests-redesign-desktop.png`
+- Implemented mobile capture: `/tmp/devops-console-tests-redesign-mobile.png`
+- Combined comparison input: `/tmp/devops-console-tests-design-comparison.png`
+- Desktop viewport/state: 1486 × 1059, populated Sample API repository, 30-day period, seven complete UTC heatmap days.
+- Mobile viewport/state: 390 × 844, same repository, period, and data.
 
-Only deterministic isolated-test-fixture captures are publishable. The
-canonical set is intentionally small:
+## Comparison passes
 
-- `Artifacts/Canonical/login-desktop.png` — 1440×900
-- `Artifacts/Canonical/login-mobile.png` — 390×844
-- `Artifacts/Canonical/projects-desktop.png` — 1440×900
-- `Artifacts/Canonical/projects-mobile.png` — 390×844
+### Pass 1
 
-The login pages come from the real Console authentication surface. The
-Projects pages come from the real Console UI running in its hermetic e2e stack,
-with a real fixture OIDC session and explicitly isolated, fixed `/api/*`
-responses from `Tools/canonical-api-fixtures.mjs`. Fixture records use only
-portable `/fixtures` paths and `example.test` identities. They are test
-evidence, never deployment inventory or product data.
+- P1 · layout/responsiveness: global-width selects made the compact filter row
+  overrun the desktop viewport and collide with comparison, refresh, and pass
+  metrics. Fixed by giving repository and period selects bounded intrinsic
+  widths and retaining the existing wrap breakpoint.
+- P1 · responsiveness: the 24-hour matrix needed an explicit bounded scroll
+  viewport on mobile. Verified that only `.test-heat-scroll` overflows
+  internally and that the document and panel bounds remain within 390 px.
+- P2 · fidelity/content: the initial sparse browser fixture produced one heatmap
+  row and an unrepresentative trend. Replaced it with seven complete hourly
+  days, a 30-day current/previous trend, failures, and several suite dynamics
+  for the final visual comparison.
 
-Every PNG has an adjacent `.provenance.json` sidecar containing its exact
-SHA-256, dimensions, viewport, fixture identifier, generator, and hashes for
-the UI, fixture, capture, stack, and locked Playwright sources. The repository
-artifact guard rejects missing, forged, or mismatched provenance and PNG
-metadata.
+### Pass 2
 
-## Reproduction
+- Typography and hierarchy match the selected compact Console direction: one
+  filter/health row, hourly load first, comparison trend second, dynamics last.
+- Spacing, borders, radii, and colors use the existing Console tokens. The
+  implementation deliberately omits the target's redundant summary sparkline;
+  the larger comparison chart carries the same data with more context.
+- The heat scale is a continuous blue → amber → red gradient with labeled 60,
+  120, and 180+ minute stops. Exact aggregate time remains available in cell
+  titles and accessible names, and white failure markers remain independent of
+  load color.
+- The implementation uses the Console's existing icon set; there are no fake
+  images, placeholder artwork, handcrafted icon substitutes, or decorative
+  assets.
+- Repository and period selectors remain functional. Desktop and mobile browser
+  regressions verify the populated state, pass/failed summaries, failure cells,
+  internal heatmap scrolling, and absence of document-level overflow.
+- The installed formal-verifier self-test could not be launched because its
+  script is group-readable only by `holyglory`, while this agent runs as
+  `holygloryTT`. The repository's equivalent deterministic geometry assertions
+  were executed in its isolated authenticated browser fixture instead.
 
-Install the repository-locked browser runtime and capture through the isolated
-stack:
-
-```sh
-npm ci --ignore-scripts --prefix ci/playwright
-ci/playwright/node_modules/.bin/playwright install chromium
-NODE_PATH="$PWD/ci/playwright/node_modules" \
-  node apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs
-```
-
-Validate the capture contract and the complete Console suite:
-
-```sh
-node --test apps/DevOpsConsole/test/unit.canonical-artifacts.test.mjs
-python3 scripts/self_test_public_artifact_guard.py
-python3 scripts/public_artifact_guard.py --repo .
-npm test --prefix apps/DevOpsConsole
-```
-
-Do not commit screenshots from a live Console, coordinator home, deployment,
-or developer browser session. Live production verification belongs in private
-runtime evidence; it must not become a public inventory image.
+final result: passed

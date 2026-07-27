@@ -68,6 +68,31 @@ test('test statistics use one bounded repository-scoped coordinator read', async
   );
 });
 
+test('test repository discovery is a lightweight cached coordinator read', async (t) => {
+  const response = {
+    schema_version: 1,
+    repositories: [{ repo_id: 'repo-1', canonical_root: '/repo', display_name: 'Repo' }],
+  };
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/test-repositories') return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(response));
+    return true;
+  };
+  const { client, requests } = await fixture(t, { responder });
+  const [first, second] = await Promise.all([
+    client.testRepositories(),
+    client.testRepositories(),
+  ]);
+  assert.deepEqual(first, response);
+  assert.deepEqual(second, response);
+  assert.equal(
+    requests.filter((request) => request.path === '/v1/test-repositories').length,
+    1,
+  );
+  assert.equal(requests.at(-1).authorization, `Bearer ${TOKEN}`);
+});
+
 test('host observation receives a Docker-sized deadline without widening ordinary requests', () => {
   assert.equal(coordinatorTimeoutFor('/v1/observe'), 720_000);
   assert.equal(coordinatorTimeoutFor('/v1/inventory'), 60_000);

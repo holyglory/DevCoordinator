@@ -26,8 +26,9 @@
       "/v1/ports/assignments",
       "/v1/servers",
       "/v1/archives",
-      "/v1/events"
-      ,"/v1/tests"
+      "/v1/events",
+      "/v1/tests",
+      "/v1/test-repositories"
     ],
     "POST": [
       "/v1/ports/lease",
@@ -130,7 +131,10 @@
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"
   },
   "test_contract": {
+    "repositories": "GET /v1/test-repositories returns the protected profile's enabled repository IDs, canonical roots, and display names without building inventory or observing the host",
     "read": "GET /v1/tests requires one enrolled repo_id or canonical repository root plus optional days (1-3650) and limit (1-500)",
+    "hourly": "the read returns seven complete UTC days of hourly buckets; exact case intervals are split at hour boundaries and parallel intervals add, so test_seconds may exceed 3600 in one wall-clock hour; failure_count is attributed to the case start hour",
+    "comparison": "comparison_summary and previous_daily cover the immediately preceding equal period, while dynamics reports suite-level current_seconds, previous_seconds, change_percent, failures, and last_run",
     "ownership": "the service-owned broker database stores repository-attributed sessions, group runs, and exact individual case timings; clients never receive a database handle",
     "inventory": "server-wide normalized inventory includes a bounded 30-day test_statistics projection per active repository for DevOps Board",
     "privacy": "run records retain command fingerprints and selectors, never raw child output, commands, environment values, credentials, or failure payloads"

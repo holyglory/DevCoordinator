@@ -33,9 +33,13 @@
     telegram: null,      // GET /api/telegram payload for bots manageable by this account
     archives: null,      // owner-only GET /api/lifecycle/list ({ archives })
     tests: null,         // selected repository's Coordinator-owned test statistics
+    testsRepositories: null, // lightweight enrolled repository catalog
     testsProject: null,
     testsDays: 30,
     testsLoading: false,
+    testsRepositoriesLoading: false,
+    testsQueryKey: null,
+    testsLoadedAt: 0,
   };
 
   const ui = {
@@ -375,7 +379,10 @@
     if (state.overview) renderAll(true);
     // The performance page charts use a longer history window than sparklines.
     if (page === 'performance') refreshMetrics();
-    if (page === 'tests') loadTests();
+    if (page === 'tests') {
+      loadTestRepositories();
+      loadTests();
+    }
     if (page === 'access' && state.session?.accessAdmin === true) loadAccess();
     if (page === 'invites' && state.session?.accessAdmin === true) loadInvites();
     if (page === 'telegram' && state.session?.email) loadTelegram();
@@ -386,11 +393,13 @@
     $('#tests-project').addEventListener('change', (event) => {
       state.testsProject = event.currentTarget.value;
       state.tests = null;
+      state.testsQueryKey = null;
       loadTests({ force: true });
     });
     $('#tests-days').addEventListener('change', (event) => {
       state.testsDays = Number(event.currentTarget.value);
       state.tests = null;
+      state.testsQueryKey = null;
       loadTests({ force: true });
     });
     window.addEventListener('hashchange', applyPage);
@@ -1644,6 +1653,7 @@
       state.metricsMap = new Map((data?.entities || []).map((e) => [e.key, e]));
       bump();
       renderAll();
+      if (currentPage() === 'tests') loadTests();
     } catch (err) {
       // Quiet failure: charts just go stale; the overview poll owns the banner.
       if (err.status === 401) return;
@@ -2783,32 +2793,86 @@
 
   // ---------------------------------------------------------------- test statistics
 
+  function metricTestRepositories() {
+    const repositories = new Map();
+    for (const entity of state.metrics?.entities || []) {
+      if (entity?.kind !== 'project' || typeof entity.project !== 'string' || !entity.project) continue;
+      const project = entity.project;
+      if (!repositories.has(project)) {
+        repositories.set(project, {
+          project,
+          repo_id: null,
+          canonical_root: project,
+          display_name: entity.name || projectTail(project),
+        });
+      }
+    }
+    return [...repositories.values()];
+  }
+
   function testRepositories() {
-    return (state.overview?.inventory?.repositories || [])
-      .filter((repository) => repository && repository.repo_id)
+    let repositories;
+    if (state.testsRepositories) {
+      repositories = state.testsRepositories.repositories || [];
+    } else if (state.overview?.inventory?.repositories) {
+      repositories = state.overview.inventory.repositories;
+    } else {
+      repositories = metricTestRepositories();
+    }
+    return repositories
+      .filter((repository) => repository && (repository.canonical_root || repository.repo_id || repository.project))
+      .map((repository) => ({
+        ...repository,
+        project: repository.canonical_root || repository.project || repository.repo_id,
+      }))
       .slice()
       .sort((a, b) => String(a.display_name || a.canonical_root || a.repo_id)
         .localeCompare(String(b.display_name || b.canonical_root || b.repo_id)));
   }
 
+  async function loadTestRepositories({ force = false } = {}) {
+    if (state.testsRepositoriesLoading) return;
+    if (!force && state.testsRepositories) return;
+    state.testsRepositoriesLoading = true;
+    try {
+      const catalog = await api('/api/tests/repositories');
+      if (!catalog || catalog.schema_version !== 1 || !Array.isArray(catalog.repositories)) {
+        throw new Error('test repository catalog is invalid');
+      }
+      state.testsRepositories = catalog;
+    } catch (err) {
+      // During a rolling deployment an older Console process has no catalog
+      // endpoint. Retained metrics still provide canonical repository roots,
+      // so test data need not wait for heavyweight inventory.
+      if (err.status !== 401 && err.status !== 404 && testRepositories().length === 0) {
+        showBanner(err.message, () => loadTestRepositories({ force: true }), 'tests');
+      }
+    } finally {
+      state.testsRepositoriesLoading = false;
+      loadTests();
+    }
+  }
+
   async function loadTests({ force = false } = {}) {
     const repositories = testRepositories();
     const select = $('#tests-project');
-    const available = new Set(repositories.map((repository) => String(repository.repo_id)));
+    const available = new Set(repositories.map((repository) => String(repository.project)));
     if (!state.testsProject || !available.has(state.testsProject)) {
-      state.testsProject = repositories[0]?.repo_id ?? null;
+      state.testsProject = repositories[0]?.project ?? null;
       state.tests = null;
+      state.testsQueryKey = null;
     }
     select.replaceChildren(...repositories.map((repository) => h('option', {
-      value: repository.repo_id,
-      selected: repository.repo_id === state.testsProject,
+      value: repository.project,
+      selected: repository.project === state.testsProject,
     }, repository.display_name || projectTail(repository.canonical_root) || repository.repo_id)));
     $('#tests-days').value = String(state.testsDays);
     if (!state.testsProject) {
       renderTests();
       return;
     }
-    if (!force && state.tests?.repo_id === state.testsProject && state.tests.days === state.testsDays) {
+    const queryKey = `${state.testsProject}\u0000${state.testsDays}`;
+    if (!force && state.tests && state.testsQueryKey === queryKey) {
       renderTests();
       return;
     }
@@ -2817,6 +2881,8 @@
     renderTests();
     try {
       state.tests = await api(`/api/tests?project=${encodeURIComponent(state.testsProject)}&days=${state.testsDays}&limit=50`);
+      state.testsQueryKey = queryKey;
+      state.testsLoadedAt = Date.now();
       clearBanner('tests');
     } catch (err) {
       showBanner(err.message, () => loadTests({ force: true }), 'tests');
@@ -2843,15 +2909,224 @@
             h('tbody', null, rows))));
   }
 
+  function testPassRate(summary) {
+    const passed = Number(summary?.passed_count || 0);
+    const failed = Number(summary?.failed_count || 0) + Number(summary?.error_count || 0);
+    const decided = passed + failed;
+    return decided > 0 ? (100 * passed) / decided : null;
+  }
+
+  function testDelta(current, previous) {
+    const before = Number(previous || 0);
+    return before > 0 ? (100 * (Number(current || 0) - before)) / before : null;
+  }
+
+  function testDeltaText(value) {
+    if (!Number.isFinite(value)) return 'new';
+    const rounded = Math.abs(value) >= 10 ? Math.round(value) : Number(value.toFixed(1));
+    return `${value > 0 ? '+' : ''}${rounded}%`;
+  }
+
+  function testMixRgb(from, to, amount) {
+    const ratio = Math.max(0, Math.min(1, amount));
+    const channels = from.map((value, index) => Math.round(value + (to[index] - value) * ratio));
+    return `rgb(${channels.join(' ')})`;
+  }
+
+  // Three-stop heat scale: blue through 60 aggregate test-minutes, amber
+  // through 120, and red above it. Parallel test intervals add together, so
+  // a single wall-clock hour can truthfully exceed 60 minutes.
+  function testHeatColor(seconds) {
+    const minutes = Math.max(0, Number(seconds || 0) / 60);
+    if (minutes === 0) return '#142234';
+    if (minutes <= 60) return testMixRgb([20, 43, 75], [47, 140, 255], minutes / 60);
+    if (minutes <= 120) return testMixRgb([47, 140, 255], [255, 176, 32], (minutes - 60) / 60);
+    return testMixRgb([255, 176, 32], [236, 95, 103], Math.min(1, (minutes - 120) / 60));
+  }
+
+  function testDayLabel(day) {
+    const date = new Date(`${day}T00:00:00Z`);
+    if (!Number.isFinite(date.getTime())) return day;
+    return date.toLocaleDateString([], {
+      weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC',
+    });
+  }
+
+  function testHeatmap(stats) {
+    const cells = Array.isArray(stats.hourly) ? stats.hourly : [];
+    const byDay = new Map();
+    for (const cell of cells) {
+      const day = String(cell.day || '');
+      const hour = Number(cell.hour);
+      if (!day || !Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+      if (!byDay.has(day)) byDay.set(day, new Map());
+      byDay.get(day).set(hour, cell);
+    }
+    const days = [...byDay.keys()].sort();
+    const head = h('tr', null, h('th', { scope: 'col', class: 'test-heat-day' }, 'UTC'));
+    for (let hour = 0; hour < 24; hour += 1) {
+      head.append(h('th', { scope: 'col' }, String(hour).padStart(2, '0')));
+    }
+    const body = h('tbody');
+    for (const day of days) {
+      const row = h('tr', null, h('th', { scope: 'row', class: 'test-heat-day' }, testDayLabel(day)));
+      for (let hour = 0; hour < 24; hour += 1) {
+        const cell = byDay.get(day).get(hour) || { test_seconds: 0, failure_count: 0 };
+        const minutes = Number(cell.test_seconds || 0) / 60;
+        const failures = Number(cell.failure_count || 0);
+        const node = h('td', {
+          class: `test-heat-cell${failures > 0 ? ' has-failure' : ''}`,
+          style: `background-color:${testHeatColor(cell.test_seconds)}`,
+          title: `${testDayLabel(day)} ${String(hour).padStart(2, '0')}:00 UTC — ${minutes.toFixed(1)} aggregate test-minutes${failures ? `, ${failures} failed ${failures === 1 ? 'test' : 'tests'}` : ''}`,
+          'aria-label': `${testDayLabel(day)}, ${String(hour).padStart(2, '0')}:00 UTC: ${minutes.toFixed(1)} aggregate test-minutes${failures ? `; ${failures} failures` : ''}`,
+        });
+        if (failures > 0) node.append(icon('x'));
+        row.append(node);
+      }
+      body.append(row);
+    }
+    const table = h('table', { class: 'test-heatmap' }, h('thead', null, head), body);
+    return h('section', { class: 'test-heat-panel' },
+      h('div', { class: 'test-panel-title' },
+        h('h3', null, 'Testing time by hour'),
+        h('span', { class: 'meta-passive' }, 'aggregate test-minutes · UTC')),
+      days.length === 0
+        ? h('p', { class: 'empty-inline' }, 'No hourly test timing is recorded for the last seven days.')
+        : h('div', { class: 'test-heat-scroll' }, table),
+      h('div', { class: 'test-heat-legend', 'aria-label': 'Heatmap scale: blue zero to 60 minutes, amber 60 to 120 minutes, red above 120 minutes' },
+        h('div', { class: 'test-heat-scale', 'aria-hidden': 'true' }),
+        h('div', { class: 'test-heat-ticks' }, h('span', null, '0m'), h('span', null, '60m'), h('span', null, '120m'), h('span', null, '180m+')),
+        h('p', null, 'Aggregate test time may exceed 60m when tests run in parallel.')));
+  }
+
+  function testSeries(rows, days, offsetDays = 0) {
+    const values = new Map((rows || []).map((row) => [String(row.day), Number(row.test_seconds || 0)]));
+    const result = [];
+    const end = new Date();
+    end.setUTCHours(0, 0, 0, 0);
+    end.setUTCDate(end.getUTCDate() - offsetDays);
+    for (let index = days - 1; index >= 0; index -= 1) {
+      const date = new Date(end);
+      date.setUTCDate(date.getUTCDate() - index);
+      const day = date.toISOString().slice(0, 10);
+      result.push({ day, seconds: values.get(day) || 0 });
+    }
+    return result;
+  }
+
+  function testTrendChart(stats) {
+    const days = Math.max(1, Math.min(365, Number(stats.days || state.testsDays || 30)));
+    const current = testSeries(stats.daily, days, 0);
+    const previous = testSeries(stats.previous_daily, days, days);
+    const values = [...current, ...previous].map((item) => item.seconds);
+    const maxValue = Math.max(1, ...values);
+    const width = 1000;
+    const height = 190;
+    const padX = 8;
+    const padY = 12;
+    const points = (series) => series.map((item, index) => {
+      const x = padX + (index / Math.max(1, series.length - 1)) * (width - padX * 2);
+      const y = height - padY - (item.seconds / maxValue) * (height - padY * 2);
+      return { ...item, x, y };
+    });
+    const currentPoints = points(current);
+    const previousPoints = points(previous);
+    const svg = svgEl('svg', {
+      class: 'test-trend-chart', viewBox: `0 0 ${width} ${height}`,
+      preserveAspectRatio: 'none', role: 'img',
+      'aria-label': 'Daily aggregate testing time compared with the previous period',
+    });
+    for (const ratio of [0, .5, 1]) {
+      const y = padY + ratio * (height - padY * 2);
+      svg.append(svgEl('line', { class: 'test-trend-grid', x1: padX, y1: y, x2: width - padX, y2: y }));
+    }
+    const currentLine = currentPoints.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
+    const previousLine = previousPoints.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
+    svg.append(
+      svgEl('polygon', {
+        class: 'test-trend-area',
+        points: `${padX},${height - padY} ${currentLine} ${width - padX},${height - padY}`,
+      }),
+      svgEl('polyline', { class: 'test-trend-previous', fill: 'none', points: previousLine }),
+      svgEl('polyline', { class: 'test-trend-current', fill: 'none', points: currentLine }),
+    );
+    const differences = currentPoints.map((point, index) => point.seconds - previousPoints[index].seconds);
+    const riseIndex = differences.indexOf(Math.max(...differences));
+    const fallIndex = differences.indexOf(Math.min(...differences));
+    for (const [index, kind] of [[riseIndex, 'rise'], [fallIndex, 'fall']]) {
+      const point = currentPoints[index];
+      if (!point || Math.abs(differences[index]) < 1) continue;
+      svg.append(
+        svgEl('line', { class: `test-trend-marker is-${kind}`, x1: point.x, y1: padY, x2: point.x, y2: height - padY }),
+        svgEl('circle', { class: `test-trend-dot is-${kind}`, cx: point.x, cy: point.y, r: 4 }),
+      );
+    }
+    const first = current[0]?.day || '';
+    const middle = current[Math.floor(current.length / 2)]?.day || '';
+    const last = current.at(-1)?.day || '';
+    return h('section', { class: 'test-trend-panel' },
+      h('div', { class: 'test-panel-title' },
+        h('h3', null, 'Testing time trend'),
+        h('div', { class: 'test-trend-legend' },
+          h('span', { class: 'is-current' }, 'Current period'),
+          h('span', { class: 'is-previous' }, 'Previous period'))),
+      h('div', { class: 'test-trend-wrap' },
+        h('div', { class: 'test-trend-y' }, h('span', null, fmtSeconds(maxValue)), h('span', null, fmtSeconds(maxValue / 2)), h('span', null, '0s')),
+        svg),
+      h('div', { class: 'test-trend-x' }, h('span', null, first), h('span', null, middle), h('span', null, last)));
+  }
+
+  function testSummary(stats) {
+    const summary = stats.summary || {};
+    const comparison = stats.comparison_summary || {};
+    const change = testDelta(summary.test_seconds, comparison.test_seconds);
+    const hourlyTotals = new Map();
+    const dailyTotals = new Map();
+    for (const cell of stats.hourly || []) {
+      hourlyTotals.set(Number(cell.hour), (hourlyTotals.get(Number(cell.hour)) || 0) + Number(cell.test_seconds || 0));
+      dailyTotals.set(String(cell.day), (dailyTotals.get(String(cell.day)) || 0) + Number(cell.test_seconds || 0));
+    }
+    const peakHour = [...hourlyTotals].sort((a, b) => b[1] - a[1])[0]?.[0];
+    const busiestDay = [...dailyTotals].sort((a, b) => b[1] - a[1])[0]?.[0];
+    const deltaClass = Number.isFinite(change) ? (change > 0 ? 'is-worse' : 'is-better') : '';
+    return h('aside', { class: 'test-summary' },
+      h('h3', null, `${stats.days || state.testsDays}-day summary`),
+      h('strong', { class: 'test-summary-total' }, fmtSeconds(summary.test_seconds || 0)),
+      h('span', { class: 'test-summary-label' }, 'Total testing time'),
+      h('div', { class: `test-summary-delta ${deltaClass}` },
+        h('strong', null, testDeltaText(change)), h('span', null, `vs previous ${stats.days || state.testsDays} days`)),
+      h('dl', { class: 'test-summary-facts' },
+        h('div', null, h('dt', null, 'Peak hour'), h('dd', null, Number.isInteger(peakHour) ? `${String(peakHour).padStart(2, '0')}:00 UTC` : '—')),
+        h('div', null, h('dt', null, 'Busiest day'), h('dd', null, busiestDay ? testDayLabel(busiestDay) : '—'))));
+  }
+
+  function renderTestHeader(stats) {
+    $('#tests-comparison').textContent = `Previous ${state.testsDays} days`;
+    $('#tests-updated').textContent = state.testsLoadedAt ? `Updated ${fmtWhen(new Date(state.testsLoadedAt).toISOString())}` : 'Waiting for data';
+    const rate = testPassRate(stats?.summary);
+    $('#tests-pass-rate').textContent = Number.isFinite(rate) ? `${rate.toFixed(1)}%` : '—';
+    $('#tests-failed-runs').textContent = stats
+      ? String(stats.summary?.failed_run_count ?? (stats.recent_runs || []).filter((run) => ['failed', 'incomplete'].includes(run.status)).length)
+      : '—';
+  }
+
   function renderTests() {
     if (currentPage() !== 'tests') return;
     const host = $('#tests-body');
+    renderTestHeader(state.tests);
     if (state.testsLoading && !state.tests) {
       host.replaceChildren(h('div', { class: 'skel', 'aria-hidden': 'true' }), h('div', { class: 'skel', 'aria-hidden': 'true' }));
       return;
     }
     const stats = state.tests;
     if (!state.testsProject) {
+      if (!state.testsRepositories && !state.overview && !state.metrics) {
+        host.replaceChildren(
+          h('div', { class: 'skel', 'aria-hidden': 'true' }),
+          h('div', { class: 'skel', 'aria-hidden': 'true' }),
+        );
+        return;
+      }
       host.replaceChildren(emptyState('No enrolled repositories are available for test statistics.'));
       return;
     }
@@ -2859,37 +3134,24 @@
       host.replaceChildren(emptyState('Test statistics are unavailable.'));
       return;
     }
-    const summary = stats.summary || {};
-    const cards = [
-      ['Tests', summary.test_count ?? 0],
-      ['Runs', summary.run_count ?? 0],
-      ['Testing time', fmtSeconds(summary.run_seconds)],
-      ['Individual time', fmtSeconds(summary.test_seconds)],
-      ['Failed', Number(summary.failed_count || 0) + Number(summary.error_count || 0)],
-      ['Running', summary.running_count ?? 0],
-    ].map(([label, value]) => h('div', { class: 'test-stat' },
-      h('span', { class: 'test-stat-value' }, value), h('span', { class: 'test-stat-label' }, label)));
-    const dailyRows = (stats.daily || []).map((row) => h('tr', null,
-      h('td', null, row.day), h('td', null, row.test_count), h('td', null, row.run_count),
-      h('td', null, fmtSeconds(row.run_seconds)), h('td', null, fmtSeconds(row.test_seconds))));
-    const suiteRows = (stats.suites || []).map((row) => h('tr', null,
-      h('td', { class: 'mono' }, row.suite), h('td', null, row.run_count),
-      h('td', null, fmtSeconds(row.total_seconds)), h('td', null, `${Number(row.percent_of_run_time || 0).toFixed(1)}%`),
-      h('td', null, fmtSeconds(row.average_seconds))));
-    const slowRows = (stats.slow_tests || []).map((row) => h('tr', null,
-      h('td', { class: 'mono test-name' }, row.display_name || row.test_id), h('td', null, row.executions),
-      h('td', null, fmtSeconds(row.total_seconds)), h('td', null, `${Number(row.percent_of_test_time || 0).toFixed(1)}%`),
-      h('td', null, fmtSeconds(row.average_seconds)), h('td', null, row.failure_count)));
-    const recentRows = (stats.recent_runs || []).map((row) => h('tr', null,
-      h('td', null, fmtWhen(row.client_started_at)), h('td', { class: 'mono' }, row.suite),
-      h('td', null, row.run_kind), h('td', null, row.status), h('td', null, fmtSeconds(row.duration_seconds)),
-      h('td', null, row.case_count)));
+    renderTestHeader(stats);
+    const dynamicsRows = (stats.dynamics || []).map((row) => {
+      const change = row.change_percent === null || row.change_percent === undefined
+        ? Number.NaN
+        : Number(row.change_percent);
+      const changeClass = Number.isFinite(change) ? (change > 0 ? 'is-worse' : 'is-better') : '';
+      return h('tr', null,
+        h('td', { class: 'mono test-name' }, row.suite),
+        h('td', null, fmtSeconds(row.current_seconds)),
+        h('td', null, fmtSeconds(row.previous_seconds)),
+        h('td', { class: `test-dynamic-change ${changeClass}` }, testDeltaText(change)),
+        h('td', null, row.failure_count),
+        h('td', null, row.last_run ? fmtWhen(row.last_run) : '—'));
+    });
     host.replaceChildren(
-      h('div', { class: 'test-stats-grid' }, cards),
-      testTable('By day', ['Date', 'Tests', 'Runs', 'Run time', 'Test time'], dailyRows),
-      testTable('Time by test set', ['Set', 'Runs', 'Time', '% run time', 'Average'], suiteRows),
-      testTable('Individual test duration', ['Test', 'Executions', 'Time', '% test time', 'Average', 'Failures'], slowRows),
-      testTable('Recent runs', ['Started', 'Set', 'Kind', 'Result', 'Duration', 'Tests'], recentRows),
+      h('div', { class: 'test-overview-grid' }, testHeatmap(stats), testSummary(stats)),
+      testTrendChart(stats),
+      testTable('Largest dynamics', ['Suite / test set', 'Current time', 'Previous time', 'Change', 'Failures', 'Last run'], dynamicsRows),
     );
   }
 

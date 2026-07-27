@@ -11,7 +11,7 @@
     "width": 390,
     "height": 844
   },
-  "source_sha256": "7165eb6190aadc2214ef46d17104fa063f650ff91f902b323e13d13b7026703e",
+  "source_sha256": "356bed0804a7b82f607b5ef3dcd6a540f0f04de22f928706010c759fe60a1121",
   "source_files": [
     {
       "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
@@ -31,15 +31,15 @@
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.css",
-      "sha256": "cbdc0bd9ee9ff094508297c39c16757bac20da2e64c9badcc2b7435273ee5b08"
+      "sha256": "a4654e3964996d9e772220e4b0a27a8c6584a75b31b3e09f4d8fe3357e1874d5"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.js",
-      "sha256": "ad39a8566af1a65becbef3590b5011d555f73ba707c430c98c08ca7523c169bb"
+      "sha256": "09ddb51d75b38bf0aae054616a870438c1f8a57bc70030325585981fe85016d0"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/index.html",
-      "sha256": "f9c2ca033fe5f7f9e910b43f33b63a84cfe3345e6a2ff0667c790ca640ff694f"
+      "sha256": "ce95e03914a6e7700d31642c9917d8a7e1a67ecc6c2014f45b18d6eac11c56be"
     },
     {
       "path": "apps/DevOpsConsole/test/helpers/stack.mjs",

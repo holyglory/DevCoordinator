@@ -19471,6 +19471,7 @@ API_GET_ROUTES = frozenset(
         "/v1/archives",
         "/v1/events",
         "/v1/tests",
+        "/v1/test-repositories",
     }
 )
 API_POST_ROUTES = frozenset(
@@ -19636,6 +19637,50 @@ def coordinated_test_statistics_read(
     )
 
 
+def coordinated_test_repository_list() -> dict[str, Any]:
+    """Return the lightweight enrolled repository catalog for test views.
+
+    This deliberately does not build inventory or observe the host. In system
+    mode the protected profile is the authorization boundary; account mode
+    reads only active repositories from its normalized store.
+    """
+
+    profile = configured_broker_profile()
+    if profile is not None:
+        repositories = [
+            {
+                "repo_id": repository.repo_id,
+                "canonical_root": repository.canonical_root,
+                "display_name": Path(repository.canonical_root).name
+                or repository.canonical_root,
+            }
+            for repository in profile.repositories.values()
+            if repository.enabled
+        ]
+    else:
+        with AccountStore.open_default_read_only(coordinator_home()) as store:
+            with store.read_transaction() as connection:
+                repositories = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        SELECT repo_id, canonical_root, display_name
+                        FROM repositories
+                        WHERE state = 'active'
+                        ORDER BY lower(display_name), canonical_root, repo_id
+                        """
+                    )
+                ]
+    repositories.sort(
+        key=lambda row: (
+            str(row["display_name"]).casefold(),
+            str(row["canonical_root"]),
+            str(row["repo_id"]),
+        )
+    )
+    return {"schema_version": 1, "repositories": repositories}
+
+
 class ApiHandler(http.server.BaseHTTPRequestHandler):
     server_version = "CodexDevCoordinator/2"
 
@@ -19767,6 +19812,10 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 result = coordinated_test_statistics_read(
                     **parse_test_stats_query(raw_query)
                 )
+            elif path == "/v1/test-repositories":
+                if raw_query:
+                    raise ValueError("test repository catalog does not accept query parameters")
+                result = coordinated_test_repository_list()
             elif path == "/v1/inventory/no-docker":
                 target = parse_registration_inventory_query(raw_query)
                 # An ordinary no-Docker inventory remains a pure committed

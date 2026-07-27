@@ -140,6 +140,65 @@ class UniversalTestHarnessTests(unittest.TestCase):
         )
         self.assertEqual(stats["slow_tests"][0]["percent_of_test_time"], 100.0)
 
+    def test_hourly_statistics_add_parallel_case_intervals(self) -> None:
+        run_id = str(uuid.uuid4())
+        started = (datetime.now(UTC) - timedelta(days=1)).replace(
+            hour=10, minute=30, second=0, microsecond=0
+        )
+        finished = started + timedelta(hours=1)
+        self.records.start(
+            self.request(
+                BrokerOperation.TEST_RUN_START,
+                {
+                    "agent": "parallel-test",
+                    "suite": "parallel-suite",
+                    "run_kind": "test",
+                    "selection": [],
+                    "command_fingerprint": "c" * 64,
+                    "started_at": started.isoformat(),
+                },
+                operation_id=run_id,
+            )
+        )
+        cases = []
+        for ordinal in range(3):
+            cases.append(
+                {
+                    "test_id": f"tests/test_parallel.py::test_{ordinal}",
+                    "display_name": f"test_{ordinal}",
+                    "status": "failed" if ordinal == 0 else "passed",
+                    "started_at": started.isoformat(),
+                    "finished_at": finished.isoformat(),
+                    "duration_seconds": 3_600,
+                }
+            )
+        self.records.finish(
+            self.request(
+                BrokerOperation.TEST_RUN_FINISH,
+                {
+                    "run_id": run_id,
+                    "status": "failed",
+                    "finished_at": finished.isoformat(),
+                    "duration_seconds": 3_600,
+                    "exit_code": 1,
+                    "cases": cases,
+                },
+            )
+        )
+
+        stats = self.records.stats_for_repository(repo_id=self.repo_id)
+        cells = {
+            (row["day"], row["hour"]): row
+            for row in stats["hourly"]
+        }
+        day = started.date().isoformat()
+        self.assertAlmostEqual(cells[(day, 10)]["test_seconds"], 5_400, places=2)
+        self.assertAlmostEqual(cells[(day, 11)]["test_seconds"], 5_400, places=2)
+        self.assertEqual(cells[(day, 10)]["failure_count"], 1)
+        self.assertEqual(stats["summary"]["failed_run_count"], 1)
+        self.assertEqual(stats["dynamics"][0]["suite"], "parallel-suite")
+        self.assertEqual(stats["dynamics"][0]["current_seconds"], 10_800)
+
     def test_passed_run_rejects_failed_case(self) -> None:
         run_id = str(uuid.uuid4())
         started = datetime.now(UTC)

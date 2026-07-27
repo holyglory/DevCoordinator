@@ -26,6 +26,7 @@ function makeApi({ snapshot, inventoryError = null } = {}) {
   let inventoryReads = 0;
   let routeResolves = 0;
   let routeSnapshot = null;
+  let testRepositoryReads = 0;
   const coordinator = {
     async inventory() {
       inventoryReads += 1;
@@ -39,6 +40,13 @@ function makeApi({ snapshot, inventoryError = null } = {}) {
     },
     status() {
       return { ok: !inventoryError, url: 'http://127.0.0.1:29876', lastError: inventoryError?.message ?? null };
+    },
+    async testRepositories() {
+      testRepositoryReads += 1;
+      return {
+        schema_version: 1,
+        repositories: [{ repo_id: 'repo-1', canonical_root: '/repo', display_name: 'Repo' }],
+      };
     },
   };
   const routeStore = {
@@ -71,7 +79,7 @@ function makeApi({ snapshot, inventoryError = null } = {}) {
   });
   return {
     api,
-    counts: () => ({ inventoryReads, routeResolves, routeSnapshot }),
+    counts: () => ({ inventoryReads, routeResolves, routeSnapshot, testRepositoryReads }),
   };
 }
 
@@ -93,7 +101,9 @@ test('overview returns a truthful dependency error within 100ms without a second
   assert.equal(result.json.inventory, null);
   assert.equal(result.json.coordinator.inventoryState, 'error');
   assert.match(result.json.routes[0].resolved.reason, /broker maintenance in progress/);
-  assert.deepEqual(counts(), { inventoryReads: 0, routeResolves: 0, routeSnapshot: null },
+  assert.deepEqual(counts(), {
+    inventoryReads: 0, routeResolves: 0, routeSnapshot: null, testRepositoryReads: 0,
+  },
     'a failed inventory snapshot must not start another Coordinator route-resolution request');
 });
 
@@ -111,6 +121,21 @@ test('overview resolves every route from the one bounded inventory snapshot', as
   assert.equal(counts().routeResolves, 1);
   assert.equal(counts().routeSnapshot, snapshot,
     'route resolution must consume the same inventory object returned in the overview');
+});
+
+test('test repository catalog does not build the heavyweight overview', async () => {
+  const { api, counts } = makeApi({ snapshot: null });
+  const req = { method: 'GET', url: '/api/tests/repositories', headers: {} };
+  const res = responseRecorder();
+  const started = performance.now();
+  await api.handle(req, res, { email: 'owner@example.test' });
+
+  assert.equal(res.status, 200);
+  assert.ok(performance.now() - started < 100);
+  assert.equal(JSON.parse(res.body).repositories[0].repo_id, 'repo-1');
+  assert.deepEqual(counts(), {
+    inventoryReads: 0, routeResolves: 0, routeSnapshot: null, testRepositoryReads: 1,
+  });
 });
 
 test('browser boot renders Performance metrics independently of a slow overview', async () => {

@@ -4,7 +4,7 @@ import test from 'node:test';
 
 const UI = new URL('../src/ui/', import.meta.url);
 
-test('Tests destination leads with repository-scoped real statistics and bounded tables', async () => {
+test('Tests destination leads with repository-scoped hourly timing and period dynamics', async () => {
   const [html, js, css] = await Promise.all([
     fsp.readFile(new URL('index.html', UI), 'utf8'),
     fsp.readFile(new URL('app.js', UI), 'utf8'),
@@ -16,12 +16,23 @@ test('Tests destination leads with repository-scoped real statistics and bounded
   assert.match(html, /data-page="tests"/);
   assert.ok(html.indexOf('id="tests-h"') < html.indexOf('id="tests-body"'));
   assert.match(js, /function loadTests\(/);
+  assert.match(js, /function loadTestRepositories\(/);
+  assert.match(js, /\/api\/tests\/repositories/);
+  assert.match(js, /metricTestRepositories/);
   assert.match(js, /\/api\/tests\?project=/);
   for (const promisedView of [
-    'By day', 'Time by test set', 'Individual test duration', 'Recent runs',
+    'Testing time by hour', 'Testing time trend', 'Largest dynamics',
   ]) {
     assert.ok(js.includes(promisedView), promisedView);
   }
+  assert.match(js, /function testHeatColor\(seconds\)/);
+  assert.match(js, /minutes <= 60/);
+  assert.match(js, /minutes <= 120/);
+  assert.match(js, /Aggregate test time may exceed 60m when tests run in parallel/);
+  assert.match(js, /stats\.hourly/);
+  assert.match(js, /stats\.comparison_summary/);
+  assert.match(js, /stats\.previous_daily/);
+  assert.match(js, /stats\.dynamics/);
   assert.match(js, /cell\.dataset\.label = headers\[index\]/);
   assert.match(js, /cell\.setAttribute\('aria-label'/);
   assert.match(css, /\.test-table td::before/);

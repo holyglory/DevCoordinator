@@ -1414,6 +1414,9 @@ export function createConsoleApi({
         const limit = boundedInteger(searchParams.get('limit'), 25, 1, 500, 'limit');
         return sendJson(res, 200, await coordinator.testStats({ project, days, limit }));
       }
+      if (method === 'GET' && pathname === '/api/tests/repositories') {
+        return sendJson(res, 200, await coordinator.testRepositories());
+      }
       if (method === 'GET' && pathname === '/api/metrics/history') {
         return handleMetricsHistory(res, searchParams);
       }

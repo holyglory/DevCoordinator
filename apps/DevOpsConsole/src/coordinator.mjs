@@ -316,6 +316,8 @@ export function createCoordinator({ config, log }) {
 
   const invCache = { value: undefined, at: 0, inflight: null, generation: 0 };
   const srvCache = { value: undefined, at: 0, inflight: null, generation: 0 };
+  const testRepositoryCache = { value: undefined, at: 0, inflight: null, generation: 0 };
+  const testStatsCaches = new Map();
   const trustedDockerObservations = new Map();
   const observationFlights = new Map();
 
@@ -818,7 +820,15 @@ export function createCoordinator({ config, log }) {
     return request('GET', `/v1/events?${query.toString()}`);
   }
 
-  function testStats({ project, days = 30, limit = 25 } = {}) {
+  function testRepositories({ maxAgeMs = 30_000 } = {}) {
+    return cachedGet(
+      testRepositoryCache,
+      '/v1/test-repositories',
+      maxAgeMs,
+    );
+  }
+
+  function testStats({ project, days = 30, limit = 25, maxAgeMs = 5000 } = {}) {
     if (typeof project !== 'string' || !project || project.length > 4096) {
       throw new CoordError('test statistics require one bounded project identity', { status: 400 });
     }
@@ -829,7 +839,14 @@ export function createCoordinator({ config, log }) {
       throw new CoordError('test statistics limit must be an integer from 1 through 500', { status: 400 });
     }
     const query = new URLSearchParams({ project, days: String(days), limit: String(limit) });
-    return request('GET', `/v1/tests?${query.toString()}`);
+    const key = query.toString();
+    let cache = testStatsCaches.get(key);
+    if (!cache) {
+      cache = { value: undefined, at: 0, inflight: null, generation: 0 };
+      testStatsCaches.set(key, cache);
+      if (testStatsCaches.size > 128) testStatsCaches.delete(testStatsCaches.keys().next().value);
+    }
+    return cachedGet(cache, `/v1/tests?${key}`, maxAgeMs);
   }
 
   async function dockerAction(name, action, body = {}) {
@@ -936,6 +953,7 @@ export function createCoordinator({ config, log }) {
     inventoryForOverview,
     serversRaw,
     events,
+    testRepositories,
     testStats,
     observeHost,
     request,

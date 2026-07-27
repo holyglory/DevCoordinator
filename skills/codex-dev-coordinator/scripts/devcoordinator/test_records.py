@@ -333,6 +333,92 @@ class CoordinatorTestRecords:
                         (repo_id, window),
                     ).fetchone()
                 )
+                comparison_summary = dict(
+                    connection.execute(
+                        """
+                        WITH previous_runs AS (
+                            SELECT * FROM test_runs
+                            WHERE repo_id = ?
+                              AND julianday(client_started_at) >= julianday('now', ?)
+                              AND julianday(client_started_at) < julianday('now', ?)
+                        ), previous_cases AS (
+                            SELECT c.* FROM test_case_results c
+                            JOIN previous_runs r USING(run_id)
+                        )
+                        SELECT
+                            (SELECT COUNT(*) FROM previous_runs WHERE run_kind != 'session') AS run_count,
+                            (SELECT COALESCE(SUM(duration_seconds), 0) FROM previous_runs
+                             WHERE run_kind != 'session') AS run_seconds,
+                            (SELECT COUNT(*) FROM previous_cases) AS test_count,
+                            (SELECT COALESCE(SUM(duration_seconds), 0) FROM previous_cases) AS test_seconds,
+                            (SELECT COALESCE(SUM(status = 'passed'), 0) FROM previous_cases) AS passed_count,
+                            (SELECT COALESCE(SUM(status = 'failed'), 0) FROM previous_cases) AS failed_count,
+                            (SELECT COALESCE(SUM(status = 'skipped'), 0) FROM previous_cases) AS skipped_count,
+                            (SELECT COALESCE(SUM(status = 'error'), 0) FROM previous_cases) AS error_count,
+                            (SELECT COUNT(*) FROM previous_runs
+                             WHERE run_kind != 'session'
+                               AND status IN ('failed', 'incomplete')) AS failed_run_count
+                        """,
+                        (repo_id, f"-{days * 2} days", window),
+                    ).fetchone()
+                )
+                summary["failed_run_count"] = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM test_runs
+                        WHERE repo_id = ?
+                          AND run_kind != 'session'
+                          AND status IN ('failed', 'incomplete')
+                          AND julianday(client_started_at) >= julianday('now', ?)
+                        """,
+                        (repo_id, window),
+                    ).fetchone()[0]
+                )
+                # Split exact case intervals across UTC clock-hour buckets.
+                # Parallel cases intentionally add together, so aggregate test
+                # time can exceed 3,600 seconds in one wall-clock hour.
+                hourly = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        WITH RECURSIVE hours(bucket_start) AS (
+                            SELECT datetime('now', 'start of day', '-6 days')
+                            UNION ALL
+                            SELECT datetime(bucket_start, '+1 hour') FROM hours
+                            WHERE bucket_start < datetime('now', 'start of day', '+23 hours')
+                        ), recent_cases AS (
+                            SELECT c.* FROM test_case_results c
+                            JOIN test_runs r USING(run_id)
+                            WHERE r.repo_id = ?
+                              AND julianday(c.finished_at) > julianday('now', 'start of day', '-6 days')
+                              AND julianday(c.started_at) < julianday('now', 'start of day', '+1 day')
+                        )
+                        SELECT strftime('%Y-%m-%d', bucket_start) AS day,
+                               CAST(strftime('%H', bucket_start) AS INTEGER) AS hour,
+                               ROUND(COALESCE(SUM(
+                                   CASE WHEN c.run_id IS NULL THEN 0 ELSE
+                                       MAX(0,
+                                           MIN(julianday(c.finished_at), julianday(bucket_start, '+1 hour'))
+                                           - MAX(julianday(c.started_at), julianday(bucket_start))
+                                       ) * 86400
+                                   END
+                               ), 0), 3) AS test_seconds,
+                               COALESCE(SUM(
+                                   CASE WHEN c.status IN ('failed', 'error')
+                                         AND julianday(c.started_at) >= julianday(bucket_start)
+                                         AND julianday(c.started_at) < julianday(bucket_start, '+1 hour')
+                                   THEN 1 ELSE 0 END
+                               ), 0) AS failure_count
+                        FROM hours
+                        LEFT JOIN recent_cases c
+                          ON julianday(c.finished_at) > julianday(bucket_start)
+                         AND julianday(c.started_at) < julianday(bucket_start, '+1 hour')
+                        GROUP BY bucket_start
+                        ORDER BY bucket_start
+                        """,
+                        (repo_id,),
+                    )
+                ]
                 daily = [
                     dict(row)
                     for row in connection.execute(
@@ -359,6 +445,35 @@ class CoordinatorTestRecords:
                         ORDER BY day DESC
                         """,
                         (repo_id, window),
+                    )
+                ]
+                previous_daily = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        WITH previous_runs AS (
+                            SELECT * FROM test_runs WHERE repo_id = ?
+                              AND julianday(client_started_at) >= julianday('now', ?)
+                              AND julianday(client_started_at) < julianday('now', ?)
+                        ), run_daily AS (
+                            SELECT substr(client_started_at, 1, 10) AS day,
+                                   COUNT(*) AS run_count,
+                                   COALESCE(SUM(duration_seconds), 0) AS run_seconds
+                            FROM previous_runs WHERE run_kind != 'session' GROUP BY day
+                        ), case_daily AS (
+                            SELECT substr(r.client_started_at, 1, 10) AS day,
+                                   COUNT(*) AS test_count,
+                                   COALESCE(SUM(c.duration_seconds), 0) AS test_seconds
+                            FROM test_case_results c JOIN previous_runs r USING(run_id)
+                            GROUP BY day
+                        )
+                        SELECT run_daily.day, run_count,
+                               COALESCE(test_count, 0) AS test_count,
+                               run_seconds, COALESCE(test_seconds, 0) AS test_seconds
+                        FROM run_daily LEFT JOIN case_daily USING(day)
+                        ORDER BY day DESC
+                        """,
+                        (repo_id, f"-{days * 2} days", window),
                     )
                 ]
                 suite_rows = [
@@ -407,6 +522,57 @@ class CoordinatorTestRecords:
                         (repo_id, limit),
                     )
                 ]
+                dynamics = [
+                    dict(row)
+                    for row in connection.execute(
+                        """
+                        WITH current_suites AS (
+                            SELECT r.suite,
+                                   COALESCE(SUM(c.duration_seconds), 0) AS current_seconds,
+                                   COALESCE(SUM(c.status IN ('failed', 'error')), 0) AS failure_count,
+                                   MAX(r.client_started_at) AS last_run
+                            FROM test_case_results c JOIN test_runs r USING(run_id)
+                            WHERE r.repo_id = ?
+                              AND julianday(r.client_started_at) >= julianday('now', ?)
+                            GROUP BY r.suite
+                        ), previous_suites AS (
+                            SELECT r.suite,
+                                   COALESCE(SUM(c.duration_seconds), 0) AS previous_seconds
+                            FROM test_case_results c JOIN test_runs r USING(run_id)
+                            WHERE r.repo_id = ?
+                              AND julianday(r.client_started_at) >= julianday('now', ?)
+                              AND julianday(r.client_started_at) < julianday('now', ?)
+                            GROUP BY r.suite
+                        ), suite_names AS (
+                            SELECT suite FROM current_suites
+                            UNION SELECT suite FROM previous_suites
+                        )
+                        SELECT names.suite,
+                               COALESCE(current_seconds, 0) AS current_seconds,
+                               COALESCE(previous_seconds, 0) AS previous_seconds,
+                               CASE WHEN COALESCE(previous_seconds, 0) = 0 THEN NULL
+                                    ELSE ROUND(100.0 * (COALESCE(current_seconds, 0) - previous_seconds)
+                                               / previous_seconds, 3)
+                               END AS change_percent,
+                               COALESCE(failure_count, 0) AS failure_count,
+                               last_run
+                        FROM suite_names names
+                        LEFT JOIN current_suites USING(suite)
+                        LEFT JOIN previous_suites USING(suite)
+                        ORDER BY ABS(COALESCE(current_seconds, 0) - COALESCE(previous_seconds, 0)) DESC,
+                                 names.suite
+                        LIMIT ?
+                        """,
+                        (
+                            repo_id,
+                            window,
+                            repo_id,
+                            f"-{days * 2} days",
+                            window,
+                            limit,
+                        ),
+                    )
+                ]
         total_run_seconds = float(summary["run_seconds"] or 0)
         total_test_seconds = float(summary["test_seconds"] or 0)
         for row in suite_rows:
@@ -426,10 +592,14 @@ class CoordinatorTestRecords:
             "repo_id": repo_id,
             "days": days,
             "summary": summary,
+            "comparison_summary": comparison_summary,
+            "hourly": hourly,
             "daily": daily,
+            "previous_daily": previous_daily,
             "suites": suite_rows,
             "slow_tests": test_rows,
             "recent_runs": recent_runs,
+            "dynamics": dynamics,
         }
 
     @staticmethod

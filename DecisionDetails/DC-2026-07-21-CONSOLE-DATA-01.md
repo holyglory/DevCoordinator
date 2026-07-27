@@ -37,6 +37,18 @@ repository usage is still loading. A few bounded follow-ups collect a newly
 warmed snapshot without waiting for the normal poll, and immutable text assets
 negotiate Brotli or gzip with encoding-specific validators.
 
+The Tests page has the same independence contract. Repository selection comes
+from a lightweight protected-profile catalog, with recently retained project
+metrics as a rolling-deployment fallback, and test statistics use a bounded,
+repository-scoped cached read. Neither list population nor the first test-data
+paint waits for host observation or the heavyweight repository inventory. Its
+primary operational view is a seven-day UTC hourly heatmap built from exact
+case intervals split across clock-hour boundaries. Parallel intervals add, so
+an hour may truthfully exceed 60 aggregate test-minutes; blue covers 0–60,
+amber 60–120, and red more than 120, with failures marked independently. The
+selected period is compared with the immediately preceding equal period for
+daily trend and suite-level dynamics.
+
 Enrollment-only server definitions remain exact control identities for port
 leases and assignments. Every current normalized definition is classified
 exactly once under its repository scope, but definitions do not enter
@@ -74,6 +86,10 @@ a port.
   dependency-degraded paths, and keep Performance's first meaningful paint
   independent of the Coordinator so its largest content can render within one
   second on the production route.
+- Keep the Tests repository selector and first statistics paint independent of
+  inventory, with a one-second authenticated browser regression budget. Lead
+  with hourly load, period comparison, pass rate, failed runs, and the largest
+  suite dynamics rather than raw record tables.
 
 ## Alternatives rejected
 
@@ -98,8 +114,8 @@ problem, producing the same contract failure.
 ## Verification contract
 
 Console coordinator, overview first-byte, static-compression,
-project-membership, DOM-budget, lifecycle, and canonical artifact tests cover
-the read model and bounded interface. DevOps Board core and
+project-membership, test-dashboard first-paint, DOM-budget, lifecycle, and
+canonical artifact tests cover the read model and bounded interface. DevOps Board core and
 vertical-layout tests cover exact tree consumption, stable grouping, and center
 pane geometry. A producer regression fixture must keep a current definition
 with exact control evidence in `resources.servers` and one repository scope,
@@ -108,6 +124,10 @@ server IDs without lifecycle evidence. Database fixtures must separately prove
 that positive catalog absence exits current resources/tree/observations while
 catalog-discovery failure preserves them. Canonical artifacts remain bound to
 current renderer inputs and source hashes.
+
+Test statistics fixtures must prove interval splitting at UTC hour boundaries,
+parallel aggregation above 3,600 seconds per hour, failure marking, previous
+period comparison, and responsive dashboard geometry.
 
 Production verification on 2026-07-26 exercised the authenticated
 `/v1/inventory` response with the exact deployed Console
