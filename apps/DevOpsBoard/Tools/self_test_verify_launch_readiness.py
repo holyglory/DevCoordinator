@@ -188,6 +188,10 @@ def check_build_script_wiring() -> None:
         '/usr/bin/pkill -u "$(id -u)" -x "$APP_NAME"' in source,
         "initial app cleanup is not user-scoped",
     )
+    check(
+        '/usr/bin/open -F -n "$APP_BUNDLE"' in source,
+        "app launch may restore a hidden no-window state instead of mounting the Board",
+    )
     verify_case = source[source.find("--verify|verify)") :]
     check("verify_launch" in verify_case, "--verify is not wired to inventory readiness")
     check("sleep 1" not in verify_case, "--verify regressed to a timed process-existence check")

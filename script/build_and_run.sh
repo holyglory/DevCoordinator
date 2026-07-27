@@ -57,7 +57,11 @@ fi
   --json
 
 launch_app() {
-  /usr/bin/open -n "$APP_BUNDLE"
+  # The Board intentionally hides its last window instead of closing it. Do
+  # not let AppKit restore that hidden termination state on the next launch:
+  # without a mounted WindowGroup, the inventory task never starts and launch
+  # verification has no readiness event to observe.
+  /usr/bin/open -F -n "$APP_BUNDLE"
 }
 
 verify_launch() (
