@@ -192,6 +192,109 @@ class StoreTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_current_docker_stats_reuse_latest_evidence_without_history_scan(self) -> None:
+        store = self.open_store()
+        try:
+            now = "2026-07-27T12:00:00Z"
+            with store.immediate_transaction(revision_kind="observation") as connection:
+                connection.execute(
+                    "INSERT INTO hosts VALUES ('host-current','machine-current','test','host',?,?)",
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_engines(
+                        engine_id, host_id, context_identity, daemon_identity,
+                        capability_state, created_at, updated_at
+                    ) VALUES (
+                        'engine-current', 'host-current', 'default', 'daemon-current',
+                        'available', ?, ?
+                    )
+                    """,
+                    (now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_resources(
+                        docker_resource_id, engine_id, full_container_id,
+                        current_name, image, created_at, updated_at
+                    ) VALUES (
+                        'docker-current', 'engine-current', ?, 'current',
+                        'fixture/current', ?, ?
+                    )
+                    """,
+                    ("a" * 64, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_observations(
+                        docker_resource_id, lifecycle, sampled_at,
+                        observation_fingerprint
+                    ) VALUES ('docker-current', 'running', ?, 'observation-current')
+                    """,
+                    (now,),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO telemetry_samples(
+                        sample_id, host_resource_kind, host_resource_id,
+                        sampled_at, cpu_percent
+                    ) VALUES (?, 'docker', 'docker-retired', ?, ?)
+                    """,
+                    (
+                        (
+                            f"retired-docker-sample-{index:05d}",
+                            f"2026-07-{1 + index // 1440:02d}T"
+                            f"{index // 60 % 24:02d}:{index % 60:02d}:00Z",
+                            float(index),
+                        )
+                        for index in range(20_000)
+                    ),
+                )
+                for sample_id, sampled_at, cpu_percent in (
+                    ("docker-current-in-window", "2026-07-27T12:05:00Z", 5.0),
+                    ("docker-current-after-window", "2026-07-27T12:20:00Z", 20.0),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO telemetry_samples(
+                            sample_id, host_resource_kind, host_resource_id,
+                            sampled_at, cpu_percent
+                        ) VALUES (?, 'docker', 'docker-current', ?, ?)
+                        """,
+                        (sample_id, sampled_at, cpu_percent),
+                    )
+
+            progress_calls = 0
+
+            def reject_historical_scan() -> int:
+                nonlocal progress_calls
+                progress_calls += 1
+                return int(progress_calls > 500)
+
+            evidence = store_module.LatestDockerObservation(
+                snapshot_id="snapshot-current",
+                started_at="2026-07-27T12:00:00Z",
+                completed_at="2026-07-27T12:10:00Z",
+                resource_ids=frozenset({"docker-current"}),
+            )
+            with store.read_transaction() as connection:
+                connection.set_progress_handler(reject_historical_scan, 100)
+                try:
+                    current, compatibility = store_module._current_docker_stats(
+                        connection,
+                        latest_evidence={"host-current": evidence},
+                        active_resource_ids={"docker-current"},
+                    )
+                finally:
+                    connection.set_progress_handler(None, 0)
+
+            self.assertEqual(current["docker-current"]["cpu_percent"], 5.0)
+            self.assertEqual(compatibility, current)
+            self.assertLess(progress_calls, 500)
+        finally:
+            store.close()
+
     def test_private_wal_foreign_keys_and_schema_contract(self) -> None:
         store = self.open_store()
         try:

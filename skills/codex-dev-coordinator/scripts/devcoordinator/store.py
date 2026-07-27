@@ -93,6 +93,14 @@ class StoreMetadata:
     migration_state: str
 
 
+@dataclass(frozen=True)
+class LatestDockerObservation:
+    snapshot_id: str
+    started_at: str
+    completed_at: str
+    resource_ids: frozenset[str]
+
+
 def utc_timestamp(value: float | None = None) -> str:
     seconds = time.time() if value is None else float(value)
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
@@ -488,9 +496,9 @@ def _repository_trees_projection(
     return result
 
 
-def _latest_available_docker_presence(
+def _latest_available_docker_evidence(
     connection: sqlite3.Connection,
-) -> dict[str, frozenset[str]]:
+) -> dict[str, LatestDockerObservation]:
     """Return the exact resource set from each host's latest proved Docker sample.
 
     ``docker_resources`` is durable identity/history, while
@@ -502,6 +510,7 @@ def _latest_available_docker_presence(
     """
 
     present: dict[str, set[str]] = {}
+    details: dict[str, tuple[str, str, str]] = {}
     for row in connection.execute(
         """
         WITH ranked AS (
@@ -520,8 +529,11 @@ def _latest_available_docker_presence(
             SELECT host_id, snapshot_id
             FROM ranked WHERE snapshot_ordinal = 1
         )
-        SELECT latest.host_id, resources.resource_id
+        SELECT latest.host_id, latest.snapshot_id,
+               snapshots.started_at, snapshots.completed_at,
+               resources.resource_id
         FROM latest
+        JOIN observation_snapshots snapshots USING(snapshot_id)
         LEFT JOIN observation_snapshot_resources resources
           ON resources.snapshot_id = latest.snapshot_id
          AND resources.resource_kind = 'container'
@@ -532,7 +544,31 @@ def _latest_available_docker_presence(
         resources = present.setdefault(host_id, set())
         if row["resource_id"] is not None:
             resources.add(str(row["resource_id"]))
-    return {host_id: frozenset(resources) for host_id, resources in present.items()}
+        evidence = details.setdefault(
+            host_id,
+            (
+                str(row["snapshot_id"]),
+                str(row["started_at"]),
+                str(row["completed_at"]),
+            ),
+        )
+        if evidence != (
+            str(row["snapshot_id"]),
+            str(row["started_at"]),
+            str(row["completed_at"]),
+        ):
+            raise StoreError(
+                f"latest Docker observation is contradictory for host {host_id}"
+            )
+    return {
+        host_id: LatestDockerObservation(
+            snapshot_id=details[host_id][0],
+            started_at=details[host_id][1],
+            completed_at=details[host_id][2],
+            resource_ids=frozenset(resources),
+        )
+        for host_id, resources in present.items()
+    }
 
 
 def _current_telemetry_samples(
@@ -580,6 +616,67 @@ def _current_telemetry_samples(
             )
         )
     return samples
+
+
+def _current_docker_stats(
+    connection: sqlite3.Connection,
+    *,
+    latest_evidence: dict[str, LatestDockerObservation],
+    active_resource_ids: Iterable[str],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Return exact current and compatibility Docker metrics with bounded reads."""
+
+    active_ids = {str(resource_id) for resource_id in active_resource_ids}
+    current: dict[str, dict[str, Any]] = {}
+    compatibility: dict[str, dict[str, Any]] = {}
+    for row in connection.execute(
+        """
+        SELECT resource.docker_resource_id, engine.host_id,
+               observation.lifecycle
+        FROM docker_resources resource
+        JOIN docker_engines engine USING(engine_id)
+        JOIN docker_observations observation USING(docker_resource_id)
+        ORDER BY resource.docker_resource_id
+        """
+    ):
+        resource_id = str(row["docker_resource_id"])
+        if resource_id not in active_ids or row["lifecycle"] != "running":
+            continue
+        evidence = latest_evidence.get(str(row["host_id"]))
+        if evidence is not None and resource_id not in evidence.resource_ids:
+            continue
+        parameters: tuple[Any, ...]
+        window_clause = ""
+        if evidence is None:
+            parameters = (resource_id,)
+        else:
+            window_clause = "AND sampled_at >= ? AND sampled_at <= ?"
+            parameters = (
+                resource_id,
+                evidence.started_at,
+                evidence.completed_at,
+            )
+        sample = connection.execute(
+            f"""
+            SELECT sampled_at, cpu_percent, memory_bytes,
+                   network_rx_bytes, network_tx_bytes,
+                   block_read_bytes, block_write_bytes
+            FROM telemetry_samples
+            WHERE host_resource_kind = 'docker'
+              AND host_resource_id = ?
+              {window_clause}
+            ORDER BY sampled_at DESC, sample_id DESC
+            LIMIT 1
+            """,
+            parameters,
+        ).fetchone()
+        if sample is None:
+            continue
+        projected = {"docker_resource_id": resource_id, **dict(sample)}
+        compatibility[resource_id] = projected
+        if evidence is not None:
+            current[resource_id] = projected
+    return current, compatibility
 
 
 def _current_server_resource_ids(
@@ -1663,7 +1760,11 @@ class AccountStore(CoordinatorStore):
             )
             inventory_epoch = time.time()
             inventory_time = utc_timestamp(inventory_epoch)
-            present_docker_resources = _latest_available_docker_presence(connection)
+            latest_docker_evidence = _latest_available_docker_evidence(connection)
+            present_docker_resources = {
+                host_id: evidence.resource_ids
+                for host_id, evidence in latest_docker_evidence.items()
+            }
             removed_runtime_resources = _latest_removed_runtime_resources(connection)
 
             def docker_resource_is_present(host_id: Any, resource_id: Any) -> bool:
@@ -1934,7 +2035,7 @@ class AccountStore(CoordinatorStore):
                 )
                 or row["resource_kind"] not in {"container", "server"}
             ]
-            control_bindings = [
+            all_control_bindings = [
                 dict(row)
                 for row in connection.execute(
                     """
@@ -1944,6 +2045,10 @@ class AccountStore(CoordinatorStore):
                     FROM control_bindings ORDER BY resource_kind, resource_id, source_id
                     """
                 )
+            ]
+            control_bindings = [
+                row
+                for row in all_control_bindings
                 if row["authority_state"] != "retired"
                 and (
                     (
@@ -1959,6 +2064,25 @@ class AccountStore(CoordinatorStore):
                     or row["resource_kind"] not in {"container", "server"}
                 )
             ]
+            bindings_by_resource: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for binding in all_control_bindings:
+                bindings_by_resource.setdefault(
+                    (str(binding["resource_kind"]), str(binding["resource_id"])),
+                    [],
+                ).append(binding)
+            for candidates in bindings_by_resource.values():
+                candidates.sort(
+                    key=lambda binding: (
+                        binding["authority_state"] == "authoritative",
+                        int(binding["priority"]),
+                        str(binding["binding_id"]),
+                    ),
+                    reverse=True,
+                )
+            source_homes = {
+                str(source["source_id"]): str(source["canonical_home"])
+                for source in coordinator_sources
+            }
             unassigned: list[dict[str, Any]] = []
             reason_explanations = {
                 "name_only": "The host resource has an exact controller, but only its name—not a repository path—was observed.",
@@ -1976,23 +2100,12 @@ class AccountStore(CoordinatorStore):
                        u.reason_code, u.suggested_root, u.status,
                        sr.payload_sha256 AS source_payload_fingerprint,
                        observed.canonical_home AS observed_home,
-                       cb.binding_id AS control_binding_id,
-                       cb.resource_kind AS binding_resource_kind,
-                       cb.resource_id AS binding_resource_id,
-                       cb.source_id AS binding_source_id,
-                       cb.capability AS binding_capability,
-                       cb.provenance AS binding_provenance,
-                       cb.authority_state, cb.generation AS binding_generation,
-                       controller.canonical_home AS controller_home,
                        m.immutable_fingerprint AS membership_fingerprint,
                        d.engine_id, d.full_container_id,
                        rr.status AS retirement_status
                 FROM unassigned_resources u
                 LEFT JOIN source_resources sr USING(source_resource_id)
                 LEFT JOIN coordinator_sources observed ON observed.source_id = sr.source_id
-                LEFT JOIN control_bindings cb
-                  ON cb.resource_kind = u.resource_kind AND cb.resource_id = u.resource_id
-                LEFT JOIN coordinator_sources controller ON controller.source_id = cb.source_id
                 LEFT JOIN repository_memberships m
                   ON m.resource_kind = u.resource_kind AND m.host_resource_id = u.resource_id
                 LEFT JOIN docker_resources d
@@ -2016,6 +2129,39 @@ class AccountStore(CoordinatorStore):
                     continue
                 item = dict(row)
                 item.pop("source_payload_fingerprint")
+                binding_candidates = bindings_by_resource.get(
+                    (str(item["resource_kind"]), str(item["resource_id"])),
+                    [],
+                )
+                binding = binding_candidates[0] if binding_candidates else None
+                item.update(
+                    {
+                        "control_binding_id": (
+                            binding["binding_id"] if binding is not None else None
+                        ),
+                        "binding_resource_kind": (
+                            binding["resource_kind"] if binding is not None else None
+                        ),
+                        "binding_resource_id": (
+                            binding["resource_id"] if binding is not None else None
+                        ),
+                        "binding_source_id": (
+                            binding["source_id"] if binding is not None else None
+                        ),
+                        "binding_capability": (
+                            binding["capability"] if binding is not None else None
+                        ),
+                        "binding_provenance": (
+                            binding["provenance"] if binding is not None else None
+                        ),
+                        "authority_state": (
+                            binding["authority_state"] if binding is not None else None
+                        ),
+                        "binding_generation": (
+                            binding["generation"] if binding is not None else None
+                        ),
+                    }
+                )
                 immutable_fingerprint = item.pop("membership_fingerprint")
                 engine_id = item.pop("engine_id")
                 full_container_id = item.pop("full_container_id")
@@ -2032,7 +2178,11 @@ class AccountStore(CoordinatorStore):
                         }
                     )
                 observed_home = item.pop("observed_home")
-                controller_home = item.pop("controller_home")
+                controller_home = (
+                    source_homes.get(str(binding["source_id"]))
+                    if binding is not None
+                    else None
+                )
                 ownership_fingerprint = _projected_binding_fingerprint(item)
                 authority_state = item.pop("authority_state")
                 for key in (
@@ -2630,113 +2780,10 @@ class AccountStore(CoordinatorStore):
                 if (str(row["_repo_id"]), str(row["name"]))
                 not in removed_runtime_server_keys
             ]
-            current_docker_stats = {
-                str(row["docker_resource_id"]): dict(row)
-                for row in connection.execute(
-                    """
-                    WITH ranked_snapshots AS (
-                        SELECT s.host_id, s.snapshot_id, s.started_at,
-                               s.completed_at,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY s.host_id
-                                   ORDER BY s.completed_at DESC, s.snapshot_id DESC
-                               ) AS snapshot_ordinal
-                        FROM observation_snapshots s
-                        JOIN observation_capabilities c USING(snapshot_id)
-                        WHERE s.status = 'completed'
-                          AND s.completed_at IS NOT NULL
-                          AND c.observer_domain = s.observer_domain
-                          AND c.docker_available = 1
-                    ), latest_snapshots AS (
-                        SELECT host_id, snapshot_id, started_at, completed_at
-                        FROM ranked_snapshots WHERE snapshot_ordinal = 1
-                    ), ranked_samples AS (
-                        SELECT resources.resource_id AS docker_resource_id,
-                               telemetry.sampled_at, telemetry.cpu_percent,
-                               telemetry.memory_bytes,
-                               telemetry.network_rx_bytes,
-                               telemetry.network_tx_bytes,
-                               telemetry.block_read_bytes,
-                               telemetry.block_write_bytes,
-                               ROW_NUMBER() OVER (
-                                   PARTITION BY resources.resource_id
-                                   ORDER BY telemetry.sampled_at DESC,
-                                            telemetry.sample_id DESC
-                               ) AS sample_ordinal
-                        FROM latest_snapshots snapshot
-                        JOIN observation_snapshot_resources resources
-                          ON resources.snapshot_id = snapshot.snapshot_id
-                         AND resources.resource_kind = 'container'
-                        JOIN docker_resources resource
-                          ON resource.docker_resource_id = resources.resource_id
-                        JOIN docker_engines engine
-                          ON engine.engine_id = resource.engine_id
-                         AND engine.host_id = snapshot.host_id
-                        JOIN docker_observations observation
-                          ON observation.docker_resource_id = resources.resource_id
-                         AND observation.lifecycle = 'running'
-                        JOIN telemetry_samples telemetry
-                          ON telemetry.host_resource_kind = 'docker'
-                         AND telemetry.host_resource_id = resources.resource_id
-                        WHERE julianday(telemetry.sampled_at)
-                                  >= julianday(snapshot.started_at)
-                          AND julianday(telemetry.sampled_at)
-                                  <= julianday(snapshot.completed_at)
-                    )
-                    SELECT docker_resource_id, sampled_at, cpu_percent,
-                           memory_bytes, network_rx_bytes, network_tx_bytes,
-                           block_read_bytes, block_write_bytes
-                    FROM ranked_samples WHERE sample_ordinal = 1
-                    ORDER BY docker_resource_id
-                    """
-                )
-            }
-            project_docker_stats = dict(current_docker_stats)
-            project_docker_stats.update(
-                {
-                    str(row["docker_resource_id"]): dict(row)
-                    for row in connection.execute(
-                        """
-                        SELECT observation.docker_resource_id,
-                               telemetry.sampled_at, telemetry.cpu_percent,
-                               telemetry.memory_bytes,
-                               telemetry.network_rx_bytes,
-                               telemetry.network_tx_bytes,
-                               telemetry.block_read_bytes,
-                               telemetry.block_write_bytes
-                        FROM docker_observations observation
-                        JOIN docker_resources resource USING(docker_resource_id)
-                        JOIN docker_engines engine USING(engine_id)
-                        JOIN telemetry_samples telemetry
-                          ON telemetry.host_resource_kind = 'docker'
-                         AND telemetry.host_resource_id = observation.docker_resource_id
-                        WHERE observation.lifecycle = 'running'
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM observation_snapshots snapshot
-                              JOIN observation_capabilities capability
-                                USING(snapshot_id)
-                              WHERE snapshot.host_id = engine.host_id
-                                AND snapshot.status = 'completed'
-                                AND snapshot.completed_at IS NOT NULL
-                                AND capability.observer_domain
-                                    = snapshot.observer_domain
-                                AND capability.docker_available = 1
-                          )
-                          AND telemetry.sample_id = (
-                              SELECT newer.sample_id
-                              FROM telemetry_samples newer
-                              WHERE newer.host_resource_kind = 'docker'
-                                AND newer.host_resource_id
-                                    = observation.docker_resource_id
-                              ORDER BY newer.sampled_at DESC,
-                                       newer.sample_id DESC
-                              LIMIT 1
-                          )
-                        ORDER BY observation.docker_resource_id
-                        """
-                    )
-                }
+            current_docker_stats, project_docker_stats = _current_docker_stats(
+                connection,
+                latest_evidence=latest_docker_evidence,
+                active_resource_ids=active_docker_resource_ids,
             )
             compatibility_containers: list[dict[str, Any]] = []
             containers_by_resource: dict[str, dict[str, Any]] = {}
