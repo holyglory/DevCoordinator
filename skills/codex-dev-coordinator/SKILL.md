@@ -74,6 +74,12 @@ cleanup also fail closed.
 - Do not run package-manager servers, Docker/Compose, or local database stacks
   directly. Use a lower-level Coordinator command only when the runtime result
   identifies that repair and its `--help` confirms the authority.
+- For root-only `broker publish-image` apply/rollback, activate the shared
+  maintenance marker first and stop **only** `devcoordinator-broker.service`.
+  Keep `dev-coordinator.service` and `devops-console.service` running so every
+  Console and agent receives the bounded maintenance response. Always restart
+  the broker and clear the exact maintenance deployment ID in a `finally`
+  path. The command rejects mutation when either safeguard is absent.
 - Before destructive PostgreSQL-in-Docker work, invoke
   `postgres-docker-backup` against the verified immutable container ID.
 

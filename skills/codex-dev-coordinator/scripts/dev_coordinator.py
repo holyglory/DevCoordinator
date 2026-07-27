@@ -74,6 +74,10 @@ from devcoordinator.image_publication import (
     publication_status,
     rollback_publication,
 )
+from devcoordinator.maintenance import (
+    MaintenanceMarkerError,
+    load_maintenance_state,
+)
 from devcoordinator.broker_persistence import BrokerPersistence
 from devcoordinator.broker_links import BrokerLink, BrokerLinkStore
 from devcoordinator.broker_profile import (
@@ -12234,9 +12238,12 @@ def coordinated_broker_enroll(args: argparse.Namespace) -> dict[str, Any]:
 def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]:
     """Run the explicit root-only image publication lifecycle.
 
-    The broker process must be stopped for any mutation phase.  Holding its
-    lifetime lock prevents another coordinator lifecycle action from racing the
-    immutable snapshot, image tag, or sealed Compose recreation.
+    The broker process must be stopped for any mutation phase, but the loopback
+    API must remain available and maintenance mode must already be active.
+    Holding the broker lifetime lock prevents another coordinator lifecycle
+    action from racing the immutable snapshot, image tag, or sealed Compose
+    recreation without turning a planned maintenance window into an opaque
+    connection-refused outage for every Console and agent.
     """
 
     if os.geteuid() != 0:
@@ -12286,6 +12293,7 @@ def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]
         runtime_config=config,
         name=str(args.publication),
     )
+    _require_live_image_publication_maintenance_boundary()
     # The broker service itself holds this same lock during normal operation.
     # A failed acquisition is a deliberate stop condition, not an invitation to
     # issue an uncoordinated raw Docker command.
@@ -12314,6 +12322,45 @@ def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]
             previous_image_confirmation=str(args.confirm_previous_image_id),
             service_uid=0,
             broker_database_path=database_path,
+        )
+
+
+def _require_live_image_publication_maintenance_boundary() -> None:
+    """Fail closed unless offline publication preserves the public control plane."""
+
+    try:
+        access_gid = grp.getgrnam("devcoordinator-clients").gr_gid
+        maintenance = load_maintenance_state(
+            expected_uid=0,
+            expected_gid=access_gid,
+        )
+    except (KeyError, MaintenanceMarkerError, OSError, ValueError) as exc:
+        raise RuntimeError(
+            "image publication could not verify server-wide maintenance mode"
+        ) from exc
+    if maintenance is None:
+        raise RuntimeError(
+            "image publication apply/rollback requires active server-wide "
+            "maintenance mode before the broker is stopped"
+        )
+    try:
+        api_state = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "dev-coordinator.service"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            "image publication could not verify the loopback Coordinator API"
+        ) from exc
+    if api_state.returncode != 0:
+        raise RuntimeError(
+            "image publication requires dev-coordinator.service to remain active; "
+            "stop only devcoordinator-broker.service so Consoles and agents receive "
+            "the maintenance response instead of ECONNREFUSED"
         )
 
 

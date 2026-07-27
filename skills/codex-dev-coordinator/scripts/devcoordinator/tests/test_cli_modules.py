@@ -1864,6 +1864,73 @@ class LifecycleParserContractTests(unittest.TestCase):
 
 
 class BrokerCLIContractTests(unittest.TestCase):
+    def test_image_publication_requires_active_maintenance_marker(self) -> None:
+        with (
+            mock.patch.object(
+                dev_coordinator.grp,
+                "getgrnam",
+                return_value=mock.Mock(gr_gid=986),
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "load_maintenance_state",
+                return_value=None,
+            ),
+            mock.patch.object(dev_coordinator.subprocess, "run") as run,
+            self.assertRaisesRegex(RuntimeError, "requires active server-wide"),
+        ):
+            dev_coordinator._require_live_image_publication_maintenance_boundary()
+        run.assert_not_called()
+
+    def test_image_publication_keeps_loopback_api_available(self) -> None:
+        with (
+            mock.patch.object(
+                dev_coordinator.grp,
+                "getgrnam",
+                return_value=mock.Mock(gr_gid=986),
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "load_maintenance_state",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                dev_coordinator.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=3),
+            ) as run,
+            self.assertRaisesRegex(RuntimeError, "instead of ECONNREFUSED"),
+        ):
+            dev_coordinator._require_live_image_publication_maintenance_boundary()
+        run.assert_called_once_with(
+            ["systemctl", "is-active", "--quiet", "dev-coordinator.service"],
+            check=False,
+            stdin=dev_coordinator.subprocess.DEVNULL,
+            stdout=dev_coordinator.subprocess.DEVNULL,
+            stderr=dev_coordinator.subprocess.DEVNULL,
+            timeout=5.0,
+        )
+
+    def test_image_publication_accepts_preserved_control_plane(self) -> None:
+        with (
+            mock.patch.object(
+                dev_coordinator.grp,
+                "getgrnam",
+                return_value=mock.Mock(gr_gid=986),
+            ),
+            mock.patch.object(
+                dev_coordinator,
+                "load_maintenance_state",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                dev_coordinator.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=0),
+            ),
+        ):
+            dev_coordinator._require_live_image_publication_maintenance_boundary()
+
     def test_sigterm_fences_mutations_before_serve_loop_poll(self) -> None:
         events: list[str] = []
         handlers: dict[int, object] = {}
