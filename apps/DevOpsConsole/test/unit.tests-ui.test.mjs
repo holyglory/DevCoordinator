@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { promises as fsp } from 'node:fs';
 import test from 'node:test';
 
@@ -11,6 +12,14 @@ test('Tests destination leads with repository-scoped hourly timing and period dy
     fsp.readFile(new URL('app.css', UI), 'utf8'),
   ]);
   assert.match(html, /data-nav="tests">Tests/);
+  const assetVersion = createHash('sha256')
+    .update(css)
+    .update('\0')
+    .update(js)
+    .digest('hex')
+    .slice(0, 12);
+  assert.match(html, new RegExp(`/app\\.css\\?v=${assetVersion}`));
+  assert.match(html, new RegExp(`/app\\.js\\?v=${assetVersion}`));
   assert.match(html, /data-page="performance"[\s\S]*href="#\/tests">Test dashboards<\/a>/,
     'Performance must disclose where test-run dashboards live');
   assert.match(html, /data-page="tests"/);
