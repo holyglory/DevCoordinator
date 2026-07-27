@@ -93,8 +93,8 @@ def check_boundary(
         raise AuthBoundaryError("invalid coordinator port, timeout, or readiness wait")
     expected = {
         "anonymous_health": 200,
-        "anonymous_inventory": 401,
-        "authenticated_inventory": 200,
+        "anonymous_ready": 401,
+        "authenticated_ready": 200,
     }
     deadline = monotonic_fn() + wait_seconds
     attempts = 0
@@ -112,8 +112,8 @@ def check_boundary(
                 token = read_token(token_file)
             observed = {
                 "anonymous_health": probe("/healthz", None),
-                "anonymous_inventory": probe("/v1/inventory", None),
-                "authenticated_inventory": probe("/v1/inventory", token),
+                "anonymous_ready": probe("/v1/ready", None),
+                "authenticated_ready": probe("/v1/ready", token),
             }
         except AuthBoundaryError as error:
             # The coordinator creates a missing token atomically before it
@@ -144,10 +144,10 @@ def check_boundary(
             sleep_fn(min(poll_interval_seconds, remaining))
             continue
         if observed != expected:
-            authenticated_status = observed["authenticated_inventory"]
+            authenticated_status = observed["authenticated_ready"]
             anonymous_contract_ready = (
                 observed["anonymous_health"] == expected["anonymous_health"]
-                and observed["anonymous_inventory"] == expected["anonymous_inventory"]
+                and observed["anonymous_ready"] == expected["anonymous_ready"]
             )
             if (
                 anonymous_contract_ready
@@ -155,21 +155,21 @@ def check_boundary(
                 and 500 <= authenticated_status <= 599
             ):
                 # A reachable API can publish its health/auth middleware just
-                # before the authenticated inventory backend finishes opening.
+                # before its authenticated readiness handler finishes opening.
                 # Retry only that exact, fail-closed startup shape. Re-probing
                 # all three endpoints on the next attempt ensures an anonymous
                 # boundary regression is never hidden by readiness polling.
                 remaining = deadline - monotonic_fn()
                 if remaining <= 0:
                     raise AuthBoundaryError(
-                        "authenticated coordinator inventory did not become ready "
+                        "authenticated coordinator endpoint did not become ready "
                         "before the readiness deadline "
                         f"after {attempts} attempt(s); last status=HTTP {authenticated_status}"
                     )
                 sleep_fn(min(poll_interval_seconds, remaining))
                 if monotonic_fn() >= deadline:
                     raise AuthBoundaryError(
-                        "authenticated coordinator inventory did not become ready "
+                        "authenticated coordinator endpoint did not become ready "
                         "before the readiness deadline "
                         f"after {attempts} attempt(s); last status=HTTP {authenticated_status}"
                     )

@@ -19462,6 +19462,7 @@ def coordinated_lifecycle_restore(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 API_GET_ROUTES = frozenset(
     {
+        "/v1/ready",
         "/v1/inventory",
         "/v1/inventory/no-docker",
         "/v1/state",
@@ -19802,6 +19803,16 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 )
                 self._send_runtime_artifact(result)
                 return
+            elif path == "/v1/ready":
+                # Readiness proves the protected HTTP/authentication boundary
+                # without serializing the complete authority graph.  A large
+                # inventory is product data, not a prerequisite for keeping
+                # the control API alive.
+                result = {
+                    "ok": True,
+                    "service": "codex-dev-coordinator",
+                    "version": VERSION,
+                }
             elif path == "/v1/inventory":
                 result: Any = coordinated_build_inventory()
             elif path == "/v1/archives":

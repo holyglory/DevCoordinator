@@ -88,15 +88,15 @@ def main() -> int:
             calls.append((path, bearer))
             if path == "/healthz" and bearer is None:
                 return 200
-            if path == "/v1/inventory" and bearer is None:
+            if path == "/v1/ready" and bearer is None:
                 return 401
-            if path == "/v1/inventory" and bearer == "fixture-secret-token":
+            if path == "/v1/ready" and bearer == "fixture-secret-token":
                 return 200
             return 500
 
         observed = check_boundary(token_file=token_file, status_fn=healthy)
-        require(observed["anonymous_inventory"] == 401, "anonymous inventory was not proved closed")
-        require(calls[-1] == ("/v1/inventory", "fixture-secret-token"), "token was not server-side only")
+        require(observed["anonymous_ready"] == 401, "anonymous readiness was not proved closed")
+        require(calls[-1] == ("/v1/ready", "fixture-secret-token"), "token was not server-side only")
 
         # Reproduce the production Type=simple startup race: systemd reports
         # the unit active before the Python listener accepts its first
@@ -120,12 +120,12 @@ def main() -> int:
             monotonic_fn=lambda: clock[0],
             sleep_fn=lambda duration: clock.__setitem__(0, clock[0] + duration),
         )
-        require(delayed == {"anonymous_health": 200, "anonymous_inventory": 401, "authenticated_inventory": 200}, "delayed coordinator did not converge")
+        require(delayed == {"anonymous_health": 200, "anonymous_ready": 401, "authenticated_ready": 200}, "delayed coordinator did not converge")
         require(delayed_calls == 4, "startup refusal did not restart the full boundary probe")
 
         # The HTTP listener and authorization middleware can be ready before
-        # the authenticated inventory backend has finished opening its broker
-        # connection. Preserve the already-proved anonymous boundary while a
+        # the authenticated readiness backend has finished opening. Preserve
+        # the already-proved anonymous boundary while a
         # bounded authenticated 5xx converges, then require the complete
         # contract again on every attempt.
         warming_clock = [0.0]
@@ -136,9 +136,9 @@ def main() -> int:
             warming_calls.append((path, bearer))
             if path == "/healthz" and bearer is None:
                 return 200
-            if path == "/v1/inventory" and bearer is None:
+            if path == "/v1/ready" and bearer is None:
                 return 401
-            if path == "/v1/inventory" and bearer == "fixture-secret-token":
+            if path == "/v1/ready" and bearer == "fixture-secret-token":
                 return next(warming_statuses)
             return 418
 
@@ -151,8 +151,8 @@ def main() -> int:
             sleep_fn=lambda duration: warming_clock.__setitem__(0, warming_clock[0] + duration),
         )
         require(
-            warmed == {"anonymous_health": 200, "anonymous_inventory": 401, "authenticated_inventory": 200},
-            "authenticated inventory warmup did not converge",
+            warmed == {"anonymous_health": 200, "anonymous_ready": 401, "authenticated_ready": 200},
+            "authenticated readiness warmup did not converge",
         )
         require(len(warming_calls) == 9, "authenticated 5xx did not rerun the full boundary probe")
         require(warming_clock[0] == 0.2, "authenticated 5xx retry did not respect the poll interval")
@@ -167,7 +167,7 @@ def main() -> int:
             stalled_calls += 1
             if path == "/healthz" and bearer is None:
                 return 200
-            if path == "/v1/inventory" and bearer is None:
+            if path == "/v1/ready" and bearer is None:
                 return 401
             return 503
 
@@ -206,7 +206,7 @@ def main() -> int:
                 mismatch_calls += 1
                 if path == "/healthz" and bearer is None:
                     return 200
-                if path == "/v1/inventory" and bearer is None:
+                if path == "/v1/ready" and bearer is None:
                     return 401
                 return wrong_authenticated_status
 
@@ -240,7 +240,7 @@ def main() -> int:
             broken_anonymous_calls += 1
             if path == "/healthz" and bearer is None:
                 return 503
-            if path == "/v1/inventory" and bearer is None:
+            if path == "/v1/ready" and bearer is None:
                 return 401
             return 503
 
@@ -302,7 +302,7 @@ def main() -> int:
             real_result = run_checker(real_token, real_port, wait_seconds=5, request_timeout=4)
             require(real_result.returncode == 0, f"real delayed coordinator was rejected: {real_result.stderr}")
             require(time.monotonic() - started >= 0.2, "real delayed-bind fixture did not exercise startup absence")
-            require('"anonymous_inventory": 401' in real_result.stdout, "real CLI did not prove auth closure")
+            require('"anonymous_ready": 401' in real_result.stdout, "real CLI did not prove auth closure")
         finally:
             coordinator.terminate()
             try:
@@ -344,7 +344,7 @@ def main() -> int:
             wrong_server.shutdown()
             wrong_server.server_close()
             wrong_thread.join(timeout=2)
-        require(wrong_result.returncode == 1, "reachable anonymous inventory leak was accepted")
+        require(wrong_result.returncode == 1, "reachable anonymous readiness leak was accepted")
         require("boundary mismatch" in wrong_result.stderr, "wrong real boundary had the wrong failure")
         require(time.monotonic() - wrong_started < 1.5, "semantic boundary failure was retried")
 
@@ -411,7 +411,7 @@ def main() -> int:
             monotonic_fn=lambda: missing_clock[0],
             sleep_fn=publish_token,
         )
-        require(after_token_publish["authenticated_inventory"] == 200, "late token was not retried")
+        require(after_token_publish["authenticated_ready"] == 200, "late token was not retried")
 
         # A permanently unreachable listener must still fail closed at a
         # bounded deadline and must not leak the private bearer value.
@@ -473,7 +473,7 @@ def main() -> int:
         def anonymous_leak(_host: str, _port: int, _timeout: float, path: str, bearer: str | None) -> int:
             if path == "/healthz":
                 return 200
-            if path == "/v1/inventory" and bearer is None:
+            if path == "/v1/ready" and bearer is None:
                 return 200
             return 200
         try:

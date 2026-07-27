@@ -1347,6 +1347,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
         self.assertEqual(
             set(dev_coordinator.API_GET_ROUTES),
             {
+                "/v1/ready",
                 "/v1/inventory",
                 "/v1/inventory/no-docker",
                 "/v1/state",
