@@ -48,6 +48,11 @@ and a clean supervised exit so `Restart=always` reloads it; malformed state
 fails startup without exposing profile contents. Installer-detected profile/
 database drift blocks broker restart until exact offline reconciliation passes.
 
+Offline upgrades publish `/run/devcoordinator-maintenance/maintenance.json` before
+quiescing the broker. Clients check this broker-independent path before
+socket access and receive a typed wait/retry response; malformed state fails closed.
+One foreground rollback transaction clears its ID only after readiness or verified rollback.
+
 ## Temporary containers and tests
 
 Server-wide ephemeral containers come only from administrator-sealed,

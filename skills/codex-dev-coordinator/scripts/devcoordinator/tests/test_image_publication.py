@@ -180,7 +180,8 @@ class ImagePublicationTests(unittest.TestCase):
         self.assertIn("--file", command)
         self.assertIn("--tag", command)
         self.assertIn("io.devcoordinator.source-fingerprint=" + "a" * 64, command)
-        self.assertNotIn("--build-arg", command)
+        self.assertIn("--build-arg", command)
+        self.assertIn("DEVCOORDINATOR_SOURCE_FINGERPRINT=" + "a" * 64, command)
         self.assertNotIn("--network", command)
 
     def test_compose_capture_rejects_input_drift_before_returning_material(self) -> None:

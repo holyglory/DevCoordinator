@@ -1588,10 +1588,11 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
                 "bounded host observation deadline expired before PostgreSQL discovery"
             )
             self._observe(store, host_id, [timed_out])
+            graph = store.inventory_v2()
             with store.read_transaction() as connection:
                 latest = connection.execute(
                     """
-                    SELECT available, error_code, error_message
+                    SELECT database_binding_id, available, error_code, error_message
                     FROM database_observations o
                     JOIN database_bindings b USING(database_binding_id)
                     WHERE b.database_name = 'app'
@@ -1601,6 +1602,89 @@ class NormalizedDockerGroupingTests(unittest.TestCase):
         self.assertEqual(latest["available"], 0)
         self.assertEqual(latest["error_code"], "database_discovery_failed")
         self.assertIn("deadline", latest["error_message"])
+        binding_id = str(latest["database_binding_id"])
+        self.assertIn(
+            binding_id,
+            {
+                item["database_binding_id"]
+                for item in graph["resources"]["databases"]
+            },
+            "an observer failure is unknown presence, not positive absence",
+        )
+        self.assertIn(
+            binding_id,
+            {
+                value
+                for tree in graph["repository_trees"]
+                for scope in tree["scopes"]
+                for value in scope["database_binding_ids"]
+            },
+        )
+
+    def test_positive_database_absence_is_history_not_a_current_tree_resource(
+        self,
+    ) -> None:
+        repository = self.root / "database-absence-owner"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+        full_id = "e" * 64
+        with AccountStore.open_default(self.home) as store:
+            host_id = store.ensure_local_host()
+            self._insert_repository(store, host_id, repository)
+            present = self._container(full_id, "database-absence", project=repository)
+            present["databases"] = [{"name": "removed_app", "size_bytes": 2048}]
+            self._observe(store, host_id, [present])
+            with store.read_transaction() as connection:
+                binding_id = str(
+                    connection.execute(
+                        """
+                        SELECT database_binding_id FROM database_bindings
+                        WHERE database_name = 'removed_app'
+                        """
+                    ).fetchone()[0]
+                )
+
+            absent = self._container(full_id, "database-absence", project=repository)
+            absent["databases"] = []
+            self._observe(store, host_id, [absent])
+            graph = store.inventory_v2()
+            with store.read_transaction() as connection:
+                durable = connection.execute(
+                    """
+                    SELECT available, error_code FROM database_observations
+                    WHERE database_binding_id = ?
+                    """,
+                    (binding_id,),
+                ).fetchone()
+
+        self.assertEqual(
+            (durable["available"], durable["error_code"]),
+            (0, "database_absent"),
+        )
+        self.assertNotIn(
+            binding_id,
+            {
+                item["database_binding_id"]
+                for item in graph["resources"]["databases"]
+            },
+        )
+        self.assertNotIn(
+            binding_id,
+            {
+                item["database_binding_id"]
+                for item in graph["observations"]["databases"]
+            },
+        )
+        self.assertNotIn(
+            binding_id,
+            {
+                value
+                for tree in graph["repository_trees"]
+                for scope in tree["scopes"]
+                for value in scope["database_binding_ids"]
+            },
+            "positive absence stays durable history without becoming a current project resource",
+        )
 
     def test_nested_git_worktree_is_not_collapsed_into_enrolled_outer_repository(self) -> None:
         outer = self.root / "outer"

@@ -2140,6 +2140,8 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, str(ROOT / "scripts" / "self_test_legacy_console_rollback_ready.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_legacy_console_rollback_ready.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_loaded_systemd_paths.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_deploy_server_wide_maintenance.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_deploy_server_wide_maintenance.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_server_wide_install.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_broker_shutdown_unit.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_broker_shutdown_unit.py")])

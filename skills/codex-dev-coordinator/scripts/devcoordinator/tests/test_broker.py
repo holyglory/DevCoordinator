@@ -4514,6 +4514,15 @@ class StoreBackedBrokerTests(unittest.TestCase):
             released = service.reply_for_document(peer_for(), release.to_wire())
             self.assertTrue(released["ok"], released)
             self.assertEqual(released["result"]["status"], "released")
+            repeated_release = service.reply_for_document(
+                peer_for(),
+                request_for(
+                    BrokerOperation.PORT_RELEASE,
+                    resource_id=leases[0]["lease_id"],
+                ).to_wire(),
+            )
+            self.assertTrue(repeated_release["ok"], repeated_release)
+            self.assertEqual(repeated_release["result"], released["result"])
             with CoordinatorStore.open(
                 persistence.database_path, expected_uid=os.geteuid()
             ) as store:

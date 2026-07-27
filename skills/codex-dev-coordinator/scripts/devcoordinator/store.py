@@ -362,12 +362,23 @@ def _repository_trees_projection(
     *,
     repositories: list[dict[str, Any]],
     project_usage: list[dict[str, Any]],
+    current_server_resource_ids: frozenset[str],
     current_database_binding_ids: frozenset[str],
 ) -> list[dict[str, Any]]:
     """Build the authoritative primary/temporary repository hierarchy."""
 
     repositories_by_id = {str(item["repo_id"]): item for item in repositories}
     usage_by_root = {str(item["project"]): item for item in project_usage}
+    servers_by_repo: dict[str, list[str]] = {}
+    for row in connection.execute(
+        """
+        SELECT repo_id, server_definition_id FROM server_definitions
+        ORDER BY repo_id, server_definition_id
+        """
+    ):
+        server_id = str(row["server_definition_id"])
+        if server_id in current_server_resource_ids:
+            servers_by_repo.setdefault(str(row["repo_id"]), []).append(server_id)
     databases_by_repo: dict[str, list[str]] = {}
     for row in connection.execute(
         """
@@ -441,7 +452,12 @@ def _repository_trees_projection(
                     None if session is None else bool(session["kill_after_run"])
                 ),
                 "usage": usage,
-                "server_ids": list(projected_usage.get("server_ids") or []),
+                # The normalized repository tree classifies every current
+                # definition exactly once. Compatibility project usage stays
+                # lifecycle-only, so this must not be derived from its
+                # server_ids or control-only definitions disappear from the
+                # authoritative graph and make the contract contradictory.
+                "server_ids": servers_by_repo.get(str(row["repo_id"]), []),
                 "container_resource_ids": list(
                     projected_usage.get("container_resource_ids") or []
                 ),
@@ -1769,11 +1785,21 @@ class AccountStore(CoordinatorStore):
                 str(row["database_binding_id"])
                 for row in connection.execute(
                     """
-                    SELECT database_binding_id, docker_resource_id
-                    FROM database_bindings ORDER BY database_binding_id
+                    SELECT b.database_binding_id, b.docker_resource_id,
+                           o.available, o.error_code
+                    FROM database_bindings b
+                    LEFT JOIN database_observations o USING(database_binding_id)
+                    ORDER BY b.database_binding_id
                     """
                 )
                 if str(row["docker_resource_id"]) in active_docker_resource_ids
+                # A completed catalog observation that proves a named database
+                # absent makes that binding history. Observer failure remains
+                # unknown presence and must retain the last current binding.
+                and not (
+                    row["available"] == 0
+                    and str(row["error_code"] or "") == "database_absent"
+                )
                 and ("database_stack", str(row["database_binding_id"]))
                 not in removed_runtime_resources
             )
@@ -3190,6 +3216,8 @@ class AccountStore(CoordinatorStore):
                     """
                 )
                 if str(row["docker_resource_id"]) in visible_docker_ids
+                and str(row["database_binding_id"])
+                in current_database_binding_ids
             ]
             leases = [
                 dict(row)
@@ -3295,6 +3323,7 @@ class AccountStore(CoordinatorStore):
                 connection,
                 repositories=repositories,
                 project_usage=compatibility_usage,
+                current_server_resource_ids=current_server_resource_ids,
                 current_database_binding_ids=current_database_binding_ids,
             )
             graph = {

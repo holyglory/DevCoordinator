@@ -856,6 +856,8 @@ def build_command_for(
         f"io.devcoordinator.source-fingerprint={source_fingerprint}",
         "--label",
         f"io.devcoordinator.input-fingerprint={input_fingerprint}",
+        "--build-arg",
+        f"DEVCOORDINATOR_SOURCE_FINGERPRINT={source_fingerprint}",
         "--file",
         str(dockerfile),
         "--tag",

@@ -38,6 +38,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, FrozenSet, Iterable, Mapping, Optional, Protocol
 
+from .maintenance import (
+    MAINTENANCE_ROOT,
+    MaintenanceMarkerError,
+    load_maintenance_state,
+)
+
 PROTOCOL_VERSION = 1
 # Inventory is a bounded whole-host graph.  Keep the local protocol bounded,
 # but size it for a real multi-repository machine rather than a mutation-sized
@@ -45,6 +51,7 @@ PROTOCOL_VERSION = 1
 DEFAULT_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_SOCKET_MODE = 0o660
+SYSTEM_BROKER_SOCKET_PATH = Path("/run/devcoordinator/broker.sock")
 DEFAULT_MAX_CLIENTS = 32
 DEFAULT_COMPLETED_OPERATION_CACHE = 1024
 # POSIX guarantees an atomic pipe write of at least 512 bytes.  Keeping this
@@ -153,11 +160,13 @@ class BrokerError(RuntimeError):
         message: str,
         *,
         operation_id: Optional[str] = None,
+        retry_after_seconds: Optional[int] = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.operation_id = operation_id
+        self.retry_after_seconds = retry_after_seconds
 
 
 class BrokerBackendError(BrokerError):
@@ -1625,6 +1634,7 @@ class BrokerClient:
         expected_socket_mode: int = DEFAULT_SOCKET_MODE,
         timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        maintenance_root: Optional[Path] = None,
     ) -> None:
         self.socket_path = Path(socket_path)
         if not _is_exact_int(expected_broker_uid) or expected_broker_uid < 0:
@@ -1648,6 +1658,40 @@ class BrokerClient:
             raise ValueError("max_message_bytes must be positive")
         self._timeout_seconds = timeout_seconds
         self._max_message_bytes = max_message_bytes
+        self._maintenance_root = (
+            MAINTENANCE_ROOT
+            if maintenance_root is None
+            and self.socket_path == SYSTEM_BROKER_SOCKET_PATH
+            else (None if maintenance_root is None else Path(maintenance_root))
+        )
+
+    def _require_available(self, *, operation_id: str) -> None:
+        if self._maintenance_root is None:
+            return
+        try:
+            maintenance = load_maintenance_state(
+                expected_uid=self._expected_broker_uid,
+                expected_gid=(
+                    self._expected_broker_uid
+                    if self._expected_socket_gid is None
+                    else self._expected_socket_gid
+                ),
+                maintenance_root=self._maintenance_root,
+            )
+        except MaintenanceMarkerError as error:
+            raise BrokerError(
+                "maintenance_state_invalid",
+                "Coordinator maintenance state cannot be verified; wait for the administrator before retrying.",
+                operation_id=operation_id,
+                retry_after_seconds=60,
+            ) from error
+        if maintenance is not None:
+            raise BrokerError(
+                "maintenance_in_progress",
+                maintenance.message,
+                operation_id=operation_id,
+                retry_after_seconds=maintenance.retry_after_seconds,
+            )
 
     def call(self, request: BrokerRequest) -> dict[str, Any]:
         if not isinstance(request, BrokerRequest):
@@ -1657,6 +1701,7 @@ class BrokerClient:
                 "ephemeral.secret_fd requires retrieve_ephemeral_secret_fd(); "
                 "ordinary JSON broker calls never receive credential material"
             )
+        self._require_available(operation_id=request.operation_id)
         payload = _encode_json_document(request.to_wire())
         with self._authenticated_connection(request) as connection:
             try:
@@ -1699,6 +1744,7 @@ class BrokerClient:
             raise TypeError("request must be BrokerRequest")
         if request.operation is not BrokerOperation.EPHEMERAL_SECRET_FD:
             raise TypeError("request must use ephemeral.secret_fd")
+        self._require_available(operation_id=request.operation_id)
         if not _descriptor_transport_available():
             raise BrokerError(
                 "secret_fd_transport_unavailable",

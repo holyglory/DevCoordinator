@@ -100,6 +100,16 @@ broker/Public Console; malformed replacements fail the supervised startup
 gate. Authorization/schema drift must be repaired offline through the
 installer's documented plan/verify workflow before restarting the broker.
 
+During an administrator-owned offline upgrade, every new client call first
+checks the protected broker-independent maintenance marker. A trusted active
+marker returns classification `maintenance`, code `maintenance_in_progress`,
+and a bounded retry interval before any socket connection. Invalid marker
+identity, mode, or content fails closed as `maintenance_state_invalid`. Wait
+and retry through this skill; never bypass the fence with direct state, Docker,
+database, process, or socket access. The marker remains available when systemd
+removes the broker's separate runtime directory and only its deployment owner
+may clear it after service and registration verification or healthy rollback.
+
 Inventory is a pure read. Runtime performs any required bounded observation
 before action and returns committed evidence. Board and Console consume
 Python-produced `repository_trees`; they never infer grouping.

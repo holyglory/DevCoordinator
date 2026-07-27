@@ -1773,6 +1773,21 @@ class LifecycleParserContractTests(unittest.TestCase):
         )
         self.assertIn("Coordinator skill", error["action_required"])
 
+    def test_maintenance_error_returns_typed_wait_and_retry_response(self) -> None:
+        payload = dev_coordinator.coordinator_exception_payload(
+            dev_coordinator.BrokerError(
+                "maintenance_in_progress",
+                "Coordinator upgrade in progress; please wait.",
+                operation_id="4c6507a0-7f32-4cfd-bf5c-a196322687b3",
+                retry_after_seconds=30,
+            )
+        )
+
+        self.assertEqual(payload["classification"], "maintenance")
+        self.assertEqual(payload["code"], "maintenance_in_progress")
+        self.assertEqual(payload["retry_after_seconds"], 30)
+        self.assertIn("Wait", payload["action_required"])
+
     def test_source_fingerprint_health_check_matches_build_algorithm_and_detects_stale_runtime(
         self,
     ) -> None:
