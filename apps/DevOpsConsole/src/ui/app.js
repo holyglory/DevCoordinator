@@ -2702,7 +2702,7 @@
 
   let fetching = false;
   let refetchQueued = false;
-  let inventoryWarmupRetries = 0;
+  let inventoryWarmupStartedAt = null;
 
   async function refreshOverview({ force = false, fresh = false } = {}) {
     if (fetching) { refetchQueued = true; return; }
@@ -2714,12 +2714,17 @@
       state.lastFetch = Date.now();
       clearBanner('overview');
       renderAll(force);
-      if (data.coordinator?.inventoryState === 'loading' && !data.inventory
-          && inventoryWarmupRetries < 4) {
-        inventoryWarmupRetries += 1;
-        setTimeout(() => refreshOverview(), 120);
+      if (data.coordinator?.inventoryState === 'loading' && !data.inventory) {
+        inventoryWarmupStartedAt ??= Date.now();
+        if (Date.now() - inventoryWarmupStartedAt < 15_000) {
+          // The API deliberately returns the first cold response inside its
+          // first-byte budget while one coalesced inventory read warms the
+          // server cache.  Follow that read until it resolves instead of
+          // abandoning the loading screen after four sub-second retries.
+          setTimeout(() => refreshOverview(), 200);
+        }
       } else if (data.coordinator?.inventoryState !== 'loading') {
-        inventoryWarmupRetries = 0;
+        inventoryWarmupStartedAt = null;
       }
       if (currentPage() === 'tests') loadTests();
       if (state.session?.accessAdmin === true && state.access && accessRoutesSig !== currentAccessRoutesSig()) {

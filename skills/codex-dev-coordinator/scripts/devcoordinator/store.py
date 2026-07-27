@@ -2321,10 +2321,39 @@ class AccountStore(CoordinatorStore):
                         in current_database_binding_ids
                     )
                 ],
+                # Inventory is a current-state projection, not the durable
+                # observation audit log.  Publishing every historical
+                # snapshot made the host inventory grow without bound (and
+                # forced every Console poll to serialize tens of thousands
+                # of rows).  Keep the newest snapshot plus the newest
+                # completed snapshot for each observer domain.  That retains
+                # an in-flight/failure state and the last usable completed
+                # evidence without duplicating history that remains durable
+                # in SQLite.
                 "snapshots": [
-                    dict(row)
+                    {
+                        key: value
+                        for key, value in dict(row).items()
+                        if key not in {"latest_ordinal", "status_ordinal"}
+                    }
                     for row in connection.execute(
-                        "SELECT * FROM observation_snapshots ORDER BY started_at DESC"
+                        """
+                        SELECT * FROM (
+                            SELECT s.*,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY host_id, observer_domain
+                                       ORDER BY started_at DESC, snapshot_id DESC
+                                   ) AS latest_ordinal,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY host_id, observer_domain, status
+                                       ORDER BY started_at DESC, snapshot_id DESC
+                                   ) AS status_ordinal
+                            FROM observation_snapshots s
+                        )
+                        WHERE latest_ordinal = 1
+                           OR (status = 'completed' AND status_ordinal = 1)
+                        ORDER BY started_at DESC, snapshot_id DESC
+                        """
                     )
                 ],
             }

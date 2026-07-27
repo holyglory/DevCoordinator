@@ -198,6 +198,92 @@ test('overview inventory obeys its cold first-byte budget and reuses the complet
   assert.equal(inventoryRequests, 1, 'the timed-out caller must leave one cache-warming refresh running');
 });
 
+test('overview inventory excludes audit history after deriving the current Console view', async (t) => {
+  const compatibility = {
+    coordinator_home: '/fixture/coordinator',
+    state_path: '/fixture/coordinator/coordinator.sqlite3',
+    project: null,
+    urls: [],
+    servers: [],
+    leases: [],
+    port_assignments: [],
+    recent_events: [],
+    docker: { available: true, containers: [], postgres: [] },
+    postgres: [],
+    backups: [],
+    project_usage: [],
+  };
+  const payload = {
+    schema_version: 2,
+    store: { state_revision: 7, observation_revision: 11 },
+    repositories: [],
+    repository_trees: [],
+    memberships: [],
+    resources: { servers: [], docker: [], docker_ports: [], databases: [] },
+    unassigned_resources: [],
+    lifecycle_violations: [],
+    docker_engines: [{ engine_id: 'engine-a' }],
+    events: [{ event_id: 'audit-event' }],
+    database_backups: [{ database_backup_id: 'audit-backup' }],
+    observations: {
+      servers: [],
+      docker: [],
+      databases: [],
+      snapshots: [{ snapshot_id: 'historical-snapshot' }],
+      telemetry: [{ sample_id: 'historical-sample' }],
+    },
+    v1_compatibility: compatibility,
+  };
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/inventory') return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(payload));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  const result = await client.inventoryForOverview({ maxAgeMs: 0, maxWaitMs: 100 });
+
+  assert.equal(result.state, 'fresh');
+  assert.deepEqual(result.inventory.repository_trees, []);
+  assert.deepEqual(result.inventory.resources, payload.resources);
+  assert.deepEqual(result.inventory.docker, compatibility.docker);
+  assert.deepEqual(Object.keys(result.inventory.observations).sort(), [
+    'databases', 'docker', 'servers',
+  ]);
+  assert.equal(Object.hasOwn(result.inventory, 'events'), false);
+  assert.equal(Object.hasOwn(result.inventory, 'database_backups'), false);
+  assert.equal(Object.hasOwn(result.inventory, 'docker_engines'), false);
+  assert.equal(Object.hasOwn(result.inventory, 'v1_compatibility'), false);
+});
+
+test('a malformed warmed inventory becomes an overview error instead of an endless loading state', async (t) => {
+  let requests = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/inventory') return false;
+    requests += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      schema_version: 2,
+      repositories: [],
+      repository_trees: [],
+      v1_compatibility: { servers: [] },
+    }));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  const first = await client.inventoryForOverview({ maxAgeMs: 60_000, maxWaitMs: 100 });
+  const cached = await client.inventoryForOverview({ maxAgeMs: 60_000, maxWaitMs: 10 });
+
+  for (const result of [first, cached]) {
+    assert.equal(result.state, 'error');
+    assert.equal(result.inventory, null);
+    assert.match(result.error.message, /compatibility projection is incomplete/);
+  }
+  assert.equal(requests, 1);
+});
+
 test('event pages preserve opaque cursors and explicit host observation identity', async (t) => {
   const page = {
     schema_version: 1,

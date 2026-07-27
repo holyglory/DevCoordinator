@@ -300,6 +300,35 @@ function consoleInventoryView(value, trustedObservations = new Map()) {
   return projected;
 }
 
+// The Coordinator's normalized inventory also contains durable audit and
+// historical observation evidence.  The browser needs the authoritative
+// repository/resource graph and the compatibility read model, but it must not
+// receive the entire audit graph on every six-second overview poll.  Docker
+// telemetry is projected above before the historical-only fields are removed.
+function consoleOverviewInventoryView(value, trustedObservations = new Map()) {
+  const projected = consoleInventoryView(value, trustedObservations);
+  if (!projected || projected.schema_version !== 2) return projected;
+  const observations = projected.observations;
+  return {
+    schema_version: projected.schema_version,
+    store: projected.store,
+    repositories: projected.repositories,
+    repository_trees: projected.repository_trees,
+    memberships: projected.memberships,
+    resources: projected.resources,
+    unassigned_resources: projected.unassigned_resources,
+    lifecycle_violations: projected.lifecycle_violations,
+    observations: observations && typeof observations === 'object'
+      ? {
+          servers: observations.servers,
+          docker: observations.docker,
+          databases: observations.databases,
+        }
+      : observations,
+    ...Object.fromEntries(CONSOLE_INVENTORY_KEYS.map((key) => [key, projected[key]])),
+  };
+}
+
 export function createCoordinator({ config, log }) {
   const clog = typeof log?.child === 'function' ? log.child({ mod: 'coordinator' }) : log;
   const baseUrl = String(config.coordinatorUrl).replace(/\/+$/, '');
@@ -739,11 +768,17 @@ export function createCoordinator({ config, log }) {
   } = {}) {
     const now = Date.now();
     const ageMs = invCache.value === undefined ? null : Math.max(0, now - invCache.at);
-    const project = (value) => consoleInventoryView(value, trustedDockerObservations);
+    const project = (value) => consoleOverviewInventoryView(value, trustedDockerObservations);
     if (invCache.value !== undefined && ageMs <= maxAgeMs) {
-      return {
-        inventory: project(invCache.value), state: 'fresh', ageMs, refreshing: false, error: null,
-      };
+      try {
+        return {
+          inventory: project(invCache.value), state: 'fresh', ageMs, refreshing: false, error: null,
+        };
+      } catch (error) {
+        return {
+          inventory: null, state: 'error', ageMs, refreshing: false, error,
+        };
+      }
     }
 
     const refresh = cachedGet(invCache, '/v1/inventory', maxAgeMs)
@@ -753,9 +788,15 @@ export function createCoordinator({ config, log }) {
       // Observe rejection inside `refresh` even though the caller gets the
       // retained snapshot immediately.
       void refresh;
-      return {
-        inventory: project(invCache.value), state: 'stale', ageMs, refreshing: true, error: null,
-      };
+      try {
+        return {
+          inventory: project(invCache.value), state: 'stale', ageMs, refreshing: true, error: null,
+        };
+      } catch (error) {
+        return {
+          inventory: null, state: 'error', ageMs, refreshing: true, error,
+        };
+      }
     }
 
     const pending = Symbol('inventory-overview-pending');

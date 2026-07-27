@@ -85,6 +85,71 @@ class RuntimeApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_inventory_keeps_only_current_observation_snapshot_evidence(self) -> None:
+        with AccountStore.open_default(
+            self.home, effective_uid=os.geteuid()
+        ) as store:
+            host_id = store.ensure_local_host()
+            with store.immediate_transaction(revision_kind="observation") as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO observation_snapshots(
+                        snapshot_id, host_id, observer_domain, status,
+                        started_at, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            "domain-a-old-completed",
+                            host_id,
+                            "observer:domain-a",
+                            "completed",
+                            "2026-01-01T00:00:00Z",
+                            "2026-01-01T00:00:01Z",
+                        ),
+                        (
+                            "domain-a-current-completed",
+                            host_id,
+                            "observer:domain-a",
+                            "completed",
+                            "2026-01-02T00:00:00Z",
+                            "2026-01-02T00:00:01Z",
+                        ),
+                        (
+                            "domain-a-running",
+                            host_id,
+                            "observer:domain-a",
+                            "running",
+                            "2026-01-03T00:00:00Z",
+                            None,
+                        ),
+                        (
+                            "domain-b-current-completed",
+                            host_id,
+                            "observer:domain-b",
+                            "completed",
+                            "2026-01-04T00:00:00Z",
+                            "2026-01-04T00:00:01Z",
+                        ),
+                    ],
+                )
+            snapshots = store.inventory_v2()["observations"]["snapshots"]
+
+        self.assertEqual(
+            {row["snapshot_id"] for row in snapshots},
+            {
+                "domain-a-current-completed",
+                "domain-a-running",
+                "domain-b-current-completed",
+            },
+        )
+        self.assertTrue(
+            all(
+                "latest_ordinal" not in row and "status_ordinal" not in row
+                for row in snapshots
+            )
+        )
+
     def request(self, **changes: object) -> dict[str, object]:
         value: dict[str, object] = {
             "schema_version": 1,

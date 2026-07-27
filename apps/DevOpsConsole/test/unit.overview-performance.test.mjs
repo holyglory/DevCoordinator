@@ -150,8 +150,8 @@ test('browser boot renders Performance metrics independently of a slow overview'
     /await refreshOverview\(\{ force: true \}\);\s*await refreshMetrics\(\);/,
     'a slow overview must not block the first meaningful Performance paint');
   assert.match(source,
-    /inventoryState === 'loading'[\s\S]{0,260}inventoryWarmupRetries < 4[\s\S]{0,260}setTimeout/,
-    'a bounded cold response must trigger a few quick cache follow-ups instead of waiting for the polling interval');
+    /inventoryWarmupStartedAt \?\?= Date\.now\(\);[\s\S]{0,120}Date\.now\(\) - inventoryWarmupStartedAt < 15_000[\s\S]{0,500}setTimeout/,
+    'a bounded cold response must follow the coalesced cache warm-up instead of abandoning the loading screen');
   assert.match(source,
     /function degradedPanel\(o\)[\s\S]{0,180}inventoryState === 'loading'/,
     'a bounded cold read must render as loading rather than falsely claiming the Coordinator is unreachable');
