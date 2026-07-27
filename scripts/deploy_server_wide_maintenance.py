@@ -20,6 +20,7 @@ import sys
 import time
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -420,8 +421,15 @@ class Driver:
         token = payload.decode("utf-8").strip()
         if not token:
             raise DeploymentError("Coordinator API token is empty")
+        query = urllib.parse.urlencode(
+            {
+                "project": str(self.repository),
+                "name": "devops-console",
+                "port": "443",
+            }
+        )
         request = urllib.request.Request(
-            "http://127.0.0.1:29876/v1/inventory/no-docker",
+            f"http://127.0.0.1:29876/v1/inventory/no-docker?{query}",
             headers={"Authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(request, timeout=20) as response:

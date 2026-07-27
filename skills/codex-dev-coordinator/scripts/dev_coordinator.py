@@ -11054,7 +11054,13 @@ def coordinated_build_registration_inventory(
             include_docker=False,
         )
 
-    result = pure_normalized_inventory(include_docker=False)
+    # A broker-backed service must request only the target repository here.
+    # Fetching the complete server-wide graph defeats this endpoint's bounded
+    # readiness contract before the exact target projection is applied.
+    result = pure_normalized_inventory(
+        project=resolved_project,
+        include_docker=False,
+    )
     source_compatibility = result["v1_compatibility"]
     target_key = f"{resolved_project}::{target_name}"
     relevant_servers = [

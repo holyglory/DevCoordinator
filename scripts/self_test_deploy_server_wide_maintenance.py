@@ -192,6 +192,7 @@ def main() -> int:
         driver = object.__new__(MODULE.Driver)
         driver.token_file = token_file
         driver.transaction = root
+        driver.repository = Path("/home/DevCoordinator")
         padding = "x" * (8 * 1024 * 1024)
         response_payload = json.dumps({"padding": padding}).encode("utf-8")
         previous_urlopen = MODULE.urllib.request.urlopen
@@ -242,6 +243,12 @@ def main() -> int:
         '"/usr/sbin/runuser",\n                "--user",\n                "holyglory"'
         in source,
         "root deployment still runs private auth evidence as the wrong user",
+    )
+    expect(
+        '"project": str(self.repository)' in source
+        and '"name": "devops-console"' in source
+        and '"port": "443"' in source,
+        "deployment evidence still requests the complete server-wide inventory",
     )
     deploy_source = inspect.getsource(MODULE.Driver.deploy)
     expect(
