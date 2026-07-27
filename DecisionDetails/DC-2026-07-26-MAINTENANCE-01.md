@@ -60,6 +60,13 @@ slow multi-gigabyte copy window. The marker does not claim that unsupported
 runtime, database cancellation, or replay combinations are implemented; those
 remain fail-closed Completion Ledger work.
 
+Subsequent code-only releases reuse the same transaction with an explicit
+same-schema mode. That mode requires the checked-out target to equal `main`,
+requires a distinct ancestor as rollback source, proves schema 12 before and
+after the writer-free checkpoint, skips the one-time migration, and retains
+the same backups, installer verification, service readiness, public checks,
+maintenance recovery, and source rollback behavior.
+
 Console listener adoption first reconciles any saved active client link. The
 broker permits a repeated release only after the normal peer, account,
 repository, resource, and lease authorization succeeds, and returns the exact

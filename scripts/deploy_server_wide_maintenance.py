@@ -81,6 +81,8 @@ def _json_write(path: Path, document: dict[str, Any]) -> None:
 class Driver:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.schema_before = SCHEMA_AFTER if args.same_schema_release else SCHEMA_BEFORE
+        self.schema_after = SCHEMA_AFTER
         self.repository = Path(args.repository).resolve(strict=True)
         self.transaction = Path(args.transaction_dir)
         self.token_file = Path(args.token_file)
@@ -160,7 +162,12 @@ class Driver:
             )
         return completed
 
-    def git(self, *arguments: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
+    def git(
+        self,
+        *arguments: str,
+        timeout: float = 120,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         return self.run(
             [
                 "/usr/bin/git",
@@ -171,6 +178,7 @@ class Driver:
                 *arguments,
             ],
             timeout=timeout,
+            check=check,
         )
 
     def _schema_evidence(self, database: Path, *, expected: int) -> dict[str, Any]:
@@ -363,7 +371,7 @@ class Driver:
         return document
 
     def online_backup(self) -> Path:
-        root = self.transaction / "online-schema-9-backup"
+        root = self.transaction / f"online-schema-{self.schema_before}-backup"
         root.mkdir(mode=0o700)
         completed = self.run(
             [
@@ -404,12 +412,14 @@ class Driver:
             or stat.S_IMODE(manifest_metadata.st_mode) != 0o600
             or document.get("type") != "devcoordinator-sqlite-backup"
             or document.get("store_role") != "service"
-            or document.get("schema_version") != SCHEMA_BEFORE
+            or document.get("schema_version") != self.schema_before
             or document.get("verification", {}).get("status") != "verified"
             or document.get("artifact_sha256") != digest
             or document.get("artifact_size_bytes") != artifact.stat().st_size
         ):
-            raise DeploymentError("online schema-9 backup manifest verification failed")
+            raise DeploymentError(
+                f"online schema-{self.schema_before} backup manifest verification failed"
+            )
         return manifest
 
     def capture_units(self) -> None:
@@ -808,10 +818,13 @@ class Driver:
                 "renormalize compatible Console state",
                 self.normalize_console_private_state,
             )
-            attempt("verify rollback schema", lambda: self.schema_evidence(expected=SCHEMA_BEFORE))
+            attempt(
+                "verify rollback schema",
+                lambda: self.schema_evidence(expected=self.schema_before),
+            )
             attempt(
                 "verify rollback client schema",
-                lambda: self.client_schema_evidence(expected=SCHEMA_BEFORE),
+                lambda: self.client_schema_evidence(expected=self.schema_before),
             )
         if not failures and self.marker_active:
             attempt(
@@ -849,16 +862,30 @@ class Driver:
         target = self.git("rev-parse", self.args.target_commit).stdout.strip()
         main = self.git("rev-parse", "main").stdout.strip()
         rollback = self.git("rev-parse", self.args.rollback_ref).stdout.strip()
-        if current != rollback or target != main or target != self.args.target_commit:
+        if target != main or target != self.args.target_commit:
+            raise DeploymentError("target ref does not match the approved exact main commit")
+        if self.args.same_schema_release:
+            if current != target:
+                raise DeploymentError(
+                    "same-schema release must start from the approved target checkout"
+                )
+            ancestor = self.git(
+                "merge-base", "--is-ancestor", rollback, target, check=False
+            )
+            if ancestor.returncode != 0 or rollback == target:
+                raise DeploymentError(
+                    "same-schema rollback ref must be a distinct ancestor of target"
+                )
+        elif current != rollback:
             raise DeploymentError(
-                "checkout/target/rollback refs do not match the approved exact commits"
+                "migration checkout does not match the approved rollback commit"
             )
         pre_units = {
             unit: self.require_active(unit)
             for unit in (BROKER_UNIT, API_UNIT, CONSOLE_UNIT)
         }
-        pre_schema = self.schema_evidence(expected=SCHEMA_BEFORE)
-        pre_client_schema = self.client_schema_evidence(expected=SCHEMA_BEFORE)
+        pre_schema = self.schema_evidence(expected=self.schema_before)
+        pre_client_schema = self.client_schema_evidence(expected=self.schema_before)
         self.require_no_database_helpers()
         self.inventory("pre-inventory.json")
         public_before = [
@@ -904,14 +931,15 @@ class Driver:
                 self.wait_inactive(unit)
             if BROKER_SOCKET.exists() or BROKER_SOCKET.is_symlink():
                 raise DeploymentError("broker socket remains after stopped boundary")
-            self.schema_evidence(expected=SCHEMA_BEFORE)
+            self.schema_evidence(expected=self.schema_before)
             self.require_no_database_helpers()
             self.capture_database()
             self.capture_client_database()
             self.phase = "writer-free-checkpoint"
             self.journal()
-            self.migrate()
-            migrated = self.schema_evidence(expected=SCHEMA_AFTER)
+            if not self.args.same_schema_release:
+                self.migrate()
+            migrated = self.schema_evidence(expected=self.schema_after)
             self.installer("plan")
             self.installer("apply")
             self.installer_applied = True
@@ -951,7 +979,7 @@ class Driver:
             self.run(["/usr/bin/systemctl", "restart", API_UNIT], timeout=90)
             self.run(["/usr/bin/systemctl", "restart", CONSOLE_UNIT], timeout=120)
             services = self.verify_services(inventory_name="post-inventory.json")
-            final_schema = self.schema_evidence(expected=SCHEMA_AFTER)
+            final_schema = self.schema_evidence(expected=self.schema_after)
             public_after = [self.public_get(url) for url in self.args.public_url]
             self.phase = "complete"
             result = {
@@ -1009,6 +1037,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--token-file", required=True)
     parser.add_argument("--console-env-file", required=True)
     parser.add_argument("--console-state-dir", required=True)
+    parser.add_argument(
+        "--same-schema-release",
+        action="store_true",
+        help=(
+            "deploy code and unit changes while retaining schema 12; target must "
+            "be the checked-out main commit and rollback-ref a distinct ancestor"
+        ),
+    )
     return parser.parse_args(argv)
 
 

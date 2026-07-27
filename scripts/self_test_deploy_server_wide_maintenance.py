@@ -245,6 +245,18 @@ def main() -> int:
     )
     deploy_source = inspect.getsource(MODULE.Driver.deploy)
     expect(
+        "same-schema release must start from the approved target checkout" in deploy_source,
+        "same-schema release does not bind the checked-out target commit",
+    )
+    expect(
+        "same-schema rollback ref must be a distinct ancestor of target" in deploy_source,
+        "same-schema release does not retain a historical rollback source",
+    )
+    expect(
+        "if not self.args.same_schema_release:" in deploy_source,
+        "same-schema release still runs the one-time schema migration",
+    )
+    expect(
         deploy_source.index("self.capture_client_database()")
         < deploy_source.index("self.migrate()"),
         "client database is not checkpointed before target migration/startup",
