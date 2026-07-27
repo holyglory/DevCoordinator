@@ -29,6 +29,8 @@ test('Tests destination leads with repository-scoped hourly timing and period dy
   assert.match(js, /minutes <= 60/);
   assert.match(js, /minutes <= 120/);
   assert.match(js, /Aggregate test time may exceed 60m when tests run in parallel/);
+  assert.match(js, /class: 'test-summary-compact'/);
+  assert.match(js, /class: `test-heat-hour/);
   assert.match(js, /stats\.hourly/);
   assert.match(js, /stats\.comparison_summary/);
   assert.match(js, /stats\.previous_daily/);
@@ -37,4 +39,8 @@ test('Tests destination leads with repository-scoped hourly timing and period dy
   assert.match(js, /cell\.setAttribute\('aria-label'/);
   assert.match(css, /\.test-table td::before/);
   assert.match(css, /content: attr\(data-label\)/);
+  assert.match(css, /\.test-heat-scroll \{ max-width: 100%; overflow-x: clip/);
+  assert.match(css, /\.test-heatmap \{ width: 100%; min-width: 0/);
+  assert.match(css, /@media \(max-width: 1100px\)[\s\S]*\.test-summary \{ display: none; \}/);
+  assert.match(css, /@media \(max-width: 360px\)[\s\S]*\.test-heat-hour\.is-six/);
 });

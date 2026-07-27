@@ -2957,6 +2957,43 @@
     });
   }
 
+  function testDayShortLabel(day) {
+    const date = new Date(`${day}T00:00:00Z`);
+    if (!Number.isFinite(date.getTime())) return day;
+    return date.toLocaleDateString([], {
+      weekday: 'short', day: 'numeric', timeZone: 'UTC',
+    });
+  }
+
+  function testSummaryDetails(stats) {
+    const summary = stats.summary || {};
+    const comparison = stats.comparison_summary || {};
+    const change = testDelta(summary.test_seconds, comparison.test_seconds);
+    const hourlyTotals = new Map();
+    const dailyTotals = new Map();
+    for (const cell of stats.hourly || []) {
+      hourlyTotals.set(Number(cell.hour), (hourlyTotals.get(Number(cell.hour)) || 0) + Number(cell.test_seconds || 0));
+      dailyTotals.set(String(cell.day), (dailyTotals.get(String(cell.day)) || 0) + Number(cell.test_seconds || 0));
+    }
+    const peakHour = [...hourlyTotals].sort((a, b) => b[1] - a[1])[0]?.[0];
+    const busiestDay = [...dailyTotals].sort((a, b) => b[1] - a[1])[0]?.[0];
+    return {
+      summary,
+      change,
+      peakHour,
+      busiestDay,
+      deltaClass: Number.isFinite(change) ? (change > 0 ? 'is-worse' : 'is-better') : '',
+    };
+  }
+
+  function testCompactSummary(stats) {
+    const { summary, peakHour, busiestDay } = testSummaryDetails(stats);
+    return h('dl', { class: 'test-summary-compact', 'aria-label': 'Testing summary' },
+      h('div', null, h('dt', null, 'Total time'), h('dd', null, fmtSeconds(summary.test_seconds || 0))),
+      h('div', null, h('dt', null, 'Peak hour'), h('dd', null, Number.isInteger(peakHour) ? `${String(peakHour).padStart(2, '0')}:00` : '—')),
+      h('div', null, h('dt', null, 'Busiest day'), h('dd', null, busiestDay ? testDayShortLabel(busiestDay) : '—')));
+  }
+
   function testHeatmap(stats) {
     const cells = Array.isArray(stats.hourly) ? stats.hourly : [];
     const byDay = new Map();
@@ -2970,11 +3007,16 @@
     const days = [...byDay.keys()].sort();
     const head = h('tr', null, h('th', { scope: 'col', class: 'test-heat-day' }, 'UTC'));
     for (let hour = 0; hour < 24; hour += 1) {
-      head.append(h('th', { scope: 'col' }, String(hour).padStart(2, '0')));
+      head.append(h('th', {
+        scope: 'col',
+        class: `test-heat-hour${hour % 2 === 0 ? ' is-even' : ''}${hour % 6 === 0 ? ' is-six' : ''}`,
+      }, String(hour).padStart(2, '0')));
     }
     const body = h('tbody');
     for (const day of days) {
-      const row = h('tr', null, h('th', { scope: 'row', class: 'test-heat-day' }, testDayLabel(day)));
+      const row = h('tr', null, h('th', { scope: 'row', class: 'test-heat-day' },
+        h('span', { class: 'test-heat-day-full' }, testDayLabel(day)),
+        h('span', { class: 'test-heat-day-short' }, testDayShortLabel(day))));
       for (let hour = 0; hour < 24; hour += 1) {
         const cell = byDay.get(day).get(hour) || { test_seconds: 0, failure_count: 0 };
         const minutes = Number(cell.test_seconds || 0) / 60;
@@ -2995,6 +3037,7 @@
       h('div', { class: 'test-panel-title' },
         h('h3', null, 'Testing time by hour'),
         h('span', { class: 'meta-passive' }, 'aggregate test-minutes · UTC')),
+      testCompactSummary(stats),
       days.length === 0
         ? h('p', { class: 'empty-inline' }, 'No hourly test timing is recorded for the last seven days.')
         : h('div', { class: 'test-heat-scroll' }, table),
@@ -3082,18 +3125,7 @@
   }
 
   function testSummary(stats) {
-    const summary = stats.summary || {};
-    const comparison = stats.comparison_summary || {};
-    const change = testDelta(summary.test_seconds, comparison.test_seconds);
-    const hourlyTotals = new Map();
-    const dailyTotals = new Map();
-    for (const cell of stats.hourly || []) {
-      hourlyTotals.set(Number(cell.hour), (hourlyTotals.get(Number(cell.hour)) || 0) + Number(cell.test_seconds || 0));
-      dailyTotals.set(String(cell.day), (dailyTotals.get(String(cell.day)) || 0) + Number(cell.test_seconds || 0));
-    }
-    const peakHour = [...hourlyTotals].sort((a, b) => b[1] - a[1])[0]?.[0];
-    const busiestDay = [...dailyTotals].sort((a, b) => b[1] - a[1])[0]?.[0];
-    const deltaClass = Number.isFinite(change) ? (change > 0 ? 'is-worse' : 'is-better') : '';
+    const { summary, change, peakHour, busiestDay, deltaClass } = testSummaryDetails(stats);
     return h('aside', { class: 'test-summary' },
       h('h3', null, `${stats.days || state.testsDays}-day summary`),
       h('strong', { class: 'test-summary-total' }, fmtSeconds(summary.test_seconds || 0)),

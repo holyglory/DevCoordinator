@@ -1649,6 +1649,32 @@ test('Tests loads repository data within one second while current inventory is s
       assert.ok(desktopGeometry.sections.every((section) => (
         section.left >= 0 && section.right <= desktopGeometry.viewportWidth
       )), 'every Tests panel must stay inside the desktop viewport');
+
+      await page.setViewportSize({ width: 981, height: 964 });
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const narrowGeometry = await page.evaluate(() => {
+        const heatScroll = document.querySelector('.test-heat-scroll');
+        return {
+          documentWidth: document.documentElement.scrollWidth,
+          viewportWidth: window.innerWidth,
+          heatClientWidth: heatScroll?.clientWidth,
+          heatScrollWidth: heatScroll?.scrollWidth,
+          summaryDisplay: getComputedStyle(document.querySelector('.test-summary')).display,
+          compactSummaryDisplay: getComputedStyle(document.querySelector('.test-summary-compact')).display,
+        };
+      });
+      assert.ok(narrowGeometry.documentWidth <= narrowGeometry.viewportWidth,
+        'the annotated 981px Tests layout must not overflow');
+      assert.ok(narrowGeometry.heatScrollWidth <= narrowGeometry.heatClientWidth,
+        'the annotated 981px heatmap must not have a horizontal scrollbar');
+      assert.equal(narrowGeometry.summaryDisplay, 'none',
+        'the right summary panel must not consume narrow-screen space');
+      assert.notEqual(narrowGeometry.compactSummaryDisplay, 'none',
+        'the narrow-screen heatmap must preserve its summary facts');
+      if (process.env.TESTS_DESIGN_NARROW_SCREENSHOT) {
+        await page.screenshot({ path: process.env.TESTS_DESIGN_NARROW_SCREENSHOT, fullPage: true });
+      }
+
       await page.setViewportSize({ width: 390, height: 844 });
       await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
       const mobileGeometry = await page.evaluate(() => {
@@ -1663,6 +1689,11 @@ test('Tests loads repository data within one second while current inventory is s
             clientWidth: heatScroll.clientWidth,
             scrollWidth: heatScroll.scrollWidth,
           } : null,
+          heatmap: document.querySelector('.test-heatmap')?.getBoundingClientRect().toJSON(),
+          summaryDisplay: getComputedStyle(document.querySelector('.test-summary')).display,
+          compactSummaryDisplay: getComputedStyle(document.querySelector('.test-summary-compact')).display,
+          visibleHourLabels: [...document.querySelectorAll('.test-heat-hour')]
+            .filter((node) => getComputedStyle(node).visibility === 'visible').length,
         };
       });
       assert.ok(mobileGeometry.documentWidth <= mobileGeometry.viewportWidth,
@@ -1670,9 +1701,38 @@ test('Tests loads repository data within one second while current inventory is s
       assert.ok(mobileGeometry.heatScroll);
       assert.ok(mobileGeometry.heatScroll.left >= 0
         && mobileGeometry.heatScroll.right <= mobileGeometry.viewportWidth,
-      'the intentionally scrollable heatmap viewport must stay on screen');
-      assert.ok(mobileGeometry.heatScroll.scrollWidth > mobileGeometry.heatScroll.clientWidth,
-        'the 24-hour heatmap should scroll inside its own bounded mobile viewport');
+      'the heatmap viewport must stay on screen');
+      assert.ok(mobileGeometry.heatScroll.scrollWidth <= mobileGeometry.heatScroll.clientWidth,
+        'the 24-hour heatmap must fit without a nested horizontal scrollbar');
+      assert.ok(mobileGeometry.heatmap.left >= mobileGeometry.heatScroll.left
+        && mobileGeometry.heatmap.right <= mobileGeometry.heatScroll.right + 1,
+      'the heatmap table must fit inside its panel');
+      assert.equal(mobileGeometry.summaryDisplay, 'none',
+        'the separate summary panel must be removed on narrow screens');
+      assert.notEqual(mobileGeometry.compactSummaryDisplay, 'none',
+        'narrow screens must retain summary facts in a compact strip');
+      assert.equal(mobileGeometry.visibleHourLabels, 12,
+        'mobile should label every other hour while retaining all 24 data cells');
+
+      await page.setViewportSize({ width: 320, height: 844 });
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const smallMobileGeometry = await page.evaluate(() => {
+        const heatScroll = document.querySelector('.test-heat-scroll');
+        return {
+          viewportWidth: window.innerWidth,
+          documentWidth: document.documentElement.scrollWidth,
+          heatClientWidth: heatScroll?.clientWidth,
+          heatScrollWidth: heatScroll?.scrollWidth,
+          visibleHourLabels: [...document.querySelectorAll('.test-heat-hour')]
+            .filter((node) => getComputedStyle(node).visibility === 'visible').length,
+        };
+      });
+      assert.ok(smallMobileGeometry.documentWidth <= smallMobileGeometry.viewportWidth,
+        'the Tests dashboard must fit a 320px mobile viewport');
+      assert.ok(smallMobileGeometry.heatScrollWidth <= smallMobileGeometry.heatClientWidth,
+        'the heatmap must not scroll at 320px');
+      assert.equal(smallMobileGeometry.visibleHourLabels, 4,
+        'small mobile should label six-hour intervals while retaining all 24 data cells');
       if (process.env.TESTS_DESIGN_MOBILE_SCREENSHOT) {
         await page.screenshot({ path: process.env.TESTS_DESIGN_MOBILE_SCREENSHOT, fullPage: true });
       }
