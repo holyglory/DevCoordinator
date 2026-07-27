@@ -205,6 +205,26 @@ def add_broker_parser(subparsers: Any) -> None:
     )
     grant.add_argument("--disable", action="store_true")
 
+    grant_runtime = actions.add_parser(
+        "grant-runtime",
+        help="grant one exact typed runtime action for an enrolled resource",
+    )
+    _database_argument(grant_runtime)
+    grant_runtime.add_argument("--uid", type=int, required=True)
+    grant_runtime.add_argument("--repo-id", required=True)
+    grant_runtime.add_argument(
+        "--resource-kind",
+        choices=("service", "docker", "database_stack"),
+        required=True,
+    )
+    grant_runtime.add_argument("--resource-id", required=True)
+    grant_runtime.add_argument(
+        "--runtime-action",
+        choices=("status", "start", "stop", "restart", "replace"),
+        required=True,
+    )
+    grant_runtime.add_argument("--disable", action="store_true")
+
     grant_database = actions.add_parser("grant-database")
     _database_argument(grant_database)
     grant_database.add_argument("--uid", type=int, required=True)
@@ -610,6 +630,24 @@ def handle_broker_cli(args: argparse.Namespace) -> Any:
             "resource_kind": str(args.resource_kind),
             "resource_id": str(args.resource_id),
             "operation": operation.value,
+            "enabled": not bool(args.disable),
+        }
+    if args.action == "grant-runtime":
+        persistence.grant_runtime(
+            uid=int(args.uid),
+            repo_id=str(args.repo_id),
+            resource_kind=str(args.resource_kind),
+            resource_id=str(args.resource_id),
+            action=str(args.runtime_action),
+            enabled=not bool(args.disable),
+        )
+        return {
+            "status": "configured",
+            "uid": int(args.uid),
+            "repo_id": str(args.repo_id),
+            "resource_kind": str(args.resource_kind),
+            "resource_id": str(args.resource_id),
+            "runtime_action": str(args.runtime_action),
             "enabled": not bool(args.disable),
         }
     if args.action == "grant-database":

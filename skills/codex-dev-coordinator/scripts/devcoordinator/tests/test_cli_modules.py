@@ -2922,6 +2922,43 @@ class BrokerCLIContractTests(unittest.TestCase):
             persistence.grant_resource.assert_called_once()
             self.assertEqual(result["repo_id"], "repo-id")
 
+    def test_admin_runtime_grant_is_exact_and_typed(self) -> None:
+        value = parser()
+        with tempfile.TemporaryDirectory() as raw:
+            database = str(Path(raw) / "coordinator.sqlite3")
+            args = value.parse_args(
+                [
+                    "broker",
+                    "grant-runtime",
+                    "--database",
+                    database,
+                    "--uid",
+                    "501",
+                    "--repo-id",
+                    "repo-id",
+                    "--resource-kind",
+                    "service",
+                    "--resource-id",
+                    "service-id",
+                    "--runtime-action",
+                    "restart",
+                ]
+            )
+            persistence = mock.Mock()
+            with mock.patch(
+                "devcoordinator.broker_cli.BrokerPersistence", return_value=persistence
+            ):
+                result = handle_broker_cli(args)
+            persistence.grant_runtime.assert_called_once_with(
+                uid=501,
+                repo_id="repo-id",
+                resource_kind="service",
+                resource_id="service-id",
+                action="restart",
+                enabled=True,
+            )
+            self.assertEqual(result["runtime_action"], "restart")
+
     def test_store_artifact_admin_commands_cover_account_and_service_roles(
         self,
     ) -> None:
