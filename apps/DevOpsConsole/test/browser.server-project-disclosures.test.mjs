@@ -1384,3 +1384,104 @@ test('lifecycle-disabled admin sessions never request archives or surface an aut
       await fs.promises.rm(fakeDockerDir, { recursive: true, force: true });
     }
   });
+
+test('Performance paints retained metrics within one second while current inventory is slow',
+  { timeout: 120_000 }, async () => {
+    const { chromium } = loadLockedPlaywright();
+    const fakeDockerDir = await canonicalTempDir('devops-console-browser-performance-');
+    await writeEmptyDockerFixture(fakeDockerDir);
+    let stack;
+    let browser;
+    let context;
+    try {
+      stack = await startStack({
+        allowedEmails: ['operator@example.test'],
+        claims: { email: 'operator@example.test', name: 'Fixture Operator' },
+        coordinatorEnv: { PATH: `${fakeDockerDir}${path.delimiter}${process.env.PATH ?? ''}` },
+      });
+      const jar = makeJar();
+      assert.equal((await login(stack, jar)).status, 200);
+      const sessionCookie = jar.get('dc_session');
+      assert.ok(sessionCookie);
+
+      browser = await launchChromium(
+        chromium,
+        [`--host-resolver-rules=MAP ${stack.consoleHost} 127.0.0.1`],
+      );
+      context = await browser.newContext({
+        viewport: { width: 1135, height: 919 },
+        ignoreHTTPSErrors: true,
+        colorScheme: 'dark',
+        reducedMotion: 'reduce',
+      });
+      await context.addCookies([{
+        name: sessionCookie.name,
+        value: sessionCookie.value,
+        domain: sessionCookie.hostOnly ? sessionCookie.domain : `.${sessionCookie.domain}`,
+        path: sessionCookie.path,
+        secure: sessionCookie.secure,
+        httpOnly: sessionCookie.httpOnly,
+        sameSite: 'Lax',
+      }]);
+      await context.addInitScript(() => {
+        window.__consoleLcp = 0;
+        new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) window.__consoleLcp = Math.max(window.__consoleLcp, entry.startTime);
+        }).observe({ type: 'largest-contentful-paint', buffered: true });
+      });
+
+      const page = await context.newPage();
+      const unexpectedRequests = [];
+      let appEncoding = null;
+      page.on('response', (response) => {
+        if (new URL(response.url()).pathname === '/app.js') {
+          appEncoding = response.headers()['content-encoding'] || null;
+        }
+      });
+      await page.route('**/api/**', async (route) => {
+        const request = route.request();
+        const pathname = new URL(request.url()).pathname;
+        let body;
+        if (pathname === '/api/overview') {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          body = CANONICAL_OVERVIEW;
+        } else if (pathname === '/api/metrics/history') body = CANONICAL_METRICS;
+        else if (pathname === '/api/session') {
+          body = { ...CANONICAL_SESSION, accessAdmin: false, lifecycleAvailable: false };
+        } else if (pathname === '/api/prefs') body = CANONICAL_PREFS;
+        else if (pathname === '/api/telegram') {
+          body = { bots: [], pendingAuthorizations: [], authorizedChats: [] };
+        } else {
+          unexpectedRequests.push(`${request.method()} ${pathname}`);
+          body = {};
+        }
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      });
+
+      const startedAt = Date.now();
+      await page.goto(`https://${stack.consoleHost}:${stack.httpsPort}/#/performance`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('#perf-body .perf-card').first().waitFor({ state: 'visible' });
+      const meaningfulPaintMs = Date.now() - startedAt;
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      const timing = await page.evaluate(() => ({
+        ttfb: performance.getEntriesByType('navigation')[0]?.responseStart ?? Infinity,
+        lcp: window.__consoleLcp,
+      }));
+
+      assert.ok(timing.ttfb < 100, `fixture document TTFB was ${timing.ttfb.toFixed(1)}ms`);
+      assert.ok(meaningfulPaintMs < 1000,
+        `Performance metrics became visible after ${meaningfulPaintMs}ms`);
+      assert.ok(timing.lcp > 0 && timing.lcp < 1000,
+        `fixture LCP was ${Number(timing.lcp).toFixed(1)}ms`);
+      assert.equal(appEncoding, 'br', 'Chromium should receive the immutable app bundle over Brotli');
+      await page.getByRole('link', { name: 'Test dashboards' }).waitFor({ state: 'visible' });
+      assert.deepEqual(unexpectedRequests, []);
+    } finally {
+      await context?.close();
+      await browser?.close();
+      await stack?.close();
+      await fs.promises.rm(fakeDockerDir, { recursive: true, force: true });
+    }
+  });

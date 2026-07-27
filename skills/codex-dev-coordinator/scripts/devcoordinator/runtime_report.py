@@ -1435,6 +1435,15 @@ def build_runtime_report(
     observation_proof = (
         observation_proof if isinstance(observation_proof, Mapping) else {}
     )
+    stop_state_is_terminal_absence = bool(
+        terminal_state.get("observed_state") == "absent"
+        or (
+            target_kind == "database_stack"
+            and terminal_state.get("observed_state") == "stopped"
+            and terminal_state.get("database_available") is not True
+            and terminal_state.get("database_resource_count") == 0
+        )
+    )
     proved_absent_stop = bool(
         request.get("action") == "stop"
         and target_kind in {"docker", "database_stack"}
@@ -1442,7 +1451,7 @@ def build_runtime_report(
         and terminal_state.get("proof") == "post_observation_inventory"
         and str(terminal_state.get("resource_kind") or "") == target_kind
         and str(terminal_state.get("resource_id") or "") == target_id
-        and terminal_state.get("observed_state") == "absent"
+        and stop_state_is_terminal_absence
         and observation_proof.get("observer_domain")
         == "host-runtime-v2:full-docker"
         and observation_proof.get("docker_available") is True

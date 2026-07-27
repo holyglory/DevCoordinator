@@ -1133,10 +1133,32 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
                 resource_id=DATABASE_ID,
             )
             with self.subTest(action=action):
+                call_count_before = len(self.actions.calls)
+
+                def observe_database_action(
+                    store: CoordinatorStore,
+                ) -> dict[str, object]:
+                    action_completed = len(self.actions.calls) > call_count_before
+                    lifecycle = (
+                        "stopped"
+                        if action_completed and action == "stop"
+                        else "running"
+                    )
+                    return self._runtime_observer(
+                        store,
+                        lifecycle=lifecycle,
+                        database_available=(
+                            False
+                            if action_completed and action == "stop"
+                            else True
+                        ),
+                    )
+
                 reply = self._reply(
                     action=action,
                     target_kind="database_stack",
                     resource_id=DATABASE_ID,
+                    service=self._service(observer=observe_database_action),
                 )
                 self.assertTrue(reply["ok"], reply)
                 report = reply["result"]
@@ -1144,8 +1166,18 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
                 terminal = report["result"]["terminal_state"]
                 self.assertEqual(terminal["docker_resource_id"], CONTAINER_ID)
                 self.assertEqual(
-                    terminal["database_available"], action != "stop"
+                    terminal["database_available"],
+                    None if action == "stop" else True,
                 )
+                if action == "stop":
+                    self.assertFalse(
+                        any(
+                            item["kind"] == "database_stack"
+                            and item["id"] == DATABASE_ID
+                            for item in report["resources"]
+                        ),
+                        "positive database absence must retire it from the current tree",
+                    )
         self.assertEqual(
             [call[0] for call in self.actions.calls],
             ["start", "stop", "restart"],

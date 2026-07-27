@@ -1165,7 +1165,13 @@ class StoreBackedMutationBackend:
             snapshot=after_snapshot,
             observation=after_observation,
         )
-        if final_blocked is not None:
+        expected_database_stop_retirement = (
+            action == "stop"
+            and target.resource_kind == "database_stack"
+            and not after_snapshot.classification_evidence
+            and len(after_snapshot.matching_resources) == 0
+        )
+        if final_blocked is not None and not expected_database_stop_retirement:
             code = "unclassified_resource"
             message = "Runtime family became unclassified after the host action."
             self._record_failure(request.operation_id, code=code, message=message)

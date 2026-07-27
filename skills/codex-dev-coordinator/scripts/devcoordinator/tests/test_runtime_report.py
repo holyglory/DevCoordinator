@@ -427,6 +427,41 @@ class RuntimeReportTests(unittest.TestCase):
             report["evidence"]["reason_code"], "missing_authoritative_resource"
         )
 
+    def test_proved_database_stop_may_retire_the_target_from_the_current_tree(self) -> None:
+        inventory = self.inventory()
+        inventory["repository_trees"][0]["scopes"][1]["database_binding_ids"] = []
+        inventory["resources"]["databases"] = []
+        inventory["observations"]["databases"] = []
+        inventory["observations"]["docker"][1]["lifecycle"] = "stopped"
+        request = self.request(
+            action="stop",
+            target={"kind": "database_stack", "id": "database-temp"},
+        )
+        action_result = {
+            "ok": True,
+            "terminal_state": {
+                "proof": "post_observation_inventory",
+                "resource_kind": "database_stack",
+                "resource_id": "database-temp",
+                "observed_state": "stopped",
+                "database_available": None,
+                "database_resource_count": 0,
+                "observation_proof": {
+                    "observer_domain": "host-runtime-v2:full-docker",
+                    "docker_available": True,
+                },
+            },
+        }
+
+        report = self.build(
+            inventory=inventory,
+            request=request,
+            action_result=action_result,
+        )
+
+        self.assertTrue(report["ok"], report)
+        self.assertFalse(any(item["id"] == "database-temp" for item in report["resources"]))
+
     def test_result_defaults_to_failure_without_inventing_missing_membership(self) -> None:
         inventory = self.inventory()
         inventory["repository_trees"][0]["scopes"][1]["server_ids"] = []

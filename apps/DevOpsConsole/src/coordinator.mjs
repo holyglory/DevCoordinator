@@ -722,6 +722,60 @@ export function createCoordinator({ config, log }) {
       .then((value) => consoleInventoryView(value, trustedDockerObservations));
   }
 
+  /**
+   * Read inventory for the latency-sensitive Console overview.
+   *
+   * A current or bounded-stale snapshot returns immediately while one
+   * coalesced refresh runs in the background. A cold cache waits only for the
+   * supplied first-byte budget; the same in-flight request continues warming
+   * the cache after this method returns `loading`.
+   */
+  async function inventoryForOverview({
+    maxAgeMs = 5000,
+    maxStaleMs = 300_000,
+    maxWaitMs = 40,
+  } = {}) {
+    const now = Date.now();
+    const ageMs = invCache.value === undefined ? null : Math.max(0, now - invCache.at);
+    const project = (value) => consoleInventoryView(value, trustedDockerObservations);
+    if (invCache.value !== undefined && ageMs <= maxAgeMs) {
+      return {
+        inventory: project(invCache.value), state: 'fresh', ageMs, refreshing: false, error: null,
+      };
+    }
+
+    const refresh = cachedGet(invCache, '/v1/inventory', maxAgeMs)
+      .then((value) => ({ inventory: project(value), error: null }))
+      .catch((error) => ({ inventory: null, error }));
+    if (invCache.value !== undefined && ageMs <= maxStaleMs) {
+      // Observe rejection inside `refresh` even though the caller gets the
+      // retained snapshot immediately.
+      void refresh;
+      return {
+        inventory: project(invCache.value), state: 'stale', ageMs, refreshing: true, error: null,
+      };
+    }
+
+    const pending = Symbol('inventory-overview-pending');
+    const outcome = await Promise.race([
+      refresh,
+      delay(maxWaitMs, pending, { ref: false }),
+    ]);
+    if (outcome === pending) {
+      return {
+        inventory: null, state: 'loading', ageMs: null, refreshing: true, error: null,
+      };
+    }
+    if (outcome.error) {
+      return {
+        inventory: null, state: 'error', ageMs: null, refreshing: false, error: outcome.error,
+      };
+    }
+    return {
+      inventory: outcome.inventory, state: 'fresh', ageMs: 0, refreshing: false, error: null,
+    };
+  }
+
   function observeHost(body = {}) {
     const project = typeof body?.project === 'string' ? body.project : '';
     const existing = observationFlights.get(project);
@@ -879,6 +933,7 @@ export function createCoordinator({ config, log }) {
     ensureRunning,
     probe,
     inventory,
+    inventoryForOverview,
     serversRaw,
     events,
     testStats,

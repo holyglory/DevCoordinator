@@ -7,6 +7,8 @@
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
+import { createBrotliCompress, createGzip, constants as zlibConstants } from 'node:zlib';
 
 const MIME = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -19,6 +21,24 @@ const MIME = new Map([
   ['.json', 'application/json; charset=utf-8'],
   ['.txt', 'text/plain; charset=utf-8'],
 ]);
+
+const COMPRESSIBLE = new Set(['.html', '.css', '.js', '.mjs', '.svg', '.json', '.txt']);
+const MIN_COMPRESSION_BYTES = 1024;
+
+function acceptedEncoding(header) {
+  const choices = new Map();
+  for (const part of String(header || '').toLowerCase().split(',')) {
+    const [name, ...params] = part.trim().split(';');
+    if (!name) continue;
+    const q = params.map((item) => item.trim()).find((item) => item.startsWith('q='));
+    const quality = q ? Number(q.slice(2)) : 1;
+    choices.set(name, Number.isFinite(quality) ? quality : 0);
+  }
+  const permits = (name) => (choices.get(name) ?? choices.get('*') ?? 0) > 0;
+  if (permits('br')) return 'br';
+  if (permits('gzip')) return 'gzip';
+  return null;
+}
 
 export function createStaticServer({ dir, log } = {}) {
   if (!dir) throw new TypeError('createStaticServer: dir is required');
@@ -92,7 +112,11 @@ export function createStaticServer({ dir, log } = {}) {
         return;
       }
 
-      const etag = `"${Math.round(st.mtimeMs).toString(16)}-${st.size.toString(16)}"`;
+      const encoding = COMPRESSIBLE.has(ext) && st.size >= MIN_COMPRESSION_BYTES
+        ? acceptedEncoding(req.headers['accept-encoding'])
+        : null;
+      const encodingTag = encoding ? `-${encoding}` : '';
+      const etag = `"${Math.round(st.mtimeMs).toString(16)}-${st.size.toString(16)}${encodingTag}"`;
       const headers = {
         'content-type': MIME.get(ext),
         etag,
@@ -101,6 +125,8 @@ export function createStaticServer({ dir, log } = {}) {
         'cache-control': ext === '.html' ? 'no-cache' : 'public, max-age=3600, immutable',
         'x-content-type-options': 'nosniff',
       };
+      if (COMPRESSIBLE.has(ext)) headers.vary = 'Accept-Encoding';
+      if (encoding) headers['content-encoding'] = encoding;
 
       const inm = req.headers['if-none-match'];
       if (inm && inm.split(',').some((t) => {
@@ -112,7 +138,7 @@ export function createStaticServer({ dir, log } = {}) {
         return;
       }
 
-      headers['content-length'] = st.size;
+      if (!encoding) headers['content-length'] = st.size;
       if (method === 'HEAD') {
         res.writeHead(200, headers);
         res.end();
@@ -121,12 +147,15 @@ export function createStaticServer({ dir, log } = {}) {
 
       res.writeHead(200, headers);
       const stream = createReadStream(abs);
-      stream.on('error', (err) => {
-        log?.error?.('static file stream error', { path: pathname, error: err.message });
-        res.destroy(err);
-      });
-      res.on('close', () => stream.destroy());
-      stream.pipe(res);
+      if (encoding === 'br') {
+        await pipeline(stream, createBrotliCompress({
+          params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 5 },
+        }), res);
+      } else if (encoding === 'gzip') {
+        await pipeline(stream, createGzip({ level: 6 }), res);
+      } else {
+        await pipeline(stream, res);
+      }
     } catch (err) {
       log?.error?.('static handler failure', { error: err?.message });
       if (!res.headersSent) sendText(res, 500, 'internal error');

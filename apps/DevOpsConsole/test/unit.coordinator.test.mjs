@@ -147,6 +147,32 @@ test('coordinator probe is anonymous while every protected request uses the priv
   assert.equal(requests[1].authorization, `Bearer ${TOKEN}`);
 });
 
+test('overview inventory obeys its cold first-byte budget and reuses the completed refresh', async (t) => {
+  let inventoryRequests = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/inventory') return false;
+    inventoryRequests += 1;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ servers: [], project_usage: [], marker: 'warmed' }));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+
+  const started = performance.now();
+  const cold = await client.inventoryForOverview({ maxAgeMs: 0, maxWaitMs: 10 });
+  const elapsedMs = performance.now() - started;
+  assert.equal(cold.state, 'loading');
+  assert.equal(cold.inventory, null);
+  assert.ok(elapsedMs < 100, `cold overview waited ${elapsedMs.toFixed(1)}ms`);
+
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  const warm = await client.inventoryForOverview({ maxAgeMs: 60_000, maxWaitMs: 10 });
+  assert.equal(warm.state, 'fresh');
+  assert.equal(warm.inventory.marker, 'warmed');
+  assert.equal(inventoryRequests, 1, 'the timed-out caller must leave one cache-warming refresh running');
+});
+
 test('event pages preserve opaque cursors and explicit host observation identity', async (t) => {
   const page = {
     schema_version: 1,

@@ -415,12 +415,14 @@ export function createRouteStore({ file, config, log, randomUUID = () => crypto.
   // kind:'docker' resolves through the (cached) coordinator inventory: the
   // durable identity is container name + container-side port; the published
   // host port is looked up live so a remapped restart keeps working.
-  async function resolveDocker(route, coordinator) {
-    let inventoryData;
-    try {
-      inventoryData = await coordinator.inventory();
-    } catch (err) {
-      return { port: null, reason: `coordinator unavailable: ${err?.message ?? err}` };
+  async function resolveDocker(route, coordinator, suppliedInventory = null) {
+    let inventoryData = suppliedInventory;
+    if (!inventoryData) {
+      try {
+        inventoryData = await coordinator.inventory();
+      } catch (err) {
+        return { port: null, reason: `coordinator unavailable: ${err?.message ?? err}` };
+      }
     }
     const docker = inventoryData?.docker;
     if (!docker || docker.available === false) {
@@ -459,21 +461,25 @@ export function createRouteStore({ file, config, log, randomUUID = () => crypto.
     return guardCoordinatorPort(hostPort, { container }) ?? { port: hostPort, container };
   }
 
-  async function resolve(slugInput, coordinator) {
+  async function resolve(slugInput, coordinator, suppliedInventory = null) {
     const route = routes.get(lookupKey(slugInput));
     if (!route) return { port: null, reason: 'route not found' };
     if (route.kind === 'port') {
       return guardCoordinatorPort(route.port) ?? { port: route.port };
     }
     if (route.kind === 'docker') {
-      return resolveDocker(route, coordinator);
+      return resolveDocker(route, coordinator, suppliedInventory);
     }
 
     let servers;
-    try {
-      servers = await coordinator.serversRaw();
-    } catch (err) {
-      return { port: null, reason: `coordinator unavailable: ${err?.message ?? err}` };
+    if (suppliedInventory) {
+      servers = suppliedInventory.servers;
+    } else {
+      try {
+        servers = await coordinator.serversRaw();
+      } catch (err) {
+        return { port: null, reason: `coordinator unavailable: ${err?.message ?? err}` };
+      }
     }
     const candidates = (Array.isArray(servers) ? servers : [])
       .filter((s) => s && s.project === route.project && s.name === route.serverName)

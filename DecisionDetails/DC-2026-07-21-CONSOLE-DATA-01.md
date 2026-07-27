@@ -26,6 +26,17 @@ clients do not assign it by similar names or paths. Docker-hosted HTTP services
 remain first-class services when the producer proves their container, port,
 health, route, and lifecycle relationship.
 
+The Console overview is a latency-sensitive projection, not another observer.
+It returns a current snapshot immediately, serves a bounded-stale snapshot
+while one coalesced refresh continues, and waits at most 40 ms when the cache
+is cold. Every route displayed in that response resolves from the exact same
+snapshot; a failed inventory read never fans out into another server or Docker
+request. Browser boot starts overview and locally retained metrics together,
+so the Performance page can paint machine and history data while current
+repository usage is still loading. A few bounded follow-ups collect a newly
+warmed snapshot without waiting for the normal poll, and immutable text assets
+negotiate Brotli or gzip with encoding-specific validators.
+
 Enrollment-only server definitions remain exact control identities for port
 leases and assignments. Every current normalized definition is classified
 exactly once under its repository scope, but definitions do not enter
@@ -59,6 +70,10 @@ a port.
 - Keep inventory transport bounded and compact, decode large payloads off the
   native main actor, and retain source-bound production snapshots for wide and
   narrow layouts.
+- Keep document and overview first-byte work below 100 ms in the ordinary and
+  dependency-degraded paths, and keep Performance's first meaningful paint
+  independent of the Coordinator so its largest content can render within one
+  second on the production route.
 
 ## Alternatives rejected
 
@@ -82,8 +97,9 @@ problem, producing the same contract failure.
 
 ## Verification contract
 
-Console coordinator, project-membership, DOM-budget, lifecycle, and canonical
-artifact tests cover the read model and bounded interface. DevOps Board core and
+Console coordinator, overview first-byte, static-compression,
+project-membership, DOM-budget, lifecycle, and canonical artifact tests cover
+the read model and bounded interface. DevOps Board core and
 vertical-layout tests cover exact tree consumption, stable grouping, and center
 pane geometry. A producer regression fixture must keep a current definition
 with exact control evidence in `resources.servers` and one repository scope,

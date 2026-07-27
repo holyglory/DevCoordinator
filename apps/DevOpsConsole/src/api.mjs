@@ -149,11 +149,13 @@ export function createConsoleApi({
     return `${origin.protocol}//${slug}.${config.domain}${port}`;
   }
 
-  async function resolveSafe(slug) {
+  async function resolveSafe(slug, inventoryData = null) {
     try {
-      // resolve() uses coordinator.serversRaw() for server routes and the
-      // cached coordinator.inventory() for docker routes (both coalesced).
-      return await routeStore.resolve(slug, coordinator);
+      // Overview route resolution receives its exact inventory snapshot so it
+      // cannot fan out into another Coordinator read or contradict the rows
+      // rendered beside it. Proxy-time resolution omits this argument and
+      // remains independently live.
+      return await routeStore.resolve(slug, coordinator, inventoryData);
     } catch (err) {
       return { port: null, reason: err?.message ?? String(err) };
     }
@@ -587,10 +589,19 @@ export function createConsoleApi({
     sendJson(res, 200, await telegramView(session));
   }
 
-  async function routeViews() {
-    // serversRaw() is cached+coalesced, so parallel resolves share one call.
+  async function routeViews(inventoryData, inventoryError = null) {
+    const unavailable = inventoryError?.message
+      || (inventoryData ? null : 'current Coordinator inventory is still loading');
     return Promise.all(
-      routeStore.list().map(async (route) => toRouteView(route, await resolveSafe(route.slug))),
+      routeStore.list().map(async (route) => {
+        // Fixed-port routes need no Coordinator evidence. Server and Docker
+        // routes fail immediately with the one overview error rather than
+        // starting another request with a 60-second inventory deadline.
+        if (!inventoryData && route.kind !== 'port') {
+          return toRouteView(route, { port: null, reason: unavailable });
+        }
+        return toRouteView(route, await resolveSafe(route.slug, inventoryData));
+      }),
     );
   }
 
@@ -610,20 +621,41 @@ export function createConsoleApi({
     );
   }
 
-  async function handleOverview(res) {
+  async function handleOverview(res, { fresh = false } = {}) {
     let inventoryData = null;
     let coordErr = null;
-    try {
-      inventoryData = await coordinator.inventory();
-      // Piggyback the fresh reading into the history buffers so charts stay
-      // live while somebody is watching, between background sampler ticks.
-      metrics?.ingest(inventoryData);
-    } catch (err) {
-      coordErr = err;
+    let inventoryState = 'error';
+    let inventoryAgeMs = null;
+    let inventoryRefreshing = false;
+    if (typeof coordinator.inventoryForOverview === 'function') {
+      const snapshot = await coordinator.inventoryForOverview(fresh
+        ? { maxAgeMs: 0, maxStaleMs: 0, maxWaitMs: 250 }
+        : undefined);
+      inventoryData = snapshot.inventory;
+      coordErr = snapshot.error;
+      inventoryState = snapshot.state;
+      inventoryAgeMs = snapshot.ageMs;
+      inventoryRefreshing = snapshot.refreshing;
+    } else {
+      try {
+        inventoryData = await coordinator.inventory({ maxAgeMs: fresh ? 0 : 5000 });
+        inventoryState = 'fresh';
+        inventoryAgeMs = 0;
+      } catch (err) {
+        coordErr = err;
+      }
     }
+    // Piggyback available snapshots into the history buffers so charts stay
+    // live while somebody is watching, between background sampler ticks.
+    if (inventoryData) metrics?.ingest(inventoryData);
     const base = coordinator.status();
-    const coordView = coordinatorOverviewView(base, coordErr);
-    const routes = await routeViews();
+    const coordView = {
+      ...coordinatorOverviewView(base, coordErr),
+      inventoryState,
+      inventoryAgeMs,
+      inventoryRefreshing,
+    };
+    const routes = await routeViews(inventoryData, coordErr);
     sendJson(res, 200, {
       console: {
         version: config.version,
@@ -1374,7 +1406,7 @@ export function createConsoleApi({
       }
 
       if (method === 'GET' && pathname === '/api/overview') {
-        return await handleOverview(res);
+        return await handleOverview(res, { fresh: searchParams.get('fresh') === '1' });
       }
       if (method === 'GET' && pathname === '/api/tests') {
         const project = requireString(searchParams.get('project'), 'project');

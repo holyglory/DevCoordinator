@@ -1405,7 +1405,7 @@
     // collection before refreshing and revealing the post-action target.
     lifecycleRefreshInFlight = true;
     const refreshes = Promise.all([
-      refreshOverview({ force: true }),
+      refreshOverview({ force: true, fresh: true }),
       loadArchives({ force: true }),
     ]);
     if (currentPage() !== model.target.page) location.hash = `#/${model.target.page}`;
@@ -1506,7 +1506,7 @@
           }
           closeLifecycleDialog({ restoreFocus: false });
           await Promise.all([
-            refreshOverview({ force: true }),
+            refreshOverview({ force: true, fresh: true }),
             loadArchives({ force: true }),
           ]);
           renderAll(true);
@@ -1524,7 +1524,7 @@
         model.stage = 'planning';
         renderLifecycleDialog();
         await Promise.all([
-          refreshOverview({ force: true }),
+          refreshOverview({ force: true, fresh: true }),
           loadArchives({ force: true }),
         ]);
         model.plan = checkedPlan(await workerRequest());
@@ -2692,17 +2692,25 @@
 
   let fetching = false;
   let refetchQueued = false;
+  let inventoryWarmupRetries = 0;
 
-  async function refreshOverview({ force = false } = {}) {
+  async function refreshOverview({ force = false, fresh = false } = {}) {
     if (fetching) { refetchQueued = true; return; }
     fetching = true;
     try {
-      const data = await api('/api/overview');
+      const data = await api(`/api/overview${fresh ? '?fresh=1' : ''}`);
       state.overview = data;
       state.stale = false;
       state.lastFetch = Date.now();
       clearBanner('overview');
       renderAll(force);
+      if (data.coordinator?.inventoryState === 'loading' && !data.inventory
+          && inventoryWarmupRetries < 4) {
+        inventoryWarmupRetries += 1;
+        setTimeout(() => refreshOverview(), 120);
+      } else if (data.coordinator?.inventoryState !== 'loading') {
+        inventoryWarmupRetries = 0;
+      }
       if (currentPage() === 'tests') loadTests();
       if (state.session?.accessAdmin === true && state.access && accessRoutesSig !== currentAccessRoutesSig()) {
         loadAccess({ force: true });
@@ -2720,7 +2728,7 @@
     } catch (err) {
       if (err.status === 401) return;
       state.stale = true;
-      showBanner(err.message, () => refreshOverview({ force: true }), 'overview');
+      showBanner(err.message, () => refreshOverview({ force: true, fresh: true }), 'overview');
       if (!state.overview) renderFirstLoadError();
       else renderHeader();
     } finally {
@@ -2729,7 +2737,7 @@
         // A mutation finished while a poll was in flight — fetch once more so
         // the UI reflects post-mutation state instead of the stale response.
         refetchQueued = false;
-        refreshOverview({ force });
+        refreshOverview({ force, fresh });
       }
     }
   }
@@ -2759,7 +2767,7 @@
       await fn();
       ui.busy.delete(busyKey);
       bump();
-      await refreshOverview({ force: true });
+      await refreshOverview({ force: true, fresh: true });
       return true;
     } catch (err) {
       ui.busy.delete(busyKey);
@@ -2915,7 +2923,19 @@
     const page = currentPage();
     unmountInactiveSections(page);
     const o = state.overview;
-    if (!o) return;
+    if (!o) {
+      if (page === 'performance') {
+        setSection('usage-body', sig('overview-loading'),
+          () => [emptyState('Loading current project usage…')], force);
+        setSection('perf-body', sig(state.metricsAt, 'metrics-only'), () => buildPerf(null), force);
+        const count = state.metrics
+          ? (state.metrics.entities || []).filter((e) => e.kind === 'server' || e.kind === 'docker').length
+          : null;
+        setCount('perf-count', count);
+        setNavCount('performance', count);
+      }
+      return;
+    }
     if (popover.key !== null) {
       if (!force) { popover.pending = true; return; }
       popover.pending = false;
@@ -3128,7 +3148,7 @@
           h('div', { class: 'prob-actions' },
             h('button', {
               class: 'btn small', type: 'button', 'data-fk': 'hdr-coord-retry',
-              onclick: () => refreshOverview({ force: true }),
+              onclick: () => refreshOverview({ force: true, fresh: true }),
             }, icon('refresh'), 'Try again')),
         ],
       });
@@ -3216,7 +3236,7 @@
           h('div', { class: 'prob-actions' },
             h('button', {
               class: 'btn small', type: 'button', 'data-fk': 'hdr-stale-retry',
-              onclick: () => refreshOverview({ force: true }),
+              onclick: () => refreshOverview({ force: true, fresh: true }),
             }, icon('refresh'), 'Refresh now')),
         ],
       });
@@ -3296,6 +3316,9 @@
   }
 
   function degradedPanel(o) {
+    if (o?.coordinator?.inventoryState === 'loading') {
+      return h('p', { class: 'empty' }, 'Loading live Coordinator inventory…');
+    }
     return h('div', { class: 'degraded' },
       icon('warn'),
       h('div', null,
@@ -3303,7 +3326,7 @@
         h('p', { class: 'deg-msg' }, coordErrorText(o)),
         h('button', {
           class: 'btn small', type: 'button',
-          onclick: () => refreshOverview({ force: true }),
+          onclick: () => refreshOverview({ force: true, fresh: true }),
         }, icon('refresh'), 'Try again')));
   }
 
@@ -3687,7 +3710,7 @@
       $('#rf-access-text').textContent = 'Google sign-in required';
       updatePreview();
       announce(`Route ${slug}.${domain} created`);
-      await refreshOverview({ force: true });
+      await refreshOverview({ force: true, fresh: true });
     } catch (err) {
       if (err.status !== 401) {
         fail(err.message);
@@ -5237,7 +5260,7 @@
       $('#lf-preferred').value = '';
       $('#lf-project').value = '';
       announce(`Port ${resp?.lease?.port ?? ''} leased`);
-      await refreshOverview({ force: true });
+      await refreshOverview({ force: true, fresh: true });
     } catch (err) {
       if (err.status !== 401) {
         fail(err.message);
@@ -5922,10 +5945,11 @@
         }
       });
 
-    await refreshOverview({ force: true });
-    await refreshMetrics();
+    const initialOverview = refreshOverview({ force: true });
+    const initialMetrics = refreshMetrics();
     startPolling();
     startCountdowns();
+    await Promise.allSettled([initialOverview, initialMetrics]);
   }
 
   boot();

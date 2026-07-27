@@ -76,7 +76,7 @@ test('archive counts never claim zero before the owner-only archive list loads',
 
 test('post-lifecycle focus waits until inventory and archive refreshes settle', async () => {
   const app = await fsp.readFile(new URL('../src/ui/app.js', import.meta.url), 'utf8');
-  const refresh = extractFunction(app, 'async function refreshOverview({ force = false } = {})');
+  const refresh = extractFunction(app, 'async function refreshOverview({ force = false, fresh = false } = {})');
   const focus = extractFunction(app, 'function focusLifecycleTarget()');
 
   assert.match(refresh, /!lifecycleRefreshInFlight[\s\S]*loadArchives\(\{ force: true \}\)/,
@@ -91,7 +91,7 @@ test('archive UI and polling require explicit backend lifecycle readiness', asyn
   const sync = extractFunction(app, 'function syncLifecycleVisibility()');
   const load = extractFunction(app, 'async function loadArchives({ force = false } = {})');
   const button = extractFunction(app, 'function archiveButton(target, { compact = false } = {})');
-  const refresh = extractFunction(app, 'async function refreshOverview({ force = false } = {})');
+  const refresh = extractFunction(app, 'async function refreshOverview({ force = false, fresh = false } = {})');
   const boot = extractFunction(app, 'async function boot()');
 
   assert.match(capability, /accessAdmin === true/);

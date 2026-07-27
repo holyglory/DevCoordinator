@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { createRequire } from 'node:module';
+import fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -58,6 +59,23 @@ function loadLockedPlaywright() {
   throw new Error(
     'locked Playwright runtime not found; run npm ci --ignore-scripts --prefix ci/playwright and set NODE_PATH=ci/playwright/node_modules',
   );
+}
+
+async function launchChromium(chromium, args) {
+  const configured = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+  const candidates = [configured, '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser']
+    .filter((item, index, list) => item && list.indexOf(item) === index && fs.existsSync(item));
+  const attempts = [{ name: 'Playwright-managed Chromium', options: {} },
+    ...candidates.map((executablePath) => ({ name: executablePath, options: { executablePath } }))];
+  const failures = [];
+  for (const attempt of attempts) {
+    try {
+      return await chromium.launch({ headless: true, args, ...attempt.options });
+    } catch (error) {
+      failures.push(`${attempt.name}: ${String(error.message).split('\n')[0]}`);
+    }
+  }
+  throw new Error(`could not launch a real Chromium browser:\n${failures.join('\n')}`);
 }
 
 async function preparePage(context, unexpectedRequests, browserErrors) {
@@ -192,10 +210,8 @@ async function main() {
     if (loginResult.status !== 200 || !sessionCookie) {
       throw new Error(`isolated fixture login failed with HTTP ${loginResult.status}`);
     }
-    browser = await chromium.launch({
-      headless: true,
-      args: [`--host-resolver-rules=MAP ${stack.consoleHost} 127.0.0.1`],
-    });
+    browser = await launchChromium(chromium,
+      [`--host-resolver-rules=MAP ${stack.consoleHost} 127.0.0.1`]);
     for (const definition of CAPTURES) {
       await captureOne({ browser, stack, sessionCookie, definition });
     }

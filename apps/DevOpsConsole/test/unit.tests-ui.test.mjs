@@ -11,6 +11,8 @@ test('Tests destination leads with repository-scoped real statistics and bounded
     fsp.readFile(new URL('app.css', UI), 'utf8'),
   ]);
   assert.match(html, /data-nav="tests">Tests/);
+  assert.match(html, /data-page="performance"[\s\S]*href="#\/tests">Test dashboards<\/a>/,
+    'Performance must disclose where test-run dashboards live');
   assert.match(html, /data-page="tests"/);
   assert.ok(html.indexOf('id="tests-h"') < html.indexOf('id="tests-body"'));
   assert.match(js, /function loadTests\(/);

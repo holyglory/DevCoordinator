@@ -6,12 +6,12 @@
   "generator": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
   "width": 390,
   "height": 844,
-  "sha256": "dbf64172c5e9d96fec569e49b4585decc7596356df110e94ffab6052f14b0e20",
+  "sha256": "ee09c4592f9d9841f2d186a5c316d6e4dafcca84743b816c8a3c5402147ef889",
   "viewport": {
     "width": 390,
     "height": 844
   },
-  "source_sha256": "6f671bdf87140c785c7f48bdb29154a1352a2b81d7e56e0cec0b05b61fd4b25f",
+  "source_sha256": "7165eb6190aadc2214ef46d17104fa063f650ff91f902b323e13d13b7026703e",
   "source_files": [
     {
       "path": "apps/DevOpsConsole/Tools/canonical-api-fixtures.mjs",
@@ -23,7 +23,7 @@
     },
     {
       "path": "apps/DevOpsConsole/Tools/capture-canonical-artifacts.mjs",
-      "sha256": "30f37231e8a1fffd31a49d791dda3c896f76ad5bcaee3ed204ea91b836f935ac"
+      "sha256": "4abb2bb4da1a745d69983195af686ccd3e82316331f6926d74323223cb24dd8a"
     },
     {
       "path": "apps/DevOpsConsole/src/auth/pages.mjs",
@@ -35,11 +35,11 @@
     },
     {
       "path": "apps/DevOpsConsole/src/ui/app.js",
-      "sha256": "cb4dd2184f353e74a09f4dc5d93b15108c32bb34082b82510ccfe76f96b98e64"
+      "sha256": "ad39a8566af1a65becbef3590b5011d555f73ba707c430c98c08ca7523c169bb"
     },
     {
       "path": "apps/DevOpsConsole/src/ui/index.html",
-      "sha256": "96287f98f5ebcb9e7b6cff1adcde42579227d1ba62918c599b893c075076d3ea"
+      "sha256": "f9c2ca033fe5f7f9e910b43f33b63a84cfe3345e6a2ff0667c790ca640ff694f"
     },
     {
       "path": "apps/DevOpsConsole/test/helpers/stack.mjs",
