@@ -4563,10 +4563,19 @@ class BrokerPersistence:
                          AND m.host_resource_id = b.resource_id
                         WHERE b.binding_id = ? AND b.resource_kind = ?
                           AND b.resource_id = ? AND b.authority_state = 'authoritative'
-                          AND s.effective_uid = ?
-                          AND (m.repo_id = ? OR m.repo_id IS NULL)
+                          AND (
+                            (m.repo_id = ? AND s.effective_uid IN (0, ?))
+                            OR (m.repo_id IS NULL AND s.effective_uid = ?)
+                          )
                         """,
-                        (control_binding_id, resource_kind, resource_id, uid, repo_id),
+                        (
+                            control_binding_id,
+                            resource_kind,
+                            resource_id,
+                            repo_id,
+                            uid,
+                            uid,
+                        ),
                     ).fetchone()
                 else:
                     exact = connection.execute(

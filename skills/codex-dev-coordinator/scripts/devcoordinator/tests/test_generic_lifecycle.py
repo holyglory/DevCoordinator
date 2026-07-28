@@ -80,6 +80,40 @@ def _grant_project_archive(persistence: object) -> None:
 
 
 class GenericLifecycleBrokerTests(unittest.TestCase):
+    def test_service_observed_repository_member_can_receive_exact_cleanup_grant(
+        self,
+    ) -> None:
+        with fixtures.CanonicalTemporaryDirectory() as root:
+            persistence, _actions = fixtures.seed_store_backed_broker(root)
+            with CoordinatorStore.open(
+                persistence.database_path, expected_uid=os.geteuid()
+            ) as store:
+                with store.immediate_transaction() as connection:
+                    connection.execute(
+                        "UPDATE coordinator_sources SET effective_uid = 0"
+                    )
+                    connection.execute(
+                        "UPDATE repository_memberships SET immutable_fingerprint = ? "
+                        "WHERE host_resource_id = ?",
+                        ("sha256:" + "a" * 64, fixtures.CONTAINER_ID),
+                    )
+                exact, repo_id = SQLiteLifecyclePersistence(store).resolve_resource(
+                    ResourceKind.CONTAINER,
+                    fixtures.CONTAINER_ID,
+                    fixtures.CONTROL_ID,
+                )
+
+            persistence.grant_cleanup_resource(
+                uid=os.geteuid(),
+                repo_id=repo_id,
+                resource_kind=exact.kind.value,
+                resource_id=exact.resource_id,
+                control_binding_id=exact.control_binding_id,
+                immutable_fingerprint=exact.immutable_fingerprint,
+                ownership_fingerprint=exact.ownership_fingerprint,
+                operation=BrokerOperation.CLEANUP_PLAN,
+            )
+
     def test_completed_permanent_cleanup_replay_does_not_resolve_deleted_resource(self) -> None:
         with fixtures.CanonicalTemporaryDirectory() as root:
             persistence, actions = fixtures.seed_store_backed_broker(root)
