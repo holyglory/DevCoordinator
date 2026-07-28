@@ -2630,7 +2630,7 @@ volumes:
             "snapshot-post-" + current_id,
         )
 
-    def test_invoked_failure_requires_reconciliation_and_never_reexecutes(self) -> None:
+    def test_invoked_failure_is_reconciled_before_a_new_request_executes(self) -> None:
         calls = 0
 
         def runner(
@@ -2718,8 +2718,23 @@ volumes:
             self.fixture.peer(), new_request.to_wire()
         )
         self.assertFalse(blocked["ok"], blocked)
-        self.assertEqual(blocked["error"]["code"], "compose_operation_pending")
-        self.assertEqual(calls, 1)
+        self.assertEqual(blocked["error"]["code"], "operation_outcome_uncertain")
+        self.assertEqual(calls, 2)
+        with CoordinatorStore.open(
+            self.fixture.persistence.database_path,
+            expected_uid=os.geteuid(),
+        ) as store:
+            with store.read_transaction() as connection:
+                reconciled = connection.execute(
+                    """
+                    SELECT status, phase, error_code
+                    FROM operations WHERE operation_id = ?
+                    """,
+                    (request.operation_id,),
+                ).fetchone()
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertEqual(reconciled["phase"], "reconciled")
+        self.assertEqual(reconciled["error_code"], "compose_outcome_reconciled")
 
     def test_missing_effective_model_evidence_requires_fingerprint_abandonment(
         self,

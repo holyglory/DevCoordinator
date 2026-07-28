@@ -361,7 +361,36 @@ class StoreBackedMutationBackend:
                     "This durable operation is already running or requires reconciliation; it was not executed again.",
                     operation_id=request.operation_id,
                 )
-            self._persistence.require_no_active_compose_operation(authorized)
+            try:
+                self._persistence.require_no_active_compose_operation(authorized)
+            except BrokerError as exc:
+                if exc.code != "compose_operation_pending":
+                    raise
+                prior_operation_id = (
+                    self._persistence.reconcilable_prior_compose_operation_id(
+                        authorized
+                    )
+                )
+                if prior_operation_id is None:
+                    raise
+                candidate = self._persistence.compose_reconciliation_candidate(
+                    prior_operation_id
+                )
+                if (
+                    candidate["repo_id"] != request.project_id
+                    or candidate["compose_definition_id"] != request.resource_id
+                ):
+                    raise
+                reconciliation_evidence = self._observe_fresh_full_docker(
+                    request.operation_id,
+                    project_id=request.project_id,
+                )
+                self._persistence.reconcile_compose_operation(
+                    prior_operation_id,
+                    evidence=reconciliation_evidence,
+                    authorized=authorized,
+                )
+                self._persistence.require_no_active_compose_operation(authorized)
             compose_preflight = self._observe_fresh_full_docker(
                 request.operation_id,
                 project_id=request.project_id,

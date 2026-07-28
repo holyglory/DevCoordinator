@@ -6560,6 +6560,59 @@ class BrokerPersistence:
                     request=request,
                 )
 
+    def reconcilable_prior_compose_operation_id(
+        self,
+        authorized: AuthorizedBrokerRequest,
+    ) -> str | None:
+        """Return an exact prior uncertain Compose operation for this request."""
+
+        request = authorized.request
+        if request.operation not in _COMPOSE_OPERATIONS:
+            raise ValueError("request is not a Compose operation")
+        with self._store() as store:
+            with store.read_transaction() as connection:
+                _authorize_connection(
+                    connection,
+                    peer=authorized.peer,
+                    request=request,
+                )
+                row = connection.execute(
+                    """
+                    SELECT operation.operation_id
+                    FROM operations operation
+                    JOIN operation_targets target USING(operation_id)
+                    JOIN broker_compose_definitions target_definition
+                      ON target_definition.compose_definition_id = target.target_id
+                    JOIN repositories target_repository
+                      ON target_repository.repo_id = target_definition.repo_id
+                    JOIN broker_compose_definitions requested_definition
+                      ON requested_definition.compose_definition_id = ?
+                    JOIN repositories requested_repository
+                      ON requested_repository.repo_id = requested_definition.repo_id
+                    WHERE target.target_kind = 'compose'
+                      AND (
+                          target.target_id = ?
+                          OR (
+                              target_definition.project_name =
+                                  requested_definition.project_name
+                              AND target_repository.host_id =
+                                  requested_repository.host_id
+                          )
+                      )
+                      AND operation.operation_id != ?
+                      AND operation.status = 'needs_attention'
+                      AND operation.phase = 'reconciliation_required'
+                    ORDER BY operation.created_at, operation.operation_id
+                    LIMIT 1
+                    """,
+                    (
+                        request.resource_id,
+                        request.resource_id,
+                        request.operation_id,
+                    ),
+                ).fetchone()
+                return None if row is None else str(row["operation_id"])
+
     def list_removed_repository(
         self, authorized: AuthorizedBrokerRequest
     ) -> list[dict[str, Any]]:
@@ -8094,22 +8147,41 @@ class BrokerPersistence:
         evidence: Mapping[str, Any] | None,
         abandon_as_failed: bool = False,
         confirm_definition_fingerprint: str | None = None,
+        authorized: AuthorizedBrokerRequest | None = None,
     ) -> dict[str, Any]:
         """Resolve one uncertain Compose outcome as an evidenced terminal failure."""
 
-        if os.geteuid() != 0 or self.expected_uid != 0:
+        if authorized is None and (os.geteuid() != 0 or self.expected_uid != 0):
             raise PermissionError(
                 "Compose reconciliation requires the root service administrator"
             )
+        if authorized is not None and authorized.request.operation not in _COMPOSE_OPERATIONS:
+            raise ValueError("automatic reconciliation requires a Compose request")
         _require_identifier(operation_id, "operation_id")
         if not abandon_as_failed and not isinstance(evidence, Mapping):
             raise TypeError("Compose reconciliation evidence must be a mapping")
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
+                if authorized is not None:
+                    _authorize_connection(
+                        connection,
+                        peer=authorized.peer,
+                        request=authorized.request,
+                    )
                 candidate = _compose_reconciliation_candidate_connection(
                     connection, operation_id=operation_id
                 )
+                if authorized is not None and (
+                    candidate["repo_id"] != authorized.request.project_id
+                    or candidate["compose_definition_id"]
+                    != authorized.request.resource_id
+                ):
+                    raise BrokerError(
+                        "resource_access_denied",
+                        "Prior Compose operation does not belong to the exact authorized definition.",
+                        operation_id=authorized.request.operation_id,
+                    )
                 scope_recoverable = bool(candidate["scope_recoverable"])
                 if abandon_as_failed:
                     if scope_recoverable:
@@ -8186,8 +8258,13 @@ class BrokerPersistence:
                 reconciliation = {
                     "mode": mode,
                     "administrator": {
-                        "uid": 0,
-                        "actor": "broker-admin:uid:0",
+                        "uid": 0 if authorized is None else authorized.peer.uid,
+                        "actor": (
+                            "broker-admin:uid:0"
+                            if authorized is None
+                            else "broker:auto-reconcile:uid:"
+                            + str(authorized.peer.uid)
+                        ),
                     },
                     "snapshot": snapshot_evidence,
                     "proof": proof,
