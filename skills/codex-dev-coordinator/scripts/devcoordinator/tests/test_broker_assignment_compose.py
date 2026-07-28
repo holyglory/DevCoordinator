@@ -3948,6 +3948,8 @@ volumes:
         )
         self.assertFalse(reply["ok"], reply)
         self.assertEqual(reply["error"]["code"], "compose_operation_pending")
+        self.assertEqual(reply["operation_id"], second_request.operation_id)
+        self.assertIn(first_request.operation_id, reply["error"]["message"])
         self.assertEqual(observations, 0)
         self.assertEqual(runner_calls, 0)
 
@@ -3960,6 +3962,8 @@ volumes:
                 compose_preflight=evidence,
             )
         self.assertEqual(raised.exception.code, "compose_operation_pending")
+        self.assertEqual(raised.exception.operation_id, second_request.operation_id)
+        self.assertIn(first_request.operation_id, raised.exception.message)
 
     def test_compose_preflight_rejects_missing_stale_and_wrong_domain_evidence(
         self,

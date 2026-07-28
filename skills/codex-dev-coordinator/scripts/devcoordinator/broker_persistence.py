@@ -10931,9 +10931,13 @@ def _require_no_unresolved_compose_operation(
         (request.resource_id, request.resource_id, request.operation_id),
     ).fetchone()
     if unresolved is not None:
+        unresolved_operation_id = str(unresolved["operation_id"])
         raise BrokerError(
             "compose_operation_pending",
-            "A prior Compose operation for this exact definition requires completion or reconciliation.",
+            "A prior Compose operation for this exact definition requires "
+            "completion or reconciliation: operation_id="
+            + unresolved_operation_id
+            + ".",
             operation_id=request.operation_id,
         )
 
