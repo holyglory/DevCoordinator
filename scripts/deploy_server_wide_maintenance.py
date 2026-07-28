@@ -53,6 +53,7 @@ SCHEMA_BEFORE = 9
 SCHEMA_AFTER = 12
 CONSOLE_SERVER_ID = "144ba3fb-9939-5a81-91b1-f1bb3a5db418"
 MAX_INVENTORY_RESPONSE_BYTES = 64 * 1024 * 1024
+ONLINE_BACKUP_TIMEOUT_SECONDS = 15 * 60
 
 
 class DeploymentError(RuntimeError):
@@ -99,6 +100,11 @@ class Driver:
             console_state_dir / "identity-assertion-public.json"
         )
         self.deployment_id = str(uuid.UUID(args.deployment_id))
+        self.recover_deployment_id = (
+            str(uuid.UUID(args.recover_deployment_id))
+            if args.recover_deployment_id
+            else None
+        )
         self.group_gid = grp.getgrnam(CLIENT_GROUP).gr_gid
         self.console_uid = pwd.getpwnam("holyglory").pw_uid
         self.phase = "initializing"
@@ -362,6 +368,63 @@ class Driver:
             CONSOLE_UNIT: console,
         }
 
+    def recover_prior_failed_deployment(self) -> dict[str, Any] | None:
+        """Recover one explicitly identified rollback-failed control plane.
+
+        Recovery is accepted only behind that transaction's trusted marker.
+        Establish a stopped Console boundary before loading the approved target
+        source into the API. Clear only the exact old fence for the readiness
+        proof, and restore it if that proof fails.
+        """
+
+        if self.recover_deployment_id is None:
+            return None
+        self.prepare_maintenance_root()
+        maintenance = load_maintenance_state(
+            expected_uid=0,
+            expected_gid=self.group_gid,
+        )
+        if maintenance is None or maintenance.deployment_id != self.recover_deployment_id:
+            raise DeploymentError(
+                "rollback recovery requires the exact trusted maintenance transaction"
+            )
+        broker = self.require_active(BROKER_UNIT)
+        api_before = self.require_active(API_UNIT)
+        self.run(["/usr/bin/systemctl", "stop", CONSOLE_UNIT], timeout=120)
+        self.wait_inactive(CONSOLE_UNIT)
+        self.run(["/usr/bin/systemctl", "restart", API_UNIT], timeout=90)
+        api = self.require_active(API_UNIT)
+        console_private_state = self.normalize_console_private_state()
+        clear_maintenance(
+            expected_uid=0,
+            expected_gid=self.group_gid,
+            deployment_id=self.recover_deployment_id,
+        )
+        try:
+            self.run(["/usr/bin/systemctl", "restart", CONSOLE_UNIT], timeout=120)
+            services = self.verify_services(inventory_name="recovery-inventory.json")
+        except BaseException:
+            activate_maintenance(
+                expected_uid=0,
+                expected_gid=self.group_gid,
+                deployment_id=self.recover_deployment_id,
+                scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
+                message=PUBLIC_MAINTENANCE_MESSAGE,
+                retry_after_seconds=maintenance.retry_after_seconds,
+                started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            )
+            raise
+        evidence = {
+            "recovered_deployment_id": self.recover_deployment_id,
+            "broker": broker,
+            "api_before": api_before,
+            "api": api,
+            "console": services["console"],
+            "console_private_state": console_private_state,
+        }
+        self.journal(prior_recovery=evidence)
+        return evidence
+
     def wait_inactive(self, unit: str, *, timeout: float = 120) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -524,7 +587,10 @@ class Driver:
                 "--output-root",
                 str(root),
             ],
-            timeout=120,
+            # The authoritative store can be several GiB. Keep the operation
+            # bounded, but size the deadline for a verified copy plus hashing
+            # on a contended host instead of forcing a rollback at 120s.
+            timeout=ONLINE_BACKUP_TIMEOUT_SECONDS,
         )
         try:
             result = json.loads(completed.stdout)
@@ -1024,6 +1090,7 @@ class Driver:
             raise DeploymentError(
                 "migration checkout does not match the approved rollback commit"
             )
+        prior_recovery = self.recover_prior_failed_deployment()
         pre_units = self.require_or_recover_preflight_services()
         # A same-schema release can be introducing the bounded inventory path
         # itself. Requiring the old in-memory API to serialize inventory here
@@ -1049,7 +1116,11 @@ class Driver:
         self.marker_active = True
         try:
             self.phase = "maintenance-draining"
-            self.journal(pre_units=pre_units, public_before=public_before)
+            self.journal(
+                pre_units=pre_units,
+                public_before=public_before,
+                prior_recovery=prior_recovery,
+            )
             self.wait_for_operation_quiescence()
             pre_schema = self.schema_evidence(expected=self.schema_before)
             pre_client_schema = self.client_schema_evidence(expected=self.schema_before)
@@ -1181,6 +1252,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rollback-ref", required=True)
     parser.add_argument("--transaction-dir", required=True)
     parser.add_argument("--deployment-id", required=True)
+    parser.add_argument(
+        "--recover-deployment-id",
+        help=(
+            "exact trusted maintenance transaction left by a rollback-failed "
+            "deployment; recover its API/Console boundary before preflight"
+        ),
+    )
     parser.add_argument("--client-user", action="append", required=True)
     parser.add_argument("--public-url", action="append", required=True)
     parser.add_argument("--token-file", required=True)

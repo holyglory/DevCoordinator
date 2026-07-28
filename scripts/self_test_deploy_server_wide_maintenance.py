@@ -343,6 +343,23 @@ def main() -> int:
         "deployment does not tolerate the broker's bounded post-stop lock handoff",
     )
     expect(
+        MODULE.ONLINE_BACKUP_TIMEOUT_SECONDS >= 10 * 60,
+        "multi-GiB verified backup still inherits the incident-causing short deadline",
+    )
+    failed_recovery_source = inspect.getsource(
+        MODULE.Driver.recover_prior_failed_deployment
+    )
+    expect(
+        failed_recovery_source.index("load_maintenance_state(")
+        < failed_recovery_source.index('["/usr/bin/systemctl", "stop", CONSOLE_UNIT]')
+        < failed_recovery_source.index('["/usr/bin/systemctl", "restart", API_UNIT]')
+        < failed_recovery_source.index("clear_maintenance(")
+        < failed_recovery_source.index('["/usr/bin/systemctl", "restart", CONSOLE_UNIT]')
+        < failed_recovery_source.index("self.verify_services(")
+        < failed_recovery_source.index("activate_maintenance("),
+        "rollback-failed recovery is not fenced, ordered, and verified before reopening",
+    )
+    expect(
         deploy_source.index("os.chown(self.transaction, 0, 0)")
         < deploy_source.index("self.journal()"),
         "deployment artifacts can inherit a group owner that blocks installer rollback",

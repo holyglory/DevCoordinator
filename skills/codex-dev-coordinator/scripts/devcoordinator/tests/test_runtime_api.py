@@ -85,6 +85,20 @@ class RuntimeApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_legacy_empty_server_environment_list_normalizes_without_profile_failure(
+        self,
+    ) -> None:
+        normalized = dev_coordinator.normalize_server_definition(
+            {"name": "legacy-server", "cmd": ["true"], "env": []},
+            str(self.repository),
+        )
+        self.assertEqual(normalized["env"], {})
+        with self.assertRaisesRegex(ValueError, "key/value map"):
+            dev_coordinator.normalize_server_definition(
+                {"name": "invalid-server", "cmd": ["true"], "env": ["A=B"]},
+                str(self.repository),
+            )
+
     def test_inventory_keeps_only_current_observation_snapshot_evidence(self) -> None:
         with AccountStore.open_default(
             self.home, effective_uid=os.geteuid()

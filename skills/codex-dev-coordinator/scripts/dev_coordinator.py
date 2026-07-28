@@ -6100,6 +6100,15 @@ def normalize_server_definition(raw: dict[str, Any], project: str) -> dict[str, 
     with contextlib.suppress(TypeError, ValueError):
         port = int(port) if port is not None else None
     cwd = resolve_runtime_path(project, raw.get("cwd"))
+    raw_environment = raw.get("env")
+    if raw_environment is None or (
+        isinstance(raw_environment, (list, tuple)) and not raw_environment
+    ):
+        environment: dict[str, str] = {}
+    elif isinstance(raw_environment, Mapping):
+        environment = dict(raw_environment)
+    else:
+        raise ValueError("server env must be a key/value map")
     return {
         "type": "server",
         "name": name,
@@ -6114,7 +6123,7 @@ def normalize_server_definition(raw: dict[str, Any], project: str) -> dict[str, 
         "health_url": raw.get("health_url"),
         "readiness_url": raw.get("readiness_url") or raw.get("ready_url"),
         "health_timeout": float(raw.get("health_timeout") or 10),
-        "env": runtime_list(raw.get("env")),
+        "env": environment,
     }
 
 

@@ -766,7 +766,7 @@ def _reinstalled_server_id(
 
 
 def _bounded_server_environment(value: Any) -> dict[str, str]:
-    if value is None:
+    if value is None or (isinstance(value, (list, tuple)) and not value):
         return {}
     if not isinstance(value, Mapping) or len(value) > _MAX_SERVER_ENVIRONMENT_ENTRIES:
         raise ValueError("server env must be a bounded NUL-free string map")
