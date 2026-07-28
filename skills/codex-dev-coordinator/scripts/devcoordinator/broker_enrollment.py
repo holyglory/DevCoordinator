@@ -1282,16 +1282,7 @@ def _grant_observed_lifecycle_resources(
                 resource_id=exact.resource_id,
                 control_binding_id=exact.control_binding_id,
                 immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=(
-                    exact.control_contract_fingerprint
-                    if operation
-                    in {
-                        BrokerOperation.CLEANUP_PLAN,
-                        BrokerOperation.CLEANUP_APPLY,
-                        BrokerOperation.RESOURCE_RESTORE,
-                    }
-                    else exact.ownership_fingerprint
-                ),
+                ownership_fingerprint=exact.ownership_fingerprint,
                 operation=operation,
             )
 
@@ -1350,7 +1341,16 @@ def _grant_observed_cleanup_resources(
                 resource_id=exact.resource_id,
                 control_binding_id=exact.control_binding_id,
                 immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.ownership_fingerprint,
+                ownership_fingerprint=(
+                    exact.control_contract_fingerprint
+                    if operation
+                    in {
+                        BrokerOperation.CLEANUP_PLAN,
+                        BrokerOperation.CLEANUP_APPLY,
+                        BrokerOperation.RESOURCE_RESTORE,
+                    }
+                    else exact.ownership_fingerprint
+                ),
                 operation=operation,
             )
 
