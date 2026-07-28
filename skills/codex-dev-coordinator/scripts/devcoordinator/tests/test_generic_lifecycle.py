@@ -110,7 +110,7 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 resource_id=exact.resource_id,
                 control_binding_id=exact.control_binding_id,
                 immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.ownership_fingerprint,
+                ownership_fingerprint=exact.control_contract_fingerprint,
                 operation=BrokerOperation.CLEANUP_PLAN,
             )
             persistence.grant_cleanup(
@@ -137,7 +137,7 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 resource_id=exact.resource_id,
                 control_binding_id=exact.control_binding_id,
                 immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.ownership_fingerprint,
+                ownership_fingerprint=exact.control_contract_fingerprint,
                 operation=BrokerOperation.CLEANUP_PLAN,
             )
 
@@ -548,7 +548,11 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                     resource_id=fixtures.CONTAINER_ID,
                     control_binding_id=exact.control_binding_id,
                     immutable_fingerprint=exact.immutable_fingerprint,
-                    ownership_fingerprint=exact.ownership_fingerprint,
+                    ownership_fingerprint=(
+                        exact.control_contract_fingerprint
+                        if operation is BrokerOperation.RESOURCE_RESTORE
+                        else exact.ownership_fingerprint
+                    ),
                     operation=operation,
                 )
             adapter = RestorableLifecycleAdapter()
@@ -607,7 +611,7 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 resource_id=fixtures.CONTAINER_ID,
                 control_binding_id=exact.control_binding_id,
                 immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.ownership_fingerprint,
+                ownership_fingerprint=exact.control_contract_fingerprint,
                 operation=BrokerOperation.CLEANUP_PLAN,
             )
             persistence.grant_cleanup_resource(
@@ -617,7 +621,7 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 resource_id=fixtures.CONTAINER_ID,
                 control_binding_id=exact.control_binding_id,
                 immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.ownership_fingerprint,
+                ownership_fingerprint=exact.control_contract_fingerprint,
                 operation=BrokerOperation.CLEANUP_APPLY,
             )
             purge_plan = service.reply_for_document(
@@ -636,7 +640,7 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 resource_id=fixtures.CONTAINER_ID,
                 control_binding_id=exact.control_binding_id,
                 immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.ownership_fingerprint,
+                ownership_fingerprint=exact.control_contract_fingerprint,
                 operation=BrokerOperation.CLEANUP_APPLY,
                 enabled=False,
             )
@@ -695,7 +699,7 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 resource_id=fixtures.CONTAINER_ID,
                 control_binding_id=exact.control_binding_id,
                 immutable_fingerprint=exact.immutable_fingerprint,
-                ownership_fingerprint=exact.ownership_fingerprint,
+                ownership_fingerprint=exact.control_contract_fingerprint,
                 operation=BrokerOperation.RESOURCE_RESTORE,
             )
             restored = service.reply_for_document(

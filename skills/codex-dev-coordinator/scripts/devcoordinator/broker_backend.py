@@ -522,7 +522,7 @@ class StoreBackedMutationBackend:
                                 resource_id=exact.resource_id,
                                 control_binding_id=exact.control_binding_id,
                                 immutable_fingerprint=exact.immutable_fingerprint,
-                                ownership_fingerprint=exact.ownership_fingerprint,
+                                ownership_fingerprint=exact.control_contract_fingerprint,
                                 operation=BrokerOperation.RESOURCE_RESTORE,
                             )
                             result = dict(
@@ -2063,7 +2063,7 @@ class StoreBackedMutationBackend:
             resource_id=exact.resource_id,
             control_binding_id=exact.control_binding_id,
             immutable_fingerprint=exact.immutable_fingerprint,
-            ownership_fingerprint=exact.ownership_fingerprint,
+            ownership_fingerprint=exact.control_contract_fingerprint,
             operation=operation,
         )
         return exact, repo_id
