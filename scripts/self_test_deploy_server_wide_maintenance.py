@@ -353,8 +353,10 @@ def main() -> int:
         failed_recovery_source.index("load_maintenance_state(")
         < failed_recovery_source.index('["/usr/bin/systemctl", "stop", CONSOLE_UNIT]')
         < failed_recovery_source.index('["/usr/bin/systemctl", "restart", API_UNIT]')
+        < failed_recovery_source.index("clear_maintenance(")
+        < failed_recovery_source.index('["/usr/bin/systemctl", "restart", CONSOLE_UNIT]')
         < failed_recovery_source.index("self.verify_services(")
-        < failed_recovery_source.index("clear_maintenance("),
+        < failed_recovery_source.index("activate_maintenance("),
         "rollback-failed recovery is not fenced, ordered, and verified before reopening",
     )
     expect(

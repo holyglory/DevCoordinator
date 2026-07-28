@@ -373,7 +373,8 @@ class Driver:
 
         Recovery is accepted only behind that transaction's trusted marker.
         Establish a stopped Console boundary before loading the approved target
-        source into the API, then prove registration before clearing the fence.
+        source into the API. Clear only the exact old fence for the readiness
+        proof, and restore it if that proof fails.
         """
 
         if self.recover_deployment_id is None:
@@ -394,13 +395,25 @@ class Driver:
         self.run(["/usr/bin/systemctl", "restart", API_UNIT], timeout=90)
         api = self.require_active(API_UNIT)
         console_private_state = self.normalize_console_private_state()
-        self.run(["/usr/bin/systemctl", "restart", CONSOLE_UNIT], timeout=120)
-        services = self.verify_services(inventory_name="recovery-inventory.json")
         clear_maintenance(
             expected_uid=0,
             expected_gid=self.group_gid,
             deployment_id=self.recover_deployment_id,
         )
+        try:
+            self.run(["/usr/bin/systemctl", "restart", CONSOLE_UNIT], timeout=120)
+            services = self.verify_services(inventory_name="recovery-inventory.json")
+        except BaseException:
+            activate_maintenance(
+                expected_uid=0,
+                expected_gid=self.group_gid,
+                deployment_id=self.recover_deployment_id,
+                scope=CONTROL_PLANE_MAINTENANCE_SCOPE,
+                message=PUBLIC_MAINTENANCE_MESSAGE,
+                retry_after_seconds=maintenance.retry_after_seconds,
+                started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            )
+            raise
         evidence = {
             "recovered_deployment_id": self.recover_deployment_id,
             "broker": broker,
