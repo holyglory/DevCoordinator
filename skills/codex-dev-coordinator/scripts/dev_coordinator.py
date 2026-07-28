@@ -12334,7 +12334,7 @@ def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]
             broker_database_path=database_path,
         )
 
-    if mode not in {"apply", "rollback"}:
+    if mode not in {"build", "apply", "rollback"}:
         raise ValueError("image publication mode is invalid")
     if not args.operation_id:
         raise ValueError(f"image publication {mode} requires --operation-id")
@@ -12346,6 +12346,20 @@ def coordinated_broker_publish_image(args: argparse.Namespace) -> dict[str, Any]
         runtime_config=config,
         name=str(args.publication),
     )
+    if mode == "build":
+        if not args.confirm_plan_fingerprint:
+            raise ValueError(
+                "image publication build requires --confirm-plan-fingerprint"
+            )
+        return apply_publication(
+            specification=specification,
+            artifact_root=artifact_root,
+            operation_id=str(args.operation_id),
+            confirmation_fingerprint=str(args.confirm_plan_fingerprint),
+            service_uid=0,
+            broker_database_path=database_path,
+            rollout=False,
+        )
     _require_live_image_publication_maintenance_boundary()
     # The broker service itself holds this same lock during normal operation.
     # A failed acquisition is a deliberate stop condition, not an invitation to

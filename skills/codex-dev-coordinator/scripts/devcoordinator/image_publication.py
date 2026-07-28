@@ -343,8 +343,9 @@ def apply_publication(
     docker_runner: Callable[[Sequence[str], float, Mapping[str, str]], subprocess.CompletedProcess[str]] | None = None,
     http_fetcher: Callable[[str, float], tuple[int, str]] | None = None,
     now: Callable[[], float] = time.time,
+    rollout: bool = True,
 ) -> dict[str, Any]:
-    """Build exactly one planned snapshot and recreate its declared workload."""
+    """Build one planned snapshot and optionally recreate its declared workload."""
 
     directory, manifest = load_manifest(
         artifact_root=artifact_root,
@@ -410,6 +411,9 @@ def apply_publication(
     manifest["image"] = image
     manifest["runtime_package"] = package_identity
     write_manifest(directory, manifest, expected_uid=service_uid)
+
+    if not rollout:
+        return publication_summary(manifest, artifact_directory=directory)
 
     manifest["status"] = "rolling_out"
     manifest["rollout_started_at"] = _utc_now()

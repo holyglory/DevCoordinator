@@ -442,6 +442,61 @@ class ImagePublicationTests(unittest.TestCase):
         self.assertNotIn("do-not-leak-bearer", json.dumps(diagnostic))
         self.assertLessEqual(len(diagnostic["stdout_tail"]), publication.BUILD_DIAGNOSTIC_LIMIT + 3)
 
+    def test_build_only_publishes_the_image_without_touching_workloads(self) -> None:
+        with mock.patch.object(publication, "docker_image_id", return_value=IMAGE_ID), mock.patch.object(
+            publication, "_docker_environment", return_value={}
+        ):
+            plan = publication.plan_publication(
+                specification=self.specification,
+                artifact_root=self.artifacts,
+                operation_id="36363636-3636-4363-8363-363636363636",
+                service_uid=os.geteuid(),
+                broker_database_path=self.broker_database,
+                compose_renderer=rendered_model,
+                compose_enrollment_verifier=self._enrollment_verifier,
+            )
+            _directory, planned = publication.load_manifest(
+                artifact_root=self.artifacts,
+                operation_id=plan["operation_id"],
+                expected_uid=os.geteuid(),
+            )
+            image = {
+                "image_id": IMAGE_ID,
+                "repo_digests": [],
+                "labels": {
+                    "io.devcoordinator.publication": self.specification.name,
+                    "io.devcoordinator.source-fingerprint": planned["source"]["fingerprint"],
+                    "io.devcoordinator.input-fingerprint": planned["snapshot"]["input_manifest_sha256"],
+                },
+            }
+            with mock.patch.object(
+                publication, "docker_image_evidence", return_value=image
+            ), mock.patch.object(
+                publication, "installed_package_identity", return_value="libgssapi-krb5-2=1.0:amd64"
+            ), mock.patch.object(
+                publication,
+                "run_compose_rollout",
+                side_effect=AssertionError("build-only publication must not touch workloads"),
+            ):
+                result = publication.apply_publication(
+                    specification=self.specification,
+                    artifact_root=self.artifacts,
+                    operation_id=plan["operation_id"],
+                    confirmation_fingerprint=plan["plan_fingerprint"],
+                    service_uid=os.geteuid(),
+                    broker_database_path=self.broker_database,
+                    compose_renderer=rendered_model,
+                    compose_enrollment_verifier=self._enrollment_verifier,
+                    docker_runner=lambda command, _timeout, _environment: subprocess.CompletedProcess(
+                        command, 0, stdout="built", stderr=""
+                    ),
+                    rollout=False,
+                )
+
+        self.assertEqual(result["status"], "built")
+        self.assertEqual(result["image_id"], IMAGE_ID)
+        self.assertIsNone(result["runtime_verification"])
+
     def test_apply_persists_failed_rollout_diagnostic(self) -> None:
         with mock.patch.object(publication, "docker_image_id", return_value=IMAGE_ID), mock.patch.object(
             publication, "_docker_environment", return_value={}

@@ -389,7 +389,7 @@ def add_broker_parser(subparsers: Any) -> None:
         ),
     )
     publish_image.add_argument(
-        "--mode", choices=("plan", "apply", "status", "rollback"), required=True
+        "--mode", choices=("plan", "build", "apply", "status", "rollback"), required=True
     )
     publish_image.add_argument("--project", required=True)
     publish_image.add_argument("--runtime-file")
