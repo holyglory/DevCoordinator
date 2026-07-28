@@ -4672,7 +4672,7 @@ class BrokerPersistence:
                       AND b.resource_kind = a.resource_kind
                       AND b.resource_id = a.resource_id
                       AND b.authority_state = 'authoritative'
-                      AND s.effective_uid = ?
+                      AND s.effective_uid IN (0, ?)
                       AND m.repo_id = a.repo_id
                     LIMIT 1
                     """,

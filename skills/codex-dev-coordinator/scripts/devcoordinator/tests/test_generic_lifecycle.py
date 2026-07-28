@@ -113,6 +113,33 @@ class GenericLifecycleBrokerTests(unittest.TestCase):
                 ownership_fingerprint=exact.ownership_fingerprint,
                 operation=BrokerOperation.CLEANUP_PLAN,
             )
+            persistence.grant_cleanup(
+                uid=os.geteuid(),
+                repo_id=repo_id,
+                operation=BrokerOperation.CLEANUP_PLAN,
+            )
+            persistence.authorize_cleanup_resource(
+                AuthorizedBrokerRequest(
+                    peer=fixtures.peer_for(),
+                    request=fixtures.request_for(
+                        BrokerOperation.CLEANUP_PLAN,
+                        resource_id=exact.resource_id,
+                        arguments={
+                            "action": "purge",
+                            "target_kind": "container",
+                            "target_id": exact.resource_id,
+                            "reason": "service-observed project cleanup",
+                        },
+                    ),
+                ),
+                repo_id=repo_id,
+                resource_kind=exact.kind.value,
+                resource_id=exact.resource_id,
+                control_binding_id=exact.control_binding_id,
+                immutable_fingerprint=exact.immutable_fingerprint,
+                ownership_fingerprint=exact.ownership_fingerprint,
+                operation=BrokerOperation.CLEANUP_PLAN,
+            )
 
     def test_completed_permanent_cleanup_replay_does_not_resolve_deleted_resource(self) -> None:
         with fixtures.CanonicalTemporaryDirectory() as root:
