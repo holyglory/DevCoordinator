@@ -936,7 +936,7 @@ def _worktree_matches_scope(raw: str, scope: RepositoryScopeIdentity) -> bool:
             expected_kind="directory",
             final_owner_uid=os.geteuid(),
         )
-    except RepositoryContextError:
+    except (RepositoryContextError, _filesystem_acl.FilesystemACLTrustError):
         return False
     return (identity.device, identity.inode) == (
         scope.root_device,
@@ -1098,7 +1098,7 @@ def _repository_path_matches_scope(
         _path, identity = _canonical_existing_directory(
             canonical_root, field="stored repository root"
         )
-    except RepositoryContextError:
+    except (RepositoryContextError, _filesystem_acl.FilesystemACLTrustError):
         return False
     return (identity.device, identity.inode) == (
         scope.root_device,

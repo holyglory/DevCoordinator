@@ -733,6 +733,26 @@ class RepositoryContextTests(unittest.TestCase):
                         scope=context.root,
                     )
 
+    def test_untrusted_unrelated_legacy_repository_is_not_an_identity_match(self) -> None:
+        context = resolve_repository_context(
+            root_repo=str(self.repository), temporary_repo=None
+        )
+        error = repository_context_module._filesystem_acl.FilesystemACLTrustError(
+            "unrelated repository has a different writer"
+        )
+
+        with mock.patch.object(
+            repository_context_module,
+            "_canonical_existing_directory",
+            side_effect=error,
+        ):
+            self.assertFalse(
+                repository_context_module._repository_path_matches_scope(
+                    "/unrelated/legacy/repository",
+                    context.root,
+                )
+            )
+
     def test_case_alias_resolves_to_same_identity_when_filesystem_supports_it(self) -> None:
         alias = self.repository.with_name(self.repository.name.upper())
         if alias == self.repository or not alias.exists() or not os.path.samefile(
