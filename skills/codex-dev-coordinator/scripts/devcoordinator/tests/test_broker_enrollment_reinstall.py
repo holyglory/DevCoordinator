@@ -524,7 +524,6 @@ class BrokerEnrollmentReinstallTests(unittest.TestCase):
 
     def test_server_environment_rejects_unstructured_or_unbounded_values(self) -> None:
         invalid = (
-            [],
             {"": "value"},
             {"BAD=NAME": "value"},
             {"BAD\x00NAME": "value"},
@@ -539,6 +538,10 @@ class BrokerEnrollmentReinstallTests(unittest.TestCase):
             with self.subTest(environment_type=type(environment).__name__):
                 with self.assertRaisesRegex(ValueError, "bounded NUL-free"):
                     broker_enrollment._bounded_server_environment(environment)
+
+    def test_legacy_empty_server_environment_list_normalizes_to_empty_map(self) -> None:
+        self.assertEqual(broker_enrollment._bounded_server_environment([]), {})
+        self.assertEqual(broker_enrollment._bounded_server_environment(()), {})
 
     def test_profile_revocation_removes_only_exact_old_incarnation_for_all_clients(
         self,
