@@ -26,6 +26,7 @@ def rendered_model(**_kwargs: object) -> bytes:
             "services": {
                 "migrate": {"image": "postgres:17-alpine"},
                 "worker": {"image": "example/worker:local"},
+                "helper": {"image": "example/worker:local"},
             },
         }
     ).encode("utf-8")
@@ -53,7 +54,7 @@ class ImagePublicationTests(unittest.TestCase):
             encoding="utf-8",
         )
         (self.project / "compose.yml").write_text(
-            "services:\n  migrate:\n    image: postgres:17-alpine\n  worker:\n    image: example/worker:local\n",
+            "services:\n  migrate:\n    image: postgres:17-alpine\n  worker:\n    image: example/worker:local\n  helper:\n    image: example/worker:local\n",
             encoding="utf-8",
         )
         environment = self.project / ".env"
@@ -64,7 +65,7 @@ class ImagePublicationTests(unittest.TestCase):
                 "compose_files": ["compose.yml"],
                 "env_files": [".env"],
                 "project_name": "demo",
-                "services": ["migrate", "worker"],
+                "services": ["migrate", "worker", "helper"],
             },
             "image_publications": [
                 {
@@ -80,7 +81,7 @@ class ImagePublicationTests(unittest.TestCase):
                         "root": "services/worker/src/App",
                         "exclude_directories": ["bin", "obj"],
                     },
-                    "rollout_services": ["migrate", "worker"],
+                    "rollout_services": ["migrate", "worker", "helper"],
                     "migration_service": "migrate",
                     "workload_service": "worker",
                     "workload_container": "demo-worker",
@@ -300,7 +301,7 @@ class ImagePublicationTests(unittest.TestCase):
                     definition_id,
                     definition_fingerprint,
                     effective.model_sha256,
-                    json.dumps(list(self.specification.compose_services)),
+                    json.dumps(sorted(self.specification.compose_services)),
                     json.dumps(list(effective.profiles)),
                     json.dumps(list(effective.host_access_risks)),
                     "2026-07-23T00:00:00Z",
@@ -517,7 +518,7 @@ class ImagePublicationTests(unittest.TestCase):
 
         material = publication.ComposeMaterial(
             compose_payloads=(
-                b"services:\n  migrate:\n    image: postgres:17-alpine\n  worker:\n    image: example/worker:local\n",
+                b"services:\n  migrate:\n    image: postgres:17-alpine\n  worker:\n    image: example/worker:local\n  helper:\n    image: example/worker:local\n",
             ),
             env_payloads=(b"TOKEN=fixture-sealed\n",),
             evidence={},
@@ -530,7 +531,10 @@ class ImagePublicationTests(unittest.TestCase):
                 run_docker=lambda *_args: self.fail("rollout must use the sealed compose runner"),
                 material=material,
             )
-        self.assertEqual([item["services"] for item in result["phases"]], [["migrate"], ["worker"]])
+        self.assertEqual(
+            [item["services"] for item in result["phases"]],
+            [["migrate"], ["worker", "helper"]],
+        )
         self.assertEqual(len(commands), 2)
         for command in commands:
             self.assertIn("--no-build", command)

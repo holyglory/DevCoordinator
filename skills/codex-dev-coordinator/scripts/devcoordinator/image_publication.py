@@ -1044,7 +1044,13 @@ def run_compose_rollout(
     phase_services: list[tuple[str, ...]] = []
     if specification.migration_service is not None:
         phase_services.append((specification.migration_service,))
-    phase_services.append((specification.workload_service,))
+    rollout_services = tuple(
+        service
+        for service in specification.rollout_services
+        if service != specification.migration_service
+    )
+    if rollout_services:
+        phase_services.append(rollout_services)
     with _pinned_project_directory(specification.project) as pinned:
         with _sealed_compose_input_snapshots(
             compose_payloads=captured.compose_payloads,
