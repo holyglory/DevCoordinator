@@ -5642,6 +5642,16 @@ def docker_ps_inventory(
                             }
                         )
             container["port_bindings"] = port_bindings
+        else:
+            # A container may disappear between the exhaustive `ps --all`
+            # listing and bulk inspect. Preserve the listing as degraded
+            # evidence, including only the lifecycle that `ps` itself proves,
+            # while keeping the inspection-complete gate false.
+            status = str(container.get("status") or "").strip()
+            if status == "Up" or status.startswith(("Up ", "Restarting ")):
+                container["running"] = True
+            elif status.startswith(("Exited ", "Created", "Dead", "Removal In Progress")):
+                container["running"] = False
         if not container.get("full_id"):
             identity_errors.append(
                 str(container.get("name") or container.get("id") or "unknown")

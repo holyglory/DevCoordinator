@@ -114,6 +114,7 @@ class LifecycleParserContractTests(unittest.TestCase):
         self.assertFalse(observed["container_inspection_available"])
         self.assertEqual(observed["containers"][0]["full_id"], full_id)
         self.assertFalse(observed["containers"][0]["inspection_observable"])
+        self.assertTrue(observed["containers"][0]["running"])
         self.assertFalse(observed["compose_assets_available"])
         self.assertEqual(observed["compose_assets"], [])
 

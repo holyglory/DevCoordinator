@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import sqlite3
@@ -1792,7 +1791,10 @@ def commit_host_inventory_observation(
     # A completed snapshot is authoritative absence evidence for the engine.
     # Keep durable resource identity/history, but mark resources not present in
     # this sample stopped instead of deleting them.
-    if docker.get("available") is True:
+    if (
+        docker.get("available") is True
+        and docker.get("container_inspection_available") is True
+    ):
         rows = connection.execute(
             """
             SELECT d.docker_resource_id, d.current_name, o.lifecycle, o.health,
