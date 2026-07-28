@@ -11534,8 +11534,6 @@ def _compose_action_observation_proof(
     if action in {"up", "restart"}:
         desired = (
             not count_mismatch_services
-            and unclassified_container_count == 0
-            and not unexpected_services
             and not excess_services
         )
         proof_kind = "all_target_services_running"

@@ -424,6 +424,10 @@ def call_broker(
                                 BrokerOperation.EPHEMERAL_START,
                                 BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
                                 BrokerOperation.EPHEMERAL_FINISH,
+                                BrokerOperation.COMPOSE_UP,
+                                BrokerOperation.COMPOSE_STOP,
+                                BrokerOperation.COMPOSE_RESTART,
+                                BrokerOperation.COMPOSE_DOWN,
                             }
                             else 60.0
                         )
@@ -443,6 +447,10 @@ def call_broker(
                 BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
                 BrokerOperation.EPHEMERAL_FINISH,
                 BrokerOperation.RUNTIME_REQUEST,
+                BrokerOperation.COMPOSE_UP,
+                BrokerOperation.COMPOSE_STOP,
+                BrokerOperation.COMPOSE_RESTART,
+                BrokerOperation.COMPOSE_DOWN,
             }
             else 10.0
         ),

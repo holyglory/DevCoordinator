@@ -1898,6 +1898,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
         cases = (
             (BrokerOperation.DOCKER_STOP, 10.0),
             (BrokerOperation.RUNTIME_REQUEST, 60.0),
+            (BrokerOperation.COMPOSE_UP, 5 * 60.0),
             (
                 BrokerOperation.INVENTORY_READ,
                 broker_profile_module.INVENTORY_READ_CLIENT_TIMEOUT_SECONDS,
