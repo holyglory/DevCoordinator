@@ -4111,6 +4111,79 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertEqual(result["classification"], "unclassified_resource")
         self.assertEqual(dispatched, [])
 
+    def test_stopped_unassigned_container_does_not_block_family(self) -> None:
+        dispatched: list[str] = []
+        with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:
+            host_id, repo_id = self._insert_repository(store)
+            server_id = self._insert_running_service(
+                store, repo_id=repo_id, host_id=host_id
+            )
+            timestamp = utc_timestamp()
+            engine_id = deterministic_id("docker-engine", host_id, "stopped-orphan")
+            resource_id = deterministic_id(
+                "docker-resource", engine_id, "stopped-orphan"
+            )
+            with store.immediate_transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO docker_engines(
+                        engine_id, host_id, context_identity, capability_state,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'stopped-orphan-context', 'available', ?, ?)
+                    """,
+                    (engine_id, host_id, timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_resources(
+                        docker_resource_id, engine_id, full_container_id,
+                        current_name, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'stopped-orphan', ?, ?)
+                    """,
+                    (resource_id, engine_id, "f" * 64, timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_observations(
+                        docker_resource_id, lifecycle, sampled_at,
+                        observation_fingerprint
+                    ) VALUES (?, 'stopped', ?, 'stopped-orphan-observation')
+                    """,
+                    (resource_id, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO unassigned_resources(
+                        unassigned_id, host_id, resource_kind, resource_id,
+                        display_name, reason_code, status, created_at, updated_at
+                    ) VALUES (?, ?, 'container', ?, 'stopped-orphan',
+                              'name_only', 'active', ?, ?)
+                    """,
+                    (
+                        deterministic_id("unassigned", host_id, resource_id),
+                        host_id,
+                        resource_id,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            result = execute_runtime_request(
+                self.request(
+                    action="status",
+                    target={"kind": "service", "id": server_id, "name": "web"},
+                    options={},
+                ),
+                store=store,
+                callbacks=self._callbacks(
+                    store,
+                    dispatch=lambda *_args: dispatched.append("dispatch")
+                    or self._running_service_result(server_id),
+                ),
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(dispatched, ["dispatch"])
+        self.assertNotIn("evidence", result)
+
     def test_explicit_unrelated_unassigned_resource_does_not_block_family(self) -> None:
         dispatched: list[str] = []
         with AccountStore.open_default(self.home, effective_uid=os.geteuid()) as store:

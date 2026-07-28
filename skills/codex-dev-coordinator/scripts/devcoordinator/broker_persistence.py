@@ -6688,11 +6688,24 @@ class BrokerPersistence:
                     dict(row)
                     for row in connection.execute(
                         """
-                        SELECT resource_kind, resource_id, display_name,
-                               reason_code, suggested_root
-                        FROM unassigned_resources
-                        WHERE status = 'active' AND host_id = ?
-                        ORDER BY resource_kind, resource_id
+                        SELECT unassigned.resource_kind,
+                               unassigned.resource_id,
+                               unassigned.display_name,
+                               unassigned.reason_code,
+                               unassigned.suggested_root
+                        FROM unassigned_resources unassigned
+                        LEFT JOIN docker_observations observed_docker
+                          ON unassigned.resource_kind = 'container'
+                         AND observed_docker.docker_resource_id = unassigned.resource_id
+                        WHERE unassigned.status = 'active'
+                          AND unassigned.host_id = ?
+                          AND (
+                            unassigned.resource_kind <> 'container'
+                            OR observed_docker.lifecycle IS NULL
+                            OR observed_docker.lifecycle <> 'stopped'
+                          )
+                        ORDER BY unassigned.resource_kind,
+                                 unassigned.resource_id
                         """,
                         (next(iter(family_host_ids)),),
                     )

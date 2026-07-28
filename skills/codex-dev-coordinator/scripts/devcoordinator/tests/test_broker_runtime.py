@@ -616,6 +616,56 @@ class BrokerRuntimeAuthorizationTests(unittest.TestCase):
         )
         self.assertEqual(self.actions.calls, [])
 
+    def test_stopped_unassigned_container_does_not_block_shared_status(self) -> None:
+        self._grant("status")
+        now = utc_timestamp()
+        with CoordinatorStore.open(
+            self.persistence.database_path, expected_uid=os.geteuid()
+        ) as store:
+            with store.immediate_transaction() as connection:
+                engine_id = str(
+                    connection.execute(
+                        "SELECT engine_id FROM docker_engines LIMIT 1"
+                    ).fetchone()[0]
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_resources(
+                        docker_resource_id, engine_id, full_container_id,
+                        current_name, created_at, updated_at
+                    ) VALUES ('stopped-orphan-container', ?, ?,
+                              'stopped-orphan', ?, ?)
+                    """,
+                    (engine_id, "f" * 64, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO docker_observations(
+                        docker_resource_id, lifecycle, sampled_at,
+                        observation_fingerprint
+                    ) VALUES ('stopped-orphan-container', 'stopped', ?,
+                              'stopped-orphan-observation')
+                    """,
+                    (now,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO unassigned_resources(
+                        unassigned_id, host_id, resource_kind, resource_id,
+                        display_name, reason_code, status, created_at, updated_at
+                    ) VALUES ('runtime-stopped-unassigned', ?, 'container',
+                              'stopped-orphan-container', 'stopped orphan',
+                              'name_only', 'active', ?, ?)
+                    """,
+                    (HOST_ID, now, now),
+                )
+
+        reply = self._reply()
+
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(reply["result"]["ok"], reply)
+        self.assertEqual(reply["result"]["classification"], "observed_not_ready")
+
     def test_explicit_foreign_path_unassigned_is_not_a_family_false_positive(self) -> None:
         self._grant("status")
         now = utc_timestamp()
