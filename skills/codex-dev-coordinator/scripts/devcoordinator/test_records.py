@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -39,6 +39,75 @@ def _parsed_timestamp(value: object, field: str) -> str:
             "invalid_test_result", f"{field} must include an explicit UTC offset."
         )
     return parsed.isoformat()
+
+
+def _utc_datetime(value: object) -> datetime:
+    """Parse a stored, already-validated test timestamp into UTC."""
+
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _hourly_case_statistics(
+    rows: list[Mapping[str, Any]], *, now: datetime | None = None
+) -> list[dict[str, Any]]:
+    """Aggregate the seven-day heatmap in one pass over relevant cases.
+
+    The previous SQL joined every case to every generated hour before testing
+    interval overlap. On a busy repository that multiplied tens of thousands
+    of case rows by 168 buckets and tied up a Coordinator request thread for
+    several seconds. Keep the same interval semantics while making the work
+    linear in the number of relevant cases.
+    """
+
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    window_start = current.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - timedelta(days=6)
+    window_end = window_start + timedelta(days=7)
+    buckets: dict[datetime, dict[str, Any]] = {}
+    cursor = window_start
+    while cursor < window_end:
+        buckets[cursor] = {
+            "day": cursor.date().isoformat(),
+            "hour": cursor.hour,
+            "test_seconds": 0.0,
+            "failure_count": 0,
+        }
+        cursor += timedelta(hours=1)
+
+    for row in rows:
+        started = _utc_datetime(row["started_at"])
+        finished = _utc_datetime(row["finished_at"])
+        overlap_start = max(started, window_start)
+        overlap_end = min(finished, window_end)
+        if overlap_end <= overlap_start:
+            continue
+        bucket = overlap_start.replace(minute=0, second=0, microsecond=0)
+        while bucket < overlap_end:
+            bucket_end = bucket + timedelta(hours=1)
+            seconds = (
+                min(overlap_end, bucket_end) - max(overlap_start, bucket)
+            ).total_seconds()
+            if seconds > 0:
+                buckets[bucket]["test_seconds"] += seconds
+            bucket = bucket_end
+        if (
+            row["status"] in {"failed", "error"}
+            and window_start <= started < window_end
+        ):
+            failure_bucket = started.replace(minute=0, second=0, microsecond=0)
+            buckets[failure_bucket]["failure_count"] += 1
+
+    return [
+        {
+            **bucket,
+            "test_seconds": round(float(bucket["test_seconds"]), 3),
+        }
+        for bucket in buckets.values()
+    ]
 
 
 class CoordinatorTestRecords:
@@ -376,49 +445,25 @@ class CoordinatorTestRecords:
                 )
                 # Split exact case intervals across UTC clock-hour buckets.
                 # Parallel cases intentionally add together, so aggregate test
-                # time can exceed 3,600 seconds in one wall-clock hour.
-                hourly = [
-                    dict(row)
-                    for row in connection.execute(
-                        """
-                        WITH RECURSIVE hours(bucket_start) AS (
-                            SELECT datetime('now', 'start of day', '-6 days')
-                            UNION ALL
-                            SELECT datetime(bucket_start, '+1 hour') FROM hours
-                            WHERE bucket_start < datetime('now', 'start of day', '+23 hours')
-                        ), recent_cases AS (
-                            SELECT c.* FROM test_case_results c
+                # time can exceed 3,600 seconds in one wall-clock hour. Read
+                # each relevant case once; the old case x 168-hour SQL join
+                # let one large project monopolize the shared API for seconds.
+                hourly = _hourly_case_statistics(
+                    [
+                        dict(row)
+                        for row in connection.execute(
+                            """
+                            SELECT c.started_at, c.finished_at, c.status
+                            FROM test_case_results c
                             JOIN test_runs r USING(run_id)
                             WHERE r.repo_id = ?
                               AND julianday(c.finished_at) > julianday('now', 'start of day', '-6 days')
                               AND julianday(c.started_at) < julianday('now', 'start of day', '+1 day')
+                            """,
+                            (repo_id,),
                         )
-                        SELECT strftime('%Y-%m-%d', bucket_start) AS day,
-                               CAST(strftime('%H', bucket_start) AS INTEGER) AS hour,
-                               ROUND(COALESCE(SUM(
-                                   CASE WHEN c.run_id IS NULL THEN 0 ELSE
-                                       MAX(0,
-                                           MIN(julianday(c.finished_at), julianday(bucket_start, '+1 hour'))
-                                           - MAX(julianday(c.started_at), julianday(bucket_start))
-                                       ) * 86400
-                                   END
-                               ), 0), 3) AS test_seconds,
-                               COALESCE(SUM(
-                                   CASE WHEN c.status IN ('failed', 'error')
-                                         AND julianday(c.started_at) >= julianday(bucket_start)
-                                         AND julianday(c.started_at) < julianday(bucket_start, '+1 hour')
-                                   THEN 1 ELSE 0 END
-                               ), 0) AS failure_count
-                        FROM hours
-                        LEFT JOIN recent_cases c
-                          ON julianday(c.finished_at) > julianday(bucket_start)
-                         AND julianday(c.started_at) < julianday(bucket_start, '+1 hour')
-                        GROUP BY bucket_start
-                        ORDER BY bucket_start
-                        """,
-                        (repo_id,),
-                    )
-                ]
+                    ]
+                )
                 daily = [
                     dict(row)
                     for row in connection.execute(

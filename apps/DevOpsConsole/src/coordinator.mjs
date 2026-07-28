@@ -15,6 +15,9 @@ const RUNTIME_ARTIFACT_KINDS = new Set([
 const RUNTIME_ARTIFACT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024;
 const TOKEN_MAX_BYTES = 4096;
+const TEST_STATS_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const TEST_STATS_CACHE_MAX_ENTRIES = 32;
+const TEST_STATS_MAX_STALE_MS = 24 * 60 * 60 * 1000;
 const FULL_DOCKER_OBSERVER_DOMAIN = 'host-runtime-v2:full-docker';
 const OPERATIONAL_SERVER_STATES = new Set([
   'running', 'starting', 'unhealthy', 'stopping', 'stopped',
@@ -369,6 +372,69 @@ export function createCoordinator({ config, log }) {
   const trustedDockerObservations = new Map();
   const observationFlights = new Map();
   let inventoryOverviewFailure = null;
+
+  const testStatsSnapshotPath = path.join(config.stateDir, 'test-stats-cache-v1.json');
+
+  function loadTestStatsSnapshots() {
+    try {
+      const info = fs.lstatSync(testStatsSnapshotPath);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > TEST_STATS_CACHE_MAX_BYTES) return;
+      const document = JSON.parse(fs.readFileSync(testStatsSnapshotPath, 'utf8'));
+      if (document?.version !== 1 || !Array.isArray(document.entries)) return;
+      const now = Date.now();
+      for (const entry of document.entries.slice(0, TEST_STATS_CACHE_MAX_ENTRIES)) {
+        if (
+          typeof entry?.key !== 'string'
+          || entry.key.length < 1
+          || entry.key.length > 8192
+          || !Number.isFinite(entry.at)
+          || entry.at > now
+          || now - entry.at > TEST_STATS_MAX_STALE_MS
+          || entry.value?.schema_version !== 1
+        ) continue;
+        testStatsCaches.set(entry.key, {
+          value: entry.value,
+          at: entry.at,
+          inflight: null,
+          generation: 0,
+        });
+      }
+    } catch (err) {
+      if (err?.code !== 'ENOENT') {
+        clog?.warn?.('ignored invalid persisted test statistics cache', {
+          error: String(err?.message ?? err),
+        });
+      }
+    }
+  }
+
+  function persistTestStatsSnapshots() {
+    const now = Date.now();
+    const entries = [...testStatsCaches.entries()]
+      .filter(([, cache]) => (
+        cache.value?.schema_version === 1
+        && Number.isFinite(cache.at)
+        && now - cache.at <= TEST_STATS_MAX_STALE_MS
+      ))
+      .sort((a, b) => b[1].at - a[1].at)
+      .slice(0, TEST_STATS_CACHE_MAX_ENTRIES)
+      .map(([key, cache]) => ({ key, at: cache.at, value: cache.value }));
+    const encoded = `${JSON.stringify({ version: 1, entries })}\n`;
+    if (Buffer.byteLength(encoded) > TEST_STATS_CACHE_MAX_BYTES) return;
+    const temporary = `${testStatsSnapshotPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      fs.mkdirSync(path.dirname(testStatsSnapshotPath), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(temporary, encoded, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+      fs.renameSync(temporary, testStatsSnapshotPath);
+    } catch (err) {
+      try { fs.unlinkSync(temporary); } catch { /* best-effort temporary cleanup */ }
+      clog?.warn?.('could not persist test statistics cache', {
+        error: String(err?.message ?? err),
+      });
+    }
+  }
+
+  loadTestStatsSnapshots();
 
   function noteAlive() {
     ok = true;
@@ -759,11 +825,8 @@ export function createCoordinator({ config, log }) {
     return ensureInflight;
   }
 
-  function cachedGet(cache, apiPath, maxAgeMs) {
-    if (!cache.dirty && cache.value !== undefined && Date.now() - cache.at <= maxAgeMs) {
-      return Promise.resolve(cache.value);
-    }
-    if (cache.inflight) return cache.inflight; // coalesce concurrent callers
+  function startCachedGet(cache, apiPath, onValue = null) {
+    if (cache.inflight) return cache.inflight;
     const generation = cache.generation;
     const inflight = request('GET', apiPath)
       .then((value) => {
@@ -771,6 +834,7 @@ export function createCoordinator({ config, log }) {
           cache.value = value;
           cache.at = Date.now();
           cache.dirty = false;
+          onValue?.(value);
         }
         return value;
       })
@@ -779,6 +843,13 @@ export function createCoordinator({ config, log }) {
       });
     cache.inflight = inflight;
     return inflight;
+  }
+
+  function cachedGet(cache, apiPath, maxAgeMs, onValue = null) {
+    if (!cache.dirty && cache.value !== undefined && Date.now() - cache.at <= maxAgeMs) {
+      return Promise.resolve(cache.value);
+    }
+    return startCachedGet(cache, apiPath, onValue);
   }
 
   function inventory({ maxAgeMs = 5000 } = {}) {
@@ -942,7 +1013,13 @@ export function createCoordinator({ config, log }) {
     );
   }
 
-  function testStats({ project, days = 30, limit = 25, maxAgeMs = 5000 } = {}) {
+  function testStats({
+    project,
+    days = 30,
+    limit = 25,
+    maxAgeMs = 30_000,
+    maxStaleMs = TEST_STATS_MAX_STALE_MS,
+  } = {}) {
     if (typeof project !== 'string' || !project || project.length > 4096) {
       throw new CoordError('test statistics require one bounded project identity', { status: 400 });
     }
@@ -960,7 +1037,21 @@ export function createCoordinator({ config, log }) {
       testStatsCaches.set(key, cache);
       if (testStatsCaches.size > 128) testStatsCaches.delete(testStatsCaches.keys().next().value);
     }
-    return cachedGet(cache, `/v1/tests?${key}`, maxAgeMs);
+    const apiPath = `/v1/tests?${key}`;
+    const ageMs = cache.value === undefined ? Number.POSITIVE_INFINITY : Date.now() - cache.at;
+    if (cache.value !== undefined && ageMs > maxAgeMs && ageMs <= maxStaleMs) {
+      // Statistics are observational. Preserve the last completed dashboard
+      // across API restarts and refresh it in the background instead of
+      // making page paint depend on a large repository query.
+      startCachedGet(cache, apiPath, persistTestStatsSnapshots).catch((err) => {
+        clog?.warn?.('test statistics refresh failed; serving retained data', {
+          project,
+          error: String(err?.message ?? err),
+        });
+      });
+      return Promise.resolve(cache.value);
+    }
+    return cachedGet(cache, apiPath, maxAgeMs, persistTestStatsSnapshots);
   }
 
   async function dockerAction(name, action, body = {}) {

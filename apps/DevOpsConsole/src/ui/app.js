@@ -242,25 +242,29 @@
 
   function showBanner(value, retry, key = 'action') {
     const maintenance = isMaintenanceError(value);
-    const message = maintenance
-      ? 'Controls are updating. No action needed — running services stay online and live data reconnects automatically.'
-      : value?.message ?? String(value);
-    bannerKey = maintenance ? 'maintenance' : key;
+    if (maintenance) {
+      // Planned maintenance and background refreshes are not decisions the
+      // user can act on. Keep retained content or skeletons in place without
+      // turning normal loading into a global text badge.
+      clearBanner('maintenance');
+      return;
+    }
+    const message = value?.message ?? String(value);
+    bannerKey = key;
     $('#banner-slot').replaceChildren(
       h('div', {
-        class: `banner${maintenance ? ' maintenance' : ''}`,
-        role: maintenance ? 'status' : 'alert',
-        'aria-live': maintenance ? 'polite' : null,
+        class: 'banner',
+        role: 'alert',
       },
-        icon(maintenance ? 'refresh' : 'warn'),
+        icon('warn'),
         h('span', { class: 'banner-msg' }, String(message)),
-        retry && !maintenance ? h('button', {
+        retry ? h('button', {
           class: 'btn small', type: 'button',
           onclick: () => { clearBanner(); retry(); },
         }, 'Retry') : null,
         h('button', {
           class: 'iconbtn', type: 'button',
-          'aria-label': maintenance ? 'Dismiss maintenance status' : 'Dismiss error', title: 'Dismiss',
+          'aria-label': 'Dismiss error', title: 'Dismiss',
           onclick: () => clearBanner(),
         }, icon('x'))),
     );
@@ -3767,19 +3771,18 @@
   }
 
   function degradedPanel(o) {
-    if (o?.coordinator?.inventoryState === 'loading') {
-      return h('p', { class: 'empty' }, 'Loading live Coordinator inventory…');
-    }
     const maintenance = o?.coordinator?.failureKind === 'maintenance';
+    if (o?.coordinator?.inventoryState === 'loading' || maintenance) {
+      return h('div', { class: 'skel', 'aria-hidden': 'true' });
+    }
     return h('div', {
-      class: `degraded${maintenance ? ' maintenance' : ''}`,
-      role: maintenance ? 'status' : null,
+      class: 'degraded',
     },
-      icon(maintenance ? 'refresh' : 'warn'),
+      icon('warn'),
       h('div', null,
         h('p', { class: 'deg-title' }, coordinatorFailureTitle(o)),
         h('p', { class: 'deg-msg' }, coordErrorText(o)),
-        maintenance ? h('p', { class: 'deg-hint' }, coordinatorFailureHint(o)) : h('button', {
+        h('button', {
           class: 'btn small', type: 'button',
           onclick: () => refreshOverview({ force: true, fresh: true }),
         }, icon('refresh'), 'Try again')));

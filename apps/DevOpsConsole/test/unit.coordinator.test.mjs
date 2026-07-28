@@ -68,6 +68,44 @@ test('test statistics use one bounded repository-scoped coordinator read', async
   );
 });
 
+test('test statistics survive a Console restart and refresh stale data in the background', async (t) => {
+  const response = {
+    schema_version: 1,
+    repo_id: 'repo-1',
+    days: 30,
+    summary: { test_count: 42 },
+  };
+  let slow = false;
+  let statisticsRequests = 0;
+  const responder = async ({ req, res }) => {
+    if (req.url !== '/v1/tests?project=repo-1&days=30&limit=25') return false;
+    statisticsRequests += 1;
+    if (slow) await new Promise((resolve) => setTimeout(resolve, 150));
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(response));
+    return true;
+  };
+  const { client, config } = await fixture(t, { responder });
+  assert.deepEqual(await client.testStats({ project: 'repo-1' }), response);
+
+  slow = true;
+  const restarted = createCoordinator({ config, log: null });
+  t.after(() => restarted.close());
+  const started = performance.now();
+  const retained = await restarted.testStats({
+    project: 'repo-1',
+    maxAgeMs: 0,
+    maxStaleMs: 60_000,
+  });
+  const elapsedMs = performance.now() - started;
+
+  assert.deepEqual(retained, response);
+  assert.ok(elapsedMs < 50, `retained test statistics waited ${elapsedMs.toFixed(1)}ms`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(statisticsRequests, 2,
+    'a stale retained response must start exactly one background refresh');
+});
+
 test('test repository discovery is a lightweight cached coordinator read', async (t) => {
   const response = {
     schema_version: 1,
@@ -193,19 +231,20 @@ async function fixture(t, { tokenOnDisk = TOKEN, expectedToken = TOKEN, responde
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const port = server.address().port;
+  const config = {
+    coordinatorUrl: `http://127.0.0.1:${port}`,
+    coordinatorTokenFile: tokenFile,
+    coordinatorAutostart: false,
+    coordinatorScript: '/unused/dev_coordinator.py',
+    coordinatorHome: dir,
+    stateDir: dir,
+  };
   const client = createCoordinator({
-    config: {
-      coordinatorUrl: `http://127.0.0.1:${port}`,
-      coordinatorTokenFile: tokenFile,
-      coordinatorAutostart: false,
-      coordinatorScript: '/unused/dev_coordinator.py',
-      coordinatorHome: dir,
-      stateDir: dir,
-    },
+    config,
     log: null,
   });
   t.after(() => client.close());
-  return { client, requests, tokenFile };
+  return { client, requests, tokenFile, config };
 }
 
 test('coordinator probe is anonymous while every protected request uses the private bearer token', async (t) => {

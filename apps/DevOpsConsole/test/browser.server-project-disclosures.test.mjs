@@ -1593,6 +1593,7 @@ test('Tests loads repository data within one second while current inventory is s
       const page = await context.newPage();
       let overviewCompleted = false;
       let testsStartedBeforeOverview = false;
+      let testsMaintenance = false;
       const utcDay = (offset) => {
         const date = new Date();
         date.setUTCHours(0, 0, 0, 0);
@@ -1665,7 +1666,17 @@ test('Tests loads repository data within one second while current inventory is s
           body = { error: 'not found' };
         } else if (pathname === '/api/tests') {
           testsStartedBeforeOverview = !overviewCompleted;
-          body = testStats;
+          if (testsMaintenance) {
+            status = 503;
+            body = {
+              error: 'Controls are updating',
+              code: 'maintenance_in_progress',
+              classification: 'maintenance',
+              retry_after_seconds: 30,
+            };
+          } else {
+            body = testStats;
+          }
         } else if (pathname === '/api/metrics/history') body = CANONICAL_METRICS;
         else if (pathname === '/api/session') {
           body = { ...CANONICAL_SESSION, accessAdmin: false, lifecycleAvailable: false };
@@ -1837,6 +1848,17 @@ test('Tests loads repository data within one second while current inventory is s
       if (process.env.TESTS_DESIGN_MOBILE_SCREENSHOT) {
         await page.screenshot({ path: process.env.TESTS_DESIGN_MOBILE_SCREENSHOT, fullPage: true });
       }
+
+      testsMaintenance = true;
+      const maintenanceResponse = page.waitForResponse((response) => (
+        new URL(response.url()).pathname === '/api/tests' && response.status() === 503
+      ));
+      await page.locator('#tests-days').selectOption('7');
+      await maintenanceResponse;
+      assert.equal(await page.locator('#banner-slot .banner').count(), 0,
+        'planned test-data maintenance must not create a non-actionable text badge');
+      assert.doesNotMatch(await page.locator('body').innerText(),
+        /No action needed|nothing is required from (?:the )?user|running services stay online/i);
     } finally {
       await context?.close();
       await browser?.close();

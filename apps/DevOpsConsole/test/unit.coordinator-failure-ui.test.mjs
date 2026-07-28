@@ -81,18 +81,18 @@ test('visible failure labels remain truthful for HTTP and transport errors', asy
     'the header guidance must explain the actual failure class');
   assert.match(degraded, /coordinatorFailureTitle\(o\)/,
     'the page-level degraded panel must use the same truthful title');
-  assert.match(degraded, /role: maintenance \? 'status' : null/,
-    'planned maintenance must be an informational status, not an alert');
-  assert.match(degraded, /maintenance \? h\('p',[\s\S]*coordinatorFailureHint\(o\)/,
-    'planned maintenance must explain automatic recovery without a retry action');
+  assert.match(degraded, /inventoryState === 'loading' \|\| maintenance/,
+    'cold loading and planned maintenance must render the same quiet skeleton');
+  assert.match(degraded, /class: 'skel'/,
+    'planned maintenance must not become a non-actionable text panel');
 
   const banner = extractFunction(app, 'function showBanner(value, retry, key = \'action\')');
-  assert.match(banner, /No action needed/);
-  assert.match(banner, /running services stay online/);
-  assert.match(banner, /retry && !maintenance/,
-    'Retry cannot be offered for an operation the user cannot influence');
-  assert.match(banner, /role: maintenance \? 'status' : 'alert'/,
-    'maintenance must not increment urgency by presenting as an error alert');
+  assert.match(banner, /if \(maintenance\)[\s\S]*clearBanner\('maintenance'\);[\s\S]*return;/,
+    'maintenance must remain silent because the user has no decision to make');
+  assert.doesNotMatch(banner, /No action|nothing is required|running services stay online/i,
+    'non-actionable loading prose must never appear in a global badge');
+  assert.match(banner, /role: 'alert'/,
+    'global banners are reserved for real actionable failures');
 
   const problems = extractFunction(app, 'function headerProblems(o)');
   assert.match(problems, /c\.failureKind !== 'maintenance'/,

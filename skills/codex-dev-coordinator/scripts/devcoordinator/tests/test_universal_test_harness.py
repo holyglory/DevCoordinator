@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import inspect
 import json
 import os
 from pathlib import Path
@@ -198,6 +199,12 @@ class UniversalTestHarnessTests(unittest.TestCase):
         self.assertEqual(stats["summary"]["failed_run_count"], 1)
         self.assertEqual(stats["dynamics"][0]["suite"], "parallel-suite")
         self.assertEqual(stats["dynamics"][0]["current_seconds"], 10_800)
+
+    def test_hourly_statistics_never_reintroduce_case_by_bucket_cross_join(self) -> None:
+        source = inspect.getsource(CoordinatorTestRecords.stats_for_repository)
+        self.assertIn("_hourly_case_statistics", source)
+        self.assertNotIn("WITH RECURSIVE hours", source)
+        self.assertNotIn("LEFT JOIN recent_cases", source)
 
     def test_passed_run_rejects_failed_case(self) -> None:
         run_id = str(uuid.uuid4())
