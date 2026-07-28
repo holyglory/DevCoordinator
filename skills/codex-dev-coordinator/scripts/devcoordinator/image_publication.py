@@ -1057,6 +1057,39 @@ def run_compose_rollout(
             env_payloads=captured.env_payloads,
             action="up",
         ) as (sealed_files, sealed_env_files):
+            cleanup_command: list[str] = [
+                docker,
+                "compose",
+                "--project-directory",
+                ".",
+                "--project-name",
+                specification.compose_project_name,
+            ]
+            for env_file in sealed_env_files:
+                cleanup_command.extend(("--env-file", env_file))
+            for compose_file in sealed_files:
+                cleanup_command.extend(("--file", compose_file))
+            cleanup_command.extend(("rm", "--force", "--stop"))
+            cleanup_command.extend(specification.rollout_services)
+            cleanup_result = _run_compose_command(
+                tuple(cleanup_command),
+                pinned,
+                COMPOSE_TIMEOUT_SECONDS,
+                environment,
+            )
+            if cleanup_result.returncode != 0:
+                raise ComposeRolloutError(
+                    completed_phases=phases,
+                    failed_services=specification.rollout_services,
+                    result=cleanup_result,
+                )
+            phases.append(
+                {
+                    "action": "clean-cutover",
+                    "services": list(specification.rollout_services),
+                    "output_sha256": _output_fingerprint(cleanup_result),
+                }
+            )
             for services in phase_services:
                 command: list[str] = [
                     docker,
@@ -1091,6 +1124,7 @@ def run_compose_rollout(
                     )
                 phases.append(
                     {
+                        "action": "up",
                         "services": list(services),
                         "output_sha256": _output_fingerprint(result),
                     }

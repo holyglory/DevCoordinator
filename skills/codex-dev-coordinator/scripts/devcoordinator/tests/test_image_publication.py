@@ -532,11 +532,20 @@ class ImagePublicationTests(unittest.TestCase):
                 material=material,
             )
         self.assertEqual(
-            [item["services"] for item in result["phases"]],
-            [["migrate"], ["worker", "helper"]],
+            [(item["action"], item["services"]) for item in result["phases"]],
+            [
+                ("clean-cutover", ["migrate", "worker", "helper"]),
+                ("up", ["migrate"]),
+                ("up", ["worker", "helper"]),
+            ],
         )
-        self.assertEqual(len(commands), 2)
-        for command in commands:
+        self.assertEqual(len(commands), 3)
+        cleanup = commands[0]
+        self.assertIn("rm", cleanup)
+        self.assertIn("--force", cleanup)
+        self.assertIn("--stop", cleanup)
+        self.assertNotIn("--volumes", cleanup)
+        for command in commands[1:]:
             self.assertIn("--no-build", command)
             self.assertIn("--force-recreate", command)
             self.assertNotIn("build", command)
@@ -554,12 +563,17 @@ class ImagePublicationTests(unittest.TestCase):
         with mock.patch.object(publication, "_resolve_docker_executable", return_value="/usr/bin/docker"), mock.patch.object(
             publication,
             "_run_compose_command",
-            return_value=subprocess.CompletedProcess(
-                ("docker", "compose"),
-                1,
-                stdout="TOKEN=do-not-leak-diagnostic\n",
-                stderr="Authorization: " + "Bearer " + "do-not-leak-bearer\n",
-            ),
+            side_effect=[
+                subprocess.CompletedProcess(
+                    ("docker", "compose"), 0, stdout="removed", stderr=""
+                ),
+                subprocess.CompletedProcess(
+                    ("docker", "compose"),
+                    1,
+                    stdout="TOKEN=do-not-leak-diagnostic\n",
+                    stderr="Authorization: " + "Bearer " + "do-not-leak-bearer\n",
+                ),
+            ],
         ):
             with self.assertRaises(publication.ComposeRolloutError) as raised:
                 publication.run_compose_rollout(
