@@ -442,6 +442,7 @@ def call_broker(
                 BrokerOperation.EPHEMERAL_START,
                 BrokerOperation.EPHEMERAL_IMAGE_PREFETCH,
                 BrokerOperation.EPHEMERAL_FINISH,
+                BrokerOperation.RUNTIME_REQUEST,
             }
             else 10.0
         ),

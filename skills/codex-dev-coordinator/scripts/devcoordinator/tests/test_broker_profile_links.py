@@ -1897,6 +1897,7 @@ class BrokerProfileTrustTests(unittest.TestCase):
         )
         cases = (
             (BrokerOperation.DOCKER_STOP, 10.0),
+            (BrokerOperation.RUNTIME_REQUEST, 60.0),
             (
                 BrokerOperation.INVENTORY_READ,
                 broker_profile_module.INVENTORY_READ_CLIENT_TIMEOUT_SECONDS,
@@ -1950,7 +1951,20 @@ class BrokerProfileTrustTests(unittest.TestCase):
                                         "plan_fingerprint": "sha256:" + "5" * 64,
                                     }
                                     if operation == BrokerOperation.REPOSITORY_REMOVE
-                                    else {}
+                                    else (
+                                        {
+                                            "action": "stop",
+                                            "agent": "runtime-test-agent",
+                                            "root_repo_id": REPO_ID,
+                                            "temporary_repo_id": None,
+                                            "target_kind": "docker",
+                                            "purpose": "development",
+                                            "ttl_seconds": None,
+                                            "kill_after_run": False,
+                                        }
+                                        if operation == BrokerOperation.RUNTIME_REQUEST
+                                        else {}
+                                    )
                                 )
                             )
                         ),
