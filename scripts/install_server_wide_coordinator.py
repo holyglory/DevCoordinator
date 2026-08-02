@@ -77,12 +77,19 @@ RUNTIME_DEPENDENCY_ENVIRONMENT = {
 }
 SYSTEM_OWNER_UID = 0
 SYSTEM_OWNER_GID = 0
-SYSTEM_PYTHON = Path("/usr/bin/python3")
+SYSTEM_PYTHON = Path("/opt/devcoordinator-authority/bin/python")
+SYSTEM_PYTHON_VERIFIER = ROOT / "scripts/verify_authority_runtime.py"
 RUNTIME_DEPENDENCY_CHECK = (
     SKILL_SOURCE / "scripts/validate_runtime_dependencies.py"
 )
 RUNTIME_DEPENDENCY_CONTRACT = "devcoordinator-broker-runtime-v1"
 COMPOSE_VERSION_REQUIREMENT = "stable >=2.17,<3 or >=5,<6"
+PINNED_AUTHORITY_PACKAGES = {
+    "PyYAML": "6.0.3",
+    "cryptography": "49.0.0",
+    "cffi": "2.0.0",
+    "pycparser": "2.22",
+}
 AUTHORITY_DATABASE_PATH = Path("/var/lib/devcoordinator/coordinator.sqlite3")
 CLIENT_PROFILE_PATH = Path("/etc/devcoordinator/client-profiles.json")
 PROFILE_DATABASE_ENROLLMENT_DRIFT = "profile_database_enrollment_drift"
@@ -185,11 +192,40 @@ def runtime_dependency_evidence() -> dict[str, Any]:
 
     if not SYSTEM_PYTHON.is_file():
         return {"ok": False, "code": "system_python_missing"}
+    if (
+        not SYSTEM_PYTHON_VERIFIER.is_file()
+        or SYSTEM_PYTHON_VERIFIER.is_symlink()
+    ):
+        return {"ok": False, "code": "authority_runtime_verifier_missing"}
+    try:
+        verified = subprocess.run(
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                str(SYSTEM_PYTHON_VERIFIER),
+                "verify",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"ok": False, "code": "authority_runtime_verification_unavailable"}
+    if verified.returncode != 0:
+        return {"ok": False, "code": "authority_runtime_manifest_mismatch"}
     if not RUNTIME_DEPENDENCY_CHECK.is_file() or RUNTIME_DEPENDENCY_CHECK.is_symlink():
         return {"ok": False, "code": "runtime_dependency_check_missing"}
     try:
         completed = subprocess.run(
-            [str(SYSTEM_PYTHON), "-I", str(RUNTIME_DEPENDENCY_CHECK)],
+            [str(SYSTEM_PYTHON), "-I", "-B", str(RUNTIME_DEPENDENCY_CHECK)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -219,7 +255,7 @@ def runtime_dependency_failure(
     current = runtime_dependency_evidence() if evidence is None else evidence
     if current.get("ok") is True:
         compose = current.get("docker_compose")
-        pyyaml = current.get("pyyaml")
+        authority_packages = current.get("authority_packages")
         requirements = current.get("requirements")
         required_capabilities = (
             "config_json",
@@ -231,11 +267,10 @@ def runtime_dependency_failure(
             current.get("contract") == RUNTIME_DEPENDENCY_CONTRACT
             and requirements
             == {
-                "pyyaml": "6.x",
+                "authority_packages": PINNED_AUTHORITY_PACKAGES,
                 "docker_compose": COMPOSE_VERSION_REQUIREMENT,
             }
-            and isinstance(pyyaml, dict)
-            and pyyaml.get("detected_major") == "6"
+            and authority_packages == PINNED_AUTHORITY_PACKAGES
             and isinstance(compose, dict)
             and isinstance(compose.get("docker_cli"), str)
             and Path(str(compose["docker_cli"])).is_absolute()
@@ -246,13 +281,25 @@ def runtime_dependency_failure(
         return "the broker runtime dependency check returned invalid success evidence"
     code = str(current.get("code") or "")
     if code == "system_python_missing":
-        return "the broker system Python /usr/bin/python3 is missing or unsafe"
+        return (
+            "the pinned broker authority virtual environment "
+            "/opt/devcoordinator-authority is missing or unsafe"
+        )
     if code == "runtime_dependency_check_missing":
         return "the broker runtime dependency check is missing or unsafe"
-    if code.startswith("pyyaml_"):
+    if code in {
+        "authority_runtime_verifier_missing",
+        "authority_runtime_verification_unavailable",
+        "authority_runtime_manifest_mismatch",
+    }:
         return (
-            "the broker system Python does not provide PyYAML 6.x; install the "
-            "distribution python3-yaml package (or an equivalent system package)"
+            "the broker authority runtime was not authenticated by its "
+            "root-owned manifest before execution"
+        )
+    if code.startswith("pyyaml_") or code.startswith("authority_"):
+        return (
+            "the broker authority virtual environment does not match the exact "
+            "hash-locked PyYAML/cryptography/cffi/pycparser closure"
         )
     if code == "docker_cli_unavailable":
         return (
@@ -2418,7 +2465,7 @@ def desired_plan(names: list[str]) -> dict[str, Any]:
         },
         "runtime_requirements": {
             "python": str(SYSTEM_PYTHON),
-            "pyyaml": "6.x",
+            "authority_packages": PINNED_AUTHORITY_PACKAGES,
             "docker_compose": COMPOSE_VERSION_REQUIREMENT,
             "compose_capabilities": [
                 "config --format json",
@@ -2703,13 +2750,17 @@ def restore_source_acl(backup: Path) -> None:
     run(command("setfacl"), f"--restore={backup}")
 
 
-def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bool) -> dict[str, Any]:
+def apply_install(
+    names: list[str],
+    transaction_raw: str,
+    allow_noncanonical: bool,
+    authority_wheelhouse: str | None = None,
+) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise InstallError("apply requires root once; clients require no sudo afterward")
     validate_broker_unit_source()
     require_managed_docker_source_policy()
     restart_precondition = require_profile_database_enrollment_consistency()
-    require_runtime_dependencies()
     transaction = Path(transaction_raw)
     if not transaction.is_absolute() or transaction.exists() or transaction.is_symlink():
         raise InstallError("--transaction-dir must be one new absolute path")
@@ -2733,9 +2784,41 @@ def apply_install(names: list[str], transaction_raw: str, allow_noncanonical: bo
         "legacy_docker_dropin": None,
         "legacy_docker_dropin_removed": False,
         "restart_precondition": restart_precondition,
+        "authority_runtime_transaction": None,
     }
     atomic_json(transaction / JOURNAL_NAME, journal)
     try:
+        if authority_wheelhouse is not None:
+            runtime_transaction = transaction / "authority-runtime"
+            completed = subprocess.run(
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-B",
+                    str(ROOT / "scripts/install_authority_runtime.py"),
+                    "apply",
+                    "--wheelhouse",
+                    authority_wheelhouse,
+                    "--transaction-dir",
+                    str(runtime_transaction),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10 * 60,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = completed.stdout.strip() or completed.stderr.strip()
+                raise InstallError(
+                    "authority runtime transaction failed"
+                    + (f": {detail}" if detail else "")
+                )
+            journal["authority_runtime_transaction"] = str(runtime_transaction)
+            atomic_json(transaction / JOURNAL_NAME, journal)
+        require_runtime_dependencies()
+
         for source, destination in SYSTEM_FILES.items():
             journal["system_files"].append(
                 install_file(source, destination, transaction)
@@ -2894,6 +2977,21 @@ def rollback_install(transaction: Path) -> dict[str, Any]:
     for user in reversed(document.get("group_members_added", [])):
         run(command("gpasswd"), "-d", str(user), ACCESS_GROUP)
     run(command("systemctl"), "daemon-reload")
+    runtime_transaction = document.get("authority_runtime_transaction")
+    if runtime_transaction and not document.get(
+        "authority_runtime_transaction_rolled_back"
+    ):
+        run(
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(ROOT / "scripts/install_authority_runtime.py"),
+            "rollback",
+            "--transaction-dir",
+            str(runtime_transaction),
+        )
+        document["authority_runtime_transaction_rolled_back"] = True
+        atomic_json(journal_path, document)
     document["status"] = "rolled_back"
     atomic_json(journal_path, document)
     return document
@@ -3041,6 +3139,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     apply = actions.add_parser("apply")
     apply.add_argument("--client-user", action="append", required=True)
     apply.add_argument("--transaction-dir", required=True)
+    apply.add_argument(
+        "--authority-wheelhouse",
+        help=(
+            "root-owned offline wheel directory used for one transactional "
+            "authority-runtime activation; omit only when the live manifest "
+            "already verifies"
+        ),
+    )
     apply.add_argument("--allow-noncanonical-skill-links", action="store_true")
     rollback = actions.add_parser("rollback")
     rollback.add_argument("--transaction-dir", required=True)
@@ -3061,6 +3167,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.client_user,
                 args.transaction_dir,
                 bool(args.allow_noncanonical_skill_links),
+                args.authority_wheelhouse,
             )
         elif args.action == "rollback":
             result = rollback_install(Path(args.transaction_dir))

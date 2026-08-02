@@ -557,6 +557,141 @@ def exercise_legacy_docker_dropin_controls() -> None:
             INSTALLER.SYSTEM_OWNER_GID = original_owner_gid
 
 
+def exercise_nested_authority_runtime_rollback() -> None:
+    """A later installer failure must reverse an already activated runtime."""
+
+    with tempfile.TemporaryDirectory(
+        prefix="devcoordinator-authority-nested-"
+    ) as raw:
+        root = Path(raw).resolve(strict=True)
+        root.chmod(0o700)
+        transaction = root / "install-transaction"
+        wheelhouse = root / "approved-wheels"
+        wheelhouse.mkdir(mode=0o700)
+        fixture_home = Path("/home/authority-runtime-fixture")
+        fixture_record = pwd.struct_passwd(
+            (
+                "authority-runtime-fixture",
+                "x",
+                os.getuid(),
+                os.getgid(),
+                "",
+                str(fixture_home),
+                "/bin/sh",
+            )
+        )
+        runtime_apply = INSTALLER.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"ok":true}\n',
+            stderr="",
+        )
+        rollback_calls: list[tuple[str, ...]] = []
+        with (
+            mock.patch.object(INSTALLER.os, "geteuid", return_value=0),
+            mock.patch.object(INSTALLER.os, "chown"),
+            mock.patch.object(
+                INSTALLER,
+                "SYSTEM_OWNER_UID",
+                os.getuid(),
+            ),
+            mock.patch.object(
+                INSTALLER,
+                "SYSTEM_OWNER_GID",
+                os.getgid(),
+            ),
+            mock.patch.object(INSTALLER, "validate_broker_unit_source"),
+            mock.patch.object(INSTALLER, "require_managed_docker_source_policy"),
+            mock.patch.object(
+                INSTALLER,
+                "require_profile_database_enrollment_consistency",
+                return_value={"ok": True},
+            ),
+            mock.patch.object(
+                INSTALLER,
+                "client_records",
+                return_value=[(fixture_record, fixture_home)],
+            ),
+            mock.patch.object(
+                INSTALLER,
+                "enrolled_home_write_paths",
+                return_value=[fixture_home],
+            ),
+            mock.patch.object(
+                INSTALLER.subprocess,
+                "run",
+                return_value=runtime_apply,
+            ) as runtime_run,
+            mock.patch.object(
+                INSTALLER,
+                "require_runtime_dependencies",
+                side_effect=INSTALLER.InstallError(
+                    "injected post-runtime preflight failure"
+                ),
+            ),
+            mock.patch.object(
+                INSTALLER,
+                "command",
+                side_effect=lambda name: name,
+            ),
+            mock.patch.object(
+                INSTALLER,
+                "run",
+                side_effect=lambda *arguments: rollback_calls.append(
+                    tuple(str(value) for value in arguments)
+                ),
+            ),
+        ):
+            must_reject(
+                lambda: INSTALLER.apply_install(
+                    [fixture_record.pw_name],
+                    str(transaction),
+                    False,
+                    str(wheelhouse),
+                ),
+                "post-runtime installer failure",
+            )
+        expected_runtime_transaction = transaction / "authority-runtime"
+        expect(
+            runtime_run.call_args.args[0]
+            == [
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                str(INSTALLER.ROOT / "scripts/install_authority_runtime.py"),
+                "apply",
+                "--wheelhouse",
+                str(wheelhouse),
+                "--transaction-dir",
+                str(expected_runtime_transaction),
+            ],
+            "outer installer did not invoke the exact nested runtime transaction",
+        )
+        expect(
+            (
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                str(INSTALLER.ROOT / "scripts/install_authority_runtime.py"),
+                "rollback",
+                "--transaction-dir",
+                str(expected_runtime_transaction),
+            )
+            in rollback_calls,
+            "outer installer did not roll back the activated nested runtime",
+        )
+        journal = json.loads(
+            (transaction / INSTALLER.JOURNAL_NAME).read_text(encoding="utf-8")
+        )
+        expect(
+            journal["status"] == "rolled_back"
+            and journal["authority_runtime_transaction"]
+            == str(expected_runtime_transaction)
+            and journal["authority_runtime_transaction_rolled_back"] is True,
+            "outer installer did not durably journal nested runtime rollback",
+        )
+
+
 def exercise_source_acl_transaction() -> None:
     # The installed broker and this ACL transaction are Linux-only. macOS does
     # not provide getfacl/setfacl, so retain the source-contract assertions in
@@ -745,14 +880,22 @@ def exercise_docker_socket_admission_evidence() -> None:
     with tempfile.TemporaryDirectory(prefix="devcoordinator-missing-listxattr-") as raw:
         owned = Path(raw).resolve(strict=True)
         owned.chmod(0o700)
+        owner_uid = os.getuid()
+        owner_gid = os.getgid()
+        if owner_uid == 0:
+            # Exercise the ordinary owner-mode branch even when the repository
+            # validator itself runs as root.
+            owner_uid = 12_345
+            owner_gid = 12_345
+            os.chown(owned, owner_uid, owner_gid)
         with mock.patch.object(INSTALLER, "_read_posix_acl", return_value=(None, "getfacl_unavailable")), mock.patch.object(
             INSTALLER.os, "listxattr", new=None, create=True
         ):
             owner = INSTALLER._identity_path_permission(
-                owned, uid=os.getuid(), gids={os.getgid()}, required="x"
+                owned, uid=owner_uid, gids={owner_gid}, required="x"
             )
             foreign = INSTALLER._identity_path_permission(
-                owned, uid=os.getuid() + 10_000, gids=set(), required="x"
+                owned, uid=owner_uid + 10_000, gids=set(), required="x"
             )
         expect(
             owner["allowed"] is True and owner["source"] == "owner_mode",
@@ -1797,8 +1940,15 @@ def main() -> int:
         == [str(fixture_home)],
         "installer plan does not bind the generated drop-in to the complete client set",
     )
-    assert plan["runtime_requirements"]["python"] == "/usr/bin/python3"
-    assert plan["runtime_requirements"]["pyyaml"] == "6.x"
+    assert plan["runtime_requirements"]["python"] == (
+        "/opt/devcoordinator-authority/bin/python"
+    )
+    assert plan["runtime_requirements"]["authority_packages"] == {
+        "PyYAML": "6.0.3",
+        "cryptography": "49.0.0",
+        "cffi": "2.0.0",
+        "pycparser": "2.22",
+    }
     assert (
         plan["runtime_requirements"]["docker_compose"]
         == "stable >=2.17,<3 or >=5,<6"
@@ -1870,9 +2020,20 @@ def main() -> int:
     )
     expect("KillMode=control-group" not in unit, "broker unit retained the old kill mode")
     expect("TimeoutStopSec=15" not in unit, "broker unit retained the old stop timeout")
-    assert "ExecStartPre=/usr/bin/python3 -I " in unit
-    assert "validate_runtime_dependencies.py" in unit
-    assert "ExecStart=/usr/bin/python3 -I " in unit
+    assert (
+        "ExecStartPre=/usr/bin/python3 -I -B "
+        "/home/DevCoordinator/scripts/verify_authority_runtime.py verify"
+    ) in unit
+    assert (
+        "ExecStartPre=/opt/devcoordinator-authority/bin/python -I -B "
+        "/home/DevCoordinator/skills/codex-dev-coordinator/scripts/"
+        "validate_runtime_dependencies.py"
+    ) in unit
+    assert (
+        "ExecStart=/opt/devcoordinator-authority/bin/python -I -B "
+        "/home/DevCoordinator/skills/codex-dev-coordinator/scripts/"
+        "dev_coordinator.py"
+    ) in unit
 
     tmpfiles = (INSTALLER.ROOT / "deploy/devcoordinator.tmpfiles.conf").read_text(
         encoding="utf-8"
@@ -1916,10 +2077,20 @@ def main() -> int:
         "ok": True,
         "contract": "devcoordinator-broker-runtime-v1",
         "requirements": {
-            "pyyaml": "6.x",
+            "authority_packages": {
+                "PyYAML": "6.0.3",
+                "cryptography": "49.0.0",
+                "cffi": "2.0.0",
+                "pycparser": "2.22",
+            },
             "docker_compose": "stable >=2.17,<3 or >=5,<6",
         },
-        "pyyaml": {"detected_major": "6"},
+        "authority_packages": {
+            "PyYAML": "6.0.3",
+            "cryptography": "49.0.0",
+            "cffi": "2.0.0",
+            "pycparser": "2.22",
+        },
         "docker_compose": {
             "docker_cli": "/usr/bin/docker",
             "version": "2.17.0-desktop.1",
@@ -1930,6 +2101,11 @@ def main() -> int:
         },
     }
     with (
+        mock.patch.object(
+            INSTALLER,
+            "SYSTEM_PYTHON",
+            Path("/usr/bin/python3"),
+        ),
         mock.patch.object(
             INSTALLER.subprocess,
             "run",
@@ -1949,22 +2125,36 @@ def main() -> int:
         ),
     ):
         assert INSTALLER.runtime_dependency_failure() is None
-        assert run.call_args.args[0] == [
+        assert len(run.call_args_list) == 2
+        assert run.call_args_list[0].args[0] == [
             "/usr/bin/python3",
             "-I",
+            "-B",
+            str(INSTALLER.SYSTEM_PYTHON_VERIFIER),
+            "verify",
+        ]
+        assert run.call_args_list[0].kwargs["env"] == {
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        assert run.call_args_list[0].kwargs["timeout"] == 60
+        assert run.call_args_list[1].args[0] == [
+            str(INSTALLER.SYSTEM_PYTHON),
+            "-I",
+            "-B",
             str(INSTALLER.RUNTIME_DEPENDENCY_CHECK),
         ]
-        assert run.call_args.kwargs["env"] == {
+        assert run.call_args_list[1].kwargs["env"] == {
             "DEVCOORDINATOR_AUTHORITY": "service",
             "DOCKER_CONFIG": "/var/lib/devcoordinator/docker",
             "HOME": "/root",
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         }
-        assert run.call_args.kwargs["timeout"] == 35
+        assert run.call_args_list[1].kwargs["timeout"] == 35
     failure_cases = (
         (
             {"ok": False, "code": "pyyaml_missing"},
-            "PyYAML 6.x",
+            "hash-locked PyYAML/cryptography/cffi/pycparser closure",
         ),
         (
             {"ok": False, "code": "compose_version_prerelease"},
@@ -1976,35 +2166,42 @@ def main() -> int:
         ),
     )
     for evidence, expected in failure_cases:
-        with mock.patch.object(
-            INSTALLER.subprocess,
-            "run",
-            return_value=INSTALLER.subprocess.CompletedProcess(
-                args=[],
-                returncode=1,
-                stdout=json.dumps(evidence),
-                stderr="preflight failed",
-            ),
-        ):
-            assert expected in str(INSTALLER.runtime_dependency_failure())
+        assert expected in str(INSTALLER.runtime_dependency_failure(evidence))
     invalid_success = dict(success_evidence)
     invalid_success["docker_compose"] = {
         **success_evidence["docker_compose"],
         "config_json": False,
     }
-    with mock.patch.object(
-        INSTALLER.subprocess,
-        "run",
-        return_value=INSTALLER.subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=json.dumps(invalid_success),
-            stderr="",
+    assert "invalid success evidence" in str(
+        INSTALLER.runtime_dependency_failure(invalid_success)
+    )
+    with (
+        mock.patch.object(
+            INSTALLER,
+            "SYSTEM_PYTHON",
+            Path("/usr/bin/python3"),
         ),
+        mock.patch.object(
+            INSTALLER.subprocess,
+            "run",
+            return_value=INSTALLER.subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr="manifest mismatch",
+            ),
+        ) as run,
     ):
-        assert "invalid success evidence" in str(
-            INSTALLER.runtime_dependency_failure()
-        )
+        evidence = INSTALLER.runtime_dependency_evidence()
+        assert evidence == {
+            "ok": False,
+            "code": "authority_runtime_manifest_mismatch",
+        }
+        assert len(run.call_args_list) == 1
+    assert "root-owned manifest" in str(
+        INSTALLER.runtime_dependency_failure(evidence)
+    )
+    exercise_nested_authority_runtime_rollback()
     exercise_profile_database_enrollment_guard()
     exercise_source_acl_transaction()
     exercise_managed_docker_source_policy()

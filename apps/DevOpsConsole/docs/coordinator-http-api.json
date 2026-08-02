@@ -21,6 +21,7 @@
       "/healthz",
       "/v1/inventory",
       "/v1/inventory/no-docker",
+      "/v1/infrastructure",
       "/v1/state",
       "/v1/ports",
       "/v1/ports/assignments",
@@ -129,6 +130,35 @@
     "project_usage": "rows include stable usage_key plus authoritative server_ids and exact container_resource_ids; container_names remain legacy display data and are not ownership keys",
     "docker_ownership": "Compose labels and verified coordinator sidecars are mutation authority; name similarity is read-only evidence",
     "project_reports": "ok=false must be treated as failure even when HTTP status is 200; inspect partial, preflight_failed, classification, actions, and action_errors"
+  },
+  "infrastructure_contract": {
+    "schema": "spectre.infrastructure.projection.v1",
+    "read_semantics": "pure broker-owned snapshot; no host observation or mutation",
+    "fixed_broker_scope": {
+      "project": "infrastructure",
+      "resource": "observation-read",
+      "operation": "infrastructure.read",
+      "repository_generation": 0
+    },
+    "pagination": "immutable host GUID ascending; optional after_host_id; host_limit 1-100",
+    "bounds": {
+      "hosts_per_page": 100,
+      "virtual_machines_per_host": 256,
+      "missing_approved_virtual_machines_per_host": 256,
+      "rejection_incidents_per_host": 20
+    },
+    "freshness": {
+      "projection_generated_at": "canonical RFC3339 UTC",
+      "observation_cadence_seconds": 60,
+      "stale_after_seconds": 180,
+      "states": [
+        "fresh",
+        "stale",
+        "never"
+      ],
+      "offline_policy": "freshness never implies offline; only explicit future terminal evidence may do so"
+    },
+    "method_policy": "GET only; no infrastructure ingest, enrollment, lifecycle, or remote-mutation HTTP route exists"
   },
   "test_contract": {
     "repositories": "GET /v1/test-repositories returns the protected profile's enabled repository IDs, canonical roots, and display names without building inventory or observing the host",

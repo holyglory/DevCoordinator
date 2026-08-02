@@ -9,8 +9,9 @@ and review; no external audit-skill checkout is required.
 - Product promise: **One private page where the VPS owner sees every dev
   server, container, port lease and public subdomain on `vr.ae`, can expose,
   restart, inspect or retract them, can grant exact domains through reviewed
-  Google invite requests, and can route project events to approved Telegram
-  subscribers.**
+  Google invite requests, can route project events to approved Telegram
+  subscribers, and can inspect separately enrolled physical hosts and virtual
+  machines without implying remote control or independent failure domains.**
 - Primary users: configured owners; invited Google users may be domain-only
   viewers or Console operators. Only configured owners administer Google
   access. Every Console-authorized account may own Telegram bots; configured
@@ -64,6 +65,7 @@ Prioritized: top rows are the most frequent and most important.
 | J10 Archive, restore, or permanently remove a host resource | Owner | Monthly | 2 | High | Active/Archived filter on Projects, Servers, or Docker | Exact resource is durably fenced, restored without starting, or removed only from a reviewed archived plan |
 | J11 Request and decide exact Google access | Requester / owner | Monthly+ | 2 | High | Protected-host denial / Incoming invites | One exact host-derived request is approved or denied; replacement routes cannot inherit it |
 | J12 Register a Telegram bot and authorize project notifications | Console operator / bot owner | Monthly setup, continuous delivery | 3 | High | Telegram page / private bot chat | Exact projects and approved chats receive durable server/Docker lifecycle, failure, and crash events |
+| J13 Inspect remote infrastructure truth | Operator | Daily during lab qualification | 1 | High | Infrastructure page | Enrolled hosts, expected/current VM roster, observation age, verification, incidents, capacity, and shared failure domain are distinguishable without any remote-control promise |
 
 ## Journey Detail
 
@@ -731,6 +733,54 @@ Prioritized: top rows are the most frequent and most important.
     pending/recent authorization, remove confirm, desktop, and 390px states are
     usable and never reveal a token.
 
+### J13 — Inspect remote infrastructure truth
+
+- User: configured Console owner/access-admin on desktop or phone during
+  laboratory qualification and incident triage. A general Console grant does
+  not authorize this management-address and classification-bearing view.
+- Goal: distinguish enrollment, contact, capture, acceptance, verification,
+  retained evidence, expected VM scope, current VM state, and shared physical
+  failure domains without opening a remote-administration path.
+- Entry point: the prominent Hyper-V block is the first real collection on
+  `#/servers`; `Open infrastructure details` leads to `#/infrastructure`.
+  Both surfaces show an honest loading/error/empty state before any host data.
+- Required information: immutable host/cell/VM identities; platform and
+  capacity; the exact failure-domain label; current versus centrally approved
+  VM counts; complete versus partial roster status; missing-approved VM GUIDs;
+  last transport-verified contact, observer capture, and acceptance as separate
+  times; accepted-signature and retained-signed-evidence availability as
+  separate facts; recent rejected-report incidents; VM state, approved role,
+  allocation, heartbeat, observed addresses, checkpoint and replication facts.
+- Truthfulness rules: a failed Console refresh retains and visibly labels the
+  last page; it does not relabel hosts offline. A partial report retains prior
+  current VM rows and exposes its error code. A complete report that omits an
+  approved VM renders a roster-gap incident. A digest is not called a retained
+  signed evidence artifact. One Windows host with six VMs remains one failure
+  domain, not six-node HA. `cell.enabled=false` or
+  `enrollment_enabled=false` is explicitly `Disabled` and not active; fresh
+  retained observation age never overrides that administrative state.
+- Interaction: expanding a host reveals the GUID-keyed VM roster and recent
+  rejection incidents. Bounded host pages have Previous/Next navigation.
+  Refresh and disclosure are the only controls; no Start, Stop, Restart,
+  console, checkpoint, disk, network, enrollment, or ingest control exists.
+- Polling/recovery: fetch every 15 seconds only for an owner while `#/servers`
+  or `#/infrastructure` is active and the document is visible; refresh
+  immediately when a hidden tab becomes visible on either destination.
+- Device/accessibility constraints: collection-first at 1440×900 and 390×844,
+  no horizontal document scroll, status never color-only, disclosure is a
+  labelled button with `aria-expanded`, GUIDs wrap without clipping.
+- Acceptance criteria:
+  - `/api/infrastructure` requires an exact configured owner/access-admin.
+    Unauthenticated requests receive 401; other authenticated Console users
+    receive 403 before cursor validation or a Coordinator read. Their
+    Infrastructure navigation and Servers Hyper-V block remain hidden, and a
+    direct `#/infrastructure` hash falls back without fetching the projection.
+  - Complete, partial, no-observation, rejected-report, missing-approved,
+    unavailable-broker, retained-stale, empty, paged, desktop, and mobile states
+    render honestly.
+  - No HTTP or browser mutation endpoint/control exists for remote
+    infrastructure.
+
 ## Journey Decision Model
 
 | Surface | Primary user goal | Primary decision | Required facts | Warning/flag conditions | Frequent actions | Secondary/rare actions | Unresolved assumptions |
@@ -745,6 +795,7 @@ Prioritized: top rows are the most frequent and most important.
 | Access page | Grant exact private destinations | Which user gets which host | Google email; real host + target; owner/public state; Console privilege consequence | User removal revokes live sessions; owners immutable | Add user; toggle a host grant | Remove user | Ownership transfer remains environment-only |
 | Protected-host denial / Incoming invites | Request and decide exact access | Is this verified account entitled to this exact current destination? | Verified email; server-derived host/title/target; request/status/time | Console-control consequence; stale instance; denial cooldown/rate limit | Request invite; Approve/Deny | Review recent decisions | Only configured owners decide |
 | Telegram page | Deliver project events to approved chats | Which owned bot, exact projects, and private-chat users? | Redacted bot identity/owner/status; current repo names/paths backed by exact `repo_id`; queue/status/error | Existing webhook takeover; vanished assignment; destructive bot removal; delivery error | Register; assign project; approve/deny `/start` | Remove bot; inspect recent decisions | Bot owner isolation; configured-owner override |
+| Infrastructure page | Inspect enrolled remote host/VM truth | Is the accepted roster current, complete, verified, and within its stated failure domain? | Immutable IDs; expected/current/missing VM counts; contact/capture/acceptance; signature/evidence; capacity; incidents | Partial roster; missing approved VM; rejected report; retained stale page; unavailable broker | Expand host; refresh; page | Inspect rejection details | Observation-only; no remote mutation |
 | Projects/Servers/Docker lifecycle views | Clean durable host state safely | Archive, restore, purge, or leave intact | Human target, active/archive state, exact effects/retained/deleted/blockers, capability flags | Blockers; partial/needs-attention result; exact purge phrase mismatch | Archive; inspect archived; restore | Permanent remove; advertised worktree remove | None |
 | Servers/Docker usage cells | Spot a hog in place | Is this row's load normal? | Live CPU % + memory numbers; sparkline shape | Sampling failure note | Click for history charts | — | CPU normalized to observed peak, numbers absolute |
 | Performance page | Find resource hogs with history | Which entity/project to act on | Per-entity CPU/mem charts (current, peak, window); per-project bars | Sampler error note; stale (not running) cards dimmed | Read; navigate to the row to act | Cross-reference project bars | History is in-process, resets with console |
@@ -814,7 +865,8 @@ Binding affordance rules, made concrete for this app:
 | --- | --- | --- | --- | --- | --- |
 | Summary bar | Triage (J1) | Desktop + 390px screenshots healthy vs. coordinator-down vs. TLS-warning | loading, healthy, degraded, stale-data | none — this doc + contract are the target | None |
 | Routes | J2, J4 | Screenshots: empty state, populated table, create-form validation error, public-confirm flow; clipboard check | empty, invalid slug, in-flight, 409 error, public confirm, delete confirm, unresolved dot | none | None |
-| Servers | J3 | Screenshots: collapsed list, expanded row with logs, badge popover, busy buttons; scroll-position retention across a poll | skeleton, empty, degraded, expanded+logs, log error, busy, missing_command-disabled | none | Pull-based logs accepted |
+| Servers | J3, J13 | Screenshots: owner Hyper-V block before application rows plus collapsed list, expanded row with logs, badge popover, busy buttons; scroll-position retention across a poll; prove the block/nav are absent and no infrastructure request occurs for a non-owner | Hyper-V loading/empty/populated/retained-error/disabled, skeleton, empty, degraded, expanded+logs, log error, busy, missing_command-disabled | none | Pull-based logs accepted |
+| Infrastructure | J13 | Owner API 401/403/200 isolation plus desktop + 390px browser and formal geometry evidence for real GUID-keyed host/VM rows | loading, empty, populated, disabled cell/host, partial roster, missing approved VM, no observation, retained refresh error, unavailable first page, paging failure | none | Read-only; no remote mutation controls |
 | Docker | J5 | Screenshots: list, log panel, unavailable-daemon state | empty, unavailable, busy, stop-confirm | none | No compose-up in UI |
 | Port leases | J6 | Screenshots: form + populated table incl. countdown warning; lease→release round trip | empty, degraded, ticking countdown, form error, release confirm | none | Attribution = console user |
 | Performance | J7 | Screenshots: populated chart cards (running + dimmed stale), usage bars; row sparkline popover | collecting (no history yet), populated, sampler-error note, degraded | none | CPU normalized to observed peak |
@@ -831,7 +883,7 @@ is supported and every relevance tier keeps its documented access path
 
 ## Screen Requirements
 
-Nine hash-routed pages behind one sticky header (summary bar + nav; the
+Hash-routed pages behind one sticky header (summary bar + nav; the
 header is identical on every page):
 
 | Screen area | Journey | Critical info | Primary actions | Secondary actions | Rare details | Device/context constraints |
@@ -839,7 +891,8 @@ header is identical on every page):
 | Projects page (`#/projects`, default) | J8, J7 | Collapsed-by-default repo tree: per-node running counts and project CPU/mem; expanding one repo shows losslessly paged members with item CPU/mem, kind tags and subdomain chip on web-serving containers | Whole-project start/stop/restart; per-item start/stop/restart; hide idle; assign/edit container subdomain. Every row (project header, server, container) renders the SAME three color-coded slots — Start (green) / Restart (blue) / Stop (red), inapplicable ones disabled, never hidden — so buttons align into columns | Expand/collapse one node; page members; reveal hidden; unhide | Repo path (title); pin markers | Tree stacks on phone; actions wrap; at most 75 members mounted |
 | Sticky header (single row) | J1 | Brand; needs-attention badge (only when something is wrong); account button | Open badge popover (facts, instructions, actions per problem) | Sign out via account popover | Coordinator error text; cert dates; renew command | ONE row on every viewport; domain label hidden <480px; sticky top |
 | Section nav | All | Page names, live counts, active page | Switch page | Hamburger open/close (≤1023px) | — | Tabs inline in the header row ≥1024px; drawer with ≥40px targets below |
-| Servers page (`#/servers`, default) | J2, J3, J7 | Every nonempty repo/resource-group header, collapsed by default, with running count and project CPU/mem; opening one shows its losslessly paged health badge, name, port, subdomain and CPU/mem rows; Docker-hosted web servers remain first-class rows | Expand one project then a server; restart; refresh logs; assign/edit subdomain (containers too, with an explicitly HTTP-labelled port picker when several are published); open history charts | Collapse/switch project; Stop; start (stopped containers); page through the open project's servers | pid/cmd/cwd/health detail; container image/ports detail | Full-width accessible project targets; compact two-line headers at 390px; from 480–719px each server uses three compact identity/facts/actions bands without redundant labels, below 480px four bounded bands; log box height-capped; at most 75 server rows mounted |
+| Servers page (`#/servers`, default) | J2, J3, J7, J13 | For owners, the real Hyper-V host block leads the page with loading/error/empty/populated truth, active/disabled enrollment status and a details link. Then every nonempty repo/resource-group header is collapsed by default, with running count and project CPU/mem; opening one shows its losslessly paged health badge, name, port, subdomain and CPU/mem rows; Docker-hosted web servers remain first-class rows | Refresh Hyper-V truth or open its details; expand one project then a server; restart; refresh logs; assign/edit subdomain (containers too, with an explicitly HTTP-labelled port picker when several are published); open history charts | Collapse/switch project; Stop; start (stopped containers); page through the open project's servers | pid/cmd/cwd/health detail; container image/ports detail | Hyper-V block is hidden for non-owners. Full-width accessible project targets; compact two-line headers at 390px; from 480–719px each server uses three compact identity/facts/actions bands without redundant labels, below 480px four bounded bands; log box height-capped; at most 75 server rows mounted |
+| Infrastructure page (`#/infrastructure`, owners only) | J13 | Enrolled physical-host collection first; explicit Active/Disabled enrollment; current/approved/missing VM counts; roster completeness; contact/capture/acceptance; signature/evidence; capacity; failure-domain label; rejection incidents | Expand host; refresh; page through bounded host collection | Inspect GUID-keyed VM roster and rejection details | Certificate generation and payload digest remain verification metadata, never a retained-evidence claim | Cards and GUIDs wrap at 390px; no horizontal scroll; only owner + active/visible-page polling; no lifecycle controls |
 | Routes page (`#/routes`) | J2, J4 | URL, resolved dot, access mode; targets: fixed port, managed server, docker container | Create; copy; toggle access | Delete; title; "view server" link | Timestamps | Form stacks at 390px; table rows become labelled cards |
 | Docker page (`#/docker`) | J5, J7 | Losslessly paged status, name, image, ports, CPU/mem numbers; subdomain chip on web-serving containers | Logs; restart; start; open history charts; assign/edit subdomain | Stop; page through all containers | stats/labels | Same card pattern; at most 75 containers mounted |
 | Port leases page (`#/ports`) | J6 | Port, purpose, countdown; lease form; pinned ports (port permanently owned per server, with server status) | Lease; release (confirmed); unassign pin (confirmed) | Preferred port/TTL/project | Lease id, ISO expiry, agent, pin provenance (title) | Form stacks at 390px |
@@ -878,7 +931,8 @@ header is identical on every page):
   restart; coordinator error strings with quotes
   (`"'matching server not found'"`) shown verbatim; invited user with no
   grants; public route with a saved dormant grant; deleted/reused slug;
-  deep link to Access/Incoming invites as a non-owner (falls back to Projects);
+  deep link to Access/Incoming invites/Infrastructure as a non-owner (falls
+  back to Projects without an infrastructure read);
   forged/expired invite claim, duplicate request, denied cooldown, stale route
   instance; Telegram webhook conflict without/with explicit takeover, another
   user's bot ID, group-chat `/start`, duplicate update, vanished `repo_id`,

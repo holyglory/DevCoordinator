@@ -8,13 +8,15 @@ import fcntl
 import grp
 import json
 import os
+import pwd
 import signal
 import socket
+import sqlite3
 import stat
 import sys
 import threading
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,12 +32,21 @@ from .broker import (
 from .broker_backend import build_store_backed_broker_runtime
 from .broker_host import LocalBrokerHostMutations
 from .broker_links import BrokerLinkStore
-from .broker_persistence import BrokerPersistence
+from .broker_persistence import (
+    INFRASTRUCTURE_INGRESS_SERVICE_ACCOUNT,
+    BrokerPersistence,
+    prepare_infrastructure_ingress_access_request,
+    prepare_infrastructure_reader_access_request,
+)
 from .broker_profile import SYSTEM_PROFILE_PATH
 from .broker_profile_enrollment_migration import (
     migrate_protected_profile_enrollments,
     reconcile_protected_profile_repository_generation,
 )
+from .infrastructure_observation import (
+    InfrastructureObservationAuthority,
+)
+from .schema import SCHEMA_VERSION
 from .store import AccountStore
 from .store_backup import (
     create_store_backup,
@@ -288,6 +299,107 @@ def add_broker_parser(subparsers: Any) -> None:
     )
     grant_cleanup_resource.add_argument("--disable", action="store_true")
 
+    infrastructure_admin = actions.add_parser(
+        "infrastructure-admin",
+        help=(
+            "apply one root-only closed remote-infrastructure enrollment or "
+            "certificate-lifecycle request with an immutable receipt"
+        ),
+    )
+    _database_argument(infrastructure_admin)
+    infrastructure_admin.add_argument(
+        "--request-file",
+        required=True,
+        help="root-owned regular JSON request; private keys are never accepted",
+    )
+
+    infrastructure_ingress_access = actions.add_parser(
+        "infrastructure-ingress-access",
+        help=(
+            "replace the fixed dedicated-ingress broker grants from one "
+            "root-owned closed request and retain an immutable receipt"
+        ),
+    )
+    _database_argument(infrastructure_ingress_access)
+    infrastructure_ingress_access.add_argument(
+        "--request-file",
+        required=True,
+        help=(
+            "root-owned regular JSON request binding the fixed system account, "
+            "numeric UID, broker account, and expiry"
+        ),
+    )
+
+    infrastructure_reader_access = actions.add_parser(
+        "infrastructure-reader-access",
+        help=(
+            "replace or disable one expiring Console/API infrastructure-read "
+            "grant from a root-owned request and retain an immutable receipt"
+        ),
+    )
+    _database_argument(infrastructure_reader_access)
+    infrastructure_reader_access.add_argument(
+        "--request-file",
+        required=True,
+        help=(
+            "root-owned regular JSON request binding the exact service account, "
+            "numeric UID, broker account, action, and optional expiry"
+        ),
+    )
+
+    infrastructure_observer_readiness = actions.add_parser(
+        "infrastructure-observer-readiness",
+        help=(
+            "export one create-new, at-most-15-minute central readiness receipt "
+            "after read-only schema, enrollment, ingress-authority and PKI proof"
+        ),
+    )
+    _database_argument(infrastructure_observer_readiness)
+    infrastructure_observer_readiness.add_argument(
+        "--host-provision-receipt",
+        required=True,
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--agent-provision-receipt",
+        required=True,
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--certificate-provision-receipt",
+        required=True,
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--ingress-access-receipt",
+        required=True,
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--reader-access-receipt",
+        required=True,
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--ingress-configuration",
+        required=True,
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--client-certificate",
+        required=True,
+        help="public observer client leaf only; never a private key",
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--server-trust-root",
+        required=True,
+        help="exact public root pinned by the Windows observer",
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--output",
+        required=True,
+        help="absent path below a protected root-owned directory",
+    )
+    infrastructure_observer_readiness.add_argument(
+        "--validity-seconds",
+        type=int,
+        default=900,
+    )
+
     port_range = actions.add_parser("grant-port-range")
     _database_argument(port_range)
     port_range.add_argument("--uid", type=int, required=True)
@@ -525,6 +637,18 @@ def handle_broker_cli(args: argparse.Namespace) -> Any:
         with AccountStore.open_default(args.coordinator_home) as store:
             return BrokerLinkStore(store).reconcile_pending(limit=int(args.limit))
 
+    if args.action == "infrastructure-admin":
+        return _administer_infrastructure(args)
+
+    if args.action == "infrastructure-ingress-access":
+        return _administer_infrastructure_ingress_access(args)
+
+    if args.action == "infrastructure-reader-access":
+        return _administer_infrastructure_reader_access(args)
+
+    if args.action == "infrastructure-observer-readiness":
+        return _export_infrastructure_observer_readiness(args)
+
     if args.action == "store-backup":
         return create_store_backup(
             args.database,
@@ -727,6 +851,216 @@ def handle_broker_cli(args: argparse.Namespace) -> Any:
             "enabled": not bool(args.disable),
         }
     raise ValueError("unsupported broker action")
+
+
+def _read_closed_admin_json(path: Path) -> dict[str, Any]:
+    absolute = path.expanduser().absolute()
+    if absolute.is_symlink() or absolute.resolve() != absolute:
+        raise PermissionError(
+            "infrastructure admin request file must have no symbolic-link path"
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(absolute, flags)
+    try:
+        opened = os.fstat(descriptor)
+        after = absolute.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or stat.S_IMODE(opened.st_mode) & 0o022
+            or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            raise PermissionError(
+                "infrastructure admin request must be a stable root-owned "
+                "regular file that is not group/other writable"
+            )
+        raw = os.read(descriptor, 1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError(
+                "infrastructure admin request exceeds the 1 MiB bound"
+            )
+        if os.read(descriptor, 1):
+            raise ValueError(
+                "infrastructure admin request exceeds the 1 MiB bound"
+            )
+    finally:
+        os.close(descriptor)
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(
+                    "infrastructure admin request contains a duplicate JSON key"
+                )
+            result[key] = value
+        return result
+
+    def reject_float(_value: str) -> Any:
+        raise ValueError(
+            "infrastructure admin request floats are not permitted"
+        )
+
+    try:
+        document = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=object_pairs,
+            parse_float=reject_float,
+            parse_constant=reject_float,
+        )
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            "infrastructure admin request is not strict UTF-8"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "infrastructure admin request is not valid JSON"
+        ) from error
+    if not isinstance(document, dict):
+        raise ValueError("infrastructure admin request must be a JSON object")
+    return document
+
+
+def _administer_infrastructure(args: argparse.Namespace) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "infrastructure administration requires the root service owner"
+        )
+    database = _require_root_schema14_database(Path(args.database))
+    request = _read_closed_admin_json(Path(args.request_file))
+    with exclusive_broker_service_lock(database):
+        authority = InfrastructureObservationAuthority(
+            database,
+            expected_uid=0,
+        )
+        return authority.administer(request, operator_uid=0)
+
+
+def _administer_infrastructure_ingress_access(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "infrastructure ingress access requires the root service owner"
+        )
+    database = _require_root_schema14_database(Path(args.database))
+    request = _read_closed_admin_json(Path(args.request_file))
+    normalized = prepare_infrastructure_ingress_access_request(request)
+    service_account = str(normalized["payload"]["service_account"])
+    if service_account != INFRASTRUCTURE_INGRESS_SERVICE_ACCOUNT:
+        raise PermissionError(
+            "infrastructure ingress request does not bind the fixed account"
+        )
+    try:
+        actual_uid = int(pwd.getpwnam(service_account).pw_uid)
+    except KeyError as error:
+        raise PermissionError(
+            "the dedicated infrastructure ingress system account is missing"
+        ) from error
+    if actual_uid != int(normalized["payload"]["uid"]) or actual_uid == 0:
+        raise PermissionError(
+            "the dedicated infrastructure ingress account UID does not match "
+            "the root-owned request"
+        )
+    with exclusive_broker_service_lock(database):
+        persistence = BrokerPersistence(database, expected_uid=0)
+        return persistence.administer_infrastructure_ingress_access(
+            normalized,
+            operator_uid=0,
+        )
+
+
+def _administer_infrastructure_reader_access(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise PermissionError(
+            "infrastructure reader access requires the root service owner"
+        )
+    database = _require_root_schema14_database(Path(args.database))
+    request = _read_closed_admin_json(Path(args.request_file))
+    normalized = prepare_infrastructure_reader_access_request(request)
+    service_account = str(normalized["payload"]["service_account"])
+    try:
+        actual_uid = int(pwd.getpwnam(service_account).pw_uid)
+    except KeyError as error:
+        raise PermissionError(
+            "the infrastructure reader operating-system account is missing"
+        ) from error
+    if actual_uid != int(normalized["payload"]["uid"]) or actual_uid == 0:
+        raise PermissionError(
+            "the infrastructure reader account UID does not match the "
+            "root-owned request"
+        )
+    with exclusive_broker_service_lock(database):
+        persistence = BrokerPersistence(database, expected_uid=0)
+        return persistence.administer_infrastructure_reader_access(
+            normalized,
+            operator_uid=0,
+        )
+
+
+def _export_infrastructure_observer_readiness(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    from .infrastructure_readiness import (
+        CentralReadinessInputs,
+        export_observer_central_readiness,
+    )
+
+    return export_observer_central_readiness(
+        CentralReadinessInputs(
+            database=Path(args.database),
+            host_provision_receipt=Path(args.host_provision_receipt),
+            agent_provision_receipt=Path(args.agent_provision_receipt),
+            certificate_provision_receipt=Path(
+                args.certificate_provision_receipt
+            ),
+            ingress_access_receipt=Path(args.ingress_access_receipt),
+            reader_access_receipt=Path(args.reader_access_receipt),
+            ingress_configuration=Path(args.ingress_configuration),
+            client_certificate=Path(args.client_certificate),
+            server_trust_root=Path(args.server_trust_root),
+            output=Path(args.output),
+            validity_seconds=int(args.validity_seconds),
+        )
+    )
+
+
+def _require_root_schema14_database(path: Path) -> Path:
+    database = path.expanduser().absolute()
+    if database.is_symlink() or database.resolve() != database:
+        raise PermissionError(
+            "infrastructure authority database must have no symbolic-link path"
+        )
+    metadata = database.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise PermissionError(
+            "infrastructure authority database must be a root-owned regular "
+            "file that is not group/other writable"
+        )
+    # This command is not a schema activation path. Refuse before opening the
+    # Coordinator store if the offline deployment transaction has not already
+    # installed the exact v14 authority.
+    uri = database.as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
+        row = connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+        ).fetchone()
+    if row is None or int(row[0]) != SCHEMA_VERSION or SCHEMA_VERSION != 14:
+        raise RuntimeError(
+            "infrastructure administration requires an already activated "
+            "schema-v14 authority; it never upgrades the live database"
+        )
+    return database
 
 
 def _store_artifact_create_arguments(parser: argparse.ArgumentParser) -> None:

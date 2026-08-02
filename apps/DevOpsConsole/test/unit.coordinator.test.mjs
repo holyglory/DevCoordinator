@@ -10,6 +10,18 @@ import { CoordError, coordinatorTimeoutFor, createCoordinator } from '../src/coo
 
 const TOKEN = 'fixture-coordinator-token-0123456789abcdef';
 
+async function waitFor(predicate, {
+  timeoutMs = 1_000,
+  intervalMs = 5,
+} = {}) {
+  const deadline = performance.now() + timeoutMs;
+  while (!predicate()) {
+    if (performance.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return true;
+}
+
 test('published HTTP contract describes normalized query-only inventory and its legacy projection', async () => {
   const contract = JSON.parse(await fsp.readFile(
     new URL('../docs/coordinator-http-api.json', import.meta.url),
@@ -37,6 +49,10 @@ test('published HTTP contract describes normalized query-only inventory and its 
     'test_statistics',
   ]);
   assert.equal(contract.inventory_contract.compatibility_projection, 'v1_compatibility');
+  assert.equal(contract.infrastructure_contract.read_semantics, 'pure broker-owned snapshot; no host observation or mutation');
+  assert.equal(contract.infrastructure_contract.freshness.observation_cadence_seconds, 60);
+  assert.equal(contract.infrastructure_contract.freshness.stale_after_seconds, 180);
+  assert.match(contract.infrastructure_contract.freshness.offline_policy, /never implies offline/);
   assert.match(contract.inventory_contract.ordinary_inventory, /without runtime sampling or persistence/);
   assert.match(contract.inventory_contract.no_docker, /in-memory copy/);
   assert.match(contract.inventory_contract.no_docker, /never persists/);
@@ -68,6 +84,178 @@ test('test statistics use one bounded repository-scoped coordinator read', async
   );
 });
 
+test('infrastructure uses one bounded authenticated immutable-ID-sorted read', async (t) => {
+  // Version 7 proves the Console mirrors the authority's canonical UUID
+  // contract instead of imposing the old v1-v5-only transport regex.
+  const hostId = '018f2e4d-7c2a-7b3c-8d4e-0123456789ab';
+  const vmId = '00000000-0000-4000-8000-000000000101';
+  const response = {
+    schema: 'spectre.infrastructure.projection.v1',
+    generated_at: '2026-07-29T12:00:00Z',
+    observation_cadence_seconds: 60,
+    stale_after_seconds: 180,
+    sort: 'host_id',
+    after_host_id: null,
+    host_limit: 100,
+    vm_limit_per_host: 256,
+    rejection_limit_per_host: 20,
+    hosts: [{
+      host_id: hostId,
+      contact_freshness: { status: 'stale', age_seconds: 180, stale_after_seconds: 180 },
+      capture_freshness: { status: 'fresh', age_seconds: 179, stale_after_seconds: 180 },
+      acceptance_freshness: { status: 'fresh', age_seconds: 0, stale_after_seconds: 180 },
+      virtual_machines: [{ vm_id: vmId }],
+      missing_approved_virtual_machines: [],
+      recent_rejections: [],
+    }],
+    has_more: false,
+    next_after_host_id: null,
+  };
+  const expectedPath = '/v1/infrastructure?host_limit=100'
+    + '&vm_limit_per_host=256&rejection_limit_per_host=20';
+  const responder = async ({ req, res }) => {
+    if (req.url !== expectedPath) return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(response));
+    return true;
+  };
+  const { client, requests } = await fixture(t, { responder });
+  assert.deepEqual(await client.infrastructure(), response);
+  assert.equal(requests.at(-1).authorization, `Bearer ${TOKEN}`);
+  assert.equal(requests.at(-1).method, 'GET');
+
+  response.hosts[0].contact_freshness = {
+    status: 'fresh',
+    age_seconds: 180,
+    stale_after_seconds: 180,
+  };
+  await assert.rejects(
+    client.infrastructure(),
+    (error) => error instanceof CoordError
+      && error.status === 502
+      && /invalid infrastructure projection/.test(error.message),
+  );
+
+  assert.throws(
+    () => client.infrastructure({ afterHostId: 'not-a-guid' }),
+    (error) => error instanceof CoordError && error.status === 400,
+  );
+});
+
+test('infrastructure accepts a compact UTF-8 maximum host page below the authority budget', async (t) => {
+  const hosts = Array.from({ length: 100 }, (_, offset) => {
+    const ordinal = String(offset + 1).padStart(12, '0');
+    return {
+      host_id: `00000000-0000-4000-8000-${ordinal}`,
+      display_name: `РЛС «Север» ${'Я'.repeat(45_000)}`,
+      contact_freshness: { status: 'fresh', age_seconds: 0, stale_after_seconds: 180 },
+      capture_freshness: { status: 'fresh', age_seconds: 0, stale_after_seconds: 180 },
+      acceptance_freshness: { status: 'fresh', age_seconds: 0, stale_after_seconds: 180 },
+      virtual_machines: [],
+      missing_approved_virtual_machines: [],
+      recent_rejections: [],
+    };
+  });
+  const response = {
+    schema: 'spectre.infrastructure.projection.v1',
+    generated_at: '2026-07-29T12:00:00Z',
+    observation_cadence_seconds: 60,
+    stale_after_seconds: 180,
+    sort: 'host_id',
+    after_host_id: null,
+    host_limit: 100,
+    vm_limit_per_host: 256,
+    rejection_limit_per_host: 20,
+    hosts,
+    has_more: false,
+    next_after_host_id: null,
+  };
+  const encoded = Buffer.from(JSON.stringify(response), 'utf8');
+  assert.ok(encoded.length < 12 * 1024 * 1024);
+  const responder = async ({ req, res }) => {
+    if (!req.url.startsWith('/v1/infrastructure?')) return false;
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-length': String(encoded.length),
+    });
+    res.end(encoded);
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+  const observed = await client.infrastructure();
+  assert.equal(observed.hosts.length, 100);
+  assert.match(observed.hosts[0].display_name, /^РЛС «Север»/);
+});
+
+test('infrastructure rejects a response larger than the Console transport cap', async (t) => {
+  const responder = async ({ req, res }) => {
+    if (!req.url.startsWith('/v1/infrastructure?')) return false;
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'content-length': String(16 * 1024 * 1024 + 1),
+    });
+    res.end('{}');
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+  await assert.rejects(
+    client.infrastructure(),
+    (error) => error instanceof CoordError
+      && error.status === 502
+      && /oversized infrastructure projection/.test(error.message),
+  );
+});
+
+test('infrastructure rejects unbounded or out-of-order coordinator projections', async (t) => {
+  const hostId = '00000000-0000-4000-8000-000000000002';
+  const response = {
+    schema: 'spectre.infrastructure.projection.v1',
+    generated_at: '2026-07-29T12:00:00Z',
+    observation_cadence_seconds: 60,
+    stale_after_seconds: 180,
+    sort: 'host_id',
+    after_host_id: null,
+    host_limit: 100,
+    vm_limit_per_host: 256,
+    rejection_limit_per_host: 20,
+    hosts: [
+      {
+        host_id: hostId,
+        contact_freshness: { status: 'stale', age_seconds: 180, stale_after_seconds: 180 },
+        capture_freshness: { status: 'fresh', age_seconds: 179, stale_after_seconds: 180 },
+        acceptance_freshness: { status: 'never', age_seconds: null, stale_after_seconds: 180 },
+        virtual_machines: [],
+        missing_approved_virtual_machines: [],
+        recent_rejections: [],
+      },
+      {
+        host_id: hostId,
+        contact_freshness: { status: 'stale', age_seconds: 180, stale_after_seconds: 180 },
+        capture_freshness: { status: 'fresh', age_seconds: 179, stale_after_seconds: 180 },
+        acceptance_freshness: { status: 'never', age_seconds: null, stale_after_seconds: 180 },
+        virtual_machines: [],
+        missing_approved_virtual_machines: [],
+        recent_rejections: [],
+      },
+    ],
+    has_more: false,
+    next_after_host_id: null,
+  };
+  const responder = async ({ req, res }) => {
+    if (!req.url.startsWith('/v1/infrastructure?')) return false;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(response));
+    return true;
+  };
+  const { client } = await fixture(t, { responder });
+  await assert.rejects(
+    client.infrastructure(),
+    (error) => error instanceof CoordError
+      && error.status === 502
+      && /invalid infrastructure projection/.test(error.message),
+  );
+});
+
 test('test statistics survive a Console restart and refresh stale data in the background', async (t) => {
   const response = {
     schema_version: 1,
@@ -88,6 +276,11 @@ test('test statistics survive a Console restart and refresh stale data in the ba
   const { client, config } = await fixture(t, { responder });
   assert.deepEqual(await client.testStats({ project: 'repo-1' }), response);
 
+  const snapshotPath = path.join(config.stateDir, 'test-stats-cache-v1.json');
+  const persisted = JSON.parse(await fsp.readFile(snapshotPath, 'utf8'));
+  persisted.entries[0].at = Date.now() - 1_000;
+  await fsp.writeFile(snapshotPath, JSON.stringify(persisted), { mode: 0o600 });
+
   slow = true;
   const restarted = createCoordinator({ config, log: null });
   t.after(() => restarted.close());
@@ -101,7 +294,11 @@ test('test statistics survive a Console restart and refresh stale data in the ba
 
   assert.deepEqual(retained, response);
   assert.ok(elapsedMs < 50, `retained test statistics waited ${elapsedMs.toFixed(1)}ms`);
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(
+    await waitFor(() => statisticsRequests === 2),
+    true,
+    'the background refresh did not start within its bounded test deadline',
+  );
   assert.equal(statisticsRequests, 2,
     'a stale retained response must start exactly one background refresh');
 });

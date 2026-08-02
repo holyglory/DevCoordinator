@@ -109,6 +109,52 @@ async function settle(page) {
   });
 }
 
+async function verifyMobileProjectsGeometry(page) {
+  const result = await page.evaluate(() => {
+    const warnings = [...document.querySelectorAll(
+      '#projects-body .tree-item.ownership-unverified .ownership-warning',
+    )].filter((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+    return {
+      count: warnings.length,
+      failures: warnings.flatMap((warning) => {
+        const warningRect = warning.getBoundingClientRect();
+        const copy = warning.querySelector('.ownership-warning-copy');
+        const copyRect = copy?.getBoundingClientRect();
+        const title = warning.querySelector('.ownership-warning-title');
+        const titleRect = title?.getBoundingClientRect();
+        const titleStyle = title ? getComputedStyle(title) : null;
+        const lineHeight = titleStyle
+          ? Number.parseFloat(titleStyle.lineHeight)
+            || Number.parseFloat(titleStyle.fontSize) * 1.2
+          : 0;
+        const reasons = [];
+        if (warningRect.width < 200) reasons.push(`warning width ${warningRect.width}`);
+        if (!copyRect || copyRect.width < 160) {
+          reasons.push(`copy width ${copyRect?.width ?? 0}`);
+        }
+        if (!titleRect || !lineHeight || titleRect.height / lineHeight > 2.1) {
+          reasons.push(`title lines ${titleRect && lineHeight ? titleRect.height / lineHeight : 'unknown'}`);
+        }
+        if (warning.scrollWidth > warning.clientWidth + 1) {
+          reasons.push(`horizontal overflow ${warning.scrollWidth - warning.clientWidth}`);
+        }
+        return reasons;
+      }),
+    };
+  });
+  if (result.count === 0) {
+    throw new Error('canonical mobile Projects fixture rendered no ownership diagnosis');
+  }
+  if (result.failures.length) {
+    throw new Error(
+      `canonical mobile Projects ownership diagnosis is unreadable: ${result.failures.join('; ')}`,
+    );
+  }
+}
+
 async function captureOne({ browser, stack, sessionCookie, definition }) {
   const browserErrors = [];
   const unexpectedRequests = [];
@@ -159,8 +205,12 @@ async function captureOne({ browser, stack, sessionCookie, definition }) {
       await page.getByText('queue-worker', { exact: true }).waitFor();
       await page.getByText('preview-web', { exact: true }).waitFor();
       await page.getByText('cleanup after run', { exact: false }).waitFor();
+      await page.evaluate(() => window.scrollTo(0, 0));
     }
     await settle(page);
+    if (definition.page === 'projects' && definition.viewport.width <= 599) {
+      await verifyMobileProjectsGeometry(page);
+    }
     if (unexpectedRequests.length || browserErrors.length) {
       throw new Error([...unexpectedRequests.map((item) => `unexpected request: ${item}`), ...browserErrors].join('\n'));
     }

@@ -1357,7 +1357,7 @@ class BrokerComposeTests(unittest.TestCase):
             self.fixture.persistence.release_compose_project_name(
                 compose_definition_id=COMPOSE_ALPHA,
                 observation_evidence=evidence,
-                actor_uid=os.geteuid(),
+                actor_uid=1,
             )
 
         tampered = dict(evidence)

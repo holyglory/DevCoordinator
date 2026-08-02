@@ -63,6 +63,13 @@ from devcoordinator.broker_cli import (
     serve_broker,
 )
 from devcoordinator.broker import BrokerError, BrokerOperation
+from devcoordinator.infrastructure_observation import (
+    INFRASTRUCTURE_BROKER_PROJECT_ID,
+    INFRASTRUCTURE_READ_RESOURCE_ID,
+    MAX_PROJECTION_BYTES,
+    InfrastructureValidationError,
+    prepare_read_arguments,
+)
 from devcoordinator.broker_enrollment import (
     _normalize_ephemeral_templates,
     enroll_repository,
@@ -19615,6 +19622,7 @@ API_GET_ROUTES = frozenset(
         "/v1/ready",
         "/v1/inventory",
         "/v1/inventory/no-docker",
+        "/v1/infrastructure",
         "/v1/state",
         "/v1/ports",
         "/v1/ports/assignments",
@@ -19747,6 +19755,68 @@ def parse_test_stats_query(raw_query: str) -> dict[str, Any]:
     return {"project": project, "days": days, "limit": limit}
 
 
+def parse_infrastructure_query(raw_query: str) -> dict[str, Any]:
+    """Translate one bounded read-only HTTP page into broker arguments."""
+
+    if not raw_query:
+        return prepare_read_arguments({})
+    values = parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        strict_parsing=True,
+        max_num_fields=4,
+    )
+    allowed = {
+        "after_host_id",
+        "host_limit",
+        "vm_limit_per_host",
+        "rejection_limit_per_host",
+    }
+    if set(values) - allowed or any(len(items) != 1 for items in values.values()):
+        raise ValueError(
+            "infrastructure query accepts one after_host_id, host_limit, "
+            "vm_limit_per_host, and rejection_limit_per_host"
+        )
+    arguments: dict[str, Any] = {}
+    if "after_host_id" in values:
+        arguments["after_host_id"] = values["after_host_id"][0]
+    for name in (
+        "host_limit",
+        "vm_limit_per_host",
+        "rejection_limit_per_host",
+    ):
+        if name not in values:
+            continue
+        raw = values[name][0]
+        if not raw.isdigit():
+            raise ValueError(f"{name} must be an integer")
+        arguments[name] = int(raw)
+    try:
+        return prepare_read_arguments(arguments)
+    except InfrastructureValidationError as error:
+        raise ValueError(error.message) from None
+
+
+def coordinated_infrastructure_read(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Read only the fixed-scope infrastructure projection through the broker."""
+
+    profile = configured_broker_profile()
+    if profile is None:
+        raise PermissionError(
+            "server-wide infrastructure read requires an authenticated broker profile"
+        )
+    _operation_id, result = call_broker(
+        service=profile.service,
+        account_id=profile.account_id,
+        repo_id=INFRASTRUCTURE_BROKER_PROJECT_ID,
+        repository_generation=0,
+        resource_id=INFRASTRUCTURE_READ_RESOURCE_ID,
+        operation=BrokerOperation.INFRASTRUCTURE_READ,
+        arguments=arguments,
+    )
+    return result
+
+
 def coordinated_test_statistics_read(
     *, project: str, days: int, limit: int
 ) -> dict[str, Any]:
@@ -19839,10 +19909,13 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(API_REQUEST_TIMEOUT_SECONDS)
 
-    def _send(
-        self, status: int, payload: Any, *, headers: dict[str, str] | None = None
+    def _send_json_bytes(
+        self,
+        status: int,
+        body: bytes,
+        *,
+        headers: dict[str, str] | None = None,
     ) -> None:
-        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -19857,6 +19930,26 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         # while never writing that representation to the connection.
         if self.command != "HEAD":
             self.wfile.write(body)
+
+    def _send(
+        self, status: int, payload: Any, *, headers: dict[str, str] | None = None
+    ) -> None:
+        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        self._send_json_bytes(status, body, headers=headers)
+
+    def _send_infrastructure(self, payload: Mapping[str, Any]) -> None:
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(body) > MAX_PROJECTION_BYTES:
+            raise RuntimeError(
+                "infrastructure projection exceeds the HTTP result limit"
+            )
+        self._send_json_bytes(200, body)
 
     def _send_runtime_artifact(self, payload: Mapping[str, Any]) -> None:
         text_value = payload.get("text")
@@ -19990,6 +20083,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 }
             elif path == "/v1/inventory":
                 result: Any = coordinated_build_inventory()
+            elif path == "/v1/infrastructure":
+                result = coordinated_infrastructure_read(
+                    parse_infrastructure_query(raw_query)
+                )
+                self._send_infrastructure(result)
+                return
             elif path == "/v1/archives":
                 result = coordinated_list_archives()
             elif path == "/v1/events":

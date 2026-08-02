@@ -18,8 +18,9 @@ RuntimeDirectoryPreserve=restart
 StateDirectory=devcoordinator
 StateDirectoryMode=0700
 UMask=0077
-ExecStartPre=/usr/bin/python3 -I /home/DevCoordinator/skills/codex-dev-coordinator/scripts/validate_runtime_dependencies.py
-ExecStart=/usr/bin/python3 -I /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py broker serve --database /var/lib/devcoordinator/coordinator.sqlite3 --socket /run/devcoordinator/broker.sock --access-group devcoordinator-clients
+ExecStartPre=/usr/bin/python3 -I -B /home/DevCoordinator/scripts/verify_authority_runtime.py verify
+ExecStartPre=/opt/devcoordinator-authority/bin/python -I -B /home/DevCoordinator/skills/codex-dev-coordinator/scripts/validate_runtime_dependencies.py
+ExecStart=/opt/devcoordinator-authority/bin/python -I -B /home/DevCoordinator/skills/codex-dev-coordinator/scripts/dev_coordinator.py broker serve --database /var/lib/devcoordinator/coordinator.sqlite3 --socket /run/devcoordinator/broker.sock --access-group devcoordinator-clients
 Restart=on-failure
 RestartSec=2
 # Authority admission and committed inventory must remain schedulable while a

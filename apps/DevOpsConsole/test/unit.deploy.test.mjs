@@ -216,11 +216,17 @@ test('cutover process identity and signaling are Linux-format and PID-reuse safe
   for (const mode of [0o111, 0o311, 0o644, 0o664, 0o757, 0o777]) {
     assert.equal(isSafeGitExecutableMode(mode), false, `unsafe checkout mode ${mode.toString(8)}`);
   }
-  const registrationMode = (await fsp.stat(registrationReadyPath)).mode & 0o777;
+  const repositoryRoot = path.resolve(APP_ROOT, '..', '..');
+  const { stdout: registrationIndex } = await execFileAsync(
+    'git',
+    ['ls-files', '--stage', '--', 'scripts/check_console_registration_ready.py'],
+    { cwd: repositoryRoot },
+  );
+  const registrationMode = Number.parseInt(registrationIndex.trim().split(/\s+/, 1)[0], 8) & 0o777;
   assert.equal(
     isSafeGitExecutableMode(registrationMode),
     true,
-    `registration helper mode ${registrationMode.toString(8)} must be 755 or 775`,
+    `tracked registration helper mode ${registrationMode.toString(8)} must be executable`,
   );
 });
 

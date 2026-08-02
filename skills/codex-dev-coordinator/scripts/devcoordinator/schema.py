@@ -9,8 +9,10 @@ import sqlite3
 from typing import Iterable
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 14
 MINIMUM_MIGRATABLE_SCHEMA_VERSION = 1
+INFRASTRUCTURE_CERTIFICATE_MAX_VALIDITY_SECONDS = 30 * 24 * 60 * 60
+INFRASTRUCTURE_CERTIFICATE_MAX_OVERLAP_SECONDS = 72 * 60 * 60
 
 
 _SHA256_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
@@ -1269,6 +1271,476 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_running_observer_per_domain
 ON observation_snapshots(host_id, observer_domain)
 WHERE status = 'running';
 
+-- Remote infrastructure is a distinct, observation-only authority domain.
+-- Its identities never overlap local process/container identities, and the
+-- signed observer never receives a writable database handle.
+CREATE TABLE IF NOT EXISTS infrastructure_cells (
+    cell_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    region TEXT,
+    classification_label TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS infrastructure_hosts (
+    host_id TEXT PRIMARY KEY,
+    cell_id TEXT NOT NULL
+        REFERENCES infrastructure_cells(cell_id) ON DELETE RESTRICT,
+    display_name TEXT NOT NULL,
+    failure_domain_label TEXT NOT NULL,
+    platform TEXT NOT NULL CHECK(platform = 'windows-hyperv'),
+    scope_sha256 TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS infrastructure_hosts_by_cell
+ON infrastructure_hosts(cell_id, host_id);
+
+-- Every VM identity and role is centrally approved. The observer may report
+-- only this immutable-ID scope and cannot gain authority by choosing a name or
+-- role in its signed payload.
+CREATE TABLE IF NOT EXISTS infrastructure_host_vm_scope (
+    host_id TEXT NOT NULL
+        REFERENCES infrastructure_hosts(host_id) ON DELETE CASCADE,
+    vm_id TEXT NOT NULL,
+    approved_role TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(host_id, vm_id)
+);
+
+CREATE TABLE IF NOT EXISTS infrastructure_observer_agents (
+    agent_id TEXT PRIMARY KEY,
+    host_id TEXT NOT NULL
+        REFERENCES infrastructure_hosts(host_id) ON DELETE RESTRICT,
+    assigned_scope_sha256 TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    last_contact_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS infrastructure_agents_by_host
+ON infrastructure_observer_agents(host_id, agent_id);
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_agent_scope_insert_guard
+BEFORE INSERT ON infrastructure_observer_agents
+WHEN NOT EXISTS (
+    SELECT 1 FROM infrastructure_hosts host
+    WHERE host.host_id = NEW.host_id
+      AND host.scope_sha256 = NEW.assigned_scope_sha256
+)
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure agent scope does not match host');
+END;
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_agent_scope_update_guard
+BEFORE UPDATE ON infrastructure_observer_agents
+WHEN NOT EXISTS (
+    SELECT 1 FROM infrastructure_hosts host
+    WHERE host.host_id = NEW.host_id
+      AND host.scope_sha256 = NEW.assigned_scope_sha256
+)
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure agent scope does not match host');
+END;
+
+CREATE TABLE IF NOT EXISTS infrastructure_agent_certificates (
+    agent_id TEXT NOT NULL
+        REFERENCES infrastructure_observer_agents(agent_id) ON DELETE CASCADE,
+    certificate_generation INTEGER NOT NULL
+        CHECK(certificate_generation >= 1),
+    certificate_fingerprint_sha256 TEXT NOT NULL UNIQUE,
+    jws_key_id TEXT NOT NULL,
+    jws_algorithm TEXT NOT NULL CHECK(jws_algorithm = 'PS256'),
+    jws_spki_der_base64 TEXT NOT NULL,
+    jws_spki_sha256 TEXT NOT NULL UNIQUE,
+    valid_from_epoch INTEGER NOT NULL CHECK(valid_from_epoch >= 0),
+    valid_until_epoch INTEGER NOT NULL
+        CHECK(
+            valid_until_epoch > valid_from_epoch
+            AND valid_until_epoch - valid_from_epoch <= 2592000
+        ),
+    revoked_at TEXT,
+    revocation_reason TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(agent_id, certificate_generation),
+    CHECK(
+        (revoked_at IS NULL AND revocation_reason IS NULL)
+        OR
+        (revoked_at IS NOT NULL AND revocation_reason IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS infrastructure_certificates_by_expiry
+ON infrastructure_agent_certificates(valid_until_epoch, agent_id);
+
+-- Root-only offline administration commits the enrollment mutation and this
+-- canonical receipt in one transaction. Receipts contain no private key or
+-- secret material and cannot be rewritten after publication.
+CREATE TABLE IF NOT EXISTS infrastructure_admin_receipts (
+    request_id TEXT PRIMARY KEY,
+    request_schema TEXT NOT NULL
+        CHECK(request_schema = 'spectre.infrastructure.admin.v1'),
+    action TEXT NOT NULL CHECK(action IN (
+        'cell.provision',
+        'host.provision',
+        'agent.provision',
+        'certificate.provision',
+        'certificate.revoke'
+    )),
+    request_json TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    operator_uid INTEGER NOT NULL CHECK(operator_uid = 0),
+    authority_schema_version INTEGER NOT NULL CHECK(authority_schema_version = 14),
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_admin_receipts_immutable_update
+BEFORE UPDATE ON infrastructure_admin_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure admin receipts are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_admin_receipts_immutable_delete
+BEFORE DELETE ON infrastructure_admin_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure admin receipts are immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS infrastructure_agent_replay_state (
+    agent_id TEXT PRIMARY KEY
+        REFERENCES infrastructure_observer_agents(agent_id) ON DELETE CASCADE,
+    current_boot_id TEXT NOT NULL,
+    last_sequence INTEGER NOT NULL CHECK(last_sequence >= 1),
+    last_observation_id TEXT NOT NULL,
+    last_captured_at TEXT NOT NULL,
+    last_accepted_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS infrastructure_agent_boot_history (
+    agent_id TEXT NOT NULL
+        REFERENCES infrastructure_observer_agents(agent_id) ON DELETE CASCADE,
+    agent_boot_id TEXT NOT NULL,
+    first_sequence INTEGER NOT NULL CHECK(first_sequence >= 1),
+    last_sequence INTEGER NOT NULL CHECK(last_sequence >= first_sequence),
+    first_accepted_at TEXT NOT NULL,
+    last_accepted_at TEXT NOT NULL,
+    PRIMARY KEY(agent_id, agent_boot_id)
+);
+
+-- Accepted headers are immutable evidence. Current projections point at them
+-- but rejected reports never update or replace them.
+CREATE TABLE IF NOT EXISTS infrastructure_observations (
+    observation_id TEXT PRIMARY KEY,
+    cell_id TEXT NOT NULL
+        REFERENCES infrastructure_cells(cell_id) ON DELETE RESTRICT,
+    host_id TEXT NOT NULL
+        REFERENCES infrastructure_hosts(host_id) ON DELETE RESTRICT,
+    agent_id TEXT NOT NULL,
+    certificate_generation INTEGER NOT NULL,
+    agent_boot_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK(sequence >= 1),
+    captured_at TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    accepted_at TEXT NOT NULL,
+    roster_complete INTEGER NOT NULL CHECK(roster_complete IN (0, 1)),
+    roster_error_code TEXT,
+    scope_sha256 TEXT NOT NULL,
+    canonical_payload_sha256 TEXT NOT NULL,
+    observer_version TEXT NOT NULL,
+    vm_count INTEGER NOT NULL CHECK(vm_count >= 0),
+    signature_verified INTEGER NOT NULL CHECK(signature_verified = 1),
+    evidence_available INTEGER NOT NULL CHECK(evidence_available = 1),
+    signed_envelope_sha256 TEXT NOT NULL
+        CHECK(length(signed_envelope_sha256) = 64),
+    signed_envelope_locator TEXT NOT NULL
+        CHECK(signed_envelope_locator = 'sha256:' || signed_envelope_sha256),
+    signed_envelope_size_bytes INTEGER NOT NULL
+        CHECK(
+            signed_envelope_size_bytes >= 1
+            AND signed_envelope_size_bytes <= 786432
+        ),
+    FOREIGN KEY(agent_id, certificate_generation)
+        REFERENCES infrastructure_agent_certificates(
+            agent_id, certificate_generation
+        ) ON DELETE RESTRICT,
+    UNIQUE(agent_id, agent_boot_id, sequence),
+    CHECK(
+        (roster_complete = 1 AND roster_error_code IS NULL)
+        OR
+        (roster_complete = 0 AND roster_error_code IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS infrastructure_observations_by_host
+ON infrastructure_observations(host_id, accepted_at DESC, observation_id);
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_observation_scope_insert_guard
+BEFORE INSERT ON infrastructure_observations
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM infrastructure_hosts host
+    JOIN infrastructure_observer_agents agent
+      ON agent.host_id = host.host_id
+    WHERE host.host_id = NEW.host_id
+      AND host.cell_id = NEW.cell_id
+      AND host.scope_sha256 = NEW.scope_sha256
+      AND agent.agent_id = NEW.agent_id
+      AND agent.assigned_scope_sha256 = NEW.scope_sha256
+)
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure observation scope identity mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_observations_immutable_update
+BEFORE UPDATE ON infrastructure_observations
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure accepted observations are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_observations_immutable_delete
+BEFORE DELETE ON infrastructure_observations
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure accepted observations are immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS infrastructure_current_hosts (
+    host_id TEXT PRIMARY KEY
+        REFERENCES infrastructure_hosts(host_id) ON DELETE CASCADE,
+    observation_id TEXT NOT NULL
+        REFERENCES infrastructure_observations(observation_id) ON DELETE RESTRICT,
+    hostname TEXT NOT NULL,
+    platform TEXT NOT NULL CHECK(platform = 'windows-hyperv'),
+    platform_version TEXT NOT NULL,
+    management_addresses_json TEXT NOT NULL,
+    logical_cpu INTEGER NOT NULL CHECK(logical_cpu >= 1),
+    physical_memory_bytes INTEGER NOT NULL
+        CHECK(physical_memory_bytes >= 1),
+    uptime_seconds INTEGER NOT NULL CHECK(uptime_seconds >= 0),
+    roster_complete INTEGER NOT NULL CHECK(roster_complete IN (0, 1)),
+    roster_error_code TEXT,
+    last_captured_at TEXT NOT NULL,
+    last_accepted_at TEXT NOT NULL,
+    CHECK(
+        (roster_complete = 1 AND roster_error_code IS NULL)
+        OR
+        (roster_complete = 0 AND roster_error_code IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS infrastructure_current_vms (
+    host_id TEXT NOT NULL
+        REFERENCES infrastructure_hosts(host_id) ON DELETE CASCADE,
+    vm_id TEXT NOT NULL,
+    observation_id TEXT NOT NULL
+        REFERENCES infrastructure_observations(observation_id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    role TEXT,
+    state TEXT NOT NULL CHECK(state IN (
+        'running', 'off', 'paused', 'saved', 'starting', 'stopping', 'unknown'
+    )),
+    generation INTEGER NOT NULL CHECK(generation IN (1, 2)),
+    vcpu INTEGER NOT NULL CHECK(vcpu >= 1),
+    startup_memory_bytes INTEGER NOT NULL CHECK(startup_memory_bytes >= 0),
+    assigned_memory_bytes INTEGER NOT NULL CHECK(assigned_memory_bytes >= 0),
+    ip_addresses_json TEXT NOT NULL,
+    heartbeat TEXT NOT NULL CHECK(heartbeat IN (
+        'ok', 'degraded', 'unknown', 'not-running'
+    )),
+    automatic_checkpoints INTEGER NOT NULL
+        CHECK(automatic_checkpoints IN (0, 1)),
+    replication TEXT NOT NULL CHECK(replication IN (
+        'disabled', 'enabled', 'unknown'
+    )),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY(host_id, vm_id),
+    FOREIGN KEY(host_id, vm_id)
+        REFERENCES infrastructure_host_vm_scope(host_id, vm_id)
+        ON DELETE RESTRICT
+);
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_current_host_observation_guard
+BEFORE INSERT ON infrastructure_current_hosts
+WHEN NOT EXISTS (
+    SELECT 1 FROM infrastructure_observations observation
+    WHERE observation.observation_id = NEW.observation_id
+      AND observation.host_id = NEW.host_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure current host observation mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_current_host_update_guard
+BEFORE UPDATE ON infrastructure_current_hosts
+WHEN NOT EXISTS (
+    SELECT 1 FROM infrastructure_observations observation
+    WHERE observation.observation_id = NEW.observation_id
+      AND observation.host_id = NEW.host_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure current host observation mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_current_vm_insert_guard
+BEFORE INSERT ON infrastructure_current_vms
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM infrastructure_observations observation
+    JOIN infrastructure_host_vm_scope scope
+      ON scope.host_id = observation.host_id
+    WHERE observation.observation_id = NEW.observation_id
+      AND observation.host_id = NEW.host_id
+      AND scope.vm_id = NEW.vm_id
+      AND scope.approved_role IS NEW.role
+)
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure current VM scope mismatch');
+END;
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_current_vm_update_guard
+BEFORE UPDATE ON infrastructure_current_vms
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM infrastructure_observations observation
+    JOIN infrastructure_host_vm_scope scope
+      ON scope.host_id = observation.host_id
+    WHERE observation.observation_id = NEW.observation_id
+      AND observation.host_id = NEW.host_id
+      AND scope.vm_id = NEW.vm_id
+      AND scope.approved_role IS NEW.role
+)
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure current VM scope mismatch');
+END;
+
+CREATE INDEX IF NOT EXISTS infrastructure_current_vms_by_observation
+ON infrastructure_current_vms(observation_id, host_id, vm_id);
+
+-- Durable operation replay is separate from immutable audit so a conflicting
+-- reuse of an operation UUID can itself be audited without changing the
+-- original terminal outcome.
+CREATE TABLE IF NOT EXISTS infrastructure_ingest_operations (
+    broker_operation_id TEXT PRIMARY KEY,
+    request_sha256 TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected')),
+    result_json TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    completed_at TEXT NOT NULL,
+    CHECK(
+        (outcome = 'accepted' AND result_json IS NOT NULL
+         AND error_code IS NULL AND error_message IS NULL)
+        OR
+        (outcome = 'rejected' AND result_json IS NULL
+         AND error_code IS NOT NULL AND error_message IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS infrastructure_ingest_audit (
+    audit_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    audit_id TEXT NOT NULL UNIQUE,
+    broker_operation_id TEXT NOT NULL,
+    broker_peer_uid INTEGER NOT NULL CHECK(broker_peer_uid >= 0),
+    broker_account_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected')),
+    rejection_code TEXT,
+    rejection_message TEXT,
+    certificate_fingerprint_sha256 TEXT,
+    certificate_generation INTEGER
+        CHECK(certificate_generation IS NULL OR certificate_generation >= 1),
+    agent_id TEXT,
+    cell_id TEXT,
+    host_id TEXT,
+    observation_id TEXT,
+    agent_boot_id TEXT,
+    sequence INTEGER CHECK(sequence IS NULL OR sequence >= 1),
+    captured_at TEXT,
+    claimed_agent_id TEXT,
+    claimed_cell_id TEXT,
+    claimed_host_id TEXT,
+    claimed_observation_id TEXT,
+    claimed_agent_boot_id TEXT,
+    claimed_sequence INTEGER CHECK(
+        claimed_sequence IS NULL OR claimed_sequence >= 1
+    ),
+    claimed_captured_at TEXT,
+    request_sha256 TEXT NOT NULL,
+    canonical_payload_sha256 TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    signature_verified INTEGER NOT NULL CHECK(signature_verified IN (0, 1)),
+    mtls_verified INTEGER NOT NULL CHECK(mtls_verified IN (0, 1)),
+    signed_envelope_sha256 TEXT
+        CHECK(
+            signed_envelope_sha256 IS NULL
+            OR length(signed_envelope_sha256) = 64
+        ),
+    signed_envelope_locator TEXT
+        CHECK(
+            signed_envelope_locator IS NULL
+            OR signed_envelope_locator = 'sha256:' || signed_envelope_sha256
+        ),
+    signed_envelope_size_bytes INTEGER
+        CHECK(
+            signed_envelope_size_bytes IS NULL
+            OR (
+                signed_envelope_size_bytes >= 1
+                AND signed_envelope_size_bytes <= 786432
+            )
+        ),
+    evidence_available INTEGER NOT NULL CHECK(evidence_available IN (0, 1)),
+    CHECK(
+        (outcome = 'accepted' AND rejection_code IS NULL
+         AND rejection_message IS NULL)
+        OR
+        (outcome = 'rejected' AND rejection_code IS NOT NULL
+         AND rejection_message IS NOT NULL)
+    ),
+    CHECK(
+        (
+            evidence_available = 1
+            AND signed_envelope_sha256 IS NOT NULL
+            AND signed_envelope_locator IS NOT NULL
+            AND signed_envelope_size_bytes IS NOT NULL
+        )
+        OR
+        (
+            evidence_available = 0
+            AND outcome = 'rejected'
+            AND signature_verified = 0
+            AND signed_envelope_sha256 IS NULL
+            AND signed_envelope_locator IS NULL
+            AND signed_envelope_size_bytes IS NULL
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS infrastructure_audit_by_host
+ON infrastructure_ingest_audit(host_id, audit_sequence DESC);
+
+CREATE INDEX IF NOT EXISTS infrastructure_audit_by_operation
+ON infrastructure_ingest_audit(broker_operation_id, audit_sequence);
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_ingest_audit_immutable_update
+BEFORE UPDATE ON infrastructure_ingest_audit
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure ingest audit is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS infrastructure_ingest_audit_immutable_delete
+BEFORE DELETE ON infrastructure_ingest_audit
+BEGIN
+    SELECT RAISE(ABORT, 'infrastructure ingest audit is immutable');
+END;
+
 CREATE TABLE IF NOT EXISTS telemetry_samples (
     sample_id TEXT PRIMARY KEY,
     host_resource_kind TEXT NOT NULL,
@@ -1911,6 +2383,311 @@ def _upgrade_cleanup_tombstones_to_v11(
     )
 
 
+def _upgrade_infrastructure_certificates_to_v14(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add real PS256 verification material without inventing old key data.
+
+    The v13 development contract retained only a caller-chosen JWS key ID.
+    There is no sound derivation from that identifier to the public signing
+    key. An empty v13 table can therefore be upgraded additively, while any
+    existing certificate row is an explicit offline reenrollment blocker.
+    """
+
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(infrastructure_agent_certificates)"
+        )
+    }
+    required = {
+        "jws_algorithm",
+        "jws_spki_der_base64",
+        "jws_spki_sha256",
+    }
+    missing = required - columns
+    if missing:
+        row_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM infrastructure_agent_certificates"
+            ).fetchone()[0]
+        )
+        if row_count:
+            raise RuntimeError(
+                "schema v13 infrastructure certificate rows lack immutable "
+                "PS256/SPKI verification material; reenroll them through an "
+                "audited offline migration before upgrading to schema v14"
+            )
+        additions = {
+            "jws_algorithm": (
+                "TEXT NOT NULL CHECK(jws_algorithm = 'PS256')"
+            ),
+            "jws_spki_der_base64": "TEXT NOT NULL",
+            "jws_spki_sha256": "TEXT NOT NULL",
+        }
+        for name in (
+            "jws_algorithm",
+            "jws_spki_der_base64",
+            "jws_spki_sha256",
+        ):
+            if name in missing:
+                connection.execute(
+                    "ALTER TABLE infrastructure_agent_certificates "
+                    f"ADD COLUMN {name} {additions[name]}"
+                )
+
+    invalid_validity = connection.execute(
+        """
+        SELECT agent_id, certificate_generation
+        FROM infrastructure_agent_certificates
+        WHERE valid_until_epoch - valid_from_epoch > ?
+        LIMIT 1
+        """,
+        (INFRASTRUCTURE_CERTIFICATE_MAX_VALIDITY_SECONDS,),
+    ).fetchone()
+    if invalid_validity is not None:
+        raise RuntimeError(
+            "infrastructure certificate generation exceeds the schema-v14 "
+            "30-day cryptoperiod and requires audited offline reenrollment"
+        )
+    invalid_overlap = connection.execute(
+        """
+        SELECT older.agent_id, older.certificate_generation,
+               newer.certificate_generation
+        FROM infrastructure_agent_certificates AS older
+        JOIN infrastructure_agent_certificates AS newer
+          ON newer.agent_id = older.agent_id
+         AND newer.certificate_generation > older.certificate_generation
+        WHERE older.revoked_at IS NULL
+          AND newer.revoked_at IS NULL
+          AND MIN(older.valid_until_epoch, newer.valid_until_epoch)
+              - MAX(older.valid_from_epoch, newer.valid_from_epoch) > ?
+        LIMIT 1
+        """,
+        (INFRASTRUCTURE_CERTIFICATE_MAX_OVERLAP_SECONDS,),
+    ).fetchone()
+    if invalid_overlap is not None:
+        raise RuntimeError(
+            "infrastructure certificate generations exceed the schema-v14 "
+            "72-hour active overlap bound and require audited offline "
+            "reenrollment or revocation"
+        )
+
+    signing_index = next(
+        (
+            row
+            for row in connection.execute(
+                "PRAGMA index_list(infrastructure_agent_certificates)"
+            )
+            if str(row[1])
+            == "infrastructure_certificates_by_signing_material"
+        ),
+        None,
+    )
+    if signing_index is not None:
+        indexed_columns = [
+            str(row[2])
+            for row in connection.execute(
+                "PRAGMA index_info(infrastructure_certificates_by_signing_material)"
+            )
+        ]
+        if not bool(signing_index[2]) or indexed_columns != [
+            "jws_spki_sha256"
+        ]:
+            connection.execute(
+                "DROP INDEX infrastructure_certificates_by_signing_material"
+            )
+    try:
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            infrastructure_certificates_by_signing_material
+            ON infrastructure_agent_certificates(jws_spki_sha256)
+            """
+        )
+    except sqlite3.IntegrityError as error:
+        raise RuntimeError(
+            "infrastructure certificate generations reuse a JWS SPKI digest; "
+            "schema v14 requires a globally unique signing key per generation "
+            "and cannot choose which duplicated identity is authoritative"
+        ) from error
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS
+        infrastructure_certificate_validity_insert_guard
+        BEFORE INSERT ON infrastructure_agent_certificates
+        WHEN NEW.valid_until_epoch - NEW.valid_from_epoch > 2592000
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'infrastructure certificate validity exceeds 30 days'
+            );
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS
+        infrastructure_certificate_overlap_insert_guard
+        BEFORE INSERT ON infrastructure_agent_certificates
+        WHEN EXISTS (
+            SELECT 1
+            FROM infrastructure_agent_certificates AS existing
+            WHERE existing.agent_id = NEW.agent_id
+              AND existing.revoked_at IS NULL
+              AND MIN(existing.valid_until_epoch, NEW.valid_until_epoch)
+                  - MAX(existing.valid_from_epoch, NEW.valid_from_epoch) > 259200
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'infrastructure certificate overlap exceeds 72 hours'
+            );
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS infrastructure_certificate_identity_immutable
+        BEFORE UPDATE ON infrastructure_agent_certificates
+        WHEN OLD.agent_id != NEW.agent_id
+          OR OLD.certificate_generation != NEW.certificate_generation
+          OR OLD.certificate_fingerprint_sha256 != NEW.certificate_fingerprint_sha256
+          OR OLD.jws_key_id != NEW.jws_key_id
+          OR OLD.jws_algorithm != NEW.jws_algorithm
+          OR OLD.jws_spki_der_base64 != NEW.jws_spki_der_base64
+          OR OLD.jws_spki_sha256 != NEW.jws_spki_sha256
+          OR OLD.valid_from_epoch != NEW.valid_from_epoch
+          OR OLD.valid_until_epoch != NEW.valid_until_epoch
+          OR OLD.created_at != NEW.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'infrastructure certificate identity is immutable');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS infrastructure_certificate_revocation_guard
+        BEFORE UPDATE ON infrastructure_agent_certificates
+        WHEN (OLD.revoked_at IS NOT NULL)
+          OR NEW.revoked_at IS NULL
+          OR NEW.revocation_reason IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'infrastructure certificate revocation is append-only');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS infrastructure_certificate_delete_guard
+        BEFORE DELETE ON infrastructure_agent_certificates
+        BEGIN
+            SELECT RAISE(ABORT, 'infrastructure certificate generations are immutable');
+        END
+        """
+    )
+
+
+def _upgrade_infrastructure_artifacts_to_v14(
+    connection: sqlite3.Connection,
+) -> None:
+    """Add broker-owned envelope bindings without fabricating old evidence."""
+
+    requirements = {
+        "infrastructure_observations": {
+            "signed_envelope_sha256": "TEXT",
+            "signed_envelope_locator": "TEXT",
+            "signed_envelope_size_bytes": "INTEGER",
+        },
+        "infrastructure_ingest_audit": {
+            "signed_envelope_sha256": "TEXT",
+            "signed_envelope_locator": "TEXT",
+            "signed_envelope_size_bytes": "INTEGER",
+            "evidence_available": "INTEGER",
+        },
+    }
+    missing_by_table: dict[str, dict[str, str]] = {}
+    for table, expected in requirements.items():
+        columns = {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        missing = {
+            name: declaration
+            for name, declaration in expected.items()
+            if name not in columns
+        }
+        if missing:
+            missing_by_table[table] = missing
+    if missing_by_table:
+        retained = sum(
+            int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in requirements
+        )
+        if retained:
+            raise RuntimeError(
+                "schema-v14 infrastructure rows lack broker-owned signed-envelope "
+                "evidence; the immutable records require audited offline "
+                "reconciliation instead of fabricated artifact locators"
+            )
+        for table, missing in missing_by_table.items():
+            for column, declaration in missing.items():
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS infrastructure_observation_artifact_guard
+        BEFORE INSERT ON infrastructure_observations
+        WHEN NEW.evidence_available != 1
+          OR NEW.signed_envelope_sha256 IS NULL
+          OR length(NEW.signed_envelope_sha256) != 64
+          OR NEW.signed_envelope_locator
+             != 'sha256:' || NEW.signed_envelope_sha256
+          OR NEW.signed_envelope_size_bytes < 1
+          OR NEW.signed_envelope_size_bytes > 786432
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'infrastructure observation lacks verified envelope evidence'
+            );
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS infrastructure_audit_artifact_guard
+        BEFORE INSERT ON infrastructure_ingest_audit
+        WHEN NOT (
+            (
+                NEW.evidence_available = 1
+                AND NEW.signed_envelope_sha256 IS NOT NULL
+                AND length(NEW.signed_envelope_sha256) = 64
+                AND NEW.signed_envelope_locator
+                    = 'sha256:' || NEW.signed_envelope_sha256
+                AND NEW.signed_envelope_size_bytes >= 1
+                AND NEW.signed_envelope_size_bytes <= 786432
+            )
+            OR
+            (
+                NEW.evidence_available = 0
+                AND NEW.outcome = 'rejected'
+                AND NEW.signature_verified = 0
+                AND NEW.signed_envelope_sha256 IS NULL
+                AND NEW.signed_envelope_locator IS NULL
+                AND NEW.signed_envelope_size_bytes IS NULL
+            )
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'infrastructure ingest audit lacks verified envelope evidence'
+            );
+        END
+        """
+    )
+
+
 def initialize_schema(
     connection: sqlite3.Connection,
     *,
@@ -1929,6 +2706,8 @@ def initialize_schema(
                 connection.execute(sql)
     if statement.strip():
         raise RuntimeError("coordinator schema contains an incomplete SQL statement")
+    _upgrade_infrastructure_certificates_to_v14(connection)
+    _upgrade_infrastructure_artifacts_to_v14(connection)
     # Existing stores predate the insertion-order journal. Backfill once in a
     # deterministic order; the trigger assigns every later event atomically in
     # its originating transaction. AUTOINCREMENT prevents cursor reuse after
@@ -1957,7 +2736,7 @@ def initialize_schema(
         # were developed on two compatible feature lines: broker-owned
         # ephemeral/test journals and repository-family/runtime/worker state.
         # Their migrations are deliberately idempotent and all run below so a
-        # database from either line reaches the merged v12 contract without
+        # database from either line reaches the merged v14 contract without
         # guessing which same-numbered historical line produced it.
         # The caller owns one BEGIN IMMEDIATE transaction around this entire
         # function, so a malformed leftover rolls back both DDL and every

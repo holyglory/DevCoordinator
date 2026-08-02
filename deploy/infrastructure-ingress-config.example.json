@@ -1,0 +1,37 @@
+{
+  "schema": "spectre.infrastructure.ingress-config.v1",
+  "listen": {
+    "host": "127.0.0.1",
+    "port": 9443,
+    "public_host": "spectre.classified.guru:9443"
+  },
+  "tls": {
+    "server_certificate_path": "/etc/devcoordinator/infrastructure-ingress/server-fullchain.pem",
+    "server_private_key_path": "/etc/devcoordinator/infrastructure-ingress/server-key.pem",
+    "server_certificate_generation": 1,
+    "server_certificate_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "server_certificate_valid_from_epoch": 1,
+    "server_certificate_valid_until_epoch": 2,
+    "client_ca_certificate_path": "/etc/devcoordinator/infrastructure-ingress/client-ca.pem",
+    "client_crl_path": "/etc/devcoordinator/infrastructure-ingress/client-ca.crl.pem"
+  },
+  "artifact_root": "/var/lib/devcoordinator-infrastructure-ingress/envelopes",
+  "broker": {
+    "socket_path": "/run/devcoordinator/broker.sock",
+    "expected_broker_uid": 0,
+    "expected_socket_gid": 991,
+    "expected_socket_mode": "0660",
+    "authority_generation": "REPLACE_WITH_EXACT_BROKER_DATABASE_GENERATION",
+    "account_id": "spectre-infrastructure-ingress"
+  },
+  "limits": {
+    "handshake_timeout_seconds": 5,
+    "request_timeout_seconds": 10,
+    "max_header_bytes": 16384,
+    "max_body_bytes": 786432,
+    "max_concurrency": 32,
+    "rate_per_certificate_per_minute": 120,
+    "rate_per_ip_per_minute": 300,
+    "crl_max_age_seconds": 21600
+  }
+}

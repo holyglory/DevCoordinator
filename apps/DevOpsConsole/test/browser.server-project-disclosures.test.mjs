@@ -604,6 +604,22 @@ test('real Servers and Docker UI keep project disclosures exclusive, focused, an
         else if (request.method() === 'GET' && pathname === '/api/access/requests') {
           body = { version: 1, pendingCount: 0, requests: [] };
         }
+        else if (request.method() === 'GET' && pathname === '/api/infrastructure') {
+          body = {
+            schema: 'spectre.infrastructure.projection.v1',
+            generated_at: '2026-07-29T12:00:00Z',
+            observation_cadence_seconds: 60,
+            stale_after_seconds: 180,
+            sort: 'host_id',
+            after_host_id: null,
+            host_limit: 100,
+            vm_limit_per_host: 256,
+            rejection_limit_per_host: 20,
+            hosts: [],
+            has_more: false,
+            next_after_host_id: null,
+          };
+        }
         else if (request.method() === 'GET' && pathname === '/api/telegram') {
           body = { version: 1, bots: telegramBots, projects: [] };
         }
