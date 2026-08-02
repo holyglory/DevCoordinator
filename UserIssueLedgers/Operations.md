@@ -1,0 +1,5 @@
+# User Issue Ledger: Operations
+
+| ID | Applies to | Mistake pattern | Required behavior | Prevention and verification |
+| --- | --- | --- | --- | --- |
+| UIL-OPERATIONS-001 | Remote-access and reverse-tunnel status reports | Describing access as absent when enrollment credentials and pinned host identity still exist but the current listener/session is down, which erases the distinction between configured access and live connectivity. | State configured/enrolled access and current tunnel/session state separately; preserve the fact that access previously worked, name the last verified transition when evidence exists, and never imply that credentials or enrollment were lost solely because a live probe fails. | Before reporting status, verify the retained key fingerprint and pinned host entry, current listener/process, an exact fail-closed SSH probe, and relevant bastion/service history. Report those evidence classes separately and identify which endpoint owns recovery when the live route is down. |
