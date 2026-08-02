@@ -1,6 +1,6 @@
 /* DevOps Console control panel.
  * Vanilla JS, no dependencies. Talks only to same-origin /api/*.
- * Hash-routed pages (#/projects, #/tests, #/servers, #/routes, #/docker, #/ports,
+ * Hash-routed pages (#/projects, #/tests, #/servers, #/infrastructure, #/routes, #/docker, #/ports,
  * #/performance, #/access, #/invites, #/telegram)
  * share one sticky status bar. Polls GET /api/overview every 6s and
  * GET /api/metrics/history every 10s (both paused while the tab is hidden),
@@ -11,6 +11,8 @@
 
   const POLL_MS = 6000;
   const METRICS_POLL_MS = 10_000;
+  const INFRASTRUCTURE_POLL_MS = 15_000;
+  const INFRASTRUCTURE_SERVERS_PREVIEW_LIMIT = 6;
   const METRICS_LIMIT_SPARK = 90; // row sparkline window (~15 min at 10s sampling)
   const METRICS_LIMIT_FULL = 360; // performance-page window (~1 h at 10s)
   const RESOURCE_PAGE_SIZE = 75;  // bound selectable DOM for host-wide inventories
@@ -40,6 +42,13 @@
     testsRepositoriesLoading: false,
     testsQueryKey: null,
     testsLoadedAt: 0,
+    infrastructure: null, // current bounded immutable-host-ID page
+    infrastructureAfter: null,
+    infrastructureHistory: [],
+    infrastructureLoading: false,
+    infrastructureStale: false,
+    infrastructureError: null,
+    infrastructureLoadedAt: 0,
   };
 
   const ui = {
@@ -56,6 +65,7 @@
     resourcePages: { projects: 0, servers: 0, docker: 0 }, // zero-based page per large collection
     lifecycleViews: { projects: 'active', servers: 'active', docker: 'active' },
     archiveGroupsExpanded: { projects: new Set(), servers: new Set(), docker: new Set() },
+    infrastructureExpanded: new Set(), // physical host GUIDs with visible VM rosters
     lifecycleDialog: null, // { action, target, stage, plan, returnFocusKey }
     lifecycleFocus: null,  // target revealed after a successful archive/restore/purge
     version: 0,            // bumped on any ui-state change to invalidate sigs
@@ -369,6 +379,7 @@
     { id: 'projects', title: 'Projects' },
     { id: 'tests', title: 'Tests' },
     { id: 'servers', title: 'Servers' },
+    { id: 'infrastructure', title: 'Infrastructure' },
     { id: 'routes', title: 'Routes' },
     { id: 'docker', title: 'Docker' },
     { id: 'ports', title: 'Port leases' },
@@ -382,7 +393,10 @@
     const m = /^#\/([a-z-]+)/.exec(location.hash || '');
     const id = m ? m[1] : '';
     if (!PAGES.some((p) => p.id === id)) return 'projects';
-    if ((id === 'access' || id === 'invites') && state.session?.accessAdmin !== true) return 'projects';
+    if (
+      (id === 'access' || id === 'invites' || id === 'infrastructure')
+      && state.session?.accessAdmin !== true
+    ) return 'projects';
     return id;
   }
 
@@ -417,6 +431,10 @@
       loadTestRepositories();
       loadTests();
     }
+    if (
+      (page === 'infrastructure' || page === 'servers')
+      && state.session?.accessAdmin === true
+    ) loadInfrastructure();
     if (page === 'access' && state.session?.accessAdmin === true) loadAccess();
     if (page === 'invites' && state.session?.accessAdmin === true) loadInvites();
     if (page === 'telegram' && state.session?.email) loadTelegram();
@@ -447,6 +465,512 @@
     });
   }
 
+  // ---------------------------------------------------------------- remote infrastructure
+
+  let infrastructureRequestGeneration = 0;
+
+  function infrastructureRequestPath(afterHostId) {
+    return afterHostId
+      ? `/api/infrastructure?after=${encodeURIComponent(afterHostId)}`
+      : '/api/infrastructure';
+  }
+
+  async function loadInfrastructure({ force = false } = {}) {
+    if (
+      state.session?.accessAdmin !== true
+      || !['infrastructure', 'servers'].includes(currentPage())
+    ) return;
+    const cachedAgeMs = state.infrastructureLoadedAt > 0
+      ? Date.now() - state.infrastructureLoadedAt
+      : Number.POSITIVE_INFINITY;
+    const cachedPageIsFresh = cachedAgeMs >= 0 && cachedAgeMs < INFRASTRUCTURE_POLL_MS;
+    if (
+      !force
+      && cachedPageIsFresh
+      && state.infrastructure
+      && !state.infrastructureError
+    ) {
+      renderInfrastructureSurfaces();
+      return;
+    }
+    const generation = ++infrastructureRequestGeneration;
+    const requestedAfter = state.infrastructureAfter;
+    state.infrastructureLoading = true;
+    bump();
+    renderInfrastructureSurfaces();
+    try {
+      const projection = await api(infrastructureRequestPath(requestedAfter));
+      if (
+        generation !== infrastructureRequestGeneration
+        || requestedAfter !== state.infrastructureAfter
+      ) return;
+      state.infrastructure = projection;
+      state.infrastructureStale = false;
+      state.infrastructureError = null;
+      state.infrastructureLoadedAt = Date.now();
+      bump();
+      renderInfrastructureSurfaces(true);
+    } catch (err) {
+      if (
+        err.status === 401
+        || generation !== infrastructureRequestGeneration
+        || requestedAfter !== state.infrastructureAfter
+      ) return;
+      state.infrastructureStale = Boolean(state.infrastructure);
+      state.infrastructureError = err;
+      bump();
+      renderInfrastructureSurfaces(true);
+    } finally {
+      if (generation === infrastructureRequestGeneration) {
+        state.infrastructureLoading = false;
+        bump();
+        renderInfrastructureSurfaces(true);
+      }
+    }
+  }
+
+  function openNextInfrastructurePage() {
+    const next = state.infrastructure?.next_after_host_id;
+    if (!state.infrastructure?.has_more || !next) return;
+    state.infrastructureHistory.push(state.infrastructureAfter);
+    state.infrastructureAfter = next;
+    state.infrastructure = null;
+    state.infrastructureError = null;
+    state.infrastructureStale = false;
+    bump();
+    renderInfrastructureSurfaces(true);
+    loadInfrastructure({ force: true });
+  }
+
+  function openPreviousInfrastructurePage() {
+    if (!state.infrastructureHistory.length) return;
+    state.infrastructureAfter = state.infrastructureHistory.pop() ?? null;
+    state.infrastructure = null;
+    state.infrastructureError = null;
+    state.infrastructureStale = false;
+    bump();
+    renderInfrastructureSurfaces(true);
+    loadInfrastructure({ force: true });
+  }
+
+  function infrastructureFact(label, value, { mono = false } = {}) {
+    return h('div', { class: 'infra-fact' },
+      h('span', { class: 'infra-fact-label' }, label),
+      h('span', { class: mono ? 'mono' : null }, value ?? '—'));
+  }
+
+  function infrastructureStateBadge(value, label = value) {
+    const normalized = String(value || 'unknown').toLowerCase();
+    const tone = normalized === 'running' || normalized === 'ok'
+      || normalized === 'verified' || normalized === 'fresh'
+      ? 'ok'
+      : ['off', 'not-running', 'disabled', 'never'].includes(normalized)
+        ? 'neutral'
+        : ['partial', 'degraded', 'paused', 'saved', 'stale'].includes(normalized)
+          ? 'warn'
+          : normalized === 'unknown' ? 'neutral' : 'warn';
+    return h('span', { class: `infra-badge ${tone}` }, label);
+  }
+
+  function infrastructureFreshness(value) {
+    const status = value?.status;
+    if (status === 'never') return infrastructureStateBadge('never', 'Never');
+    const age = Number(value?.age_seconds);
+    const ageLabel = Number.isInteger(age) && age >= 0
+      ? age < 60 ? `${age}s old` : `${Math.floor(age / 60)}m ${age % 60}s old`
+      : 'age unavailable';
+    if (status === 'fresh') return infrastructureStateBadge('fresh', `Fresh · ${ageLabel}`);
+    if (status === 'stale') return infrastructureStateBadge('stale', `Stale · ${ageLabel}`);
+    return infrastructureStateBadge('unknown', 'Unknown');
+  }
+
+  function infrastructureActivity(host) {
+    const cellEnabled = host?.cell?.enabled === true;
+    const enrollmentEnabled = host?.enrollment_enabled === true;
+    if (cellEnabled && enrollmentEnabled) {
+      return {
+        active: true,
+        label: 'Active',
+        title: 'Active enrollment',
+        detail: 'The cell and this host enrollment are enabled.',
+      };
+    }
+    let title = 'Infrastructure enrollment disabled';
+    if (!cellEnabled && !enrollmentEnabled) title = 'Cell and host enrollment disabled';
+    else if (!cellEnabled) title = 'Cell disabled';
+    else if (!enrollmentEnabled) title = 'Host enrollment disabled';
+    return {
+      active: false,
+      label: 'Disabled',
+      title,
+      detail: 'This host is not active for new observations. Retained observations remain read-only evidence; freshness does not mean enrollment is enabled.',
+    };
+  }
+
+  function buildInfrastructureVm(vm) {
+    const addresses = Array.isArray(vm.ip_addresses) && vm.ip_addresses.length
+      ? vm.ip_addresses.join(', ')
+      : 'No addresses observed';
+    return h('article', {
+      class: 'infra-vm',
+      'data-vm-guid': vm.vm_id,
+    },
+    h('div', { class: 'infra-vm-head' },
+      h('div', null,
+        h('strong', null, vm.name || 'Unnamed virtual machine'),
+        h('code', { class: 'infra-guid' }, vm.vm_id)),
+      infrastructureStateBadge(vm.state),
+      infrastructureStateBadge(vm.heartbeat, `Heartbeat: ${vm.heartbeat}`)),
+    h('div', { class: 'infra-vm-facts' },
+      infrastructureFact('Approved role', vm.role || 'No role assigned'),
+      infrastructureFact('Resources', `${vm.vcpu} vCPU · ${fmtBytes(vm.startup_memory_bytes)} startup · ${fmtBytes(vm.assigned_memory_bytes)} assigned`),
+      infrastructureFact('Observed addresses', addresses, { mono: true }),
+      infrastructureFact('Generation', String(vm.generation)),
+      infrastructureFact('Automatic checkpoints', vm.automatic_checkpoints ? 'Enabled' : 'Disabled'),
+      infrastructureFact('Replication', vm.replication || 'unknown')));
+  }
+
+  function buildInfrastructureHost(host) {
+    const expanded = ui.infrastructureExpanded.has(host.host_id);
+    const snapshot = host.snapshot;
+    const activity = infrastructureActivity(host);
+    const currentCount = Number(host.current_vm_count || 0);
+    const approvedCount = Number(host.approved_vm_count || 0);
+    const missing = Array.isArray(host.missing_approved_virtual_machines)
+      ? host.missing_approved_virtual_machines
+      : [];
+    const missingCount = missing.length;
+    const missingCountText = host.missing_approved_projection_truncated
+      ? missingCount > 0
+        ? `At least ${missingCount} approved VM${missingCount === 1 ? '' : 's'} `
+          + `${missingCount === 1 ? 'does' : 'do'} not have a current row.`
+        : 'Additional approved VMs are missing outside this bounded page.'
+      : `${missingCount} approved VM${missingCount === 1 ? '' : 's'} `
+        + `${missingCount === 1 ? 'does' : 'do'} not have a current row.`;
+    const rosterLabel = !snapshot
+      ? 'Awaiting first accepted observation'
+      : snapshot.roster_complete ? 'Complete roster report' : 'Partial roster report';
+    const rosterTone = !snapshot || snapshot.roster_complete ? 'neutral' : 'partial';
+    const detailsId = `infra-host-${host.host_id}`;
+    const incidentItems = [];
+
+    if (!activity.active) {
+      incidentItems.push(h('div', { class: 'infra-incident warn', role: 'status' },
+        h('strong', null, activity.title),
+        h('span', null, activity.detail)));
+    }
+    if (snapshot && !snapshot.roster_complete) {
+      incidentItems.push(h('div', { class: 'infra-incident warn', role: 'status' },
+        h('strong', null, 'Partial VM discovery'),
+        h('span', null,
+          `The observer reported ${snapshot.roster_error_code || 'an unspecified discovery error'}. `
+          + 'Previously current VM rows are retained; absence is not inferred from this report.')));
+    }
+    if (missing.length || host.missing_approved_projection_truncated) {
+      incidentItems.push(h('div', { class: 'infra-incident err', role: 'alert' },
+        h('strong', null,
+          snapshot?.roster_complete
+            ? 'Complete report is missing centrally approved VMs'
+            : 'Centrally approved VMs are absent from current state'),
+        h('span', null,
+          `${missingCountText} This is a roster gap, not a lower expected count.`),
+        h('ul', { class: 'infra-missing-list' }, missing.map((item) => h('li', null,
+          h('code', null, item.vm_id),
+          ` · ${item.approved_role || 'no approved role'}`))),
+        host.missing_approved_projection_truncated
+          ? h('span', { class: 'meta-passive' }, 'Additional missing identities are outside this bounded page.')
+          : null));
+    }
+    if (host.vm_projection_truncated) {
+      incidentItems.push(h('div', { class: 'infra-incident warn', role: 'status' },
+        h('strong', null, 'VM roster page is truncated'),
+        h('span', null, 'Only the first 256 VM GUIDs are present in this bounded response.')));
+    }
+
+    const rejections = Array.isArray(host.recent_rejections) ? host.recent_rejections : [];
+    return h('article', {
+      class: `infra-host${state.infrastructureStale ? ' is-stale' : ''}${activity.active ? '' : ' is-disabled'}`,
+      'data-infrastructure-host': host.host_id,
+      'data-infrastructure-active': String(activity.active),
+    },
+    h('button', {
+      class: 'infra-host-toggle',
+      type: 'button',
+      'aria-expanded': String(expanded),
+      'aria-controls': detailsId,
+      'data-fk': `infra-host:${host.host_id}`,
+      onclick: () => {
+        if (expanded) ui.infrastructureExpanded.delete(host.host_id);
+        else ui.infrastructureExpanded.add(host.host_id);
+        bump();
+        renderInfrastructure(true);
+      },
+    },
+    h('span', { class: `chev${expanded ? ' open' : ''}`, 'aria-hidden': 'true' }, icon('chevron')),
+    h('span', { class: 'infra-host-identity' },
+      h('strong', null, host.display_name || 'Unnamed enrolled host'),
+      h('code', { class: 'infra-guid' }, host.host_id)),
+    h('span', { class: 'infra-host-cell' },
+      h('span', null, host.cell?.name || 'Unnamed cell'),
+      h('span', { class: 'meta-passive' },
+        [host.cell?.region, host.cell?.classification_label].filter(Boolean).join(' · ') || 'No region/classification label')),
+    h('span', { class: 'infra-host-count' }, `${currentCount} current / ${approvedCount} approved VMs`),
+    h('span', { class: 'infra-host-statuses' },
+      infrastructureStateBadge(activity.active ? 'ok' : 'disabled', activity.label),
+      h('span', { class: `infra-badge ${rosterTone}` }, rosterLabel))),
+    h('div', { class: 'infra-failure-domain' },
+      h('strong', null, 'Failure domain'),
+      h('span', null, host.failure_domain_label || 'No failure-domain label')),
+    h('div', { class: 'infra-host-facts' },
+      infrastructureFact('Platform', snapshot
+        ? `${host.platform} · ${snapshot.platform_version}`
+        : host.platform),
+      infrastructureFact('Capacity', snapshot
+        ? `${snapshot.logical_cpu} logical CPU · ${fmtBytes(snapshot.physical_memory_bytes)} RAM`
+        : 'Awaiting first accepted observation'),
+      infrastructureFact('Last transport-verified contact', fmtWhen(host.last_contact_at)),
+      infrastructureFact('Transport contact freshness', infrastructureFreshness(host.contact_freshness)),
+      infrastructureFact('Last observer capture', fmtWhen(host.last_captured_at)),
+      infrastructureFact('Observer capture freshness', infrastructureFreshness(host.capture_freshness)),
+      infrastructureFact('Last accepted', fmtWhen(host.last_accepted_at)),
+      infrastructureFact('Acceptance freshness', infrastructureFreshness(host.acceptance_freshness)),
+      infrastructureFact('Enrollment activity', activity.active
+        ? 'Active — cell and host enabled'
+        : `Disabled — ${activity.title}`),
+      infrastructureFact('Accepted signature', host.signature_verified ? 'Verified' : 'No accepted verified signature'),
+      infrastructureFact('Retained signed evidence artifact', host.evidence_available ? 'Available' : 'Unavailable'),
+      infrastructureFact('Management addresses', snapshot?.management_addresses?.length
+        ? snapshot.management_addresses.join(', ')
+        : 'No addresses observed', { mono: true })),
+    ...incidentItems,
+    h('div', { id: detailsId, class: 'infra-host-details', hidden: !expanded },
+      expanded
+        ? [
+          h('div', { class: 'infra-detail-head' },
+            h('h3', null, 'Current virtual machines'),
+            h('span', { class: 'meta-passive' }, 'Identity is the Hyper-V VM GUID, not the name.')),
+          !host.virtual_machines?.length
+            ? h('p', { class: 'empty' }, snapshot
+              ? 'No current virtual machines are present in the accepted projection.'
+              : 'No accepted VM observation yet.')
+            : h('div', { class: 'infra-vm-list' }, host.virtual_machines.map(buildInfrastructureVm)),
+          rejections.length
+            ? h('section', { class: 'infra-rejections', 'aria-label': 'Recent report rejection incidents' },
+              h('h3', null, 'Recent report rejection incidents'),
+              h('p', { class: 'sec-sub' }, 'Rejected reports do not replace the last accepted snapshot.'),
+              h('ul', null, rejections.map((item) => h('li', null,
+                h('strong', null, item.code),
+                h('span', null, item.message),
+                h('span', { class: 'meta-passive' }, fmtWhen(item.received_at))))))
+            : null,
+        ]
+        : null));
+  }
+
+  function buildInfrastructurePage() {
+    const projection = state.infrastructure;
+    const out = [];
+    if (state.infrastructureError) {
+      out.push(h('div', {
+        class: `infra-fetch-state ${state.infrastructure ? 'warn' : 'err'}`,
+        role: 'alert',
+      },
+      h('strong', null, state.infrastructure
+        ? 'Refresh failed — retained infrastructure snapshot remains visible'
+        : 'Infrastructure is unavailable'),
+      h('span', null, state.infrastructureError.message || String(state.infrastructureError)),
+      state.infrastructure
+        ? h('span', { class: 'meta-passive' }, `Retained page loaded ${fmtWhen(state.infrastructureLoadedAt)}`)
+        : null,
+      h('button', {
+        class: 'btn small',
+        type: 'button',
+        onclick: () => loadInfrastructure({ force: true }),
+      }, 'Try again'),
+      !state.infrastructure && state.infrastructureHistory.length
+        ? h('button', {
+          class: 'btn small',
+          type: 'button',
+          onclick: openPreviousInfrastructurePage,
+        }, 'Previous hosts')
+        : null));
+    } else if (state.infrastructureStale && projection) {
+      out.push(h('div', { class: 'infra-fetch-state warn', role: 'status' },
+        h('strong', null, 'Retained infrastructure snapshot'),
+        h('span', null, 'The latest refresh did not complete. Host state below is retained and is not being relabelled offline.')));
+    }
+    if (!projection) {
+      if (state.infrastructureLoading) {
+        out.push(h('p', { class: 'empty', role: 'status' }, 'Loading enrolled infrastructure…'),
+          h('div', { class: 'skel', 'aria-hidden': 'true' }),
+          h('div', { class: 'skel', 'aria-hidden': 'true' }));
+      } else if (!state.infrastructureError) {
+        out.push(emptyState('Infrastructure has not been loaded yet.'));
+      }
+      return out;
+    }
+    if (!projection.hosts.length) {
+      out.push(emptyState('No infrastructure hosts are enrolled in this authority.'));
+    } else {
+      out.push(h('div', { class: 'infra-host-list' }, projection.hosts.map(buildInfrastructureHost)));
+    }
+    if (state.infrastructureHistory.length || projection.has_more) {
+      out.push(h('nav', { class: 'infra-pager', 'aria-label': 'Infrastructure host pages' },
+        h('button', {
+          class: 'btn small',
+          type: 'button',
+          disabled: !state.infrastructureHistory.length,
+          onclick: openPreviousInfrastructurePage,
+        }, 'Previous hosts'),
+        h('span', { class: 'meta-passive' }, `${projection.hosts.length} host${projection.hosts.length === 1 ? '' : 's'} on this page`),
+        h('button', {
+          class: 'btn small',
+          type: 'button',
+          disabled: !projection.has_more,
+          onclick: openNextInfrastructurePage,
+        }, 'Next hosts')));
+    }
+    return out;
+  }
+
+  function buildServersInfrastructureHost(host) {
+    const activity = infrastructureActivity(host);
+    const currentCount = Number(host.current_vm_count || 0);
+    const approvedCount = Number(host.approved_vm_count || 0);
+    return h('article', {
+      class: `servers-infrastructure-host${activity.active ? '' : ' is-disabled'}`,
+      'data-servers-infrastructure-host': host.host_id,
+      'data-infrastructure-active': String(activity.active),
+    },
+    h('div', { class: 'servers-infrastructure-host-identity' },
+      h('strong', null, host.display_name || 'Unnamed enrolled host'),
+      h('code', { class: 'infra-guid' }, host.host_id)),
+    h('div', { class: 'servers-infrastructure-host-state' },
+      infrastructureStateBadge(activity.active ? 'ok' : 'disabled', activity.label),
+      activity.active
+        ? infrastructureFreshness(host.acceptance_freshness)
+        : h('span', { class: 'servers-infrastructure-disabled-reason' }, activity.title)),
+    h('span', { class: 'servers-infrastructure-host-count' },
+      `${currentCount} current / ${approvedCount} approved VMs`),
+    h('span', { class: 'servers-infrastructure-failure-domain' },
+      host.failure_domain_label || 'No failure-domain label'));
+  }
+
+  function buildServersInfrastructureSummary() {
+    const projection = state.infrastructure;
+    const out = [];
+    if (state.infrastructureError) {
+      out.push(h('div', {
+        class: `infra-fetch-state ${projection ? 'warn' : 'err'}`,
+        role: 'alert',
+      },
+      h('strong', null, projection
+        ? 'Hyper-V refresh failed — retained host state remains visible'
+        : 'Hyper-V infrastructure is unavailable'),
+      h('span', null, state.infrastructureError.message || String(state.infrastructureError)),
+      projection
+        ? h('span', { class: 'meta-passive' }, `Retained page loaded ${fmtWhen(state.infrastructureLoadedAt)}`)
+        : null));
+    } else if (state.infrastructureStale && projection) {
+      out.push(h('div', { class: 'infra-fetch-state warn', role: 'status' },
+        h('strong', null, 'Retained Hyper-V snapshot'),
+        h('span', null, 'The latest refresh did not complete. Retained hosts are not being relabelled offline.')));
+    }
+    if (!projection) {
+      if (state.infrastructureLoading) {
+        out.push(h('p', { class: 'empty', role: 'status' }, 'Loading Hyper-V infrastructure…'),
+          h('div', { class: 'skel', 'aria-hidden': 'true' }));
+      } else if (!state.infrastructureError) {
+        out.push(emptyState('Hyper-V infrastructure has not been loaded yet.'));
+      }
+      return out;
+    }
+    if (!projection.hosts.length) {
+      out.push(emptyState('No enrolled Hyper-V hosts are available in this authority.'));
+      return out;
+    }
+    const activeCount = projection.hosts.filter(
+      (host) => infrastructureActivity(host).active,
+    ).length;
+    const disabledCount = projection.hosts.length - activeCount;
+    const previewHosts = projection.hosts.slice(0, INFRASTRUCTURE_SERVERS_PREVIEW_LIMIT);
+    out.push(h('div', { class: 'servers-infrastructure-summary' },
+      h('strong', null,
+        `${projection.hosts.length} enrolled host${projection.hosts.length === 1 ? '' : 's'} on this page`),
+      h('span', null, `${activeCount} active · ${disabledCount} disabled`)));
+    out.push(h('div', { class: 'servers-infrastructure-host-list' },
+      previewHosts.map(buildServersInfrastructureHost)));
+    if (projection.hosts.length > previewHosts.length || projection.has_more) {
+      const hiddenOnPage = Math.max(0, projection.hosts.length - previewHosts.length);
+      out.push(h('p', { class: 'servers-infrastructure-more' },
+        hiddenOnPage
+          ? `${hiddenOnPage} more host${hiddenOnPage === 1 ? '' : 's'} from this bounded page are shown in Infrastructure details.`
+          : 'Additional bounded host pages are available in Infrastructure details.'));
+    }
+    return out;
+  }
+
+  function renderServersInfrastructure(force = false) {
+    if (
+      currentPage() !== 'servers'
+      || state.session?.accessAdmin !== true
+    ) return;
+    const refresh = $('#servers-infrastructure-refresh');
+    const body = $('#servers-infrastructure-body');
+    refresh.disabled = state.infrastructureLoading;
+    refresh.textContent = state.infrastructureLoading ? 'Refreshing…' : 'Refresh';
+    body.setAttribute('aria-busy', String(state.infrastructureLoading));
+    setSection(
+      'servers-infrastructure-body',
+      sig(
+        state.infrastructure,
+        state.infrastructureLoading,
+        state.infrastructureStale,
+        state.infrastructureError?.message ?? null,
+      ),
+      buildServersInfrastructureSummary,
+      force,
+    );
+  }
+
+  function renderInfrastructure(force = false) {
+    if (
+      currentPage() !== 'infrastructure'
+      || state.session?.accessAdmin !== true
+    ) return;
+    const projection = state.infrastructure;
+    const count = projection?.hosts?.length ?? null;
+    const refresh = $('#infrastructure-refresh');
+    const body = $('#infrastructure-body');
+    refresh.disabled = state.infrastructureLoading;
+    refresh.textContent = state.infrastructureLoading ? 'Refreshing…' : 'Refresh';
+    body.setAttribute('aria-busy', String(state.infrastructureLoading));
+    setCount('infrastructure-count', count);
+    setNavCount(
+      'infrastructure',
+      state.infrastructureAfter === null && projection
+        ? (projection.has_more ? `${count}+` : count)
+        : null,
+    );
+    setSection(
+      'infrastructure-body',
+      sig(
+        projection,
+        state.infrastructureLoading,
+        state.infrastructureStale,
+        state.infrastructureError?.message ?? null,
+        [...ui.infrastructureExpanded].sort(),
+      ),
+      buildInfrastructurePage,
+      force,
+    );
+  }
+
+  function renderInfrastructureSurfaces(force = false) {
+    renderInfrastructure(force);
+    renderServersInfrastructure(force);
+  }
+
   // ---------------------------------------------------------------- access policy
 
   let accessFetching = false;
@@ -456,11 +980,22 @@
     const admin = state.session?.accessAdmin === true;
     $('#nav-access').hidden = !admin;
     $('#nav-invites').hidden = !admin;
+    $('#nav-infrastructure').hidden = !admin;
     $('#nav-telegram').hidden = !state.session?.email;
+    $('#servers-infrastructure').hidden = !admin;
     $('#access-add').hidden = !admin;
     if (!admin) {
       state.access = null;
       state.invites = null;
+      infrastructureRequestGeneration += 1;
+      state.infrastructure = null;
+      state.infrastructureAfter = null;
+      state.infrastructureHistory = [];
+      state.infrastructureLoading = false;
+      state.infrastructureStale = false;
+      state.infrastructureError = null;
+      state.infrastructureLoadedAt = 0;
+      setNavCount('infrastructure', null);
     }
     syncLifecycleVisibility();
     applyPage();
@@ -3346,7 +3881,9 @@
   const SECTION_BODY_PAGES = Object.freeze({
     'projects-body': 'projects',
     'tests-body': 'tests',
+    'infrastructure-body': 'infrastructure',
     'routes-body': 'routes',
+    'servers-infrastructure-body': 'servers',
     'servers-body': 'servers',
     'docker-body': 'docker',
     'leases-body': 'ports',
@@ -3370,9 +3907,12 @@
   function renderAll(force = false) {
     const page = currentPage();
     unmountInactiveSections(page);
+    if (page === 'servers') renderServersInfrastructure(force);
     const o = state.overview;
     if (!o) {
-      if (page === 'performance') {
+      if (page === 'infrastructure') {
+        renderInfrastructure(force);
+      } else if (page === 'performance') {
         setSection('usage-body', sig('overview-loading'),
           () => [emptyState('Loading current project usage…')], force);
         setSection('perf-body', sig(state.metricsAt, 'metrics-only'), () => buildPerf(null), force);
@@ -3410,9 +3950,12 @@
           ? buildArchivedCollection('projects') : buildProjects(o), force);
     } else if (page === 'tests') {
       renderTests();
+    } else if (page === 'infrastructure') {
+      renderInfrastructure(force);
     } else if (page === 'routes') {
       setSection('routes-body', sig(o.routes), () => buildRoutes(o), force);
     } else if (page === 'servers') {
+      renderServersInfrastructure(force);
       setSection('servers-body',
         sig(o.inventory?.servers ?? null, o.inventory?.port_assignments ?? null,
           o.inventory?.docker ?? null, o.inventory?.repository_trees ?? null,
@@ -3455,6 +3998,9 @@
     setCount('projects-count', ui.lifecycleViews.projects === 'archived'
       ? (archivesCurrent ? archivesForPage('projects').length : null) : projectGroups);
     setCount('tests-count', state.tests?.summary?.test_count ?? null);
+    setCount('infrastructure-count', state.session?.accessAdmin === true
+      ? state.infrastructure?.hosts?.length ?? null
+      : null);
     setCount('routes-count', (o.routes || []).length);
     setCount('servers-count', ui.lifecycleViews.servers === 'archived'
       ? (archivesCurrent ? archivesForPage('servers').length : null)
@@ -3477,6 +4023,12 @@
 
     setNavCount('projects', projectGroups);
     setNavCount('tests', state.tests?.summary?.test_count ?? null);
+    setNavCount('infrastructure', state.session?.accessAdmin === true
+      && state.infrastructureAfter === null && state.infrastructure
+      ? (state.infrastructure.has_more
+        ? `${state.infrastructure.hosts.length}+`
+        : state.infrastructure.hosts.length)
+      : null);
     setNavCount('servers', o.inventory ? (o.inventory.servers || []).length + webContainerCount : null);
     setNavCount('routes', (o.routes || []).length);
     setNavCount('docker', o.inventory?.docker?.available ? (o.inventory.docker.containers || []).length : null);
@@ -6329,6 +6881,15 @@
     setInterval(() => {
       if (!document.hidden) refreshMetrics();
     }, METRICS_POLL_MS);
+    setInterval(() => {
+      if (
+        !document.hidden
+        && state.session?.accessAdmin === true
+        && ['infrastructure', 'servers'].includes(currentPage())
+      ) {
+        loadInfrastructure({ force: true });
+      }
+    }, INFRASTRUCTURE_POLL_MS);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         refreshOverview();
@@ -6339,6 +6900,12 @@
         if (state.session?.accessAdmin === true) loadInvites({ force: true });
         if (state.session?.email) loadTelegram({ force: true });
         if (lifecycleAvailable()) loadArchives({ force: true });
+        if (
+          state.session?.accessAdmin === true
+          && ['infrastructure', 'servers'].includes(currentPage())
+        ) {
+          loadInfrastructure({ force: true });
+        }
       }
     });
   }
@@ -6367,6 +6934,11 @@
     wireTelegramDialog();
     wireLifecycle();
     $('#invites-refresh').addEventListener('click', () => loadInvites({ force: true }));
+    $('#infrastructure-refresh').addEventListener('click', () => loadInfrastructure({ force: true }));
+    $('#servers-infrastructure-refresh').addEventListener(
+      'click',
+      () => loadInfrastructure({ force: true }),
+    );
     applyPage();
 
     loadPrefs();

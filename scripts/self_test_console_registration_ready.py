@@ -1083,6 +1083,10 @@ def normalized_producer_contract_test() -> None:
         root = Path(raw).resolve()
         project = root / "project"
         project.mkdir()
+        # The producer contract is repository-scoped. Give the fixture its own
+        # nearest Git marker so an unrelated marker above the system temporary
+        # directory cannot silently reclassify it as another repository.
+        (project / ".git").mkdir()
         home = root / "coordinator-home"
         home.mkdir(mode=0o700)
         original_home = os.environ.get("CODEX_AGENT_COORDINATOR_HOME")

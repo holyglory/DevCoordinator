@@ -53,6 +53,11 @@ from .worker_control import WorkerControlError, WorkerController, WorkerReplaceE
 from .worker_cleanup import unregister_workers_for_plan
 from .runtime_api import validate_runtime_terminal_state
 from .host_lifecycle import CoordinatorHostLifecycleAdapter
+from .infrastructure_observation import (
+    InfrastructureIngestRejected,
+    InfrastructureObservationAuthority,
+    InfrastructureValidationError,
+)
 from .cleanup_lifecycle import CleanupLifecycle
 from .observer import observation_owner_scope
 from .broker_host import (
@@ -231,6 +236,8 @@ class StoreBackedMutationBackend:
         ]
         | None = None,
         secret_manager: VolatileRunSecretManager | None = None,
+        infrastructure_ingress_staging_root: Path | None = None,
+        infrastructure_broker_artifact_root: Path | None = None,
     ) -> None:
         self._persistence = persistence
         self._host_mutations = host_mutations
@@ -253,6 +260,25 @@ class StoreBackedMutationBackend:
             expected_uid=persistence.expected_uid,
             busy_timeout_ms=persistence.busy_timeout_ms,
         )
+        self._infrastructure = InfrastructureObservationAuthority(
+            persistence.database_path,
+            expected_uid=persistence.expected_uid,
+            busy_timeout_ms=persistence.busy_timeout_ms,
+            **(
+                {
+                    "ingress_staging_root": infrastructure_ingress_staging_root
+                }
+                if infrastructure_ingress_staging_root is not None
+                else {}
+            ),
+            **(
+                {
+                    "broker_artifact_root": infrastructure_broker_artifact_root
+                }
+                if infrastructure_broker_artifact_root is not None
+                else {}
+            ),
+        )
 
     def execute(self, authorized: AuthorizedBrokerRequest) -> Mapping[str, Any]:
         request = authorized.request
@@ -266,6 +292,32 @@ class StoreBackedMutationBackend:
             return self._test_records.stats(authorized)
         if request.operation == BrokerOperation.HOST_OBSERVE:
             return self._observe_committed_host(request.operation_id)
+        if request.operation == BrokerOperation.INFRASTRUCTURE_READ:
+            return self._infrastructure.read_projection(request.arguments)
+        if (
+            request.operation
+            == BrokerOperation.INFRASTRUCTURE_VERIFICATION_CONTEXT
+        ):
+            try:
+                return self._infrastructure.verification_context(
+                    request.arguments
+                )
+            except InfrastructureValidationError as error:
+                raise BrokerError(error.code, error.message) from None
+        if request.operation == BrokerOperation.INFRASTRUCTURE_INGEST:
+            try:
+                return self._infrastructure.ingest(
+                    request.arguments,
+                    broker_operation_id=request.operation_id,
+                    broker_peer_uid=authorized.peer.uid,
+                    broker_account_id=request.account_id,
+                )
+            except InfrastructureIngestRejected as error:
+                raise BrokerBackendError(
+                    error.code,
+                    error.message,
+                    operation_id=request.operation_id,
+                ) from None
         if request.operation == BrokerOperation.RUNTIME_REQUEST:
             return self._execute_runtime_request(authorized)
         if request.operation in WORKER_OPERATIONS:

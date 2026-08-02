@@ -22,6 +22,10 @@ const RUNTIME_ARTIFACT_KINDS = new Set([
   'service', 'run', 'diagnostic', 'docker', 'database_stack', 'worker_attempt',
 ]);
 const RUNTIME_ARTIFACT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Match the authority's lowercase canonical UUID contract without inventing a
+// version restriction: Hyper-V GUIDs and future authority IDs are not limited
+// to RFC 4122 versions 1-5.
+const INFRASTRUCTURE_CURSOR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024;
 const TAIL_MAX = 5000;
 
@@ -211,6 +215,12 @@ export function createConsoleApi({
   function requireAccessAdmin(session) {
     if (!accessStore?.isAdmin(session?.email)) {
       throw new ApiError(403, 'only configured Console owners can manage access');
+    }
+  }
+
+  function requireInfrastructureAdmin(session) {
+    if (!accessStore?.isAdmin(session?.email)) {
+      throw new ApiError(403, 'only configured Console owners can read infrastructure');
     }
   }
 
@@ -676,6 +686,22 @@ export function createConsoleApi({
       inventory: inventoryData,
       routes,
     });
+  }
+
+  async function handleInfrastructure(res, searchParams) {
+    const keys = [...searchParams.keys()];
+    if (keys.some((key) => key !== 'after') || searchParams.getAll('after').length > 1) {
+      throw new ApiError(400, 'infrastructure accepts one after cursor');
+    }
+    const afterHostId = searchParams.get('after');
+    if (afterHostId !== null && !INFRASTRUCTURE_CURSOR_RE.test(afterHostId)) {
+      throw new ApiError(400, 'infrastructure after cursor must be a canonical UUID');
+    }
+    return sendJson(
+      res,
+      200,
+      await coordinator.infrastructure({ afterHostId }),
+    );
   }
 
   async function handleRouteCreate(req, res) {
@@ -1424,6 +1450,15 @@ export function createConsoleApi({
 
       if (method === 'GET' && pathname === '/api/overview') {
         return await handleOverview(res, { fresh: searchParams.get('fresh') === '1' });
+      }
+      if (method === 'GET' && pathname === '/api/infrastructure') {
+        // Infrastructure contains management addresses, cell classification,
+        // immutable host identities and retained security incidents. Console
+        // access alone is not authority to read it: reject before parsing the
+        // cursor or touching the Coordinator so non-owners cannot use either
+        // surface as an oracle.
+        requireInfrastructureAdmin(session);
+        return await handleInfrastructure(res, searchParams);
       }
       if (method === 'GET' && pathname === '/api/tests') {
         const project = requireString(searchParams.get('project'), 'project');

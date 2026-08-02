@@ -1532,7 +1532,19 @@ class RuntimeAndSocketIntegrationTests(unittest.TestCase):
                         expected_broker_uid=os.geteuid() + 10_000,
                         expected_socket_gid=os.getegid(),
                     ).call(request)
-                self.assertEqual(owner.exception.code, "unsafe_runtime_directory")
+                # Root-owned path components remain trusted for every
+                # configured service UID, so a root test process reaches the
+                # exact socket-owner check. An unprivileged fixture instead
+                # rejects its current-UID runtime directory as an ancestor
+                # owned by neither root nor the configured broker UID.
+                self.assertEqual(
+                    owner.exception.code,
+                    (
+                        "broker_identity_mismatch"
+                        if os.geteuid() == 0
+                        else "unsafe_runtime_directory"
+                    ),
+                )
 
                 with self.assertRaises(BrokerError) as group:
                     BrokerClient(

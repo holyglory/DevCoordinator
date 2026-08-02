@@ -38,13 +38,26 @@ from .compose_contract import (
     require_sealable_compose_payload,
     stable_compose_descriptor_path,
 )
-from .store import AccountStore, CoordinatorStore, fingerprint, utc_timestamp
+from .schema import SCHEMA_VERSION
+from .store import (
+    AccountStore,
+    CoordinatorStore,
+    canonical_json,
+    fingerprint,
+    utc_timestamp,
+)
 from .database_backups import (
     inspect_database_backup,
     record_successful_restore,
     upsert_database_backup,
 )
 from .events import list_event_page
+from .infrastructure_observation import (
+    INFRASTRUCTURE_BROKER_PROJECT_ID,
+    INFRASTRUCTURE_INGEST_RESOURCE_ID,
+    INFRASTRUCTURE_READ_RESOURCE_ID,
+    INFRASTRUCTURE_VERIFICATION_CONTEXT_RESOURCE_ID,
+)
 from .ephemeral_secrets import (
     EphemeralSecretPolicy,
     POSTGRES_INITDB_PASSWORD_FILE_V1,
@@ -180,6 +193,37 @@ _TEST_OPERATIONS = frozenset(
         BrokerOperation.TEST_STATS_READ,
     }
 )
+_INFRASTRUCTURE_OPERATIONS = frozenset(
+    {
+        BrokerOperation.INFRASTRUCTURE_INGEST,
+        BrokerOperation.INFRASTRUCTURE_READ,
+        BrokerOperation.INFRASTRUCTURE_VERIFICATION_CONTEXT,
+    }
+)
+_INFRASTRUCTURE_INGRESS_OPERATIONS = frozenset(
+    {
+        BrokerOperation.INFRASTRUCTURE_INGEST,
+        BrokerOperation.INFRASTRUCTURE_VERIFICATION_CONTEXT,
+    }
+)
+INFRASTRUCTURE_INGRESS_ACCESS_REQUEST_SCHEMA = (
+    "spectre.infrastructure.ingress-access.v1"
+)
+INFRASTRUCTURE_INGRESS_ACCESS_RECEIPT_SCHEMA = (
+    "spectre.infrastructure.ingress-access-receipt.v1"
+)
+INFRASTRUCTURE_INGRESS_SERVICE_ACCOUNT = (
+    "devcoord-infra-ingress"
+)
+INFRASTRUCTURE_INGRESS_BROKER_ACCOUNT_ID = "spectre-infrastructure-ingress"
+INFRASTRUCTURE_INGRESS_ACCESS_MAX_VALIDITY_SECONDS = 30 * 24 * 60 * 60
+INFRASTRUCTURE_READER_ACCESS_REQUEST_SCHEMA = (
+    "spectre.infrastructure.reader-access.v1"
+)
+INFRASTRUCTURE_READER_ACCESS_RECEIPT_SCHEMA = (
+    "spectre.infrastructure.reader-access-receipt.v1"
+)
+INFRASTRUCTURE_READER_ACCESS_MAX_VALIDITY_SECONDS = 30 * 24 * 60 * 60
 
 
 def _operation_actor(authorized: AuthorizedBrokerRequest) -> str:
@@ -233,6 +277,66 @@ CREATE TABLE IF NOT EXISTS broker_acl_principals (
 
 CREATE UNIQUE INDEX IF NOT EXISTS broker_principal_uid_account_identity
 ON broker_acl_principals(uid, account_id);
+
+-- Dedicated local service principals are not repository enrollments. They
+-- receive only the fixed-scope remote-infrastructure operations appropriate
+-- to their role and cannot use this table to acquire local runtime, lifecycle,
+-- port, or database authority.
+CREATE TABLE IF NOT EXISTS broker_infrastructure_service_acl (
+    uid INTEGER NOT NULL,
+    account_id TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN (
+        'infrastructure.ingest', 'infrastructure.read',
+        'infrastructure.verification_context'
+    )),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    valid_until_epoch INTEGER NOT NULL CHECK(valid_until_epoch > 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(uid, operation),
+    FOREIGN KEY(uid, account_id)
+        REFERENCES broker_acl_principals(uid, account_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS broker_infrastructure_service_acl_active
+ON broker_infrastructure_service_acl(operation, enabled, valid_until_epoch, uid);
+
+CREATE TABLE IF NOT EXISTS broker_infrastructure_ingress_access_receipts (
+    request_id TEXT PRIMARY KEY,
+    request_schema TEXT NOT NULL CHECK(
+        request_schema = 'spectre.infrastructure.ingress-access.v1'
+    ),
+    action TEXT NOT NULL CHECK(action IN (
+        'ingress.replace', 'ingress.disable'
+    )),
+    request_json TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    operator_uid INTEGER NOT NULL CHECK(operator_uid = 0),
+    authority_schema_version INTEGER NOT NULL CHECK(
+        authority_schema_version = 14
+    ),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS broker_infrastructure_reader_access_receipts (
+    request_id TEXT PRIMARY KEY,
+    request_schema TEXT NOT NULL CHECK(
+        request_schema = 'spectre.infrastructure.reader-access.v1'
+    ),
+    action TEXT NOT NULL CHECK(action IN (
+        'reader.replace', 'reader.disable'
+    )),
+    request_json TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    operator_uid INTEGER NOT NULL CHECK(operator_uid = 0),
+    authority_schema_version INTEGER NOT NULL CHECK(
+        authority_schema_version = 14
+    ),
+    created_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS broker_repository_enrollments (
     uid INTEGER NOT NULL,
@@ -801,6 +905,56 @@ CREATE INDEX IF NOT EXISTS broker_database_acl_lookup
 ON broker_database_acl(repo_id, docker_resource_id, database_binding_id, operation, enabled);
 """
 
+_INFRASTRUCTURE_INGRESS_ACCESS_RECEIPT_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS
+        broker_infrastructure_ingress_access_receipts_immutable_update
+    BEFORE UPDATE ON broker_infrastructure_ingress_access_receipts
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'infrastructure ingress access receipts are immutable'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+        broker_infrastructure_ingress_access_receipts_immutable_delete
+    BEFORE DELETE ON broker_infrastructure_ingress_access_receipts
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'infrastructure ingress access receipts are immutable'
+        );
+    END
+    """,
+)
+
+_INFRASTRUCTURE_READER_ACCESS_RECEIPT_TRIGGERS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS
+        broker_infrastructure_reader_access_receipts_immutable_update
+    BEFORE UPDATE ON broker_infrastructure_reader_access_receipts
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'infrastructure reader access receipts are immutable'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS
+        broker_infrastructure_reader_access_receipts_immutable_delete
+    BEFORE DELETE ON broker_infrastructure_reader_access_receipts
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'infrastructure reader access receipts are immutable'
+        );
+    END
+    """,
+)
+
 
 @dataclass(frozen=True)
 class DurableOperationDisposition:
@@ -940,6 +1094,174 @@ class ComposeMutationTarget:
     repository_generation: int
 
 
+def prepare_infrastructure_ingress_access_request(
+    value: Any,
+) -> dict[str, Any]:
+    """Normalize one closed root-owned dedicated-ingress access request."""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "request_id",
+        "action",
+        "payload",
+    }:
+        raise ValueError(
+            "infrastructure ingress access request fields are invalid"
+        )
+    if value.get("schema") != INFRASTRUCTURE_INGRESS_ACCESS_REQUEST_SCHEMA:
+        raise ValueError(
+            "infrastructure ingress access request schema is unsupported"
+        )
+    request_id = value.get("request_id")
+    try:
+        canonical_request_id = str(uuid.UUID(str(request_id)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError(
+            "infrastructure ingress access request_id is invalid"
+        ) from error
+    if request_id != canonical_request_id:
+        raise ValueError(
+            "infrastructure ingress access request_id must be canonical"
+        )
+    action = value.get("action")
+    if action not in {"ingress.replace", "ingress.disable"}:
+        raise ValueError(
+            "infrastructure ingress access action is unsupported"
+        )
+    payload = value.get("payload")
+    common_fields = {
+        "service_account",
+        "uid",
+        "account_id",
+    }
+    expected_fields = (
+        common_fields | {"valid_until_epoch"}
+        if action == "ingress.replace"
+        else common_fields
+    )
+    if not isinstance(payload, Mapping) or set(payload) != expected_fields:
+        raise ValueError(
+            "infrastructure ingress access payload fields are invalid"
+        )
+    if (
+        payload.get("service_account")
+        != INFRASTRUCTURE_INGRESS_SERVICE_ACCOUNT
+    ):
+        raise ValueError(
+            "infrastructure ingress service account is not the fixed v1 account"
+        )
+    uid = payload.get("uid")
+    if type(uid) is not int or not 1 <= uid <= (1 << 31) - 1:
+        raise ValueError(
+            "infrastructure ingress UID must be one non-root system UID"
+        )
+    if (
+        payload.get("account_id")
+        != INFRASTRUCTURE_INGRESS_BROKER_ACCOUNT_ID
+    ):
+        raise ValueError(
+            "infrastructure ingress broker account is not the fixed v1 account"
+        )
+    if action == "ingress.replace":
+        valid_until_epoch = payload.get("valid_until_epoch")
+        if type(valid_until_epoch) is not int or valid_until_epoch <= 0:
+            raise ValueError(
+                "infrastructure ingress access expiry is invalid"
+            )
+    else:
+        valid_until_epoch = None
+    normalized_payload = {
+        "service_account": INFRASTRUCTURE_INGRESS_SERVICE_ACCOUNT,
+        "uid": uid,
+        "account_id": INFRASTRUCTURE_INGRESS_BROKER_ACCOUNT_ID,
+    }
+    if valid_until_epoch is not None:
+        normalized_payload["valid_until_epoch"] = valid_until_epoch
+    return {
+        "schema": INFRASTRUCTURE_INGRESS_ACCESS_REQUEST_SCHEMA,
+        "request_id": canonical_request_id,
+        "action": action,
+        "payload": normalized_payload,
+    }
+
+
+def prepare_infrastructure_reader_access_request(
+    value: Any,
+) -> dict[str, Any]:
+    """Normalize one closed root-owned Console/API read-access request."""
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "request_id",
+        "action",
+        "payload",
+    }:
+        raise ValueError(
+            "infrastructure reader access request fields are invalid"
+        )
+    if value.get("schema") != INFRASTRUCTURE_READER_ACCESS_REQUEST_SCHEMA:
+        raise ValueError(
+            "infrastructure reader access request schema is unsupported"
+        )
+    request_id = value.get("request_id")
+    try:
+        canonical_request_id = str(uuid.UUID(str(request_id)))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise ValueError(
+            "infrastructure reader access request_id is invalid"
+        ) from error
+    if request_id != canonical_request_id:
+        raise ValueError(
+            "infrastructure reader access request_id must be canonical"
+        )
+    action = value.get("action")
+    if action not in {"reader.replace", "reader.disable"}:
+        raise ValueError(
+            "infrastructure reader access action is unsupported"
+        )
+    payload = value.get("payload")
+    common_fields = {"service_account", "uid", "account_id"}
+    expected_fields = (
+        common_fields | {"valid_until_epoch"}
+        if action == "reader.replace"
+        else common_fields
+    )
+    if not isinstance(payload, Mapping) or set(payload) != expected_fields:
+        raise ValueError(
+            "infrastructure reader access payload fields are invalid"
+        )
+    service_account = payload.get("service_account")
+    account_id = payload.get("account_id")
+    _require_identifier(service_account, "service_account")
+    _require_identifier(account_id, "account_id")
+    uid = payload.get("uid")
+    if type(uid) is not int or not 1 <= uid <= (1 << 31) - 1:
+        raise ValueError(
+            "infrastructure reader UID must be one non-root operating-system UID"
+        )
+    if action == "reader.replace":
+        valid_until_epoch = payload.get("valid_until_epoch")
+        if type(valid_until_epoch) is not int or valid_until_epoch <= 0:
+            raise ValueError(
+                "infrastructure reader access expiry is invalid"
+            )
+    else:
+        valid_until_epoch = None
+    normalized_payload: dict[str, Any] = {
+        "service_account": service_account,
+        "uid": uid,
+        "account_id": account_id,
+    }
+    if valid_until_epoch is not None:
+        normalized_payload["valid_until_epoch"] = valid_until_epoch
+    return {
+        "schema": INFRASTRUCTURE_READER_ACCESS_REQUEST_SCHEMA,
+        "request_id": canonical_request_id,
+        "action": action,
+        "payload": normalized_payload,
+    }
+
+
 class StoreBackedAuthorizer:
     """Live ACL authorizer; every request reads the current durable policy."""
 
@@ -1021,6 +1343,71 @@ class BrokerPersistence:
                 for statement in BROKER_SCHEMA.split(";"):
                     if statement.strip():
                         connection.execute(statement)
+                for statement in (
+                    _INFRASTRUCTURE_INGRESS_ACCESS_RECEIPT_TRIGGERS
+                    + _INFRASTRUCTURE_READER_ACCESS_RECEIPT_TRIGGERS
+                ):
+                    connection.execute(statement)
+                infrastructure_acl_row = connection.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type = 'table' "
+                    "AND name = 'broker_infrastructure_service_acl'"
+                ).fetchone()
+                infrastructure_acl_sql = str(
+                    infrastructure_acl_row[0]
+                    if infrastructure_acl_row
+                    else ""
+                )
+                if "infrastructure.verification_context" not in infrastructure_acl_sql:
+                    connection.execute(
+                        "ALTER TABLE broker_infrastructure_service_acl "
+                        "RENAME TO broker_infrastructure_service_acl_pre_v14"
+                    )
+                    connection.execute(
+                        """
+                        CREATE TABLE broker_infrastructure_service_acl (
+                            uid INTEGER NOT NULL,
+                            account_id TEXT NOT NULL,
+                            operation TEXT NOT NULL CHECK(operation IN (
+                                'infrastructure.ingest',
+                                'infrastructure.read',
+                                'infrastructure.verification_context'
+                            )),
+                            enabled INTEGER NOT NULL DEFAULT 1
+                                CHECK(enabled IN (0, 1)),
+                            valid_until_epoch INTEGER NOT NULL
+                                CHECK(valid_until_epoch > 0),
+                            updated_at TEXT NOT NULL,
+                            PRIMARY KEY(uid, operation),
+                            FOREIGN KEY(uid, account_id)
+                                REFERENCES broker_acl_principals(uid, account_id)
+                                ON DELETE CASCADE
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO broker_infrastructure_service_acl(
+                            uid, account_id, operation, enabled,
+                            valid_until_epoch, updated_at
+                        )
+                        SELECT uid, account_id, operation, enabled,
+                               valid_until_epoch, updated_at
+                        FROM broker_infrastructure_service_acl_pre_v14
+                        """
+                    )
+                    connection.execute(
+                        "DROP TABLE broker_infrastructure_service_acl_pre_v14"
+                    )
+                    connection.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS
+                        broker_infrastructure_service_acl_active
+                        ON broker_infrastructure_service_acl(
+                            operation, enabled, valid_until_epoch, uid
+                        )
+                        """
+                    )
                 ephemeral_acl_row = connection.execute(
                     "SELECT sql FROM sqlite_master "
                     "WHERE type = 'table' AND name = 'broker_ephemeral_acl'"
@@ -1362,6 +1749,608 @@ class BrokerPersistence:
                     (uid, account_id, int(enabled), utc_timestamp()),
                 )
 
+    def replace_infrastructure_service_access(
+        self,
+        *,
+        uid: int,
+        account_id: str,
+        operations: Iterable[BrokerOperation],
+        valid_until_epoch: int,
+    ) -> None:
+        """Replace only the fixed-scope infrastructure grants for one UID.
+
+        This administrator-side API is intentionally not a broker operation.
+        Public ingress may receive only ingest plus verification-context and
+        must have no broader authority. The non-mutating read grant may coexist
+        with an authenticated Console/API UID's repository authority. Neither
+        path creates a fake repository enrollment or grants new runtime,
+        lifecycle, port, Docker, database, or host-observe authority.
+        """
+
+        if type(uid) is not int or uid < 0:
+            raise ValueError("uid must be a non-negative integer")
+        _require_identifier(account_id, "account_id")
+        if (
+            type(valid_until_epoch) is not int
+            or valid_until_epoch <= int(time.time())
+        ):
+            raise ValueError("valid_until_epoch must be in the future")
+        try:
+            normalized = frozenset(BrokerOperation(item) for item in operations)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "operations contain an unsupported broker operation"
+            ) from None
+        if not normalized <= _INFRASTRUCTURE_OPERATIONS:
+            raise ValueError(
+                "infrastructure service access accepts only ingest, "
+                "verification-context, or read operations"
+            )
+        now_epoch = int(time.time())
+        updated_at = utc_timestamp(now_epoch)
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                self._replace_infrastructure_service_access_in_transaction(
+                    connection,
+                    uid=uid,
+                    account_id=account_id,
+                    operations=normalized,
+                    valid_until_epoch=valid_until_epoch,
+                    now_epoch=now_epoch,
+                    updated_at=updated_at,
+                )
+
+    def administer_infrastructure_ingress_access(
+        self,
+        request: Mapping[str, Any],
+        *,
+        operator_uid: int,
+        now_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically replace the fixed ingress ACL and retain its receipt."""
+
+        if operator_uid != 0 or self.expected_uid != 0:
+            raise PermissionError(
+                "infrastructure ingress access requires the root service owner"
+            )
+        normalized = prepare_infrastructure_ingress_access_request(request)
+        request_json = canonical_json(normalized)
+        request_sha256 = hashlib.sha256(
+            request_json.encode("utf-8")
+        ).hexdigest()
+        request_id = str(normalized["request_id"])
+        action = str(normalized["action"])
+        current_epoch = (
+            int(time.time()) if now_epoch is None else int(now_epoch)
+        )
+        payload = normalized["payload"]
+        valid_until_epoch = (
+            int(payload["valid_until_epoch"])
+            if action == "ingress.replace"
+            else None
+        )
+        replayed = False
+        result: dict[str, Any]
+        result_sha256: str
+        created_at: str
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                metadata = connection.execute(
+                    """
+                    SELECT schema_version, database_generation
+                    FROM schema_metadata
+                    WHERE singleton = 1
+                    """
+                ).fetchone()
+                if (
+                    metadata is None
+                    or int(metadata["schema_version"]) != SCHEMA_VERSION
+                    or SCHEMA_VERSION != 14
+                ):
+                    raise RuntimeError(
+                        "infrastructure ingress access requires schema 14"
+                    )
+                authority_generation = str(metadata["database_generation"])
+                _require_identifier(
+                    authority_generation, "database_generation"
+                )
+                existing = connection.execute(
+                    """
+                    SELECT request_schema, action, request_json,
+                           request_sha256, result_json, result_sha256,
+                           operator_uid, authority_schema_version, created_at
+                    FROM broker_infrastructure_ingress_access_receipts
+                    WHERE request_id = ?
+                    """,
+                    (request_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing["request_schema"])
+                        != INFRASTRUCTURE_INGRESS_ACCESS_REQUEST_SCHEMA
+                        or str(existing["action"]) != action
+                        or str(existing["request_json"]) != request_json
+                        or str(existing["request_sha256"])
+                        != request_sha256
+                        or int(existing["operator_uid"]) != operator_uid
+                        or int(existing["authority_schema_version"]) != 14
+                    ):
+                        raise BrokerError(
+                            "infrastructure_ingress_access_request_conflict",
+                            "The request_id already binds a different immutable "
+                            "infrastructure ingress access request.",
+                        )
+                    result_json = str(existing["result_json"])
+                    result_sha256 = str(existing["result_sha256"])
+                    if (
+                        hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+                        != result_sha256
+                    ):
+                        raise BrokerError(
+                            "infrastructure_ingress_access_receipt_corrupt",
+                            "The retained infrastructure ingress access receipt "
+                            "does not match its digest.",
+                        )
+                    decoded = json.loads(result_json)
+                    if not isinstance(decoded, dict):
+                        raise BrokerError(
+                            "infrastructure_ingress_access_receipt_corrupt",
+                            "The retained infrastructure ingress access result "
+                            "is invalid.",
+                        )
+                    result = decoded
+                    created_at = str(existing["created_at"])
+                    replayed = True
+                else:
+                    created_at = utc_timestamp(current_epoch)
+                    if action == "ingress.replace":
+                        assert valid_until_epoch is not None
+                        if not (
+                            current_epoch < valid_until_epoch
+                            <= current_epoch
+                            + INFRASTRUCTURE_INGRESS_ACCESS_MAX_VALIDITY_SECONDS
+                        ):
+                            raise ValueError(
+                                "infrastructure ingress access expiry must be "
+                                "in the future and no more than 30 days"
+                            )
+                        self._replace_infrastructure_service_access_in_transaction(
+                            connection,
+                            uid=int(payload["uid"]),
+                            account_id=str(payload["account_id"]),
+                            operations=_INFRASTRUCTURE_INGRESS_OPERATIONS,
+                            valid_until_epoch=valid_until_epoch,
+                            now_epoch=current_epoch,
+                            updated_at=created_at,
+                        )
+                        operations = sorted(
+                            operation.value
+                            for operation in _INFRASTRUCTURE_INGRESS_OPERATIONS
+                        )
+                        status = "configured"
+                    else:
+                        self._disable_infrastructure_ingress_access_in_transaction(
+                            connection,
+                            uid=int(payload["uid"]),
+                            account_id=str(payload["account_id"]),
+                            updated_at=created_at,
+                        )
+                        operations = []
+                        status = "disabled"
+                    result = {
+                        "status": status,
+                        "role": "infrastructure-ingress",
+                        "service_account": str(payload["service_account"]),
+                        "uid": int(payload["uid"]),
+                        "account_id": str(payload["account_id"]),
+                        "operations": operations,
+                        "valid_until_epoch": valid_until_epoch,
+                        "authority_generation": authority_generation,
+                    }
+                    result_json = canonical_json(result)
+                    result_sha256 = hashlib.sha256(
+                        result_json.encode("utf-8")
+                    ).hexdigest()
+                    connection.execute(
+                        """
+                        INSERT INTO
+                            broker_infrastructure_ingress_access_receipts(
+                                request_id, request_schema, action,
+                                request_json, request_sha256,
+                                result_json, result_sha256,
+                                operator_uid, authority_schema_version,
+                                created_at
+                            )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 14, ?)
+                        """,
+                        (
+                            request_id,
+                            INFRASTRUCTURE_INGRESS_ACCESS_REQUEST_SCHEMA,
+                            action,
+                            request_json,
+                            request_sha256,
+                            result_json,
+                            result_sha256,
+                            created_at,
+                        ),
+                    )
+        return {
+            "schema": INFRASTRUCTURE_INGRESS_ACCESS_RECEIPT_SCHEMA,
+            "request_id": request_id,
+            "action": action,
+            "request_sha256": request_sha256,
+            "result": result,
+            "result_sha256": result_sha256,
+            "operator_uid": operator_uid,
+            "authority_schema_version": 14,
+            "created_at": created_at,
+            "replayed": replayed,
+        }
+
+    def administer_infrastructure_reader_access(
+        self,
+        request: Mapping[str, Any],
+        *,
+        operator_uid: int,
+        now_epoch: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically replace/disable one expiring read grant and receipt."""
+
+        if operator_uid != 0 or self.expected_uid != 0:
+            raise PermissionError(
+                "infrastructure reader access requires the root service owner"
+            )
+        normalized = prepare_infrastructure_reader_access_request(request)
+        request_json = canonical_json(normalized)
+        request_sha256 = hashlib.sha256(
+            request_json.encode("utf-8")
+        ).hexdigest()
+        request_id = str(normalized["request_id"])
+        action = str(normalized["action"])
+        current_epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+        payload = normalized["payload"]
+        valid_until_epoch = (
+            int(payload["valid_until_epoch"])
+            if action == "reader.replace"
+            else None
+        )
+        replayed = False
+        result: dict[str, Any]
+        result_sha256: str
+        created_at: str
+        with self._store() as store:
+            with store.immediate_transaction() as connection:
+                metadata = connection.execute(
+                    """
+                    SELECT schema_version, database_generation
+                    FROM schema_metadata
+                    WHERE singleton = 1
+                    """
+                ).fetchone()
+                if (
+                    metadata is None
+                    or int(metadata["schema_version"]) != SCHEMA_VERSION
+                    or SCHEMA_VERSION != 14
+                ):
+                    raise RuntimeError(
+                        "infrastructure reader access requires schema 14"
+                    )
+                authority_generation = str(metadata["database_generation"])
+                _require_identifier(
+                    authority_generation,
+                    "database_generation",
+                )
+                existing = connection.execute(
+                    """
+                    SELECT request_schema, action, request_json,
+                           request_sha256, result_json, result_sha256,
+                           operator_uid, authority_schema_version, created_at
+                    FROM broker_infrastructure_reader_access_receipts
+                    WHERE request_id = ?
+                    """,
+                    (request_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing["request_schema"])
+                        != INFRASTRUCTURE_READER_ACCESS_REQUEST_SCHEMA
+                        or str(existing["action"]) != action
+                        or str(existing["request_json"]) != request_json
+                        or str(existing["request_sha256"]) != request_sha256
+                        or int(existing["operator_uid"]) != operator_uid
+                        or int(existing["authority_schema_version"]) != 14
+                    ):
+                        raise BrokerError(
+                            "infrastructure_reader_access_request_conflict",
+                            "The request_id already binds a different immutable "
+                            "infrastructure reader access request.",
+                        )
+                    result_json = str(existing["result_json"])
+                    result_sha256 = str(existing["result_sha256"])
+                    if (
+                        hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+                        != result_sha256
+                    ):
+                        raise BrokerError(
+                            "infrastructure_reader_access_receipt_corrupt",
+                            "The retained infrastructure reader access receipt "
+                            "does not match its digest.",
+                        )
+                    decoded = json.loads(result_json)
+                    if not isinstance(decoded, dict):
+                        raise BrokerError(
+                            "infrastructure_reader_access_receipt_corrupt",
+                            "The retained infrastructure reader result is invalid.",
+                        )
+                    result = decoded
+                    created_at = str(existing["created_at"])
+                    replayed = True
+                else:
+                    created_at = utc_timestamp(current_epoch)
+                    uid = int(payload["uid"])
+                    account_id = str(payload["account_id"])
+                    if action == "reader.replace":
+                        assert valid_until_epoch is not None
+                        if not (
+                            current_epoch < valid_until_epoch
+                            <= current_epoch
+                            + INFRASTRUCTURE_READER_ACCESS_MAX_VALIDITY_SECONDS
+                        ):
+                            raise ValueError(
+                                "infrastructure reader access expiry must be in "
+                                "the future and no more than 30 days"
+                            )
+                        _require_uid_has_no_enabled_infrastructure_service_access(
+                            connection,
+                            uid=uid,
+                        )
+                        self._replace_infrastructure_service_access_in_transaction(
+                            connection,
+                            uid=uid,
+                            account_id=account_id,
+                            operations=frozenset(
+                                {BrokerOperation.INFRASTRUCTURE_READ}
+                            ),
+                            valid_until_epoch=valid_until_epoch,
+                            now_epoch=current_epoch,
+                            updated_at=created_at,
+                        )
+                        status = "configured"
+                        operations = [
+                            BrokerOperation.INFRASTRUCTURE_READ.value
+                        ]
+                    else:
+                        self._disable_infrastructure_reader_access_in_transaction(
+                            connection,
+                            uid=uid,
+                            account_id=account_id,
+                            updated_at=created_at,
+                        )
+                        status = "disabled"
+                        operations = []
+                    result = {
+                        "status": status,
+                        "role": "infrastructure-reader",
+                        "service_account": str(payload["service_account"]),
+                        "uid": uid,
+                        "account_id": account_id,
+                        "operations": operations,
+                        "valid_until_epoch": valid_until_epoch,
+                        "authority_generation": authority_generation,
+                    }
+                    result_json = canonical_json(result)
+                    result_sha256 = hashlib.sha256(
+                        result_json.encode("utf-8")
+                    ).hexdigest()
+                    connection.execute(
+                        """
+                        INSERT INTO
+                            broker_infrastructure_reader_access_receipts(
+                                request_id, request_schema, action,
+                                request_json, request_sha256,
+                                result_json, result_sha256,
+                                operator_uid, authority_schema_version,
+                                created_at
+                            )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 14, ?)
+                        """,
+                        (
+                            request_id,
+                            INFRASTRUCTURE_READER_ACCESS_REQUEST_SCHEMA,
+                            action,
+                            request_json,
+                            request_sha256,
+                            result_json,
+                            result_sha256,
+                            created_at,
+                        ),
+                    )
+        return {
+            "schema": INFRASTRUCTURE_READER_ACCESS_RECEIPT_SCHEMA,
+            "request_id": request_id,
+            "action": action,
+            "request_sha256": request_sha256,
+            "result": result,
+            "result_sha256": result_sha256,
+            "operator_uid": operator_uid,
+            "authority_schema_version": 14,
+            "created_at": created_at,
+            "replayed": replayed,
+        }
+
+    @staticmethod
+    def _disable_infrastructure_reader_access_in_transaction(
+        connection: sqlite3.Connection,
+        *,
+        uid: int,
+        account_id: str,
+        updated_at: str,
+    ) -> None:
+        if type(uid) is not int or uid <= 0:
+            raise ValueError(
+                "infrastructure reader UID must be a non-root UID"
+            )
+        _require_identifier(account_id, "account_id")
+        principal = connection.execute(
+            """
+            SELECT account_id
+            FROM broker_acl_principals
+            WHERE uid = ?
+            """,
+            (uid,),
+        ).fetchone()
+        if (
+            principal is not None
+            and str(principal["account_id"]) != account_id
+        ):
+            raise BrokerError(
+                "principal_account_conflict",
+                "This operating-system UID is enrolled for a different account.",
+            )
+        connection.execute(
+            """
+            UPDATE broker_infrastructure_service_acl
+            SET enabled = 0, updated_at = ?
+            WHERE uid = ? AND account_id = ?
+              AND operation = 'infrastructure.read'
+            """,
+            (updated_at, uid, account_id),
+        )
+
+    @staticmethod
+    def _disable_infrastructure_ingress_access_in_transaction(
+        connection: sqlite3.Connection,
+        *,
+        uid: int,
+        account_id: str,
+        updated_at: str,
+    ) -> None:
+        if type(uid) is not int or uid <= 0:
+            raise ValueError(
+                "infrastructure ingress UID must be a non-root UID"
+            )
+        _require_identifier(account_id, "account_id")
+        principal = connection.execute(
+            """
+            SELECT account_id
+            FROM broker_acl_principals
+            WHERE uid = ?
+            """,
+            (uid,),
+        ).fetchone()
+        if (
+            principal is not None
+            and str(principal["account_id"]) != account_id
+        ):
+            raise BrokerError(
+                "principal_account_conflict",
+                "This operating-system UID is enrolled for a different account.",
+            )
+        connection.execute(
+            """
+            UPDATE broker_infrastructure_service_acl
+            SET enabled = 0, updated_at = ?
+            WHERE uid = ? AND account_id = ?
+              AND operation IN (
+                  'infrastructure.ingest',
+                  'infrastructure.verification_context'
+              )
+            """,
+            (updated_at, uid, account_id),
+        )
+
+    @staticmethod
+    def _replace_infrastructure_service_access_in_transaction(
+        connection: sqlite3.Connection,
+        *,
+        uid: int,
+        account_id: str,
+        operations: frozenset[BrokerOperation],
+        valid_until_epoch: int,
+        now_epoch: int,
+        updated_at: str,
+    ) -> None:
+        if type(uid) is not int or uid < 0:
+            raise ValueError("uid must be a non-negative integer")
+        _require_identifier(account_id, "account_id")
+        if (
+            type(valid_until_epoch) is not int
+            or valid_until_epoch <= now_epoch
+        ):
+            raise ValueError("valid_until_epoch must be in the future")
+        if not operations <= _INFRASTRUCTURE_OPERATIONS:
+            raise ValueError(
+                "infrastructure service access contains an invalid operation"
+            )
+        if operations & _INFRASTRUCTURE_INGRESS_OPERATIONS:
+            if operations != _INFRASTRUCTURE_INGRESS_OPERATIONS:
+                raise BrokerError(
+                    "infrastructure_ingress_scope_mixed",
+                    "A dedicated infrastructure ingress UID may receive "
+                    "exactly ingest plus verification-context; partial "
+                    "or read-mixed ingress authority is invalid.",
+                )
+            _require_infrastructure_principal_isolated(
+                connection, uid=uid
+            )
+        principal = connection.execute(
+            """
+            SELECT account_id, enabled
+            FROM broker_acl_principals WHERE uid = ?
+            """,
+            (uid,),
+        ).fetchone()
+        if principal is None:
+            connection.execute(
+                """
+                INSERT INTO broker_acl_principals(
+                    uid, account_id, enabled, updated_at
+                ) VALUES (?, ?, 1, ?)
+                """,
+                (uid, account_id, updated_at),
+            )
+        elif str(principal["account_id"]) != account_id:
+            raise BrokerError(
+                "principal_account_conflict",
+                "This operating-system UID is already enrolled for a "
+                "different account.",
+            )
+        elif not bool(principal["enabled"]):
+            raise BrokerError(
+                "peer_not_authorized",
+                "The service principal is disabled and cannot receive "
+                "infrastructure grants.",
+            )
+        connection.execute(
+            """
+            UPDATE broker_infrastructure_service_acl
+            SET enabled = 0, updated_at = ?
+            WHERE uid = ?
+            """,
+            (updated_at, uid),
+        )
+        for operation in sorted(operations, key=lambda item: item.value):
+            connection.execute(
+                """
+                INSERT INTO broker_infrastructure_service_acl(
+                    uid, account_id, operation, enabled,
+                    valid_until_epoch, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?)
+                ON CONFLICT(uid, operation) DO UPDATE SET
+                    account_id = excluded.account_id,
+                    enabled = 1,
+                    valid_until_epoch = excluded.valid_until_epoch,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    uid,
+                    account_id,
+                    operation.value,
+                    valid_until_epoch,
+                    updated_at,
+                ),
+            )
+
     def provision_repository_enrollment(
         self,
         *,
@@ -1397,6 +2386,9 @@ class BrokerPersistence:
         now = utc_timestamp()
         with self._store() as store:
             with store.immediate_transaction() as connection:
+                _require_uid_has_no_enabled_infrastructure_service_access(
+                    connection, uid=uid
+                )
                 principal = connection.execute(
                     "SELECT account_id FROM broker_acl_principals WHERE uid = ?",
                     (uid,),
@@ -8499,6 +9491,87 @@ def _backfill_worker_replace_acl(
     )
 
 
+def _require_infrastructure_principal_isolated(
+    connection: sqlite3.Connection,
+    *,
+    uid: int,
+) -> None:
+    """Fail closed when an infrastructure service UID has any broader role.
+
+    This checks all current and future ``broker_*`` tables that carry a UID,
+    excluding only the principal identity and the fixed infrastructure ACL
+    itself. Retained operation/lease ownership also blocks reuse: an explicit
+    administrator decommission is required before a user/runtime UID can
+    become a dedicated public-ingress identity. Non-mutating read authority is
+    deliberately allowed to coexist with the authenticated Console/API UID.
+    """
+
+    broader_tables: list[str] = []
+    for row in connection.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name GLOB 'broker_*'
+        ORDER BY name
+        """
+    ):
+        table = str(row["name"])
+        if table in {
+            "broker_acl_principals",
+            "broker_infrastructure_service_acl",
+        }:
+            continue
+        if re.fullmatch(r"broker_[a-z0-9_]+", table) is None:
+            raise BrokerError(
+                "infrastructure_principal_isolation_unverifiable",
+                "A broker authority table name could not be inspected safely.",
+            )
+        columns = {
+            str(column["name"])
+            for column in connection.execute(
+                f'PRAGMA table_info("{table}")'
+            )
+        }
+        if "uid" not in columns:
+            continue
+        if connection.execute(
+            f'SELECT 1 FROM "{table}" WHERE uid = ? LIMIT 1',
+            (uid,),
+        ).fetchone() is not None:
+            broader_tables.append(table)
+    if broader_tables:
+        raise BrokerError(
+            "infrastructure_principal_not_dedicated",
+            "Infrastructure service UID already has broader repository, "
+            "runtime, control, or retained ownership authority and cannot "
+            "receive or exercise the fixed infrastructure grant.",
+        )
+
+
+def _require_uid_has_no_enabled_infrastructure_service_access(
+    connection: sqlite3.Connection,
+    *,
+    uid: int,
+) -> None:
+    if connection.execute(
+        """
+        SELECT 1 FROM broker_infrastructure_service_acl
+        WHERE uid = ? AND enabled = 1
+          AND operation IN (
+              'infrastructure.ingest',
+              'infrastructure.verification_context'
+          )
+        LIMIT 1
+        """,
+        (uid,),
+    ).fetchone() is not None:
+        raise BrokerError(
+            "infrastructure_principal_is_dedicated",
+            "A UID with enabled fixed infrastructure service authority cannot "
+            "receive repository enrollment; disable and decommission that "
+            "service identity first.",
+        )
+
+
 def _authorize_connection(
     connection: sqlite3.Connection,
     *,
@@ -8536,6 +9609,55 @@ def _authorize_connection(
             "The authenticated account cannot act for the requested account.",
             operation_id=request.operation_id,
         )
+    if request.operation in _INFRASTRUCTURE_OPERATIONS:
+        if request.operation in _INFRASTRUCTURE_INGRESS_OPERATIONS:
+            _require_infrastructure_principal_isolated(
+                connection, uid=peer.uid
+            )
+        expected_resource_id = (
+            INFRASTRUCTURE_INGEST_RESOURCE_ID
+            if request.operation is BrokerOperation.INFRASTRUCTURE_INGEST
+            else (
+                INFRASTRUCTURE_READ_RESOURCE_ID
+                if request.operation is BrokerOperation.INFRASTRUCTURE_READ
+                else INFRASTRUCTURE_VERIFICATION_CONTEXT_RESOURCE_ID
+            )
+        )
+        if (
+            request.project_id != INFRASTRUCTURE_BROKER_PROJECT_ID
+            or request.resource_id != expected_resource_id
+            or request.repository_generation != 0
+        ):
+            raise BrokerError(
+                "resource_access_denied",
+                "Infrastructure service requests must target their exact fixed broker scope.",
+                operation_id=request.operation_id,
+            )
+        grant = connection.execute(
+            """
+            SELECT account_id, enabled, valid_until_epoch
+            FROM broker_infrastructure_service_acl
+            WHERE uid = ? AND operation = ?
+            """,
+            (peer.uid, request.operation.value),
+        ).fetchone()
+        if (
+            grant is None
+            or not bool(grant["enabled"])
+            or str(grant["account_id"]) != request.account_id
+        ):
+            raise BrokerError(
+                "operation_access_denied",
+                "The authenticated service principal is not authorized for this infrastructure operation.",
+                operation_id=request.operation_id,
+            )
+        if int(time.time()) >= int(grant["valid_until_epoch"]):
+            raise BrokerError(
+                "service_enrollment_expired",
+                "The infrastructure service-principal grant has expired.",
+                operation_id=request.operation_id,
+            )
+        return None
     repository_identity = connection.execute(
         """
         SELECT canonical_root, state, generation

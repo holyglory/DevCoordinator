@@ -175,6 +175,7 @@ class ObservationEventTests(unittest.TestCase):
             containers.append(container)
         docker = {
             "available": available,
+            "container_inspection_available": available and inspectable,
             "containers": containers,
             "postgres": [],
         }

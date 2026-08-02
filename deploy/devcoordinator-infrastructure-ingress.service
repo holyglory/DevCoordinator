@@ -1,0 +1,51 @@
+[Unit]
+Description=DevCoordinator remote-infrastructure mTLS observation ingress
+Documentation=file:///home/DevCoordinator/docs/architecture/remote-infrastructure-observation.md
+After=network-online.target devcoordinator-broker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=devcoord-infra-ingress
+Group=devcoord-infra-ingress
+SupplementaryGroups=devcoordinator-clients
+WorkingDirectory=/home/DevCoordinator
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+StateDirectory=devcoordinator-infrastructure-ingress/envelopes
+StateDirectoryMode=0700
+UMask=0077
+ExecStartPre=+/usr/bin/python3 -I -B /home/DevCoordinator/scripts/verify_authority_runtime.py verify
+ExecStartPre=/opt/devcoordinator-authority/bin/python -I -B /home/DevCoordinator/skills/codex-dev-coordinator/scripts/devcoordinator_infrastructure_ingress.py --config /etc/devcoordinator/infrastructure-ingress/config.json --check-config
+ExecStart=/opt/devcoordinator-authority/bin/python -I -B /home/DevCoordinator/skills/codex-dev-coordinator/scripts/devcoordinator_infrastructure_ingress.py --config /etc/devcoordinator/infrastructure-ingress/config.json
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=30
+TimeoutStopSec=35
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+ReadWritePaths=/var/lib/devcoordinator-infrastructure-ingress
+
+[Install]
+WantedBy=multi-user.target

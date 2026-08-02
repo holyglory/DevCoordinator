@@ -44,6 +44,16 @@ from .maintenance import (
     PUBLIC_MAINTENANCE_MESSAGE,
     load_maintenance_state,
 )
+from .infrastructure_observation import (
+    INFRASTRUCTURE_BROKER_PROJECT_ID,
+    INFRASTRUCTURE_INGEST_RESOURCE_ID,
+    INFRASTRUCTURE_READ_RESOURCE_ID,
+    INFRASTRUCTURE_VERIFICATION_CONTEXT_RESOURCE_ID,
+    InfrastructureValidationError,
+    prepare_ingest_arguments,
+    prepare_read_arguments,
+    prepare_verification_context_arguments,
+)
 
 PROTOCOL_VERSION = 1
 # Inventory is a bounded whole-host graph.  Keep the local protocol bounded,
@@ -110,6 +120,11 @@ class BrokerOperation(str, Enum):
     INVENTORY_READ = "inventory.read"
     EVENTS_READ = "events.read"
     HOST_OBSERVE = "host.observe"
+    INFRASTRUCTURE_INGEST = "infrastructure.ingest"
+    INFRASTRUCTURE_READ = "infrastructure.read"
+    INFRASTRUCTURE_VERIFICATION_CONTEXT = (
+        "infrastructure.verification_context"
+    )
     TEST_RUN_START = "test.run_start"
     TEST_RUN_FINISH = "test.run_finish"
     TEST_STATS_READ = "test.stats_read"
@@ -290,6 +305,30 @@ class BrokerRequest:
         arguments = _validate_arguments(
             operation, value["arguments"], operation_id=operation_id
         )
+        if operation in {
+            BrokerOperation.INFRASTRUCTURE_INGEST,
+            BrokerOperation.INFRASTRUCTURE_READ,
+            BrokerOperation.INFRASTRUCTURE_VERIFICATION_CONTEXT,
+        }:
+            expected_resource_id = (
+                INFRASTRUCTURE_INGEST_RESOURCE_ID
+                if operation is BrokerOperation.INFRASTRUCTURE_INGEST
+                else (
+                    INFRASTRUCTURE_READ_RESOURCE_ID
+                    if operation is BrokerOperation.INFRASTRUCTURE_READ
+                    else INFRASTRUCTURE_VERIFICATION_CONTEXT_RESOURCE_ID
+                )
+            )
+            if (
+                project_id != INFRASTRUCTURE_BROKER_PROJECT_ID
+                or resource_id != expected_resource_id
+                or repository_generation != 0
+            ):
+                raise BrokerError(
+                    "resource_access_denied",
+                    "Infrastructure operations must target their exact fixed broker scope.",
+                    operation_id=operation_id,
+                )
         if (
             operation is BrokerOperation.EPHEMERAL_SECRET_FD
             and arguments["run_id"] != resource_id
@@ -831,6 +870,8 @@ class SerializedMutationWriter:
             BrokerOperation.EPHEMERAL_IMAGE_STATUS,
             BrokerOperation.WORKER_POLICY_READ,
             BrokerOperation.WORKER_ATTEMPT_READ,
+            BrokerOperation.INFRASTRUCTURE_READ,
+            BrokerOperation.INFRASTRUCTURE_VERIFICATION_CONTEXT,
         } or (
             request.request.operation is BrokerOperation.RUNTIME_REQUEST
             and request.request.arguments.get("action") == "status"
@@ -881,6 +922,9 @@ class SerializedMutationWriter:
             self._waiting_count += 1
             self._metrics_condition.notify_all()
         operation_id = request.request.operation_id
+        cache_completed_outcome = (
+            request.request.operation is not BrokerOperation.INFRASTRUCTURE_INGEST
+        )
         resource_key = "\x1f".join(
             (
                 request.request.account_id,
@@ -910,10 +954,12 @@ class SerializedMutationWriter:
                 self._admitted_mutation_count += 1
                 self._metrics_condition.notify_all()
             try:
-                with self._cache_lock:
-                    cached = self._completed.get(operation_id)
-                    if cached is not None:
-                        self._completed.move_to_end(operation_id)
+                cached: _CachedOutcome | None = None
+                if cache_completed_outcome:
+                    with self._cache_lock:
+                        cached = self._completed.get(operation_id)
+                        if cached is not None:
+                            self._completed.move_to_end(operation_id)
                 if cached is not None:
                     if cached.fingerprint != fingerprint:
                         raise BrokerError(
@@ -940,7 +986,10 @@ class SerializedMutationWriter:
                         error_code=exc.code,
                         error_message=exc.message,
                     )
-                    if exc.code not in _NON_TERMINAL_OPERATION_ERRORS:
+                    if (
+                        cache_completed_outcome
+                        and exc.code not in _NON_TERMINAL_OPERATION_ERRORS
+                    ):
                         self._remember(operation_id, outcome)
                     raise BrokerError(
                         exc.code, exc.message, operation_id=operation_id
@@ -957,17 +1006,19 @@ class SerializedMutationWriter:
                             "The broker could not complete the mutation; inspect broker logs."
                         ),
                     )
-                    self._remember(operation_id, outcome)
+                    if cache_completed_outcome:
+                        self._remember(operation_id, outcome)
                     raise BrokerError(
                         outcome.error_code or "mutation_failed",
                         outcome.error_message or "Broker mutation failed.",
                         operation_id=operation_id,
                     ) from None
 
-                self._remember(
-                    operation_id,
-                    _CachedOutcome(fingerprint=fingerprint, result=result),
-                )
+                if cache_completed_outcome:
+                    self._remember(
+                        operation_id,
+                        _CachedOutcome(fingerprint=fingerprint, result=result),
+                    )
                 return dict(result)
             finally:
                 with self._metrics_condition:
@@ -1983,6 +2034,33 @@ def _validate_arguments(
                 operation_id=operation_id,
             )
         return {}
+    if operation == BrokerOperation.INFRASTRUCTURE_INGEST:
+        try:
+            return prepare_ingest_arguments(value)
+        except InfrastructureValidationError as error:
+            raise BrokerError(
+                error.code,
+                error.message,
+                operation_id=operation_id,
+            ) from None
+    if operation == BrokerOperation.INFRASTRUCTURE_READ:
+        try:
+            return prepare_read_arguments(value)
+        except InfrastructureValidationError as error:
+            raise BrokerError(
+                error.code,
+                error.message,
+                operation_id=operation_id,
+            ) from None
+    if operation == BrokerOperation.INFRASTRUCTURE_VERIFICATION_CONTEXT:
+        try:
+            return prepare_verification_context_arguments(value)
+        except InfrastructureValidationError as error:
+            raise BrokerError(
+                error.code,
+                error.message,
+                operation_id=operation_id,
+            ) from None
 
     if operation == BrokerOperation.TEST_RUN_START:
         required = {

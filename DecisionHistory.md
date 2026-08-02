@@ -10,6 +10,16 @@ Confirmed access direction: verified identity is not authorization. Console and 
 
 Confirmed operational direction: the public Console, authenticated API, and broker are independently supervised availability boundaries with exact readiness and migration gates; offline authority work uses a broker-independent, owner-bound wait fence that survives broker shutdown and remains until verified readiness or rollback; the metrics loop is the sole periodic observer and backs off after completion; long-lived protected-profile readers reload through their own supervisor after stable profile replacement. DevCoordinator is the independent source of its apps, skills, deployment assets, and validation; releases require fetched ancestry, preserved dirty work, fresh-clone and standalone-package proof, production-shaped interface evidence, and the Build macOS Apps workflow for native delivery. See [DC-2026-07-26-MAINTENANCE-01](DecisionDetails/DC-2026-07-26-MAINTENANCE-01.md), [DC-2026-07-20-CONSOLE-RESILIENCE-01](DecisionDetails/DC-2026-07-20-CONSOLE-RESILIENCE-01.md), [DC-2026-07-21-CONSOLE-DATA-01](DecisionDetails/DC-2026-07-21-CONSOLE-DATA-01.md), and [DC-2026-07-11-20](DecisionDetails/DC-2026-07-11-20.md).
 
+Confirmed remote-infrastructure direction: Hyper-V hosts and VMs are a distinct observation domain, not fabricated local Server rows. Enrolled platform agents report outbound through dedicated mTLS plus signed, replay-fenced envelopes; the Coordinator remains the durable authority, the Console renders a bounded read-only Infrastructure projection, and one host with many VMs remains one failure domain. See [DC-2026-07-29-REMOTE-INFRA-01](DecisionDetails/DC-2026-07-29-REMOTE-INFRA-01.md).
+
+## DC-2026-07-29-REMOTE-INFRA-01 — Remote infrastructure is separately enrolled and observed
+
+ID: DC-2026-07-29-REMOTE-INFRA-01 · Details: [supporting record](DecisionDetails/DC-2026-07-29-REMOTE-INFRA-01.md)
+
+Decision: Keep remote hosts and VMs in a separate read-only observation domain. Immutable identities and outbound mTLS/PS256 reports feed one Coordinator authority that replay-checks, scope-checks and persists exact evidence. Split expiring ingest/read roles, bounded pages and a transactionally activated authority runtime limit authority and mixed-generation failure. The supporting record owns the exact PKI lifetimes, receipt gates and operational constraints.
+
+Why: Local Server rows, UI SSH/WinRM, direct database writers and a Console importer were rejected because they invent failure independence, couple reads to privileged access or create competing authorities. A dedicated outbound observer costs schema, PKI and operations but preserves least privilege, immutable truth and multi-host growth; bounded roles, runtime generations and byte-aware pagination contain public-edge, rollback and transport risks. A command plane remains out of scope.
+
 ## DC-2026-07-26-MAINTENANCE-01 — Offline upgrades expose one durable wait fence
 
 ID: DC-2026-07-26-MAINTENANCE-01 · Details: [supporting record](DecisionDetails/DC-2026-07-26-MAINTENANCE-01.md)

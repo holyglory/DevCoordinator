@@ -4,9 +4,11 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1865,6 +1867,416 @@ class LifecycleParserContractTests(unittest.TestCase):
 
 
 class BrokerCLIContractTests(unittest.TestCase):
+    @unittest.skipUnless(os.geteuid() == 0, "root-only administration contract")
+    def test_infrastructure_admin_cli_is_offline_owner_gated_and_receipted(
+        self,
+    ) -> None:
+        value = parser()
+        with tempfile.TemporaryDirectory(
+            prefix=".infrastructure-admin-cli-",
+            dir="/tmp",
+        ) as raw:
+            root = Path(raw).resolve()
+            database = root / "coordinator.sqlite3"
+            with CoordinatorStore.open(database):
+                pass
+            request_path = root / "request.json"
+            request_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "spectre.infrastructure.admin.v1",
+                        "request_id": "00000000-0000-0000-0000-000000000901",
+                        "action": "cell.provision",
+                        "payload": {
+                            "cell_id": (
+                                "00000000-0000-0000-0000-000000000902"
+                            ),
+                            "name": "CLI fixture cell",
+                            "region": "lab",
+                            "classification_label": "test-only",
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            request_path.chmod(0o600)
+            args = value.parse_args(
+                [
+                    "broker",
+                    "infrastructure-admin",
+                    "--database",
+                    str(database),
+                    "--request-file",
+                    str(request_path),
+                ]
+            )
+            first = handle_broker_cli(args)
+            replay = handle_broker_cli(args)
+            self.assertFalse(first["replayed"])
+            self.assertTrue(replay["replayed"])
+            self.assertEqual(first["request_sha256"], replay["request_sha256"])
+            self.assertEqual(first["result_sha256"], replay["result_sha256"])
+            self.assertEqual(first["operator_uid"], 0)
+            self.assertEqual(first["authority_schema_version"], 14)
+            with CoordinatorStore.open_read_only(database) as store:
+                with store.read_transaction() as connection:
+                    self.assertEqual(
+                        int(
+                            connection.execute(
+                                """
+                                SELECT COUNT(*)
+                                FROM infrastructure_admin_receipts
+                                """
+                            ).fetchone()[0]
+                        ),
+                        1,
+                    )
+
+    def test_infrastructure_admin_cli_rejects_non_root_before_opening(self) -> None:
+        args = argparse.Namespace(
+            database="/not/opened.sqlite3",
+            request_file="/not/opened.json",
+        )
+        with (
+            mock.patch.object(
+                broker_cli_module.os,
+                "geteuid",
+                return_value=1000,
+            ),
+            self.assertRaisesRegex(PermissionError, "root service owner"),
+        ):
+            broker_cli_module._administer_infrastructure(args)
+
+    @unittest.skipUnless(os.geteuid() == 0, "root-only administration contract")
+    def test_infrastructure_ingress_access_is_fixed_receipted_and_idempotent(
+        self,
+    ) -> None:
+        value = parser()
+        with tempfile.TemporaryDirectory(
+            prefix=".infrastructure-ingress-access-cli-",
+            dir="/tmp",
+        ) as raw:
+            root = Path(raw).resolve()
+            database = root / "coordinator.sqlite3"
+            with CoordinatorStore.open(database):
+                pass
+            request_path = root / "request.json"
+            valid_until = int(time.time()) + 24 * 60 * 60
+            request = {
+                "schema": "spectre.infrastructure.ingress-access.v1",
+                "request_id": "00000000-0000-0000-0000-000000000911",
+                "action": "ingress.replace",
+                "payload": {
+                    "service_account": (
+                        "devcoord-infra-ingress"
+                    ),
+                    "uid": 12345,
+                    "account_id": "spectre-infrastructure-ingress",
+                    "valid_until_epoch": valid_until,
+                },
+            }
+            request_path.write_text(
+                json.dumps(request, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            request_path.chmod(0o600)
+            args = value.parse_args(
+                [
+                    "broker",
+                    "infrastructure-ingress-access",
+                    "--database",
+                    str(database),
+                    "--request-file",
+                    str(request_path),
+                ]
+            )
+            with mock.patch.object(
+                broker_cli_module.pwd,
+                "getpwnam",
+                return_value=mock.Mock(pw_uid=12345),
+            ):
+                first = handle_broker_cli(args)
+                replay = handle_broker_cli(args)
+            self.assertFalse(first["replayed"])
+            self.assertTrue(replay["replayed"])
+            self.assertEqual(first["request_sha256"], replay["request_sha256"])
+            self.assertEqual(first["result_sha256"], replay["result_sha256"])
+            self.assertEqual(
+                first["result"]["operations"],
+                [
+                    "infrastructure.ingest",
+                    "infrastructure.verification_context",
+                ],
+            )
+            with CoordinatorStore.open_read_only(database) as store:
+                with store.read_transaction() as connection:
+                    rows = list(
+                        connection.execute(
+                            """
+                            SELECT uid, account_id, operation, enabled,
+                                   valid_until_epoch
+                            FROM broker_infrastructure_service_acl
+                            WHERE uid = 12345
+                            ORDER BY operation
+                            """
+                        )
+                    )
+                    self.assertEqual(len(rows), 2)
+                    self.assertTrue(all(int(row["enabled"]) == 1 for row in rows))
+                    self.assertTrue(
+                        all(
+                            int(row["valid_until_epoch"]) == valid_until
+                            for row in rows
+                        )
+                    )
+                    self.assertEqual(
+                        int(
+                            connection.execute(
+                                """
+                                SELECT COUNT(*)
+                                FROM
+                                    broker_infrastructure_ingress_access_receipts
+                                """
+                            ).fetchone()[0]
+                        ),
+                        1,
+                    )
+            request["payload"]["valid_until_epoch"] = valid_until + 1
+            request_path.write_text(
+                json.dumps(request, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    broker_cli_module.pwd,
+                    "getpwnam",
+                    return_value=mock.Mock(pw_uid=12345),
+                ),
+                self.assertRaises(BrokerError) as conflict,
+            ):
+                handle_broker_cli(args)
+            self.assertEqual(
+                conflict.exception.code,
+                "infrastructure_ingress_access_request_conflict",
+            )
+            disable = {
+                "schema": "spectre.infrastructure.ingress-access.v1",
+                "request_id": "00000000-0000-0000-0000-000000000912",
+                "action": "ingress.disable",
+                "payload": {
+                    "service_account": "devcoord-infra-ingress",
+                    "uid": 12345,
+                    "account_id": "spectre-infrastructure-ingress",
+                },
+            }
+            request_path.write_text(
+                json.dumps(disable, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                broker_cli_module.pwd,
+                "getpwnam",
+                return_value=mock.Mock(pw_uid=12345),
+            ):
+                disabled = handle_broker_cli(args)
+            self.assertEqual(disabled["result"]["status"], "disabled")
+            self.assertEqual(disabled["result"]["operations"], [])
+            with CoordinatorStore.open_read_only(database) as store:
+                with store.read_transaction() as connection:
+                    self.assertEqual(
+                        int(
+                            connection.execute(
+                                """
+                                SELECT COUNT(*)
+                                FROM broker_infrastructure_service_acl
+                                WHERE uid = 12345 AND enabled = 1
+                                """
+                            ).fetchone()[0]
+                        ),
+                        0,
+                    )
+            request["request_id"] = (
+                "00000000-0000-0000-0000-000000000913"
+            )
+            request["payload"]["valid_until_epoch"] = (
+                int(time.time()) + 30 * 24 * 60 * 60 + 60
+            )
+            request_path.write_text(
+                json.dumps(request, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    broker_cli_module.pwd,
+                    "getpwnam",
+                    return_value=mock.Mock(pw_uid=12345),
+                ),
+                self.assertRaisesRegex(ValueError, "no more than 30 days"),
+            ):
+                handle_broker_cli(args)
+            with (
+                mock.patch.object(
+                    broker_cli_module.pwd,
+                    "getpwnam",
+                    return_value=mock.Mock(pw_uid=12344),
+                ),
+                self.assertRaisesRegex(PermissionError, "UID does not match"),
+            ):
+                handle_broker_cli(args)
+            with CoordinatorStore.open(database) as store:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    with store.immediate_transaction() as connection:
+                        connection.execute(
+                            """
+                            DELETE FROM
+                                broker_infrastructure_ingress_access_receipts
+                            """
+                        )
+
+    def test_infrastructure_ingress_access_rejects_non_root_before_opening(
+        self,
+    ) -> None:
+        args = argparse.Namespace(
+            database="/not/opened.sqlite3",
+            request_file="/not/opened.json",
+        )
+        with (
+            mock.patch.object(
+                broker_cli_module.os,
+                "geteuid",
+                return_value=1000,
+            ),
+            self.assertRaisesRegex(PermissionError, "root service owner"),
+        ):
+            broker_cli_module._administer_infrastructure_ingress_access(args)
+
+    @unittest.skipUnless(os.geteuid() == 0, "root-only administration contract")
+    def test_infrastructure_reader_access_is_receipted_and_revocable(
+        self,
+    ) -> None:
+        value = parser()
+        with tempfile.TemporaryDirectory(
+            prefix=".infrastructure-reader-access-cli-",
+            dir="/tmp",
+        ) as raw:
+            root = Path(raw).resolve()
+            database = root / "coordinator.sqlite3"
+            with CoordinatorStore.open(database):
+                pass
+            request_path = root / "request.json"
+            valid_until = int(time.time()) + 24 * 60 * 60
+            replace = {
+                "schema": "spectre.infrastructure.reader-access.v1",
+                "request_id": "00000000-0000-0000-0000-000000000921",
+                "action": "reader.replace",
+                "payload": {
+                    "service_account": "devcoord-console",
+                    "uid": 12346,
+                    "account_id": "spectre-console-infrastructure-reader",
+                    "valid_until_epoch": valid_until,
+                },
+            }
+            request_path.write_text(
+                json.dumps(replace, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            request_path.chmod(0o600)
+            args = value.parse_args(
+                [
+                    "broker",
+                    "infrastructure-reader-access",
+                    "--database",
+                    str(database),
+                    "--request-file",
+                    str(request_path),
+                ]
+            )
+            with mock.patch.object(
+                broker_cli_module.pwd,
+                "getpwnam",
+                return_value=mock.Mock(pw_uid=12346),
+            ):
+                receipt = handle_broker_cli(args)
+                replay = handle_broker_cli(args)
+            self.assertEqual(
+                receipt["result"]["operations"],
+                ["infrastructure.read"],
+            )
+            self.assertFalse(receipt["replayed"])
+            self.assertTrue(replay["replayed"])
+            self.assertEqual(
+                receipt["result_sha256"],
+                replay["result_sha256"],
+            )
+            disable = {
+                "schema": "spectre.infrastructure.reader-access.v1",
+                "request_id": "00000000-0000-0000-0000-000000000922",
+                "action": "reader.disable",
+                "payload": {
+                    "service_account": "devcoord-console",
+                    "uid": 12346,
+                    "account_id": "spectre-console-infrastructure-reader",
+                },
+            }
+            request_path.write_text(
+                json.dumps(disable, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                broker_cli_module.pwd,
+                "getpwnam",
+                return_value=mock.Mock(pw_uid=12346),
+            ):
+                disabled = handle_broker_cli(args)
+            self.assertEqual(disabled["result"]["status"], "disabled")
+            with CoordinatorStore.open_read_only(database) as store:
+                with store.read_transaction() as connection:
+                    self.assertEqual(
+                        int(
+                            connection.execute(
+                                """
+                                SELECT COUNT(*)
+                                FROM broker_infrastructure_service_acl
+                                WHERE uid = 12346
+                                  AND operation = 'infrastructure.read'
+                                  AND enabled = 1
+                                """
+                            ).fetchone()[0]
+                        ),
+                        0,
+                    )
+                    self.assertEqual(
+                        int(
+                            connection.execute(
+                                """
+                                SELECT COUNT(*)
+                                FROM
+                                    broker_infrastructure_reader_access_receipts
+                                """
+                            ).fetchone()[0]
+                        ),
+                        2,
+                    )
+
+    def test_infrastructure_reader_access_rejects_non_root_before_opening(
+        self,
+    ) -> None:
+        args = argparse.Namespace(
+            database="/not/opened.sqlite3",
+            request_file="/not/opened.json",
+        )
+        with (
+            mock.patch.object(
+                broker_cli_module.os,
+                "geteuid",
+                return_value=1000,
+            ),
+            self.assertRaisesRegex(PermissionError, "root service owner"),
+        ):
+            broker_cli_module._administer_infrastructure_reader_access(args)
+
     def test_image_publication_requires_active_maintenance_marker(self) -> None:
         with (
             mock.patch.object(

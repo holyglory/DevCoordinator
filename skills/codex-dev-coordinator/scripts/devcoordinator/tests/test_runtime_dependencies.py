@@ -239,7 +239,7 @@ class ComposeCapabilityContractTests(unittest.TestCase):
             )
 
         fake_yaml = types.SimpleNamespace(
-            __version__="6.0.2",
+            __version__="6.0.3",
             load=lambda value: value,
             SafeLoader=type("SafeLoader", (), {}),
         )

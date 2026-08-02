@@ -8,8 +8,8 @@
 <title>DevOps Console — vr.ae</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230e1116'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='4'%20fill='none'%20stroke='%234da3ff'%20stroke-width='2'/%3E%3Ccircle%20cx='8'%20cy='8'%20r='1.4'%20fill='%233fc97c'/%3E%3C/svg%3E">
 <!-- ?v= busts the 1h immutable asset cache on deploys; index.html itself is no-cache. -->
-<link rel="stylesheet" href="/app.css?v=d22d8015ccf4">
-<script src="/app.js?v=d22d8015ccf4" defer></script>
+<link rel="stylesheet" href="/app.css?v=2f2e4a73165b">
+<script src="/app.js?v=2f2e4a73165b" defer></script>
 </head>
 <body>
 
@@ -28,6 +28,7 @@
       <a href="#/projects" data-nav="projects">Projects <span class="nav-count" id="nav-count-projects" hidden></span></a>
       <a href="#/tests" data-nav="tests">Tests <span class="nav-count" id="nav-count-tests" hidden></span></a>
       <a href="#/servers" data-nav="servers">Servers <span class="nav-count" id="nav-count-servers" hidden></span></a>
+      <a href="#/infrastructure" data-nav="infrastructure" id="nav-infrastructure" hidden>Infrastructure <span class="nav-count" id="nav-count-infrastructure" hidden></span></a>
       <a href="#/routes" data-nav="routes">Routes <span class="nav-count" id="nav-count-routes" hidden></span></a>
       <a href="#/docker" data-nav="docker">Docker <span class="nav-count" id="nav-count-docker" hidden></span></a>
       <a href="#/ports" data-nav="ports">Port leases <span class="nav-count" id="nav-count-ports" hidden></span></a>
@@ -128,6 +129,20 @@
     </div>
   </section>
 
+  <section id="sec-infrastructure" class="card" data-page="infrastructure" aria-labelledby="infrastructure-h" hidden>
+    <div class="sec-head collection-head">
+      <div>
+        <h2 id="infrastructure-h">Infrastructure <span class="count" id="infrastructure-count" hidden></span></h2>
+        <p class="sec-sub">Enrolled physical hosts and their observed virtual machines. This view is read-only; one host remains one failure domain.</p>
+      </div>
+      <button id="infrastructure-refresh" class="btn" type="button">Refresh</button>
+    </div>
+    <div id="infrastructure-body" class="sec-body" aria-live="polite" aria-busy="true">
+      <div class="skel" aria-hidden="true"></div>
+      <div class="skel" aria-hidden="true"></div>
+    </div>
+  </section>
+
   <section id="sec-servers" class="card" data-page="servers" aria-labelledby="servers-h" hidden>
     <div class="sec-head collection-head">
       <div>
@@ -139,6 +154,22 @@
         <button class="btn small" type="button" data-lifecycle-view="archived" aria-pressed="false">Archived <span class="count" id="servers-archived-count" hidden></span></button>
       </div>
     </div>
+    <section id="servers-infrastructure" class="servers-infrastructure" aria-labelledby="servers-infrastructure-h" hidden>
+      <div class="servers-infrastructure-head">
+        <div>
+          <p class="servers-infrastructure-kicker">Physical virtualization</p>
+          <h3 id="servers-infrastructure-h">Hyper-V infrastructure</h3>
+          <p class="sec-sub">Real enrolled hosts and observed virtual machines. This block is read-only and separate from Coordinator-managed application servers.</p>
+        </div>
+        <div class="servers-infrastructure-actions">
+          <button id="servers-infrastructure-refresh" class="btn small" type="button">Refresh</button>
+          <a class="btn small" href="#/infrastructure">Open infrastructure details</a>
+        </div>
+      </div>
+      <div id="servers-infrastructure-body" class="servers-infrastructure-body" aria-live="polite" aria-busy="true">
+        <p class="empty" role="status">Loading Hyper-V infrastructure…</p>
+      </div>
+    </section>
     <div id="servers-body" class="sec-body">
       <div class="skel" aria-hidden="true"></div>
       <div class="skel" aria-hidden="true"></div>

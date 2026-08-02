@@ -49,11 +49,17 @@ PROFILE = Path("/etc/devcoordinator/client-profiles.json")
 BROKER_SOCKET = Path("/run/devcoordinator/broker.sock")
 DEPLOY_LOCK = Path("/run/devcoordinator-deploy.lock")
 CLIENT_GROUP = "devcoordinator-clients"
-SCHEMA_BEFORE = 9
-SCHEMA_AFTER = 12
+SCHEMA_BEFORE = 4
+SCHEMA_AFTER = 14
 CONSOLE_SERVER_ID = "144ba3fb-9939-5a81-91b1-f1bb3a5db418"
 MAX_INVENTORY_RESPONSE_BYTES = 64 * 1024 * 1024
 ONLINE_BACKUP_TIMEOUT_SECONDS = 15 * 60
+OFFLINE_SCHEMA_UPGRADE_RECEIPT_CONTRACT = (
+    "devcoordinator.offline-schema-upgrade-receipt.v1"
+)
+OFFLINE_SCHEMA_UPGRADE_RESULT_CONTRACT = "devcoordinator.offline-schema-upgrade.v1"
+SERVICE_SCHEMA_UPGRADE_RECEIPT_NAME = "target-service-database-upgrade.json"
+CLIENT_SCHEMA_UPGRADE_RECEIPT_NAME = "target-console-database-upgrade.json"
 
 
 class DeploymentError(RuntimeError):
@@ -82,6 +88,85 @@ def _json_write(path: Path, document: dict[str, Any]) -> None:
     finally:
         with suppress(FileNotFoundError):
             temporary.unlink()
+
+
+def _immutable_json_receipt(
+    path: Path,
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    """Create one private receipt without any replacement path."""
+
+    try:
+        parent = path.parent.lstat()
+    except FileNotFoundError as error:
+        raise DeploymentError("immutable receipt parent is missing") from error
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise DeploymentError(
+            "immutable receipt parent must be private and owned by the effective UID"
+        )
+    payload = (
+        json.dumps(document, indent=2, sort_keys=True, separators=(",", ": "))
+        + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    created = False
+    try:
+        try:
+            descriptor = os.open(path, flags, 0o400)
+        except FileExistsError as error:
+            raise DeploymentError(
+                f"immutable receipt already exists and will not be replaced: {path}"
+            ) from error
+        created = True
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise DeploymentError("immutable receipt write made no progress")
+                offset += written
+            os.fchmod(descriptor, 0o400)
+            os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o400
+                or metadata.st_nlink != 1
+                or metadata.st_size != len(payload)
+            ):
+                raise DeploymentError(
+                    "immutable receipt failed its ownership, mode, link, or size proof"
+                )
+        finally:
+            os.close(descriptor)
+        directory = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        if created:
+            with suppress(FileNotFoundError):
+                path.unlink()
+        raise
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+        "mode": "0400",
+    }
 
 
 class Driver:
@@ -123,6 +208,9 @@ class Driver:
         self.client_database_captured = False
         self.installer_applied = False
         self.units_captured = False
+        self.service_schema_upgrade_evidence: dict[str, Any] | None = None
+        self.client_schema_upgrade_evidence: dict[str, Any] | None = None
+        self.profile_enrollment_backfill_evidence: dict[str, Any] | None = None
 
     def journal(self, **extra: Any) -> None:
         _json_write(
@@ -140,6 +228,11 @@ class Driver:
                 "client_database_captured": self.client_database_captured,
                 "installer_applied": self.installer_applied,
                 "units_captured": self.units_captured,
+                "service_schema_upgrade": self.service_schema_upgrade_evidence,
+                "client_schema_upgrade": self.client_schema_upgrade_evidence,
+                "profile_enrollment_backfill": (
+                    self.profile_enrollment_backfill_evidence
+                ),
                 **extra,
             },
         )
@@ -282,6 +375,301 @@ class Driver:
 
     def client_schema_evidence(self, *, expected: int) -> dict[str, Any]:
         return self._schema_evidence(self.client_database, expected=expected)
+
+    def target_schema_readiness(
+        self,
+        database: Path,
+        *,
+        expected_uid: int,
+        evidence_name: str,
+    ) -> dict[str, Any]:
+        """Run the target source's full read-only database readiness proof."""
+
+        verifier = (
+            self.repository / "scripts/verify_coordinator_schema_readiness.py"
+        )
+        command = [
+            "/usr/bin/python3",
+            "-I",
+            str(verifier),
+            "--database",
+            str(database),
+            "--expected-uid",
+            str(expected_uid),
+            "--expected-schema",
+            str(self.schema_after),
+        ]
+        if expected_uid != 0:
+            try:
+                account = pwd.getpwuid(expected_uid).pw_name
+            except KeyError as error:
+                raise DeploymentError(
+                    "target database owner UID has no local account"
+                ) from error
+            command = [
+                "/usr/sbin/runuser",
+                "--user",
+                account,
+                "--",
+                *command,
+            ]
+        completed = self.run(command, timeout=15 * 60)
+        try:
+            document = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise DeploymentError(
+                "target schema readiness verifier did not return JSON"
+            ) from error
+        if (
+            not isinstance(document, dict)
+            or document.get("ok") is not True
+            or document.get("schema", {}).get("schema_version")
+            != self.schema_after
+            or document.get("checks")
+            != {
+                "foreign_key_check": "ok",
+                "integrity_check": "ok",
+                "nonterminal_operations": 0,
+                "semantic_invariants": "ok",
+            }
+            or document.get("infrastructure_projection", {}).get("schema")
+            != "spectre.infrastructure.projection.v1"
+            or not isinstance(
+                document.get("legacy_projection_counts"), dict
+            )
+        ):
+            raise DeploymentError(
+                "target database did not satisfy the complete readiness contract"
+            )
+        _json_write(self.transaction / evidence_name, document)
+        return document
+
+    def upgrade_database_schema_offline(
+        self,
+        database: Path,
+        *,
+        expected_uid: int,
+        database_role: str,
+        receipt_name: str,
+    ) -> dict[str, Any]:
+        """Upgrade one captured database and retain one create-new receipt."""
+
+        if not self.database_captured or not self.client_database_captured:
+            raise DeploymentError(
+                "both writer-free database checkpoints are required before upgrade"
+            )
+        target_contracts = {
+            "service_authority": (
+                DATABASE,
+                0,
+                SERVICE_SCHEMA_UPGRADE_RECEIPT_NAME,
+            ),
+            "console_client_journal": (
+                self.client_database,
+                self.console_uid,
+                CLIENT_SCHEMA_UPGRADE_RECEIPT_NAME,
+            ),
+        }
+        if target_contracts.get(database_role) != (
+            database,
+            expected_uid,
+            receipt_name,
+        ):
+            raise DeploymentError(
+                "offline schema upgrade target does not match its fixed role contract"
+            )
+        if (
+            not receipt_name
+            or Path(receipt_name).name != receipt_name
+            or not receipt_name.endswith(".json")
+        ):
+            raise DeploymentError("offline schema upgrade receipt name is invalid")
+        receipt_path = self.transaction / receipt_name
+        if os.path.lexists(receipt_path):
+            raise DeploymentError(
+                f"immutable receipt already exists and blocks upgrade: {receipt_path}"
+            )
+
+        upgrader = (
+            self.repository / "scripts/upgrade_coordinator_schema_offline.py"
+        )
+        migration_timestamp = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        )
+        command = [
+            "/usr/bin/python3",
+            "-I",
+            str(upgrader),
+            "--database",
+            str(database),
+            "--expected-uid",
+            str(expected_uid),
+            "--expected-before",
+            str(self.schema_before),
+            "--expected-after",
+            str(self.schema_after),
+            "--timestamp",
+            migration_timestamp,
+        ]
+        if expected_uid != 0:
+            try:
+                account = pwd.getpwuid(expected_uid).pw_name
+            except KeyError as error:
+                raise DeploymentError(
+                    "offline schema upgrade owner UID has no local account"
+                ) from error
+            command = [
+                "/usr/sbin/runuser",
+                "--user",
+                account,
+                "--",
+                *command,
+            ]
+        completed = self.run(command, timeout=15 * 60)
+        try:
+            document = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise DeploymentError(
+                "offline schema upgrader did not return JSON"
+            ) from error
+        if (
+            not isinstance(document, dict)
+            or document.get("ok") is not True
+            or document.get("receipt_contract")
+            != OFFLINE_SCHEMA_UPGRADE_RESULT_CONTRACT
+            or document.get("database") != str(database)
+            or document.get("database_owner_uid") != expected_uid
+            or document.get("migration_timestamp") != migration_timestamp
+            or document.get("schema_before") != self.schema_before
+            or document.get("schema_after") != self.schema_after
+            or document.get("checks")
+            != {
+                "foreign_keys_after": "ok",
+                "foreign_keys_before": "ok",
+                "integrity_after": "ok",
+                "integrity_before": "ok",
+                "nonterminal_operations": 0,
+                "semantic_invariants_after": "ok",
+                "wal_checkpoint": "ok",
+            }
+        ):
+            raise DeploymentError(
+                "offline schema upgrade did not satisfy the complete contract"
+            )
+        receipt = {
+            "receipt_contract": OFFLINE_SCHEMA_UPGRADE_RECEIPT_CONTRACT,
+            "deployment_id": self.deployment_id,
+            "database_role": database_role,
+            "database": str(database),
+            "database_owner_uid": expected_uid,
+            "upgrade": document,
+        }
+        artifact = _immutable_json_receipt(
+            receipt_path,
+            receipt,
+        )
+        return {
+            "receipt": receipt,
+            "artifact": artifact,
+        }
+
+    def require_schema_upgrade_receipt(
+        self,
+        evidence: dict[str, Any],
+        *,
+        receipt_name: str,
+        database_role: str,
+        database: Path,
+        expected_uid: int,
+    ) -> None:
+        """Reopen and bind one saved receipt before any profile backfill."""
+
+        receipt = evidence.get("receipt") if isinstance(evidence, dict) else None
+        artifact = evidence.get("artifact") if isinstance(evidence, dict) else None
+        expected_path = self.transaction / receipt_name
+        if (
+            not isinstance(receipt, dict)
+            or not isinstance(artifact, dict)
+            or receipt.get("receipt_contract")
+            != OFFLINE_SCHEMA_UPGRADE_RECEIPT_CONTRACT
+            or receipt.get("deployment_id") != self.deployment_id
+            or receipt.get("database_role") != database_role
+            or receipt.get("database") != str(database)
+            or receipt.get("database_owner_uid") != expected_uid
+            or artifact.get("path") != str(expected_path)
+            or artifact.get("mode") != "0400"
+        ):
+            raise DeploymentError(
+                f"offline schema upgrade receipt binding is invalid for {database_role}"
+            )
+        try:
+            metadata = expected_path.lstat()
+        except FileNotFoundError as error:
+            raise DeploymentError(
+                f"offline schema upgrade receipt is missing for {database_role}"
+            ) from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o400
+            or metadata.st_nlink != 1
+            or not 0 < metadata.st_size <= 1024 * 1024
+        ):
+            raise DeploymentError(
+                f"offline schema upgrade receipt is unsafe for {database_role}"
+            )
+        descriptor = os.open(
+            expected_path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise DeploymentError(
+                    f"offline schema upgrade receipt changed while opening for {database_role}"
+                )
+            payload = bytearray()
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) > 1024 * 1024:
+                    raise DeploymentError(
+                        f"offline schema upgrade receipt is oversized for {database_role}"
+                    )
+            final = os.fstat(descriptor)
+            if (
+                (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino)
+                or final.st_size != opened.st_size
+                or len(payload) != opened.st_size
+            ):
+                raise DeploymentError(
+                    f"offline schema upgrade receipt changed while reading for {database_role}"
+                )
+        finally:
+            os.close(descriptor)
+        digest = hashlib.sha256(payload).hexdigest()
+        try:
+            retained = json.loads(payload)
+        except json.JSONDecodeError as error:
+            raise DeploymentError(
+                f"offline schema upgrade receipt is not JSON for {database_role}"
+            ) from error
+        if (
+            retained != receipt
+            or artifact.get("sha256") != digest
+            or artifact.get("size_bytes") != len(payload)
+        ):
+            raise DeploymentError(
+                f"offline schema upgrade receipt content drifted for {database_role}"
+            )
 
     def require_no_database_helpers(self) -> None:
         findings: list[dict[str, Any]] = []
@@ -701,19 +1089,69 @@ class Driver:
             metadata = source.lstat()
             if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise DeploymentError(f"database checkpoint source is unsafe: {source}")
-            payload = source.read_bytes()
             target = checkpoint / name
-            target.write_bytes(payload)
-            target.chmod(0o600)
-            with target.open("rb") as handle:
-                os.fsync(handle.fileno())
+            source_descriptor = os.open(
+                source,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            target_descriptor = -1
+            digest = hashlib.sha256()
+            copied = 0
+            try:
+                opened = os.fstat(source_descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (metadata.st_dev, metadata.st_ino)
+                    or opened.st_size != metadata.st_size
+                ):
+                    raise DeploymentError(
+                        f"database checkpoint source changed while opening: {source}"
+                    )
+                target_descriptor = os.open(
+                    target,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                )
+                while True:
+                    chunk = os.read(source_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    copied += len(chunk)
+                    offset = 0
+                    while offset < len(chunk):
+                        offset += os.write(target_descriptor, chunk[offset:])
+                os.fsync(target_descriptor)
+                final_source = os.fstat(source_descriptor)
+                if (
+                    (final_source.st_dev, final_source.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                    or final_source.st_size != opened.st_size
+                    or final_source.st_mtime_ns != opened.st_mtime_ns
+                    or final_source.st_ctime_ns != opened.st_ctime_ns
+                    or copied != opened.st_size
+                ):
+                    raise DeploymentError(
+                        f"database checkpoint source changed while copying: {source}"
+                    )
+            finally:
+                if target_descriptor >= 0:
+                    os.close(target_descriptor)
+                os.close(source_descriptor)
             documents[name] = {
                 "present": True,
                 "mode": stat.S_IMODE(metadata.st_mode),
                 "uid": metadata.st_uid,
                 "gid": metadata.st_gid,
-                "size": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": copied,
+                "sha256": digest.hexdigest(),
             }
         if not documents.get(database.name, {}).get("present"):
             raise DeploymentError(f"writer-free checkpoint omitted database: {database}")
@@ -852,7 +1290,30 @@ class Driver:
     def checkout(self, ref: str) -> None:
         self.git("checkout", ref)
 
-    def migrate(self) -> None:
+    def migrate(
+        self,
+        *,
+        service_schema_upgrade: dict[str, Any],
+        client_schema_upgrade: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Backfill protected profiles only after both receipted upgrades."""
+
+        self.require_schema_upgrade_receipt(
+            service_schema_upgrade,
+            receipt_name=SERVICE_SCHEMA_UPGRADE_RECEIPT_NAME,
+            database_role="service_authority",
+            database=DATABASE,
+            expected_uid=0,
+        )
+        self.require_schema_upgrade_receipt(
+            client_schema_upgrade,
+            receipt_name=CLIENT_SCHEMA_UPGRADE_RECEIPT_NAME,
+            database_role="console_client_journal",
+            database=self.client_database,
+            expected_uid=self.console_uid,
+        )
+        self.schema_evidence(expected=self.schema_after)
+        self.client_schema_evidence(expected=self.schema_after)
         cli = self.repository / "skills/codex-dev-coordinator/scripts/dev_coordinator.py"
         arguments = [
             "/usr/bin/python3",
@@ -865,14 +1326,65 @@ class Driver:
             "--profile",
             str(PROFILE),
         ]
-        self.run(arguments, timeout=120)
-        second = self.run(arguments, timeout=120)
-        try:
-            document = json.loads(second.stdout)
-        except json.JSONDecodeError as error:
-            raise DeploymentError("profile migration did not return JSON") from error
-        if int(document.get("inserted", -1)) != 0:
+        first_completed = self.run(arguments, timeout=120)
+        second_completed = self.run(arguments, timeout=120)
+
+        def migration_document(
+            completed: subprocess.CompletedProcess[str],
+            *,
+            phase: str,
+        ) -> dict[str, Any]:
+            try:
+                document = json.loads(completed.stdout)
+            except json.JSONDecodeError as error:
+                raise DeploymentError(
+                    f"profile migration {phase} did not return JSON"
+                ) from error
+            checked = document.get("checked") if isinstance(document, dict) else None
+            inserted = document.get("inserted") if isinstance(document, dict) else None
+            already_current = (
+                document.get("already_current")
+                if isinstance(document, dict)
+                else None
+            )
+            if (
+                not isinstance(document, dict)
+                or document.get("status") != "migrated"
+                or document.get("database") != str(DATABASE)
+                or document.get("profile") != str(PROFILE)
+                or not isinstance(document.get("database_generation"), str)
+                or not document["database_generation"]
+                or not isinstance(checked, int)
+                or isinstance(checked, bool)
+                or checked < 0
+                or not isinstance(inserted, int)
+                or isinstance(inserted, bool)
+                or inserted < 0
+                or not isinstance(already_current, int)
+                or isinstance(already_current, bool)
+                or already_current < 0
+                or inserted + already_current != checked
+            ):
+                raise DeploymentError(
+                    f"profile migration {phase} returned invalid evidence"
+                )
+            return document
+
+        first = migration_document(first_completed, phase="backfill")
+        second = migration_document(second_completed, phase="idempotency")
+        if (
+            second["inserted"] != 0
+            or second["already_current"] != second["checked"]
+            or second["checked"] != first["checked"]
+            or second.get("database_generation")
+            != first.get("database_generation")
+        ):
             raise DeploymentError("profile migration is not idempotent")
+        return {
+            "contract": "devcoordinator.post-upgrade-profile-backfill.v1",
+            "backfill": first,
+            "idempotency": second,
+        }
 
     def installer(self, action: str) -> None:
         arguments = [
@@ -885,7 +1397,17 @@ class Driver:
             arguments.extend(("--client-user", user))
         if action == "apply":
             arguments.extend(("--transaction-dir", str(self.install_transaction)))
-        self.run(arguments, timeout=300)
+            if self.args.authority_wheelhouse:
+                arguments.extend(
+                    (
+                        "--authority-wheelhouse",
+                        self.args.authority_wheelhouse,
+                    )
+                )
+        self.run(
+            arguments,
+            timeout=15 * 60 if action == "apply" else 300,
+        )
 
     def verify_services(self, *, inventory_name: str) -> dict[str, Any]:
         broker = self.require_active(BROKER_UNIT)
@@ -1158,13 +1680,64 @@ class Driver:
             self.capture_client_database()
             self.phase = "writer-free-checkpoint"
             self.journal()
+            service_schema_upgrade = None
+            client_schema_upgrade = None
+            profile_enrollment_backfill = None
             if not self.args.same_schema_release:
-                self.migrate()
+                service_schema_upgrade = self.upgrade_database_schema_offline(
+                    DATABASE,
+                    expected_uid=0,
+                    database_role="service_authority",
+                    receipt_name=SERVICE_SCHEMA_UPGRADE_RECEIPT_NAME,
+                )
+                self.service_schema_upgrade_evidence = service_schema_upgrade
+                self.phase = "service-database-upgraded"
+                self.journal(
+                    service_schema_upgrade=service_schema_upgrade,
+                )
+                client_schema_upgrade = self.upgrade_database_schema_offline(
+                    self.client_database,
+                    expected_uid=self.console_uid,
+                    database_role="console_client_journal",
+                    receipt_name=CLIENT_SCHEMA_UPGRADE_RECEIPT_NAME,
+                )
+                self.client_schema_upgrade_evidence = client_schema_upgrade
+                self.phase = "database-schemas-upgraded"
+                self.journal(
+                    service_schema_upgrade=service_schema_upgrade,
+                    client_schema_upgrade=client_schema_upgrade,
+                )
+                profile_enrollment_backfill = self.migrate(
+                    service_schema_upgrade=service_schema_upgrade,
+                    client_schema_upgrade=client_schema_upgrade,
+                )
+                self.profile_enrollment_backfill_evidence = (
+                    profile_enrollment_backfill
+                )
+                self.phase = "profile-enrollment-backfilled"
+                self.journal(
+                    service_schema_upgrade=service_schema_upgrade,
+                    client_schema_upgrade=client_schema_upgrade,
+                    profile_enrollment_backfill=profile_enrollment_backfill,
+                )
             migrated = self.schema_evidence(expected=self.schema_after)
+            migrated_client = self.client_schema_evidence(
+                expected=self.schema_after
+            )
             self.installer("plan")
             self.installer("apply")
             self.installer_applied = True
             self.installer("verify")
+            target_service_database = self.target_schema_readiness(
+                DATABASE,
+                expected_uid=0,
+                evidence_name="target-service-database-readiness.json",
+            )
+            target_client_database = self.target_schema_readiness(
+                self.client_database,
+                expected_uid=self.console_uid,
+                evidence_name="target-console-database-readiness.json",
+            )
             self.run(
                 [
                     "/usr/bin/systemd-analyze",
@@ -1186,7 +1759,16 @@ class Driver:
                 timeout=30,
             )
             self.phase = "starting-target"
-            self.journal(migrated=migrated, console_private_state=console_private_state)
+            self.journal(
+                migrated=migrated,
+                migrated_client=migrated_client,
+                service_schema_upgrade=service_schema_upgrade,
+                client_schema_upgrade=client_schema_upgrade,
+                profile_enrollment_backfill=profile_enrollment_backfill,
+                target_service_database=target_service_database,
+                target_client_database=target_client_database,
+                console_private_state=console_private_state,
+            )
             self.run(["/usr/bin/systemctl", "start", BROKER_UNIT], timeout=180)
             self.require_active(BROKER_UNIT)
             self.wait_broker_ready()
@@ -1197,7 +1779,16 @@ class Driver:
             )
             self.marker_active = False
             self.phase = "starting-target-services"
-            self.journal(migrated=migrated, console_private_state=console_private_state)
+            self.journal(
+                migrated=migrated,
+                migrated_client=migrated_client,
+                service_schema_upgrade=service_schema_upgrade,
+                client_schema_upgrade=client_schema_upgrade,
+                profile_enrollment_backfill=profile_enrollment_backfill,
+                target_service_database=target_service_database,
+                target_client_database=target_client_database,
+                console_private_state=console_private_state,
+            )
             self.run(["/usr/bin/systemctl", "restart", API_UNIT], timeout=90)
             self.run(["/usr/bin/systemctl", "restart", CONSOLE_UNIT], timeout=120)
             services = self.verify_services(inventory_name="post-inventory.json")
@@ -1211,6 +1802,12 @@ class Driver:
                 "transaction": str(self.transaction),
                 "backup_manifest": str(backup_manifest),
                 "schema": final_schema,
+                "client_schema": migrated_client,
+                "service_schema_upgrade": service_schema_upgrade,
+                "client_schema_upgrade": client_schema_upgrade,
+                "profile_enrollment_backfill": profile_enrollment_backfill,
+                "target_service_database": target_service_database,
+                "target_client_database": target_client_database,
                 "units": {
                     name: {"MainPID": state["MainPID"], "ActiveState": state["ActiveState"]}
                     for name, state in services.items()
@@ -1268,8 +1865,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--same-schema-release",
         action="store_true",
         help=(
-            "deploy code and unit changes while retaining schema 12; target must "
+            "deploy code and unit changes while retaining schema 14; target must "
             "be the checked-out main commit and rollback-ref a distinct ancestor"
+        ),
+    )
+    parser.add_argument(
+        "--authority-wheelhouse",
+        help=(
+            "root-owned absolute offline wheel directory for transactional "
+            "authority-runtime installation or upgrade; required when the "
+            "currently active runtime manifest is absent or differs"
         ),
     )
     return parser.parse_args(argv)

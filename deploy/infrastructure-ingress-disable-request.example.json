@@ -1,0 +1,10 @@
+{
+  "schema": "spectre.infrastructure.ingress-access.v1",
+  "request_id": "REPLACE_WITH_NEW_CANONICAL_UUID",
+  "action": "ingress.disable",
+  "payload": {
+    "service_account": "devcoord-infra-ingress",
+    "uid": 0,
+    "account_id": "spectre-infrastructure-ingress"
+  }
+}

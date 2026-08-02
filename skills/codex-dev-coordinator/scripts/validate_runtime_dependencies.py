@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import importlib
+from importlib import metadata as importlib_metadata
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -30,6 +32,15 @@ DOCKER_LOCATIONS = (
 )
 COMPOSE_VERSION_REQUIREMENT = "stable >=2.17,<3 or >=5,<6"
 RUNTIME_CONTRACT = "devcoordinator-broker-runtime-v1"
+PINNED_AUTHORITY_PACKAGES = {
+    "PyYAML": "6.0.3",
+    "cryptography": "49.0.0",
+    "cffi": "2.0.0",
+    "pycparser": "2.22",
+}
+PINNED_AUTHORITY_PYTHON = Path(
+    "/opt/devcoordinator-authority/bin/python"
+)
 _COMPOSE_VERSION = re.compile(
     r"^(?:Docker Compose version )?v?"
     r"(?P<major>0|[1-9][0-9]*)\."
@@ -58,7 +69,7 @@ def _failure(code: str, **evidence: object) -> dict[str, object]:
         "contract": RUNTIME_CONTRACT,
         "code": code,
         "requirements": {
-            "pyyaml": "6.x",
+            "authority_packages": dict(PINNED_AUTHORITY_PACKAGES),
             "docker_compose": COMPOSE_VERSION_REQUIREMENT,
         },
         **evidence,
@@ -229,15 +240,64 @@ def _compose_capability_status(
 def runtime_dependency_status() -> dict[str, object]:
     """Return bounded, non-sensitive dependency evidence for service startup."""
 
+    if (
+        sys.implementation.name != "cpython"
+        or sys.version_info[:2] != (3, 14)
+        or sys.platform != "linux"
+        or platform.machine() != "x86_64"
+    ):
+        return _failure(
+            "authority_interpreter_unsupported",
+            detected_interpreter=sys.implementation.name,
+            detected_python=f"{sys.version_info.major}.{sys.version_info.minor}",
+            detected_platform=sys.platform,
+            detected_machine=platform.machine(),
+        )
+    if (
+        os.environ.get("DEVCOORDINATOR_AUTHORITY") == "service"
+        and Path(sys.executable).absolute() != PINNED_AUTHORITY_PYTHON
+    ):
+        return _failure(
+            "authority_interpreter_path_mismatch",
+            detected_executable=str(Path(sys.executable).absolute()),
+        )
+    observed_packages: dict[str, str] = {}
+    for package, expected in PINNED_AUTHORITY_PACKAGES.items():
+        try:
+            observed = importlib_metadata.version(package)
+        except importlib_metadata.PackageNotFoundError:
+            return _failure(
+                "authority_dependency_missing",
+                missing_package=package,
+            )
+        if observed != expected:
+            return _failure(
+                "authority_dependency_version_unsupported",
+                package=package,
+                detected_version=observed,
+            )
+        observed_packages[package] = observed
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    except ImportError:
+        return _failure("authority_cryptography_api_missing")
+    if not (
+        callable(getattr(serialization, "load_der_public_key", None))
+        and isinstance(getattr(rsa, "RSAPublicKey", None), type)
+        and isinstance(getattr(hashes, "SHA256", None), type)
+        and isinstance(getattr(padding, "PSS", None), type)
+    ):
+        return _failure("authority_cryptography_api_missing")
     try:
         import yaml
     except ImportError:
         return _failure("pyyaml_missing")
     version = str(getattr(yaml, "__version__", ""))
-    if not version.startswith("6."):
+    if version != PINNED_AUTHORITY_PACKAGES["PyYAML"]:
         return _failure(
             "pyyaml_version_unsupported",
-            detected_pyyaml_major=version.partition(".")[0] or "unknown",
+            detected_pyyaml_version=version or "unknown",
         )
     if not callable(getattr(yaml, "load", None)) or not isinstance(
         getattr(yaml, "SafeLoader", None), type
@@ -296,10 +356,10 @@ def runtime_dependency_status() -> dict[str, object]:
         "ok": True,
         "contract": RUNTIME_CONTRACT,
         "requirements": {
-            "pyyaml": "6.x",
+            "authority_packages": dict(PINNED_AUTHORITY_PACKAGES),
             "docker_compose": COMPOSE_VERSION_REQUIREMENT,
         },
-        "pyyaml": {"detected_major": "6"},
+        "authority_packages": observed_packages,
         "docker_compose": {
             "docker_cli": docker_executable,
             "version": str(compose_version["version"]),

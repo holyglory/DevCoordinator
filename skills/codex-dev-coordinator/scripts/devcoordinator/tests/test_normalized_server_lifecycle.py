@@ -1422,6 +1422,7 @@ class NormalizedPortLifecycleTests(unittest.TestCase):
                 "/v1/ports",
                 "/v1/ports/assignments",
                 "/v1/servers",
+                "/v1/infrastructure",
                 "/v1/archives",
                 "/v1/events",
                 "/v1/tests",

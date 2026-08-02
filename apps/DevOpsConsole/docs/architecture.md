@@ -45,7 +45,19 @@ A single Node process that is the public edge of the VPS `vr.ae`:
    (`docs/coordinator-http-api.json` is the authoritative endpoint map). The
    production `dev-coordinator.service` owns that process. Optional local
    autostart is available only when `COORDINATOR_AUTOSTART=1`.
-7. **Telegram notifications**: any Console-authorized account may register and
+7. **Remote infrastructure observation**: the Console reads the broker-owned
+   `infrastructure.read` projection through authenticated `GET
+   /v1/infrastructure` and exposes it as same-origin `GET
+   /api/infrastructure` only after an exact configured-owner/access-admin
+   check. General Console access does not reveal management addresses, cell
+   classification, immutable host identities, or rejection incidents. This is
+   a separate read-only domain; no ingest,
+   enrollment, power, checkpoint, console, disk, network, or guest-mutation
+   route exists on either HTTP boundary. The projection carries server-derived
+   contact/capture/acceptance freshness at a 60-second cadence: `Fresh` through
+   179 seconds, `Stale` from 180 seconds, and `Never` before the first matching
+   event. None of those states implies network `Offline`.
+8. **Telegram notifications**: any Console-authorized account may register and
    own bots, while configured owners may administer all of them. Exact
    coordinator `repo_id` assignments select events. Private `/start` messages
    enter a per-bot approval queue; approved chats receive coordinator journal
@@ -339,6 +351,7 @@ export function createCoordinator({ config, log })
 // → { ensureRunning(): Promise<{ ok, autostarted, error? }>,
 //     probe(): Promise<boolean>,                       // anonymous GET /healthz, 2s timeout
 //     inventory({ maxAgeMs = 5000 } = {}): Promise<Inventory>,   // cached + coalesced
+//     infrastructure({ afterHostId = null } = {}): Promise<InfrastructurePage>,
 //     serversRaw({ maxAgeMs = 3000 } = {}): Promise<Server[]>,   // GET /v1/servers cached
 //     events({ after = null, limit = 100 } = {}): Promise<EventPage>,
 //     observeHost(b): Promise<ObservationResult>,
@@ -578,6 +591,7 @@ failures and 5xx surface as 502 with the coordinator's message. Mutations
 | Method+Path | Behavior |
 |---|---|
 | `GET /api/overview` | `{ console: { version, domain, consoleHost, now, tls: certManager.info(), devInsecureHttp }, coordinator: coordinator.status(), inventory: Inventory\|null, routes: RouteView[] }`. Inventory from `coordinator.inventory()`; on CoordError → `inventory: null` and `coordinator.ok:false` with error (HTTP still 200 — UI shows degraded state). `RouteView = Route + { url: 'https://<slug>.<domain>', upstreamAuth: { configured, scheme? }, resolved: { port, reason?, serverStatus?, containerStatus? } }` (kind=server resolves via `serversRaw`; kind=docker via the cached `inventory()` — both shared/coalesced). No upstream secret is returned. |
+| `GET /api/infrastructure?after=<host-uuid>` | Configured owners/access-admins alone receive the pure broker-owned `spectre.infrastructure.projection.v1` page. Authorization runs before cursor parsing and before any Coordinator read; other authenticated Console accounts receive 403. The server fixes bounds at 100 hosts, 256 current VMs, 256 missing-approved VM identities, and 20 recent rejection incidents per host; validates canonical generation time, the fixed 60/180-second freshness contract, immutable-ID ordering, and the optional canonical host-GUID cursor; and never accepts a browser-selected broker operation. POST/PATCH/DELETE and ingest/enrollment/mutation variants do not exist. |
 | `GET /api/access` | Owner-only `{ version, users: [{ email, owner, grants }], resources: [{ id, kind, host, title, auth, target }], invitedCount }`. Configured owners appear locked; only owners may read the full email list. |
 | `GET /api/access/requests?status=pending\|approved\|denied\|stale\|all` | Owner-only `{ version, pendingCount, requests }`. Each request view carries its email, exact resource/host/target, status and decision metadata; private Google-subject hash and immutable resource-instance value remain server-only. Default status is `pending`. |
 | `POST /api/access/requests/:id/decision` | Owner-only `{ decision:'approve'\|'deny' }` → `{ request, pendingCount, access }`. Approval atomically merges the exact current resource grant; stale or already-conflicting decisions fail honestly. |
@@ -639,8 +653,8 @@ check), GET/HEAD only.
 ## UI (`src/ui/`)
 
 Vanilla JS control panel split into hash-routed pages (`#/projects` default,
-`#/servers`, `#/routes`, `#/docker`, `#/ports`, `#/performance`, and the
-owner-only `#/access`);
+`#/servers`, `#/infrastructure`, `#/routes`, `#/docker`, `#/ports`, `#/performance`, and the
+owner-only `#/infrastructure` and `#/access`);
 unknown/empty hashes fall back to Projects. One sticky SINGLE-ROW header on
 every page and viewport: brand + section nav (tabs with live counts inline
 ≥1024px; a hamburger-toggled drawer dropping below the row on narrower
@@ -660,13 +674,29 @@ slots via `treeActionSlots` (inapplicable actions disabled, never hidden) so
 buttons align into columns across project headers, servers and containers.
 Fetches `/api/overview` every 6s and `/api/metrics/history` every 10s (both
 paused when `document.hidden`; the performance page requests a longer
-window), optimistic updates on mutations then refetch.
+window). The independent Infrastructure projection polls every 15s only for a
+configured owner while `#/servers` or `#/infrastructure` is active and the
+document is visible. Mutating local
+resource journeys use optimistic updates then refetch.
 
 Pages: **Projects** (default; a tree of repos built from the coordinator's
 `project_usage` membership — `server_ids`/`container_names`, never re-derived
 client-side — with per-item AND per-project CPU/mem + sparklines, per-item
 start/stop/restart, whole-project start/stop/restart via
-`/api/projects/action`, collapsible nodes), **Servers** (grouped by repo;
+`/api/projects/action`, collapsible nodes), **Infrastructure** (owner-only; the enrolled
+physical-host collection first; separate transport-verified contact, observer
+capture, accepted time, signature, and retained-evidence facts; explicit
+current-versus-approved VM counts and missing-approved roster incidents;
+failure-domain and capacity facts; GUID-keyed expandable VM rosters; partial
+reports retain prior rows; failed page refreshes retain and visibly label the
+last snapshot; a failed next-page request exposes an immediate Previous action
+instead of stranding the operator; server-derived `Fresh`/`Stale`/`Never`
+contact, capture, and acceptance facts never infer `Offline`; no lifecycle
+controls; disabled cells or host enrollments are explicitly `Disabled` and
+not active even when retained telemetry is fresh), **Servers** (an owner-only,
+prominent Hyper-V block appears before the application-server collection with
+real loading/error/empty/populated states, active/disabled host status, bounded
+real host rows, and a link to Infrastructure details; then servers are grouped by repo;
 expandable rows: health classification, pid, project,
 cmd, log tail viewer, stop/restart, per-server subdomain assign/edit/remove —
 the primary way routes are managed — plus live CPU%/memory numbers with a

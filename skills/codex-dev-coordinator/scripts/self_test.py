@@ -805,7 +805,27 @@ def check_registration_pid_guards() -> None:
 
         if sys.platform.startswith("linux"):
             opaque, opaque_port = spawn_listener(project, nondumpable=True)
-            must_reject(opaque.pid, opaque_port, "working directory is not observable")
+            if os.geteuid() == 0:
+                # Linux root can still resolve /proc/<pid>/cwd for a
+                # nondumpable child. The fail-closed unobservable branch is
+                # covered by the injected empty-lsof fixture above; here prove
+                # only the capability the current principal actually has.
+                opaque_identity = module.registration_pid_identity(
+                    pid=opaque.pid,
+                    host="127.0.0.1",
+                    port=opaque_port,
+                    project=str(project),
+                )
+                check(
+                    opaque_identity["cwd"] == str(project),
+                    "root-visible nondumpable listener resolved the wrong cwd",
+                )
+            else:
+                must_reject(
+                    opaque.pid,
+                    opaque_port,
+                    "working directory is not observable",
+                )
     finally:
         for process in processes:
             if process.poll() is None:

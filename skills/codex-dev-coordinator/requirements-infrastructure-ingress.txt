@@ -1,0 +1,12 @@
+# Shared broker/ingress authority runtime. Both services are startup-gated to
+# these exact reviewed releases and API surface.
+# Hashes bind the approved CPython 3.14/Linux x86-64 wheels (plus the universal
+# pure-Python parser) published by their PyPI projects.
+PyYAML==6.0.3 \
+    --hash=sha256:c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5
+cryptography==49.0.0 \
+    --hash=sha256:cbc77da8c523d5abd028635ba850a6966fcee2c82e2bf65a41d1d8afe0f98be9
+cffi==2.0.0 \
+    --hash=sha256:afb8db5439b81cf9c9d0c80404b60c3cc9c3add93e114dcae767f1477cb53775
+pycparser==2.22 \
+    --hash=sha256:c3702b6d3dd8c7abc1afa565d7e63d53a1d0bd86cdc24edd75470f4de499cfcc

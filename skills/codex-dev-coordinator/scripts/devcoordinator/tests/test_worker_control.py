@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import pwd
 import tempfile
 import unittest
 
@@ -186,10 +187,21 @@ class WorkerControllerTests(unittest.TestCase):
         self.supervision = WorkerSupervision(self.store)
         self.manager = FakeNativeManager(self.supervision)
         script = Path(__file__).parents[2] / "dev_coordinator.py"
+        self.execution_uid = os.geteuid()
+        if self.execution_uid == 0:
+            try:
+                self.execution_uid = int(pwd.getpwnam("nobody").pw_uid)
+            except KeyError:
+                self.execution_uid = next(
+                    int(account.pw_uid)
+                    for account in pwd.getpwall()
+                    if int(account.pw_uid) > 0
+                )
         self.controller = WorkerController(
             self.store,
             coordinator_script=script,
             manager_factory=lambda **_kwargs: self.manager,
+            execution_uid=self.execution_uid,
             sleeper=lambda _seconds: None,
         )
 

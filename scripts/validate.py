@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib
+from importlib import metadata as importlib_metadata
 import json
 import os
 import re
@@ -19,6 +20,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VALIDATION_REQUIREMENTS = ROOT / "ci" / "validation-requirements.txt"
+VALIDATION_INFRASTRUCTURE_REQUIREMENTS = (
+    ROOT / "ci" / "validation-infrastructure-requirements.txt"
+)
+INFRASTRUCTURE_INGRESS_REQUIREMENTS = (
+    ROOT
+    / "skills"
+    / "codex-dev-coordinator"
+    / "requirements-infrastructure-ingress.txt"
+)
 VALIDATION_ENVIRONMENT_MARKER = "DEVCOORDINATOR_VALIDATION_ENVIRONMENT"
 SKILLS = [
     ROOT / "skills" / "codex-dev-coordinator",
@@ -42,10 +52,28 @@ def validation_pyyaml_ready() -> bool:
     except ImportError:
         return False
     return (
-        str(getattr(yaml, "__version__", "")) == "6.0.2"
+        str(getattr(yaml, "__version__", "")) == "6.0.3"
         and callable(getattr(yaml, "load", None))
         and isinstance(getattr(yaml, "SafeLoader", None), type)
     )
+
+
+def validation_ingress_runtime_ready() -> bool:
+    """Return whether validation has the exact reviewed ingress closure."""
+
+    required_versions = {
+        "cryptography": "49.0.0",
+        "cffi": "2.0.0",
+        "pycparser": "2.22",
+    }
+    try:
+        observed = {
+            package: importlib_metadata.version(package)
+            for package in required_versions
+        }
+    except importlib_metadata.PackageNotFoundError:
+        return False
+    return observed == required_versions
 
 
 def validation_pip_command(python: Path) -> list[str]:
@@ -65,6 +93,8 @@ def validation_pip_command(python: Path) -> list[str]:
         "--require-hashes",
         "--requirement",
         str(VALIDATION_REQUIREMENTS),
+        "--requirement",
+        str(VALIDATION_INFRASTRUCTURE_REQUIREMENTS),
     ]
 
 
@@ -84,8 +114,8 @@ def validation_dependency_lock_errors(
     except ValueError:
         return ["validation dependency lock is not valid requirement syntax"]
     errors: list[str] = []
-    if not tokens or tokens[0] != "PyYAML==6.0.2":
-        errors.append("validation must pin exactly PyYAML 6.0.2")
+    if not tokens or tokens[0] != "PyYAML==6.0.3":
+        errors.append("validation must pin exactly PyYAML 6.0.3")
     hashes = tokens[1:]
     hash_pattern = re.compile(r"--hash=sha256:[0-9a-f]{64}")
     if any(hash_pattern.fullmatch(token) is None for token in hashes):
@@ -95,36 +125,141 @@ def validation_dependency_lock_errors(
     return errors
 
 
+def validation_infrastructure_lock_errors(source: str) -> list[str]:
+    """Validate the closed cross-platform ingress test dependency lock."""
+
+    logical_lines: list[str] = []
+    current = ""
+    for raw_line in source.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        current += (" " if current else "") + (
+            line[:-1].strip() if line.endswith("\\") else line
+        )
+        if not line.endswith("\\"):
+            logical_lines.append(current)
+            current = ""
+    if current:
+        return ["validation infrastructure lock has an incomplete continuation"]
+    expected = {
+        "cryptography==49.0.0": 6,
+        "cffi==2.0.0": 6,
+        "pycparser==2.22": 1,
+    }
+    hash_pattern = re.compile(r"--hash=sha256:[0-9a-f]{64}")
+    observed: set[str] = set()
+    errors: list[str] = []
+    for line in logical_lines:
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            errors.append(
+                "validation infrastructure lock has invalid requirement syntax"
+            )
+            continue
+        if not tokens:
+            continue
+        requirement = tokens[0]
+        if requirement not in expected or requirement in observed:
+            errors.append(
+                "validation infrastructure lock contains an unexpected or "
+                f"duplicate requirement: {requirement}"
+            )
+            continue
+        observed.add(requirement)
+        hashes = tokens[1:]
+        if (
+            len(hashes) < expected[requirement]
+            or len(hashes) != len(set(hashes))
+            or any(hash_pattern.fullmatch(token) is None for token in hashes)
+        ):
+            errors.append(
+                f"validation infrastructure lock hashes are invalid: {requirement}"
+            )
+    missing = sorted(set(expected) - observed)
+    if missing:
+        errors.append(
+            "validation infrastructure lock is missing: " + ", ".join(missing)
+        )
+    return errors
+
+
 def check_validation_environment_contract() -> None:
     """Prove validation dependencies stay isolated, pinned, and hash-locked."""
 
     digest_a = "0" * 64
     digest_b = "1" * 64
     good = (
-        f"PyYAML==6.0.2 --hash=sha256:{digest_a} "
+        f"PyYAML==6.0.3 --hash=sha256:{digest_a} "
         f"--hash=sha256:{digest_b}"
     )
     if validation_dependency_lock_errors(good, minimum_hashes=2):
         raise SystemExit("validation dependency lock rejected its control fixture")
     must_catch = (
         "PyYAML>=6",
-        "PyYAML==6.0.2",
+        "PyYAML==6.0.3",
         good + " requests==2.0.0",
-        "PyYAML==6.0.2 --hash=sha256:not-a-digest",
+        "PyYAML==6.0.3 --hash=sha256:not-a-digest",
     )
     if any(
         not validation_dependency_lock_errors(source, minimum_hashes=2)
         for source in must_catch
     ):
         raise SystemExit("validation dependency lock detector missed a broken fixture")
+    infrastructure_good = "\n".join(
+        (
+            "cryptography==49.0.0 "
+            + " ".join(
+                f"--hash=sha256:{value * 64}" for value in "012345"
+            ),
+            "cffi==2.0.0 "
+            + " ".join(
+                f"--hash=sha256:{value * 64}" for value in "6789bc"
+            ),
+            "pycparser==2.22 --hash=sha256:" + "a" * 64,
+        )
+    )
+    if validation_infrastructure_lock_errors(infrastructure_good):
+        raise SystemExit(
+            "validation infrastructure lock rejected its control fixture"
+        )
+    for broken in (
+        infrastructure_good.replace("cryptography==49.0.0", "cryptography>=49"),
+        infrastructure_good.replace(
+            "pycparser==2.22 --hash=sha256:" + "a" * 64,
+            "",
+        ),
+        infrastructure_good + "\nrequests==2.0.0 --hash=sha256:" + "b" * 64,
+        infrastructure_good.replace(
+            "--hash=sha256:" + "0" * 64,
+            "--hash=sha256:not-a-digest",
+        ),
+    ):
+        if not validation_infrastructure_lock_errors(broken):
+            raise SystemExit(
+                "validation infrastructure lock detector missed a broken fixture"
+            )
     errors = validation_dependency_lock_errors(
         VALIDATION_REQUIREMENTS.read_text(encoding="utf-8"),
         minimum_hashes=8,
     )
     if errors:
         raise SystemExit("validation dependency lock failed: " + "; ".join(errors))
+    infrastructure_errors = validation_infrastructure_lock_errors(
+        VALIDATION_INFRASTRUCTURE_REQUIREMENTS.read_text(encoding="utf-8")
+    )
+    if infrastructure_errors:
+        raise SystemExit(
+            "validation infrastructure dependency lock failed: "
+            + "; ".join(infrastructure_errors)
+        )
     if not validation_pyyaml_ready():
         raise SystemExit("validation did not enter the pinned PyYAML environment")
+    if not validation_ingress_runtime_ready():
+        raise SystemExit(
+            "validation did not enter the pinned infrastructure-ingress environment"
+        )
     command = validation_pip_command(Path("/test/python"))
     required_flags = {
         "--isolated",
@@ -134,6 +269,19 @@ def check_validation_environment_contract() -> None:
     }
     if not required_flags.issubset(command):
         raise SystemExit("validation dependency installer is not isolated and locked")
+    expected_locks = {
+        str(VALIDATION_REQUIREMENTS),
+        str(VALIDATION_INFRASTRUCTURE_REQUIREMENTS),
+    }
+    installed_locks = {
+        command[index + 1]
+        for index, token in enumerate(command[:-1])
+        if token == "--requirement"
+    }
+    if installed_locks != expected_locks:
+        raise SystemExit(
+            "validation dependency installer does not bind both approved locks"
+        )
 
 
 def run_in_validation_environment(argv: list[str]) -> int:
@@ -141,11 +289,17 @@ def run_in_validation_environment(argv: list[str]) -> int:
 
     if os.environ.get(VALIDATION_ENVIRONMENT_MARKER):
         raise SystemExit(
-            "the isolated validation environment does not provide pinned PyYAML 6.0.2"
+            "the isolated validation environment does not provide the complete "
+            "pinned validation dependency closure"
         )
     if not VALIDATION_REQUIREMENTS.is_file():
         raise SystemExit(
             f"validation dependency lock is missing: {VALIDATION_REQUIREMENTS}"
+        )
+    if not VALIDATION_INFRASTRUCTURE_REQUIREMENTS.is_file():
+        raise SystemExit(
+            "validation infrastructure dependency lock is missing: "
+            f"{VALIDATION_INFRASTRUCTURE_REQUIREMENTS}"
         )
     with tempfile.TemporaryDirectory(
         prefix="devcoordinator-validation-environment-"
@@ -167,7 +321,9 @@ def run_in_validation_environment(argv: list[str]) -> int:
             timeout=180,
         )
         environment = dict(os.environ)
-        environment[VALIDATION_ENVIRONMENT_MARKER] = "pyyaml-6.0.2"
+        environment[VALIDATION_ENVIRONMENT_MARKER] = (
+            "pyyaml-6.0.3+infrastructure-ingress-closure"
+        )
         completed = subprocess.run(
             [str(python), "-I", str(Path(__file__).resolve()), *argv],
             stdin=subprocess.DEVNULL,
@@ -2107,10 +2263,10 @@ def main(argv: list[str] | None = None) -> int:
             "native validation must run through Build macOS Apps; "
             "this CLI only supports --skip-macos-app"
         )
-    if not validation_pyyaml_ready():
+    if not validation_pyyaml_ready() or not validation_ingress_runtime_ready():
         print(
             "bootstrapping temporary hash-locked validation environment "
-            "(PyYAML 6.0.2)",
+            "(PyYAML 6.0.3 + infrastructure-ingress closure)",
             flush=True,
         )
         return run_in_validation_environment(arguments)
@@ -2144,6 +2300,10 @@ def main(argv: list[str] | None = None) -> int:
     run([sys.executable, str(ROOT / "scripts" / "self_test_loaded_systemd_paths.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_deploy_server_wide_maintenance.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_deploy_server_wide_maintenance.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_verify_coordinator_schema_readiness.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_verify_coordinator_schema_readiness.py")])
+    run([sys.executable, str(ROOT / "scripts" / "self_test_upgrade_coordinator_schema_offline.py")])
+    run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_upgrade_coordinator_schema_offline.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_server_wide_install.py")])
     run([sys.executable, str(ROOT / "scripts" / "self_test_broker_shutdown_unit.py")])
     run([sys.executable, "-O", str(ROOT / "scripts" / "self_test_broker_shutdown_unit.py")])

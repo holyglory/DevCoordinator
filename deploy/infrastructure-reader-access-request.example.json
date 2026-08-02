@@ -1,0 +1,11 @@
+{
+  "schema": "spectre.infrastructure.reader-access.v1",
+  "request_id": "REPLACE_WITH_NEW_CANONICAL_UUID",
+  "action": "reader.replace",
+  "payload": {
+    "service_account": "REPLACE_WITH_CONSOLE_SERVICE_ACCOUNT",
+    "uid": 0,
+    "account_id": "REPLACE_WITH_CONSOLE_BROKER_ACCOUNT",
+    "valid_until_epoch": 0
+  }
+}

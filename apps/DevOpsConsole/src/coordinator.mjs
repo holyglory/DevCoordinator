@@ -14,6 +14,16 @@ const RUNTIME_ARTIFACT_KINDS = new Set([
 ]);
 const RUNTIME_ARTIFACT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RUNTIME_ARTIFACT_MAX_BYTES = 1024 * 1024;
+const INFRASTRUCTURE_RESPONSE_MAX_BYTES = 16 * 1024 * 1024;
+const INFRASTRUCTURE_HOST_LIMIT = 100;
+const INFRASTRUCTURE_VM_LIMIT = 256;
+const INFRASTRUCTURE_REJECTION_LIMIT = 20;
+const INFRASTRUCTURE_OBSERVATION_CADENCE_SECONDS = 60;
+const INFRASTRUCTURE_STALE_AFTER_SECONDS = 180;
+// Mirror Python's lowercase canonical uuid.UUID text contract. Do not reject
+// Hyper-V GUIDs or newer UUID versions merely because their version/variant
+// nibble is outside the older v1-v5 regex.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TOKEN_MAX_BYTES = 4096;
 const TEST_STATS_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const TEST_STATS_CACHE_MAX_ENTRIES = 32;
@@ -92,6 +102,32 @@ function timestampMillis(value) {
   if (typeof value !== 'string' || !value) return null;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function canonicalSecondUtcMillis(value) {
+  if (
+    typeof value !== 'string'
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)
+  ) return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  return new Date(parsed).toISOString().replace('.000Z', 'Z') === value
+    ? parsed
+    : null;
+}
+
+function validInfrastructureFreshness(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value.stale_after_seconds !== INFRASTRUCTURE_STALE_AFTER_SECONDS) return false;
+  if (value.status === 'never') return value.age_seconds === null;
+  if (!Number.isInteger(value.age_seconds) || value.age_seconds < 0) return false;
+  if (value.status === 'fresh') {
+    return value.age_seconds < INFRASTRUCTURE_STALE_AFTER_SECONDS;
+  }
+  if (value.status === 'stale') {
+    return value.age_seconds >= INFRASTRUCTURE_STALE_AFTER_SECONDS;
+  }
+  return false;
 }
 
 // During a rolling server-wide upgrade, the HTTP API can already expose a
@@ -564,6 +600,59 @@ export function createCoordinator({ config, log }) {
     return { text: Buffer.concat(chunks, size).toString('utf8') };
   }
 
+  async function readBoundedInfrastructureJson(res) {
+    const rawLength = res.headers.get('content-length');
+    if (
+      rawLength
+      && /^\d+$/.test(rawLength)
+      && Number(rawLength) > INFRASTRUCTURE_RESPONSE_MAX_BYTES
+    ) {
+      await res.body?.cancel().catch(() => {});
+      throw new CoordError('coordinator returned an oversized infrastructure projection', {
+        status: 502,
+      });
+    }
+    if (!String(res.headers.get('content-type') ?? '').toLowerCase().startsWith('application/json')) {
+      await res.body?.cancel().catch(() => {});
+      throw new CoordError('coordinator returned an invalid infrastructure projection', {
+        status: 502,
+      });
+    }
+    if (!res.body) {
+      throw new CoordError('coordinator returned an empty infrastructure projection', {
+        status: 502,
+      });
+    }
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        size += chunk.length;
+        if (size > INFRASTRUCTURE_RESPONSE_MAX_BYTES) {
+          await reader.cancel().catch(() => {});
+          throw new CoordError('coordinator returned an oversized infrastructure projection', {
+            status: 502,
+          });
+        }
+        chunks.push(chunk);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    try {
+      return JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+    } catch {
+      throw new CoordError('coordinator returned an invalid infrastructure projection', {
+        status: 502,
+      });
+    }
+  }
+
   async function fetchJson(method, apiPath, body, timeoutMs, responseMode = 'json') {
     const ac = new AbortController();
     pendingAborts.add(ac);
@@ -606,6 +695,21 @@ export function createCoordinator({ config, log }) {
       if (responseMode === 'runtime-artifact' && res.status === 200) {
         try {
           data = await readBoundedRuntimeArtifact(res);
+        } catch (err) {
+          if (err instanceof CoordError) {
+            noteAlive();
+            throw err;
+          }
+          const coordErr = new CoordError(
+            `coordinator response read failed (${method} ${apiPath}): ${err?.message ?? err}`,
+          );
+          coordErr.cause = err;
+          noteDown(coordErr);
+          throw coordErr;
+        }
+      } else if (responseMode === 'infrastructure-json' && res.status === 200) {
+        try {
+          data = await readBoundedInfrastructureJson(res);
         } catch (err) {
           if (err instanceof CoordError) {
             noteAlive();
@@ -1005,6 +1109,105 @@ export function createCoordinator({ config, log }) {
     return request('GET', `/v1/events?${query.toString()}`);
   }
 
+  function infrastructure({ afterHostId = null } = {}) {
+    if (
+      afterHostId !== null
+      && (typeof afterHostId !== 'string' || !UUID_RE.test(afterHostId))
+    ) {
+      throw new CoordError('infrastructure page cursor must be a canonical UUID', {
+        status: 400,
+      });
+    }
+    const query = new URLSearchParams({
+      host_limit: String(INFRASTRUCTURE_HOST_LIMIT),
+      vm_limit_per_host: String(INFRASTRUCTURE_VM_LIMIT),
+      rejection_limit_per_host: String(INFRASTRUCTURE_REJECTION_LIMIT),
+    });
+    if (afterHostId !== null) query.set('after_host_id', afterHostId);
+    return request(
+      'GET',
+      `/v1/infrastructure?${query.toString()}`,
+      null,
+      { responseMode: 'infrastructure-json' },
+    ).then((value) => {
+      if (
+        !value
+        || typeof value !== 'object'
+        || Array.isArray(value)
+        || value.schema !== 'spectre.infrastructure.projection.v1'
+        || canonicalSecondUtcMillis(value.generated_at) === null
+        || value.observation_cadence_seconds !== INFRASTRUCTURE_OBSERVATION_CADENCE_SECONDS
+        || value.stale_after_seconds !== INFRASTRUCTURE_STALE_AFTER_SECONDS
+        || value.sort !== 'host_id'
+        || value.after_host_id !== afterHostId
+        || value.host_limit !== INFRASTRUCTURE_HOST_LIMIT
+        || value.vm_limit_per_host !== INFRASTRUCTURE_VM_LIMIT
+        || value.rejection_limit_per_host !== INFRASTRUCTURE_REJECTION_LIMIT
+        || !Array.isArray(value.hosts)
+        || value.hosts.length > INFRASTRUCTURE_HOST_LIMIT
+      ) {
+        throw new CoordError('coordinator returned an invalid infrastructure projection', {
+          status: 502,
+        });
+      }
+      let previousHostId = afterHostId;
+      for (const host of value.hosts) {
+        const hostId = host?.host_id;
+        const virtualMachines = host?.virtual_machines;
+        const missing = host?.missing_approved_virtual_machines;
+        const rejections = host?.recent_rejections;
+        if (
+          typeof hostId !== 'string'
+          || !UUID_RE.test(hostId)
+          || (previousHostId !== null && hostId <= previousHostId)
+          || !Array.isArray(virtualMachines)
+          || virtualMachines.length > INFRASTRUCTURE_VM_LIMIT
+          || !Array.isArray(missing)
+          || missing.length > INFRASTRUCTURE_VM_LIMIT
+          || !Array.isArray(rejections)
+          || rejections.length > INFRASTRUCTURE_REJECTION_LIMIT
+          || !validInfrastructureFreshness(host?.contact_freshness)
+          || !validInfrastructureFreshness(host?.capture_freshness)
+          || !validInfrastructureFreshness(host?.acceptance_freshness)
+        ) {
+          throw new CoordError('coordinator returned an invalid infrastructure projection', {
+            status: 502,
+          });
+        }
+        for (const collection of [virtualMachines, missing]) {
+          let previousVmId = null;
+          for (const item of collection) {
+            if (
+              typeof item?.vm_id !== 'string'
+              || !UUID_RE.test(item.vm_id)
+              || (previousVmId !== null && item.vm_id <= previousVmId)
+            ) {
+              throw new CoordError('coordinator returned an invalid infrastructure projection', {
+                status: 502,
+              });
+            }
+            previousVmId = item.vm_id;
+          }
+        }
+        previousHostId = hostId;
+      }
+      if (
+        typeof value.has_more !== 'boolean'
+        || (value.next_after_host_id !== null && (
+          typeof value.next_after_host_id !== 'string'
+          || !UUID_RE.test(value.next_after_host_id)
+        ))
+        || (value.has_more && value.next_after_host_id !== value.hosts.at(-1)?.host_id)
+        || (!value.has_more && value.next_after_host_id !== null)
+      ) {
+        throw new CoordError('coordinator returned an invalid infrastructure projection', {
+          status: 502,
+        });
+      }
+      return value;
+    });
+  }
+
   function testRepositories({ maxAgeMs = 30_000 } = {}) {
     return cachedGet(
       testRepositoryCache,
@@ -1158,6 +1361,7 @@ export function createCoordinator({ config, log }) {
     inventoryForOverview,
     serversRaw,
     events,
+    infrastructure,
     testRepositories,
     testStats,
     observeHost,

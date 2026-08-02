@@ -19,7 +19,9 @@ test('incoming invites are an owner-only collection with exact approve and deny 
 
   assert.match(html, /href="#\/invites"[^>]+id="nav-invites" hidden/);
   assert.match(html, /<section id="sec-invites"[\s\S]*?<div id="invites-body"/);
-  assert.match(js, /\(id === 'access' \|\| id === 'invites'\)[\s\S]*accessAdmin/,
+  assert.match(
+    js,
+    /\(id === 'access' \|\| id === 'invites' \|\| id === 'infrastructure'\)[\s\S]*accessAdmin/,
     'nonowners must not navigate to the access-request queue');
   assert.match(js, /api\('\/api\/access\/requests\?status=all'\)/);
   assert.match(js, /body: \{ decision \}/);

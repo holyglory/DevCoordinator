@@ -17,6 +17,7 @@ import shutil
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -304,6 +305,7 @@ class CrossUIDRuntimeFixture:
             MAIN_CONTAINER_ID: "always",
             ORPHAN_CONTAINER_ID: "always",
         }
+        self.compose_present = True
         self.host_calls: list[tuple[str, str]] = []
         self.lifecycle_calls: list[tuple[str, str]] = []
 
@@ -515,24 +517,27 @@ class CrossUIDRuntimeFixture:
                         f"cross-uid-{resource_id}-{lifecycle}",
                     ),
                 )
-            main_lifecycle = "running" if self.running[MAIN_CONTAINER_ID] else "stopped"
-            connection.execute(
-                """
-                INSERT INTO broker_observed_compose_containers(
-                    snapshot_id, docker_resource_id, full_container_id,
-                    project_name, service_name, lifecycle, ownership_state,
-                    authoritative_owner_repo_id, observation_fingerprint
-                ) VALUES (?, ?, ?, 'crossuid', 'app', ?, 'exclusive', ?, ?)
-                """,
-                (
-                    snapshot_id,
-                    MAIN_CONTAINER_ID,
-                    MAIN_FULL_ID,
-                    main_lifecycle,
-                    repo_id,
-                    "sha256:" + "7" * 64,
-                ),
-            )
+            if self.compose_present:
+                main_lifecycle = (
+                    "running" if self.running[MAIN_CONTAINER_ID] else "stopped"
+                )
+                connection.execute(
+                    """
+                    INSERT INTO broker_observed_compose_containers(
+                        snapshot_id, docker_resource_id, full_container_id,
+                        project_name, service_name, lifecycle, ownership_state,
+                        authoritative_owner_repo_id, observation_fingerprint
+                    ) VALUES (?, ?, ?, 'crossuid', 'app', ?, 'exclusive', ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        MAIN_CONTAINER_ID,
+                        MAIN_FULL_ID,
+                        main_lifecycle,
+                        repo_id,
+                        "sha256:" + "7" * 64,
+                    ),
+                )
         return {
             "snapshot_id": snapshot_id,
             "host_id": host_id,
@@ -575,6 +580,8 @@ class CrossUIDRuntimeFixture:
         return {"status": "restarted", "resource_id": target.docker_resource_id}
 
     def compose_up(self, target: Any) -> Mapping[str, Any]:
+        self.compose_present = True
+        self.running[MAIN_CONTAINER_ID] = True
         self.host_calls.append(("compose.up", target.compose_definition_id))
         return {
             "status": "started",
@@ -582,6 +589,7 @@ class CrossUIDRuntimeFixture:
         }
 
     def compose_stop(self, target: Any) -> Mapping[str, Any]:
+        self.running[MAIN_CONTAINER_ID] = False
         self.host_calls.append(("compose.stop", target.compose_definition_id))
         return {
             "status": "stopped",
@@ -589,6 +597,8 @@ class CrossUIDRuntimeFixture:
         }
 
     def compose_restart(self, target: Any) -> Mapping[str, Any]:
+        self.compose_present = True
+        self.running[MAIN_CONTAINER_ID] = True
         self.host_calls.append(("compose.restart", target.compose_definition_id))
         return {
             "status": "restarted",
@@ -596,6 +606,8 @@ class CrossUIDRuntimeFixture:
         }
 
     def compose_down(self, target: Any) -> Mapping[str, Any]:
+        self.compose_present = False
+        self.running[MAIN_CONTAINER_ID] = False
         self.host_calls.append(("compose.down", target.compose_definition_id))
         return {
             "status": "stopped",
@@ -1215,7 +1227,19 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
             os.chown(runtime_directory, SERVICE_UID, ACCESS_GID)
             database_path.parent.mkdir(mode=0o700)
             project_root.mkdir(mode=0o750)
-            (project_root / ".git").mkdir(mode=0o750)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "init.defaultBranch=main",
+                    "init",
+                    "--quiet",
+                    str(project_root),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
             compose_file = project_root / "compose.yaml"
             compose_file.write_text(
                 "services:\n  app:\n    image: example.invalid/cross-uid:test\n",
@@ -1229,8 +1253,11 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             poison.chmod(0o755)
-            for path in (project_root, project_root / ".git", compose_file):
+            for path in (project_root, compose_file):
                 os.chown(path, FIRST_UID, ACCESS_GID)
+            for path in (project_root / ".git").rglob("*"):
+                os.chown(path, FIRST_UID, ACCESS_GID)
+            os.chown(project_root / ".git", FIRST_UID, ACCESS_GID)
             os.chown(account_home, FIRST_UID, ACCESS_GID)
 
             port = _free_tcp_port()
@@ -1260,6 +1287,7 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                 },
                 compose_model_renderer=_rendered_compose_fixture,
                 observe_host=fixture.observe,
+                grant_cleanup_capabilities=True,
                 validity_seconds=3_600,
             )
             protected_profile_before = profile_path.read_bytes()
@@ -1289,6 +1317,7 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                     },
                     compose_model_renderer=_rendered_compose_fixture,
                     observe_host=fixture.observe,
+                    grant_cleanup_capabilities=True,
                     validity_seconds=3_600,
                 )
             self.assertEqual(
@@ -1353,7 +1382,11 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
             finished_pid, status = os.waitpid(child[0], 0)
             self.assertEqual(finished_pid, child[0])
             self.assertTrue(os.WIFEXITED(status), result)
-            self.assertEqual(os.WEXITSTATUS(status), 0, result)
+            self.assertEqual(
+                os.WEXITSTATUS(status),
+                0,
+                {"result": result, "host_calls": fixture.host_calls},
+            )
             child = None
 
             self.assertEqual(result["status"], "success", result)
@@ -1401,7 +1434,6 @@ class CrossUIDBrokerAcceptanceTests(unittest.TestCase):
                     ("disable_policy", ORPHAN_CONTAINER_ID),
                     ("stop", ORPHAN_CONTAINER_ID),
                     ("disable_policy", MAIN_CONTAINER_ID),
-                    ("stop", MAIN_CONTAINER_ID),
                 ],
             )
 
